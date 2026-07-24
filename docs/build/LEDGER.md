@@ -15,17 +15,24 @@ truth for build progress — not chat history, not git log alone.
 
 ## Status
 
-| Field                | Value                                                                                                                                       |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| Current phase        | **Phase 0 — Foundations**                                                                                                                   |
-| Current task         | Phase 0 PR [#2](https://github.com/adamparco/kube-agents/pull/2) open for review; entering Phase 1 (read-only Platform Agent + GitOps loop) |
-| Overall              | 🟢 Phase 0 acceptance passing — harness bootstrapped; P0-T1…T7 done + verified                                                              |
-| Autonomy             | **Fully autonomous** (advance across phase boundaries; halt only on hard blocker or failed load-bearing suite)                              |
-| Verification targets | **Kind (inner loop)** + **scratch GKE (identity/cloud criteria)**                                                                           |
-| Last updated         | 2026-07-23 — Phase 0 pre-PR gate passed (VAP allow-list + guard/OKF fixes re-verified); opening PR                                          |
-| Last updated by      | harness-run (bootstrap session)                                                                                                             |
+| Field                | Value                                                                                                                                    |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Current phase        | **Phase 1 — Read-only Platform Agent + GitOps loop**                                                                                     |
+| Current task         | Breakdown done (`docs/build/phase-1.md`, 12 tasks). Next: implement — start T2 (dead helpers) + T7 (CRD fields) + T1 (read-only render). |
+| Overall              | ✅ Phase 0 **merged to `main`**; 🟡 Phase 1 in progress — write-surface mapped (7-agent workflow), breakdown written                     |
+| Autonomy             | **Fully autonomous** (advance across phase boundaries; halt only on hard blocker or failed load-bearing suite)                           |
+| Verification targets | **Kind (inner loop)** + **scratch GKE (identity/cloud criteria)**                                                                        |
+| Last updated         | 2026-07-24 — PR #1 + #2 merged; `main` now has design + Phase 0; Phase 1 breakdown written                                               |
+| Last updated by      | harness-run (Phase 1 kickoff)                                                                                                            |
 
-**Load-bearing halt conditions (stop and surface, do not auto-advance):**
+**Merge policy (set by user 2026-07-24):** phase PRs are **auto-merged once the pre-merge gate is
+green** (invariants + load-bearing suites passing on Kind), then the build continues — no wait for
+manual merge. Auto-merge is gated, not blind: any halt condition below blocks the merge and surfaces
+instead. **Base/target = `main`** — PR #1 consolidated design + Phase 0 onto `main` (`11d95fd`), so
+future phase branches base on `main` and PR → `main`. (Product runtime GitOps review is unaffected —
+that is a separate, RBAC/VAP-enforced property of the built system.)
+
+**Load-bearing halt conditions (stop and surface, do NOT merge or auto-advance):**
 
 1. A **security negative test** (03 §11) fails — read-only, per-tier scope, attenuation, no break-glass.
 2. A **failure-isolation chaos test** (05 §8) fails.
@@ -40,16 +47,16 @@ truth for build progress — not chat history, not git log alone.
 Phases and acceptance criteria are defined in `docs/design/07-implementation-roadmap.md` §2.
 Detailed task breakdowns live in `docs/build/phase-<N>.md` (created when the phase is entered).
 
-| Phase | Title                                  | Status              | PR                                                    | Notes                                                                                               |
-| ----- | -------------------------------------- | ------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| 0     | Foundations                            | 🟢 PR open (review) | [#2](https://github.com/adamparco/kube-agents/pull/2) | A1–A4 green on Kind; pre-PR gate passed (4 fixes); PR #2 → fork, base `docs/design-end-state-specs` |
-| 1     | Read-only Platform Agent + GitOps loop | ⬜ Not started      | —                                                     |                                                                                                     |
-| 2     | Cluster Admin Agent + cascade          | ⬜ Not started      | —                                                     |                                                                                                     |
-| 3     | Developer Team Agent + isolation proof | ⬜ Not started      | —                                                     |                                                                                                     |
-| 4     | Coordination & knowledge               | ⬜ Not started      | —                                                     |                                                                                                     |
-| 5     | Security gate & hardening              | ⬜ Not started      | —                                                     |                                                                                                     |
-| 6     | Failure-isolation & resilience         | ⬜ Not started      | —                                                     |                                                                                                     |
-| 7     | Cloud-agnostic seams                   | ⬜ Not started      | —                                                     |                                                                                                     |
+| Phase | Title                                  | Status              | PR                                                    | Notes                                                                                                                                                        |
+| ----- | -------------------------------------- | ------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0     | Foundations                            | ✅ merged to `main` | [#2](https://github.com/adamparco/kube-agents/pull/2) | A1–A4 green; pre-PR gate (4 fixes); PR #2 `8a31c76`; **on `main` via PR [#1](https://github.com/adamparco/kube-agents/pull/1) `11d95fd`** (design + Phase 0) |
+| 1     | Read-only Platform Agent + GitOps loop | 🟡 In progress      | —                                                     | Breakdown in `phase-1.md` (12 tasks); write-surface mapped (7-agent workflow); implementing → verify on Kind → PR to `main`                                  |
+| 2     | Cluster Admin Agent + cascade          | ⬜ Not started      | —                                                     |                                                                                                                                                              |
+| 3     | Developer Team Agent + isolation proof | ⬜ Not started      | —                                                     |                                                                                                                                                              |
+| 4     | Coordination & knowledge               | ⬜ Not started      | —                                                     |                                                                                                                                                              |
+| 5     | Security gate & hardening              | ⬜ Not started      | —                                                     |                                                                                                                                                              |
+| 6     | Failure-isolation & resilience         | ⬜ Not started      | —                                                     |                                                                                                                                                              |
+| 7     | Cloud-agnostic seams                   | ⬜ Not started      | —                                                     |                                                                                                                                                              |
 
 Legend: ⬜ not started · 🟡 in progress · 🟢 acceptance passing · ✅ merged · 🔴 blocked
 
@@ -90,6 +97,6 @@ This is what a reviewer reads to understand choices the specs didn't dictate.
 
 Open items that halt autonomous progress. Clear a row when resolved (move detail to the PR).
 
-| Date | Phase | Blocker                                                                                                                                                                   | Needs |
-| ---- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
-| —    | —     | None open. Phase 0 PR [#2](https://github.com/adamparco/kube-agents/pull/2) is open for review; harness proceeding to Phase 1 (verify locally, no push until Phase 1 PR). | —     |
+| Date | Phase | Blocker                                                                                                                                                                                  | Needs |
+| ---- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| —    | —     | None open. Phase 0 merged to `main` (PR #1 + #2). Harness implementing Phase 1 per `phase-1.md`; verify on Kind, then a single Phase 1 PR → `main` (auto-merged when the gate is green). | —     |
