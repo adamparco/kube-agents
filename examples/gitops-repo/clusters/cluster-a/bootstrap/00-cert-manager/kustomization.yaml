@@ -1,0 +1,13 @@
+# Bootstrap wave 00 — cert-manager (PINNED to v1.14.x).
+#
+# The kube-agents controller's admission webhook is served with a cert-manager-issued certificate
+# (config/certmanager), so cert-manager must be installed and its webhook Ready BEFORE wave 10. The
+# pipeline waits on the cert-manager Deployments after applying this wave (see apply.yml).
+#
+# Pinned to an immutable release. cert-manager publishes a single install manifest per release; kustomize
+# pulls it as a remote resource so the exact version is reproducible and reviewable in the PR diff.
+# Repin the version deliberately (it is a cluster-wide control-plane dependency), never track a range.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - https://github.com/cert-manager/cert-manager/releases/download/v1.14.7/cert-manager.yaml

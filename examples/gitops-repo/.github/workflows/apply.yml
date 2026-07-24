@@ -144,12 +144,51 @@ jobs:
             fi
           }
 
+          # Apply the spoke bootstrap (clusters/<name>/bootstrap/) in ORDERED waves. Unlike apply_path,
+          # bootstrap has hard dependencies (cert-manager → controller webhook → VAP-before-identity,
+          # 05 §7), so numbered wave subdirs are applied in lexical order and we BLOCK on readiness after
+          # the load-bearing waves. A wave dir with a kustomization.yaml is applied with `-k` (it may pull
+          # remote bases); otherwise plain `-f` (server-side). Absent bootstrap/ → no-op (e.g. the hub,
+          # which is bootstrapped out-of-band). Waits are keyed on the wave's basename so adding/removing
+          # a wave needs no pipeline change.
+          apply_bootstrap() {
+            local root="$1"
+            [ -d "$root" ] || { echo "  (skip $root — no bootstrap)"; return 0; }
+            local wave
+            for wave in "$root"/*/; do
+              wave="${wave%/}"
+              [ -d "$wave" ] || continue
+              if [ -f "$wave/kustomization.yaml" ] || [ -f "$wave/kustomization.yml" ]; then
+                echo "  kubectl apply -k → $wave"
+                kubectl apply --server-side -k "$wave"
+              else
+                apply_path "$wave"
+              fi
+              case "$(basename "$wave")" in
+                00-cert-manager)
+                  echo "    waiting for cert-manager to be Ready…"
+                  kubectl -n cert-manager rollout status deploy/cert-manager --timeout=300s
+                  kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=300s
+                  kubectl -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=300s
+                  ;;
+                10-controller)
+                  echo "    waiting for the kube-agents controller to be Ready…"
+                  kubectl -n kubeagents-system rollout status deploy/kubeagents-controller-manager --timeout=300s
+                  ;;
+              esac
+            done
+          }
+
           case "$TARGET" in
             cluster:*)
               name="${TARGET#cluster:}"
               echo "Applying cluster '$name'"
-              # provisioning first (cluster/cloud resources), then namespaces, then agents.
+              # Order matters (05 §7): provisioning (the cluster/cloud resources exist) → bootstrap
+              # (cert-manager + controller + VAP, in ordered waves) → namespaces → agents (identity
+              # before pod, now guarded by the enforcing VAP). This resolves the spoke chicken-and-egg:
+              # the same provisioning PR installs the control plane before its first Agent CR lands.
               apply_path "clusters/$name/provisioning"
+              apply_bootstrap "clusters/$name/bootstrap"
               for ns in clusters/"$name"/namespaces/*/; do apply_path "${ns%/}"; done
               apply_path "clusters/$name/agents"
               ;;
