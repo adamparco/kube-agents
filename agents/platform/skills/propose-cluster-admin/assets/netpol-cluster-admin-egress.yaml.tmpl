@@ -1,0 +1,87 @@
+# clusters/@@CLUSTER@@/agents/netpol-cluster-admin-egress.yaml
+#
+# Rendered by the propose-cluster-admin skill (F4 cascade). The per-tier DEFAULT-DENY egress
+# NetworkPolicy for @@CLUSTER@@'s cluster-admin agent pod (03 §10). It selects every cluster-admin pod
+# by the tier label the controller stamps on the pod template (`kube-agents/tier: cluster-admin`), so
+# it needs no agent-name knowledge. Applied in the `agents/` wave alongside the identity + CR.
+#
+# SHAPE = PURE ALLOWLIST. policyTypes:[Egress] with a podSelector makes egress default-deny; only the
+# CIDRs/ports below are reachable. The cloud metadata server (169.254.169.254) and arbitrary hosts are
+# UNREACHABLE with no explicit block rule (the 03 §11 egress negative). There is deliberately NO
+# 0.0.0.0/0 rule.
+#
+# CROSS-CLUSTER CONTRACT (05 §5): a spoke consumes exactly two hub services — Inference (LiteLLM,
+# per-tier virtual key) and Minty (the GitHub/Workload-Identity token broker) — over VPC-internal
+# private endpoints, plus cloud APIs, GitHub, and the MCP grounding endpoints. No cross-cluster
+# Kubernetes credentials ever.
+#
+# LIMITATION (hostname precision): NetworkPolicy is L3/L4 — GitHub/MCP are allowlisted by IP CIDR (which
+# drifts). The hostname-precise L7 egress proxy is a Phase 5 hardening item (07).
+#
+# GKE Workload Identity note (flagged for production): on GKE, WI tokens are fetched via the GKE metadata
+# server (169.254.169.254), which this policy does NOT allow — WI's metadata concealment already blocks
+# the node-SA paths, and the load-bearing negative is that the RAW cloud metadata is unreachable. If your
+# agent acquires GCP tokens via the metadata server rather than Minty, add a NARROW allow to
+# 169.254.169.254/32:988 (WI only) or adopt the Phase 5 L7 proxy. On Kind there is no metadata server.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cluster-admin-egress
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: cluster-admin
+    app.kubernetes.io/managed-by: gitops
+spec:
+  podSelector:
+    matchLabels:
+      kube-agents/tier: cluster-admin
+  policyTypes:
+    - Egress
+  egress:
+    # 1) DNS — cluster resolution. Without this, every name-based egress fails before it starts.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # 2) Hub Inference (LiteLLM) — the ONLY inference path (per-tier virtual key), VPC-internal private.
+    - to:
+        - ipBlock:
+            cidr: @@HUB_INFERENCE_CIDR@@
+      ports:
+        - protocol: TCP
+          port: 443
+    # 3) Hub Minty — the Workload-Identity / GitHub token broker, VPC-internal private. Short-lived,
+    #    scoped tokens only; the agent holds no long-lived write credentials.
+    - to:
+        - ipBlock:
+            cidr: @@HUB_MINTY_CIDR@@
+      ports:
+        - protocol: TCP
+          port: 443
+    # 4) Google cloud APIs via Private Google Access (restricted.googleapis.com). Reads only.
+    - to:
+        - ipBlock:
+            cidr: 199.36.153.8/30
+      ports:
+        - protocol: TCP
+          port: 443
+    # 5) GitHub — push suggestion branches / open PRs (submit-suggestion) with a Minty-minted token.
+    #    Allowlisted by GitHub's published IP ranges (https://api.github.com/meta).
+    - to:
+        - ipBlock:
+            cidr: @@GITHUB_CIDRS@@
+      ports:
+        - protocol: TCP
+          port: 443
+    # 6) MCP grounding endpoints the agent reads live docs from (developer_knowledge, gke — 03 §10).
+    - to:
+        - ipBlock:
+            cidr: @@MCP_GROUNDING_CIDRS@@
+      ports:
+        - protocol: TCP
+          port: 443
