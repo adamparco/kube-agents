@@ -1,0 +1,47 @@
+name: Review Gate
+
+# Security review-gate (06 §7): the agent-driven review-security-k8s-* suite runs on every PR that
+# touches a security-relevant path (and a daily heartbeat re-run), a hermetic scorer turns the JSON
+# findings into the merge decision. CI is authoritative and runs outside the agent (decision R-A);
+# an unmitigated high/critical finding fails this job. See docs/build/phase-5.md + docs/design/06 §7.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "**/provisioning/**"
+      - "**/agents/**"
+      - "**/namespaces/**"
+      - "**/policy/**"
+      - "**/SOUL.md"
+      - ".agents/skills/review-security-k8s-**"
+      - "security-review-waivers.yaml"
+      - "scripts/review-gate/**"
+      - ".github/workflows/review-gate.yml"
+  schedule:
+    - cron: "17 7 * * *" # daily heartbeat re-run (off the top-of-hour stampede)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  review-gate:
+    name: Security review gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Scorer self-test (the gate's own correctness)
+        run: |
+          python3 scripts/review-gate/test_score_findings.py
+          python3 scripts/review-gate/test_extract_findings.py
+
+      - name: Run agent-driven detector (headless; skips loudly on fork / no secret)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: bash scripts/review-gate/run-detector.sh findings.json
+
+      - name: Score findings (authoritative merge decision)
+        run: python3 scripts/review-gate/score_findings.py --waivers security-review-waivers.yaml findings.json

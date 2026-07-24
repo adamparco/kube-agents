@@ -1,0 +1,27 @@
+# Security-review waivers — kube-agents review-gate (06 §7; decision R-C in docs/build/phase-5.md).
+#
+# Each entry MITIGATES one high/critical finding so the review-gate no longer blocks merge on it.
+# medium/low findings are advisory and never need a waiver. A waiver is itself a reviewed change:
+# it lives in the repo and merges through the same PR flow, so every mitigation decision is
+# attributable and revertible (06 §8).
+#
+# Fingerprint: sha256(agent + "\n" + file + "\n" + normalize(message))[:16], where normalize =
+# lowercase + collapse-whitespace + strip line-number tokens. Get a finding's fingerprint with:
+#   python3 scripts/review-gate/score_findings.py --fingerprint findings.json
+#
+# Fields (all required per entry):
+#   fingerprint    16 hex chars — the finding being waived
+#   justification  why this finding is accepted / how it is mitigated by another control
+#   approved_by    the human who approved the waiver (GitHub handle)
+#   expires        ISO-8601 date YYYY-MM-DD — after this date the waiver stops mitigating and
+#                  the gate blocks again (forces periodic re-review; never a permanent bypass)
+#
+# Example (illustrative — not active because it lives in a comment):
+#   - fingerprint: 0123456789abcdef
+#     justification: hostPath is required by the CSI node daemonset and scoped read-only.
+#     approved_by: adamparco
+#     expires: 2026-12-31
+#
+# Full format + workflow: docs/build/phase-5/review-gate-waivers.md
+
+waivers: []

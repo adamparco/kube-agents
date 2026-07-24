@@ -592,6 +592,14 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 			MountPath: path.Dir(sessionKVDBPath),
 			SubPath:   "session",
 		},
+		{
+			// Writable scratch for readOnlyRootFilesystem (H-A, 05 §5). The agent's HOME and cwd live
+			// under the /opt/data PVC (writable); only /tmp needs a separate ephemeral mount. Per
+			// container (not a shared emptyDir) so a compromised sidecar cannot stage files in the
+			// agent's scratch space.
+			Name:      "platform-agent-tmp",
+			MountPath: "/tmp",
+		},
 	}
 
 	var apiServerSecretRef *corev1.SecretKeySelector
@@ -630,6 +638,7 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 			VolumeMounts: append(defaultPlatformAgentVolumeMounts, extraVolumeMounts...),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
+				ReadOnlyRootFilesystem:   ptr.To(true),
 				Capabilities: &corev1.Capabilities{
 					Drop: []corev1.Capability{"ALL"},
 				},
@@ -663,6 +672,11 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 				MountPath: path.Dir(sessionKVDBPath),
 				SubPath:   "session",
 			},
+			{
+				// Writable scratch for readOnlyRootFilesystem (H-A) — see the main container.
+				Name:      "platform-agent-dashboard-tmp",
+				MountPath: "/tmp",
+			},
 		}
 
 		containers = append(containers, corev1.Container{
@@ -690,6 +704,7 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 			VolumeMounts: append(dashboardVolumeMounts, extraVolumeMounts...),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
+				ReadOnlyRootFilesystem:   ptr.To(true),
 				Capabilities: &corev1.Capabilities{
 					Drop: []corev1.Capability{"ALL"},
 				},
@@ -738,9 +753,15 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 				Name:      "fluent-bit-state",
 				MountPath: "/fluent-bit/state",
 			},
+			{
+				// Writable scratch for readOnlyRootFilesystem (H-A) — fluent-bit buffers/scratch.
+				Name:      "fluent-bit-tmp",
+				MountPath: "/tmp",
+			},
 		},
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: ptr.To(false),
+			ReadOnlyRootFilesystem:   ptr.To(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
 			},
@@ -796,8 +817,16 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 				corev1.ResourceMemory: resource.MustParse("128Mi"),
 			},
 		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				// Writable scratch for readOnlyRootFilesystem (H-A) — the Go watcher's os.TempDir.
+				Name:      "event-watcher-tmp",
+				MountPath: "/tmp",
+			},
+		},
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: ptr.To(false),
+			ReadOnlyRootFilesystem:   ptr.To(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
 			},
@@ -809,7 +838,7 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 
 // buildDefaultVolumes generates the default volumes for Agent
 func buildDefaultVolumes(agent *agentv1alpha1.Agent) []corev1.Volume {
-	return []corev1.Volume{
+	volumes := []corev1.Volume{
 		{
 			Name: "platform-agent-data-vol",
 			VolumeSource: corev1.VolumeSource{
@@ -865,7 +894,33 @@ func buildDefaultVolumes(agent *agentv1alpha1.Agent) []corev1.Volume {
 				},
 			},
 		},
+		// Per-container writable /tmp scratch backing readOnlyRootFilesystem (H-A, 05 §5). Ephemeral
+		// (emptyDir) so nothing durable escapes the read-only root; per container so a compromised
+		// sidecar cannot plant files in the agent's scratch space.
+		{
+			Name:         "platform-agent-tmp",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+		{
+			Name:         "fluent-bit-tmp",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+		{
+			Name:         "event-watcher-tmp",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
 	}
+
+	// The dashboard container is only rendered when enabled, so its /tmp volume is added to match —
+	// keeping the volume set free of an orphaned entry when the dashboard is off.
+	if isDashboardEnabled(agent) {
+		volumes = append(volumes, corev1.Volume{
+			Name:         "platform-agent-dashboard-tmp",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		})
+	}
+
+	return volumes
 }
 
 // buildPlatformExplorerRole generates the custom ClusterRole manifest

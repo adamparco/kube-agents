@@ -11,6 +11,13 @@
 # The `kubernetes.io/metadata.name` label is auto-applied by the apiserver (NamespaceDefaultLabelName)
 # and is what the sibling NetworkPolicies use to select this namespace; `kube-agents/tenant` marks it
 # as a kube-agents-managed tenant for auditing/selection.
+#
+# POD SECURITY (Phase 5 H-B, 05 §5): every proposed tenant namespace enforces the `restricted` Pod
+# Security Standard, so the developer-team agent pod (and any tenant workload) must satisfy runAsNonRoot,
+# seccomp RuntimeDefault, drop-ALL capabilities, and no privilege-escalation. `readOnlyRootFilesystem`
+# — which restricted-PSS does not cover — is additionally hard-enforced on agent pods by
+# policy/vap-agent-pod-hardening.yaml. `warn`/`audit` are set alongside `enforce` so a would-be
+# violation is also surfaced (not just blocked).
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -18,3 +25,9 @@ metadata:
   labels:
     kube-agents/tenant: @@NAMESPACE@@
     app.kubernetes.io/managed-by: gitops
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest

@@ -73,6 +73,24 @@ func TestClusterAdminRender_LoadBearing(t *testing.T) {
 
 	main := containerByName(t, dep, "platform-agent")
 
+	// (Phase 5 H-A, 05 §5) Every agent container runs with a read-only root filesystem — a mutable
+	// root fs would let a compromised process rewrite its own binaries/config. Assert it on EVERY
+	// rendered container so a golden regen can't silently weaken one; a writable /tmp emptyDir backs it.
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.SecurityContext == nil || c.SecurityContext.ReadOnlyRootFilesystem == nil || !*c.SecurityContext.ReadOnlyRootFilesystem {
+			t.Errorf("container %q: readOnlyRootFilesystem must be true (Phase 5 hardening)", c.Name)
+		}
+		hasTmp := false
+		for _, m := range c.VolumeMounts {
+			if m.MountPath == "/tmp" {
+				hasTmp = true
+			}
+		}
+		if !hasTmp {
+			t.Errorf("container %q: a writable /tmp mount must back readOnlyRootFilesystem", c.Name)
+		}
+	}
+
 	// Image is resolved BY TIER: the input omits spec.deployment.image, so the render must fall back to
 	// defaultImageForTier(cluster-admin). A regression here means a cluster-admin pod runs a wrong image.
 	const wantImage = "ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0"

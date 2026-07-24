@@ -1,0 +1,63 @@
+# ValidatingAdmissionPolicy — every agent pod must run with a read-only root filesystem (05 §5; 08 §4;
+# Phase 5 H-A/H-B; acceptance c).
+#
+# This is the focused COMPLEMENT to PSS `enforce: restricted` (set as a namespace label). Restricted-PSS
+# already enforces the core of the hardened context — runAsNonRoot, seccomp RuntimeDefault, drop-ALL
+# capabilities, no privilege-escalation, no host namespaces — but it deliberately does NOT require
+# `readOnlyRootFilesystem`. The operator renders every agent container with `readOnlyRootFilesystem: true`
+# (a writable /tmp emptyDir backs it); this policy makes that continuously enforced, so a hand-edited or
+# drifted pod that drops it is rejected at admission even if it slipped past review.
+#
+# COMPOSES WITH `vap-agent-readonly` (does not collide): that policy governs RBAC objects
+# (roles/clusterroles) — this one governs Pods. Different resources, different policy names, both bound
+# `Deny`; a pod/RBAC change is judged by whichever policy matches. Neither weakens the other.
+#
+# SCOPE: only pods carrying the `kube-agents/tier` label the operator stamps on every agent pod template
+# (03 §10) — so tenant/system workloads are untouched by THIS policy (their baseline is the namespace's
+# PSS label). Requires K8s >= 1.30 (VAP GA); CEL is scoped to the object's own container lists.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-agent-pod-hardening
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    # Only govern agent pods — those carrying the tier label the controller stamps on the pod template.
+    - name: is-agent-pod
+      expression: "has(object.metadata.labels) && 'kube-agents/tier' in object.metadata.labels"
+  validations:
+    # 1) Every workload container must set readOnlyRootFilesystem: true. Absent or false both fail
+    #    (explicit == true), so a container that omits the field is rejected — no silent gap.
+    - expression: >-
+        object.spec.containers.all(c,
+          has(c.securityContext) &&
+          has(c.securityContext.readOnlyRootFilesystem) &&
+          c.securityContext.readOnlyRootFilesystem == true)
+      message: "every agent container must set securityContext.readOnlyRootFilesystem: true (Phase 5 hardening; a writable /tmp emptyDir backs it)"
+      reason: Forbidden
+    # 2) Same requirement for init containers (they run with the same identity and must not leave a
+    #    writable root fs behind). Skipped only when there are none.
+    - expression: >-
+        !has(object.spec.initContainers) ||
+        object.spec.initContainers.all(c,
+          has(c.securityContext) &&
+          has(c.securityContext.readOnlyRootFilesystem) &&
+          c.securityContext.readOnlyRootFilesystem == true)
+      message: "every agent init container must set securityContext.readOnlyRootFilesystem: true (Phase 5 hardening)"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-agent-pod-hardening
+spec:
+  policyName: kube-agents-agent-pod-hardening
+  validationActions: ["Deny"]
+  # No paramRef / matchResources selector: applies in every namespace. The matchConditions above already
+  # narrow enforcement to `kube-agents/tier` pods, so non-agent workloads are never touched by this policy.

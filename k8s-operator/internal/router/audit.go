@@ -45,6 +45,10 @@ type AuditRecord struct {
 	// ThreadID is the thread-affinity key the turn belonged to (conversation correlation). Never an authz
 	// input; carried purely so an operator can trace a whole conversation across turns.
 	ThreadID string
+	// TraceID is the per-turn correlation id (Phase 5 T-A, 06 §8): the same id the dispatcher stamps as the
+	// kage_trace_id attribute and the agent echoes as a PR Trace-Id trailer. Recording it here is what ties
+	// the requester (Sender) to the exact turn a later GitOps mutation traces back to (acceptance d).
+	TraceID string
 	// Allowed is the before-dispatch authorization decision.
 	Allowed bool
 	// Dispatched is true only if the message was actually delivered to the target topic.
@@ -78,6 +82,7 @@ func (s LogAuditSink) Record(_ context.Context, rec AuditRecord) {
 		"identity", rec.Identity,
 		"tier", string(rec.Tier),
 		"threadID", rec.ThreadID,
+		"traceID", rec.TraceID,
 		"allowed", rec.Allowed,
 		"dispatched", rec.Dispatched,
 		"clarify", rec.Clarify,

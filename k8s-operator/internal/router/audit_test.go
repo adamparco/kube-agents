@@ -82,6 +82,31 @@ func TestGateway_AuditAttributionSurface(t *testing.T) {
 		}
 	})
 
+	t.Run("delivered turn ties Sender to TraceID and carries it to dispatch (attribution)", func(t *testing.T) {
+		// Phase 5 T-A (acceptance d): the per-turn trace id is recorded on the audit record alongside the
+		// requester (tying who↔which-turn) AND handed to the dispatcher, which the production dispatcher
+		// stamps as kage_trace_id so the agent can echo it as the PR Trace-Id trailer.
+		idx := NewIndex()
+		idx.Upsert(agentCR("cluster-a-agent", "cluster-admin", "proj-x", "cluster-a", "", "topic-ca", []string{"users/alice"}))
+		sink := &capturingSink{}
+		fake := &FakeDispatcher{}
+		g := &Gateway{Resolver: NewResolver(), Index: idx, Dispatch: fake, ProjectID: "proj-x", Audit: sink}
+		const trace = "projects/p/topics/inbound/messages/12345"
+
+		out, err := g.Handle(context.Background(), Message{Text: "@kage /cluster-cluster-a status", Sender: "users/alice", TraceID: trace})
+		if err != nil || !out.Dispatched {
+			t.Fatalf("delivered turn = (dispatched=%v err=%v), want dispatched", out.Dispatched, err)
+		}
+		rec := lastRecord(t, sink)
+		if rec.TraceID != trace || rec.Sender != "users/alice" {
+			t.Errorf("audit tie = (sender=%s traceID=%s), want users/alice / %s", rec.Sender, rec.TraceID, trace)
+		}
+		sent := fake.Sent()
+		if len(sent) != 1 || sent[0].TraceID != trace || sent[0].Sender != "users/alice" {
+			t.Errorf("dispatch attribution = %+v, want one delivery with sender users/alice + traceID %s", sent, trace)
+		}
+	})
+
 	t.Run("sticky follow-up records ModeSticky with tier and identity", func(t *testing.T) {
 		idx := NewIndex()
 		idx.Upsert(agentCR("team-y-a", "developer-team", "proj-x", "cluster-a", "team-y", "topic-ty", []string{"users/alice"}))

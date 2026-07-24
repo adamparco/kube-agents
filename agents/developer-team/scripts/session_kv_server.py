@@ -436,7 +436,93 @@ def _escalation_query_head(session_id: str, payload: Dict[str, Any]) -> str:
     )
 
 
-def _report_and_gitops_tail(session_id: str, project_query: str) -> str:
+# Keys the ChatOps router / event source may use to carry per-turn attribution into the inject request
+# (Phase 5 T-A, 06 §8; acceptance d). The router stamps kage_sender / kage_trace_id on the dispatched
+# message; an event source may instead name them requested_by / trace_id. Both spellings are accepted so
+# the attribution survives whichever path fed the inject.
+_ATTR_REQUESTED_BY_KEYS = ("requested_by", "kage_sender", "requester", "sender")
+_ATTR_TRACE_ID_KEYS = ("trace_id", "kage_trace_id", "traceID")
+
+
+def _first_present(*sources: Dict[str, Any], keys: tuple = ()) -> str:
+    """Return the first non-empty value for any of `keys` across `sources` (in order), else ''."""
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in keys:
+            val = src.get(key)
+            if val:
+                return str(val).strip()
+    return ""
+
+
+def _extract_attribution(request_data: Dict[str, Any], payload: Dict[str, Any]) -> tuple[str, str]:
+    """Pull (requested_by, trace_id) from the inject request, preferring the top-level envelope.
+
+    The router-added correlation fields ride on the dispatched message; the credential proxy forwards them
+    either at the top level of the inject body or inside the inner payload. Missing values stay empty here
+    — submit_suggestion then falls back to the autonomous attribution, so a signal-driven turn with no
+    human requester is still attributable, never silently unattributed.
+    """
+    requested_by = _first_present(request_data, payload, keys=_ATTR_REQUESTED_BY_KEYS)
+    trace_id = _first_present(request_data, payload, keys=_ATTR_TRACE_ID_KEYS)
+    return requested_by, trace_id
+
+
+def _record_session_attribution(session_id: str, requested_by: str, trace_id: str) -> None:
+    """Merge (requested_by, trace_id) into the session's metadata row so the turn is auditable.
+
+    Attribution is persisted (not just passed to the agent) so an operator can, from get_metadata alone,
+    tie a session to the human + turn that triggered it — the read side of acceptance d. Best-effort: a
+    metadata write failure must never block the actual notification/turn.
+    """
+    if not (requested_by or trace_id):
+        return
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                row = conn.execute(
+                    "SELECT metadata FROM session_metadata WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                meta = json.loads(row[0]) if row else {}
+                if requested_by:
+                    meta["requested_by"] = requested_by
+                if trace_id:
+                    meta["trace_id"] = trace_id
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET metadata = excluded.metadata, "
+                    "updated_at = CURRENT_TIMESTAMP",
+                    (session_id, json.dumps(meta)),
+                )
+    except Exception as exc:
+        logger.error(f"Failed to record session attribution for {session_id}: {exc}")
+
+
+def _attribution_instruction(requested_by: str, trace_id: str) -> str:
+    """The line that tells the agent to stamp the attribution trailers on any GitOps PR it opens.
+
+    submit_suggestion stamps Requested-by:/Trace-Id: unconditionally (falling back to autonomous), but
+    passing the router-provided values explicitly is what ties a merged PR back to THIS turn's requester.
+    Emitted only when at least one value is known; a purely autonomous turn omits it and lets the script's
+    fallback attribute to the agent identity.
+    """
+    if not (requested_by or trace_id):
+        return ""
+    flags = []
+    if requested_by:
+        flags.append(f"--requested-by '{requested_by}'")
+    if trace_id:
+        flags.append(f"--trace-id '{trace_id}'")
+    return (
+        "\n4. ATTRIBUTION (required): when you run the submit-suggestion skill to open the PR, pass "
+        f"{' '.join(flags)} so the change is attributable to the requester and this exact turn "
+        "(they become the Requested-by:/Trace-Id: PR trailers)."
+    )
+
+
+def _report_and_gitops_tail(session_id: str, project_query: str, requested_by: str = "", trace_id: str = "") -> str:
     """Shared reporting-format + read-only GitOps-PR instruction tail for every kind."""
     return (
         f"When calling your send_notification tool to report findings, you MUST pass this exact session ID: '{session_id}' as the session_id argument so it routes as a threaded reply to the warning alert.\n\n"
@@ -456,6 +542,7 @@ def _report_and_gitops_tail(session_id: str, project_query: str) -> str:
         f"1. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.\n"
         f"2. Post a threaded response confirming the PR was created and include the clickable PR link.\n"
         f"3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster."
+        + _attribution_instruction(requested_by, trace_id)
     )
 
 
@@ -480,7 +567,11 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
     else:  # k8s-event / k8s-event-followup (default framing)
         head = _k8s_event_query_head(session_id, payload, cluster_name)
 
-    return head + _report_and_gitops_tail(session_id, project_query)
+    # Attribution (Phase 5 T-A): the router-provided requester + per-turn trace id ride on the payload
+    # (stashed by inject_message) so the GitOps tail can instruct the agent to stamp them on any PR.
+    requested_by = str(payload.get("kage_requested_by") or "").strip()
+    trace_id = str(payload.get("kage_trace_id") or "").strip()
+    return head + _report_and_gitops_tail(session_id, project_query, requested_by, trace_id)
 
 
 def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> None:
@@ -555,6 +646,16 @@ def inject_message(
             status_code=400,
             detail=f"unknown or missing inject kind: {kind!r} (expected one of {sorted(_KNOWN_INJECT_KINDS)})",
         )
+
+    # Attribution (Phase 5 T-A, acceptance d): capture the requester + per-turn trace id the router carried
+    # in, persist them to the session metadata (audit read side), and stash them on the payload so the
+    # agent-query builder can instruct the agent to stamp them as PR trailers (the mutation write side).
+    requested_by, trace_id = _extract_attribution(request_data, payload)
+    _record_session_attribution(session_id, requested_by, trace_id)
+    if requested_by:
+        payload["kage_requested_by"] = requested_by
+    if trace_id:
+        payload["kage_trace_id"] = trace_id
 
     alert_msg = _format_inject_card(kind, payload)
 

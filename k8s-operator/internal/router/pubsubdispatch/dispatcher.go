@@ -82,7 +82,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, target router.Target, msg rou
 		data = []byte(msg.Text)
 	}
 
-	attrs := make(map[string]string, len(msg.Attrs)+4)
+	attrs := make(map[string]string, len(msg.Attrs)+5)
 	for k, v := range msg.Attrs {
 		attrs[k] = v
 	}
@@ -90,7 +90,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, target router.Target, msg rou
 	attrs["kage_router"] = "true"
 	attrs["kage_target_identity"] = target.Identity
 	attrs["kage_target_handle"] = target.Handle
+	// kage_sender is the requester (attribution); kage_trace_id is the per-turn correlation id. Together they
+	// are the attribution the target pod's inject path records and the agent echoes as Requested-by:/Trace-Id:
+	// PR trailers (Phase 5 T-A, 06 §8; acceptance d), so a merged GitOps change traces back to this exact turn.
 	attrs["kage_sender"] = msg.Sender
+	attrs["kage_trace_id"] = msg.TraceID
 
 	res := d.publisher(target.TopicName).Publish(ctx, &pubsub.Message{Data: data, Attributes: attrs})
 	if _, err := res.Get(ctx); err != nil {
