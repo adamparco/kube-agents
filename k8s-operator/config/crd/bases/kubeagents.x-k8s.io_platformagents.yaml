@@ -7150,6 +7150,13 @@ spec:
                           rule:
                             "!has(self.enabled) || self.enabled == false || (has(self.projectId)
                             && has(self.topicName) && has(self.subscriptionName))"
+                        - message:
+                            allowedUsers must be non-empty when the Google Chat
+                            integration is enabled (an empty allowlist admits all authenticated
+                            users)
+                          rule:
+                            "!has(self.enabled) || self.enabled == false || (has(self.allowedUsers)
+                            && size(self.allowedUsers) > 0)"
                     slack:
                       description: Slack configures the Slack integration.
                       properties:
@@ -7239,6 +7246,12 @@ spec:
                           rule:
                             "!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef)
                             && has(self.appTokenSecretRef))"
+                        - message:
+                            allowedUsers must be non-empty when the Slack integration
+                            is enabled (an empty allowlist admits all authenticated users)
+                          rule:
+                            "!has(self.enabled) || self.enabled == false || (has(self.allowedUsers)
+                            && size(self.allowedUsers) > 0)"
                   type: object
                 parentRef:
                   description:

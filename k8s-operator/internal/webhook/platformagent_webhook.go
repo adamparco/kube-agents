@@ -96,6 +96,23 @@ func (v *PlatformAgentCustomValidator) ValidateUpdate(ctx context.Context, oldOb
 	}
 	platformagentlog.Info("validating PlatformAgent update", "name", platformAgent.Name)
 
+	// Tier is immutable (06 §1.1). This is also enforced declaratively by a CEL rule on the CRD; the
+	// webhook check is defense-in-depth and keeps the guarantee unit-testable. oldObj is nil in some
+	// unit tests (and never nil in real admission), so guard the comparison.
+	if oldAgent, ok := oldObj.(*agentv1alpha1.PlatformAgent); ok && oldAgent != nil {
+		if effectiveTier(oldAgent) != effectiveTier(platformAgent) {
+			return nil, apierrors.NewInvalid(
+				schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
+				platformAgent.Name,
+				field.ErrorList{field.Invalid(
+					field.NewPath("spec", "tier"),
+					platformAgent.Spec.Tier,
+					fmt.Sprintf("tier is immutable (was %q)", effectiveTier(oldAgent)),
+				)},
+			)
+		}
+	}
+
 	return v.validatePlatformAgent(ctx, platformAgent)
 }
 
@@ -105,28 +122,102 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		return nil, nil
 	}
 
-	// 1. Enforce 1 PlatformAgent per project limit (enforced at cluster level on the Hub/Management cluster)
+	// 1. Closed-allowlist guardrail (A4): an enabled chat integration must carry a non-empty allowlist.
+	if fe := validateClosedAllowlist(platformAgent); fe != nil {
+		return nil, apierrors.NewInvalid(
+			schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
+			platformAgent.Name,
+			field.ErrorList{fe},
+		)
+	}
+
+	// 2. Enforce one agent per (tier, scope) (06 §1.2). The identity key is derived per-tier: platform
+	// is unique per project, cluster-admin per cluster, developer-team per namespace. Agents in
+	// different tiers or scopes coexist. Enforced cluster-wide on the Hub/Management cluster.
 	if v.Client != nil {
 		var list agentv1alpha1.PlatformAgentList
 		if err := v.Client.List(ctx, &list); err != nil {
 			return nil, err
 		}
-		for _, item := range list.Items {
-			// Skip terminating agents to prevent deadlocking new platformagent deployment
+		identity := scopeIdentity(platformAgent)
+		for i := range list.Items {
+			item := &list.Items[i]
+			// Skip terminating agents to prevent deadlocking a replacement deployment.
 			if item.DeletionTimestamp != nil {
 				continue
 			}
-			if item.Name != platformAgent.Name || item.Namespace != platformAgent.Namespace {
+			// Skip the object under validation itself (update path).
+			if item.Name == platformAgent.Name && item.Namespace == platformAgent.Namespace {
+				continue
+			}
+			if scopeIdentity(item) == identity {
 				return nil, apierrors.NewInvalid(
 					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
 					platformAgent.Name,
-					field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per project")},
+					field.ErrorList{field.Duplicate(
+						field.NewPath("spec"),
+						fmt.Sprintf("an agent already exists for %s (%s/%s); (tier, scope) must be unique", identity, item.Namespace, item.Name),
+					)},
 				)
 			}
 		}
 	}
 
 	return nil, nil
+}
+
+// effectiveTier returns the agent's tier, defaulting an empty value to platform (the CRD default) so
+// stored objects written before defaulting compare equal to freshly-defaulted ones.
+func effectiveTier(agent *agentv1alpha1.PlatformAgent) agentv1alpha1.AgentTier {
+	if agent.Spec.Tier == "" {
+		return agentv1alpha1.TierPlatform
+	}
+	return agent.Spec.Tier
+}
+
+// scopeIdentity returns the (tier, scope) uniqueness key for an agent (06 §1.2). Two agents that
+// resolve to the same identity may not coexist. The scope fields that matter are per-tier: platform →
+// projectId; cluster-admin → +clusterName; developer-team → +namespace.
+func scopeIdentity(agent *agentv1alpha1.PlatformAgent) string {
+	tier := effectiveTier(agent)
+	var projectID, clusterName, namespace string
+	if s := agent.Spec.Scope; s != nil {
+		projectID = s.ProjectID
+		clusterName = s.ClusterName
+		namespace = s.Namespace
+	}
+	switch tier {
+	case agentv1alpha1.TierClusterAdmin:
+		return fmt.Sprintf("tier=%s;project=%s;cluster=%s", tier, projectID, clusterName)
+	case agentv1alpha1.TierDeveloperTeam:
+		return fmt.Sprintf("tier=%s;project=%s;cluster=%s;namespace=%s", tier, projectID, clusterName, namespace)
+	default: // platform (and the empty/default case)
+		return fmt.Sprintf("tier=%s;project=%s", tier, projectID)
+	}
+}
+
+// validateClosedAllowlist enforces A4: an enabled chat integration must carry a non-empty allowlist.
+// An empty/absent allowlist means "all authenticated users", which is the open default we must close.
+// This is also enforced by CEL on the CRD; the webhook check keeps it unit-testable and defense-in-depth.
+func validateClosedAllowlist(platformAgent *agentv1alpha1.PlatformAgent) *field.Error {
+	integration := platformAgent.Spec.Integration
+	if integration == nil {
+		return nil
+	}
+	base := field.NewPath("spec", "integration")
+	if gc := integration.GoogleChat; gc != nil && gc.Enabled != nil && *gc.Enabled && len(gc.AllowedUsers) == 0 {
+		return field.Required(
+			base.Child("googleChat", "allowedUsers"),
+			"allowedUsers must be non-empty when the Google Chat integration is enabled (an empty allowlist admits all authenticated users)",
+		)
+	}
+	if sl := integration.Slack; sl != nil && sl.Enabled != nil && *sl.Enabled && len(sl.AllowedUsers) == 0 {
+		return field.Required(
+			base.Child("slack", "allowedUsers"),
+			"allowedUsers must be non-empty when the Slack integration is enabled (an empty allowlist admits all authenticated users)",
+		)
+	}
+	return nil
 }
 
 // ValidateDelete implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
