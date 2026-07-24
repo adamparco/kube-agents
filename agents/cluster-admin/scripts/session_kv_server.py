@@ -13,13 +13,14 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from contextlib import closing
 
 import logging
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import inject_auth
 
 # Configure logging
 logging.basicConfig(
@@ -84,14 +85,40 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
         logger.error(f"Failed to clean up old DB records: {exc}")
 
 
+def _require_inject_auth(authorization: Optional[str], x_asserted_caller: Optional[str]) -> None:
+    """Guard the machine-push seam (POST /sessions and /sessions/{id}/inject).
+
+    Enforces the per-pod bearer key (and optional owner allow-list) when API_SERVER_KEY is
+    set — which the operator always does in production. When it is unset (local dev / unit
+    tests) the seam is left open with a warning; the 127.0.0.1 bind is the unconditional
+    network-level backstop in that case. See inject_auth.check_inject_auth for the decision.
+    """
+    expected = inject_auth.expected_api_key()
+    if not expected:
+        logger.warning(
+            "API_SERVER_KEY unset — session-inject seam auth is DISABLED (dev/test only)"
+        )
+        return
+    err = inject_auth.check_inject_auth(
+        authorization, x_asserted_caller, expected, inject_auth.allowed_owners()
+    )
+    if err is not None:
+        status_code, detail = err
+        raise HTTPException(status_code=status_code, detail=detail)
+
+
 @app.get("/healthz")
 def healthz() -> Dict[str, str]:
     return {"status": "ok"}
 
 
 @app.post("/sessions", status_code=201)
-def create_session() -> Dict[str, str]:
+def create_session(
+    authorization: Optional[str] = Header(default=None),
+    x_asserted_caller: Optional[str] = Header(default=None),
+) -> Dict[str, str]:
     """Create a new session ID for the incoming incident."""
+    _require_inject_auth(authorization, x_asserted_caller)
     session_id = f"k8s-evt-{uuid.uuid4().hex[:8]}"
     
     # Save the session to the local metadata DB
@@ -326,8 +353,15 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
 
 
 @app.post("/sessions/{session_id}/inject")
-def inject_message(session_id: str, request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
+def inject_message(
+    session_id: str,
+    request_data: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(default=None),
+    x_asserted_caller: Optional[str] = Header(default=None),
+) -> Dict[str, str]:
     """Receive the event payload and notify the Platform Agent via Google Chat."""
+    _require_inject_auth(authorization, x_asserted_caller)
     raw_message = request_data.get("message", "")
     if not raw_message:
         raise HTTPException(status_code=400, detail="message field is required")

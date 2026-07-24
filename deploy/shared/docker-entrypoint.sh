@@ -40,8 +40,11 @@ fi
 # 5. Start background microservices (FastAPI proxy)
 mkdir -p "$TARGET_DIR/logs"
 if [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
-    echo "Starting Session KV server on port 8699..."
-    "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 0.0.0.0 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
+    echo "Starting Session KV server on 127.0.0.1:8699..."
+    # Bind loopback only: the inject seam is a same-pod interface (sidecar/relay -> agent).
+    # This closes the cross-pod network path unconditionally; inject_auth adds the bearer
+    # backstop against a compromised co-container. See Phase 4 P4-T1 (S1).
+    "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 127.0.0.1 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
 fi
 
 # 5.5. Initialize default GKE context for the container to the host cluster

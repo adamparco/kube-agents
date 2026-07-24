@@ -162,6 +162,79 @@ class TestSessionKvServerApi(unittest.TestCase):
 
 
 
+class TestSessionKvServerInjectAuth(unittest.TestCase):
+    """Phase 4 / P4-T1 (S1): the machine-push seam enforces a bearer when API_SERVER_KEY
+    is set. When unset (as in the other API tests above) the seam is open — proving the
+    conditional-enforcement design keeps the existing dev/test path green."""
+
+    API_KEY = "unit-test-per-pod-key"
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        self.client = TestClient(session_kv_server.app)
+
+    def test_create_session_rejected_without_bearer_when_key_set(self):
+        with patch.dict(os.environ, {"API_SERVER_KEY": self.API_KEY}):
+            resp = self.client.post("/sessions")
+            self.assertEqual(resp.status_code, 401)
+
+    def test_create_session_rejected_with_wrong_bearer(self):
+        with patch.dict(os.environ, {"API_SERVER_KEY": self.API_KEY}):
+            resp = self.client.post("/sessions", headers={"Authorization": "Bearer nope"})
+            self.assertEqual(resp.status_code, 401)
+
+    def test_create_session_accepted_with_correct_bearer(self):
+        with patch.dict(os.environ, {"API_SERVER_KEY": self.API_KEY}):
+            resp = self.client.post(
+                "/sessions", headers={"Authorization": f"Bearer {self.API_KEY}"}
+            )
+            self.assertEqual(resp.status_code, 201)
+            self.assertTrue(resp.json()["sessionID"].startswith("k8s-evt-"))
+
+    def test_inject_rejected_without_bearer_when_key_set(self):
+        with patch.dict(os.environ, {"API_SERVER_KEY": self.API_KEY}):
+            resp = self.client.post(
+                "/sessions/some-session/inject",
+                json={"message": json.dumps({"reason": "FailedMount"})},
+            )
+            self.assertEqual(resp.status_code, 401)
+
+    def test_inject_accepted_with_correct_bearer(self):
+        with patch.dict(os.environ, {"API_SERVER_KEY": self.API_KEY}):
+            # trigger_agent_troubleshooter runs as a background task; patch it out so the
+            # test asserts only the auth gate, not the downstream hermes/chat call.
+            with patch.object(session_kv_server, "trigger_agent_troubleshooter"):
+                resp = self.client.post(
+                    "/sessions/some-session/inject",
+                    headers={"Authorization": f"Bearer {self.API_KEY}"},
+                    json={"message": json.dumps({"reason": "FailedMount", "namespace": "ns"})},
+                )
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json(), {"status": "injected"})
+
+    def test_owner_allowlist_enforced_when_set(self):
+        env = {"API_SERVER_KEY": self.API_KEY, "SESSION_KV_ALLOWED_OWNERS": "platform"}
+        with patch.dict(os.environ, env):
+            # Correct key but disallowed asserted caller -> 403.
+            resp = self.client.post(
+                "/sessions",
+                headers={
+                    "Authorization": f"Bearer {self.API_KEY}",
+                    "X-Asserted-Caller": "developer-team",
+                },
+            )
+            self.assertEqual(resp.status_code, 403)
+            # Allowed caller -> 201.
+            ok = self.client.post(
+                "/sessions",
+                headers={
+                    "Authorization": f"Bearer {self.API_KEY}",
+                    "X-Asserted-Caller": "platform",
+                },
+            )
+            self.assertEqual(ok.status_code, 201)
+
+
 class TestSessionKvServerQueryBuilding(unittest.TestCase):
 
     @patch.dict(os.environ, {"GCP_PROJECT_ID": "test-project-id"})
