@@ -63,7 +63,11 @@ spec:
       ports:
         - protocol: TCP
           port: 443
-    # 4) Google cloud APIs via Private Google Access (restricted.googleapis.com). Reads only.
+    # 4) Google cloud APIs via Private Google Access (restricted.googleapis.com). Reads only. This ALSO
+    #    carries the eventingress Pub/Sub SUBSCRIBE leg (Phase 4 D1, 04 §4): pubsub.googleapis.com
+    #    resolves to the same restricted VIP, so draining PRE-CREATED alert/GitHub subscriptions needs
+    #    no new CIDR/port. Subscribe-only — eventingress never creates a topic/subscription and never
+    #    publishes; the invariant (read-only, GitOps-only writes) is unchanged.
     - to:
         - ipBlock:
             cidr: 199.36.153.8/30

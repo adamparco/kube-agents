@@ -1,0 +1,75 @@
+# eventingress sidecar patch — DEFERRABLE (scratch GKE only; Phase 4 D1, 04 §4).
+#
+# WHAT: adds the `eventingress` container to an agent Deployment so non-chat machine push — alerts
+# (Cloud Monitoring over Pub/Sub) and GitHub webhooks — reaches the agent's LOCAL session-inject seam
+# (127.0.0.1:8699, S1), reusing the exact bearer + owner + kind-discriminated envelope the
+# k8s-event-watcher sidecar already speaks. Delivery is a same-pod loopback call — no cross-tier network
+# path (invariant 3).
+#
+# WHY A PATCH, NOT OPERATOR-INJECTED: unlike the k8s-event-watcher (always injected — it needs only the
+# in-cluster API), eventingress needs PRE-CREATED cloud Pub/Sub subscriptions that exist only on scratch
+# GKE. Baking it into the always-on injection path would fail closed on Kind (no project, no
+# subscriptions). So it ships in the image (deploy/docker/Dockerfile) but is attached out-of-band via
+# this strategic-merge patch on the clusters where the cloud transport exists.
+#
+# ON KIND: this patch is NOT applied. The in-pod delivery contract is proven hermetically by the
+# synthetic terminus (`eventingress --source=synthetic --event-file=...`, see verify-phase4.sh) — the
+# SAME relay code, without Pub/Sub. The cloud transport (Pub/Sub, GitHub HMAC) is scratch-GKE-deferred,
+# NOT faked.
+#
+# SUBSCRIBE-ONLY INVARIANT: eventingress only DRAINS pre-created subscriptions. It never creates a topic
+# or subscription and never publishes. Its egress rides the existing Private Google Access rule
+# (restricted.googleapis.com, 199.36.153.8/30:443) — see the tier egress NetworkPolicy; no new CIDR.
+#
+# HOW TO APPLY (scratch GKE), replacing an agent Deployment name and the two subscription IDs:
+#
+#   kubectl patch deployment <agent-name> -n kubeagents-system \
+#     --type=strategic --patch-file deploy/eventingress/sidecar-patch.yaml
+#
+# The subscriptions, topics, and their Cloud Monitoring / GitHub webhook wiring are provisioned out of
+# band (Terraform / gcloud) as part of scratch-GKE setup; this patch only consumes them.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: PLACEHOLDER-agent-name
+  namespace: kubeagents-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: eventingress
+          # Same image as the agent/watcher; the binary is baked in at /usr/local/bin/eventingress.
+          image: PLACEHOLDER-agent-image
+          command:
+            - /usr/local/bin/eventingress
+          args:
+            - --source=pubsub
+            # Loopback to the local inject seam — identical contract to the k8s-event-watcher sidecar.
+            - --daemon-url=http://127.0.0.1:8699
+            - --token-env=API_SERVER_KEY
+            # The agent's tier == its X-Asserted-Caller owner claim (must be an allowed owner, S1).
+            - --owner=PLACEHOLDER-tier
+            - --project=PLACEHOLDER-gcp-project
+            # PRE-CREATED subscriptions (subscribe-only). Omit either flag to disable that source.
+            - --alert-subscription=PLACEHOLDER-alert-sub
+            - --github-subscription=PLACEHOLDER-github-sub
+          env:
+            # Same seam bearer token the watcher uses (S1). Loopback-only; never leaves the pod.
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-secrets
+                  key: API_SERVER_KEY
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

@@ -85,7 +85,10 @@ spec:
         - protocol: TCP
           port: 443
     # 5) Google cloud APIs via Private Google Access (restricted.googleapis.com). Stable range — reads
-    #    only (the agent's cloud GSA is viewer-only; the write path is a GitOps PR).
+    #    only (the agent's cloud GSA is viewer-only; the write path is a GitOps PR). This ALSO carries
+    #    the eventingress Pub/Sub SUBSCRIBE leg (Phase 4 D1, 04 §4): pubsub.googleapis.com resolves to
+    #    the same restricted VIP, so draining PRE-CREATED alert/GitHub subscriptions needs no new
+    #    CIDR/port. Subscribe-only — eventingress never creates a topic/subscription and never publishes.
     - to:
         - ipBlock:
             cidr: 199.36.153.8/30
