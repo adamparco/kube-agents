@@ -1,11 +1,19 @@
 import argparse
 import json
+import os
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from datetime import datetime, timedelta, timezone
+
+# Resolve the monitoring endpoint from the provider-neutral seam (default: Cloud Monitoring). Note:
+# the metric TYPE names below are GCP-managed-Prometheus identifiers; translating them for a non-GCP
+# Prometheus is backend-specific query logic, deferred separately (D3). See obs_backend.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from obs_backend import monitoring_base_url  # noqa: E402
 
 # Parse arguments
 parser = argparse.ArgumentParser(description="Query token usage delta for GKE Managed Service for Prometheus metrics")
@@ -39,7 +47,7 @@ def get_token_delta(metric_name):
         "interval.endTime": end_str
     }
     query_string = urllib.parse.urlencode(params)
-    url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/timeSeries?{query_string}"
+    url = f"{monitoring_base_url()}/v3/projects/{project_id}/timeSeries?{query_string}"
 
     
     # Construct urllib Request

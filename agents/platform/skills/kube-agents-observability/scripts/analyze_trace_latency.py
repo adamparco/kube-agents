@@ -1,11 +1,17 @@
 import argparse
 import json
+import os
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from datetime import datetime, timedelta, timezone
+
+# Resolve the tracing endpoint from the provider-neutral seam (default: Cloud Trace). See obs_backend.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from obs_backend import trace_base_url  # noqa: E402
 
 # Parse arguments
 parser = argparse.ArgumentParser(description="Analyze trace latencies to locate bottlenecks (e.g. slow tool or model calls)")
@@ -59,7 +65,7 @@ params = {
     "pageSize": limit
 }
 query_string = urllib.parse.urlencode(params)
-list_url = f"https://cloudtrace.googleapis.com/v1/projects/{project_id}/traces?{query_string}"
+list_url = f"{trace_base_url()}/v1/projects/{project_id}/traces?{query_string}"
 print(f"Retrieving the last {limit} traces...")
 list_data = fetch_api(list_url)
 
@@ -103,7 +109,7 @@ def parse_timestamp(ts_str):
 # Step 2: Query and analyze each trace
 for trace in list_data.get('traces', []):
     trace_id = trace.get('traceId')
-    detail_url = f"https://cloudtrace.googleapis.com/v1/projects/{project_id}/traces/{trace_id}"
+    detail_url = f"{trace_base_url()}/v1/projects/{project_id}/traces/{trace_id}"
     detail = fetch_api(detail_url)
     
     if not detail or not detail.get('spans'):

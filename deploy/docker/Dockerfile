@@ -93,7 +93,11 @@ COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
 COPY --chown=hermes:hermes docs/glossary.md /opt/defaults/docs/
 
 
-# 5.5. Install and enable hermes-otel plugin in /opt/defaults
+# 5.5. Install and enable hermes-otel plugin in /opt/defaults.
+#      The OTLP endpoint baked below is the DEFAULT (GKE managed OTel collector). It is overridable at
+#      runtime by the standard OTEL_EXPORTER_OTLP_ENDPOINT env — resolved by docker-entrypoint.sh step
+#      4b (provider-neutral observability seam; Phase 7 P7-T3, 01 §6). Unset env ⇒ this default is used
+#      unchanged (no regression on GKE).
 RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"

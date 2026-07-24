@@ -1,11 +1,17 @@
 import argparse
 import json
+import os
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from datetime import datetime, timedelta, timezone
+
+# Resolve the tracing endpoint from the provider-neutral seam (default: Cloud Trace). See obs_backend.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from obs_backend import trace_base_url  # noqa: E402
 
 parser = argparse.ArgumentParser(description="Fetch traces from Cloud Trace API")
 parser.add_argument("--project-id", required=True, help="Google Cloud Project ID")
@@ -38,7 +44,7 @@ params = {
     "pageSize": 10
 }
 query_string = urllib.parse.urlencode(params)
-url = f"https://cloudtrace.googleapis.com/v1/projects/{project_id}/traces?{query_string}"
+url = f"{trace_base_url()}/v1/projects/{project_id}/traces?{query_string}"
 
 
 # Construct urllib Request

@@ -1,8 +1,14 @@
 import argparse
 import json
+import os
 import subprocess
+import sys
 import urllib.error
 import urllib.request
+
+# Resolve the monitoring endpoint from the provider-neutral seam (default: Cloud Monitoring). See obs_backend.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from obs_backend import monitoring_base_url  # noqa: E402
 
 # Parse arguments
 parser = argparse.ArgumentParser(description="List available metric descriptors matching 'litellm'")
@@ -12,7 +18,7 @@ args = parser.parse_args()
 project_id = args.project_id
 
 # Construct the URL for the MetricDescriptors API
-url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/metricDescriptors"
+url = f"{monitoring_base_url()}/v3/projects/{project_id}/metricDescriptors"
 
 # Use active gcloud auth token to authenticate the API request
 try:
