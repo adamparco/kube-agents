@@ -1,0 +1,72 @@
+# clusters/cluster-a/provisioning/cluster-a.yaml
+#
+# The CANONICAL KCC (Config Connector) provisioning exemplar for cluster-a — the `kcc` arm of the
+# `spec.iac.format` seam (06 §1.1, §4; enum kcc|terraform, default kcc). This is the artifact a
+# platform agent authors via PR when the proposing agent's iac.format is `kcc` (the default), per
+# agents/platform/skills/gke-cluster-creator/SKILL.md. Its parity twin is the Terraform HCL exemplar
+# at ../../cluster-b/provisioning/ (iac.format: terraform) — the two describe the SAME cluster shape
+# in the two supported formats, and local-dev/tests/iac-parity.py asserts they stay equivalent.
+#
+# The reference actuation pipeline applies this dir with `kubectl apply --server-side --recursive`
+# because it holds *.yaml and no *.tf (apply.yml apply_path(): *.tf → terraform, else *.y*ml →
+# kubectl). Keep this dir KCC-only; a Terraform target lives in a SEPARATE cluster dir (cluster-b)
+# so the two formats never collide in one provisioning dir.
+#
+# Shape: GKE Standard, regional, STABLE channel, private VPC-native + Workload Identity + Shielded
+# nodes, e2-standard-4 / 100GB, node autoscaling 1–4 — the gke-cluster-creator "Standard Regional"
+# template (SKILL.md §2). `PROJECT_ID` is substituted per project by CI/CD (same convention as the
+# identity manifests in ../agents/identity/).
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: cluster-a
+  namespace: config-control
+  labels:
+    app.kubernetes.io/managed-by: gitops
+  annotations:
+    cnrm.cloud.google.com/project-id: "PROJECT_ID"
+spec:
+  location: us-central1
+  # Node lifecycle is owned by the ContainerNodePool below, so the default pool is removed and node
+  # count is managed there (avoids cluster recreation on node changes).
+  initialNodeCount: 1
+  removeDefaultNodePool: true
+  networkingMode: VPC_NATIVE
+  ipAllocationPolicy: {}
+  releaseChannel:
+    channel: STABLE
+  workloadIdentityConfig:
+    # Workload Identity is the KSA→GSA seam the read-only agent identities depend on (06 §2). On a
+    # non-GKE second target this is IRSA (EKS) / AAD Workload Identity (AKS) — deferred-not-faked (D1).
+    workloadPool: "PROJECT_ID.svc.id.goog"
+  privateClusterConfig:
+    enablePrivateNodes: true
+    enablePrivateEndpoint: false
+---
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerNodePool
+metadata:
+  name: cluster-a-pool
+  namespace: config-control
+  labels:
+    app.kubernetes.io/managed-by: gitops
+  annotations:
+    cnrm.cloud.google.com/project-id: "PROJECT_ID"
+spec:
+  location: us-central1
+  clusterRef:
+    name: cluster-a
+  autoscaling:
+    minNodeCount: 1
+    maxNodeCount: 4
+  management:
+    autoRepair: true
+    autoUpgrade: true
+  nodeConfig:
+    machineType: e2-standard-4
+    diskSizeGb: 100
+    shieldedInstanceConfig:
+      enableSecureBoot: true
+      enableIntegrityMonitoring: true
+    oauthScopes:
+      - "https://www.googleapis.com/auth/cloud-platform"
