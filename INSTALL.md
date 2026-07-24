@@ -23,6 +23,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Phase 3 — Kind inner loop (Developer Team Agent + namespace isolation)](#phase-3--kind-inner-loop-developer-team-agent--namespace-isolation)
    - [Phase 4 — Coordination & knowledge (push-first proactivity + OKF)](#phase-4--coordination--knowledge-push-first-proactivity--okf)
    - [Phase 5 — Security gate & hardening (review-gate CI, egress, pod hardening, attribution)](#phase-5--security-gate--hardening-review-gate-ci-egress-pod-hardening-attribution)
+   - [Phase 6 — Failure-isolation & resilience (chaos: no cascade)](#phase-6--failure-isolation--resilience-chaos-no-cascade)
 6. [Teardown & Cleanup](#teardown--cleanup)
 7. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
@@ -475,6 +476,59 @@ per-turn trace id flow router → inject seam → session → PR, stamped as dur
    webhook**, **gVisor execution sandbox**, and **per-request user down-scoping** remain deferred
    hardening (08 §5). **05 §8 chaos** (failure-isolation) is Phase 6 and is marked N-A here rather than
    silently skipped.
+
+### Phase 6 — Failure-isolation & resilience (chaos: no cascade)
+
+Phase 6 is a **validation phase** — it adds no new persona and no new write path. It graduates the
+05 §8 **failure-isolation (chaos)** suite from deferred to a live, load-bearing gate, proving the
+design's central resilience claim: **no cascade failure** (04 §6). Four experiments run against the
+existing Kind cluster (`local-dev/kind/chaos-suite.sh`):
+
+- **C1 — controller down.** Scale `kubeagents-controller-manager` → 0. A running pod stays Ready
+  (running pods continue), the deleted agent Deployment is **not** recreated (no reconciles without the
+  controller), and on scale-up the controller re-acquires leadership and recreates it (reconcile /
+  provisioning **resumes**). — Accept **(b)**.
+- **C2 — controller up.** Delete the real agent Deployment → the controller recreates it (owned by its
+  `Agent` CR); delete a running pod → its Deployment recreates it. The controller **relaunches** agent
+  workloads. — Accept **(c)**.
+- **C3 — Cluster Admin Agent down.** Kill the cluster-admin pod; its Developer Team pod stays
+  UID-stable + Ready across the whole window (**no cascade**) and the cluster-admin is relaunched. —
+  Accept **(b)**.
+- **C4 — hub down.** Scale a hub-inference stand-in → 0; the spoke workload keeps running its
+  last-applied state, is structurally decoupled from the hub (owned by its own ReplicaSet, no hub
+  ownerRef), and **no Config Sync / Config Connector / Argo / Flux CRD is required** (unopinionated
+  actuation, 05 §8 bullet 4). — Accept **(a)**.
+
+Run the consolidated Phase 6 gate — the NET-NEW chaos suite plus the full prior-phase regression
+(the live ops are destructive and **guarded to Kind contexts**; every op is reversible, single-object,
+and self-cleaning):
+
+```bash
+local-dev/kind/verify-phase6.sh kind-kube-agents-dev
+```
+
+> **The dev cluster must run the locally-built controller.** The published `k8s-operator:v0.1.0` image
+> predates the Phase 5 pod hardening — it renders agent pods **without** `readOnlyRootFilesystem`, which
+> the `vap-agent-pod-hardening` VAP (correctly) rejects at admission, so a recreated pod never appears.
+> Before Phase 6, build and load the current controller so its live rendering matches source:
+>
+> ```bash
+> cd k8s-operator && make docker-build IMG=kube-agents/k8s-operator:dev
+> kind load docker-image kube-agents/k8s-operator:dev --name kube-agents-dev
+> kubectl -n kubeagents-system set image deploy/kubeagents-controller-manager manager=kube-agents/k8s-operator:dev
+> ```
+>
+> With the hardened controller deployed, a recreated agent pod is **admitted** (it stays `Pending` on a
+> single-node dev cluster because the controller bakes prod-correct ~2Gi+ requests across a 4-container
+> pod — faithful, not a failure). This is the first point where the **live controller-rendered** agent
+> pod is observed carrying `readOnlyRootFilesystem: true` and passing the hardening VAP end-to-end.
+
+> **Deferred, not faked (04 §6 honest scoping).** The **literal** spoke agent-reasoning-pause under a
+> real hub outage — the spoke agent blocking because it cannot reach real hub-hosted inference/Minty
+> over private networking — needs two clusters and is deferred to a **scratch-GKE** run. C4 proves the
+> load-bearing half on Kind (cluster state + workloads survive hub loss) and never asserts the rest
+> green. Parent → child is an **authority/lifecycle** edge, not a runtime dependency; the hub is
+> shared-fate for agent **reasoning**, not for the cluster's **running state**.
 
 ## Teardown & Cleanup
 
