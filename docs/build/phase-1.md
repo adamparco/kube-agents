@@ -142,13 +142,37 @@ then deploy the no-mint controller, then assert the agent still reads and mints 
 **Halt (do not auto-merge) if:** the VAP suite regresses, the controller mints any RBAC/SA, the cloud
 GSA retains admin IAM, or a destructive test would touch a non-Kind/non-scratch context.
 
+### Verification results (2026-07-24) — A1–A4 ✅ PASS
+
+All steps run; evidence in `LEDGER.md` §Verification log. Summary:
+
+1. **Build/gen/test** — `go build/vet/test ./...` green; `make generate manifests` clean (no drift).
+2. **Read-only tool surface (T1)** — rendered config has no `gke` write server / no `mcp-gke` toolset
+   (only the read-only `developer_knowledge` MCP remains); config mount `readOnly: true`. ✅
+3. **No-mint controller (T4/T5, 08 §7)** — controller ClusterRole grants **no** `rbac.authorization.k8s.io`
+   apiGroup at all (cannot mint any Role/Binding); `serviceaccounts`→`get;list;watch`. ✅
+4. **Read-only identity** — `auth can-i` as `platform-agent` SA on Kind: reads yes; create/delete/update/
+   escalate no. ✅
+5. **Cardinality/allowlist (T8)** — CRD installed on Kind: valid CR admitted; enabled-chat + empty
+   allowlist DENIED by CEL; `tier` change DENIED (`tier is immutable`). (tier,scope) cardinality is
+   webhook-only → unit-tested. ✅
+6. **VAP suite (03 §11, load-bearing)** — `negative-attenuation.sh` all 4 checks PASS (exit 0); T6
+   overlay VAP-clean. ✅
+7. **GitOps loop (A1/A3)** — `submit_suggestion` guardrails: protected-branch + cross-tier refusals,
+   valid `platform-agent/…` push. Live PR open = this Phase 1 PR (the audit record). ✅
+8. **Cloud GSA viewer-only (T9, A2)** — role-selection emits viewer-only for every input (local); on
+   scratch `adamparco-kage` the live GSA (provisioned pre-P1-T9 with admin) was converged via the real
+   `execute_platform_agent` reconcile (user-approved) → `get-iam-policy` viewer-only, no admin roles. ✅
+9. **Workload Identity binding** — GSA ↔ `[kubeagents-system/kubeagents-platform-agent]` intact. ✅
+
 ---
 
 ## Notes / open items
 
 - **Scratch GKE incurs cost** — only T9's cloud-GSA assertion and the WI check use it; Kind covers the
   rest. If scratch GKE is unavailable in a given run, land the code + Kind verification and flag T9's
-  cloud assertion as **pending scratch-GKE** in the PR (do not fake it green).
+  cloud assertion as **pending scratch-GKE** in the PR (do not fake it green). _(2026-07-24: scratch
+  `adamparco-kage` was available; T9 cloud + WI verified live — see Verification results above.)_
 - **Migration window (roadmap risk row):** sequence T6/T7 before T4/T5 so the agent never loses its read
   identity mid-change.
 - The customer GitOps target repo (`integration.github.gitRepo`) is external in prod; here it is the
