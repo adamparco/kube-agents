@@ -53,7 +53,7 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - platformagents
+      - agents
     verbs:
       - create
       - delete
@@ -65,13 +65,13 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - platformagents/finalizers
+      - agents/finalizers
     verbs:
       - update
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - platformagents/status
+      - agents/status
     verbs:
       - get
       - patch

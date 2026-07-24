@@ -1,0 +1,13 @@
+# kage-router: the read-only ChatOps front door (05 C15, 06 §2b). Grouped as its own kustomize base so
+# it can be deployed with the operator (included from config/default) or on its own. Its RBAC is
+# viewer-only (get/list/watch agents) — see role.yaml.
+resources:
+  - service_account.yaml
+  - role.yaml
+  - role_binding.yaml
+  - deployment.yaml
+
+images:
+  - name: kage-router
+    newName: ghcr.io/gke-labs/kube-agents/kage-router
+    newTag: v0.1.0

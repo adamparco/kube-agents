@@ -1,0 +1,55 @@
+# Bootstrap wave 20 — the agent-read-only ValidatingAdmissionPolicy (VAP), applied per cluster.
+#
+# MATERIALIZED COPY of ../../../../policy/vap-agent-readonly.yaml (the canonical exemplar + VAP test
+# fixture). It is copied here — not referenced up-tree — because the pipeline applies bootstrap waves
+# with `kubectl apply -f`/`-k` scoped to the wave dir, and kustomize disallows out-of-tree paths. Keep
+# this in sync with the canonical file whenever the read-only shape changes (same convention as the
+# materialized identity in ../../agents/identity/).
+#
+# WHY THIS IS A BOOTSTRAP WAVE: the VAP must be ENFORCING before the `agents/` apply lands any agent
+# identity, so a Role/ClusterRole granting an agent SA a write verb or a wrong-scope binding is rejected
+# at apply time even if it was merged past review (03 §4, §11). Requires K8s >= 1.30 (VAP GA).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-agent-readonly
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["roles", "clusterroles"]
+  matchConditions:
+    # Only govern agent RBAC — objects carrying the tier label the overlay stamps.
+    - name: is-agent-rbac
+      expression: "has(object.metadata.labels) && 'kube-agents/tier' in object.metadata.labels"
+  validations:
+    # 1) Read-only: every rule may grant ONLY read verbs (get/list/watch). This is an ALLOW-LIST, so
+    #    write verbs (create/update/patch/delete/deletecollection/*) AND privilege-escalation verbs
+    #    (impersonate/bind/escalate, CSR approve/sign, use, …) and any future non-read verb are all
+    #    denied. Agent render overlays only ever emit get/list/watch, so this rejects nothing legit.
+    #    (`impersonate` is standalone-exploitable — an agent SA with it could act as system:masters.)
+    - expression: >-
+        !has(object.rules) ||
+        object.rules.all(r,
+          !has(r.verbs) ||
+          r.verbs.all(v, v in ['get','list','watch']))
+      message: "agent RBAC may grant only read verbs (get/list/watch) — no write or privilege-escalation verbs (impersonate/bind/escalate/…); agents are read-only (03 §4)"
+      reason: Forbidden
+    # 2) Wrong-scope: the namespace tier (developer-team) must not get a cluster-scoped ClusterRole.
+    - expression: >-
+        !(object.kind == 'ClusterRole' &&
+          object.metadata.labels['kube-agents/tier'] == 'developer-team')
+      message: "developer-team is a namespace-scoped tier and may not be granted a ClusterRole (wrong-scope, 03 §4)"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-agent-readonly
+spec:
+  policyName: kube-agents-agent-readonly
+  validationActions: ["Deny"]
+  # No paramRef / matchResources selector: applies to every namespace and the cluster scope.

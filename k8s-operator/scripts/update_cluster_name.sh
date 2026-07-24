@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🔄 Utility: Update GKE Cluster Name in PlatformAgent CRD
+# 🔄 Utility: Update GKE Cluster Name in Agent CRD
 # ==============================================================================
-# Renders and patches the PlatformAgent resource with a new target GKE cluster name.
+# Renders and patches the Agent resource with a new target GKE cluster name.
 # ==============================================================================
 
 set -e
@@ -41,19 +41,19 @@ if [ -z "$CLUSTER_NAME" ]; then
 fi
 
 # 2. Check if platform-agent resource exists in the cluster
-print_info "Verifying PlatformAgent resource '${AGENT_NAME}' in namespace '${NAMESPACE}'..."
-if ! kubectl get platformagent "${AGENT_NAME}" -n "${NAMESPACE}" >/dev/null 2>&1; then
-  print_error "PlatformAgent resource '${AGENT_NAME}' not found in namespace '${NAMESPACE}'."
+print_info "Verifying Agent resource '${AGENT_NAME}' in namespace '${NAMESPACE}'..."
+if ! kubectl get agent "${AGENT_NAME}" -n "${NAMESPACE}" >/dev/null 2>&1; then
+  print_error "Agent resource '${AGENT_NAME}' not found in namespace '${NAMESPACE}'."
   print_info "Make sure you are connected to the correct GKE cluster context."
   exit 1
 fi
 
 # 3. Patch the resource
 print_info "Updating cluster name to '${CLUSTER_NAME}'..."
-if kubectl patch platformagent "${AGENT_NAME}" -n "${NAMESPACE}" --type='merge' -p "{\"spec\":{\"harness\":{\"clusterName\":\"${CLUSTER_NAME}\"}}}" >/dev/null 2>&1; then
-  print_success "Successfully updated GKE cluster name to '${CLUSTER_NAME}' in PlatformAgent spec!"
+if kubectl patch agent "${AGENT_NAME}" -n "${NAMESPACE}" --type='merge' -p "{\"spec\":{\"harness\":{\"clusterName\":\"${CLUSTER_NAME}\"}}}" >/dev/null 2>&1; then
+  print_success "Successfully updated GKE cluster name to '${CLUSTER_NAME}' in Agent spec!"
   print_info "The operator will automatically reconcile the deployment and restart the sidecar container shortly."
 else
-  print_error "Failed to patch PlatformAgent resource."
+  print_error "Failed to patch Agent resource."
   exit 1
 fi

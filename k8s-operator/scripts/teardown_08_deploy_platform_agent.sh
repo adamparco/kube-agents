@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 6: Teardown PlatformAgent Custom Resource
+# 🧹 Step 6: Teardown Agent Custom Resource
 # ==============================================================================
-# Idempotent script to clean up the applied PlatformAgent Custom Resource (CR)
+# Idempotent script to clean up the applied Agent Custom Resource (CR)
 # and delete the local generated manifest file.
 # ==============================================================================
 
@@ -23,7 +23,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 ensure_teardown_state
 
 # ─── Confirmation Prompt ──────────────────────────────────────────────────────
-confirm_action "This will permanently delete the PlatformAgent Custom Resource and its generated manifest file." \
+confirm_action "This will permanently delete the Agent Custom Resource and its generated manifest file." \
   "GCP Project:$PROJECT_ID" \
   "GKE Cluster:$CLUSTER_NAME" \
   "Namespace:$NAMESPACE"
@@ -39,28 +39,28 @@ else
   exit 0
 fi
 
-# ─── Step 2: Delete PlatformAgent Custom Resource ─────────────────────────────
-CRD_EXISTS=$(kubectl get crd platformagents.kubeagents.x-k8s.io --ignore-not-found 2>/dev/null || echo "")
+# ─── Step 2: Delete Agent Custom Resource ─────────────────────────────
+CRD_EXISTS=$(kubectl get crd agents.kubeagents.x-k8s.io --ignore-not-found 2>/dev/null || echo "")
 if [ -n "$CRD_EXISTS" ]; then
-  CR_EXISTS=$(kubectl get platformagents.kubeagents.x-k8s.io platform-agent -n "$NAMESPACE" --ignore-not-found 2>/dev/null || echo "")
+  CR_EXISTS=$(kubectl get agents.kubeagents.x-k8s.io platform-agent -n "$NAMESPACE" --ignore-not-found 2>/dev/null || echo "")
   if [ -n "$CR_EXISTS" ]; then
-    echo -e "  ${C_CYAN}ℹ Deleting PlatformAgent 'platform-agent'...${C_RESET}"
+    echo -e "  ${C_CYAN}ℹ Deleting Agent 'platform-agent'...${C_RESET}"
     if [ "${DRY_RUN:-0}" -eq 1 ]; then
-      echo -e "  ${C_GREEN}[DRY-RUN] Would delete PlatformAgent 'platform-agent' in namespace '${NAMESPACE}'.${C_RESET}"
+      echo -e "  ${C_GREEN}[DRY-RUN] Would delete Agent 'platform-agent' in namespace '${NAMESPACE}'.${C_RESET}"
     else
-      kubectl delete platformagents.kubeagents.x-k8s.io platform-agent -n "$NAMESPACE" --timeout=60s || {
-        echo -e "  ${C_YELLOW}⚠ Timeout waiting for PlatformAgent deletion. Force removing finalizers if present...${C_RESET}"
+      kubectl delete agents.kubeagents.x-k8s.io platform-agent -n "$NAMESPACE" --timeout=60s || {
+        echo -e "  ${C_YELLOW}⚠ Timeout waiting for Agent deletion. Force removing finalizers if present...${C_RESET}"
         kubectl delete validatingwebhookconfiguration kubeagents-validating-webhook-configuration --ignore-not-found 2>/dev/null || true
-        kubectl patch platformagents.kubeagents.x-k8s.io platform-agent -n "$NAMESPACE" -p '{"metadata":{"finalizers":null}}' --type=merge || true
-        kubectl delete platformagents.kubeagents.x-k8s.io platform-agent -n "$NAMESPACE" --ignore-not-found --timeout=30s || true
+        kubectl patch agents.kubeagents.x-k8s.io platform-agent -n "$NAMESPACE" -p '{"metadata":{"finalizers":null}}' --type=merge || true
+        kubectl delete agents.kubeagents.x-k8s.io platform-agent -n "$NAMESPACE" --ignore-not-found --timeout=30s || true
       }
-      echo -e "  ${C_GREEN}✓ PlatformAgent 'platform-agent' successfully deleted.${C_RESET}"
+      echo -e "  ${C_GREEN}✓ Agent 'platform-agent' successfully deleted.${C_RESET}"
     fi
   else
-    echo -e "  ${C_GREEN}✓ PlatformAgent 'platform-agent' does not exist.${C_RESET}"
+    echo -e "  ${C_GREEN}✓ Agent 'platform-agent' does not exist.${C_RESET}"
   fi
 else
-  echo -e "  ${C_GREEN}✓ CRD 'platformagents.kubeagents.x-k8s.io' is not registered. Skipping.${C_RESET}"
+  echo -e "  ${C_GREEN}✓ CRD 'agents.kubeagents.x-k8s.io' is not registered. Skipping.${C_RESET}"
 fi
 
 # ─── Step 3: Clean up Local Manifest File ─────────────────────────────────────
@@ -74,4 +74,4 @@ if [ -f "$local_yaml" ]; then
   fi
 fi
 
-echo -e "\n${C_GREEN}${C_BOLD}✅ PlatformAgent Custom Resource successfully cleaned up!${C_RESET}"
+echo -e "\n${C_GREEN}${C_BOLD}✅ Agent Custom Resource successfully cleaned up!${C_RESET}"

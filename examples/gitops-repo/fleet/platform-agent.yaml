@@ -9,7 +9,7 @@
 # Applied by CI/CD on merge; human-reviewed (see ../CODEOWNERS). The agent is READ-ONLY: it proposes
 # infrastructure changes as GitOps PRs (submit-suggestion), never by mutating the cluster/cloud.
 apiVersion: kubeagents.x-k8s.io/v1alpha1
-kind: PlatformAgent
+kind: Agent
 metadata:
   name: platform-agent
   namespace: kubeagents-system

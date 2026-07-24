@@ -1,0 +1,68 @@
+# clusters/@@CLUSTER@@/agents/agent.yaml — the cluster-scoped cluster-admin `Agent` CR (06 §1.1, §2).
+#
+# Rendered by the propose-cluster-admin skill (F4 cascade). This is the Cluster Admin Agent's desired
+# state for @@CLUSTER@@. ONE cluster-admin agent per cluster (cardinality enforced by the admission
+# webhook on the (tier,scope) key). It is a CHILD of the project's Platform Agent (parentRef) — the
+# Platform Agent proposes this CR via submit-suggestion; a human reviews + merges; CI/CD applies it in
+# the bootstrap order.
+#
+# The kube-agents controller REFERENCES the pre-created read-only identity by name
+# (spec.security.serviceAccountName -> cluster-admin-agent); it never mints RBAC or the KSA (08 §4).
+# That identity — ServiceAccount + read-only ClusterRole/Binding + Workload Identity — lives in
+# ./identity/ and MUST be applied BEFORE this CR (identity-before-pod; the bootstrap waves enforce order).
+#
+# The agent is READ-ONLY: it audits/administers @@CLUSTER@@ and proposes changes (e.g. namespaces,
+# tenancy, a developer-team agent one layer down) as GitOps PRs — never by mutating the cluster.
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: Agent
+metadata:
+  name: cluster-admin-@@CLUSTER@@
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: cluster-admin
+spec:
+  # Persona / containment level. Immutable after creation (06 §1.1).
+  tier: cluster-admin
+  # Cluster-scoped: the cluster-admin tier's home is one cluster within the project. project + cluster
+  # together form the (tier,scope) uniqueness/routing key (agentindex.ScopeIdentity).
+  scope:
+    projectId: "@@PROJECT_ID@@"
+    clusterName: "@@CLUSTER@@"
+  # Parent is the project's Platform Agent (the tier one level up that proposed this agent). Required
+  # for non-platform tiers by the admission webhook (validateScopeAndParent).
+  parentRef:
+    name: @@PARENT@@
+  # Infrastructure-as-code format the agent authors suggestions in (KCC by default; terraform opt-in).
+  iac:
+    format: kcc
+  # Agent runtime image. Omitting spec.deployment.image lets the controller resolve the per-tier baked
+  # default (cluster-admin-agent) via defaultImageForTier; we pin explicitly here for reproducibility.
+  # Repin to a content-addressable digest (…/cluster-admin-agent@sha256:…) in production.
+  deployment:
+    image: "ghcr.io/gke-labs/kube-agents/cluster-admin-agent"
+    tag: "v0.1.0"
+    imagePullPolicy: "IfNotPresent"
+  harness:
+    clusterName: "@@CLUSTER@@"
+    location: "@@LOCATION@@"
+    hermes:
+      dashboardEnabled: true
+      apiServerSecretRef:
+        name: cluster-admin-agent-secrets
+        key: API_SERVER_KEY
+  # The controller references this pre-created SA; it does not create or annotate it (08 §4).
+  # cluster-admin-agent is defined in ./identity/ (read-only ClusterRole/Binding + WI-bound KSA).
+  security:
+    serviceAccountName: cluster-admin-agent
+  integration:
+    googleChat:
+      enabled: true
+      projectId: "@@PROJECT_ID@@"
+      # Per-agent topic the router re-publishes to (PubSubDispatcher target) and this pod's proxy drains.
+      topicName: "kubeagents-cluster-admin-@@CLUSTER@@-events"
+      subscriptionName: "kubeagents-cluster-admin-@@CLUSTER@@-events-sub"
+      # CLOSED allowlist (A4 / acceptance d): ONLY these humans can reach this agent, enforced by the
+      # router BEFORE dispatch. An empty or absent list means ALL users — never ship that (the webhook
+      # + CEL also reject an enabled integration with an empty allowlist). Replace with real Chat IDs.
+      allowedUsers:
+        - "@@ADMIN_CHAT_ID@@"

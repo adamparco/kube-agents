@@ -1,6 +1,8 @@
 # Image URL to use all building/pushing image targets.
 # Pinned to an immutable version tag (not :latest); repin to a digest in production.
 IMG ?= ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0
+# Image URL for the kage-router (the read-only ChatOps front door). Pinned like IMG.
+ROUTER_IMG ?= ghcr.io/gke-labs/kube-agents/kage-router:v0.1.0
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -68,6 +70,18 @@ docker-build: ## Build docker image with the manager.
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
+
+.PHONY: build-router
+build-router: manifests generate fmt vet ## Build kage-router binary.
+	go build -o bin/router cmd/router/main.go
+
+.PHONY: docker-build-router
+docker-build-router: ## Build docker image with the kage-router.
+	$(CONTAINER_TOOL) build -f Dockerfile.router -t ${ROUTER_IMG} .
+
+.PHONY: docker-push-router
+docker-push-router: ## Push docker image with the kage-router.
+	$(CONTAINER_TOOL) push ${ROUTER_IMG}
 
 ##@ Deployment
 
@@ -190,7 +204,7 @@ endef
 ##@ Setup & Cleanup
 
 .PHONY: provision gcp-provision
-provision gcp-provision: ## Bootstrap GCP, GKE resources, and deploy PlatformAgent.
+provision gcp-provision: ## Bootstrap GCP, GKE resources, and deploy Agent.
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/provision.sh $(ARGS)
 
@@ -235,7 +249,7 @@ gcp-provision-07-secrets: ## Step 7: Configure secrets directly in GKE.
 	@./scripts/provision_07_gcp_k8s_secrets.sh $(ARGS)
 
 .PHONY: gcp-provision-08-deploy
-gcp-provision-08-deploy: ## Step 8: Deploy the PlatformAgent Custom Resource.
+gcp-provision-08-deploy: ## Step 8: Deploy the Agent Custom Resource.
 	@chmod +x scripts/*.sh
 	@./scripts/provision_08_deploy_platform_agent.sh $(ARGS)
 
@@ -276,7 +290,7 @@ gcp-teardown-09-litellm: ## Teardown Step 9: Undeploy LiteLLM Gateway.
 	@./scripts/teardown_09_deploy_litellm.sh $(ARGS)
 
 .PHONY: gcp-teardown-08-deploy
-gcp-teardown-08-deploy: ## Teardown Step 8: Delete the PlatformAgent Custom Resource.
+gcp-teardown-08-deploy: ## Teardown Step 8: Delete the Agent Custom Resource.
 	@chmod +x scripts/*.sh
 	@./scripts/teardown_08_deploy_platform_agent.sh $(ARGS)
 

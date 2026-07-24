@@ -1,5 +1,5 @@
 apiVersion: kubeagents.x-k8s.io/v1alpha1
-kind: PlatformAgent
+kind: Agent
 metadata:
   name: platform-agent
   namespace: "${NAMESPACE}"

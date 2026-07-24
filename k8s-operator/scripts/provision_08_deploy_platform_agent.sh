@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 6: Deploy PlatformAgent Custom Resource Manifest
+# 🤖 Step 6: Deploy Agent Custom Resource Manifest
 # ==============================================================================
 # Idempotent script that connects to GKE, renders the platform-agent.yaml 
 # template, and deploys it to the cluster.
@@ -61,7 +61,7 @@ execute_kubeconfig() {
 }
 
 
-# Step 2: Apply PlatformAgent Custom Resource
+# Step 2: Apply Agent Custom Resource
 verify_custom_resource() {
   # Always return false to ensure configuration updates are applied to the Custom Resource
   return 1
@@ -140,7 +140,7 @@ execute_custom_resource() {
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
-run_step "2. Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
+run_step "2. Apply Agent Custom Resource" verify_custom_resource execute_custom_resource 0
 
 # ─── Conclusion Checklist ─────────────────────────────────────────────────────
-echo -e "\n${C_GREEN}${C_BOLD}✓ PlatformAgent Custom Resource applied successfully to GKE!${C_RESET}"
+echo -e "\n${C_GREEN}${C_BOLD}✓ Agent Custom Resource applied successfully to GKE!${C_RESET}"

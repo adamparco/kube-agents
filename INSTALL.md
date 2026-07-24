@@ -299,6 +299,38 @@ For developer testing on a workstation against a local cluster (e.g., Kind) or r
    make dev-rebuild-agent ARGS="platform"
    ```
 
+### Phase 2 — Kind inner loop (Cluster Admin Agent + cascade)
+
+Phase 2 adds the tier-discriminated `Agent` CRD (renamed from `PlatformAgent`), the read-only
+**Cluster Admin Agent** persona, the standalone **kage-router** ChatOps front door, the **F4
+provisioning cascade** (the Platform Agent proposes a subordinate cluster-admin bundle as a GitOps PR),
+and the **spoke bootstrap** ordered apply waves. Verify the whole inner loop on a local Kind cluster:
+
+1. **Create a Kind cluster** (K8s ≥ 1.30 — the VAP requires `ValidatingAdmissionPolicy` GA):
+   ```bash
+   export PATH="$HOME/go/bin:$PATH"          # kind is installed under ~/go/bin
+   kind create cluster --name kube-agents-dev --image kindest/node:v1.31.2
+   ```
+2. **Deploy the stack** (cert-manager → controller/CRD/webhooks/router → VAP):
+   ```bash
+   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.7/cert-manager.yaml
+   kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=180s
+   cd k8s-operator && make deploy IMG=ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0 && cd ..
+   kubectl apply -f examples/gitops-repo/policy/vap-agent-readonly.yaml
+   ```
+3. **Run the consolidated verification gate** (destructive; guarded to Kind contexts only):
+   ```bash
+   local-dev/kind/verify-phase2.sh kind-kube-agents-dev
+   ```
+   It exercises the load-bearing suites: live webhook serving (duplicate `(tier,scope)` + tier
+   immutability rejected), VAP attenuation (write/impersonate/wrong-scope denied), read-only per-tier
+   SAR, the cascade render → VAP dry-run, bootstrap ordering (pod binds the pre-created SA), and the
+   no-break-glass check. The deterministic router/index suites run under `cd k8s-operator && go test ./...`.
+4. **Egress enforcement (V-K11)** needs a NetworkPolicy-enforcing CNI — kindnet does **not** enforce it.
+   Create a throwaway cluster with `disableDefaultCNI: true` and install Calico to verify the per-tier
+   default-deny egress (including the metadata-server `169.254.169.254` block). See
+   [docs/build/LEDGER.md](docs/build/LEDGER.md) §Verification log for the exact steps.
+
 ## Teardown & Cleanup
 
 To safely remove provisioned resources:

@@ -62,7 +62,7 @@ fi
 # ─── Step 3: Uninstall Custom Resource Definitions (CRDs) ─────────────────────
 CRDS_INSTALLED=""
 if [ "${DRY_RUN:-0}" -ne 1 ]; then
-  CRDS_INSTALLED=$(kubectl get crds -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | grep -o 'platformagents.kubeagents.x-k8s.io' || echo "")
+  CRDS_INSTALLED=$(kubectl get crds -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | grep -o 'agents.kubeagents.x-k8s.io' || echo "")
 fi
 
 if [ "${DRY_RUN:-0}" -eq 1 ] || [ -n "$CRDS_INSTALLED" ]; then

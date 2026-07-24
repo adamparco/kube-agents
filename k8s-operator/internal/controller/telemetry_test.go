@@ -55,7 +55,7 @@ func TestOTelTelemetryEnvVars(t *testing.T) {
 // TestBuildDeploymentHasOTelEnv verifies the agent container is wired to the managed
 // collector and still carries its service name, without duplicate env entries.
 func TestBuildDeploymentHasOTelEnv(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
 	}
 
@@ -83,15 +83,13 @@ func TestBuildDeploymentHasOTelEnv(t *testing.T) {
 }
 
 func TestBuildDeploymentAllowsOTelEnvOverrides(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			AgentSpec: agentv1alpha1.AgentSpec{
-				Deployment: &agentv1alpha1.DeploymentSpec{
-					Env: []corev1.EnvVar{
-						{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: "http://custom-collector:4318"},
-						{Name: "OTEL_RESOURCE_ATTRIBUTES", Value: "deployment.environment=testing"},
-					},
+		Spec: agentv1alpha1.AgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{
+					{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: "http://custom-collector:4318"},
+					{Name: "OTEL_RESOURCE_ATTRIBUTES", Value: "deployment.environment=testing"},
 				},
 			},
 		},

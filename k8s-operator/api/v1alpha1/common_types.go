@@ -246,7 +246,7 @@ type IACSpec struct {
 // AgentSpec defines the common infrastructure configuration shared across all agent types.
 type AgentSpec struct {
 	// Tier is the agent's persona / containment level (06 §1.1). Immutable after creation.
-	// Defaults to "platform" — the only tier in Phase 1, and the value today's PlatformAgent adopts.
+	// Defaults to "platform" — the value the platform-tier Agent adopts.
 	// +kubebuilder:default=platform
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="tier is immutable"
 	// +optional
@@ -271,6 +271,14 @@ type AgentSpec struct {
 	// Security configures RBAC, Pod Security, and Workload Identity.
 	// +optional
 	Security *SecuritySpec `json:"security,omitempty"`
+
+	// Harness configures the core execution environment and framework-level settings.
+	// +required
+	Harness *HarnessSpec `json:"harness,omitempty"`
+
+	// Integration configures external connections (GitHub, Google Chat, Slack).
+	// +optional
+	Integration *AgentIntegrationSpec `json:"integration,omitempty"`
 }
 
 type DeploymentStatus struct {

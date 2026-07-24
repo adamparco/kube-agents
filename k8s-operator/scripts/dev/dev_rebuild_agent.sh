@@ -58,8 +58,8 @@ case "$SELECTED_AGENT" in
   platform)
     AGENT_TARGET="platform"
     IMAGE_NAME="platform-agent"
-    CR_KIND="PlatformAgent"
-    CR_RESOURCE="platformagents.kubeagents.x-k8s.io"
+    CR_KIND="Agent"
+    CR_RESOURCE="agents.kubeagents.x-k8s.io"
     ;;
 esac
 

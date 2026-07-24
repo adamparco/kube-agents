@@ -1,0 +1,65 @@
+# clusters/cluster-a/agents/identity/cluster-admin-identity.yaml
+#
+# The APPLIED per-cluster read-only identity for cluster-a's cluster-admin agent — SA + read-only
+# ClusterRole + ClusterRoleBinding + Workload-Identity annotation. The kube-agents controller
+# REFERENCES the ServiceAccount by name (spec.security.serviceAccountName) and mints no RBAC (08 §4).
+#
+# This is a flat manifest (not a kustomize overlay) because the reference actuation pipeline applies
+# clusters/<c>/agents/ with `kubectl apply --server-side --recursive -f` (see
+# ../../../../.github/workflows/apply.yml) — a kustomization.yaml here would break that recursive
+# apply. It is the materialized instance of the tier exemplar at
+# ../../../../policy/rbac-overlay/cluster-admin.yaml (the canonical shape + VAP test fixture); for the
+# single-cluster collapse the two are identical. Keep them in sync when the tier's read-only shape
+# changes. `CLUSTER_NAME`/`PROJECT_ID` are substituted per cluster by CI/CD.
+#
+# APPLY ORDER: this identity is applied BEFORE ../agent.yaml (identity-before-pod invariant) and AFTER
+# the VAP (so a write-verb/wrong-scope grant is rejected even during provisioning). The bootstrap
+# apply waves (clusters/<c>/bootstrap/, P2-T21) enforce the order; within the agents apply_path the
+# read-only identity below is VAP-clean, so recursive apply admits it regardless of file order.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cluster-admin-agent
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: cluster-admin
+    app.kubernetes.io/managed-by: gitops
+  annotations:
+    # Workload Identity: binds this KSA to the VIEWER-ONLY cloud GSA (06 §2; mirrors the platform
+    # identity pattern in ./platform.yaml). The GSA holds only viewer cloud IAM — the cloud-write
+    # path is a reviewed GitOps PR, never the agent process. Substituted per project by CI/CD;
+    # PROJECT_ID = your GCP project ID.
+    #
+    # NOTE (per-cluster scoping — flagged for the human before production, see phase-2.md §Notes):
+    # a single project-level GSA reads every cluster in the project. For a project running MORE THAN
+    # ONE cluster-admin agent, this GSA must become per-cluster (distinct GSA or an IAM Condition on
+    # the cluster resource) so "reads only its own cluster" (acceptance b) holds in the cloud too.
+    # Phase 2 is proven on ONE cluster (Kind + one scratch GKE), where a single viewer GSA suffices.
+    iam.gke.io/gcp-service-account: "kubeagents-cluster-admin-gsa@PROJECT_ID.iam.gserviceaccount.com"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-admin-agent-explorer
+  labels:
+    kube-agents/tier: cluster-admin
+rules:
+  - apiGroups:
+      ["", "apps", "batch", "networking.k8s.io", "rbac.authorization.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-admin-agent-explorer
+  labels:
+    kube-agents/tier: cluster-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin-agent-explorer
+subjects:
+  - kind: ServiceAccount
+    name: cluster-admin-agent
+    namespace: kubeagents-system

@@ -40,12 +40,23 @@ func TestAgentsGolden(t *testing.T) {
 		newReconciler func(client.Client, *runtime.Scheme) reconcile.Reconciler
 	}{
 		{
-			name:         "PlatformAgent",
-			inputPath:    filepath.Join("..", "..", "examples", "platformagent.yaml"),
-			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent.yaml"),
-			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			name:         "Agent",
+			inputPath:    filepath.Join("..", "..", "examples", "agent.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "agent.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.Agent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+				return &controller.AgentReconciler{Client: c, Scheme: s}
+			},
+		},
+		{
+			// Cluster-admin tier render (Phase 2 P2-T11). Locks tier-default image resolution,
+			// AGENT_TIER injection, the read-only SA binding, and the CLOSED chat allowlist.
+			name:         "ClusterAdminAgent",
+			inputPath:    filepath.Join("testdata", "cluster-admin", "input.yaml"),
+			expectedPath: filepath.Join("testdata", "cluster-admin", "expected", "agent.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.Agent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.AgentReconciler{Client: c, Scheme: s}
 			},
 		},
 	}

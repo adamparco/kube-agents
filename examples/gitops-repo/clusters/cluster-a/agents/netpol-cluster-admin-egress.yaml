@@ -1,0 +1,96 @@
+# clusters/cluster-a/agents/netpol-cluster-admin-egress.yaml
+#
+# The per-tier DEFAULT-DENY egress NetworkPolicy for cluster-a's cluster-admin agent pod (03 §10). It
+# selects every cluster-admin pod by the tier label the controller stamps on the pod template
+# (`kube-agents/tier: cluster-admin`), so it needs no agent-name knowledge and covers future pods of
+# the tier. Applied in the `agents/` wave alongside the identity + CR (recursive `-f`), in the pod's
+# namespace (kubeagents-system).
+#
+# SHAPE = PURE ALLOWLIST. policyTypes:[Egress] with a podSelector makes egress default-deny for the
+# selected pods; only the CIDRs/ports listed below are reachable. Consequently the cloud metadata
+# server (169.254.169.254) and arbitrary hosts are UNREACHABLE with no explicit block rule — they are
+# simply absent from the allowlist (the 03 §11 egress negative). There is deliberately NO 0.0.0.0/0
+# rule: a broad allow-with-exceptions would make "arbitrary hosts are not reachable" false.
+#
+# CROSS-CLUSTER CONTRACT (05 §5): a spoke consumes exactly two hub services — Inference (LiteLLM,
+# per-tier virtual key) and Minty (the GitHub/Workload-Identity token broker) — over VPC-INTERNAL
+# PRIVATE endpoints, plus cloud APIs, GitHub, and the MCP grounding endpoints. No cross-cluster
+# Kubernetes credentials ever. Fill the REPLACE_WITH_* CIDRs from your hub/VPC (the propose-cluster-admin
+# skill substitutes HUB_INFERENCE_CIDR / HUB_MINTY_CIDR per environment).
+#
+# LIMITATION (hostname precision): NetworkPolicy is L3/L4 — it cannot express hostnames, so GitHub/MCP
+# are allowlisted by their published IP CIDRs (which drift). The hostname-precise L7 egress proxy is a
+# Phase 5 hardening item (07); until then, keep these CIDRs current.
+#
+# GKE Workload Identity note (flagged for production): on GKE, WI tokens are fetched via the GKE
+# metadata server (169.254.169.254), which this policy does NOT allow — WI's metadata concealment
+# already blocks the sensitive node-SA paths, and the load-bearing negative is that the RAW cloud
+# metadata / node credentials are unreachable. If your agent acquires GCP tokens through the metadata
+# server rather than Minty, add a NARROW allow to 169.254.169.254/32:988 (WI only) or adopt the Phase 5
+# L7 proxy. On Kind (the inner-loop verification) there is no metadata server, so the negative holds as-is.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cluster-admin-egress
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: cluster-admin
+    app.kubernetes.io/managed-by: gitops
+spec:
+  podSelector:
+    matchLabels:
+      kube-agents/tier: cluster-admin
+  policyTypes:
+    - Egress
+  egress:
+    # 1) DNS — cluster resolution. Without this, every name-based egress fails before it starts.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # 2) Hub Inference (LiteLLM) — the ONLY inference path (per-tier virtual key). VPC-internal private
+    #    endpoint. The agent never calls a model provider directly.
+    - to:
+        - ipBlock:
+            cidr: REPLACE_WITH_HUB_INFERENCE_CIDR # e.g. 10.10.0.0/28 — the hub LiteLLM private endpoint
+      ports:
+        - protocol: TCP
+          port: 443
+    # 3) Hub Minty — the Workload-Identity / GitHub token broker. VPC-internal private endpoint. The
+    #    agent gets short-lived, scoped tokens here; it holds no long-lived write credentials.
+    - to:
+        - ipBlock:
+            cidr: REPLACE_WITH_HUB_MINTY_CIDR # e.g. 10.10.0.16/28 — the hub Minty private endpoint
+      ports:
+        - protocol: TCP
+          port: 443
+    # 4) Google cloud APIs via Private Google Access (restricted.googleapis.com). Stable, well-known
+    #    range — reads only (the agent's cloud GSA is viewer-only; the write path is a GitOps PR).
+    - to:
+        - ipBlock:
+            cidr: 199.36.153.8/30
+      ports:
+        - protocol: TCP
+          port: 443
+    # 5) GitHub — the agent pushes suggestion branches / opens PRs (submit-suggestion) with a Minty-
+    #    minted token. Allowlisted by GitHub's published IP ranges (https://api.github.com/meta →
+    #    .git + .api + .web). Keep current until the Phase 5 L7 proxy replaces CIDR allowlisting.
+    - to:
+        - ipBlock:
+            cidr: REPLACE_WITH_GITHUB_CIDRS # e.g. 140.82.112.0/20 (see api.github.com/meta)
+      ports:
+        - protocol: TCP
+          port: 443
+    # 6) MCP grounding endpoints the agent reads live docs from (developer_knowledge, gke — 03 §10).
+    #    Omitting these silently breaks grounding, so they are first-class allowlist entries.
+    - to:
+        - ipBlock:
+            cidr: REPLACE_WITH_MCP_GROUNDING_CIDRS # e.g. the hub MCP endpoint CIDR
+      ports:
+        - protocol: TCP
+          port: 443

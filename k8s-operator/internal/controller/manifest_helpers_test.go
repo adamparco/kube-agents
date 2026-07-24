@@ -22,6 +22,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -97,6 +98,61 @@ func TestResolveAgentImage(t *testing.T) {
 			result := resolveAgentImage(tt.deployment, tt.defaultImage)
 			if result != tt.expected {
 				t.Errorf("resolveAgentImage() = %q, expected %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDefaultImageForTier(t *testing.T) {
+	tests := []struct {
+		name string
+		tier agentv1alpha1.AgentTier
+		want string
+	}{
+		{"platform", agentv1alpha1.TierPlatform, defaultPlatformAgentImage},
+		{"cluster-admin", agentv1alpha1.TierClusterAdmin, defaultClusterAdminAgentImage},
+		{"empty defaults to platform", agentv1alpha1.AgentTier(""), defaultPlatformAgentImage},
+		{"developer-team falls back to platform (Phase 3)", agentv1alpha1.TierDeveloperTeam, defaultPlatformAgentImage},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := defaultImageForTier(tt.tier); got != tt.want {
+				t.Errorf("defaultImageForTier(%q) = %q, want %q", tt.tier, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildDeploymentTierAwareImage asserts the operator renders the per-tier baked image when a CR
+// omits spec.deployment.image, and that an explicit image still overrides regardless of tier (P2-T8).
+func TestBuildDeploymentTierAwareImage(t *testing.T) {
+	newAgent := func(tier agentv1alpha1.AgentTier, image string) *agentv1alpha1.Agent {
+		a := &agentv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "ns"},
+			Spec:       agentv1alpha1.AgentSpec{Tier: tier},
+		}
+		if image != "" {
+			a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Image: image}
+		}
+		return a
+	}
+
+	tests := []struct {
+		name  string
+		agent *agentv1alpha1.Agent
+		want  string
+	}{
+		{"cluster-admin default image", newAgent(agentv1alpha1.TierClusterAdmin, ""), defaultClusterAdminAgentImage},
+		{"platform default image", newAgent(agentv1alpha1.TierPlatform, ""), defaultPlatformAgentImage},
+		{"empty tier default image", newAgent(agentv1alpha1.AgentTier(""), ""), defaultPlatformAgentImage},
+		{"explicit image overrides on cluster-admin", newAgent(agentv1alpha1.TierClusterAdmin, "gcr.io/x/custom:v9"), "gcr.io/x/custom:v9"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dep := buildDeployment(tt.agent, "h1", "h2", "h3")
+			got := dep.Spec.Template.Spec.Containers[0].Image
+			if got != tt.want {
+				t.Errorf("rendered container image = %q, want %q", got, tt.want)
 			}
 		})
 	}

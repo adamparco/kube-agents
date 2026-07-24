@@ -1,0 +1,30 @@
+---
+# The kage-router is a READ-ONLY participant (05 C15): it keeps an in-memory routing table in sync with
+# the Agent CRs and never mutates any cluster object. Its ClusterRole is therefore the minimum an
+# informer needs — get/list/watch on agents (and agents/status for completeness) — and NOTHING that can
+# write: no create/update/patch/delete, no other resources, no leases (the router runs single-replica
+# without leader election). This is the load-bearing least-privilege grant that makes the ChatOps front
+# door itself read-only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/component: kage-router
+    app.kubernetes.io/managed-by: kustomize
+  name: router-role
+rules:
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - agents
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - agents/status
+    verbs:
+      - get

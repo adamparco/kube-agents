@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: router
+  namespace: system
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/component: kage-router
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  # Single replica: the inbound puller relies on Pub/Sub at-least-once delivery, not leader election, so
+  # the router needs no lease RBAC. Scaling out would require leader election to keep one active puller.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kube-agents-operator
+      app.kubernetes.io/component: kage-router
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: router
+      labels:
+        app.kubernetes.io/name: kube-agents-operator
+        app.kubernetes.io/component: kage-router
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: router
+          # Pinned to an immutable version tag (not :latest). In production, repin to a
+          # content-addressable digest (kage-router@sha256:...) once the image is published.
+          image: kage-router:v0.1.0
+          command:
+            - /router
+          args:
+            - --health-probe-bind-address=:8081
+          env:
+            # REPLACE both values for the target environment. The router publishes into KAGE_PROJECT_ID
+            # and pulls inbound chat events from KAGE_INBOUND_SUBSCRIPTION; it fails fast if either is unset.
+            - name: KAGE_PROJECT_ID
+              value: "REPLACE_WITH_PROJECT_ID"
+            - name: KAGE_INBOUND_SUBSCRIPTION
+              value: "REPLACE_WITH_INBOUND_SUBSCRIPTION"
+          ports:
+            - containerPort: 8081
+              name: health
+              protocol: TCP
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - "ALL"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 500m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 64Mi
+      serviceAccountName: router
+      terminationGracePeriodSeconds: 10
