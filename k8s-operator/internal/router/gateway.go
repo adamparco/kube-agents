@@ -19,6 +19,8 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 )
 
 // ErrNoSuchTarget means the message resolved to a well-formed routing key, but no live Agent CR occupies
@@ -78,19 +80,28 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 		return out, err
 	}
 
-	// 2. Route key + index lookup: find the live CR that owns this (tier, scope). Same key the webhook
-	//    enforces uniqueness on, so at most one CR can match.
-	key, err := res.Handle.RouteKey(g.ProjectID)
+	// 2. Index-assisted lookup: find the live CR(s) this handle names. Platform/cluster-admin resolve to
+	//    the single occupant of their exact RouteKey; a developer-team handle (namespace leaf only) is
+	//    resolved via the byTierLeaf secondary index — its cluster/project come from the matched CR, never
+	//    the handle. The router names only agents that exist and never guesses between several:
+	//      0 matches → ErrNoSuchTarget · 1 → route · >1 → clarify (ask which, never pick one).
+	targets, err := g.Index.LookupHandle(res.Handle, g.ProjectID)
 	if err != nil {
 		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: err.Error()})
 		return out, err
 	}
-	target, ok := g.Index.Lookup(key)
-	if !ok {
-		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Identity: key, Reason: ErrNoSuchTarget.Error()})
+	switch len(targets) {
+	case 0:
+		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: ErrNoSuchTarget.Error()})
 		return out, ErrNoSuchTarget
+	case 1:
+		out.Target = targets[0]
+	default:
+		ce := clarifyForAmbiguousHandle(res.Handle, targets)
+		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: ce.Error()})
+		return out, ce
 	}
-	out.Target = target
+	target := out.Target
 
 	// 3. Authorize BEFORE dispatch: read the TARGET's allowlist, fail-closed. This is the single
 	//    enforcement point that fronts every per-tier pod.
@@ -114,3 +125,22 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 // ErrUnauthorized is returned when Authorize refuses the turn before dispatch (Phase 2 acceptance d).
 // The specific cause is in Outcome.Decision.Reason and the audit record.
 var ErrUnauthorized = errors.New("router: sender is not authorized for the target (refused before dispatch)")
+
+// clarifyForAmbiguousHandle builds the *ClarifyError returned when a handle names more than one live
+// agent (today only the multi-cluster developer-team case: one namespace present in several clusters).
+// The handle spelling is identical for every match — that is precisely the ambiguity — so the candidate
+// menu carries that one handle per match while the human-facing Reason names the distinguishing scope
+// identities, giving the reviewer enough to re-issue an unambiguous address. The router never guesses.
+func clarifyForAmbiguousHandle(h Handle, targets []Target) *ClarifyError {
+	ids := make([]string, 0, len(targets))
+	cands := make([]Candidate, 0, len(targets))
+	for _, t := range targets {
+		ids = append(ids, t.Identity)
+		cands = append(cands, Candidate{Handle: h, Confidence: 1})
+	}
+	return &ClarifyError{
+		Reason: fmt.Sprintf("%s matches %d agents (%s); re-address the specific one",
+			h.Canonical(), len(targets), strings.Join(ids, ", ")),
+		Candidates: cands,
+	}
+}

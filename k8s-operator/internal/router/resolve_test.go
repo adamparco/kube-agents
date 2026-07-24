@@ -188,10 +188,14 @@ func TestHandle_RouteKey(t *testing.T) {
 		}
 	})
 
-	t.Run("developer-team routing deferred to Phase 3", func(t *testing.T) {
+	t.Run("developer-team has no RouteKey branch (resolved via the index)", func(t *testing.T) {
+		// A developer-team handle carries only a namespace leaf and cannot name a cluster, so its full
+		// key exists only on a live CR: it is resolved through Index.LookupHandle (byTierLeaf), never
+		// RouteKey. RouteKey therefore does not form a dev-team key — the routing path is exercised in
+		// TestIndex_LookupHandle / TestGateway_DeveloperTeamRouting.
 		h := Handle{Tier: agentv1alpha1.TierDeveloperTeam, Leaf: "team-ns"}
-		if _, err := h.RouteKey(project); !errors.Is(err, ErrDeveloperTeamRoutingDeferred) {
-			t.Errorf("RouteKey(devteam) err = %v, want ErrDeveloperTeamRoutingDeferred", err)
+		if _, err := h.RouteKey(project); !errors.Is(err, ErrUnknownTier) {
+			t.Errorf("RouteKey(devteam) err = %v, want ErrUnknownTier (no dev-team branch; use LookupHandle)", err)
 		}
 	})
 }

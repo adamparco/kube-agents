@@ -98,7 +98,7 @@ func TestIsDeterministicRefusal(t *testing.T) {
 		ErrUnknownTier,
 		ErrInferenceUnavailable,
 		ErrMissingProjectContext,
-		ErrDeveloperTeamRoutingDeferred,
+		ErrClarify,
 		ErrNoSuchTarget,
 		ErrUnauthorized,
 	}
@@ -110,6 +110,18 @@ func TestIsDeterministicRefusal(t *testing.T) {
 		if !IsDeterministicRefusal(errors.Join(errors.New("ctx"), e)) {
 			t.Errorf("IsDeterministicRefusal(wrapped %v) = false, want true", e)
 		}
+	}
+
+	// A concrete *ClarifyError (what the gateway actually returns on ambiguity) must also classify as a
+	// deterministic refusal via its Is(ErrClarify) — the delivery layer Acks it, and errors.As recovers
+	// the candidate menu for the reply.
+	ce := &ClarifyError{Reason: "ambiguous", Candidates: []Candidate{{Handle: Handle{Tier: "developer-team", Leaf: "team-x"}, Confidence: 1}}}
+	if !IsDeterministicRefusal(ce) {
+		t.Error("IsDeterministicRefusal(*ClarifyError) = false, want true")
+	}
+	var got *ClarifyError
+	if !errors.As(error(ce), &got) || len(got.Candidates) != 1 {
+		t.Errorf("errors.As(*ClarifyError) failed to recover the candidate menu: %+v", got)
 	}
 
 	// A transient dispatch/publish failure must NOT be deterministic (Nack, retry), nor must nil.
