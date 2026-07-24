@@ -7,6 +7,7 @@ It cleanly reuses the secure token refresh logic from github_token_refresh.py na
 """
 
 import argparse
+import os
 import subprocess
 import sys
 # Append global scripts path to allow importing the token refresher
@@ -15,12 +16,39 @@ sys.path.append("/opt/data/scripts")
 
 from github_token_refresh import refresh_git_credentials, log
 
-def push_branch(branch_name: str):
-    """Push the active git branch to the remote origin securely."""
+# The agent tiers that may propose changes. The branch namespace an agent may push to
+# is derived from its tier (`<tier>-agent/...`), so one tier's agent cannot open a PR in
+# another tier's namespace. This mirrors the pre-created `<tier>-agent` KSA convention.
+VALID_TIERS = {"platform", "cluster-admin", "developer-team"}
+
+
+def resolve_tier(explicit):
+    """Resolve the proposing agent's tier: explicit flag > AGENT_TIER env > default 'platform'."""
+    tier = (explicit or os.environ.get("AGENT_TIER") or "platform").strip().lower()
+    if tier not in VALID_TIERS:
+        raise ValueError(
+            f"Invalid tier '{tier}'. Must be one of: {', '.join(sorted(VALID_TIERS))}."
+        )
+    return tier
+
+
+def push_branch(branch_name: str, tier: str):
+    """Push the active git branch to the remote origin securely.
+
+    Two guardrails: never touch a protected branch, and only push within the agent's own
+    `<tier>-agent/` namespace so tier scoping holds at the propose boundary too.
+    """
     protected_branches = {"main", "master", "production"}
     clean_branch = branch_name.strip().lower()
     if clean_branch in protected_branches:
         raise ValueError(f"CRITICAL SECURITY REFUSAL: Force-pushing to protected branch '{branch_name}' is strictly blocked by GKE SRE guardrails!")
+
+    tier_prefix = f"{tier}-agent/"
+    if not clean_branch.startswith(tier_prefix):
+        raise ValueError(
+            f"CRITICAL SECURITY REFUSAL: the '{tier}' agent may only push branches under "
+            f"'{tier_prefix}' (got '{branch_name}'). Tier scoping is enforced at the propose boundary."
+        )
 
     log(f"Pushing active branch '{branch_name}' securely to origin...")
     subprocess.run(["git", "push", "-f", "origin", branch_name], check=True)
@@ -43,18 +71,21 @@ def create_pull_request(token: str, branch: str, title: str, body: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Secure GitOps PR Suggestion Submitter")
-    parser.add_argument("--branch", required=True, help="Active Git branch name")
+    parser.add_argument("--branch", required=True, help="Active Git branch name (must start with '<tier>-agent/')")
     parser.add_argument("--title", required=True, help="Pull Request title")
     parser.add_argument("--body", required=True, help="Pull Request description body")
-    
+    parser.add_argument("--tier", default=None, help="Proposing agent tier (platform, cluster-admin, developer-team). Defaults to $AGENT_TIER or 'platform'.")
+
     args = parser.parse_args()
-    
+
     try:
+        tier = resolve_tier(args.tier)
+
         # Secure dynamic token exchange & Git/gh credentials configuration
         token = refresh_git_credentials()
-        
-        # Git branch pushing
-        push_branch(args.branch)
+
+        # Git branch pushing (scoped to the agent's own tier namespace)
+        push_branch(args.branch, tier)
         
         # Submit Pull Request
         pr_url = create_pull_request(token, args.branch, args.title, args.body)

@@ -1,11 +1,18 @@
 ---
 name: gke-cluster-creator
-description: Guides the user through creating GKE clusters using pre-defined templates (Standard, Autopilot, GPU/AI).
+description: Authors declarative GKE cluster artifacts (KCC or Terraform) from best-practice templates and proposes them as a GitOps Pull Request for review. Never creates clusters directly.
 ---
 
-# GKE Cluster Creation Skill
+# GKE Cluster Creation Skill (GitOps)
 
-This skill helps users create Google Kubernetes Engine (GKE) clusters by providing a set of best-practice templates and guiding them through the customization process.
+This skill helps propose new Google Kubernetes Engine (GKE) clusters by authoring a **declarative
+infrastructure artifact** — Config Connector (KCC) YAML by default, or Terraform HCL — and routing it
+through a reviewed Pull Request. The customer's CI/CD pipeline applies the artifact on merge.
+
+> **The Platform Agent is read-only and never provisions infrastructure directly.** There is no
+> `create_cluster` tool and no `gcloud container clusters create` path. The **only** way to provision a
+> cluster is to author a declarative artifact and open a PR with the [submit-suggestion](../submit-suggestion/SKILL.md)
+> skill. This is the load-bearing Phase 1 property (06 §9, §4).
 
 ## core_behavior
 
@@ -13,18 +20,24 @@ This skill helps users create Google Kubernetes Engine (GKE) clusters by providi
    - Present the available templates to the user if they haven't specified one.
    - Explain the trade-offs (e.g., Cost vs. Availability, Autopilot vs. Standard).
 2. **Customization**:
-   - Once a template is selected, present the default configuration (JSON/YAML).
+   - Once a template is selected, present the default artifact (KCC YAML, or Terraform if the agent's
+     `spec.iac.format` is `terraform`).
    - Ask the user for essential missing information: `project_id`, `location`, `cluster_name`.
-   - Ask if they want to modify optional fields (e.g., `machineType`, `nodeCount`, `network`).
+   - Ask if they want to modify optional fields (e.g., `machineType`, node counts, network, channel).
 3. **Validation**:
    - Ensure `project_id`, `location`, and `cluster_name` are set.
-   - Ensure the configuration matches the `create_cluster` MCP tool schema.
-4. **Execution**:
-   - Call the `create_cluster` MCP tool with the final configuration.
+   - Ensure the artifact is well-formed and preserves the security defaults below (private, VPC-native,
+     Workload Identity, Shielded Nodes, a release channel).
+4. **Propose via GitOps** (there is no direct execution step):
+   - Write the artifact into the GitOps repo under `clusters/<cluster_name>/provisioning/`.
+   - Hand off to the [submit-suggestion](../submit-suggestion/SKILL.md) skill to open a PR on a
+     `platform-agent/provision-<cluster_name>` branch.
+   - Return the PR URL to the user; the cluster is created only when a human reviews and merges the PR.
 
 ## best_practices
 
-When guiding the user or generating configurations, adhere to the following GKE cluster creation best practices:
+When generating configurations, adhere to the following GKE cluster creation best practices. The
+templates below already encode them — keep them intact when customizing.
 
 ### Security
 
@@ -47,57 +60,144 @@ When guiding the user or generating configurations, adhere to the following GKE 
 
 ## templates
 
+These are **Config Connector (KCC)** resources — the default when the agent's `spec.iac.format` is
+`kcc`. Apply the placeholders `{PROJECT_ID}`, `{CLUSTER_NAME}`, and `{ZONE}`/`{REGION}`, and set
+`metadata.namespace` to the project's Config Connector namespace. Standard templates remove the default
+node pool and manage nodes with a separate `ContainerNodePool` so node changes never recreate the
+cluster. If `spec.iac.format` is `terraform`, author the equivalent `google_container_cluster` /
+`google_container_node_pool` HCL instead (see the Terraform note at the end).
+
 ### 1. Standard Zonal (Cost-Effective Dev/Test)
 
 Best for: Development, testing, non-critical workloads.
 
-```json
-{
-  "name": "projects/{PROJECT_ID}/locations/{ZONE}/clusters/{CLUSTER_NAME}",
-  "initialNodeCount": 1,
-  "nodeConfig": {
-    "machineType": "e2-medium",
-    "diskSizeGb": 50,
-    "oauthScopes": [
-      "https://www.googleapis.com/auth/devstorage.read_only",
-      "https://www.googleapis.com/auth/logging.write",
-      "https://www.googleapis.com/auth/monitoring",
-      "https://www.googleapis.com/auth/service.management.readonly",
-      "https://www.googleapis.com/auth/servicecontrol",
-      "https://www.googleapis.com/auth/trace.append"
-    ]
-  }
-}
+```yaml
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: "{CLUSTER_NAME}"
+  namespace: config-control
+  annotations:
+    cnrm.cloud.google.com/project-id: "{PROJECT_ID}"
+spec:
+  location: "{ZONE}"
+  initialNodeCount: 1
+  removeDefaultNodePool: true
+  networkingMode: VPC_NATIVE
+  ipAllocationPolicy: {} # request GKE-managed alias IP ranges
+  releaseChannel:
+    channel: REGULAR
+  workloadIdentityConfig:
+    workloadPool: "{PROJECT_ID}.svc.id.goog"
+  privateClusterConfig:
+    enablePrivateNodes: true
+    enablePrivateEndpoint: false
+---
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerNodePool
+metadata:
+  name: "{CLUSTER_NAME}-pool"
+  namespace: config-control
+  annotations:
+    cnrm.cloud.google.com/project-id: "{PROJECT_ID}"
+spec:
+  location: "{ZONE}"
+  clusterRef:
+    name: "{CLUSTER_NAME}"
+  autoscaling:
+    minNodeCount: 1
+    maxNodeCount: 3
+  management:
+    autoRepair: true
+    autoUpgrade: true
+  nodeConfig:
+    machineType: e2-medium
+    diskSizeGb: 50
+    shieldedInstanceConfig:
+      enableSecureBoot: true
+      enableIntegrityMonitoring: true
+    oauthScopes:
+      - "https://www.googleapis.com/auth/cloud-platform"
 ```
 
 ### 2. Standard Regional (High Availability)
 
 Best for: Production workloads requiring high availability.
-_Note: Creates 3 nodes (one per zone in the region) by default._
+_Note: a regional cluster replicates the control plane and node pool across the region's zones._
 
-```json
-{
-  "name": "projects/{PROJECT_ID}/locations/{REGION}/clusters/{CLUSTER_NAME}",
-  "initialNodeCount": 1,
-  "nodeConfig": {
-    "machineType": "e2-standard-4",
-    "diskSizeGb": 100,
-    "oauthScopes": ["https://www.googleapis.com/auth/cloud-platform"]
-  }
-}
+```yaml
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: "{CLUSTER_NAME}"
+  namespace: config-control
+  annotations:
+    cnrm.cloud.google.com/project-id: "{PROJECT_ID}"
+spec:
+  location: "{REGION}"
+  initialNodeCount: 1
+  removeDefaultNodePool: true
+  networkingMode: VPC_NATIVE
+  ipAllocationPolicy: {}
+  releaseChannel:
+    channel: STABLE
+  workloadIdentityConfig:
+    workloadPool: "{PROJECT_ID}.svc.id.goog"
+  privateClusterConfig:
+    enablePrivateNodes: true
+    enablePrivateEndpoint: false
+---
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerNodePool
+metadata:
+  name: "{CLUSTER_NAME}-pool"
+  namespace: config-control
+  annotations:
+    cnrm.cloud.google.com/project-id: "{PROJECT_ID}"
+spec:
+  location: "{REGION}"
+  clusterRef:
+    name: "{CLUSTER_NAME}"
+  autoscaling:
+    minNodeCount: 1 # per zone; a regional pool multiplies this across the region's zones
+    maxNodeCount: 4
+  management:
+    autoRepair: true
+    autoUpgrade: true
+  upgradeSettings:
+    maxSurge: 2
+    maxUnavailable: 0
+  nodeConfig:
+    machineType: e2-standard-4
+    diskSizeGb: 100
+    shieldedInstanceConfig:
+      enableSecureBoot: true
+      enableIntegrityMonitoring: true
+    oauthScopes:
+      - "https://www.googleapis.com/auth/cloud-platform"
 ```
 
 ### 3. Autopilot (Operations-Free)
 
-Best for: Most workloads where you don't want to manage nodes.
+Best for: Most workloads where you don't want to manage nodes. Autopilot enables VPC-native networking,
+Workload Identity, and Shielded Nodes by default.
 
-```json
-{
-  "name": "projects/{PROJECT_ID}/locations/{REGION}/clusters/{CLUSTER_NAME}",
-  "autopilot": {
-    "enabled": true
-  }
-}
+```yaml
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: "{CLUSTER_NAME}"
+  namespace: config-control
+  annotations:
+    cnrm.cloud.google.com/project-id: "{PROJECT_ID}"
+spec:
+  location: "{REGION}"
+  enableAutopilot: true
+  releaseChannel:
+    channel: REGULAR
+  privateClusterConfig:
+    enablePrivateNodes: true
+    enablePrivateEndpoint: false
 ```
 
 ### 4. GPU Inference (L4)
@@ -105,22 +205,35 @@ Best for: Most workloads where you don't want to manage nodes.
 Best for: AI/ML Inference, small model serving.
 _Note: Requires `g2-standard-4` quota._
 
-```json
-{
-  "name": "projects/{PROJECT_ID}/locations/{REGION}/clusters/{CLUSTER_NAME}",
-  "initialNodeCount": 1,
-  "nodeConfig": {
-    "machineType": "g2-standard-4",
-    "accelerators": [
-      {
-        "acceleratorCount": "1",
-        "acceleratorType": "nvidia-l4"
-      }
-    ],
-    "diskSizeGb": 100,
-    "oauthScopes": ["https://www.googleapis.com/auth/cloud-platform"]
-  }
-}
+```yaml
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerNodePool
+metadata:
+  name: "{CLUSTER_NAME}-gpu-l4"
+  namespace: config-control
+  annotations:
+    cnrm.cloud.google.com/project-id: "{PROJECT_ID}"
+spec:
+  location: "{REGION}"
+  clusterRef:
+    name: "{CLUSTER_NAME}"
+  autoscaling:
+    minNodeCount: 0 # scale to zero when idle to control GPU cost
+    maxNodeCount: 3
+  management:
+    autoRepair: true
+    autoUpgrade: true
+  nodeConfig:
+    machineType: g2-standard-4
+    diskSizeGb: 100
+    guestAccelerator:
+      - type: nvidia-l4
+        count: 1
+    shieldedInstanceConfig:
+      enableSecureBoot: true
+      enableIntegrityMonitoring: true
+    oauthScopes:
+      - "https://www.googleapis.com/auth/cloud-platform"
 ```
 
 ### 5. AI Hypercompute (A3 HighGPU)
@@ -128,22 +241,33 @@ _Note: Requires `g2-standard-4` quota._
 Best for: Large Model Training/Inference.
 _Note: High cost and strict quota requirements._
 
-```json
-{
-  "name": "projects/{PROJECT_ID}/locations/{REGION}/clusters/{CLUSTER_NAME}",
-  "initialNodeCount": 1,
-  "nodeConfig": {
-    "machineType": "a3-highgpu-8g",
-    "accelerators": [
-      {
-        "acceleratorCount": "8",
-        "acceleratorType": "nvidia-h100-80gb-hbm3"
-      }
-    ],
-    "diskSizeGb": 200,
-    "oauthScopes": ["https://www.googleapis.com/auth/cloud-platform"]
-  }
-}
+```yaml
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerNodePool
+metadata:
+  name: "{CLUSTER_NAME}-a3-highgpu"
+  namespace: config-control
+  annotations:
+    cnrm.cloud.google.com/project-id: "{PROJECT_ID}"
+spec:
+  location: "{REGION}"
+  clusterRef:
+    name: "{CLUSTER_NAME}"
+  nodeCount: 1
+  management:
+    autoRepair: true
+    autoUpgrade: true
+  nodeConfig:
+    machineType: a3-highgpu-8g
+    diskSizeGb: 200
+    guestAccelerator:
+      - type: nvidia-h100-80gb
+        count: 8
+    shieldedInstanceConfig:
+      enableSecureBoot: true
+      enableIntegrityMonitoring: true
+    oauthScopes:
+      - "https://www.googleapis.com/auth/cloud-platform"
 ```
 
 ## instructions
@@ -151,15 +275,32 @@ _Note: High cost and strict quota requirements._
 - **ALWAYS** ask for the `project_id` if it is not in the context.
 - **ALWAYS** ask for the `location` (Region or Zone).
 - **ALWAYS** ask for a unique `cluster_name`.
-- **CHECK** if the user wants `Access to Google Cloud APIs` (default `cloud-platform` scope is usually best for modern GKE).
-- **WARN** the user about cost if they select GPU or Reginal clusters.
-- **USE** `create_cluster` MCP tool to create the cluster. The `parent` argument is `projects/{PROJECT_ID}/locations/{LOCATION}` and the `cluster` argument is the JSON object. The `cluster.name` is just the short name (e.g. "my-cluster").
-- **IMPORTANT**: When calling `create_cluster`, the `cluster.name` should be the **short name** (e.g., `my-cluster`), NOT the full resource path, because the `parent` argument defines the scope.
+- **PRESERVE** the security defaults (private nodes, VPC-native, Workload Identity, Shielded Nodes, a
+  release channel) when customizing a template.
+- **WARN** the user about cost if they select GPU or regional clusters.
+- **AUTHOR, DON'T EXECUTE**: write the finished artifact to
+  `clusters/<cluster_name>/provisioning/<cluster_name>.yaml` in the GitOps repo (use the Terraform
+  equivalent under the same path if `spec.iac.format` is `terraform`). Do **not** attempt to run
+  `gcloud`, `kubectl apply`, or any cluster-creating tool — there is none, and direct mutation is
+  forbidden.
+- **PROPOSE**: invoke the [submit-suggestion](../submit-suggestion/SKILL.md) skill with a branch named
+  `platform-agent/provision-<cluster_name>`, staging only the provisioning files you authored. Present
+  the returned PR URL to the user. The cluster is created only on human merge, when the CI/CD pipeline
+  applies the artifact.
+
+### Terraform alternative
+
+If the agent's `spec.iac.format` is `terraform`, author the equivalent HCL instead of KCC — a
+`google_container_cluster` (with `remove_default_node_pool`, `networking_mode = "VPC_NATIVE"`,
+`workload_identity_config`, `release_channel`, `private_cluster_config`) plus one or more
+`google_container_node_pool` resources carrying the same machine type, autoscaling, shielded-node, and
+accelerator settings shown above. Write it to the same `clusters/<cluster_name>/provisioning/` path; the
+pipeline runs `terraform apply` on merge.
 
 ## example_usage
 
 **User**: "I want to create a GKE cluster."
-**Model**: "I can help with that. What kind of cluster do you need?
+**Model**: "I can help propose one. What kind of cluster do you need?
 
 1. **Standard Zonal**: Good for dev/test.
 2. **Standard Regional**: High availability.
@@ -174,6 +315,12 @@ _Note: High cost and strict quota requirements._
 - Cluster Name"
 
 **User**: "Project `my-proj`, zone `us-west1-b`, name `dev-cluster`."
-**Model**: "Here is the configuration I will use:
-[JSON view]
-Do you want to proceed?"
+**Model**: "Here is the KCC artifact I'll propose (private, VPC-native, Workload Identity, Shielded
+Nodes, Regular channel):
+[KCC YAML view]
+I'll write it to `clusters/dev-cluster/provisioning/dev-cluster.yaml` and open a PR for review. Shall I
+proceed?"
+
+**User**: "Yes."
+**Model**: "Opened the PR — here's the link. `dev-cluster` will be created once an SRE reviews and merges
+it." _(No cluster is created until merge; the CI/CD pipeline applies the artifact.)_
