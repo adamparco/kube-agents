@@ -1,0 +1,120 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package router is the ChatOps gateway (C15, 05) that resolves every inbound chat message to exactly
+// one (tier, scope) Agent CR and dispatches to that agent's per-tier pod (06 §2b). This file holds the
+// pure, dependency-light core: the routing grammar (grammar.go), deterministic resolution + the
+// inference boundary (resolve.go), and the before-dispatch allowlist check (authorize.go). The
+// informer/index over Agent CRs, the Pub/Sub dispatcher, and the Deployment are layered on top
+// (Phase 2 T15+) — none of them is needed to unit-test the security-load-bearing logic here.
+//
+// Two invariants are enforced structurally, not by convention:
+//
+//   - Routing is NEVER an authz signal (03 §4a). Resolve() only names the target; Authorize() decides
+//     access by reading the TARGET CR's allowlist, independently of how the target was resolved.
+//   - The router is fail-closed (03 §4a; Phase 2 acceptance d). An empty/absent allowlist refuses ALL
+//     senders — the router never honors the pod-env ALLOW_ALL default (which is the in-pod gateway's
+//     permissive v1 behavior, kept only as a defense-in-depth backstop behind this pre-dispatch check).
+package router
+
+import (
+	"errors"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
+// Mode is the routing mode recorded on every chat turn's audit record (06 §2b). Resolution order is
+// deterministic-first: slash → handle → inference. Modes slash+handle spend no inference; inference is
+// the only mode that could spend a model call, and Phase 2 refuses it (see Resolver.Resolve).
+type Mode string
+
+const (
+	// ModeSlash is a slash command: `@kage /<handle> <text>` (constant-time, no inference).
+	ModeSlash Mode = "slash"
+	// ModeHandle is an explicit `@handle` mention (constant-time, no inference).
+	ModeHandle Mode = "handle"
+	// ModeInference is the NL fallback (one router model call). Deferred to Phase 3; refused in Phase 2.
+	ModeInference Mode = "inference"
+)
+
+// Handle is a parsed chat address: a tier plus the single scope leaf the handle carries (06 §2b).
+// A handle names only its leaf — platform→project, cluster-admin→cluster, developer-team→namespace —
+// so a full routing key needs the router's project context (see Handle.RouteKey), which is why the
+// index resolves handles against Agent CRs rather than trusting the handle alone.
+type Handle struct {
+	// Tier is the addressed tier.
+	Tier agentv1alpha1.AgentTier
+	// Leaf is the scope value in the handle: project (platform) | cluster (cluster-admin) |
+	// namespace (developer-team). Always lower-cased and RFC1123-label-shaped (see parseHandleToken).
+	Leaf string
+}
+
+// Resolution is the outcome of Resolve: which agent was named and by which mode. On a refusal Resolve
+// returns the Mode it attempted (so the audit record still captures intent, 06 §2b) alongside the error.
+type Resolution struct {
+	Handle Handle
+	Mode   Mode
+}
+
+// Target is the routing-relevant projection of the resolved (tier, scope) Agent CR. The index builds
+// it from the matched CR; Authorize and the dispatcher consume it. Keeping the projection explicit
+// means the authz decision reads exactly the CR fields the contract names (06 §2b) and nothing else.
+type Target struct {
+	// Identity is agentindex.ScopeIdentity(cr) — the (tier, scope) key, also the routing-table key.
+	Identity string
+	// Tier is the target agent's tier (audit + dispatch selection).
+	Tier agentv1alpha1.AgentTier
+	// Handle is the canonical @handle of the target (audit attribution, 06 §2b).
+	Handle string
+	// TopicName is the target CR's integration.googleChat.topicName — the PubSubDispatcher re-publishes
+	// here; the target pod's own proxy drains it (no credential_proxy.py edit, Decision 2).
+	TopicName string
+	// AllowedUsers is the target CR's integration.googleChat.allowedUsers — the CLOSED trusted-human
+	// allowlist Authorize checks BEFORE dispatch. Empty/absent ⇒ the router refuses ALL (fail-closed);
+	// it never reads the pod-env *_ALLOW_ALL_USERS flag the operator renders for the permissive default.
+	AllowedUsers []string
+}
+
+// Decision is the result of the before-dispatch allowlist check. Reason is always populated (an
+// allow reason for audit, a deny reason for the caller to surface) so every decision is attributable.
+type Decision struct {
+	Allowed bool
+	Reason  string
+}
+
+// Sentinel errors. Every non-inference refusal is one of these deterministic values so callers can
+// branch on cause and tests can assert exact behavior — the router never guesses (06 §2b: low
+// confidence → clarify, not guess).
+var (
+	// ErrUnaddressed means the message named no agent by slash or handle and inference is unavailable
+	// (Phase 2). It is the deterministic Phase-2 fallback: refuse and ask the human to address explicitly.
+	ErrUnaddressed = errors.New("router: message names no agent (use a slash command or @handle)")
+	// ErrMalformedHandle means a slash/handle token was present but its leaf was empty or not a valid
+	// RFC1123 label — refused rather than coerced.
+	ErrMalformedHandle = errors.New("router: malformed handle")
+	// ErrUnknownTier means a handle token did not match any known tier prefix.
+	ErrUnknownTier = errors.New("router: unknown tier in handle")
+	// ErrInferenceUnavailable means resolution fell through to NL inference but no Inferer is wired.
+	// This is the Phase-2 posture: mode 3 is refused WITHOUT invoking any model, so inference_calls==0.
+	ErrInferenceUnavailable = errors.New("router: NL inference is disabled (Phase 2 routes by slash/handle only)")
+	// ErrMissingProjectContext means a cluster-admin handle could not be turned into a routing key
+	// because the router was given no project context to fill the scope.
+	ErrMissingProjectContext = errors.New("router: cluster-admin handle needs project context to form a routing key")
+	// ErrDeveloperTeamRoutingDeferred means a developer-team handle parsed correctly but cannot be routed
+	// in Phase 2: its handle carries only the namespace leaf, not the cluster, so no full key can form.
+	// Deterministic refusal (developer-team pods ship in Phase 3).
+	ErrDeveloperTeamRoutingDeferred = errors.New("router: developer-team routing is deferred to Phase 3")
+)
