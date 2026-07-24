@@ -1,6 +1,8 @@
 # Image URL to use all building/pushing image targets.
 # Pinned to an immutable version tag (not :latest); repin to a digest in production.
 IMG ?= ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0
+# Image URL for the kage-router (the read-only ChatOps front door). Pinned like IMG.
+ROUTER_IMG ?= ghcr.io/gke-labs/kube-agents/kage-router:v0.1.0
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -68,6 +70,18 @@ docker-build: ## Build docker image with the manager.
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
+
+.PHONY: build-router
+build-router: manifests generate fmt vet ## Build kage-router binary.
+	go build -o bin/router cmd/router/main.go
+
+.PHONY: docker-build-router
+docker-build-router: ## Build docker image with the kage-router.
+	$(CONTAINER_TOOL) build -f Dockerfile.router -t ${ROUTER_IMG} .
+
+.PHONY: docker-push-router
+docker-push-router: ## Push docker image with the kage-router.
+	$(CONTAINER_TOOL) push ${ROUTER_IMG}
 
 ##@ Deployment
 
