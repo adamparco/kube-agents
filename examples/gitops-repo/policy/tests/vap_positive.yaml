@@ -1,0 +1,18 @@
+# VAP positive fixture — cluster-admin read-only ClusterRole (03 §4/§11; Phase 2 acceptance (e)).
+#
+# This object MUST be ADMITTED by `kube-agents-agent-readonly`: it is exactly the shape the
+# cluster-admin pre-created identity ships (policy/rbac-overlay/cluster-admin.yaml) — a cluster-scoped
+# read-only ("explorer") grant. The negative suite pairs this with vap_clusteradmin_negatives.yaml so
+# a failure to admit legitimate read-only RBAC (a too-strict policy) is caught, not just failure to
+# deny writes. Consumed by tests/e2e/vap_negative_test.sh (expect apply to SUCCEED).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vaptest-cluster-admin-readonly
+  labels:
+    kube-agents/tier: cluster-admin
+rules:
+  - apiGroups:
+      ["", "apps", "batch", "networking.k8s.io", "rbac.authorization.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"] # read-only -> ADMITTED

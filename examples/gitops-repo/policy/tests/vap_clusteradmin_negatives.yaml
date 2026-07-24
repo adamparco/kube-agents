@@ -1,0 +1,43 @@
+# VAP negative fixtures — cluster-admin attenuation (03 §4/§11; Phase 2 acceptance (e)).
+#
+# These objects MUST be REJECTED at apply time by `kube-agents-agent-readonly`
+# (examples/gitops-repo/policy/vap-agent-readonly.yaml) even if a bad RBAC PR is merged past human
+# review. They are consumed by the Kind verify harness (local-dev + tests/e2e/vap_negative_test.sh):
+# each doc is applied and the apply is expected to FAIL with the quoted VAP message — a plain apply
+# error (schema/RBAC) does NOT count, the denial must provably come from the policy.
+#
+# DO NOT let CI/CD apply this file to a real cluster's policy tree — it lives under policy/tests/ and
+# is excluded from the actuation pipeline's apply paths; it is fixture input for the negative suite.
+#
+# Rule mapping (see vap-agent-readonly.yaml):
+#   doc 1 -> validation #1 (read-verb allow-list)  message contains "read verbs"
+#   doc 2 -> validation #2 (wrong-scope)           message contains "wrong-scope"
+---
+# DOC 1 — cluster-admin ClusterRole granting a WRITE verb (create). EXPECT: DENIED by validation #1.
+# The read-verb allow-list rejects any non-read verb; `create` is the canonical write. This is the
+# acceptance-(e) core: a write grant to the cluster-admin SA is refused at apply even if merged.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vaptest-cluster-admin-writer
+  labels:
+    kube-agents/tier: cluster-admin
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create"] # `create` -> DENIED
+---
+# DOC 2 — developer-team ClusterRole (wrong-scope). EXPECT: DENIED by validation #2.
+# developer-team is a namespace-scoped tier and must never receive a cluster-scoped ClusterRole, even
+# with only read verbs — the scope itself is the violation. Proves the wrong-scope arm independently
+# of the read/write arm.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vaptest-developer-team-clusterrole
+  labels:
+    kube-agents/tier: developer-team
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"] # read-only, but a ClusterRole for a namespace tier -> DENIED
