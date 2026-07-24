@@ -122,7 +122,7 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 			g.emitClarify(ctx, audit, &out, msg, res, ce)
 			return out, err
 		}
-		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Tier: res.Handle.Tier, ThreadID: msg.ThreadID, Reason: err.Error()})
+		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Tier: res.Handle.Tier, ThreadID: msg.ThreadID, TraceID: msg.TraceID, Reason: err.Error()})
 		return out, err
 	}
 
@@ -135,12 +135,12 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 	if !sticky {
 		targets, err := g.Index.LookupHandle(res.Handle, g.ProjectID)
 		if err != nil {
-			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Tier: res.Handle.Tier, ThreadID: msg.ThreadID, Reason: err.Error()})
+			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Tier: res.Handle.Tier, ThreadID: msg.ThreadID, TraceID: msg.TraceID, Reason: err.Error()})
 			return out, err
 		}
 		switch len(targets) {
 		case 0:
-			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Tier: res.Handle.Tier, ThreadID: msg.ThreadID, Reason: ErrNoSuchTarget.Error()})
+			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Tier: res.Handle.Tier, ThreadID: msg.ThreadID, TraceID: msg.TraceID, Reason: ErrNoSuchTarget.Error()})
 			return out, ErrNoSuchTarget
 		case 1:
 			out.Target = targets[0]
@@ -158,13 +158,13 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 	dec := Authorize(target, msg.Sender)
 	out.Decision = dec
 	if !dec.Allowed {
-		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Tier: target.Tier, ThreadID: msg.ThreadID, Allowed: false, Reason: dec.Reason})
+		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Tier: target.Tier, ThreadID: msg.ThreadID, TraceID: msg.TraceID, Allowed: false, Reason: dec.Reason})
 		return out, ErrUnauthorized
 	}
 
 	// 4. Dispatch: deliver only now that the turn is authorized.
 	if err := g.Dispatch.Dispatch(ctx, target, msg); err != nil {
-		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Tier: target.Tier, ThreadID: msg.ThreadID, Allowed: true, Dispatched: false, Reason: "dispatch failed: " + err.Error()})
+		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Tier: target.Tier, ThreadID: msg.ThreadID, TraceID: msg.TraceID, Allowed: true, Dispatched: false, Reason: "dispatch failed: " + err.Error()})
 		return out, err
 	}
 	out.Dispatched = true
@@ -177,7 +177,7 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 		g.Affinity.Bind(msg.ThreadID, target.Identity)
 	}
 
-	audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Tier: target.Tier, ThreadID: msg.ThreadID, Allowed: true, Dispatched: true, Reason: dec.Reason})
+	audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Tier: target.Tier, ThreadID: msg.ThreadID, TraceID: msg.TraceID, Allowed: true, Dispatched: true, Reason: dec.Reason})
 	return out, nil
 }
 
@@ -201,9 +201,9 @@ func (g *Gateway) emitClarify(ctx context.Context, audit AuditSink, out *Outcome
 		Mode:     res.Mode,
 		Handle:   res.Handle.Canonical(),
 		Tier:     res.Handle.Tier,
-		ThreadID: msg.ThreadID,
-		Clarify:  true,
-		Reason:   reason,
+		ThreadID: msg.ThreadID, TraceID: msg.TraceID,
+		Clarify: true,
+		Reason:  reason,
 	})
 }
 

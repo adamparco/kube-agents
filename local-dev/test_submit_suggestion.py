@@ -177,5 +177,116 @@ class TestTierCopiesIdentical(unittest.TestCase):
         self.assertEqual(blobs[0], blobs[2])
 
 
+class TestAttributionTrailers(unittest.TestCase):
+    """Phase 5 T-A (acceptance d): every proposed mutation is attributable.
+
+    The ChatOps router carries the requester + a per-turn trace id to the agent; submit_suggestion stamps
+    them as Requested-by:/Trace-Id: git trailers on the PR body, which the repo's squash-merge lands in
+    main's history. These tests prove the resolution precedence (flag > env > autonomous fallback), the
+    trailer shape + idempotence, and that the trailers actually reach the dry-run artifact end to end.
+    """
+
+    def setUp(self) -> None:
+        self.branch = "platform-agent/fix-netpol"
+        self.repo = tempfile.mkdtemp(prefix="submit-attr-")
+        _make_proposal_repo(self.repo, self.branch)
+        self._cwd = os.getcwd()
+        os.chdir(self.repo)
+        # Isolate KAGE_* env for each test.
+        self._saved_env = {k: os.environ.get(k) for k in ("KAGE_REQUESTED_BY", "KAGE_TRACE_ID")}
+        for k in self._saved_env:
+            os.environ.pop(k, None)
+
+    def tearDown(self) -> None:
+        os.chdir(self._cwd)
+        subprocess.run(["rm", "-rf", self.repo], check=False)
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_resolution_precedence(self) -> None:
+        # Autonomous fallback when nothing is set: attribute to the tier identity, never blank.
+        self.assertEqual(
+            submit_suggestion.resolve_attribution(None, None, "platform"),
+            ("platform-agent (autonomous)", "autonomous"),
+        )
+        # Env supplies the router-provided values.
+        os.environ["KAGE_REQUESTED_BY"] = "users/12345"
+        os.environ["KAGE_TRACE_ID"] = "proj-msg-abc123"
+        self.assertEqual(
+            submit_suggestion.resolve_attribution(None, None, "cluster-admin"),
+            ("users/12345", "proj-msg-abc123"),
+        )
+        # Explicit flags beat the env.
+        self.assertEqual(
+            submit_suggestion.resolve_attribution("users/override", "trace-override", "developer-team"),
+            ("users/override", "trace-override"),
+        )
+
+    def test_trailer_shape_and_idempotence(self) -> None:
+        out = submit_suggestion.with_attribution_trailers("corrective PR\n", "users/1", "t-1")
+        self.assertTrue(out.endswith("Requested-by: users/1\nTrace-Id: t-1\n"))
+        # Blank line separates the trailer block from the body (git-trailer shape).
+        self.assertIn("corrective PR\n\nRequested-by:", out)
+        # Re-running does not double the trailers.
+        self.assertEqual(submit_suggestion.with_attribution_trailers(out, "users/1", "t-1"), out)
+
+    def test_trailer_value_is_single_line(self) -> None:
+        rb, _ = submit_suggestion.resolve_attribution("users/\ninjected: value", None, "platform")
+        self.assertNotIn("\n", rb)
+
+    def test_dry_run_artifact_carries_trailers_from_env(self) -> None:
+        """End to end: with KAGE_* set, `main --dry-run` writes the trailers into the pr.md artifact."""
+        os.environ["KAGE_REQUESTED_BY"] = "users/99"
+        os.environ["KAGE_TRACE_ID"] = "turn-xyz"
+        artifact = tempfile.mkdtemp(prefix="submit-attr-art-")
+        argv = sys.argv
+        try:
+            with _NoNetwork(self):
+                sys.argv = [
+                    "submit_suggestion.py",
+                    "--branch", self.branch,
+                    "--title", "Fix netpol",
+                    "--body", "corrective PR",
+                    "--tier", "platform",
+                    "--dry-run",
+                    "--artifact-dir", artifact,
+                ]
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    submit_suggestion.main()
+            pr_md = (Path(artifact) / "pr.md").read_text()
+            self.assertIn("Requested-by: users/99", pr_md)
+            self.assertIn("Trace-Id: turn-xyz", pr_md)
+        finally:
+            sys.argv = argv
+            subprocess.run(["rm", "-rf", artifact], check=False)
+
+    def test_dry_run_artifact_autonomous_fallback(self) -> None:
+        """With no KAGE_* env, a self-initiated turn still stamps attributable trailers (never blank)."""
+        artifact = tempfile.mkdtemp(prefix="submit-attr-auto-")
+        try:
+            with _NoNetwork(self):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    submit_suggestion.dry_run(
+                        self.branch,
+                        "platform",
+                        "Fix netpol",
+                        submit_suggestion.with_attribution_trailers(
+                            "corrective PR",
+                            *submit_suggestion.resolve_attribution(None, None, "platform"),
+                        ),
+                        artifact,
+                    )
+            pr_md = (Path(artifact) / "pr.md").read_text()
+            self.assertIn("Requested-by: platform-agent (autonomous)", pr_md)
+            self.assertIn("Trace-Id: autonomous", pr_md)
+        finally:
+            subprocess.run(["rm", "-rf", artifact], check=False)
+
+
 if __name__ == "__main__":
     unittest.main()

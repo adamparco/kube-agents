@@ -102,8 +102,12 @@ func (r *Receiver) handle(ctx context.Context, m *pubsub.Message) {
 		Text:     ev.Text,
 		Sender:   ev.Sender,
 		ThreadID: ev.ThreadID(),
-		Raw:      m.Data,
-		Attrs:    map[string]string{"kage_space": ev.Space},
+		// TraceID roots the attribution chain (Phase 5 T-A): the inbound Pub/Sub message id is unique per
+		// turn and stable across redelivery, so it correlates this turn's audit record with the kage_trace_id
+		// attribute the dispatcher stamps and the Trace-Id: trailer the agent later puts on its GitOps PR.
+		TraceID: m.ID,
+		Raw:     m.Data,
+		Attrs:   map[string]string{"kage_space": ev.Space},
 	})
 	if herr != nil {
 		if router.IsDeterministicRefusal(herr) {

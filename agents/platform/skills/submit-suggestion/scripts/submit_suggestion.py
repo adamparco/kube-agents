@@ -31,6 +31,17 @@ VALID_TIERS = {"platform", "cluster-admin", "developer-team"}
 # first (the hermetic Kind test / a full clone), then the tracked remote, then `master`.
 _DIFF_BASES = ("main", "origin/main", "master")
 
+# Git trailer keys that make every proposed mutation attributable (Phase 5 T-A, 06 §8; acceptance d).
+# The ChatOps router stamps the requester + a per-turn trace id onto the message it dispatches
+# (kage_sender / kage_trace_id); the session carries them into the agent's environment as
+# KAGE_REQUESTED_BY / KAGE_TRACE_ID; this script echoes them as git trailers on the PR body. Because the
+# repo squash-merges (PR body -> squashed commit message), the trailers land in main's git history, so a
+# merged change resolves back to the human who asked and the exact turn that asked it. They are ALWAYS
+# stamped: a self-initiated (drift/heartbeat) turn has no human requester, so it attributes to the agent's
+# own tier identity with trace id "autonomous" rather than leaving the mutation unattributable.
+_TRAILER_REQUESTED_BY = "Requested-by"
+_TRAILER_TRACE_ID = "Trace-Id"
+
 
 def resolve_tier(explicit):
     """Resolve the proposing agent's tier: explicit flag > AGENT_TIER env > default 'platform'."""
@@ -40,6 +51,41 @@ def resolve_tier(explicit):
             f"Invalid tier '{tier}'. Must be one of: {', '.join(sorted(VALID_TIERS))}."
         )
     return tier
+
+
+def _trailer_value(raw: str) -> str:
+    """Coerce an attribution value to a single, trailer-safe line (git trailers are one line each)."""
+    return " ".join(str(raw).split()).strip()
+
+
+def resolve_attribution(explicit_requested_by, explicit_trace_id, tier: str):
+    """Resolve (requested_by, trace_id) for the PR trailers: explicit flag > env > autonomous fallback.
+
+    The router-provided identity of the human who triggered the turn arrives as $KAGE_REQUESTED_BY and the
+    per-turn correlation id as $KAGE_TRACE_ID. When neither the flag nor the env is set the turn was
+    self-initiated (a drift/heartbeat SOP with no human in the loop), so we attribute to the agent's own
+    tier identity and mark the trace 'autonomous' — every mutation stays attributable (acceptance d).
+    """
+    requested_by = _trailer_value(
+        explicit_requested_by or os.environ.get("KAGE_REQUESTED_BY") or f"{tier}-agent (autonomous)"
+    )
+    trace_id = _trailer_value(
+        explicit_trace_id or os.environ.get("KAGE_TRACE_ID") or "autonomous"
+    )
+    return requested_by, trace_id
+
+
+def with_attribution_trailers(body: str, requested_by: str, trace_id: str) -> str:
+    """Append the Requested-by:/Trace-Id: git trailers as the final block of the PR body.
+
+    Trailers are the last paragraph, one `Key: Value` per line, separated from the body by a blank line
+    (the shape `git interpret-trailers` and GitHub both recognize). Idempotent: if the body already ends
+    with these trailers (e.g. a re-run), it is returned unchanged rather than doubling them.
+    """
+    trailer_block = f"{_TRAILER_REQUESTED_BY}: {requested_by}\n{_TRAILER_TRACE_ID}: {trace_id}"
+    if body.rstrip().endswith(trailer_block):
+        return body
+    return f"{body.rstrip()}\n\n{trailer_block}\n"
 
 
 def validate_branch(branch_name: str, tier: str):
@@ -176,6 +222,19 @@ def main():
     parser.add_argument("--body", required=True, help="Pull Request description body")
     parser.add_argument("--tier", default=None, help="Proposing agent tier (platform, cluster-admin, developer-team). Defaults to $AGENT_TIER or 'platform'.")
     parser.add_argument(
+        "--requested-by",
+        default=None,
+        help="Platform id of the human who requested this change (attribution). Defaults to "
+             "$KAGE_REQUESTED_BY, or '<tier>-agent (autonomous)' for a self-initiated turn. Stamped as the "
+             "Requested-by: PR trailer.",
+    )
+    parser.add_argument(
+        "--trace-id",
+        default=None,
+        help="Per-turn correlation id from the ChatOps router (ties the PR back to the exact turn). "
+             "Defaults to $KAGE_TRACE_ID, or 'autonomous'. Stamped as the Trace-Id: PR trailer.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Halt after the local branch + commit: validate tier scoping and emit the diff "
@@ -192,9 +251,15 @@ def main():
     try:
         tier = resolve_tier(args.tier)
 
+        # Attribution trailers (Phase 5 T-A, acceptance d): stamp the requester + per-turn trace id onto
+        # the PR body so a merged mutation traces back to the human and the turn that asked for it. Applied
+        # to BOTH the dry-run artifact and the real PR, so the corrective-PR proof carries them too.
+        requested_by, trace_id = resolve_attribution(args.requested_by, args.trace_id, tier)
+        body = with_attribution_trailers(args.body, requested_by, trace_id)
+
         if args.dry_run:
             # Corrective-PR artifact only: no token exchange, no push, no PR.
-            dry_run(args.branch, tier, args.title, args.body, args.artifact_dir)
+            dry_run(args.branch, tier, args.title, body, args.artifact_dir)
             return
 
         # Secure dynamic token exchange & Git/gh credentials configuration
@@ -204,7 +269,7 @@ def main():
         push_branch(args.branch, tier)
 
         # Submit Pull Request
-        pr_url = create_pull_request(token, args.branch, args.title, args.body)
+        pr_url = create_pull_request(token, args.branch, args.title, body)
         log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
 
         # Print raw URL to stdout for the MCP tool to parse

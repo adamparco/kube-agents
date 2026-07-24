@@ -36,6 +36,12 @@ type Message struct {
 	// only after an authorized dispatch. It is a routing-continuity signal only, never an authz one; empty
 	// disables affinity for the turn.
 	ThreadID string
+	// TraceID is the per-turn correlation id (Phase 5 T-A, 06 §8; acceptance d). It roots the attribution
+	// chain: the gateway stamps it on every AuditRecord (tying Sender to the turn) and the dispatcher carries
+	// it to the target pod as the kage_trace_id attribute, so a GitOps PR the agent later opens can echo it
+	// as a Trace-Id trailer that resolves back to this exact turn. Never a routing or authz signal — purely a
+	// correlation key; empty when the inbound edge supplied no id.
+	TraceID string
 	// Raw is the original event payload to re-publish unchanged; if empty the dispatcher publishes Text.
 	Raw []byte
 	// Attrs are original message attributes to preserve on re-publish (best-effort passthrough).
@@ -65,7 +71,11 @@ type Dispatched struct {
 	TopicName string
 	Handle    string
 	Sender    string
-	Text      string
+	// TraceID is the per-turn correlation id carried to the target (attribution, Phase 5 T-A). The
+	// production dispatcher stamps it as the kage_trace_id attribute; capturing it here lets tests assert
+	// the attribution reached dispatch, tying the delivered turn to its Sender.
+	TraceID string
+	Text    string
 }
 
 // Dispatch records the delivery (or returns the preset error).
@@ -80,6 +90,7 @@ func (f *FakeDispatcher) Dispatch(_ context.Context, target Target, msg Message)
 		TopicName: target.TopicName,
 		Handle:    target.Handle,
 		Sender:    msg.Sender,
+		TraceID:   msg.TraceID,
 		Text:      msg.Text,
 	})
 	return nil
