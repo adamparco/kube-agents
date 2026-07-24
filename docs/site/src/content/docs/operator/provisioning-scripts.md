@@ -32,7 +32,7 @@ Both accept `--dry-run` to print planned actions without applying them.
 
 ### 04. IAM + Workload Identity
 
-`provision_04_gcp_iam.sh` — Creates GSAs for the controller and Platform Agent, binds Kubernetes SAs to them via Workload Identity, and grants the appropriate GKE permissions (`read-only`, `gke-admin`, or `custom`).
+`provision_04_gcp_iam.sh` — Creates GSAs for the controller and Platform Agent, binds Kubernetes SAs to them via Workload Identity, and grants read-only GKE permissions (`read-only` (default) or `custom`). The Platform Agent is read-only at the cloud boundary; the retired `gke-admin` preset is coerced to `read-only` and any stale admin bindings are removed on the next run.
 
 ### 05. Google Chat Pub/Sub
 
