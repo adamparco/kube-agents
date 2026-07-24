@@ -5,15 +5,15 @@ metadata:
   name: agent-data
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: Agent
-    name: agent
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Agent
+      name: agent
+      uid: ""
 spec:
   accessModes:
-  - ReadWriteOnce
+    - ReadWriteOnce
   resources:
     requests:
       storage: 10Gi
@@ -26,15 +26,15 @@ metadata:
   name: system-metadata
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: Agent
-    name: agent
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Agent
+      name: agent
+      uid: ""
 spec:
   accessModes:
-  - ReadWriteOnce
+    - ReadWriteOnce
   resources:
     requests:
       storage: 1Gi
@@ -120,12 +120,12 @@ metadata:
   name: agent-config
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: Agent
-    name: agent
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Agent
+      name: agent
+      uid: ""
 ---
 apiVersion: v1
 data:
@@ -177,12 +177,12 @@ metadata:
   name: agent-fluent-bit-config
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: Agent
-    name: agent
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Agent
+      name: agent
+      uid: ""
 ---
 apiVersion: v1
 data:
@@ -195,12 +195,12 @@ metadata:
   name: agent-settings
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: Agent
-    name: agent
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Agent
+      name: agent
+      uid: ""
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -212,12 +212,12 @@ metadata:
   name: agent-gateway
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: Agent
-    name: agent
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Agent
+      name: agent
+      uid: ""
 spec:
   replicas: 1
   selector:
@@ -237,175 +237,175 @@ spec:
         kube-agents/tier: cluster-admin
     spec:
       containers:
-      - env:
-        - name: PLATFORM_AGENT_HOME
-          value: /opt/data
-        - name: HOME
-          value: /opt/data/home
-        - name: PLATFORM_AGENT_PLUGINS_DEBUG
-          value: "0"
-        - name: API_SERVER_ENABLED
-          value: "true"
-        - name: API_SERVER_HOST
-          value: 0.0.0.0
-        - name: SESSION_KV_DB_PATH
-          value: /var/lib/kube-agents/session/session_kv.db
-        - name: AGENT_TIER
-          value: cluster-admin
-        - name: OTEL_SERVICE_NAME
-          value: agent-gateway
-        - name: OTEL_EXPORTER_OTLP_ENDPOINT
-          value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
-        - name: OTEL_EXPORTER_OTLP_PROTOCOL
-          value: http/protobuf
-        - name: OTEL_RESOURCE_ATTRIBUTES
-          value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=agent
-        - name: GKE_CLUSTER_NAME
-          value: cluster-a
-        - name: GKE_LOCATION
-          value: us-central1-a
-        - name: API_SERVER_KEY
-          valueFrom:
-            secretKeyRef:
-              key: api-key
-              name: agent-secrets
-        - name: GOOGLE_CHAT_PROJECT_ID
-          value: kube-agents-gkedemos
-        - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
-          value: projects/kube-agents-gkedemos/subscriptions/kubeagents-cluster-admin-cluster-a-events-sub
-        - name: GOOGLE_CHAT_ALLOWED_USERS
-          value: users/REPLACE_WITH_CLUSTER_ADMIN_ID
-        - name: GOOGLE_CHAT_HOME_CHANNEL
-        - name: TOKEN_BROKER_URL
-          value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
-        image: ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0
-        imagePullPolicy: IfNotPresent
-        name: platform-agent
-        ports:
-        - containerPort: 8642
-          name: api
-        resources:
-          limits:
-            cpu: "2"
-            memory: 4Gi
-          requests:
-            cpu: 500m
-            memory: 2Gi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-        volumeMounts:
-        - mountPath: /opt/data
-          name: platform-agent-data-vol
-        - mountPath: /opt/data/config.yaml
-          name: platform-agent-config-vol
-          readOnly: true
-          subPath: config.yaml
-        - mountPath: /opt/data/SETTINGS.md
-          name: settings-volume
-          readOnly: true
-          subPath: SETTINGS.md
-        - mountPath: /var/lib/kube-agents/session
-          name: system-metadata
-          subPath: session
-      - args:
-        - hermes
-        - dashboard
-        env:
-        - name: PLATFORM_AGENT_HOME
-          value: /opt/data
-        - name: HOME
-          value: /opt/data/home
-        - name: SESSION_KV_DB_PATH
-          value: /var/lib/kube-agents/session/session_kv.db
-        image: ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0
-        imagePullPolicy: IfNotPresent
-        name: platform-agent-dashboard
-        ports:
-        - containerPort: 9119
-          name: dashboard
-        resources:
-          limits:
-            cpu: "1"
-            memory: 2Gi
-          requests:
-            cpu: 256m
-            memory: 512Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-        volumeMounts:
-        - mountPath: /opt/data
-          name: platform-agent-data-vol
-        - mountPath: /var/lib/kube-agents/session
-          name: system-metadata
-          subPath: session
-      - args:
-        - -c
-        - /fluent-bit/etc/fluent-bit.conf
-        image: fluent/fluent-bit:5.0.7
-        name: fluent-bit
-        resources:
-          limits:
-            cpu: 500m
-            ephemeral-storage: 1Gi
-            memory: 256Mi
-          requests:
-            cpu: 100m
-            ephemeral-storage: 1Gi
-            memory: 128Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-        volumeMounts:
-        - mountPath: /opt/data
-          name: platform-agent-data-vol
-          readOnly: true
-        - mountPath: /fluent-bit/etc/fluent-bit.conf
-          name: fluent-bit-config
-          readOnly: true
-          subPath: fluent-bit.conf
-        - mountPath: /fluent-bit/etc/parsers.conf
-          name: fluent-bit-config
-          readOnly: true
-          subPath: parsers.conf
-        - mountPath: /fluent-bit/state
-          name: fluent-bit-state
-      - args:
-        - --cluster-name=cluster-a
-        - --daemon-url=http://127.0.0.1:8699
-        - --token-env=API_SERVER_KEY
-        - --owner=platform
-        - --reason=FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled
-        command:
-        - /usr/local/bin/k8s-event-watcher
-        env:
-        - name: API_SERVER_KEY
-          valueFrom:
-            secretKeyRef:
-              key: api-key
-              name: agent-secrets
-        image: ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0
-        imagePullPolicy: IfNotPresent
-        name: event-watcher
-        resources:
-          limits:
-            cpu: 200m
-            memory: 128Mi
-          requests:
-            cpu: 50m
-            memory: 64Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
+        - env:
+            - name: PLATFORM_AGENT_HOME
+              value: /opt/data
+            - name: HOME
+              value: /opt/data/home
+            - name: PLATFORM_AGENT_PLUGINS_DEBUG
+              value: "0"
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: API_SERVER_HOST
+              value: 0.0.0.0
+            - name: SESSION_KV_DB_PATH
+              value: /var/lib/kube-agents/session/session_kv.db
+            - name: AGENT_TIER
+              value: cluster-admin
+            - name: OTEL_SERVICE_NAME
+              value: agent-gateway
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=agent
+            - name: GKE_CLUSTER_NAME
+              value: cluster-a
+            - name: GKE_LOCATION
+              value: us-central1-a
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: api-key
+                  name: agent-secrets
+            - name: GOOGLE_CHAT_PROJECT_ID
+              value: kube-agents-gkedemos
+            - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
+              value: projects/kube-agents-gkedemos/subscriptions/kubeagents-cluster-admin-cluster-a-events-sub
+            - name: GOOGLE_CHAT_ALLOWED_USERS
+              value: users/REPLACE_WITH_CLUSTER_ADMIN_ID
+            - name: GOOGLE_CHAT_HOME_CHANNEL
+            - name: TOKEN_BROKER_URL
+              value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+          image: ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0
+          imagePullPolicy: IfNotPresent
+          name: platform-agent
+          ports:
+            - containerPort: 8642
+              name: api
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /opt/data
+              name: platform-agent-data-vol
+            - mountPath: /opt/data/config.yaml
+              name: platform-agent-config-vol
+              readOnly: true
+              subPath: config.yaml
+            - mountPath: /opt/data/SETTINGS.md
+              name: settings-volume
+              readOnly: true
+              subPath: SETTINGS.md
+            - mountPath: /var/lib/kube-agents/session
+              name: system-metadata
+              subPath: session
+        - args:
+            - hermes
+            - dashboard
+          env:
+            - name: PLATFORM_AGENT_HOME
+              value: /opt/data
+            - name: HOME
+              value: /opt/data/home
+            - name: SESSION_KV_DB_PATH
+              value: /var/lib/kube-agents/session/session_kv.db
+          image: ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0
+          imagePullPolicy: IfNotPresent
+          name: platform-agent-dashboard
+          ports:
+            - containerPort: 9119
+              name: dashboard
+          resources:
+            limits:
+              cpu: "1"
+              memory: 2Gi
+            requests:
+              cpu: 256m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /opt/data
+              name: platform-agent-data-vol
+            - mountPath: /var/lib/kube-agents/session
+              name: system-metadata
+              subPath: session
+        - args:
+            - -c
+            - /fluent-bit/etc/fluent-bit.conf
+          image: fluent/fluent-bit:5.0.7
+          name: fluent-bit
+          resources:
+            limits:
+              cpu: 500m
+              ephemeral-storage: 1Gi
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              ephemeral-storage: 1Gi
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /opt/data
+              name: platform-agent-data-vol
+              readOnly: true
+            - mountPath: /fluent-bit/etc/fluent-bit.conf
+              name: fluent-bit-config
+              readOnly: true
+              subPath: fluent-bit.conf
+            - mountPath: /fluent-bit/etc/parsers.conf
+              name: fluent-bit-config
+              readOnly: true
+              subPath: parsers.conf
+            - mountPath: /fluent-bit/state
+              name: fluent-bit-state
+        - args:
+            - --cluster-name=cluster-a
+            - --daemon-url=http://127.0.0.1:8699
+            - --token-env=API_SERVER_KEY
+            - --owner=platform
+            - --reason=FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled
+          command:
+            - /usr/local/bin/k8s-event-watcher
+          env:
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: api-key
+                  name: agent-secrets
+          image: ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0
+          imagePullPolicy: IfNotPresent
+          name: event-watcher
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -415,26 +415,26 @@ spec:
       serviceAccountName: cluster-admin-agent
       shareProcessNamespace: true
       volumes:
-      - name: platform-agent-data-vol
-        persistentVolumeClaim:
-          claimName: agent-data
-      - configMap:
-          defaultMode: 493
-          name: agent-config
-        name: platform-agent-config-vol
-      - configMap:
-          defaultMode: 420
-          name: agent-fluent-bit-config
-        name: fluent-bit-config
-      - emptyDir: {}
-        name: fluent-bit-state
-      - name: system-metadata
-        persistentVolumeClaim:
-          claimName: system-metadata
-      - configMap:
-          defaultMode: 420
-          name: agent-settings
-        name: settings-volume
+        - name: platform-agent-data-vol
+          persistentVolumeClaim:
+            claimName: agent-data
+        - configMap:
+            defaultMode: 493
+            name: agent-config
+          name: platform-agent-config-vol
+        - configMap:
+            defaultMode: 420
+            name: agent-fluent-bit-config
+          name: fluent-bit-config
+        - emptyDir: {}
+          name: fluent-bit-state
+        - name: system-metadata
+          persistentVolumeClaim:
+            claimName: system-metadata
+        - configMap:
+            defaultMode: 420
+            name: agent-settings
+          name: settings-volume
 status: {}
 ---
 apiVersion: v1
@@ -444,20 +444,20 @@ metadata:
   name: agent
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: Agent
-    name: agent
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Agent
+      name: agent
+      uid: ""
 spec:
   ports:
-  - name: api
-    port: 8642
-    targetPort: api
-  - name: dashboard
-    port: 9119
-    targetPort: dashboard
+    - name: api
+      port: 8642
+      targetPort: api
+    - name: dashboard
+      port: 9119
+      targetPort: dashboard
   selector:
     app: agent-gateway
 status:

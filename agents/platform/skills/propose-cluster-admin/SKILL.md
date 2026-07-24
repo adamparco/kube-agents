@@ -20,7 +20,7 @@ order and the kube-agents controller reconciles the pod **bound to the pre-creat
 
 > **You never run `kubectl`/`gcloud`/cloud mutations, and you never mint an identity at runtime.** The
 > only write path is this reviewed PR actuated by CI/CD. The bundle ships the read-only identity as
-> *desired state* (pre-created by the pipeline), never created by the controller.
+> _desired state_ (pre-created by the pipeline), never created by the controller.
 
 ## What the Bundle Contains
 
