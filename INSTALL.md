@@ -24,6 +24,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Phase 4 — Coordination & knowledge (push-first proactivity + OKF)](#phase-4--coordination--knowledge-push-first-proactivity--okf)
    - [Phase 5 — Security gate & hardening (review-gate CI, egress, pod hardening, attribution)](#phase-5--security-gate--hardening-review-gate-ci-egress-pod-hardening-attribution)
    - [Phase 6 — Failure-isolation & resilience (chaos: no cascade)](#phase-6--failure-isolation--resilience-chaos-no-cascade)
+   - [Phase 7 — Cloud-agnostic seams (Terraform, second CI/CD, provider-neutral observability)](#phase-7--cloud-agnostic-seams-terraform-second-cicd-provider-neutral-observability)
 6. [Teardown & Cleanup](#teardown--cleanup)
 7. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
@@ -529,6 +530,70 @@ local-dev/kind/verify-phase6.sh kind-kube-agents-dev
 > load-bearing half on Kind (cluster state + workloads survive hub loss) and never asserts the rest
 > green. Parent → child is an **authority/lifecycle** edge, not a runtime dependency; the hub is
 > shared-fate for agent **reasoning**, not for the cluster's **running state**.
+
+### Phase 7 — Cloud-agnostic seams (Terraform, second CI/CD, provider-neutral observability)
+
+Phase 7 is the **final** roadmap phase. Like Phase 6 it adds **no new persona and no new write path** —
+it reduces GKE coupling ([01](docs/design/01-vision-scope.md) §6) by turning three already-unopinionated
+_contracts_ into real, tested artifacts, while keeping GKE/GCP as the **zero-config default** (every knob
+unset ⇒ current behavior, byte-for-byte). Three seams land:
+
+- **IaC — Terraform HCL as well as KCC YAML.** `spec.iac.format: terraform` now has a real, committed
+  provisioning exemplar. The repo ships a matched pair of equivalent clusters:
+  `examples/gitops-repo/clusters/cluster-a/provisioning/*.yaml` (KCC, `format: kcc`) and
+  `examples/gitops-repo/clusters/cluster-b/provisioning/*.tf` (Terraform HCL, `format: terraform`). The
+  reference pipeline already dispatches `.tf`→`terraform apply` / `.y*ml`→`kubectl apply`.
+- **A second CI/CD — CircleCI alongside GitHub Actions.** `examples/gitops-repo/.circleci/config.yml`
+  actuates the same GitOps repo with the **same** KCC/HCL dispatch and least-privilege per-target creds as
+  `.github/workflows/apply.yml`, proving actuation is genuinely unopinionated — and, per **invariant 2**,
+  introducing **no agent-held write credential** (the pipeline is the privileged writer, not the agent).
+- **Provider-neutral observability.** The OTLP export endpoint moves from baked-at-build to the standard
+  `OTEL_EXPORTER_OTLP_ENDPOINT` env (resolved by the entrypoint, **defaulting to the existing
+  `gke-managed-otel` collector**), and the observability skill's backend base URLs resolve from
+  `KUBEAGENTS_OBS_BACKEND` / `OBS_*_BASE_URL` (**defaulting to `gcp`**), with a documented Prometheus/OTLP
+  path for a non-GCP target.
+
+Run the consolidated Phase 7 gate — the net-new seam validators, the vanilla (non-GKE) core-concept
+acceptance, and the full prior-phase regression (the live ops are destructive and **guarded to Kind
+contexts**):
+
+```bash
+local-dev/kind/verify-phase7.sh kind-kube-agents-dev
+```
+
+It proves 07 §2 Phase 7 Accept **(a)–(c)**:
+
+- **Section A — seam validators (hermetic, CI-safe with no cluster).** `iac-parity.py` (the Terraform HCL
+  exemplar is **structurally valid** — required `terraform{}`/`google_container_cluster`/
+  `google_container_node_pool` blocks + attributes, balanced braces — **and semantically equivalent** to
+  the KCC exemplar: same location, release channel, node machine type/count, networking; `apply.yml`
+  dispatches each format correctly; a bad-HCL negative control fails) → Accept **(a)**;
+  `circleci-parity.py` (valid `version: 2.1` config with an apply job + a workflow filtered to `main`,
+  same KCC/HCL dispatch + per-target least-priv creds as `apply.yml`, no agent-held credential; a
+  malformed-config negative control fails) → Accept **(b)**; `observability-seam.py` + `otel-endpoint.sh`
+  (an env override changes the resolved endpoint/backend to a non-`googleapis.com` target; **unset ⇒ the
+  exact current GKE default**, no regression; a non-GCP profile with a required URL unset **fails loudly**
+  rather than silently falling back to Google).
+- **Section B — vanilla (Kind, non-GKE) core-concept acceptance** → Accept **(c)**. On a vanilla upstream
+  Kubernetes node (asserted from the node `kubeletVersion` carrying **no `-gke` suffix**), the Phase 1–3
+  cloud-neutral core concepts hold with **no GKE dependency**: read-only agent SAR, GitOps-PR-only
+  mutation, namespace isolation, the `(tier,scope)` cardinality webhook, VAP attenuation, and
+  deterministic ChatOps routing (`inference_calls == 0`, proven hermetically by
+  `go test -run TestGateway_ThreadAffinity`). An explicit **no-GKE-dependency** static assertion scans the
+  cloud-neutral **mechanism** path (VAP, webhook, controller RBAC, router Go) for any `*.googleapis.com` /
+  GKE-only API reference; the cloud-**coupled** Workload-Identity→GSA annotation is flagged
+  deferred-not-faked (D1), not scanned or faked green.
+- **Section C — full regression.** `verify-phase6.sh` → transitively chaos C1–C4 + `verify-phase{2,3,4,5}.sh`
+  - 03 §11 `negative-attenuation.sh` + goldens + `go test ./...`, all still green (the seam changes are
+    additive and default-preserving, so nothing prior moves).
+
+> **Deferred, not faked.** A **real second cloud** — an EKS/AKS cluster with its cloud identity (IRSA /
+> AAD Workload Identity) and a live `terraform apply` / cross-cloud pipeline run (D1/D2). **CLI-level
+> artifact validation** — `terraform validate`/`fmt`/`apply` and `circleci config validate`: the
+> `terraform` and `circleci` binaries are absent on the build host, so structural + semantic parity is
+> proven **hermetically** (via `go`/`python3`) instead, exactly as Calico stood in for kindnet's missing
+> NetworkPolicy enforcement in earlier phases. A **live non-GCP observability backend** queried
+> end-to-end (D3). None of these are asserted green.
 
 ## Teardown & Cleanup
 
