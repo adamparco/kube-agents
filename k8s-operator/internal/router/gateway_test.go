@@ -338,3 +338,121 @@ func TestGateway_DeveloperTeamRouting(t *testing.T) {
 		t.Errorf("InferenceCalls = %d across dev-team matrix, want 0", n)
 	}
 }
+
+// TestGateway_InferenceCandidateValidity proves B2's two INDEPENDENT barriers for the NL path, end to
+// end through the gateway. Every case spends exactly one inference (the model IS consulted) yet a
+// mis-proposal never dispatches: it is refused either by the FILTER (the model's handle is not in the
+// live KnownHandles menu) or by the SPINE (Authorize reads the TARGET's allowlist). Routing an inferred
+// handle is never itself an authz signal (03 §4a) — the sender must still be on the target's allowlist.
+func TestGateway_InferenceCandidateValidity(t *testing.T) {
+	t.Parallel()
+	const project = "proj-x"
+
+	newGateway := func(spy *spyInferer) (*Gateway, *FakeDispatcher) {
+		idx := NewIndex()
+		// cluster-a is allowlisted only for users/alice; team-y only for users/alice.
+		idx.Upsert(agentCR("cluster-a-agent", "cluster-admin", project, "cluster-a", "", "topic-ca", []string{"users/alice"}))
+		idx.Upsert(agentCR("team-y-a", "developer-team", project, "cluster-a", "team-y", "topic-ty", []string{"users/alice"}))
+		fake := &FakeDispatcher{}
+		g := &Gateway{Resolver: WithInferer(spy), Index: idx, Dispatch: fake, ProjectID: project}
+		return g, fake
+	}
+
+	t.Run("hallucinated handle is filtered, never routed", func(t *testing.T) {
+		// The model invents a cluster with no live agent (absent from KnownHandles).
+		spy := &spyInferer{candidates: []Candidate{
+			{Handle: Handle{Tier: agentv1alpha1.TierClusterAdmin, Leaf: "cluster-ghost"}, Confidence: 0.99},
+		}}
+		g, fake := newGateway(spy)
+		out, err := g.Handle(context.Background(), Message{Text: "do something clever", Sender: "users/alice"})
+		if !errors.Is(err, ErrUnaddressed) {
+			t.Fatalf("err = %v, want ErrUnaddressed (hallucination filtered)", err)
+		}
+		if out.Dispatched || len(fake.Sent()) != 0 {
+			t.Errorf("hallucination dispatched (dispatched=%v sent=%d)", out.Dispatched, len(fake.Sent()))
+		}
+		if g.Resolver.InferenceCalls() != 1 {
+			t.Errorf("InferenceCalls = %d, want 1 (model was consulted)", g.Resolver.InferenceCalls())
+		}
+		// The gateway handed the inferer the LIVE menu, not an empty or foreign set.
+		if len(spy.gotKnown) != 2 {
+			t.Errorf("inferer got %d known handles, want the 2 live agents", len(spy.gotKnown))
+		}
+	})
+
+	t.Run("mis-inference to a real agent the sender can't reach is refused before dispatch", func(t *testing.T) {
+		// The model confidently proposes cluster-a for a sender who is NOT on cluster-a's allowlist.
+		spy := &spyInferer{candidates: []Candidate{
+			{Handle: Handle{Tier: agentv1alpha1.TierClusterAdmin, Leaf: "cluster-a"}, Confidence: 0.99},
+		}}
+		g, fake := newGateway(spy)
+		out, err := g.Handle(context.Background(), Message{Text: "drain cluster a", Sender: "users/mallory"})
+		if !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("err = %v, want ErrUnauthorized (authz-gated after inference)", err)
+		}
+		if out.Dispatched || len(fake.Sent()) != 0 {
+			t.Errorf("unauthorized inference dispatched (dispatched=%v sent=%d)", out.Dispatched, len(fake.Sent()))
+		}
+		if g.Resolver.InferenceCalls() != 1 {
+			t.Errorf("InferenceCalls = %d, want 1", g.Resolver.InferenceCalls())
+		}
+	})
+
+	t.Run("confident in-menu handle for an allowlisted sender routes via inference", func(t *testing.T) {
+		spy := &spyInferer{candidates: []Candidate{
+			{Handle: Handle{Tier: agentv1alpha1.TierDeveloperTeam, Leaf: "team-y"}, Confidence: 0.99},
+		}}
+		g, fake := newGateway(spy)
+		out, err := g.Handle(context.Background(), Message{Text: "help team y with its deploy", Sender: "users/alice"})
+		if err != nil {
+			t.Fatalf("authorized inference errored: %v", err)
+		}
+		if !out.Dispatched || out.Resolution.Mode != ModeInference {
+			t.Fatalf("dispatched=%v mode=%s, want true/inference", out.Dispatched, out.Resolution.Mode)
+		}
+		if len(fake.Sent()) != 1 || fake.Sent()[0].TopicName != "topic-ty" {
+			t.Fatalf("dispatch = %+v, want one send to topic-ty", fake.Sent())
+		}
+		if g.Resolver.InferenceCalls() != 1 {
+			t.Errorf("InferenceCalls = %d, want 1", g.Resolver.InferenceCalls())
+		}
+	})
+}
+
+// TestInferredHandleStaleMenuRefusedBySpine isolates B2's SECOND barrier: a candidate that PASSED the
+// resolver's filter (it was in the menu snapshot the inferer saw) is still refused when the live index
+// no longer holds it. The spine's zero-match (ErrNoSuchTarget territory), not the filter, catches a menu
+// that went stale between snapshot and dispatch — which is exactly why the two barriers are independent
+// rather than redundant. (Through the coupled gateway the two are recomputed together; this drives them
+// apart deliberately to prove the spine stands on its own.)
+func TestInferredHandleStaleMenuRefusedBySpine(t *testing.T) {
+	t.Parallel()
+	const project = "proj-x"
+	idx := NewIndex()
+	idx.Upsert(agentCR("team-y-a", "developer-team", project, "cluster-a", "team-y", "topic-ty", []string{"users/alice"}))
+	staleMenu := idx.KnownHandles() // snapshot taken while team-y is live
+
+	// team-y is deleted after the snapshot (the informer removed the CR).
+	idx.Remove(types.NamespacedName{Namespace: "kubeagents-system", Name: "team-y-a"})
+
+	spy := &spyInferer{candidates: []Candidate{
+		{Handle: Handle{Tier: agentv1alpha1.TierDeveloperTeam, Leaf: "team-y"}, Confidence: 0.99},
+	}}
+	r := WithInferer(spy)
+
+	// Barrier 1 (filter) PASSES against the stale snapshot: the resolver routes team-y.
+	res, err := r.Infer(context.Background(), "help team y", staleMenu)
+	if err != nil || res.Handle.Leaf != "team-y" {
+		t.Fatalf("Infer on stale menu = (%+v, %v), want a routed team-y (filter passes on the snapshot)", res, err)
+	}
+
+	// Barrier 2 (spine) CATCHES it: the LIVE index no longer holds team-y, so lookup yields zero targets
+	// and the gateway would refuse with ErrNoSuchTarget — never a dispatch to a departed agent.
+	targets, err := idx.LookupHandle(res.Handle, project)
+	if err != nil {
+		t.Fatalf("LookupHandle errored: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Fatalf("stale handle resolved to %d live targets, want 0 (spine refuses)", len(targets))
+	}
+}
