@@ -1,0 +1,42 @@
+# clusters/@@CLUSTER@@/namespaces/@@NAMESPACE@@/40-service-aliases.yaml
+#
+# A4 graft (load-bearing; Phase 3). The controller renders the Developer Team Agent's config with
+# service hostnames hard-coded to the POD's OWN namespace (agent_manifests.go):
+#     model.baseURL    = http://litellm.<ns>.svc.cluster.local/v1
+#     GITHUB_TOKEN_URL = http://github-token-minter.<ns>.svc.cluster.local:8080/token
+# For a dev-team pod placed in @@NAMESPACE@@ (the A1 placement clause forces metadata.namespace == @@NAMESPACE@@),
+# those resolve to `litellm.@@NAMESPACE@@.svc` / `github-token-minter.@@NAMESPACE@@.svc`, which do not exist — the
+# real services live once per cluster in kubeagents-system alongside the @@CLUSTER@@dmin agent. These
+# ExternalName Services are DNS aliases in @@NAMESPACE@@ that CNAME the in-namespace names to the shared
+# kubeagents-system services, so the rendered config works unmodified without teaching the controller
+# per-namespace service topology. The developer-team egress NetworkPolicy admits the resulting hop
+# (see 30-netpol-developer-team-egress.yaml, rule 2).
+#
+# ExternalName is pure DNS (no ClusterIP, no proxying, no port remapping): the client connects to
+# whatever port the rendered URL specifies (80 for litellm, 8080 for the minter), which must match the
+# target services in kubeagents-system. The @@CLUSTER@@dmin agent (which lives IN kubeagents-system) uses
+# those same services directly and needs no alias. The @@CLUSTER@@dmin tier proposes these aliases as part
+# of the propose-developer-team cascade.
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: @@NAMESPACE@@
+  labels:
+    kube-agents/tenant: @@NAMESPACE@@
+    app.kubernetes.io/managed-by: gitops
+spec:
+  type: ExternalName
+  externalName: litellm.kubeagents-system.svc.cluster.local
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: github-token-minter
+  namespace: @@NAMESPACE@@
+  labels:
+    kube-agents/tenant: @@NAMESPACE@@
+    app.kubernetes.io/managed-by: gitops
+spec:
+  type: ExternalName
+  externalName: github-token-minter.kubeagents-system.svc.cluster.local

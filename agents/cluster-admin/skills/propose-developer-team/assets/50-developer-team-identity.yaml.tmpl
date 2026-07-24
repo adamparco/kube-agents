@@ -1,6 +1,6 @@
-# clusters/cluster-a/namespaces/team-x/50-developer-team-identity.yaml
+# clusters/@@CLUSTER@@/namespaces/@@NAMESPACE@@/50-developer-team-identity.yaml
 #
-# The APPLIED per-namespace read-only identity for team-x's Developer Team Agent — namespaced
+# The APPLIED per-namespace read-only identity for @@NAMESPACE@@'s Developer Team Agent — namespaced
 # ServiceAccount + read-only Role + RoleBinding + Workload-Identity annotation. The kube-agents
 # controller REFERENCES the ServiceAccount by name (spec.security.serviceAccountName) and mints no
 # RBAC (08 §4). It is the materialized instance of the tier exemplar at
@@ -20,29 +20,29 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: developer-team-agent
-  namespace: team-x
+  namespace: @@NAMESPACE@@
   labels:
     kube-agents/tier: developer-team
     app.kubernetes.io/managed-by: gitops
   annotations:
-    # Workload Identity: binds this KSA to the VIEWER-ONLY cloud GSA (06 §2; mirrors the cluster-admin
+    # Workload Identity: binds this KSA to the VIEWER-ONLY cloud GSA (06 §2; mirrors the @@CLUSTER@@dmin
     # identity pattern). The GSA holds only viewer cloud IAM — the cloud-write path is a reviewed GitOps
     # PR, never the agent process. Substituted per project by CI/CD; PROJECT_ID = your GCP project ID.
     #
     # NOTE (per-namespace scoping — flagged for the human before production): a single project-level GSA
     # can read cloud resources beyond this one namespace. For true cloud-side namespace isolation, make
-    # this GSA per-namespace (distinct GSA, or an IAM Condition scoping it to team-x's resources) so
+    # this GSA per-namespace (distinct GSA, or an IAM Condition scoping it to @@NAMESPACE@@'s resources) so
     # "reads only its own namespace" holds in the cloud too. On Kind (the inner-loop verification) there
     # is no Workload Identity, so the load-bearing isolation is the namespaced Role below + the egress
     # NetworkPolicy; the K8s-layer proof does not depend on this annotation.
-    iam.gke.io/gcp-service-account: "kubeagents-developer-team-gsa@your-gcp-project-id.iam.gserviceaccount.com"
+    iam.gke.io/gcp-service-account: "kubeagents-developer-team-gsa@@@PROJECT_ID@@.iam.gserviceaccount.com"
 ---
 # Namespaced read-only ("explorer") grant — get/list/watch only, no cluster-scoped access.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: developer-team-agent-explorer
-  namespace: team-x
+  namespace: @@NAMESPACE@@
   labels:
     kube-agents/tier: developer-team
 rules:
@@ -54,7 +54,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: developer-team-agent-explorer
-  namespace: team-x
+  namespace: @@NAMESPACE@@
   labels:
     kube-agents/tier: developer-team
 roleRef:
@@ -64,4 +64,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: developer-team-agent
-    namespace: team-x
+    namespace: @@NAMESPACE@@
