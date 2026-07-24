@@ -38,6 +38,10 @@ type Outcome struct {
 	Decision Decision
 	// Dispatched is true only if Authorize allowed the turn AND the dispatcher succeeded.
 	Dispatched bool
+	// Clarify is non-nil when the turn ended in a clarifying question — an ambiguous @handle or a
+	// low-confidence NL turn (the router refuses to guess, 06 §2b). It carries the candidate menu so the
+	// caller can inspect what was asked; it is a deterministic refusal, never a dispatch.
+	Clarify *ClarifyError
 }
 
 // Gateway is the ChatOps front door (05 C15, 06 §2b). It composes the four decoupled pieces so the
@@ -64,6 +68,21 @@ type Gateway struct {
 	// thread routes to that agent (ModeSticky) WITHOUT spending inference, and every authorized dispatch
 	// (re)binds the thread. Nil disables affinity (the Phase-2 posture): every turn resolves from scratch.
 	Affinity AffinityStore
+	// Replier is the optional seam that delivers a clarifying question back to the human when the router
+	// refuses to guess (ambiguous @handle or low-confidence NL). Nil means the question is audited but not
+	// sent — the Phase-3 posture; the real Google Chat outbound reply wires in with Phase 5.
+	Replier Replier
+}
+
+// Replier delivers a clarifying question back to the human when the router refuses to guess — an
+// ambiguous @handle or a low-confidence NL turn (06 §2b: the router asks which agent, it never picks
+// one). It is an OPTIONAL seam: when the gateway's Replier is nil the question is still audited but not
+// sent, which is the Phase-3 posture (the real Google Chat outbound reply lands with the Phase-5
+// inference proxy). A Replier MUST NOT make any access decision — by the time it runs the turn has
+// already been refused-before-dispatch; it only surfaces the candidate menu so the human can re-address
+// unambiguously.
+type Replier interface {
+	Clarify(ctx context.Context, msg Message, ce *ClarifyError) error
 }
 
 // Handle routes one inbound message end to end. It returns the Outcome and, on any refusal/failure, a
@@ -95,7 +114,15 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 	}
 	out.Resolution = res
 	if err != nil {
-		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: err.Error()})
+		// A low-confidence NL turn comes back from Infer as a *ClarifyError: route it through the same
+		// clarify surface as an ambiguous @handle (audit Clarify==true, ask the human) rather than the
+		// generic-refusal path. Any other error is a terminal refusal with no candidate menu.
+		var ce *ClarifyError
+		if errors.As(err, &ce) {
+			g.emitClarify(ctx, audit, &out, msg, res, ce)
+			return out, err
+		}
+		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Tier: res.Handle.Tier, ThreadID: msg.ThreadID, Reason: err.Error()})
 		return out, err
 	}
 
@@ -108,18 +135,18 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 	if !sticky {
 		targets, err := g.Index.LookupHandle(res.Handle, g.ProjectID)
 		if err != nil {
-			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: err.Error()})
+			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Tier: res.Handle.Tier, ThreadID: msg.ThreadID, Reason: err.Error()})
 			return out, err
 		}
 		switch len(targets) {
 		case 0:
-			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: ErrNoSuchTarget.Error()})
+			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Tier: res.Handle.Tier, ThreadID: msg.ThreadID, Reason: ErrNoSuchTarget.Error()})
 			return out, ErrNoSuchTarget
 		case 1:
 			out.Target = targets[0]
 		default:
 			ce := clarifyForAmbiguousHandle(res.Handle, targets)
-			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: ce.Error()})
+			g.emitClarify(ctx, audit, &out, msg, res, ce)
 			return out, ce
 		}
 	}
@@ -131,13 +158,13 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 	dec := Authorize(target, msg.Sender)
 	out.Decision = dec
 	if !dec.Allowed {
-		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Allowed: false, Reason: dec.Reason})
+		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Tier: target.Tier, ThreadID: msg.ThreadID, Allowed: false, Reason: dec.Reason})
 		return out, ErrUnauthorized
 	}
 
 	// 4. Dispatch: deliver only now that the turn is authorized.
 	if err := g.Dispatch.Dispatch(ctx, target, msg); err != nil {
-		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Allowed: true, Dispatched: false, Reason: "dispatch failed: " + err.Error()})
+		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Tier: target.Tier, ThreadID: msg.ThreadID, Allowed: true, Dispatched: false, Reason: "dispatch failed: " + err.Error()})
 		return out, err
 	}
 	out.Dispatched = true
@@ -150,8 +177,34 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 		g.Affinity.Bind(msg.ThreadID, target.Identity)
 	}
 
-	audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Allowed: true, Dispatched: true, Reason: dec.Reason})
+	audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Tier: target.Tier, ThreadID: msg.ThreadID, Allowed: true, Dispatched: true, Reason: dec.Reason})
 	return out, nil
+}
+
+// emitClarify finalizes a turn the router refuses to guess (an ambiguous @handle or a low-confidence NL
+// turn): it records the candidate menu on out, invokes the optional Replier to ask the human which agent
+// they meant, and emits a single audit record marked Clarify (never Dispatched). A clarify is terminal
+// and deterministic — there is nothing to dispatch and nothing to retry. A Replier failure does not
+// change that outcome; it is folded into the audit reason so it is not silently dropped. Handle/Tier are
+// taken from the resolved handle: populated for an ambiguous @handle (all candidates share that handle),
+// empty for an NL clarify (the candidate menu carries the distinct handles instead).
+func (g *Gateway) emitClarify(ctx context.Context, audit AuditSink, out *Outcome, msg Message, res Resolution, ce *ClarifyError) {
+	out.Clarify = ce
+	reason := ce.Error()
+	if g.Replier != nil {
+		if rerr := g.Replier.Clarify(ctx, msg, ce); rerr != nil {
+			reason = reason + "; clarify reply failed: " + rerr.Error()
+		}
+	}
+	audit.Record(ctx, AuditRecord{
+		Sender:   msg.Sender,
+		Mode:     res.Mode,
+		Handle:   res.Handle.Canonical(),
+		Tier:     res.Handle.Tier,
+		ThreadID: msg.ThreadID,
+		Clarify:  true,
+		Reason:   reason,
+	})
 }
 
 // stickyTarget resolves a bare turn to the agent its thread is bound to, if any (06 §6). It returns a

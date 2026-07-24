@@ -20,26 +20,38 @@ import (
 	"context"
 
 	"github.com/go-logr/logr"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 // AuditRecord is the attributable trace of one routing decision (06 §2b: every chat turn is audited;
 // invariant: every action is attributable). It captures WHO (Sender), the target and HOW it was named
-// (Handle + Mode), and the OUTCOME (Allowed/Dispatched + Reason) — deliberately NOT the raw message
-// text, so audit logs don't accumulate chat contents/secrets. One record is emitted per turn, including
-// refusals, so a refused-before-dispatch turn is as visible as a delivered one.
+// (Handle + Mode + Tier), the conversation it belongs to (ThreadID), and the OUTCOME (Allowed/Dispatched/
+// Clarify + Reason) — deliberately NOT the raw message text, so audit logs don't accumulate chat
+// contents/secrets. One record is emitted per turn, including refusals, so a refused-before-dispatch turn
+// is as visible as a delivered one.
 type AuditRecord struct {
 	// Sender is the requester's platform id (attribution). Empty for an unidentified sender.
 	Sender string
-	// Mode is the resolution mode attempted (slash/handle/inference) — recorded even on refusal.
+	// Mode is the resolution mode attempted (slash/handle/sticky/inference) — recorded even on refusal.
 	Mode Mode
 	// Handle is the canonical @handle resolved/attempted (empty if resolution failed before a handle formed).
 	Handle string
 	// Identity is the target's (tier,scope) key if the turn resolved to a live agent.
 	Identity string
+	// Tier is the resolved target's tier (attribution: which tier of agent handled/refused the turn). Empty
+	// when the turn was refused before any target was resolved.
+	Tier agentv1alpha1.AgentTier
+	// ThreadID is the thread-affinity key the turn belonged to (conversation correlation). Never an authz
+	// input; carried purely so an operator can trace a whole conversation across turns.
+	ThreadID string
 	// Allowed is the before-dispatch authorization decision.
 	Allowed bool
 	// Dispatched is true only if the message was actually delivered to the target topic.
 	Dispatched bool
+	// Clarify is true when the turn ended in a clarifying question (ambiguous handle or low-confidence NL) —
+	// a deterministic refusal-to-guess, distinct from an authz denial. Never dispatched.
+	Clarify bool
 	// Reason is the human-readable cause of the outcome (allow reason, deny reason, or error summary).
 	Reason string
 }
@@ -64,8 +76,11 @@ func (s LogAuditSink) Record(_ context.Context, rec AuditRecord) {
 		"mode", string(rec.Mode),
 		"handle", rec.Handle,
 		"identity", rec.Identity,
+		"tier", string(rec.Tier),
+		"threadID", rec.ThreadID,
 		"allowed", rec.Allowed,
 		"dispatched", rec.Dispatched,
+		"clarify", rec.Clarify,
 		"reason", rec.Reason,
 	)
 }
