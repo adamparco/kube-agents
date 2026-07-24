@@ -161,14 +161,19 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			"command": "node",
 			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://developerknowledge.googleapis.com/mcp"},
 		},
-		"gke": map[string]any{
-			"command": "node",
-			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://container.googleapis.com/mcp"},
-		},
+		// NOTE: the remote `gke` MCP proxy (container.googleapis.com) is intentionally NOT wired here.
+		// It exposes cluster-mutating tools (e.g. create_cluster), and a remote MCP's toolset cannot be
+		// subset client-side, so it is dropped entirely to keep the agent read-only (03 §4, 06 §9). This
+		// render is runtime-authoritative (mounted over /opt/data/config.yaml), so dropping it here is
+		// what actually makes the deployed agent read-only. Provisioning becomes "author KCC/Terraform +
+		// open a PR" via the submit-suggestion skill; the CI/CD actuation pipeline applies on merge.
+		// developer_knowledge above is a read-only knowledge API and stays.
 	}
 	cfg.PlatformToolsets = map[string][]string{
-		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
-		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
+		// mcp-gke is intentionally absent: it is the toolset for the dropped cluster-mutating `gke`
+		// remote MCP server (see NOTE above). Keeping the agent read-only (03 §4, 06 §9).
+		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
+		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
 	}
 
 	// Execution & Display UX configuration
@@ -558,6 +563,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, pullP
 			Name:      "platform-agent-config-vol",
 			MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
 			SubPath:   "config.yaml",
+			// Runtime-authoritative config is operator-rendered and must not be mutable by the agent
+			// process (defense in depth for the read-only invariant, 03 §4).
+			ReadOnly: true,
 		},
 		{
 			Name:      "settings-volume",
