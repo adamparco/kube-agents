@@ -27,5 +27,13 @@ hard enum — add new types by PR):
 ## Entries
 
 - [Standard GKE cluster blueprint](cluster-blueprint/standard-gke.md) — `cluster-blueprint`
+- [Workload CrashLoopBackOff runbook](runbook/pod-crashloop.md) — `runbook`
+
+## Escalations
+
+Cross-tier requests are raised as `escalation/<slug>.md` entries (`type: escalation`) by the
+`raise-escalation` skill and picked up by the parent tier via `read-knowledge` (`--type escalation`) —
+never a direct agent-to-agent call (invariant 3). The [`escalation/`](escalation/.gitkeep) directory is
+seeded empty; entries appear here as lower tiers raise them.
 
 _Markdown links between entries form the knowledge graph. An optional `log.md` may record history._
