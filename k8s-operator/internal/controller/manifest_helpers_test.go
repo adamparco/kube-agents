@@ -111,8 +111,8 @@ func TestDefaultImageForTier(t *testing.T) {
 	}{
 		{"platform", agentv1alpha1.TierPlatform, defaultPlatformAgentImage},
 		{"cluster-admin", agentv1alpha1.TierClusterAdmin, defaultClusterAdminAgentImage},
+		{"developer-team", agentv1alpha1.TierDeveloperTeam, defaultDeveloperTeamAgentImage},
 		{"empty defaults to platform", agentv1alpha1.AgentTier(""), defaultPlatformAgentImage},
-		{"developer-team falls back to platform (Phase 3)", agentv1alpha1.TierDeveloperTeam, defaultPlatformAgentImage},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -143,9 +143,11 @@ func TestBuildDeploymentTierAwareImage(t *testing.T) {
 		want  string
 	}{
 		{"cluster-admin default image", newAgent(agentv1alpha1.TierClusterAdmin, ""), defaultClusterAdminAgentImage},
+		{"developer-team default image", newAgent(agentv1alpha1.TierDeveloperTeam, ""), defaultDeveloperTeamAgentImage},
 		{"platform default image", newAgent(agentv1alpha1.TierPlatform, ""), defaultPlatformAgentImage},
 		{"empty tier default image", newAgent(agentv1alpha1.AgentTier(""), ""), defaultPlatformAgentImage},
 		{"explicit image overrides on cluster-admin", newAgent(agentv1alpha1.TierClusterAdmin, "gcr.io/x/custom:v9"), "gcr.io/x/custom:v9"},
+		{"explicit image overrides on developer-team", newAgent(agentv1alpha1.TierDeveloperTeam, "gcr.io/x/custom:v9"), "gcr.io/x/custom:v9"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
