@@ -1,0 +1,24 @@
+# VAP positive fixture — developer-team read-only Role (03 §4/§11; Phase 3 isolation acceptance).
+#
+# This object MUST be ADMITTED by `kube-agents-agent-readonly`: it is exactly the shape the
+# developer-team pre-created identity ships (policy/rbac-overlay/developer-team.yaml,
+# clusters/cluster-a/namespaces/team-x/50-developer-team-identity.yaml) — a NAMESPACED read-only
+# ("explorer") Role. It is the developer-team counterpart to vap_positive.yaml (cluster-admin) and the
+# positive pair to vap_clusteradmin_negatives.yaml DOC 2 (which denies a developer-team *ClusterRole*
+# as wrong-scope): together they prove the VAP distinguishes correct-scope namespaced read-only RBAC
+# (ADMIT) from wrong-scope cluster-scoped RBAC (DENY) for the namespace tier, not just read vs write.
+#
+# Namespace: team-x (the canonical developer-team namespace). The verify harness ensures team-x exists
+# before applying (see local-dev/tests/negative-attenuation.sh, which creates it). Expect apply to
+# SUCCEED; a failure to admit this legitimate read-only Role is a too-strict-policy regression.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vaptest-developer-team-readonly
+  namespace: team-x
+  labels:
+    kube-agents/tier: developer-team
+rules:
+  - apiGroups: ["", "apps", "batch", "networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"] # namespaced + read-only -> ADMITTED

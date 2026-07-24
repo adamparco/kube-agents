@@ -1,0 +1,77 @@
+# clusters/cluster-a/namespaces/team-x/60-developer-team-agent.yaml — the namespace-scoped
+# developer-team `Agent` CR for team-x (06 §1.1, §2; Phase 3).
+#
+# This is the Developer Team Agent's desired state for the team-x namespace. ONE developer-team agent
+# per namespace (cardinality enforced by the admission webhook on the (tier,scope) key, which for this
+# tier is derived from scope.namespace). It is a CHILD of cluster-a's Cluster Admin Agent (parentRef) —
+# the Cluster Admin Agent proposes this CR (and the sibling identity + isolation manifests) via the
+# propose-developer-team cascade (submit-suggestion PR); a human reviews + merges; CI/CD applies it.
+#
+# PLACEMENT (A1, load-bearing): this CR MUST live in the namespace it scopes — metadata.namespace ==
+# spec.scope.namespace == team-x — or the admission webhook rejects it (validateScopeAndParent). The
+# controller renders every sub-resource (pod, SA binding, the tier-labeled target of the default-deny
+# NetworkPolicy + ResourceQuota) into metadata.namespace, while the (tier,scope) cardinality key is
+# derived from scope.namespace independently; the placement clause keeps the pod inside team-x's
+# isolation controls.
+#
+# The controller REFERENCES the pre-created read-only identity by name (spec.security.serviceAccountName
+# -> developer-team-agent in 50-developer-team-identity.yaml); it never mints RBAC or the KSA (08 §4).
+# That identity MUST be applied BEFORE this CR (identity-before-pod; numeric-prefix order).
+#
+# The agent is READ-ONLY: it audits the workloads in team-x and proposes changes as GitOps PRs — never
+# by mutating the cluster. As the leaf tier it proposes no child agents.
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: Agent
+metadata:
+  name: developer-team-team-x
+  namespace: team-x
+  labels:
+    kube-agents/tier: developer-team
+spec:
+  # Persona / containment level. Immutable after creation (06 §1.1).
+  tier: developer-team
+  # Namespace-scoped: the developer-team tier's home is one namespace within one cluster. project +
+  # cluster + namespace together form the (tier,scope) uniqueness/routing key (agentindex.ScopeIdentity).
+  scope:
+    projectId: "your-gcp-project-id" # substituted per project by CI/CD
+    clusterName: "cluster-a"
+    namespace: "team-x"
+  # Parent is cluster-a's Cluster Admin Agent (the tier one level up that proposed this agent). Required
+  # for non-platform tiers by the admission webhook (validateScopeAndParent).
+  parentRef:
+    name: cluster-admin-cluster-a
+  # Infrastructure-as-code format the agent authors suggestions in (KCC by default; terraform opt-in).
+  iac:
+    format: kcc
+  # Agent runtime image. Omitting spec.deployment.image lets the controller resolve the per-tier baked
+  # default (developer-team-agent) via defaultImageForTier; we pin explicitly here for reproducibility.
+  # Repin to a content-addressable digest (…/developer-team-agent@sha256:…) in production.
+  deployment:
+    image: "ghcr.io/gke-labs/kube-agents/developer-team-agent"
+    tag: "v0.1.0"
+    imagePullPolicy: "IfNotPresent"
+  harness:
+    clusterName: "cluster-a"
+    location: "us-central1"
+    hermes:
+      dashboardEnabled: true
+      apiServerSecretRef:
+        name: developer-team-agent-secrets
+        key: API_SERVER_KEY
+  # The controller references this pre-created SA; it does not create or annotate it (08 §4).
+  # developer-team-agent is defined in ./50-developer-team-identity.yaml (namespaced read-only Role +
+  # RoleBinding + WI-bound KSA).
+  security:
+    serviceAccountName: developer-team-agent
+  integration:
+    googleChat:
+      enabled: true
+      projectId: "your-gcp-project-id"
+      # Per-agent topic the router re-publishes to (PubSubDispatcher target) and this pod's proxy drains.
+      topicName: "kubeagents-developer-team-team-x-events"
+      subscriptionName: "kubeagents-developer-team-team-x-events-sub"
+      # CLOSED allowlist (A4 / acceptance d): ONLY these humans can reach this agent, enforced by the
+      # router BEFORE dispatch. An empty or absent list means ALL users — never ship that (the webhook
+      # + CEL also reject an enabled integration with an empty allowlist). Replace with real Chat IDs.
+      allowedUsers:
+        - "users/REPLACE_WITH_TEAM_X_LEAD_ID"

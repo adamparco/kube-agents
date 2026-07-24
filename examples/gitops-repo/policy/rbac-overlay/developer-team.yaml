@@ -9,6 +9,14 @@ metadata:
   labels:
     kube-agents/tier: developer-team
     app.kubernetes.io/managed-by: gitops
+  annotations:
+    # Workload Identity: binds this KSA to the VIEWER-ONLY cloud GSA (06 §2; mirrors the cluster-admin
+    # exemplar). The GSA holds only viewer cloud IAM — the cloud-write path is a reviewed GitOps PR,
+    # never the agent process. Substituted per project by CI/CD; PROJECT_ID = your GCP project ID.
+    # NOTE: a single project-level GSA can read beyond one namespace; for true cloud-side namespace
+    # isolation make it per-namespace (distinct GSA or an IAM Condition scoped to the namespace). On
+    # Kind there is no WI, so the load-bearing isolation is the namespaced Role below + egress netpol.
+    iam.gke.io/gcp-service-account: "kubeagents-developer-team-gsa@PROJECT_ID.iam.gserviceaccount.com"
 ---
 # Namespaced read only — no cluster-scoped access.
 apiVersion: rbac.authorization.k8s.io/v1
