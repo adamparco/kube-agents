@@ -5,6 +5,17 @@ metadata:
     control-plane: controller-manager
     app.kubernetes.io/name: kube-agents-operator
     app.kubernetes.io/managed-by: kustomize
+    # Pod Security (Phase 5 H-B, 05 §5): the hub namespace runs the operator AND the platform +
+    # cluster-admin agent pods; enforce the restricted PSS profile on all of them. The manager pod
+    # already satisfies it (runAsNonRoot, seccomp RuntimeDefault, drop-ALL, readOnlyRootFilesystem,
+    # no privesc), as do the operator-rendered agent pods. readOnlyRootFilesystem on agent pods is
+    # additionally hard-enforced by policy/vap-agent-pod-hardening.yaml.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
   name: system
 ---
 apiVersion: apps/v1
