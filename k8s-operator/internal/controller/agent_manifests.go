@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/agentindex"
 )
 
 const defaultPlatformAgentSecrets = "platform-agent-secrets"
@@ -296,7 +297,7 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 		saName = agent.Spec.Security.ServiceAccountName
 	}
 
-	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage)
+	image := resolveAgentImage(agent.Spec.Deployment, defaultImageForTier(agentindex.EffectiveTier(agent)))
 
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
