@@ -37,6 +37,20 @@ type ChatEvent struct {
 	Sender string
 	// Space is space.name — carried into the audit record for correlation, never used for authz.
 	Space string
+	// Thread is message.thread.name — the Chat thread the turn belongs to. It is the primary thread-affinity
+	// key (06 §6): follow-ups in the same thread stick to the agent the thread was first routed to.
+	Thread string
+}
+
+// ThreadID is the affinity key for the turn: the Chat thread when present, else the space. A space with
+// no explicit thread is itself one running conversation, so falling back to it keeps affinity working for
+// flat (non-threaded) spaces; it is empty only if the event carried neither, in which case affinity is
+// simply skipped. It is never an authz input — only a routing-continuity one.
+func (e ChatEvent) ThreadID() string {
+	if e.Thread != "" {
+		return e.Thread
+	}
+	return e.Space
 }
 
 // ErrNotAMessageEvent means the event parsed cleanly but is not a MESSAGE (e.g. ADDED_TO_SPACE,
@@ -57,6 +71,9 @@ func ParseChatEvent(raw []byte) (ChatEvent, error) {
 			Sender struct {
 				Name string `json:"name"`
 			} `json:"sender"`
+			Thread struct {
+				Name string `json:"name"`
+			} `json:"thread"`
 		} `json:"message"`
 		Space struct {
 			Name string `json:"name"`
@@ -71,6 +88,7 @@ func ParseChatEvent(raw []byte) (ChatEvent, error) {
 		Text:   envelope.Message.Text,
 		Sender: envelope.Message.Sender.Name,
 		Space:  envelope.Space.Name,
+		Thread: envelope.Message.Thread.Name,
 	}
 	// An absent type is treated as a message (some Chat integrations omit it for direct message posts);
 	// any explicitly non-MESSAGE type is skipped.

@@ -60,6 +60,10 @@ type Gateway struct {
 	ProjectID string
 	// Audit receives one record per turn (defaults to a no-op sink if nil).
 	Audit AuditSink
+	// Affinity is the optional thread→agent binding store (06 §6). When set, a bare message on a bound
+	// thread routes to that agent (ModeSticky) WITHOUT spending inference, and every authorized dispatch
+	// (re)binds the thread. Nil disables affinity (the Phase-2 posture): every turn resolves from scratch.
+	Affinity AffinityStore
 }
 
 // Handle routes one inbound message end to end. It returns the Outcome and, on any refusal/failure, a
@@ -73,12 +77,21 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 	var out Outcome
 
 	// 1. Resolve: name the target. The deterministic core (modes 1/2) runs first and never spends
-	//    inference. Only on ErrNeedsInference (no slash/handle match) does the gateway escalate to the
-	//    mode-3 core, handing it the LIVE handle menu so a hallucinated handle cannot survive. The
-	//    inferred handle then flows through the SAME lookup→authorize→dispatch spine as modes 1/2.
+	//    inference. On ErrNeedsInference (no slash/handle match) the gateway first consults thread
+	//    affinity — a bare follow-up on a bound thread routes stickily with NO inference (ModeSticky) —
+	//    and only if there is no live binding does it escalate to the mode-3 core, handing it the LIVE
+	//    handle menu so a hallucinated handle cannot survive. Deterministic resolution always wins over a
+	//    binding; the inferred handle flows through the SAME lookup→authorize→dispatch spine as modes 1/2.
 	res, err := g.Resolver.Resolve(ctx, msg.Text)
+	sticky := false
 	if errors.Is(err, ErrNeedsInference) {
-		res, err = g.Resolver.Infer(ctx, msg.Text, g.Index.KnownHandles())
+		if t, ok := g.stickyTarget(msg); ok {
+			// A live binding names a target: route to it directly, spending no inference.
+			out.Target = t
+			res, err, sticky = Resolution{Mode: ModeSticky}, nil, true
+		} else {
+			res, err = g.Resolver.Infer(ctx, msg.Text, g.Index.KnownHandles())
+		}
 	}
 	out.Resolution = res
 	if err != nil {
@@ -86,31 +99,35 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 		return out, err
 	}
 
-	// 2. Index-assisted lookup: find the live CR(s) this handle names. Platform/cluster-admin resolve to
-	//    the single occupant of their exact RouteKey; a developer-team handle (namespace leaf only) is
-	//    resolved via the byTierLeaf secondary index — its cluster/project come from the matched CR, never
-	//    the handle. The router names only agents that exist and never guesses between several:
+	// 2. Index-assisted lookup: find the live CR(s) this handle names. Skipped on the sticky path, which
+	//    already holds a live Target from the binding. Platform/cluster-admin resolve to the single
+	//    occupant of their exact RouteKey; a developer-team handle (namespace leaf only) is resolved via
+	//    the byTierLeaf secondary index — its cluster/project come from the matched CR, never the handle.
+	//    The router names only agents that exist and never guesses between several:
 	//      0 matches → ErrNoSuchTarget · 1 → route · >1 → clarify (ask which, never pick one).
-	targets, err := g.Index.LookupHandle(res.Handle, g.ProjectID)
-	if err != nil {
-		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: err.Error()})
-		return out, err
-	}
-	switch len(targets) {
-	case 0:
-		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: ErrNoSuchTarget.Error()})
-		return out, ErrNoSuchTarget
-	case 1:
-		out.Target = targets[0]
-	default:
-		ce := clarifyForAmbiguousHandle(res.Handle, targets)
-		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: ce.Error()})
-		return out, ce
+	if !sticky {
+		targets, err := g.Index.LookupHandle(res.Handle, g.ProjectID)
+		if err != nil {
+			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: err.Error()})
+			return out, err
+		}
+		switch len(targets) {
+		case 0:
+			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: ErrNoSuchTarget.Error()})
+			return out, ErrNoSuchTarget
+		case 1:
+			out.Target = targets[0]
+		default:
+			ce := clarifyForAmbiguousHandle(res.Handle, targets)
+			audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: ce.Error()})
+			return out, ce
+		}
 	}
 	target := out.Target
 
-	// 3. Authorize BEFORE dispatch: read the TARGET's allowlist, fail-closed. This is the single
-	//    enforcement point that fronts every per-tier pod.
+	// 3. Authorize BEFORE dispatch: read the TARGET's allowlist, fail-closed. This runs on EVERY path,
+	//    including sticky — a thread binding routes but never authorizes, so a follow-up from a sender who
+	//    is not on the bound agent's allowlist is still refused here, and the binding is NOT refreshed.
 	dec := Authorize(target, msg.Sender)
 	out.Decision = dec
 	if !dec.Allowed {
@@ -124,8 +141,39 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 		return out, err
 	}
 	out.Dispatched = true
+
+	// 5. Bind the thread to this agent — ONLY now, after a successful authorized dispatch. Every path
+	//    (deterministic, sticky, inference) refreshes the binding, so an explicit @handle rebinds the
+	//    thread to the newly-addressed agent and a sticky follow-up extends the TTL. Binding after (never
+	//    before) Authorize is what keeps a binding from ever standing in for an access check.
+	if g.Affinity != nil && msg.ThreadID != "" {
+		g.Affinity.Bind(msg.ThreadID, target.Identity)
+	}
+
 	audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: target.Handle, Identity: target.Identity, Allowed: true, Dispatched: true, Reason: dec.Reason})
 	return out, nil
+}
+
+// stickyTarget resolves a bare turn to the agent its thread is bound to, if any (06 §6). It returns a
+// live Target and true only when affinity is enabled, the message carries a thread, the thread has a
+// non-expired binding, AND that bound key still resolves to a live agent in the index. A binding to an
+// agent that has since been removed is STALE: stickyTarget drops it and returns false so the caller falls
+// through to fresh NL inference rather than dead-ending on a departed target. It spends no inference and
+// makes no authorization decision — the caller still runs Authorize on the returned target.
+func (g *Gateway) stickyTarget(msg Message) (Target, bool) {
+	if g.Affinity == nil || msg.ThreadID == "" {
+		return Target{}, false
+	}
+	key, ok := g.Affinity.Lookup(msg.ThreadID)
+	if !ok {
+		return Target{}, false
+	}
+	t, ok := g.Index.Lookup(key)
+	if !ok {
+		g.Affinity.Drop(msg.ThreadID) // stale binding: the bound agent is gone.
+		return Target{}, false
+	}
+	return t, true
 }
 
 // ErrUnauthorized is returned when Authorize refuses the turn before dispatch (Phase 2 acceptance d).

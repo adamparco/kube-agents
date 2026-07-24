@@ -37,8 +37,8 @@ import (
 )
 
 // Mode is the routing mode recorded on every chat turn's audit record (06 §2b). Resolution order is
-// deterministic-first: slash → handle → inference. Modes slash+handle spend no inference; inference is
-// the only mode that could spend a model call, and Phase 2 refuses it (see Resolver.Resolve).
+// deterministic-first: slash → handle → sticky (thread affinity) → inference. Only inference can spend a
+// model call; slash/handle/sticky never do. Phase 2 refused inference; Phase 3 adds sticky + inference.
 type Mode string
 
 const (
@@ -46,6 +46,11 @@ const (
 	ModeSlash Mode = "slash"
 	// ModeHandle is an explicit `@handle` mention (constant-time, no inference).
 	ModeHandle Mode = "handle"
+	// ModeSticky is a thread-affinity follow-up (06 §6): a bare message routed to the agent the thread is
+	// already bound to, spending NO inference. The binding is consulted only after slash/handle resolution
+	// finds no target, and can only ever name an agent a prior authorized turn already dispatched to — so
+	// sticky routing never precedes or replaces the per-turn Authorize check.
+	ModeSticky Mode = "sticky"
 	// ModeInference is the NL fallback (one router model call). Deferred to Phase 3; refused in Phase 2.
 	ModeInference Mode = "inference"
 )
