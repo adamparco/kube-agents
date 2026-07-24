@@ -7076,6 +7076,21 @@ spec:
                     - clusterName
                     - location
                   type: object
+                iac:
+                  description:
+                    IAC selects the IaC artifact this agent authors when
+                    proposing changes via GitOps (06 §1.1, §4).
+                  properties:
+                    format:
+                      default: kcc
+                      description:
+                        Format is the artifact format the agent authors (kcc
+                        or terraform).
+                      enum:
+                        - kcc
+                        - terraform
+                      type: string
+                  type: object
                 integration:
                   description: Integration configures platform-specific external connections.
                   properties:
@@ -7225,6 +7240,36 @@ spec:
                             "!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef)
                             && has(self.appTokenSecretRef))"
                   type: object
+                parentRef:
+                  description:
+                    ParentRef links a non-platform agent to its parent (06
+                    §1.2). Required for non-platform tiers.
+                  properties:
+                    name:
+                      description: Name is the parent Agent's name.
+                      type: string
+                  type: object
+                scope:
+                  description:
+                    Scope identifies where the agent operates (per-tier required
+                    fields, 06 §1.2).
+                  properties:
+                    clusterName:
+                      description:
+                        ClusterName is the target cluster (cluster-admin
+                        and developer-team tiers).
+                      type: string
+                    namespace:
+                      description:
+                        Namespace is the target namespace and the pod's placement
+                        namespace (developer-team tier only).
+                      type: string
+                    projectId:
+                      description:
+                        ProjectID is the GCP project the agent is scoped
+                        to (all tiers).
+                      type: string
+                  type: object
                 security:
                   description:
                     Security configures RBAC, Pod Security, and Workload
@@ -7243,6 +7288,19 @@ spec:
                         bound to the Deployment.
                       type: string
                   type: object
+                tier:
+                  default: platform
+                  description: |-
+                    Tier is the agent's persona / containment level (06 §1.1). Immutable after creation.
+                    Defaults to "platform" — the only tier in Phase 1, and the value today's PlatformAgent adopts.
+                  enum:
+                    - platform
+                    - cluster-admin
+                    - developer-team
+                  type: string
+                  x-kubernetes-validations:
+                    - message: tier is immutable
+                      rule: self == oldSelf
               required:
                 - harness
               type: object
