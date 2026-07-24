@@ -159,6 +159,8 @@ RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins 
 # --- CREDENTIAL PROXY TARGET ---
 # This additive target packages Envoy with the credential runtime. Existing
 # platform images remain unchanged until the operator enables the sidecar.
+# The sidecar container only runs Envoy (never the hermes gateway), so its baked
+# persona is inert — ONE shared image serves every tier and it stays FROM platform.
 FROM platform AS credential-proxy
 
 USER root
@@ -168,3 +170,47 @@ COPY --chmod=0644 deploy/shared/envoy-credential-proxy.yaml /etc/envoy/envoy-cre
 COPY deploy/shared/envoy-credential-sidecar.sh /usr/local/bin/envoy-credential-sidecar
 
 RUN chmod 755 /usr/local/bin/envoy /usr/local/bin/envoy-credential-sidecar
+
+
+# --- CLUSTER ADMIN AGENT TARGET ---
+# Second-tier persona (Phase 2). Mirrors the platform stage but bakes the read-only
+# cluster-admin persona from agents/cluster-admin/ (single-cluster scope, zero write
+# tools). The operator resolves this image BY TIER (defaultImageForTier) and injects
+# AGENT_TIER=cluster-admin at runtime. Built via `make docker-build-cluster-admin`
+# (the root Makefile auto-discovers agents/*/ — no target list to maintain).
+FROM agent-base AS cluster-admin
+
+# Setup cluster-admin specific defaults from consolidated configs
+COPY agents/cluster-admin/cron/ /opt/defaults/cron/
+COPY --chown=hermes:hermes agents/cluster-admin/defaults/ /opt/defaults/
+COPY agents/cluster-admin/scripts/ /opt/defaults/scripts/
+COPY agents/cluster-admin/governance/ /opt/defaults/governance/
+COPY agents/cluster-admin/SOUL.md /opt/defaults/SOUL.md
+COPY agents/cluster-admin/AGENTS.md /opt/defaults/AGENTS.md
+
+# Copy cluster-admin skills
+COPY agents/cluster-admin/skills/ /opt/hermes/skills/
+
+# Copy cluster-admin plugins
+COPY agents/cluster-admin/plugins/ /opt/hermes/plugins/
+
+# Copy cluster-admin defaults configuration as temp file
+COPY agents/cluster-admin/config.yaml /tmp/cluster-admin-config.yaml
+
+# Copy config merge helper script
+COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
+
+# Dynamically merge config.yamls using helper script
+RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yaml /tmp/cluster-admin-config.yaml && \
+    rm -f /tmp/merge_configs.py /tmp/cluster-admin-config.yaml
+
+# Normalize ownership and permissions at the end of build
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins && \
+    find /opt/defaults -type d -exec chmod 755 {} + && \
+    find /opt/defaults -type f -exec chmod 644 {} + && \
+    find /opt/hermes/skills -type d -exec chmod 755 {} + && \
+    find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/hermes/plugins -type d -exec chmod 755 {} + && \
+    find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
+    find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
+    find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
