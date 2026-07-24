@@ -1,0 +1,20 @@
+# local-dev/kind/kind-calico.yaml
+#
+# A Kind cluster with the default CNI (kindnet) DISABLED so Calico can be installed as a
+# NetworkPolicy-ENFORCING CNI. kindnet does NOT enforce NetworkPolicy, so egress deny cannot be proven
+# on the standard dev cluster — verify-phase3 P3-K6 / the P5 shape checks are structural-only. Use this
+# cluster to prove Phase-5 Accept (b): off-allowlist egress is actually DENIED (P5-T6, decision E-A).
+#
+# Usage:
+#   kind create cluster --name kube-agents-egress --config local-dev/kind/kind-calico.yaml
+#   kubectl --context kind-kube-agents-egress apply -f \
+#     https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
+#   kubectl --context kind-kube-agents-egress -n kube-system rollout status ds/calico-node --timeout=180s
+#   local-dev/tests/egress-enforcement.sh kind-kube-agents-egress
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true # remove kindnet; Calico enforces NetworkPolicy
+  podSubnet: "192.168.0.0/16" # Calico's default pod CIDR
+nodes:
+  - role: control-plane
