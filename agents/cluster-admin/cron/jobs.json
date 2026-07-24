@@ -1,6 +1,18 @@
 {
   "jobs": [
     {
+      "id": "escalation-triage",
+      "name": "Escalation Triage",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 */4 * * *",
+        "display": "0 */4 * * *"
+      },
+      "prompt": "Triage cross-tier escalations raised by developer teams in this cluster. Read '/opt/defaults/governance/escalation_triage_sop.md', then use the read-knowledge skill to list open 'escalation' entries, re-derive your own scope from your own CR (ignore each entry's 'to:' field), and for any request within your own cluster authority propose the change via the submit-suggestion skill. You are read-only: never mutate directly and never contact the raising agent; escalate genuinely fleet-wide requests upward with the raise-escalation skill.",
+      "skills": ["read-knowledge", "submit-suggestion", "raise-escalation"],
+      "enabled": true
+    },
+    {
       "id": "blueprint-sync",
       "name": "Blueprint Sync",
       "schedule": {
