@@ -22,6 +22,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Phase 2 — Kind inner loop (Cluster Admin Agent + cascade)](#phase-2--kind-inner-loop-cluster-admin-agent--cascade)
    - [Phase 3 — Kind inner loop (Developer Team Agent + namespace isolation)](#phase-3--kind-inner-loop-developer-team-agent--namespace-isolation)
    - [Phase 4 — Coordination & knowledge (push-first proactivity + OKF)](#phase-4--coordination--knowledge-push-first-proactivity--okf)
+   - [Phase 5 — Security gate & hardening (review-gate CI, egress, pod hardening, attribution)](#phase-5--security-gate--hardening-review-gate-ci-egress-pod-hardening-attribution)
 6. [Teardown & Cleanup](#teardown--cleanup)
 7. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
@@ -422,6 +423,58 @@ through a reviewed `submit-suggestion` PR.
    delivery, GitHub webhook HMAC) need the rebuilt Phase-4 image / scratch-GKE — the gate proves the
    in-pod terminus and all rendering/scoping logic instead. **05 §8 chaos** (failure-isolation) is
    Phase 6 and is marked N-A here rather than silently skipped.
+
+### Phase 5 — Security gate & hardening (review-gate CI, egress, pod hardening, attribution)
+
+Phase 5 makes the security model **continuously enforced** rather than set-once, without relaxing any
+invariant (agents stay read-only, the only write path is a reviewed PR). Four deltas land: (1) the
+**review-gate CI** (06 §7) — the agent-driven `review-security-k8s-*` skills run on every PR (and a
+heartbeat re-run) via a **headless detector**, emit findings tagged with a **severity**, and a
+**hermetic Python scorer** turns "any unmitigated high/critical" into a **merge block**; a finding is
+mitigated only by a matching, non-expired entry in `security-review-waivers.yaml` (fingerprint =
+`sha256(agent\nfile\nnormalize(message))[:16]`). (2) A **per-tier egress allowlist** for all three tiers
+(platform is net-new) plus a **real enforcement proof** on Calico. (3) The **hardened pod-security
+context on every agent pod** made continuously enforced — PSS `enforce: restricted` on the namespace
+plus a focused `vap-agent-pod-hardening` VAP that requires `readOnlyRootFilesystem: true` on every
+`kube-agents/tier` pod (restricted-PSS does not cover it), composing with — never colliding with — the
+RBAC-governing `vap-agent-readonly`. (4) **End-to-end attribution** — the authenticated requester +
+per-turn trace id flow router → inject seam → session → PR, stamped as durable `Requested-by:` /
+`Trace-Id:` trailers on the mutation PR (which squash-merge lands in `main`'s history).
+
+> **Enforcement needs the right substrate.** Two Accept criteria can only be _proven_ on capable
+> infrastructure: egress **enforcement** (b) needs a NetworkPolicy-enforcing CNI — the default `kindnet`
+> dev cluster does **not** enforce, so the shape is checked structurally on Kind and actual deny/allow is
+> proven on a **Calico** cluster (`local-dev/kind/kind-calico.yaml` + `local-dev/tests/egress-enforcement.sh`),
+> deferred-not-faked where Calico is unreachable; the pod-hardening **VAP** (c) needs K8s ≥ 1.30 (VAP GA —
+> the dev cluster is v1.31.x). A freshly-applied VAP binding also has a short activation delay, so the
+> gate polls the admission dry-run until the binding is live before judging.
+
+1. **Run the consolidated Phase 5 gate** (the live checks are destructive and guarded to Kind contexts;
+   the hermetic acceptance runs anywhere, so this is CI-safe with no cluster):
+   ```bash
+   local-dev/kind/verify-phase5.sh kind-kube-agents-dev
+   ```
+   It proves 07 §2 Phase 5 Accept **(a)–(d)** — **(a)** `score_findings.py` BLOCKS an unmitigated `high`
+   (exit 1), PASSES a clean set (exit 0), lets a matching non-expired waiver mitigate, and still BLOCKS on
+   an **expired** waiver (negative control), backed by the scorer + extractor unit suites; **(b)** all
+   three tier egress netpols are pure allowlists (`policyTypes:[Egress]`, tier `podSelector`, **no
+   `0.0.0.0/0`**), and live egress enforcement is exercised (DEFERRED, non-fatal, on kindnet — PROVEN
+   separately on Calico); **(c)** the go goldens carry `readOnlyRootFilesystem: true` on every rendered
+   container, the namespace carries the PSS `restricted` label, both VAPs are present, and — live on Kind
+   — the pod-hardening VAP **rejects** an un-hardened `kube-agents/tier` pod (the error names
+   `readOnlyRootFilesystem`), **admits** a hardened one, and leaves a non-agent pod **untouched** (scope
+   proof); **(d)** `submit-suggestion` stamps the `Requested-by:` / `Trace-Id:` trailers (flag > env >
+   autonomous fallback, single-line, idempotent, reaching the dry-run artifact) and the router audit ties
+   `Sender` to the `TraceID` carried through to dispatch. It then re-runs the load-bearing **regression**
+   live on Kind (03 §11 `negative-attenuation.sh`) plus the full prior-phase gates
+   (`verify-phase{2,3,4}.sh`) and `go test ./...`.
+2. **Deferred, not faked:** egress **enforcement** on kindnet defers to the Calico run; the **live
+   headless detector** in `review-gate.yml` needs the `ANTHROPIC_API_KEY` secret + live creds and skips
+   gracefully on fork PRs (like `auto_request_review`) — the scorer, which is the authoritative gate,
+   always runs and is proven hermetically; the **hostname-precise L7 egress proxy**, **cross-object
+   webhook**, **gVisor execution sandbox**, and **per-request user down-scoping** remain deferred
+   hardening (08 §5). **05 §8 chaos** (failure-isolation) is Phase 6 and is marked N-A here rather than
+   silently skipped.
 
 ## Teardown & Cleanup
 
