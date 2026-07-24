@@ -19,9 +19,9 @@ package router
 import "errors"
 
 // IsDeterministicRefusal reports whether err is one of the router's terminal, deterministic refusals
-// (unaddressed/malformed/unknown-tier/inference-disabled/missing-project/developer-team-deferred/
-// no-such-target/unauthorized). These outcomes are a pure function of the message and the current index,
-// so redelivering the same event cannot change them — the inbound receiver Acks them (turn handled).
+// (unaddressed/malformed/unknown-tier/inference-disabled/missing-project/clarify/no-such-target/
+// unauthorized). These outcomes are a pure function of the message and the current index, so
+// redelivering the same event cannot change them — the inbound receiver Acks them (turn handled).
 //
 // Anything else (notably a dispatch/publish failure) is transient: the receiver Nacks so Pub/Sub
 // redelivers. Keeping the classification here, next to the sentinels, means the delivery layer can't
@@ -36,7 +36,7 @@ func IsDeterministicRefusal(err error) bool {
 		ErrUnknownTier,
 		ErrInferenceUnavailable,
 		ErrMissingProjectContext,
-		ErrDeveloperTeamRoutingDeferred,
+		ErrClarify,
 		ErrNoSuchTarget,
 		ErrUnauthorized,
 	} {

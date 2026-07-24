@@ -81,9 +81,11 @@ func TestResolve_DeterministicRefusals(t *testing.T) {
 		wantErr error
 		wantMod Mode
 	}{
-		{"unaddressed NL falls through", "please scale my app to 5 replicas", ErrInferenceUnavailable, ModeInference},
-		{"empty message", "", ErrUnaddressed, ModeInference},
-		{"only the bot mention", "@kage", ErrInferenceUnavailable, ModeInference},
+		// Fallthrough (no slash/handle) is now the deterministic ErrNeedsInference signal — Resolve stops
+		// there without touching the model; the gateway decides escalate-or-refuse.
+		{"unaddressed NL needs inference", "please scale my app to 5 replicas", ErrNeedsInference, ModeInference},
+		{"empty message needs inference", "", ErrNeedsInference, ModeInference},
+		{"only the bot mention needs inference", "@kage", ErrNeedsInference, ModeInference},
 		{"unknown tier in slash", "/wombat-foo hi", ErrUnknownTier, ModeSlash},
 		{"unknown tier in handle", "@wombat-foo hi", ErrUnknownTier, ModeHandle},
 		{"empty leaf in slash", "/cluster- hi", ErrMalformedHandle, ModeSlash},
@@ -108,26 +110,31 @@ func TestResolve_DeterministicRefusals(t *testing.T) {
 	}
 }
 
-// spyInferer records invocations so tests can prove exactly when (and only when) inference is spent.
+// spyInferer records invocations (and the menu it was handed) so tests can prove exactly when — and
+// only when — inference is spent, and that the deterministic core always passes the live handle menu.
 type spyInferer struct {
-	calls  int
-	handle Handle
-	err    error
+	calls      int
+	candidates []Candidate
+	err        error
+	gotKnown   []Handle
 }
 
-func (s *spyInferer) Infer(_ context.Context, _ string) (Handle, error) {
+func (s *spyInferer) Infer(_ context.Context, _ string, known []Handle) ([]Candidate, error) {
 	s.calls++
-	return s.handle, s.err
+	s.gotKnown = known
+	return s.candidates, s.err
 }
 
-// TestResolve_InferenceBoundary proves the mode-3 boundary from both sides: addressed messages never
-// touch an Inferer even when one is wired, and only an unaddressed message spends exactly one call.
-// This is the assertion that makes InferenceCalls==0 meaningful rather than vacuous.
+// TestResolve_InferenceBoundary proves the split boundary from both sides: addressed messages resolve
+// deterministically via Resolve and NEVER reach the inferer; an unaddressed message makes Resolve return
+// ErrNeedsInference WITHOUT spending, and only the subsequent Infer call spends exactly once. This is
+// what makes InferenceCalls==0 for modes 1/2 meaningful rather than vacuous.
 func TestResolve_InferenceBoundary(t *testing.T) {
-	spy := &spyInferer{handle: Handle{Tier: agentv1alpha1.TierClusterAdmin, Leaf: "guessed"}}
+	known := []Handle{{Tier: agentv1alpha1.TierClusterAdmin, Leaf: "guessed"}}
+	spy := &spyInferer{candidates: []Candidate{{Handle: known[0], Confidence: 0.95}}}
 	r := WithInferer(spy)
 
-	// Addressed messages (mode 1/2) must NOT invoke the inferer.
+	// Addressed messages (mode 1/2) resolve deterministically and must NOT invoke the inferer.
 	for _, text := range []string{"/cluster-bravo go", "@platform-proj1 report"} {
 		if _, err := r.Resolve(context.Background(), text); err != nil {
 			t.Fatalf("Resolve(%q) unexpected error: %v", text, err)
@@ -137,16 +144,127 @@ func TestResolve_InferenceBoundary(t *testing.T) {
 		t.Fatalf("addressed messages spent inference: spy=%d counter=%d, want 0/0", spy.calls, r.InferenceCalls())
 	}
 
-	// An unaddressed message with an Inferer wired (the Phase-3 posture) spends exactly one call.
-	res, err := r.Resolve(context.Background(), "please help me")
+	// An unaddressed message: Resolve signals ErrNeedsInference WITHOUT spending.
+	if _, err := r.Resolve(context.Background(), "please help me"); !errors.Is(err, ErrNeedsInference) {
+		t.Fatalf("Resolve(unaddressed) err = %v, want ErrNeedsInference", err)
+	}
+	if spy.calls != 0 || r.InferenceCalls() != 0 {
+		t.Fatalf("Resolve spent inference on fallthrough: spy=%d counter=%d, want 0/0", spy.calls, r.InferenceCalls())
+	}
+
+	// Only Infer spends — exactly one call — and it routes the confident, in-menu candidate.
+	res, err := r.Infer(context.Background(), "please help me", known)
 	if err != nil {
-		t.Fatalf("Resolve(unaddressed) with inferer: unexpected error: %v", err)
+		t.Fatalf("Infer(unaddressed) unexpected error: %v", err)
 	}
 	if res.Mode != ModeInference || res.Handle.Leaf != "guessed" {
 		t.Errorf("inference result = (%s,%s), want (inference,guessed)", res.Mode, res.Handle.Leaf)
 	}
 	if spy.calls != 1 || r.InferenceCalls() != 1 {
 		t.Fatalf("inference accounting off: spy=%d counter=%d, want 1/1", spy.calls, r.InferenceCalls())
+	}
+	if len(spy.gotKnown) != 1 || spy.gotKnown[0].Leaf != "guessed" {
+		t.Errorf("Infer was not handed the live menu: %+v", spy.gotKnown)
+	}
+}
+
+// TestInfer_RouteClarifyAndAccounting exercises the mode-3 core contract: the deterministic core owns
+// the route/clarify decision and inference is spent exactly once for a routed OR clarified turn, and not
+// at all for empty text or a missing inferer.
+func TestInfer_RouteClarifyAndAccounting(t *testing.T) {
+	known := []Handle{
+		{Tier: agentv1alpha1.TierClusterAdmin, Leaf: "cluster-a"},
+		{Tier: agentv1alpha1.TierClusterAdmin, Leaf: "cluster-b"},
+	}
+
+	t.Run("empty text refuses before spending", func(t *testing.T) {
+		spy := &spyInferer{}
+		r := WithInferer(spy)
+		if _, err := r.Infer(context.Background(), "   ", known); !errors.Is(err, ErrUnaddressed) {
+			t.Fatalf("err = %v, want ErrUnaddressed", err)
+		}
+		if spy.calls != 0 || r.InferenceCalls() != 0 {
+			t.Fatalf("empty text spent inference: %d/%d, want 0/0", spy.calls, r.InferenceCalls())
+		}
+	})
+
+	t.Run("no inferer refuses without spending", func(t *testing.T) {
+		r := NewResolver()
+		if _, err := r.Infer(context.Background(), "do something", known); !errors.Is(err, ErrInferenceUnavailable) {
+			t.Fatalf("err = %v, want ErrInferenceUnavailable", err)
+		}
+		if r.InferenceCalls() != 0 {
+			t.Fatalf("nil-inferer path incremented: %d, want 0", r.InferenceCalls())
+		}
+	})
+
+	t.Run("confident in-menu candidate routes, spends one", func(t *testing.T) {
+		spy := &spyInferer{candidates: []Candidate{{Handle: known[0], Confidence: 0.9}}}
+		r := WithInferer(spy)
+		res, err := r.Infer(context.Background(), "drain cluster a", known)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if res.Handle != known[0] || res.Mode != ModeInference {
+			t.Fatalf("res = %+v, want route to cluster-a via inference", res)
+		}
+		if r.InferenceCalls() != 1 {
+			t.Fatalf("InferenceCalls = %d, want 1 for a routed turn", r.InferenceCalls())
+		}
+	})
+
+	t.Run("low confidence clarifies, still spends one", func(t *testing.T) {
+		spy := &spyInferer{candidates: []Candidate{{Handle: known[0], Confidence: 0.5}}}
+		r := WithInferer(spy)
+		var ce *ClarifyError
+		_, err := r.Infer(context.Background(), "ambiguous ask", known)
+		if !errors.Is(err, ErrClarify) || !errors.As(err, &ce) {
+			t.Fatalf("err = %v, want ErrClarify", err)
+		}
+		if r.InferenceCalls() != 1 {
+			t.Fatalf("InferenceCalls = %d, want 1 for a clarified turn", r.InferenceCalls())
+		}
+	})
+
+	t.Run("near-tie clarifies even above threshold", func(t *testing.T) {
+		spy := &spyInferer{candidates: []Candidate{
+			{Handle: known[0], Confidence: 0.90},
+			{Handle: known[1], Confidence: 0.88}, // within the 0.10 margin of the top
+		}}
+		r := WithInferer(spy)
+		if _, err := r.Infer(context.Background(), "which cluster", known); !errors.Is(err, ErrClarify) {
+			t.Fatalf("err = %v, want ErrClarify (near-tie)", err)
+		}
+	})
+
+	t.Run("hallucinated candidate is filtered out, refuses after spending", func(t *testing.T) {
+		spy := &spyInferer{candidates: []Candidate{
+			{Handle: Handle{Tier: agentv1alpha1.TierClusterAdmin, Leaf: "does-not-exist"}, Confidence: 0.99},
+		}}
+		r := WithInferer(spy)
+		if _, err := r.Infer(context.Background(), "route me to a ghost", known); !errors.Is(err, ErrUnaddressed) {
+			t.Fatalf("err = %v, want ErrUnaddressed (hallucination filtered)", err)
+		}
+		if r.InferenceCalls() != 1 {
+			t.Fatalf("InferenceCalls = %d, want 1 (the model WAS consulted)", r.InferenceCalls())
+		}
+	})
+}
+
+// TestInfer_ThresholdFlipByConfigOnly proves the route↔clarify boundary moves ONLY via WithThreshold:
+// the identical model proposal routes under the default gate and clarifies under a raised one.
+func TestInfer_ThresholdFlipByConfigOnly(t *testing.T) {
+	known := []Handle{{Tier: agentv1alpha1.TierClusterAdmin, Leaf: "cluster-a"}}
+	cands := []Candidate{{Handle: known[0], Confidence: 0.80}}
+
+	rRoute := WithInferer(&spyInferer{candidates: cands})
+	if res, err := rRoute.Infer(context.Background(), "x", known); err != nil || res.Handle != known[0] {
+		t.Fatalf("default threshold: res=%+v err=%v, want route", res, err)
+	}
+
+	rClarify := WithInferer(&spyInferer{candidates: cands}).WithThreshold(0.85, 0.10)
+	if _, err := rClarify.Infer(context.Background(), "x", known); !errors.Is(err, ErrClarify) {
+		t.Fatalf("raised threshold: err = %v, want ErrClarify", err)
 	}
 }
 
@@ -188,10 +306,14 @@ func TestHandle_RouteKey(t *testing.T) {
 		}
 	})
 
-	t.Run("developer-team routing deferred to Phase 3", func(t *testing.T) {
+	t.Run("developer-team has no RouteKey branch (resolved via the index)", func(t *testing.T) {
+		// A developer-team handle carries only a namespace leaf and cannot name a cluster, so its full
+		// key exists only on a live CR: it is resolved through Index.LookupHandle (byTierLeaf), never
+		// RouteKey. RouteKey therefore does not form a dev-team key — the routing path is exercised in
+		// TestIndex_LookupHandle / TestGateway_DeveloperTeamRouting.
 		h := Handle{Tier: agentv1alpha1.TierDeveloperTeam, Leaf: "team-ns"}
-		if _, err := h.RouteKey(project); !errors.Is(err, ErrDeveloperTeamRoutingDeferred) {
-			t.Errorf("RouteKey(devteam) err = %v, want ErrDeveloperTeamRoutingDeferred", err)
+		if _, err := h.RouteKey(project); !errors.Is(err, ErrUnknownTier) {
+			t.Errorf("RouteKey(devteam) err = %v, want ErrUnknownTier (no dev-team branch; use LookupHandle)", err)
 		}
 	})
 }

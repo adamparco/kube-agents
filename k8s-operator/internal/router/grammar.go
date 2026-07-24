@@ -76,12 +76,16 @@ func (h Handle) Canonical() string {
 }
 
 // RouteKey turns a parsed handle into the agentindex routing/cardinality key so a resolved handle and
-// an indexed Agent CR produce the SAME key — the no-drift guarantee (both go through agentindex). The
-// handle carries only its scope leaf, so tiers below platform need the router's project context:
+// an indexed Agent CR produce the SAME key — the no-drift guarantee (both go through agentindex). It
+// serves the two tiers whose full scope key is derivable from (handle leaf + router project context):
 //
 //   - platform:       the leaf IS the project; projectID is ignored.
 //   - cluster-admin:  key = (cluster-admin, projectID, leaf); projectID required (ErrMissingProjectContext).
-//   - developer-team: refused — the namespace-only handle cannot name a cluster (ErrDeveloperTeamRoutingDeferred).
+//
+// A developer-team handle carries only its namespace leaf and cannot name a cluster, so its full key
+// exists only on a live CR — it is resolved via Index.LookupHandle (the byTierLeaf secondary index),
+// NOT here. RouteKey therefore has no developer-team branch; call it only through Index.LookupHandle,
+// which routes each tier by the correct mechanism.
 func (h Handle) RouteKey(projectID string) (string, error) {
 	switch h.Tier {
 	case agentv1alpha1.TierPlatform:
@@ -91,8 +95,6 @@ func (h Handle) RouteKey(projectID string) (string, error) {
 			return "", ErrMissingProjectContext
 		}
 		return agentindex.Identity(agentv1alpha1.TierClusterAdmin, projectID, h.Leaf, ""), nil
-	case agentv1alpha1.TierDeveloperTeam:
-		return "", ErrDeveloperTeamRoutingDeferred
 	default:
 		return "", ErrUnknownTier
 	}

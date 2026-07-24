@@ -99,10 +99,11 @@ func (r *Receiver) handle(ctx context.Context, m *pubsub.Message) {
 	}
 
 	_, herr := r.gateway.Handle(ctx, router.Message{
-		Text:   ev.Text,
-		Sender: ev.Sender,
-		Raw:    m.Data,
-		Attrs:  map[string]string{"kage_space": ev.Space},
+		Text:     ev.Text,
+		Sender:   ev.Sender,
+		ThreadID: ev.ThreadID(),
+		Raw:      m.Data,
+		Attrs:    map[string]string{"kage_space": ev.Space},
 	})
 	if herr != nil {
 		if router.IsDeterministicRefusal(herr) {

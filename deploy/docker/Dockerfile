@@ -214,3 +214,47 @@ RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins 
     find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
     find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
+
+
+# --- DEVELOPER TEAM AGENT TARGET ---
+# Third-tier (leaf) persona (Phase 3). Mirrors the cluster-admin stage but bakes the read-only,
+# namespace-scoped developer-team persona from agents/developer-team/ (single-namespace scope, zero
+# write tools, and — as the leaf tier — NO propose-child cascade skill). The operator resolves this
+# image BY TIER (defaultImageForTier) and injects AGENT_TIER=developer-team at runtime. Built via
+# `make docker-build-developer-team` (the root Makefile auto-discovers agents/*/).
+FROM agent-base AS developer-team
+
+# Setup developer-team specific defaults from consolidated configs
+COPY agents/developer-team/cron/ /opt/defaults/cron/
+COPY --chown=hermes:hermes agents/developer-team/defaults/ /opt/defaults/
+COPY agents/developer-team/scripts/ /opt/defaults/scripts/
+COPY agents/developer-team/governance/ /opt/defaults/governance/
+COPY agents/developer-team/SOUL.md /opt/defaults/SOUL.md
+COPY agents/developer-team/AGENTS.md /opt/defaults/AGENTS.md
+
+# Copy developer-team skills
+COPY agents/developer-team/skills/ /opt/hermes/skills/
+
+# Copy developer-team plugins
+COPY agents/developer-team/plugins/ /opt/hermes/plugins/
+
+# Copy developer-team defaults configuration as temp file
+COPY agents/developer-team/config.yaml /tmp/developer-team-config.yaml
+
+# Copy config merge helper script
+COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
+
+# Dynamically merge config.yamls using helper script
+RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yaml /tmp/developer-team-config.yaml && \
+    rm -f /tmp/merge_configs.py /tmp/developer-team-config.yaml
+
+# Normalize ownership and permissions at the end of build
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins && \
+    find /opt/defaults -type d -exec chmod 755 {} + && \
+    find /opt/defaults -type f -exec chmod 644 {} + && \
+    find /opt/hermes/skills -type d -exec chmod 755 {} + && \
+    find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/hermes/plugins -type d -exec chmod 755 {} + && \
+    find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
+    find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
+    find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true

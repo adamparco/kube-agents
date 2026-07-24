@@ -37,6 +37,11 @@ const (
 	// ships its own persona baked into its own image (07 §2(a)); same pinning rules as above.
 	defaultClusterAdminAgentImage = "ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0"
 
+	// defaultDeveloperTeamAgentImage is the fallback image for the developer-team tier (the
+	// namespace-scoped leaf tier; 1 per namespace). Ships a read-only, namespace-scoped persona
+	// with no propose-child cascade; same pinning rules as above.
+	defaultDeveloperTeamAgentImage = "ghcr.io/gke-labs/kube-agents/developer-team-agent:v0.1.0"
+
 	// managedOTelEndpoint is the OTLP/HTTP endpoint of the GKE Managed OpenTelemetry
 	// collector. The same endpoint is already used by the LiteLLM integration, so agent
 	// traces and LLM-call telemetry land in the same place (Cloud Trace/Logging).
@@ -73,13 +78,14 @@ func otelTelemetryEnvVars(agentType, name, namespace string) []corev1.EnvVar {
 
 // defaultImageForTier returns the baked default image for a tier, used when an Agent CR omits
 // spec.deployment.image (07 §2(a)). Each tier ships its own read-only persona baked into its own
-// image; spec.deployment.image still overrides. developer-team is added in Phase 3 — until then an
-// unknown/empty tier falls back to the platform image (EffectiveTier already maps empty→platform,
-// so the default arm is defense-in-depth).
+// image; spec.deployment.image still overrides. An unknown/empty tier falls back to the platform
+// image (EffectiveTier already maps empty→platform, so the default arm is defense-in-depth).
 func defaultImageForTier(tier agentv1alpha1.AgentTier) string {
 	switch tier {
 	case agentv1alpha1.TierClusterAdmin:
 		return defaultClusterAdminAgentImage
+	case agentv1alpha1.TierDeveloperTeam:
+		return defaultDeveloperTeamAgentImage
 	default:
 		return defaultPlatformAgentImage
 	}

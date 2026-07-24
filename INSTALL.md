@@ -19,6 +19,8 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
 5. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
+   - [Phase 2 — Kind inner loop (Cluster Admin Agent + cascade)](#phase-2--kind-inner-loop-cluster-admin-agent--cascade)
+   - [Phase 3 — Kind inner loop (Developer Team Agent + namespace isolation)](#phase-3--kind-inner-loop-developer-team-agent--namespace-isolation)
 6. [Teardown & Cleanup](#teardown--cleanup)
 7. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
@@ -330,6 +332,50 @@ and the **spoke bootstrap** ordered apply waves. Verify the whole inner loop on 
    Create a throwaway cluster with `disableDefaultCNI: true` and install Calico to verify the per-tier
    default-deny egress (including the metadata-server `169.254.169.254` block). See
    [docs/build/LEDGER.md](docs/build/LEDGER.md) §Verification log for the exact steps.
+
+### Phase 3 — Kind inner loop (Developer Team Agent + namespace isolation)
+
+Phase 3 adds the read-only **Developer Team Agent** (one per namespace), the load-bearing **A1
+placement clause** (a developer-team `Agent` must be created in the namespace it scopes —
+`metadata.namespace == spec.scope.namespace`), the per-namespace **isolation baseline**
+(default-deny NetworkPolicy + a per-tier egress allowlist, `ResourceQuota`, and in-namespace
+`ExternalName` aliases for the shared hub services), the **`propose-developer-team`** cascade on the
+Cluster Admin Agent, and the router completion (NL confidence/clarify, candidate validity, thread
+affinity, audit attribution). It reuses the Phase 2 stack on the same Kind cluster.
+
+> **Image refresh (important).** The webhook/controller run inside the operator image, and the
+> `Agent` CRD keeps the same `v0.1.0` tag across phases. After **any** change to
+> `k8s-operator/internal/webhook` or `.../controller`, refresh the running image before verifying —
+> a same-tag image with `imagePullPolicy: IfNotPresent` will otherwise keep serving the stale build
+> and can **silently under-enforce** an admission invariant (this is exactly how a Phase 3 placement
+> escape first slipped through):
+>
+> ```bash
+> cd k8s-operator && make docker-build IMG=ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0 && cd ..
+> kind load docker-image ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0 --name kube-agents-dev
+> kubectl -n kubeagents-system rollout restart deploy/kubeagents-controller-manager
+> kubectl -n kubeagents-system rollout status  deploy/kubeagents-controller-manager --timeout=120s
+> ```
+
+1. **Run the consolidated Phase 3 gate** (destructive; guarded to Kind contexts only). It applies the
+   `team-x` tenant bundle (`namespaces/team-x/` `00`→`60`, in numeric order) and the dev-team `Agent`
+   CR, then asserts the whole isolation proof:
+   ```bash
+   local-dev/kind/verify-phase3.sh kind-kube-agents-dev
+   ```
+   It exercises: the **placement clause** (matching namespace admitted, foreign `metadata.namespace`
+   rejected), the **reconciled dev-team pod** (bound to the pre-created `developer-team-agent` SA, the
+   `developer-team-agent:<tag>` image, and the `kube-agents/tier=developer-team` label), **read-only,
+   namespace-scoped SAR** (reads in `team-x` only — no cross-namespace, cluster-scoped, write, or
+   privilege-escalation access), **duplicate `(tier,scope)` + tier immutability** rejection, **VAP
+   attenuation** (delegated to `negative-attenuation.sh`), the **isolation netpol shape** (default-deny
+   - egress tier selector, a pure allowlist with **no `0.0.0.0/0`**, server-dry-run valid) plus the
+     `ExternalName` aliases, and the **cascade** `render_developer_team.py` → VAP dry-run (identity
+     admitted, write-verb tamper denied). The deterministic router suites run under
+     `cd k8s-operator && go test ./...`.
+2. **Egress enforcement** carries the same kindnet caveat as Phase 2 — `verify-phase3.sh` validates
+   the egress policy **structurally** (shape, tier selector, zero `0.0.0.0/0`) and defers real
+   enforcement (agent pod cannot reach `169.254.169.254` or the open internet) to a Calico cluster.
 
 ## Teardown & Cleanup
 

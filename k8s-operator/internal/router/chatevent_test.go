@@ -24,19 +24,31 @@ import (
 func TestParseChatEvent(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name       string
-		raw        string
-		wantText   string
-		wantSender string
-		wantSpace  string
-		wantErr    error
+		name         string
+		raw          string
+		wantText     string
+		wantSender   string
+		wantSpace    string
+		wantThread   string
+		wantThreadID string
+		wantErr      error
 	}{
 		{
-			name:       "message event",
-			raw:        `{"type":"MESSAGE","message":{"text":"@kage /cluster-cluster-a status","sender":{"name":"users/alice","type":"HUMAN"}},"space":{"name":"spaces/AAA"}}`,
-			wantText:   "@kage /cluster-cluster-a status",
-			wantSender: "users/alice",
-			wantSpace:  "spaces/AAA",
+			name:         "message event with thread",
+			raw:          `{"type":"MESSAGE","message":{"text":"@kage /cluster-cluster-a status","sender":{"name":"users/alice","type":"HUMAN"},"thread":{"name":"spaces/AAA/threads/T1"}},"space":{"name":"spaces/AAA"}}`,
+			wantText:     "@kage /cluster-cluster-a status",
+			wantSender:   "users/alice",
+			wantSpace:    "spaces/AAA",
+			wantThread:   "spaces/AAA/threads/T1",
+			wantThreadID: "spaces/AAA/threads/T1", // thread present → ThreadID is the thread
+		},
+		{
+			name:         "no thread falls back to space for affinity",
+			raw:          `{"type":"MESSAGE","message":{"text":"hi","sender":{"name":"users/carol"}},"space":{"name":"spaces/BBB"}}`,
+			wantText:     "hi",
+			wantSender:   "users/carol",
+			wantSpace:    "spaces/BBB",
+			wantThreadID: "spaces/BBB", // no thread → ThreadID falls back to the space
 		},
 		{
 			name:       "no type is treated as message",
@@ -78,8 +90,11 @@ func TestParseChatEvent(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected err: %v", err)
 				}
-				if ev.Text != tc.wantText || ev.Sender != tc.wantSender || ev.Space != tc.wantSpace {
-					t.Errorf("event = %+v, want text=%q sender=%q space=%q", ev, tc.wantText, tc.wantSender, tc.wantSpace)
+				if ev.Text != tc.wantText || ev.Sender != tc.wantSender || ev.Space != tc.wantSpace || ev.Thread != tc.wantThread {
+					t.Errorf("event = %+v, want text=%q sender=%q space=%q thread=%q", ev, tc.wantText, tc.wantSender, tc.wantSpace, tc.wantThread)
+				}
+				if ev.ThreadID() != tc.wantThreadID {
+					t.Errorf("ThreadID() = %q, want %q", ev.ThreadID(), tc.wantThreadID)
 				}
 			}
 		})
@@ -98,7 +113,7 @@ func TestIsDeterministicRefusal(t *testing.T) {
 		ErrUnknownTier,
 		ErrInferenceUnavailable,
 		ErrMissingProjectContext,
-		ErrDeveloperTeamRoutingDeferred,
+		ErrClarify,
 		ErrNoSuchTarget,
 		ErrUnauthorized,
 	}
@@ -110,6 +125,18 @@ func TestIsDeterministicRefusal(t *testing.T) {
 		if !IsDeterministicRefusal(errors.Join(errors.New("ctx"), e)) {
 			t.Errorf("IsDeterministicRefusal(wrapped %v) = false, want true", e)
 		}
+	}
+
+	// A concrete *ClarifyError (what the gateway actually returns on ambiguity) must also classify as a
+	// deterministic refusal via its Is(ErrClarify) — the delivery layer Acks it, and errors.As recovers
+	// the candidate menu for the reply.
+	ce := &ClarifyError{Reason: "ambiguous", Candidates: []Candidate{{Handle: Handle{Tier: "developer-team", Leaf: "team-x"}, Confidence: 1}}}
+	if !IsDeterministicRefusal(ce) {
+		t.Error("IsDeterministicRefusal(*ClarifyError) = false, want true")
+	}
+	var got *ClarifyError
+	if !errors.As(error(ce), &got) || len(got.Candidates) != 1 {
+		t.Errorf("errors.As(*ClarifyError) failed to recover the candidate menu: %+v", got)
 	}
 
 	// A transient dispatch/publish failure must NOT be deterministic (Nack, retry), nor must nil.

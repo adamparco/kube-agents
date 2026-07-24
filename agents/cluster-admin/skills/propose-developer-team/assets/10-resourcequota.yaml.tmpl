@@ -1,0 +1,30 @@
+# clusters/@@CLUSTER@@/namespaces/@@NAMESPACE@@/10-resourcequota.yaml
+#
+# Blast-radius bound for the @@NAMESPACE@@ tenant (03 §3 isolation; Phase 3). A ResourceQuota caps the
+# aggregate compute + object footprint of EVERYTHING in @@NAMESPACE@@ — the Developer Team Agent pod AND the
+# tenant's own workloads — so a runaway rollout (or a compromised/looping agent) cannot starve the
+# cluster or other tenants. The @@CLUSTER@@dmin tier proposes this alongside the namespace + default-deny
+# NetworkPolicy (propose-developer-team cascade); a human reviews + merges; CI/CD applies it.
+#
+# Because a quota with `requests.*`/`limits.*` is set, every pod in @@NAMESPACE@@ MUST declare resource
+# requests+limits or admission rejects it — the agent pod's rendered spec already does (the controller
+# stamps requests/limits), and tenant workloads inherit the same discipline. Tune the numbers per tenant.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: @@NAMESPACE@@-quota
+  namespace: @@NAMESPACE@@
+  labels:
+    kube-agents/tenant: @@NAMESPACE@@
+    app.kubernetes.io/managed-by: gitops
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    pods: "50"
+    services: "20"
+    count/configmaps: "50"
+    count/secrets: "50"
+    persistentvolumeclaims: "20"

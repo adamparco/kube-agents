@@ -37,8 +37,8 @@ import (
 )
 
 // Mode is the routing mode recorded on every chat turn's audit record (06 §2b). Resolution order is
-// deterministic-first: slash → handle → inference. Modes slash+handle spend no inference; inference is
-// the only mode that could spend a model call, and Phase 2 refuses it (see Resolver.Resolve).
+// deterministic-first: slash → handle → sticky (thread affinity) → inference. Only inference can spend a
+// model call; slash/handle/sticky never do. Phase 2 refused inference; Phase 3 adds sticky + inference.
 type Mode string
 
 const (
@@ -46,6 +46,11 @@ const (
 	ModeSlash Mode = "slash"
 	// ModeHandle is an explicit `@handle` mention (constant-time, no inference).
 	ModeHandle Mode = "handle"
+	// ModeSticky is a thread-affinity follow-up (06 §6): a bare message routed to the agent the thread is
+	// already bound to, spending NO inference. The binding is consulted only after slash/handle resolution
+	// finds no target, and can only ever name an agent a prior authorized turn already dispatched to — so
+	// sticky routing never precedes or replaces the per-turn Authorize check.
+	ModeSticky Mode = "sticky"
 	// ModeInference is the NL fallback (one router model call). Deferred to Phase 3; refused in Phase 2.
 	ModeInference Mode = "inference"
 )
@@ -95,6 +100,36 @@ type Decision struct {
 	Reason  string
 }
 
+// Candidate is a handle the router proposes as a possible target, with the confidence its proposer
+// assigned it (06 §2b). Deterministic (index-assisted) candidates carry Confidence 1.0 — they are
+// exact matches that are ambiguous only because more than one live agent shares the (tier, leaf), e.g.
+// a developer-team namespace that exists in more than one cluster. The Phase-3 NL inferer (mode 3)
+// assigns fractional confidences; the deterministic core, not the model, decides route vs. clarify.
+type Candidate struct {
+	Handle     Handle
+	Confidence float64
+}
+
+// ClarifyError is a deterministic refusal that asks the human to disambiguate instead of guessing among
+// several equally-plausible targets (06 §2b: low confidence / ambiguity → clarify, never guess). It is
+// returned (as a wrapped error) when resolution names MORE THAN ONE live agent — today only the
+// multi-cluster developer-team case (a namespace that exists in several clusters) — and, from Phase 3
+// mode 3, when NL inference is uncertain. Callers branch on it with errors.Is(err, ErrClarify);
+// errors.As(err, &ce) reads the candidate menu so the reply can offer the specific choices.
+type ClarifyError struct {
+	// Reason is the human-facing explanation (names the ambiguity, e.g. the clashing scopes).
+	Reason string
+	// Candidates is the menu of plausible targets to disambiguate between (never empty for a clarify).
+	Candidates []Candidate
+}
+
+// Error makes *ClarifyError an error.
+func (e *ClarifyError) Error() string { return e.Reason }
+
+// Is lets errors.Is(err, ErrClarify) match any *ClarifyError, so the delivery layer classifies a
+// clarify as a deterministic (Ack, don't retry) refusal without unwrapping the struct.
+func (e *ClarifyError) Is(target error) bool { return target == ErrClarify }
+
 // Sentinel errors. Every non-inference refusal is one of these deterministic values so callers can
 // branch on cause and tests can assert exact behavior — the router never guesses (06 §2b: low
 // confidence → clarify, not guess).
@@ -110,11 +145,17 @@ var (
 	// ErrInferenceUnavailable means resolution fell through to NL inference but no Inferer is wired.
 	// This is the Phase-2 posture: mode 3 is refused WITHOUT invoking any model, so inference_calls==0.
 	ErrInferenceUnavailable = errors.New("router: NL inference is disabled (Phase 2 routes by slash/handle only)")
+	// ErrNeedsInference is the INTERNAL signal the deterministic Resolve returns when a message matches
+	// no slash/handle (modes 1/2) and therefore needs the mode-3 NL fallback. It never escapes the
+	// gateway: the gateway either calls Resolver.Infer (which returns a terminal outcome) or, with no
+	// Inferer wired, Infer maps it to ErrInferenceUnavailable/ErrUnaddressed. Splitting resolution this
+	// way guarantees Resolve never touches the model and never spends inference.
+	ErrNeedsInference = errors.New("router: message needs NL inference (no slash/handle match)")
 	// ErrMissingProjectContext means a cluster-admin handle could not be turned into a routing key
 	// because the router was given no project context to fill the scope.
 	ErrMissingProjectContext = errors.New("router: cluster-admin handle needs project context to form a routing key")
-	// ErrDeveloperTeamRoutingDeferred means a developer-team handle parsed correctly but cannot be routed
-	// in Phase 2: its handle carries only the namespace leaf, not the cluster, so no full key can form.
-	// Deterministic refusal (developer-team pods ship in Phase 3).
-	ErrDeveloperTeamRoutingDeferred = errors.New("router: developer-team routing is deferred to Phase 3")
+	// ErrClarify is the sentinel every *ClarifyError matches under errors.Is (see ClarifyError.Is). It
+	// marks an ambiguous turn the router refuses to guess on — a deterministic refusal (Ack, don't
+	// retry). The concrete *ClarifyError carries the candidate menu (read via errors.As).
+	ErrClarify = errors.New("router: message is ambiguous; clarification requested")
 )

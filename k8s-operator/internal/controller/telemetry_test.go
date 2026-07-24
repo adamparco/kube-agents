@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -79,6 +80,35 @@ func TestBuildDeploymentHasOTelEnv(t *testing.T) {
 	}
 	if m["OTEL_RESOURCE_ATTRIBUTES"].Value == "" {
 		t.Errorf("expected OTEL_RESOURCE_ATTRIBUTES to be set")
+	}
+}
+
+// TestBuildDeploymentOTelReflectsTier verifies the rendered OTEL_RESOURCE_ATTRIBUTES carries the
+// agent's real tier (agentindex.EffectiveTier), not a hardcoded "platform" (P3-T2). Telemetry that
+// mislabels every tier as platform makes per-tier trace/metric attribution impossible.
+func TestBuildDeploymentOTelReflectsTier(t *testing.T) {
+	tests := []struct {
+		name string
+		tier agentv1alpha1.AgentTier
+		want string
+	}{
+		{"platform", agentv1alpha1.TierPlatform, "kubeagents.agent_type=platform"},
+		{"cluster-admin", agentv1alpha1.TierClusterAdmin, "kubeagents.agent_type=cluster-admin"},
+		{"developer-team", agentv1alpha1.TierDeveloperTeam, "kubeagents.agent_type=developer-team"},
+		{"empty defaults to platform", agentv1alpha1.AgentTier(""), "kubeagents.agent_type=platform"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := &agentv1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+				Spec:       agentv1alpha1.AgentSpec{Tier: tt.tier},
+			}
+			dep := buildDeployment(agent, "h1", "h2", "h3")
+			m := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
+			if got := m["OTEL_RESOURCE_ATTRIBUTES"].Value; !strings.Contains(got, tt.want) {
+				t.Errorf("OTEL_RESOURCE_ATTRIBUTES = %q, want it to contain %q", got, tt.want)
+			}
+		})
 	}
 }
 

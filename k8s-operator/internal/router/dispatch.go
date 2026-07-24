@@ -31,6 +31,11 @@ type Message struct {
 	// Sender is the platform user id (e.g. "users/123") checked against the target allowlist. Never a
 	// routing signal — only an authz one.
 	Sender string
+	// ThreadID is the thread-affinity key (ChatEvent.ThreadID: thread, else space). The gateway consults a
+	// live thread→agent binding for a bare message BEFORE spending inference (ModeSticky), and (re)binds it
+	// only after an authorized dispatch. It is a routing-continuity signal only, never an authz one; empty
+	// disables affinity for the turn.
+	ThreadID string
 	// Raw is the original event payload to re-publish unchanged; if empty the dispatcher publishes Text.
 	Raw []byte
 	// Attrs are original message attributes to preserve on re-publish (best-effort passthrough).

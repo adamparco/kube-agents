@@ -366,7 +366,9 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 		},
 	}
 
-	envVars = append(envVars, otelTelemetryEnvVars("platform", agent.Name, agent.Namespace)...)
+	// Telemetry attributes the agent's real tier (agentindex.EffectiveTier; empty -> platform) so
+	// traces/metrics are grouped by tier rather than all reporting as "platform".
+	envVars = append(envVars, otelTelemetryEnvVars(string(tier), agent.Name, agent.Namespace)...)
 
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.BrowserArgs) > 0 {
 		envVars = append(envVars, corev1.EnvVar{
