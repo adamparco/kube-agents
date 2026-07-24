@@ -5,10 +5,15 @@ that, **on merge**, applies changed paths to the target — `kubectl apply` for 
 `terraform apply` for HCL — using **least-privilege deploy credentials scoped per target**. Agents
 hold no write credentials; the pipeline is the sole privileged writer (03 §4).
 
-Reference workflows (added in later phases):
+Reference workflows:
 
-- `apply.yml` — apply merged `clusters/**` / `fleet/**` artifacts to their target (Phase 1).
-- `review-gate.yml` — run the `review-security-k8s-*` suite via a headless harness runner on PRs
-  touching guarded paths; block merge on unmitigated high/critical findings (Phase 5, 06 §7).
+- `apply.yml` — **(Phase 1, present)** on merge to `main`, applies changed `clusters/**` / `fleet/**`
+  artifacts to their target: `kubectl apply` for KCC/K8s YAML, `terraform apply` for HCL. Least
+  privilege is per target via one **GitHub Environment per target** (each holds only its own
+  Workload-Identity-Federation provider + deploy service account). Pin every `uses:` to a commit SHA
+  in production and scope each deploy SA to its target only.
+- `review-gate.yml` — _(added in a later phase)_ run the `review-security-k8s-*` suite via a headless
+  harness runner on PRs touching guarded paths; block merge on unmitigated high/critical findings
+  (Phase 5, 06 §7).
 
 GitHub Actions is the reference; CircleCI/Jenkins/Argo/Flux/Atlantis are equally valid (06 §4).
