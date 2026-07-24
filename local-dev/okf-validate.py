@@ -14,39 +14,20 @@ Exit code 0 = all good; 1 = one or more violations (prints them). No third-party
 from __future__ import annotations
 
 import os
-import re
 import sys
 
-# Canonical starting types (06 §5). `type` is an OPEN convention, so unknown types are a note, not
-# an error — only a missing/empty `type` fails.
-CANONICAL_TYPES = {
-    "index",
-    "cluster-blueprint",
-    "tenancy-model",
-    "runbook",
-    "metric-definition",
-    "escalation",
-    "observation",
-}
-
-LINK_RE = re.compile(r"(?<!\!)\[[^\]]*\]\(([^)]+)\)")  # [text](target), skip images ![...]()
-FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-
-
-def parse_frontmatter(text: str) -> dict | None:
-    m = FRONTMATTER_RE.match(text)
-    if not m:
-        return None
-    fm: dict[str, str] = {}
-    for line in m.group(1).splitlines():
-        if ":" in line and not line.lstrip().startswith("#"):
-            key, _, val = line.partition(":")
-            fm[key.strip()] = val.strip()
-    return fm
-
-
-def is_external(target: str) -> bool:
-    return target.startswith(("http://", "https://", "mailto:", "#"))
+# The frontmatter/link parser is shared with the in-pod read path
+# (agents/*/skills/read-knowledge) so CI and the agent read the SAME schema — no drift between "what
+# validates" and "what an agent retrieves". Python puts this script's own dir (local-dev/) on
+# sys.path[0], so the sibling module imports directly.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from okf_frontmatter import (  # noqa: E402
+    CANONICAL_TYPES,
+    LINK_RE,
+    is_external,
+    link_path,
+    parse_frontmatter,
+)
 
 
 def check_file(path: str, root: str, errors: list[str], notes: list[str]) -> None:
@@ -65,20 +46,11 @@ def check_file(path: str, root: str, errors: list[str], notes: list[str]) -> Non
     for target in LINK_RE.findall(text):
         if is_external(target):
             continue
-        # Resolve the path portion of a CommonMark inline link. Handle an optional link title
-        # `[t](path.md "Title")` / `path.md 'Title'` and the angle-bracket form `[t](<path.md>)`
-        # before stripping any `#anchor` — else the title/brackets are treated as part of the path
-        # and a valid link is falsely reported broken.
-        link_path = target.strip()
-        if link_path.startswith("<") and ">" in link_path:
-            link_path = link_path[1 : link_path.index(">")]
-        else:
-            parts = link_path.split(None, 1)  # path is the first whitespace-delimited token
-            link_path = parts[0] if parts else ""
-        link_path = link_path.split("#", 1)[0].strip()
-        if not link_path:
+        # Resolve the path portion via the shared parser (handles titles, <angle-brackets>, #anchors).
+        lp = link_path(target)
+        if not lp:
             continue  # pure anchor
-        resolved = os.path.normpath(os.path.join(os.path.dirname(path), link_path))
+        resolved = os.path.normpath(os.path.join(os.path.dirname(path), lp))
         if not os.path.exists(resolved):
             errors.append(f"{rel}: broken link -> {target}")
 
