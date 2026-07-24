@@ -296,6 +296,7 @@ spec:
             capabilities:
               drop:
                 - ALL
+            readOnlyRootFilesystem: true
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
@@ -310,6 +311,8 @@ spec:
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session
+            - mountPath: /tmp
+              name: platform-agent-tmp
         - args:
             - hermes
             - dashboard
@@ -338,12 +341,15 @@ spec:
             capabilities:
               drop:
                 - ALL
+            readOnlyRootFilesystem: true
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session
+            - mountPath: /tmp
+              name: platform-agent-dashboard-tmp
         - args:
             - -c
             - /fluent-bit/etc/fluent-bit.conf
@@ -363,6 +369,7 @@ spec:
             capabilities:
               drop:
                 - ALL
+            readOnlyRootFilesystem: true
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
@@ -377,6 +384,8 @@ spec:
               subPath: parsers.conf
             - mountPath: /fluent-bit/state
               name: fluent-bit-state
+            - mountPath: /tmp
+              name: fluent-bit-tmp
         - args:
             - --cluster-name=cluster-a
             - --daemon-url=http://127.0.0.1:8699
@@ -406,6 +415,10 @@ spec:
             capabilities:
               drop:
                 - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /tmp
+              name: event-watcher-tmp
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -435,6 +448,14 @@ spec:
             defaultMode: 420
             name: agent-settings
           name: settings-volume
+        - emptyDir: {}
+          name: platform-agent-tmp
+        - emptyDir: {}
+          name: fluent-bit-tmp
+        - emptyDir: {}
+          name: event-watcher-tmp
+        - emptyDir: {}
+          name: platform-agent-dashboard-tmp
 status: {}
 ---
 apiVersion: v1
