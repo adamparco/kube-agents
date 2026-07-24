@@ -207,7 +207,7 @@ class TestSessionKvServerInjectAuth(unittest.TestCase):
                 resp = self.client.post(
                     "/sessions/some-session/inject",
                     headers={"Authorization": f"Bearer {self.API_KEY}"},
-                    json={"message": json.dumps({"reason": "FailedMount", "namespace": "ns"})},
+                    json={"message": json.dumps({"kind": "k8s-event", "reason": "FailedMount", "namespace": "ns"})},
                 )
             self.assertEqual(resp.status_code, 200)
             self.assertEqual(resp.json(), {"status": "injected"})
@@ -233,6 +233,53 @@ class TestSessionKvServerInjectAuth(unittest.TestCase):
                 },
             )
             self.assertEqual(ok.status_code, 201)
+
+
+class TestSessionKvServerInjectKinds(unittest.TestCase):
+    """Phase 4 / P4-T2 (S2): the inject seam routes on the payload's ``kind``. Unknown or
+    missing kinds are rejected (400) so a new signal source cannot be silently coerced
+    through the Kubernetes-event path. API_SERVER_KEY is unset here, so the seam is open."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        self.client = TestClient(session_kv_server.app)
+
+    def _inject(self, payload):
+        # trigger_agent_troubleshooter runs as a background task (executed synchronously by
+        # TestClient); patch it so the test asserts only routing, not the downstream call.
+        with patch.object(session_kv_server, "trigger_agent_troubleshooter"):
+            return self.client.post("/sessions/s1/inject", json={"message": json.dumps(payload)})
+
+    def test_missing_kind_rejected(self):
+        resp = self._inject({"reason": "FailedMount", "namespace": "ns"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_unknown_kind_rejected(self):
+        resp = self._inject({"kind": "pagerduty", "summary": "x"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_k8s_event_accepted(self):
+        resp = self._inject(
+            {"kind": "k8s-event", "reason": "FailedMount", "namespace": "ns", "name": "p", "kind_of_object": "Pod"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"status": "injected"})
+
+    def test_k8s_event_followup_accepted(self):
+        resp = self._inject({"kind": "k8s-event-followup", "reason": "FailedMount", "namespace": "ns"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_alert_accepted(self):
+        resp = self._inject({"kind": "alert", "summary": "High error rate", "policy": "5xx-slo", "severity": "critical"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_github_accepted(self):
+        resp = self._inject({"kind": "github", "action": "opened", "repo": "acme/infra", "number": 7, "title": "Bump"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_escalation_accepted(self):
+        resp = self._inject({"kind": "escalation", "from": "developer-team", "summary": "quota exhausted"})
+        self.assertEqual(resp.status_code, 200)
 
 
 class TestSessionKvServerQueryBuilding(unittest.TestCase):
