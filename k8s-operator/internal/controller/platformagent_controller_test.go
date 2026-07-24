@@ -102,26 +102,21 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 
 	ctx := context.Background()
 
-	// 1st Reconcile: Adds the finalizer
+	// Reconcile: the controller creates all owned workload resources in a single pass. After P1-T4/T5 it
+	// no longer adds a finalizer or mints RBAC; the read-only identity is pre-created & GitOps-managed.
 	_, err := r.Reconcile(ctx, req)
 	if err != nil {
-		t.Fatalf("Reconcile 1 failed: %v", err)
+		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	// Fetch agent to verify finalizer is added
+	// Fetch agent to verify NO finalizer is added (nothing cluster-scoped for the controller to clean up).
 	updatedAgent := &agentv1alpha1.PlatformAgent{}
 	err = cl.Get(ctx, req.NamespacedName, updatedAgent)
 	if err != nil {
 		t.Fatalf("failed to get agent: %v", err)
 	}
-	if !controllerutil.ContainsFinalizer(updatedAgent, platformAgentFinalizer) {
-		t.Errorf("expected finalizer %q to be added, but got %v", platformAgentFinalizer, updatedAgent.Finalizers)
-	}
-
-	// 2nd Reconcile: creates resources
-	_, err = r.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("Reconcile 2 failed: %v", err)
+	if controllerutil.ContainsFinalizer(updatedAgent, platformAgentFinalizer) {
+		t.Errorf("expected no finalizer, but found %v", updatedAgent.Finalizers)
 	}
 
 	// Verify resources were created
@@ -177,20 +172,28 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 		t.Errorf("expected Service to have OwnerReference to PlatformAgent")
 	}
 
-	// RBAC
+	// RBAC: the controller must NOT mint agent RBAC (P1-T4). Assert the ClusterRole / ClusterRoleBindings
+	// the old controller created are absent — identity is pre-created via GitOps and enforced by
+	// vap-agent-readonly.
 	explorerRole := &rbacv1.ClusterRole{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, explorerRole); err != nil {
-		t.Errorf("failed to get ClusterRole: %v", err)
+	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, explorerRole); err == nil {
+		t.Errorf("expected controller NOT to mint explorer ClusterRole, but it exists")
+	} else if !errors.IsNotFound(err) {
+		t.Errorf("unexpected error checking explorer ClusterRole: %v", err)
 	}
 
 	crbViewer := &rbacv1.ClusterRoleBinding{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:viewer:test-ns:test-agent"}, crbViewer); err != nil {
-		t.Errorf("failed to get ClusterRoleBinding viewer: %v", err)
+	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:viewer:test-ns:test-agent"}, crbViewer); err == nil {
+		t.Errorf("expected controller NOT to mint viewer ClusterRoleBinding, but it exists")
+	} else if !errors.IsNotFound(err) {
+		t.Errorf("unexpected error checking viewer ClusterRoleBinding: %v", err)
 	}
 
 	crbExplorer := &rbacv1.ClusterRoleBinding{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, crbExplorer); err != nil {
-		t.Errorf("failed to get ClusterRoleBinding explorer: %v", err)
+	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, crbExplorer); err == nil {
+		t.Errorf("expected controller NOT to mint explorer ClusterRoleBinding, but it exists")
+	} else if !errors.IsNotFound(err) {
+		t.Errorf("unexpected error checking explorer ClusterRoleBinding: %v", err)
 	}
 
 	// Test Deletion
@@ -205,18 +208,12 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 		t.Fatalf("Reconcile on delete failed: %v", err)
 	}
 
-	// Verify agent is deleted completely (because finalizer was removed)
+	// Verify agent is deleted completely (no finalizer blocks removal after P1-T4/T5).
 	err = cl.Get(ctx, req.NamespacedName, updatedAgent)
 	if err == nil {
 		t.Fatalf("expected agent to be deleted, but it still exists")
 	} else if !errors.IsNotFound(err) {
 		t.Fatalf("expected NotFound error, got: %v", err)
-	}
-
-	// Verify RBAC roles are deleted
-	err = cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, explorerRole)
-	if err == nil {
-		t.Errorf("expected ClusterRole to be deleted")
 	}
 }
 
@@ -276,7 +273,7 @@ func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	// 1st Reconcile: Adds finalizer
+	// 1st Reconcile: creates config + validates RuntimeClass (no finalizer after P1-T4/T5)
 	_, err := r.Reconcile(ctx, req)
 	if err != nil {
 		t.Fatalf("Reconcile 1 failed: %v", err)
@@ -375,7 +372,7 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	// 1st Reconcile: Adds finalizer
+	// 1st Reconcile: creates config + validates RuntimeClass (no finalizer after P1-T4/T5)
 	_, err := r.Reconcile(ctx, req)
 	if err != nil {
 		t.Fatalf("Reconcile 1 failed: %v", err)
@@ -494,7 +491,7 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	// 1st Reconcile: Adds finalizer
+	// 1st Reconcile: creates config + validates RuntimeClass (no finalizer after P1-T4/T5)
 	_, err := r.Reconcile(ctx, req)
 	if err != nil {
 		t.Fatalf("Reconcile 1 failed: %v", err)

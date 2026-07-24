@@ -9,7 +9,6 @@ rules:
     resources:
       - configmaps
       - persistentvolumeclaims
-      - serviceaccounts
       - services
     verbs:
       - create
@@ -27,6 +26,7 @@ rules:
       - nodes
       - persistentvolumes
       - pods
+      - serviceaccounts
     verbs:
       - get
       - list
@@ -83,18 +83,4 @@ rules:
     verbs:
       - get
       - list
-      - watch
-  - apiGroups:
-      - rbac.authorization.k8s.io
-    resources:
-      - clusterrolebindings
-      - clusterroles
-    verbs:
-      - bind
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
       - watch
