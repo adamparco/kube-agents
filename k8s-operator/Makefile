@@ -190,7 +190,7 @@ endef
 ##@ Setup & Cleanup
 
 .PHONY: provision gcp-provision
-provision gcp-provision: ## Bootstrap GCP, GKE resources, and deploy PlatformAgent.
+provision gcp-provision: ## Bootstrap GCP, GKE resources, and deploy Agent.
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/provision.sh $(ARGS)
 
@@ -235,7 +235,7 @@ gcp-provision-07-secrets: ## Step 7: Configure secrets directly in GKE.
 	@./scripts/provision_07_gcp_k8s_secrets.sh $(ARGS)
 
 .PHONY: gcp-provision-08-deploy
-gcp-provision-08-deploy: ## Step 8: Deploy the PlatformAgent Custom Resource.
+gcp-provision-08-deploy: ## Step 8: Deploy the Agent Custom Resource.
 	@chmod +x scripts/*.sh
 	@./scripts/provision_08_deploy_platform_agent.sh $(ARGS)
 
@@ -276,7 +276,7 @@ gcp-teardown-09-litellm: ## Teardown Step 9: Undeploy LiteLLM Gateway.
 	@./scripts/teardown_09_deploy_litellm.sh $(ARGS)
 
 .PHONY: gcp-teardown-08-deploy
-gcp-teardown-08-deploy: ## Teardown Step 8: Delete the PlatformAgent Custom Resource.
+gcp-teardown-08-deploy: ## Teardown Step 8: Delete the Agent Custom Resource.
 	@chmod +x scripts/*.sh
 	@./scripts/teardown_08_deploy_platform_agent.sh $(ARGS)
 

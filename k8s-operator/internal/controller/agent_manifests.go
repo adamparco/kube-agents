@@ -38,7 +38,7 @@ const defaultPlatformAgentSecrets = "platform-agent-secrets"
 const sessionKVDBPath = "/var/lib/kube-agents/session/session_kv.db"
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
-func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+func buildConfigMap(agent *agentv1alpha1.Agent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -55,7 +55,7 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 }
 
 // buildSettingsConfigMap generates the ConfigMap manifest containing SETTINGS.md
-func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+func buildSettingsConfigMap(agent *agentv1alpha1.Agent) *corev1.ConfigMap {
 	gitRepo := ""
 	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
 		gitRepo = agent.Spec.Integration.GitHub.GitRepo
@@ -80,7 +80,7 @@ func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMa
 }
 
 // renderConfigYAML generates the YAML payload for the agent config
-func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
+func renderConfigYAML(agent *agentv1alpha1.Agent) string {
 	cwd := "/opt/data"
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
 		cwd = agent.Spec.Harness.Hermes.AgentHome
@@ -243,7 +243,7 @@ func resolveGoogleChatDisplayConfig(mode string) map[string]any {
 }
 
 // buildPVC generates the PVC manifest for agent data persistence
-func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
+func buildPVC(agent *agentv1alpha1.Agent) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -264,7 +264,7 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 	}
 }
 
-func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
+func buildSystemPVC(agent *agentv1alpha1.Agent) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -286,7 +286,7 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 }
 
 // buildDeployment generates the Deployment manifest for the agent payload
-func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
+func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
 	replicas, strategy := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
 	fsGroup := int64(10000)
@@ -551,8 +551,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 }
 
-// buildBaseContainers generates the default containers for PlatformAgent
-func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string, extraVolumeMounts []corev1.VolumeMount, dashboardEnabled bool) []corev1.Container {
+// buildBaseContainers generates the default containers for Agent
+func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string, extraVolumeMounts []corev1.VolumeMount, dashboardEnabled bool) []corev1.Container {
 	defaultPlatformAgentVolumeMounts := []corev1.VolumeMount{
 		{
 			Name:      "platform-agent-data-vol",
@@ -780,8 +780,8 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, pullP
 	return containers
 }
 
-// buildDefaultVolumes generates the default volumes for PlatformAgent
-func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
+// buildDefaultVolumes generates the default volumes for Agent
+func buildDefaultVolumes(agent *agentv1alpha1.Agent) []corev1.Volume {
 	return []corev1.Volume{
 		{
 			Name: "platform-agent-data-vol",
@@ -861,7 +861,7 @@ func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
 }
 
 // buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf
-func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+func buildFluentBitConfigMap(agent *agentv1alpha1.Agent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -918,8 +918,8 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
 	}
 }
 
-// buildPlatformService generates the Service manifest for PlatformAgent
-func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
+// buildAgentService generates the Service manifest for Agent
+func buildAgentService(agent *agentv1alpha1.Agent) *corev1.Service {
 	dashboardEnabled := isDashboardEnabled(agent)
 
 	ports := []corev1.ServicePort{
@@ -956,7 +956,7 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 	}
 }
 
-func isDashboardEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+func isDashboardEnabled(agent *agentv1alpha1.Agent) bool {
 	if agent != nil && agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.DashboardEnabled != nil {
 		return *agent.Spec.Harness.Hermes.DashboardEnabled
 	}

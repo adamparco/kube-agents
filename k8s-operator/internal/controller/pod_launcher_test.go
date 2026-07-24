@@ -28,17 +28,15 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-func testAgentForLaunch() *agentv1alpha1.PlatformAgent {
-	return &agentv1alpha1.PlatformAgent{
+func testAgentForLaunch() *agentv1alpha1.Agent {
+	return &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{Name: "launch-agent", Namespace: "launch-ns"},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			AgentSpec: agentv1alpha1.AgentSpec{
-				Security: &agentv1alpha1.SecuritySpec{
-					ServiceAccountName: "platform-agent",
-				},
-				Deployment: &agentv1alpha1.DeploymentSpec{
-					RuntimeClassName: ptr.To("gvisor"),
-				},
+		Spec: agentv1alpha1.AgentSpec{
+			Security: &agentv1alpha1.SecuritySpec{
+				ServiceAccountName: "platform-agent",
+			},
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				RuntimeClassName: ptr.To("gvisor"),
 			},
 		},
 	}

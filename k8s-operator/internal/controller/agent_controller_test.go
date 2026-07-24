@@ -49,15 +49,15 @@ func setupScheme() *runtime.Scheme {
 	return scheme
 }
 
-func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
+func TestAgentReconciler_Reconcile(t *testing.T) {
 	scheme := setupScheme()
 
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
 			Namespace: "test-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{},
+		Spec: agentv1alpha1.AgentSpec{},
 	}
 
 	// Interceptor to handle Server-Side Apply (SSA) in fake client
@@ -80,15 +80,15 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 		},
 	}
 
-	// Create a fake client with the PlatformAgent
+	// Create a fake client with the Agent
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(agent).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithStatusSubresource(&agentv1alpha1.Agent{}).
 		WithInterceptorFuncs(interceptors).
 		Build()
 
-	r := &PlatformAgentReconciler{
+	r := &AgentReconciler{
 		Client: cl,
 		Scheme: scheme,
 	}
@@ -110,12 +110,12 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	}
 
 	// Fetch agent to verify NO finalizer is added (nothing cluster-scoped for the controller to clean up).
-	updatedAgent := &agentv1alpha1.PlatformAgent{}
+	updatedAgent := &agentv1alpha1.Agent{}
 	err = cl.Get(ctx, req.NamespacedName, updatedAgent)
 	if err != nil {
 		t.Fatalf("failed to get agent: %v", err)
 	}
-	if controllerutil.ContainsFinalizer(updatedAgent, platformAgentFinalizer) {
+	if controllerutil.ContainsFinalizer(updatedAgent, agentFinalizer) {
 		t.Errorf("expected no finalizer, but found %v", updatedAgent.Finalizers)
 	}
 
@@ -125,30 +125,30 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	pvc := &corev1.PersistentVolumeClaim{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-data", Namespace: "test-ns"}, pvc); err != nil {
 		t.Errorf("failed to get PVC: %v", err)
-	} else if len(pvc.OwnerReferences) != 1 || pvc.OwnerReferences[0].Kind != "PlatformAgent" {
-		t.Errorf("expected PVC to have OwnerReference to PlatformAgent")
+	} else if len(pvc.OwnerReferences) != 1 || pvc.OwnerReferences[0].Kind != "Agent" {
+		t.Errorf("expected PVC to have OwnerReference to Agent")
 	}
 
 	// ConfigMaps
 	configMap := &corev1.ConfigMap{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-config", Namespace: "test-ns"}, configMap); err != nil {
 		t.Errorf("failed to get ConfigMap test-agent-config: %v", err)
-	} else if len(configMap.OwnerReferences) != 1 || configMap.OwnerReferences[0].Kind != "PlatformAgent" {
-		t.Errorf("expected ConfigMap to have OwnerReference to PlatformAgent")
+	} else if len(configMap.OwnerReferences) != 1 || configMap.OwnerReferences[0].Kind != "Agent" {
+		t.Errorf("expected ConfigMap to have OwnerReference to Agent")
 	}
 
 	fluentBitConfigMap := &corev1.ConfigMap{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-fluent-bit-config", Namespace: "test-ns"}, fluentBitConfigMap); err != nil {
 		t.Errorf("failed to get ConfigMap test-agent-fluent-bit-config: %v", err)
-	} else if len(fluentBitConfigMap.OwnerReferences) != 1 || fluentBitConfigMap.OwnerReferences[0].Kind != "PlatformAgent" {
-		t.Errorf("expected FluentBit ConfigMap to have OwnerReference to PlatformAgent")
+	} else if len(fluentBitConfigMap.OwnerReferences) != 1 || fluentBitConfigMap.OwnerReferences[0].Kind != "Agent" {
+		t.Errorf("expected FluentBit ConfigMap to have OwnerReference to Agent")
 	}
 
 	settingsConfigMap := &corev1.ConfigMap{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-settings", Namespace: "test-ns"}, settingsConfigMap); err != nil {
 		t.Errorf("failed to get ConfigMap test-agent-settings: %v", err)
-	} else if len(settingsConfigMap.OwnerReferences) != 1 || settingsConfigMap.OwnerReferences[0].Kind != "PlatformAgent" {
-		t.Errorf("expected Settings ConfigMap to have OwnerReference to PlatformAgent")
+	} else if len(settingsConfigMap.OwnerReferences) != 1 || settingsConfigMap.OwnerReferences[0].Kind != "Agent" {
+		t.Errorf("expected Settings ConfigMap to have OwnerReference to Agent")
 	}
 
 	// Deployment
@@ -156,8 +156,8 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway", Namespace: "test-ns"}, dep); err != nil {
 		t.Errorf("failed to get Deployment: %v", err)
 	} else {
-		if len(dep.OwnerReferences) != 1 || dep.OwnerReferences[0].Kind != "PlatformAgent" {
-			t.Errorf("expected Deployment to have OwnerReference to PlatformAgent")
+		if len(dep.OwnerReferences) != 1 || dep.OwnerReferences[0].Kind != "Agent" {
+			t.Errorf("expected Deployment to have OwnerReference to Agent")
 		}
 		if len(dep.Spec.Template.Spec.Containers) == 0 || dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 			t.Errorf("expected Deployment to have container named 'platform-agent'")
@@ -168,8 +168,8 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	svc := &corev1.Service{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}, svc); err != nil {
 		t.Errorf("failed to get Service: %v", err)
-	} else if len(svc.OwnerReferences) != 1 || svc.OwnerReferences[0].Kind != "PlatformAgent" {
-		t.Errorf("expected Service to have OwnerReference to PlatformAgent")
+	} else if len(svc.OwnerReferences) != 1 || svc.OwnerReferences[0].Kind != "Agent" {
+		t.Errorf("expected Service to have OwnerReference to Agent")
 	}
 
 	// RBAC: the controller must NOT mint agent RBAC (P1-T4). Assert the ClusterRole / ClusterRoleBindings
@@ -217,19 +217,17 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	}
 }
 
-func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
+func TestAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 	scheme := setupScheme()
 
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent-missing-rc",
 			Namespace: "test-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			AgentSpec: agentv1alpha1.AgentSpec{
-				Deployment: &agentv1alpha1.DeploymentSpec{
-					RuntimeClassName: ptr.To("gvisor"),
-				},
+		Spec: agentv1alpha1.AgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				RuntimeClassName: ptr.To("gvisor"),
 			},
 		},
 	}
@@ -256,11 +254,11 @@ func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(agent).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithStatusSubresource(&agentv1alpha1.Agent{}).
 		WithInterceptorFuncs(interceptors).
 		Build()
 
-	r := &PlatformAgentReconciler{
+	r := &AgentReconciler{
 		Client: cl,
 		Scheme: scheme,
 	}
@@ -289,7 +287,7 @@ func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 	}
 
 	// Verify status is Degraded
-	updatedAgent := &agentv1alpha1.PlatformAgent{}
+	updatedAgent := &agentv1alpha1.Agent{}
 	if err := cl.Get(ctx, req.NamespacedName, updatedAgent); err != nil {
 		t.Fatalf("failed to get agent: %v", err)
 	}
@@ -309,7 +307,7 @@ func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 	}
 }
 
-func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
+func TestAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	scheme := setupScheme()
 
 	rc := &nodev1.RuntimeClass{
@@ -319,16 +317,14 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 		Handler: "gvisor",
 	}
 
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent-existing-rc",
 			Namespace: "test-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			AgentSpec: agentv1alpha1.AgentSpec{
-				Deployment: &agentv1alpha1.DeploymentSpec{
-					RuntimeClassName: ptr.To("gvisor"),
-				},
+		Spec: agentv1alpha1.AgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				RuntimeClassName: ptr.To("gvisor"),
 			},
 		},
 	}
@@ -355,11 +351,11 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(agent, rc).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithStatusSubresource(&agentv1alpha1.Agent{}).
 		WithInterceptorFuncs(interceptors).
 		Build()
 
-	r := &PlatformAgentReconciler{
+	r := &AgentReconciler{
 		Client: cl,
 		Scheme: scheme,
 	}
@@ -398,7 +394,7 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	}
 
 	// Verify status is not Degraded
-	updatedAgent := &agentv1alpha1.PlatformAgent{}
+	updatedAgent := &agentv1alpha1.Agent{}
 	if err := cl.Get(ctx, req.NamespacedName, updatedAgent); err != nil {
 		t.Fatalf("failed to get agent: %v", err)
 	}
@@ -407,7 +403,7 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	}
 }
 
-func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
+func TestAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 	scheme := setupScheme()
 
 	rc := &nodev1.RuntimeClass{
@@ -417,16 +413,14 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 		Handler: "gvisor",
 	}
 
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent-unschedulable",
 			Namespace: "test-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			AgentSpec: agentv1alpha1.AgentSpec{
-				Deployment: &agentv1alpha1.DeploymentSpec{
-					RuntimeClassName: ptr.To("gvisor"),
-				},
+		Spec: agentv1alpha1.AgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				RuntimeClassName: ptr.To("gvisor"),
 			},
 		},
 	}
@@ -474,11 +468,11 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(agent, rc, pod).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithStatusSubresource(&agentv1alpha1.Agent{}).
 		WithInterceptorFuncs(interceptors).
 		Build()
 
-	r := &PlatformAgentReconciler{
+	r := &AgentReconciler{
 		Client: cl,
 		Scheme: scheme,
 	}
@@ -503,7 +497,7 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
 
-	updatedAgent := &agentv1alpha1.PlatformAgent{}
+	updatedAgent := &agentv1alpha1.Agent{}
 	if err := cl.Get(ctx, req.NamespacedName, updatedAgent); err != nil {
 		t.Fatalf("failed to get agent: %v", err)
 	}

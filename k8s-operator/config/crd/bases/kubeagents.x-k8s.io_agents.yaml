@@ -4,20 +4,22 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: platformagents.kubeagents.x-k8s.io
+  name: agents.kubeagents.x-k8s.io
 spec:
   group: kubeagents.x-k8s.io
   names:
-    kind: PlatformAgent
-    listKind: PlatformAgentList
-    plural: platformagents
-    singular: platformagent
+    kind: Agent
+    listKind: AgentList
+    plural: agents
+    singular: agent
   scope: Namespaced
   versions:
     - name: v1alpha1
       schema:
         openAPIV3Schema:
-          description: PlatformAgent is the Schema for the platformagents API
+          description: |-
+            Agent is the Schema for the agents API. It is the single, generic, tier-discriminated agent
+            resource (06 §1/§1.1, 08 §2); the former PlatformAgent Kind is now the platform-tier instance.
           properties:
             apiVersion:
               description: |-
@@ -37,7 +39,7 @@ spec:
             metadata:
               type: object
             spec:
-              description: spec defines the desired state of PlatformAgent
+              description: spec defines the desired state of the Agent
               properties:
                 deployment:
                   description: Deployment abstracts the Kubernetes Pod/Deployment configuration.
@@ -7092,7 +7094,9 @@ spec:
                       type: string
                   type: object
                 integration:
-                  description: Integration configures platform-specific external connections.
+                  description:
+                    Integration configures external connections (GitHub,
+                    Google Chat, Slack).
                   properties:
                     github:
                       description: GitHub configures the GitHub integration.
@@ -7305,7 +7309,7 @@ spec:
                   default: platform
                   description: |-
                     Tier is the agent's persona / containment level (06 §1.1). Immutable after creation.
-                    Defaults to "platform" — the only tier in Phase 1, and the value today's PlatformAgent adopts.
+                    Defaults to "platform" — the value the platform-tier Agent adopts.
                   enum:
                     - platform
                     - cluster-admin
@@ -7318,7 +7322,7 @@ spec:
                 - harness
               type: object
             status:
-              description: status defines the observed state of PlatformAgent
+              description: status defines the observed state of the Agent
               properties:
                 address:
                   description:

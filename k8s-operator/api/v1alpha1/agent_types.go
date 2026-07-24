@@ -21,21 +21,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// PlatformAgentSpec defines the desired state of PlatformAgent
-type PlatformAgentSpec struct {
-	AgentSpec `json:",inline"`
-
-	// Harness configures the core execution environment and framework-level settings.
-	// +required
-	Harness *HarnessSpec `json:"harness,omitempty"`
-
-	// Integration configures platform-specific external connections.
-	// +optional
-	Integration *PlatformAgentIntegrationSpec `json:"integration,omitempty"`
-}
-
-// PlatformAgentIntegrationSpec extends common IntegrationSpec with platform-specific connections.
-type PlatformAgentIntegrationSpec struct {
+// AgentIntegrationSpec extends the common IntegrationSpec with chat-platform connections
+// (Google Chat, Slack). It is carried inline on AgentSpec.Integration for every tier.
+type AgentIntegrationSpec struct {
 	IntegrationSpec `json:",inline"`
 
 	// GoogleChat configures the Google Chat integration.
@@ -121,32 +109,33 @@ type SlackSpec struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 
-// PlatformAgent is the Schema for the platformagents API
-type PlatformAgent struct {
+// Agent is the Schema for the agents API. It is the single, generic, tier-discriminated agent
+// resource (06 §1/§1.1, 08 §2); the former PlatformAgent Kind is now the platform-tier instance.
+type Agent struct {
 	metav1.TypeMeta `json:",inline"`
 
 	// metadata is a standard object metadata
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	// spec defines the desired state of PlatformAgent
+	// spec defines the desired state of the Agent
 	// +required
-	Spec PlatformAgentSpec `json:"spec"`
+	Spec AgentSpec `json:"spec"`
 
-	// status defines the observed state of PlatformAgent
+	// status defines the observed state of the Agent
 	// +optional
 	Status AgentStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 
-// PlatformAgentList contains a list of PlatformAgent
-type PlatformAgentList struct {
+// AgentList contains a list of Agent
+type AgentList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitzero"`
-	Items           []PlatformAgent `json:"items"`
+	Items           []Agent `json:"items"`
 }
 
 func init() {
-	SchemeBuilder.Register(&PlatformAgent{}, &PlatformAgentList{})
+	SchemeBuilder.Register(&Agent{}, &AgentList{})
 }

@@ -2,14 +2,14 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   creationTimestamp: null
-  name: platformagent-data
+  name: agent-data
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
       blockOwnerDeletion: true
       controller: true
-      kind: PlatformAgent
-      name: platformagent
+      kind: Agent
+      name: agent
       uid: ""
 spec:
   accessModes:
@@ -29,8 +29,8 @@ metadata:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
       blockOwnerDeletion: true
       controller: true
-      kind: PlatformAgent
-      name: platformagent
+      kind: Agent
+      name: agent
       uid: ""
 spec:
   accessModes:
@@ -117,14 +117,14 @@ data:
 kind: ConfigMap
 metadata:
   creationTimestamp: null
-  name: platformagent-config
+  name: agent-config
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
       blockOwnerDeletion: true
       controller: true
-      kind: PlatformAgent
-      name: platformagent
+      kind: Agent
+      name: agent
       uid: ""
 ---
 apiVersion: v1
@@ -174,14 +174,14 @@ data:
 kind: ConfigMap
 metadata:
   creationTimestamp: null
-  name: platformagent-fluent-bit-config
+  name: agent-fluent-bit-config
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
       blockOwnerDeletion: true
       controller: true
-      kind: PlatformAgent
-      name: platformagent
+      kind: Agent
+      name: agent
       uid: ""
 ---
 apiVersion: v1
@@ -192,14 +192,14 @@ data:
 kind: ConfigMap
 metadata:
   creationTimestamp: null
-  name: platformagent-settings
+  name: agent-settings
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
       blockOwnerDeletion: true
       controller: true
-      kind: PlatformAgent
-      name: platformagent
+      kind: Agent
+      name: agent
       uid: ""
 ---
 apiVersion: apps/v1
@@ -207,21 +207,21 @@ kind: Deployment
 metadata:
   creationTimestamp: null
   labels:
-    app: platformagent-gateway
-  name: platformagent-gateway
+    app: agent-gateway
+  name: agent-gateway
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
       blockOwnerDeletion: true
       controller: true
-      kind: PlatformAgent
-      name: platformagent
+      kind: Agent
+      name: agent
       uid: ""
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: platformagent-gateway
+      app: agent-gateway
   strategy:
     type: Recreate
   template:
@@ -232,7 +232,7 @@ spec:
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
       labels:
-        app: platformagent-gateway
+        app: agent-gateway
     spec:
       containers:
         - env:
@@ -249,13 +249,13 @@ spec:
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
             - name: OTEL_SERVICE_NAME
-              value: platformagent-gateway
+              value: agent-gateway
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
             - name: OTEL_EXPORTER_OTLP_PROTOCOL
               value: http/protobuf
             - name: OTEL_RESOURCE_ATTRIBUTES
-              value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
+              value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=agent
             - name: GKE_CLUSTER_NAME
               value: cluster-a
             - name: GKE_LOCATION
@@ -264,7 +264,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   key: api-key
-                  name: platformagent-secrets
+                  name: agent-secrets
             - name: GOOGLE_CHAT_PROJECT_ID
               value: kube-agents-gkedemos
             - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
@@ -386,7 +386,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   key: api-key
-                  name: platformagent-secrets
+                  name: agent-secrets
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v0.1.0
           imagePullPolicy: IfNotPresent
           name: event-watcher
@@ -413,14 +413,14 @@ spec:
       volumes:
         - name: platform-agent-data-vol
           persistentVolumeClaim:
-            claimName: platformagent-data
+            claimName: agent-data
         - configMap:
             defaultMode: 493
-            name: platformagent-config
+            name: agent-config
           name: platform-agent-config-vol
         - configMap:
             defaultMode: 420
-            name: platformagent-fluent-bit-config
+            name: agent-fluent-bit-config
           name: fluent-bit-config
         - emptyDir: {}
           name: fluent-bit-state
@@ -429,7 +429,7 @@ spec:
             claimName: system-metadata
         - configMap:
             defaultMode: 420
-            name: platformagent-settings
+            name: agent-settings
           name: settings-volume
 status: {}
 ---
@@ -437,14 +437,14 @@ apiVersion: v1
 kind: Service
 metadata:
   creationTimestamp: null
-  name: platformagent
+  name: agent
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
       blockOwnerDeletion: true
       controller: true
-      kind: PlatformAgent
-      name: platformagent
+      kind: Agent
+      name: agent
       uid: ""
 spec:
   ports:
@@ -455,6 +455,6 @@ spec:
       port: 9119
       targetPort: dashboard
   selector:
-    app: platformagent-gateway
+    app: agent-gateway
 status:
   loadBalancer: {}

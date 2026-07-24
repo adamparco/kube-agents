@@ -65,7 +65,7 @@ type LaunchSpec struct {
 
 // launchSpecFor extracts the per-pod contract from an Agent CR (the same values the native
 // builder derives), so both launchers start from one source of truth.
-func launchSpecFor(agent *agentv1alpha1.PlatformAgent) LaunchSpec {
+func launchSpecFor(agent *agentv1alpha1.Agent) LaunchSpec {
 	spec := LaunchSpec{
 		Name:               agent.Name,
 		Namespace:          agent.Namespace,
@@ -87,7 +87,7 @@ type PodLauncher interface {
 	// name identifies the launcher for logging/telemetry.
 	name() string
 	// BuildDeployment returns the fully-specified agent Deployment.
-	BuildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment
+	BuildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment
 }
 
 // nativePodLauncher wraps the existing, verified native builder. This is the fallback and the
@@ -96,7 +96,7 @@ type nativePodLauncher struct{}
 
 func (nativePodLauncher) name() string { return "native" }
 
-func (nativePodLauncher) BuildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
+func (nativePodLauncher) BuildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
 	return buildDeployment(agent, configHash, fluentBitHash, settingsConfigHash)
 }
 
@@ -110,7 +110,7 @@ type scionPodLauncher struct {
 
 func (scionPodLauncher) name() string { return "scion" }
 
-func (s scionPodLauncher) BuildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
+func (s scionPodLauncher) BuildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
 	// Spike placeholder: derive the contract (proving the extraction path), then build via the
 	// native fallback. A real integration would submit launchSpecFor(agent) to Scion's launch
 	// primitive and reconcile the returned pod. We assert parity here instead.

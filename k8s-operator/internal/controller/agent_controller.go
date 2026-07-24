@@ -38,17 +38,17 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-const platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
+const agentFinalizer = "kubeagents.x-k8s.io/finalizer"
 
-// PlatformAgentReconciler reconciles a PlatformAgent object
-type PlatformAgentReconciler struct {
+// AgentReconciler reconciles an Agent object
+type AgentReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agents,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agents/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims;configmaps;services,verbs=get;list;watch;create;update;patch;delete
 // serviceaccounts is read-only: the controller REFERENCES the pre-created agent KSA by name and never
@@ -61,15 +61,15 @@ type PlatformAgentReconciler struct {
 // GitOps (policy/rbac-overlay/) and enforced by vap-agent-readonly. Do not re-add RBAC write verbs.
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
 
-func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	instance := &agentv1alpha1.PlatformAgent{}
+	instance := &agentv1alpha1.Agent{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("Reconciling PlatformAgent", "name", instance.Name, "namespace", instance.Namespace)
+	log.Info("Reconciling Agent", "name", instance.Name, "namespace", instance.Namespace)
 
 	// 1. Intercept Deletion (only to strip a legacy finalizer; see handleDeletion).
 	if !instance.ObjectMeta.DeletionTimestamp.IsZero() {
@@ -132,14 +132,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{}, r.updateStatusReady(ctx, instance)
 }
 
-// handleDeletion runs when a PlatformAgent is being deleted. The controller no longer mints RBAC or a
+// handleDeletion runs when an Agent is being deleted. The controller no longer mints RBAC or a
 // KSA (P1-T4/T5) and the pre-created identity is GitOps-managed, so there is nothing for the
 // controller to delete — owned workload resources (Deployment/PVC/ConfigMap/Service) are
 // garbage-collected via OwnerReferences. This only strips a legacy finalizer left by an older
 // controller so such CRs are not stuck terminating.
-func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
-	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
-		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
+func (r *AgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.Agent) (ctrl.Result, error) {
+	if controllerutil.ContainsFinalizer(agent, agentFinalizer) {
+		controllerutil.RemoveFinalizer(agent, agentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -147,7 +147,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 	return ctrl.Result{}, nil
 }
 
-func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+func (r *AgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.Agent) error {
 	for _, pvc := range []*corev1.PersistentVolumeClaim{
 		buildPVC(agent),
 		buildSystemPVC(agent),
@@ -159,7 +159,7 @@ func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agent
 	return nil
 }
 
-func (r *PlatformAgentReconciler) reconcilePersistentVolumeClaim(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pvc *corev1.PersistentVolumeClaim) error {
+func (r *AgentReconciler) reconcilePersistentVolumeClaim(ctx context.Context, agent *agentv1alpha1.Agent, pvc *corev1.PersistentVolumeClaim) error {
 	if err := ctrl.SetControllerReference(agent, pvc, r.Scheme); err != nil {
 		return err
 	}
@@ -175,13 +175,13 @@ func (r *PlatformAgentReconciler) reconcilePersistentVolumeClaim(ctx context.Con
 	return nil
 }
 
-func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+func (r *AgentReconciler) reconcileConfigMap(ctx context.Context, agent *agentv1alpha1.Agent) (string, error) {
 	cm := buildConfigMap(agent)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return "", err
 	}
 
-	err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("agent-controller"))
 	if err != nil {
 		return "", err
 	}
@@ -193,13 +193,13 @@ func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent 
 	return hash, nil
 }
 
-func (r *PlatformAgentReconciler) reconcileFluentBitConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+func (r *AgentReconciler) reconcileFluentBitConfigMap(ctx context.Context, agent *agentv1alpha1.Agent) (string, error) {
 	cm := buildFluentBitConfigMap(agent)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return "", err
 	}
 
-	err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("agent-controller"))
 	if err != nil {
 		return "", err
 	}
@@ -211,13 +211,13 @@ func (r *PlatformAgentReconciler) reconcileFluentBitConfigMap(ctx context.Contex
 	return hash, nil
 }
 
-func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+func (r *AgentReconciler) reconcileSettingsConfigMap(ctx context.Context, agent *agentv1alpha1.Agent) (string, error) {
 	cm := buildSettingsConfigMap(agent)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return "", err
 	}
 
-	err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("agent-controller"))
 	if err != nil {
 		return "", err
 	}
@@ -229,7 +229,7 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 	return hash, nil
 }
 
-func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash string) error {
+func (r *AgentReconciler) reconcileDeployment(ctx context.Context, agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsHash string) error {
 	// Pod construction goes through the launcher seam (08 §2 Scion spike): native build by
 	// default, Scion launch primitive when gated on and available, always with native fallback.
 	launcher := selectPodLauncher(logf.FromContext(ctx))
@@ -237,18 +237,18 @@ func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
-	return r.Patch(ctx, dep, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	return r.Patch(ctx, dep, client.Apply, client.ForceOwnership, client.FieldOwner("agent-controller"))
 }
 
-func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	svc := buildPlatformService(agent)
+func (r *AgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.Agent) error {
+	svc := buildAgentService(agent)
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
 		return err
 	}
-	return r.Patch(ctx, svc, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	return r.Patch(ctx, svc, client.Apply, client.ForceOwnership, client.FieldOwner("agent-controller"))
 }
 
-func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+func (r *AgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.Agent) error {
 	// Fetch actual Deployment
 	dep := &appsv1.Deployment{}
 	errDep := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
@@ -339,7 +339,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	return r.Status().Update(ctx, agent)
 }
 
-func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment) (phase string, reason string, message string) {
+func (r *AgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.Agent, dep *appsv1.Deployment) (phase string, reason string, message string) {
 	phase = "Provisioning"
 	reason = "Provisioning"
 	message = "Waiting for deployment replicas to be ready"
@@ -381,7 +381,7 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	return phase, reason, message
 }
 
-func (r *PlatformAgentReconciler) validateRuntimeClass(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+func (r *AgentReconciler) validateRuntimeClass(ctx context.Context, agent *agentv1alpha1.Agent) error {
 	if agent.Spec.Deployment == nil || agent.Spec.Deployment.RuntimeClassName == nil || *agent.Spec.Deployment.RuntimeClassName == "" {
 		return nil
 	}
@@ -395,7 +395,7 @@ func (r *PlatformAgentReconciler) validateRuntimeClass(ctx context.Context, agen
 	return nil
 }
 
-func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {
+func (r *AgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.Agent, reason, message string) error {
 	agent.Status.Phase = "Degraded"
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
@@ -412,15 +412,15 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *AgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// The controller does not own the agent ServiceAccount or any RBAC — those are pre-created and
 	// GitOps-managed (P1-T4/T5). It watches only the workload resources it renders.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&agentv1alpha1.PlatformAgent{}).
+		For(&agentv1alpha1.Agent{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
-		Named("platformagent").
+		Named("agent").
 		Complete(r)
 }

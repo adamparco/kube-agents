@@ -28,18 +28,18 @@ import (
 )
 
 func TestBuildConfigMap(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
 			Namespace: "test-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
+		Spec: agentv1alpha1.AgentSpec{
 			Harness: &agentv1alpha1.HarnessSpec{
 				Hermes: &agentv1alpha1.HermesSpec{
 					AgentHome: "/custom/home",
 				},
 			},
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				GoogleChat: &agentv1alpha1.GoogleChatSpec{
 					Enabled: ptr.To(true),
 				},
@@ -89,12 +89,12 @@ func TestBuildConfigMap(t *testing.T) {
 }
 
 func TestBuildConfigMap_MemoryConfig(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "memory-agent",
 			Namespace: "test-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
+		Spec: agentv1alpha1.AgentSpec{
 			Harness: &agentv1alpha1.HarnessSpec{
 				Memory: &agentv1alpha1.MemorySpec{
 					MemoryEnabled:      ptr.To(true),
@@ -120,10 +120,10 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 
 func TestDisplayMode(t *testing.T) {
 	// Test Default (Quiet) Mode
-	defaultAgent := &agentv1alpha1.PlatformAgent{
+	defaultAgent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{Name: "quiet-agent", Namespace: "ns"},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				GoogleChat: &agentv1alpha1.GoogleChatSpec{
 					Mode: "default",
 				},
@@ -136,10 +136,10 @@ func TestDisplayMode(t *testing.T) {
 	}
 
 	// Test Debug Mode
-	debugAgent := &agentv1alpha1.PlatformAgent{
+	debugAgent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{Name: "debug-agent", Namespace: "ns"},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				GoogleChat: &agentv1alpha1.GoogleChatSpec{
 					Mode: "debug",
 				},
@@ -153,7 +153,7 @@ func TestDisplayMode(t *testing.T) {
 }
 
 func TestBuildPVC(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
 			Namespace: "test-ns",
@@ -171,7 +171,7 @@ func TestBuildPVC(t *testing.T) {
 }
 
 func TestBuildSystemPVC(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
 			Namespace: "test-ns",
@@ -189,71 +189,69 @@ func TestBuildSystemPVC(t *testing.T) {
 }
 
 func TestBuildDeployment(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-agent",
 			Namespace: "my-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			AgentSpec: agentv1alpha1.AgentSpec{
-				Deployment: &agentv1alpha1.DeploymentSpec{
-					RuntimeClassName: ptr.To("gvisor"),
-					Image:            "gcr.io/my-proj/agent",
-					Tag:              ptr.To("v1.0.0"),
-					ImagePullPolicy:  ptr.To(corev1.PullAlways),
-					BrowserArgs:      []string{"--no-sandbox", "--disable-gpu"},
-					Env: []corev1.EnvVar{
-						{
-							Name:  "CUSTOM_VAR",
-							Value: "custom-value",
-						},
-						{
-							Name:  "CUSTOM_VAR", // Duplicate custom var, should override previous
-							Value: "new-custom-value",
-						},
+		Spec: agentv1alpha1.AgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				RuntimeClassName: ptr.To("gvisor"),
+				Image:            "gcr.io/my-proj/agent",
+				Tag:              ptr.To("v1.0.0"),
+				ImagePullPolicy:  ptr.To(corev1.PullAlways),
+				BrowserArgs:      []string{"--no-sandbox", "--disable-gpu"},
+				Env: []corev1.EnvVar{
+					{
+						Name:  "CUSTOM_VAR",
+						Value: "custom-value",
 					},
-					InitContainers: []corev1.Container{
-						{
-							Name:  "init-git",
-							Image: "git-image:latest",
-						},
-						{
-							Name:  "init-bootstrap",
-							Image: "busybox:1.36",
-						},
+					{
+						Name:  "CUSTOM_VAR", // Duplicate custom var, should override previous
+						Value: "new-custom-value",
 					},
-					Sidecars: []corev1.Container{
-						{
-							Name:  "my-sidecar",
-							Image: "sidecar-image:latest",
-						},
+				},
+				InitContainers: []corev1.Container{
+					{
+						Name:  "init-git",
+						Image: "git-image:latest",
 					},
-					SidecarVolumes: []corev1.Volume{
-						{
-							Name: "sidecar-vol",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
-							},
-						},
+					{
+						Name:  "init-bootstrap",
+						Image: "busybox:1.36",
 					},
-					ExtraVolumes: []corev1.Volume{
-						{
-							Name: "extra-vol",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
-							},
-						},
+				},
+				Sidecars: []corev1.Container{
+					{
+						Name:  "my-sidecar",
+						Image: "sidecar-image:latest",
 					},
-					ExtraVolumeMounts: []corev1.VolumeMount{
-						{
-							Name:      "extra-vol",
-							MountPath: "/extra/path",
+				},
+				SidecarVolumes: []corev1.Volume{
+					{
+						Name: "sidecar-vol",
+						VolumeSource: corev1.VolumeSource{
+							EmptyDir: &corev1.EmptyDirVolumeSource{},
 						},
 					},
 				},
-				Security: &agentv1alpha1.SecuritySpec{
-					ServiceAccountName: "custom-sa",
+				ExtraVolumes: []corev1.Volume{
+					{
+						Name: "extra-vol",
+						VolumeSource: corev1.VolumeSource{
+							EmptyDir: &corev1.EmptyDirVolumeSource{},
+						},
+					},
 				},
+				ExtraVolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      "extra-vol",
+						MountPath: "/extra/path",
+					},
+				},
+			},
+			Security: &agentv1alpha1.SecuritySpec{
+				ServiceAccountName: "custom-sa",
 			},
 			Harness: &agentv1alpha1.HarnessSpec{
 				ClusterName: "gke-cluster",
@@ -269,7 +267,7 @@ func TestBuildDeployment(t *testing.T) {
 					},
 				},
 			},
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				IntegrationSpec: agentv1alpha1.IntegrationSpec{
 					GitHub: &agentv1alpha1.GitHubSpec{
 						GitRepo: "https://github.com/my-org/my-repo.git",
@@ -601,12 +599,12 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			agent := &agentv1alpha1.PlatformAgent{
+			agent := &agentv1alpha1.Agent{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "my-agent",
 					Namespace: "my-ns",
 				},
-				Spec: agentv1alpha1.PlatformAgentSpec{
+				Spec: agentv1alpha1.AgentSpec{
 					Harness: &agentv1alpha1.HarnessSpec{
 						Hermes: tc.hermes,
 					},
@@ -637,7 +635,7 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 				t.Errorf("expected container 3 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[3].Name)
 			}
 
-			svc := buildPlatformService(agent)
+			svc := buildAgentService(agent)
 			hasDashboardPort := false
 			for _, port := range svc.Spec.Ports {
 				if port.Name == "dashboard" && port.Port == 9119 {
@@ -653,12 +651,12 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 }
 
 func TestBuildDeployment_DashboardDisabled(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-agent",
 			Namespace: "my-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
+		Spec: agentv1alpha1.AgentSpec{
 			Harness: &agentv1alpha1.HarnessSpec{
 				Hermes: &agentv1alpha1.HermesSpec{
 					DashboardEnabled: ptr.To(false),
@@ -688,7 +686,7 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 		t.Errorf("expected container 2 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[2].Name)
 	}
 
-	svc := buildPlatformService(agent)
+	svc := buildAgentService(agent)
 	for _, port := range svc.Spec.Ports {
 		if port.Name == "dashboard" || port.Port == 9119 {
 			t.Errorf("expected dashboard port 9119 to be omitted when dashboard disabled")
@@ -697,18 +695,16 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 }
 
 func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-agent",
 			Namespace: "my-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			AgentSpec: agentv1alpha1.AgentSpec{
-				Deployment: &agentv1alpha1.DeploymentSpec{
-					Image: "gcr.io/my-proj/agent",
-				},
+		Spec: agentv1alpha1.AgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				Image: "gcr.io/my-proj/agent",
 			},
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				GoogleChat: &agentv1alpha1.GoogleChatSpec{
 					Enabled:          ptr.To(true),
 					ProjectID:        "my-gcp-project",
@@ -736,13 +732,13 @@ func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 }
 
 func TestBuildDeploymentSlackIntegration(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-agent",
 			Namespace: "my-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				Slack: &agentv1alpha1.SlackSpec{
 					Enabled: ptr.To(true),
 					BotTokenSecretRef: &corev1.SecretKeySelector{
@@ -786,13 +782,13 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 }
 
 func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-agent",
 			Namespace: "my-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				Slack: &agentv1alpha1.SlackSpec{
 					Enabled:      ptr.To(true),
 					AllowedUsers: []string{""},
@@ -817,13 +813,13 @@ func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 }
 
 func TestBuildConfigMapSlackEnabled(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
 			Namespace: "test-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				Slack: &agentv1alpha1.SlackSpec{
 					Enabled: ptr.To(true),
 				},
@@ -839,7 +835,7 @@ func TestBuildConfigMapSlackEnabled(t *testing.T) {
 }
 
 func TestBuildFluentBitConfigMap(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
 			Namespace: "test-ns",
@@ -863,14 +859,14 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 
 func TestBuildPlatformService(t *testing.T) {
 	t.Run("DashboardEnabled_Default", func(t *testing.T) {
-		agent := &agentv1alpha1.PlatformAgent{
+		agent := &agentv1alpha1.Agent{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-platform-agent",
 				Namespace: "test-ns",
 			},
 		}
 
-		svc := buildPlatformService(agent)
+		svc := buildAgentService(agent)
 		if svc.Name != "test-platform-agent" {
 			t.Errorf("expected Service name test-platform-agent, got %s", svc.Name)
 		}
@@ -900,12 +896,12 @@ func TestBuildPlatformService(t *testing.T) {
 	})
 
 	t.Run("DashboardDisabled_Explicit", func(t *testing.T) {
-		agent := &agentv1alpha1.PlatformAgent{
+		agent := &agentv1alpha1.Agent{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-platform-agent",
 				Namespace: "test-ns",
 			},
-			Spec: agentv1alpha1.PlatformAgentSpec{
+			Spec: agentv1alpha1.AgentSpec{
 				Harness: &agentv1alpha1.HarnessSpec{
 					Hermes: &agentv1alpha1.HermesSpec{
 						DashboardEnabled: ptr.To(false),
@@ -914,19 +910,19 @@ func TestBuildPlatformService(t *testing.T) {
 			},
 		}
 
-		svc := buildPlatformService(agent)
+		svc := buildAgentService(agent)
 		if len(svc.Spec.Ports) != 1 {
 			t.Errorf("expected 1 service port when dashboard disabled, got %d", len(svc.Spec.Ports))
 		}
 	})
 
 	t.Run("DashboardEnabled", func(t *testing.T) {
-		agent := &agentv1alpha1.PlatformAgent{
+		agent := &agentv1alpha1.Agent{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-platform-agent",
 				Namespace: "test-ns",
 			},
-			Spec: agentv1alpha1.PlatformAgentSpec{
+			Spec: agentv1alpha1.AgentSpec{
 				Harness: &agentv1alpha1.HarnessSpec{
 					Hermes: &agentv1alpha1.HermesSpec{
 						DashboardEnabled: ptr.To(true),
@@ -935,7 +931,7 @@ func TestBuildPlatformService(t *testing.T) {
 			},
 		}
 
-		svc := buildPlatformService(agent)
+		svc := buildAgentService(agent)
 		if len(svc.Spec.Ports) != 2 {
 			t.Errorf("expected 2 service ports when dashboard enabled, got %d", len(svc.Spec.Ports))
 		}
@@ -955,13 +951,13 @@ func TestBuildPlatformService(t *testing.T) {
 }
 
 func TestBuildSettingsConfigMap(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
 			Namespace: "test-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				IntegrationSpec: agentv1alpha1.IntegrationSpec{
 					GitHub: &agentv1alpha1.GitHubSpec{
 						GitRepo: "https://github.com/my-org/my-repo.git",
@@ -989,13 +985,13 @@ func TestBuildSettingsConfigMap(t *testing.T) {
 }
 
 func TestBuildSettingsConfigMapEmptyGitRepo(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
 			Namespace: "test-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				IntegrationSpec: agentv1alpha1.IntegrationSpec{
 					GitHub: &agentv1alpha1.GitHubSpec{
 						GitRepo: "",
@@ -1017,12 +1013,12 @@ func TestBuildSettingsConfigMapEmptyGitRepo(t *testing.T) {
 }
 
 func TestBuildSettingsConfigMapNilIntegration(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
 			Namespace: "test-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
+		Spec: agentv1alpha1.AgentSpec{
 			Integration: nil,
 		},
 	}
@@ -1039,13 +1035,13 @@ func TestBuildSettingsConfigMapNilIntegration(t *testing.T) {
 }
 
 func TestBuildSettingsConfigMapNilGitHub(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
 			Namespace: "test-ns",
 		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Spec: agentv1alpha1.AgentSpec{
+			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				IntegrationSpec: agentv1alpha1.IntegrationSpec{
 					GitHub: nil,
 				},

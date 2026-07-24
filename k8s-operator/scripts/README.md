@@ -35,7 +35,7 @@ When any script is run:
    - Provisions a dedicated GKE Sandbox (gVisor) node pool (defaults to `gvisor-pool`, configurable via `GVISOR_POOL_NAME`). Executed automatically if `ENABLE_GVISOR=true`.
 3. **[provision_03_gcp_gke_operator.sh](provision_03_gcp_gke_operator.sh)**
    - Installs `cert-manager` (`v1.14.4`) if not present (including leader-election compatibility patching for GKE Autopilot clusters).
-   - Installs Custom Resource Definitions (CRDs) for `PlatformAgent`.
+   - Installs Custom Resource Definitions (CRDs) for `Agent`.
    - Deploys the Operator controller manager into the GKE cluster.
 4. **[provision_04_gcp_iam.sh](provision_04_gcp_iam.sh)**
    - Enables GCP Service APIs (`container.googleapis.com` and `cloudresourcemanager.googleapis.com`).
@@ -60,7 +60,7 @@ When any script is run:
 8. **[provision_08_deploy_platform_agent.sh](provision_08_deploy_platform_agent.sh)**
    - Uses `envsubst` to render `platform-agent.yaml` from its template.
    - Automatically enables the `gvisor` runtime class in the rendered manifest if `ENABLE_GVISOR=true`.
-   - Applies the resulting `PlatformAgent` Custom Resource (CR) to deploy the platform agent instance.
+   - Applies the resulting `Agent` Custom Resource (CR) to deploy the platform agent instance.
 9. **[provision_09_deploy_litellm.sh](provision_09_deploy_litellm.sh)**
    - Deploys the LiteLLM Gateway to the GKE cluster.
 10. **[provision_10_deploy_github_minter.sh](provision_10_deploy_github_minter.sh)**
@@ -76,7 +76,7 @@ When any script is run:
 ### Auxiliary & Development Scripts
 
 - **[common.sh](common.sh)**: Shared utility functions, color output, logging, prompt helpers, and state management.
-- **[platform-agent.yaml.template](platform-agent.yaml.template)**: Manifest template used by `provision_08_deploy_platform_agent.sh` to render the `PlatformAgent` Custom Resource.
+- **[platform-agent.yaml.template](platform-agent.yaml.template)**: Manifest template used by `provision_08_deploy_platform_agent.sh` to render the `Agent` Custom Resource.
 - **[print_instructions_gchat.sh](print_instructions_gchat.sh)**: Helper script that prints Google Chat integration post-provisioning instructions.
 - **[print_instructions_slack.sh](print_instructions_slack.sh)**: Helper script that prints Slack integration post-provisioning instructions.
 - **[dev/dev_rebuild_agent.sh](dev/dev_rebuild_agent.sh)**: Fast local development utility that builds, pushes, and redeploys agent container images.
@@ -86,7 +86,7 @@ When any script is run:
 - **[teardown_11_deploy_inference_replay.sh](teardown_11_deploy_inference_replay.sh)**: Always executed by master teardown; undeploys the proxy (including the cache PVC) if present and re-applies the LiteLLM Service manifest to restore the original selector. Idempotent no-op if the proxy was never deployed.
 - **[teardown_10_deploy_github_minter.sh](teardown_10_deploy_github_minter.sh)**: Cleans up the GitHub Token Minter deployment and disables/schedules Cloud KMS key versions for destruction.
 - **[teardown_09_deploy_litellm.sh](teardown_09_deploy_litellm.sh)**: Undeploys the LiteLLM Gateway from the cluster.
-- **[teardown_08_deploy_platform_agent.sh](teardown_08_deploy_platform_agent.sh)**: Safely deletes the `PlatformAgent` Custom Resource and cleans up local manifests.
+- **[teardown_08_deploy_platform_agent.sh](teardown_08_deploy_platform_agent.sh)**: Safely deletes the `Agent` Custom Resource and cleans up local manifests.
 - **[teardown_07_gcp_k8s_secrets.sh](teardown_07_gcp_k8s_secrets.sh)**: Deletes the Kubernetes secrets in GKE.
 - **[teardown_06_slack.sh](teardown_06_slack.sh)**: Resets Slack integration configuration state and tokens.
 - **[teardown_05_gcp_gchat.sh](teardown_05_gcp_gchat.sh)**: Deletes the Google Chat Pub/Sub topic and subscription.
