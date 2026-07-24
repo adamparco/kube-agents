@@ -1,5 +1,21 @@
-# Cluster-admin tier — pre-created read-only identity (06 §2, 03 §4).
-# Cluster-scoped read-only. One per cluster. Controller references, never mints (08 §4).
+# clusters/cluster-a/agents/identity/cluster-admin-identity.yaml
+#
+# The APPLIED per-cluster read-only identity for cluster-a's cluster-admin agent — SA + read-only
+# ClusterRole + ClusterRoleBinding + Workload-Identity annotation. The kube-agents controller
+# REFERENCES the ServiceAccount by name (spec.security.serviceAccountName) and mints no RBAC (08 §4).
+#
+# This is a flat manifest (not a kustomize overlay) because the reference actuation pipeline applies
+# clusters/<c>/agents/ with `kubectl apply --server-side --recursive -f` (see
+# ../../../../.github/workflows/apply.yml) — a kustomization.yaml here would break that recursive
+# apply. It is the materialized instance of the tier exemplar at
+# ../../../../policy/rbac-overlay/cluster-admin.yaml (the canonical shape + VAP test fixture); for the
+# single-cluster collapse the two are identical. Keep them in sync when the tier's read-only shape
+# changes. `CLUSTER_NAME`/`PROJECT_ID` are substituted per cluster by CI/CD.
+#
+# APPLY ORDER: this identity is applied BEFORE ../agent.yaml (identity-before-pod invariant) and AFTER
+# the VAP (so a write-verb/wrong-scope grant is rejected even during provisioning). The bootstrap
+# apply waves (clusters/<c>/bootstrap/, P2-T21) enforce the order; within the agents apply_path the
+# read-only identity below is VAP-clean, so recursive apply admits it regardless of file order.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
