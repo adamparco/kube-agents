@@ -18,6 +18,8 @@ package router
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"strings"
 	"sync/atomic"
 )
@@ -26,47 +28,82 @@ import (
 // `@kage @bar` address foo/bar, not kage.
 const botMention = "@kage"
 
-// Inferer is the (deferred) NL fallback that maps free-text intent to a Handle (06 §2b mode 3). Phase 2
-// ships NO implementation: Resolve refuses mode 3 WITHOUT constructing or invoking an Inferer, so the
-// router spends zero inference and a chat message is never routed on model output (03 §4a). Phase 3 may
-// wire one in; Resolver.InferenceCalls() then counts exactly its invocations.
+// Default confidence gates for the NL inference core (06 §2b). The DETERMINISTIC core — not the model —
+// owns the route-vs-clarify decision: a top candidate below threshold, or within margin of the
+// runner-up, is too weak or too ambiguous to route on and becomes a clarify (clarify, never guess).
+const (
+	defaultThreshold       = 0.75
+	defaultAmbiguityMargin = 0.10
+)
+
+// Inferer is the NL fallback (mode 3): given the message text and the CURRENT live-handle menu, it
+// PROPOSES scored candidates. It does not decide the route — the Resolver's deterministic core filters
+// the proposals down to the known menu and applies the confidence/ambiguity gates. Passing `known` in
+// means a hallucinated handle can never survive resolution (it is not in the menu), independently of
+// what the model returns. Phase 2 wires no Inferer, so mode 3 spends nothing (see Resolver.Infer).
 type Inferer interface {
-	Infer(ctx context.Context, text string) (Handle, error)
+	Infer(ctx context.Context, text string, known []Handle) ([]Candidate, error)
 }
 
-// Resolver maps inbound chat text to a target Handle by the deterministic order slash → handle →
-// inference (06 §2b). It is safe for concurrent use. A Resolver with a nil inferer is the Phase-2
-// posture: addressed messages resolve constant-time, everything else is refused with
-// ErrUnaddressed/ErrInferenceUnavailable and inference is never spent.
+// Resolver maps inbound chat text to a target Handle. Resolution is split into two halves so the model
+// boundary is structural, not conventional:
+//
+//   - Resolve: the DETERMINISTIC core (modes 1/2). Constant-time; never touches the Inferer; never
+//     increments. On no slash/handle match it returns ErrNeedsInference and stops.
+//   - Infer: the mode-3 NL core and the SOLE site that spends inference. The gateway calls it only after
+//     Resolve returns ErrNeedsInference.
+//
+// A Resolver is safe for concurrent use. A nil Inferer is the Phase-2 posture: Infer refuses without a
+// model call, so inference is never spent.
 type Resolver struct {
-	// inferer is nil in Phase 2. When nil, mode 3 is refused without any model call.
+	// inferer is nil in Phase 2. When nil, Infer refuses (ErrInferenceUnavailable) without any model call.
 	inferer Inferer
-	// inferenceCalls counts Inferer invocations. It is asserted ==0 across the Phase-2 test matrix to
-	// prove no chat routing spends inference; it can only ever increment on the mode-3 path.
+	// inferenceCalls counts Inferer invocations. It is asserted ==0 across the deterministic matrix to
+	// prove no slash/handle turn spends inference; it can only ever increment inside Infer.
 	inferenceCalls atomic.Int64
+	// threshold is the minimum top-candidate confidence to route on; below it the turn clarifies.
+	threshold float64
+	// ambiguityMargin is the minimum top−second confidence gap to route on; within it the turn clarifies.
+	ambiguityMargin float64
 }
 
-// NewResolver returns the Phase-2 resolver: slash/handle only, inference disabled (refused, not spent).
-func NewResolver() *Resolver { return &Resolver{} }
+// NewResolver returns the Phase-2 resolver: slash/handle only, inference disabled (refused, not spent),
+// with the default confidence gates.
+func NewResolver() *Resolver {
+	return &Resolver{threshold: defaultThreshold, ambiguityMargin: defaultAmbiguityMargin}
+}
 
-// WithInferer returns a resolver that falls back to inf for unaddressed messages (Phase 3). Kept so the
-// mode-3 boundary is exercised by tests today; the Phase-2 binary uses NewResolver (inferer nil).
-func WithInferer(inf Inferer) *Resolver { return &Resolver{inferer: inf} }
+// WithInferer returns a resolver that can fall back to inf for unaddressed messages (Phase 3). The
+// deterministic modes 1/2 still never invoke it; only Infer does.
+func WithInferer(inf Inferer) *Resolver {
+	r := NewResolver()
+	r.inferer = inf
+	return r
+}
 
-// InferenceCalls reports how many times an Inferer has been invoked. Always 0 for a NewResolver().
+// WithThreshold overrides the confidence gate (route only if top ≥ threshold) and the ambiguity margin
+// (clarify if top−second < margin). It is the ONLY way to move the route↔clarify boundary, so the gates
+// are fixed once at wiring time and cannot drift per call. Returns the receiver for chaining.
+func (r *Resolver) WithThreshold(threshold, margin float64) *Resolver {
+	r.threshold = threshold
+	r.ambiguityMargin = margin
+	return r
+}
+
+// InferenceCalls reports how many times an Inferer has been invoked. Always 0 for a NewResolver() and
+// for any run that only ever takes modes 1/2.
 func (r *Resolver) InferenceCalls() int64 { return r.inferenceCalls.Load() }
 
-// Resolve maps text to a target agent by deterministic order (06 §2b):
+// Resolve is the DETERMINISTIC half of resolution (06 §2b), modes 1/2 only:
 //
-//  1. slash command  `@kage /<handle> …`      → ModeSlash  (constant-time)
-//  2. explicit handle `… @<handle> …`         → ModeHandle (constant-time)
-//  3. NL inference    (fallback)              → ModeInference
+//  1. slash command  `@kage /<handle> …`  → ModeSlash  (constant-time)
+//  2. explicit handle `… @<handle> …`     → ModeHandle (constant-time)
 //
-// Modes 1–2 never touch inference. Mode 3 is refused with ErrInferenceUnavailable when no Inferer is
-// wired (Phase 2) — no model is called, so InferenceCalls stays 0. A recognized-but-broken handle is a
-// deterministic refusal (ErrMalformedHandle/ErrUnknownTier); the router clarifies, it does not guess.
-// On any refusal the returned Resolution still carries the attempted Mode for the audit record.
-func (r *Resolver) Resolve(ctx context.Context, text string) (Resolution, error) {
+// A recognized-but-broken handle is a deterministic refusal (ErrMalformedHandle/ErrUnknownTier) — the
+// router clarifies, it does not guess. On no slash/handle match Resolve returns ErrNeedsInference
+// WITHOUT touching the Inferer or incrementing: the caller (the gateway) decides whether to escalate to
+// Infer (mode 3) or refuse. The ctx is unused here but kept for signature symmetry with Infer.
+func (r *Resolver) Resolve(_ context.Context, text string) (Resolution, error) {
 	fields := strings.Fields(text)
 
 	// Mode 1: slash command. A slash command is the leading token (after an optional @kage mention);
@@ -88,19 +125,71 @@ func (r *Resolver) Resolve(ctx context.Context, text string) (Resolution, error)
 		return Resolution{Handle: h, Mode: ModeHandle}, nil
 	}
 
-	// Mode 3: NL inference fallback. Phase 2 has no Inferer — refuse WITHOUT a model call.
+	// No deterministic match: signal the caller to escalate to inference (or refuse). No model, no spend.
+	return Resolution{Mode: ModeInference}, ErrNeedsInference
+}
+
+// Infer is the mode-3 NL core and the SOLE site that spends inference. The gateway calls it only after
+// Resolve returns ErrNeedsInference. Order (load-bearing):
+//
+//  1. empty text        → ErrUnaddressed, BEFORE any increment (a blank turn spends 0 inference).
+//  2. no Inferer wired  → ErrInferenceUnavailable, no increment (the Phase-2 posture).
+//  3. otherwise         → increment EXACTLY ONCE, then call the model.
+//  4. drop every returned candidate not in `known` (a hallucinated handle cannot survive); 0 left →
+//     ErrUnaddressed.
+//  5. top < threshold OR (top−second) < margin → clarify (*ClarifyError with the surviving menu);
+//     else route the top candidate.
+//
+// The deterministic core owns steps 4–5; the model only proposes. InferenceCalls increments once for a
+// routed OR a clarified turn (the model was consulted either way) and zero for steps 1–2.
+func (r *Resolver) Infer(ctx context.Context, text string, known []Handle) (Resolution, error) {
+	if strings.TrimSpace(text) == "" {
+		return Resolution{Mode: ModeInference}, ErrUnaddressed
+	}
 	if r.inferer == nil {
-		if len(fields) == 0 {
-			return Resolution{Mode: ModeInference}, ErrUnaddressed
-		}
 		return Resolution{Mode: ModeInference}, ErrInferenceUnavailable
 	}
+
 	r.inferenceCalls.Add(1)
-	h, err := r.inferer.Infer(ctx, text)
+	cands, err := r.inferer.Infer(ctx, text, known)
 	if err != nil {
 		return Resolution{Mode: ModeInference}, err
 	}
-	return Resolution{Handle: h, Mode: ModeInference}, nil
+
+	// Barrier: re-filter the model's proposals to the live menu regardless of what it returned.
+	valid := filterKnown(cands, known)
+	if len(valid) == 0 {
+		return Resolution{Mode: ModeInference}, ErrUnaddressed
+	}
+	sort.SliceStable(valid, func(i, j int) bool { return valid[i].Confidence > valid[j].Confidence })
+
+	top := valid[0]
+	nearTie := len(valid) >= 2 && (top.Confidence-valid[1].Confidence) < r.ambiguityMargin
+	if top.Confidence < r.threshold || nearTie {
+		return Resolution{Mode: ModeInference}, &ClarifyError{
+			Reason: fmt.Sprintf(
+				"low-confidence NL match (top %.2f, threshold %.2f, margin %.2f); clarify rather than guess",
+				top.Confidence, r.threshold, r.ambiguityMargin),
+			Candidates: valid,
+		}
+	}
+	return Resolution{Handle: top.Handle, Mode: ModeInference}, nil
+}
+
+// filterKnown returns the candidates whose handle is in the live menu, preserving input order. It is the
+// deterministic barrier that makes a hallucinated handle un-routable no matter what the model proposes.
+func filterKnown(cands []Candidate, known []Handle) []Candidate {
+	allow := make(map[string]struct{}, len(known))
+	for _, h := range known {
+		allow[tierLeafKey(h)] = struct{}{}
+	}
+	out := make([]Candidate, 0, len(cands))
+	for _, c := range cands {
+		if _, ok := allow[tierLeafKey(c.Handle)]; ok {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // leadingSlashToken returns the handle token of a leading slash command, skipping one optional @kage

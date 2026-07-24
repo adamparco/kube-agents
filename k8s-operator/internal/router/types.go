@@ -140,6 +140,12 @@ var (
 	// ErrInferenceUnavailable means resolution fell through to NL inference but no Inferer is wired.
 	// This is the Phase-2 posture: mode 3 is refused WITHOUT invoking any model, so inference_calls==0.
 	ErrInferenceUnavailable = errors.New("router: NL inference is disabled (Phase 2 routes by slash/handle only)")
+	// ErrNeedsInference is the INTERNAL signal the deterministic Resolve returns when a message matches
+	// no slash/handle (modes 1/2) and therefore needs the mode-3 NL fallback. It never escapes the
+	// gateway: the gateway either calls Resolver.Infer (which returns a terminal outcome) or, with no
+	// Inferer wired, Infer maps it to ErrInferenceUnavailable/ErrUnaddressed. Splitting resolution this
+	// way guarantees Resolve never touches the model and never spends inference.
+	ErrNeedsInference = errors.New("router: message needs NL inference (no slash/handle match)")
 	// ErrMissingProjectContext means a cluster-admin handle could not be turned into a routing key
 	// because the router was given no project context to fill the scope.
 	ErrMissingProjectContext = errors.New("router: cluster-admin handle needs project context to form a routing key")

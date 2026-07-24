@@ -17,6 +17,7 @@ limitations under the License.
 package router
 
 import (
+	"strings"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -68,6 +69,14 @@ func NewIndex() *Index {
 // either a tier string or an RFC1123 leaf, so the two fields can never collide across a slot boundary.
 func tierLeafKey(h Handle) string {
 	return string(h.Tier) + "\x00" + h.Leaf
+}
+
+// splitTierLeaf is the inverse of tierLeafKey, reconstructing the Handle a byTierLeaf slot represents.
+func splitTierLeaf(tl string) (Handle, bool) {
+	if i := strings.IndexByte(tl, 0); i >= 0 {
+		return Handle{Tier: agentv1alpha1.AgentTier(tl[:i]), Leaf: tl[i+1:]}, true
+	}
+	return Handle{}, false
 }
 
 // Upsert inserts or updates the route for a. It computes the identity key from the CR (agentindex, the
@@ -180,6 +189,26 @@ func (i *Index) Len() int {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return len(i.byKey)
+}
+
+// KnownHandles returns the canonical Handle of every live agent — the menu the NL inferer must choose
+// from (06 §2b mode 3). It is derived from byTierLeaf (maintained for all tiers), deduped by (tier,
+// leaf) so a namespace present in several clusters appears once, and freshly allocated so the caller may
+// keep it. The deterministic core re-filters the model's proposals against this exact set, so a handle
+// the index does not know can never survive resolution regardless of what the model returns.
+func (i *Index) KnownHandles() []Handle {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	out := make([]Handle, 0, len(i.byTierLeaf))
+	for tl, keys := range i.byTierLeaf {
+		if len(keys) == 0 {
+			continue
+		}
+		if h, ok := splitTierLeaf(tl); ok {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // targetFromAgent projects the routing-relevant fields out of an Agent CR (06 §2b). TopicName and

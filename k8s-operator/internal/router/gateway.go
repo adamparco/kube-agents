@@ -72,8 +72,14 @@ func (g *Gateway) Handle(ctx context.Context, msg Message) (Outcome, error) {
 
 	var out Outcome
 
-	// 1. Resolve: name the target (deterministic; no inference in Phase 2).
+	// 1. Resolve: name the target. The deterministic core (modes 1/2) runs first and never spends
+	//    inference. Only on ErrNeedsInference (no slash/handle match) does the gateway escalate to the
+	//    mode-3 core, handing it the LIVE handle menu so a hallucinated handle cannot survive. The
+	//    inferred handle then flows through the SAME lookup→authorize→dispatch spine as modes 1/2.
 	res, err := g.Resolver.Resolve(ctx, msg.Text)
+	if errors.Is(err, ErrNeedsInference) {
+		res, err = g.Resolver.Infer(ctx, msg.Text, g.Index.KnownHandles())
+	}
 	out.Resolution = res
 	if err != nil {
 		audit.Record(ctx, AuditRecord{Sender: msg.Sender, Mode: res.Mode, Handle: res.Handle.Canonical(), Reason: err.Error()})
