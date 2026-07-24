@@ -155,24 +155,10 @@ def validate_location(location: str, project_id: str) -> str:
     return ""
 
 
-# =============================================================================
-# GKE Declarative Apply / Delete Helpers
-# =============================================================================
-
-def apply_manifest(path: str):
-    """Execute kubectl apply on the manifest path using secure in-cluster token."""
-    subprocess.run(
-        ["kubectl", "apply", "-f", path],
-        check=True, capture_output=True, text=True
-    )
-
-
-def delete_cluster_manifest(cluster_name: str):
-    """Delete the GKE cluster Custom Resource from the namespace asynchronously."""
-    subprocess.run(
-        ["kubectl", "delete", "containercluster", cluster_name, "-n", "kubeagents-system", "--wait=false"],
-        check=True, capture_output=True, text=True
-    )
+# NOTE: kube-agents agents are READ-ONLY (03 §4, 06 §9). No kubectl apply/delete write path exists in
+# this MCP server — the removed apply_manifest/delete_cluster_manifest helpers must not be reintroduced.
+# All infrastructure mutation goes through the `submit-suggestion` skill (a reviewed GitOps PR that the
+# CI/CD actuation pipeline applies on merge), never a direct cluster write from the agent process.
 
 
 @mcp.tool()
