@@ -17,23 +17,21 @@ limitations under the License.
 package controller
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 const (
-	defaultPlatformAgentImage = "ghcr.io/gke-labs/kube-agents/platform-agent:latest"
+	// defaultPlatformAgentImage is the fallback agent image when an Agent CR omits
+	// spec.deployment.image. Pinned to an immutable version tag (not :latest); shipped CRs
+	// pin explicitly and production should repin to a digest (platform-agent@sha256:...).
+	defaultPlatformAgentImage = "ghcr.io/gke-labs/kube-agents/platform-agent:v0.1.0"
 
 	// managedOTelEndpoint is the OTLP/HTTP endpoint of the GKE Managed OpenTelemetry
 	// collector. The same endpoint is already used by the LiteLLM integration, so agent
@@ -161,38 +159,9 @@ func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSp
 	return replicas, strategy
 }
 
-// ReconcileServiceAccount is a shared helper to reconcile a ServiceAccount on the host cluster
-// with Server-Side Apply and OwnerReference.
-func ReconcileServiceAccount(
-	ctx context.Context,
-	c client.Client,
-	scheme *runtime.Scheme,
-	owner client.Object,
-	name,
-	namespace string,
-	annotations map[string]string,
-	fieldOwner string,
-) error {
-	sa := &corev1.ServiceAccount{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "ServiceAccount",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-	}
-	if annotations != nil {
-		sa.Annotations = annotations
-	}
-
-	if err := controllerutil.SetControllerReference(owner, sa, scheme); err != nil {
-		return err
-	}
-
-	return c.Patch(ctx, sa, client.Apply, client.ForceOwnership, client.FieldOwner(fieldOwner))
-}
+// NOTE: the ReconcileServiceAccount helper was removed in P1-T5. The controller no longer mints or
+// annotates the agent KSA at runtime; the ServiceAccount (with its Workload Identity annotation) is
+// pre-created via GitOps (examples/gitops-repo/policy/rbac-overlay/) and only referenced by name.
 
 // defaultSecretRef returns ref if provided, otherwise defaults to secretName with defaultKey.
 func defaultSecretRef(ref *corev1.SecretKeySelector, secretName, defaultKey string) *corev1.SecretKeySelector {

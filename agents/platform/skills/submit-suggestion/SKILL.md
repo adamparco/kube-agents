@@ -26,11 +26,11 @@ Follow these steps to make, commit, and submit your GitOps suggestions asynchron
     git checkout main
     git pull origin main
     ```
-2.  Create and switch to a unique Git branch named dynamically after the target configuration:
+2.  Create and switch to a unique Git branch named dynamically after the target configuration. The branch **must** live in your tier's namespace, `<tier>-agent/<change_type>-<target_id>` (the submit script refuses any branch outside it):
     ```bash
-    git checkout -b platform-agent/<change_type>-<target_id>
+    git checkout -b <tier>-agent/<change_type>-<target_id>
     ```
-    _(Example: `platform-agent/provision-mercury-09` or `platform-agent/upgrade-policy-baseline`)_
+    _(Example for the platform tier: `platform-agent/provision-mercury-09` or `platform-agent/upgrade-policy-baseline`. A cluster-admin agent would use `cluster-admin-agent/...`.)_
 3.  Generate or edit the required declarative files inside the repository workspace as requested.
 4.  Stage and commit the changes locally following Conventional Commit standards. **CRITICAL SECURITY RULE:** You **must** explicitly stage only the targeted declarative manifest files you generated or modified. **Never use `git add .` or `git add -A`** to prevent committing transient debugging files, volatile local credentials, or workspace logs:
     ```bash
@@ -45,7 +45,7 @@ Invoke the secure, pre-packaged Python helper script **`submit_suggestion.py`** 
 
 ```bash
 ./skills/submit-suggestion/scripts/submit_suggestion.py \
-  --branch "platform-agent/<change_type>-<target_id>" \
+  --branch "<tier>-agent/<change_type>-<target_id>" \
   --title "<pr_title>" \
   --body "This Pull Request was generated automatically by the **Platform Agent** control plane.
 
@@ -55,7 +55,10 @@ Invoke the secure, pre-packaged Python helper script **`submit_suggestion.py`** 
 Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollout!"
 ```
 
-The script will return the clean, live GitHub PR URL dynamically!
+The script derives your tier from `$AGENT_TIER` (default `platform`); pass `--tier <tier>` to
+override it. It enforces that `--branch` starts with `<tier>-agent/`, then handles the GitHub App
+token exchange, git credential setup, branch push, and PR creation, and returns the clean, live
+GitHub PR URL dynamically!
 
 ### Step 3: Confirm Suggestion
 

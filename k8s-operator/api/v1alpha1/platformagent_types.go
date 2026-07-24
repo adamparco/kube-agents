@@ -50,6 +50,7 @@ type PlatformAgentIntegrationSpec struct {
 // GoogleChatSpec contains the configuration for the Google Chat integration,
 // enabling communication and event routing via Google Chat.
 // +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.projectId) && has(self.topicName) && has(self.subscriptionName))",message="projectId, topicName, and subscriptionName are required when Google Chat integration is enabled"
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.allowedUsers) && size(self.allowedUsers) > 0)",message="allowedUsers must be non-empty when the Google Chat integration is enabled (an empty allowlist admits all authenticated users)"
 type GoogleChatSpec struct {
 	// Enabled toggles the Google Chat integration.
 	// +kubebuilder:default=false
@@ -88,6 +89,7 @@ type GoogleChatSpec struct {
 
 // SlackSpec contains the configuration for the Slack integration.
 // +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef) && has(self.appTokenSecretRef))",message="botTokenSecretRef and appTokenSecretRef are required when Slack integration is enabled"
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.allowedUsers) && size(self.allowedUsers) > 0)",message="allowedUsers must be non-empty when the Slack integration is enabled (an empty allowlist admits all authenticated users)"
 type SlackSpec struct {
 	// Enabled toggles the Slack integration.
 	// +kubebuilder:default=false

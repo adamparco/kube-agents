@@ -14,11 +14,10 @@ mcp_servers:
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
-  gke:
-    command: "node"
-    args:
-      - "/opt/mcp-remote/dist/proxy.js"
-      - "https://container.googleapis.com/mcp"
+  # NOTE: the cluster-mutating `gke` remote MCP proxy (container.googleapis.com) is intentionally
+  # omitted so the Platform Agent is read-only (03 §4, 06 §9). This baked config is a fallback; the
+  # operator's renderConfigYAML() is runtime-authoritative and also omits it. Provisioning goes
+  # through the submit-suggestion GitOps skill, never a direct cluster write.
 
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.
@@ -28,13 +27,11 @@ platform_toolsets:
     - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
-    - mcp-gke
   api_server:
     - hermes-api-server
     - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
-    - mcp-gke
 
 memory:
   memory_enabled: false

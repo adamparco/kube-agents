@@ -41,7 +41,9 @@ spec:
             - --leader-elect
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=0
-          image: controller:latest
+          # Pinned to an immutable version tag (not :latest). In production, repin to a
+          # content-addressable digest (controller@sha256:...) once the image is published.
+          image: controller:v0.1.0
           name: manager
           env:
             - name: ENABLE_WEBHOOKS

@@ -10,6 +10,12 @@ metadata:
   labels:
     kube-agents/tier: platform
     app.kubernetes.io/managed-by: gitops
+  annotations:
+    # Workload Identity: binds this KSA to the VIEWER-ONLY cloud GSA (06 §2; provisioned by
+    # k8s-operator/scripts/provision_04_gcp_iam.sh, hardened to read-only in P1-T9). The GSA holds
+    # only viewer cloud IAM — the cloud-write path is a reviewed GitOps PR, never the agent process.
+    # Substituted per project by CI/CD; PROJECT_ID = your GCP project ID.
+    iam.gke.io/gcp-service-account: "kubeagents-platform-gsa@PROJECT_ID.iam.gserviceaccount.com"
 ---
 # Cluster-wide read ("explorer") — get/list/watch only, no write verbs.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -22,6 +28,12 @@ rules:
   - apiGroups:
       ["", "apps", "batch", "networking.k8s.io", "rbac.authorization.k8s.io"]
     resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  # CustomResourceDefinitions read: the platform agent reasons over IaC/KCC CRD types when proposing
+  # changes. This preserves the CRD read the controller's minted explorer role granted before P1-T4
+  # removed runtime RBAC-minting — do not drop it, or the cutover silently loses CRD visibility.
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -160,11 +160,21 @@ init_var_model_provider() {
 }
 
 init_var_platform_agent_permission_set() {
-  init_var "PLATFORM_AGENT_PERMISSION_SET" "gke-admin" "Enter Platform Agent Permission Set (read-only, gke-admin, custom)"
+  init_var "PLATFORM_AGENT_PERMISSION_SET" "read-only" "Enter Platform Agent Permission Set (read-only, custom)"
 
   PLATFORM_AGENT_PERMISSION_SET=$(echo "$PLATFORM_AGENT_PERMISSION_SET" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-  if [[ ! "$PLATFORM_AGENT_PERMISSION_SET" =~ ^(read-only|gke-admin|custom)$ ]]; then
-    print_error "Invalid Platform Agent Permission Set '$PLATFORM_AGENT_PERMISSION_SET'. Must be one of: read-only, gke-admin, custom."
+
+  # The 'gke-admin' preset is retired (Phase 1). The Platform Agent is read-only at the
+  # cloud boundary — the only write path is a reviewed GitOps PR applied by the CI/CD
+  # pipeline (invariant: the cloud GSA stays viewer-only). Coerce any stale value to
+  # read-only so re-provisioning an install that predates this downgrades it in place.
+  if [ "$PLATFORM_AGENT_PERMISSION_SET" = "gke-admin" ]; then
+    print_warning "PLATFORM_AGENT_PERMISSION_SET='gke-admin' is retired; the Platform Agent is read-only. Proceeding as 'read-only' (use 'custom' with explicit roles to extend it)."
+    PLATFORM_AGENT_PERMISSION_SET="read-only"
+  fi
+
+  if [[ ! "$PLATFORM_AGENT_PERMISSION_SET" =~ ^(read-only|custom)$ ]]; then
+    print_error "Invalid Platform Agent Permission Set '$PLATFORM_AGENT_PERMISSION_SET'. Must be one of: read-only, custom."
     exit 1
   fi
 

@@ -181,8 +181,89 @@ type GitHubSpec struct {
 	GitRepo string `json:"gitRepo,omitempty"`
 }
 
+// AgentTier is the persona / containment level of an agent. It is the tier discriminator the whole
+// tier model, the (tier, scope) cardinality webhook, and the pre-created RBAC render overlay key on.
+// Immutable after creation (06 §1.1).
+// +kubebuilder:validation:Enum=platform;cluster-admin;developer-team
+type AgentTier string
+
+const (
+	// TierPlatform is the root fleet-scoped tier (1 per project). The only tier in Phase 1.
+	TierPlatform AgentTier = "platform"
+	// TierClusterAdmin is the cluster-scoped tier (1 per cluster), parented by the platform agent.
+	TierClusterAdmin AgentTier = "cluster-admin"
+	// TierDeveloperTeam is the namespace-scoped tier (1 per namespace), parented by a cluster-admin.
+	TierDeveloperTeam AgentTier = "developer-team"
+)
+
+// ScopeSpec identifies where an agent operates. Per-tier required fields (06 §1.2):
+// platform → projectId; cluster-admin → projectId+clusterName; developer-team →
+// projectId+clusterName+namespace. Together with tier it forms the identity key the cardinality
+// webhook and the RBAC render overlay derive from.
+type ScopeSpec struct {
+	// ProjectID is the GCP project the agent is scoped to (all tiers).
+	// +optional
+	ProjectID string `json:"projectId,omitempty"`
+
+	// ClusterName is the target cluster (cluster-admin and developer-team tiers).
+	// +optional
+	ClusterName string `json:"clusterName,omitempty"`
+
+	// Namespace is the target namespace and the pod's placement namespace (developer-team tier only).
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// ParentRefSpec links a non-platform agent to its parent agent (06 §1.2). It is required for
+// non-platform tiers. The cross-object checks (correct parent tier; child ⊆ parent attenuation
+// ceiling) are deferred to the hardening admission webhook (08 §5) — Phase 1 carries the field only.
+type ParentRefSpec struct {
+	// Name is the parent Agent's name.
+	// +optional
+	Name string `json:"name,omitempty"`
+}
+
+// IACFormat selects the infrastructure-as-code artifact an agent authors when proposing a change.
+// +kubebuilder:validation:Enum=kcc;terraform
+type IACFormat string
+
+const (
+	// IACFormatKCC authors Config Connector (KCC) YAML — the default customer standard.
+	IACFormatKCC IACFormat = "kcc"
+	// IACFormatTerraform authors Terraform HCL.
+	IACFormatTerraform IACFormat = "terraform"
+)
+
+// IACSpec configures which IaC artifact the agent proposes via GitOps (06 §1.1, §4). Consumers treat
+// an empty Format as "kcc" (the default applies when the iac object is present; nil iac ⇒ kcc).
+type IACSpec struct {
+	// Format is the artifact format the agent authors (kcc or terraform).
+	// +kubebuilder:default=kcc
+	// +optional
+	Format IACFormat `json:"format,omitempty"`
+}
+
 // AgentSpec defines the common infrastructure configuration shared across all agent types.
 type AgentSpec struct {
+	// Tier is the agent's persona / containment level (06 §1.1). Immutable after creation.
+	// Defaults to "platform" — the only tier in Phase 1, and the value today's PlatformAgent adopts.
+	// +kubebuilder:default=platform
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="tier is immutable"
+	// +optional
+	Tier AgentTier `json:"tier,omitempty"`
+
+	// Scope identifies where the agent operates (per-tier required fields, 06 §1.2).
+	// +optional
+	Scope *ScopeSpec `json:"scope,omitempty"`
+
+	// ParentRef links a non-platform agent to its parent (06 §1.2). Required for non-platform tiers.
+	// +optional
+	ParentRef *ParentRefSpec `json:"parentRef,omitempty"`
+
+	// IAC selects the IaC artifact this agent authors when proposing changes via GitOps (06 §1.1, §4).
+	// +optional
+	IAC *IACSpec `json:"iac,omitempty"`
+
 	// Deployment abstracts the Kubernetes Pod/Deployment configuration.
 	// +optional
 	Deployment *DeploymentSpec `json:"deployment,omitempty"`

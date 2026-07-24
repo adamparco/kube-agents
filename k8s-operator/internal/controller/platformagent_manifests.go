@@ -25,7 +25,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -161,14 +160,19 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			"command": "node",
 			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://developerknowledge.googleapis.com/mcp"},
 		},
-		"gke": map[string]any{
-			"command": "node",
-			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://container.googleapis.com/mcp"},
-		},
+		// NOTE: the remote `gke` MCP proxy (container.googleapis.com) is intentionally NOT wired here.
+		// It exposes cluster-mutating tools (e.g. create_cluster), and a remote MCP's toolset cannot be
+		// subset client-side, so it is dropped entirely to keep the agent read-only (03 §4, 06 §9). This
+		// render is runtime-authoritative (mounted over /opt/data/config.yaml), so dropping it here is
+		// what actually makes the deployed agent read-only. Provisioning becomes "author KCC/Terraform +
+		// open a PR" via the submit-suggestion skill; the CI/CD actuation pipeline applies on merge.
+		// developer_knowledge above is a read-only knowledge API and stays.
 	}
 	cfg.PlatformToolsets = map[string][]string{
-		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
-		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
+		// mcp-gke is intentionally absent: it is the toolset for the dropped cluster-mutating `gke`
+		// remote MCP server (see NOTE above). Keeping the agent read-only (03 §4, 06 §9).
+		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
+		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
 	}
 
 	// Execution & Display UX configuration
@@ -558,6 +562,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, pullP
 			Name:      "platform-agent-config-vol",
 			MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
 			SubPath:   "config.yaml",
+			// Runtime-authoritative config is operator-rendered and must not be mutable by the agent
+			// process (defense in depth for the read-only invariant, 03 §4).
+			ReadOnly: true,
 		},
 		{
 			Name:      "settings-volume",
@@ -835,59 +842,10 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 }
 
 // buildPlatformExplorerRole generates the custom ClusterRole manifest
-func buildPlatformExplorerRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
-	return &rbacv1.ClusterRole{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "rbac.authorization.k8s.io/v1",
-			Kind:       "ClusterRole",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name),
-		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{""},
-				Resources: []string{"nodes", "pods", "namespaces"},
-				Verbs:     []string{"get", "list"},
-			},
-			{
-				APIGroups: []string{"apiextensions.k8s.io"},
-				Resources: []string{"customresourcedefinitions"},
-				Verbs:     []string{"get", "list"},
-			},
-		},
-	}
-}
-
-// buildClusterRoleBinding generates a ClusterRoleBinding manifest
-func buildClusterRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.ClusterRoleBinding {
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
-
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "rbac.authorization.k8s.io/v1",
-			Kind:       "ClusterRoleBinding",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: bindingName,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      saName,
-				Namespace: agent.Namespace,
-			},
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     roleName,
-		},
-	}
-}
+// NOTE: buildPlatformExplorerRole / buildClusterRoleBinding were removed in P1-T4. The controller no
+// longer mints agent RBAC at runtime; the read-only agent identity (explorer ClusterRole + binding)
+// is pre-created via GitOps (examples/gitops-repo/policy/rbac-overlay/) and enforced by
+// vap-agent-readonly. Do not reintroduce a runtime RBAC-minting path here (08 §4, 03 §4).
 
 // Helper to calculate the SHA256 hash of ConfigMap Data for rolling restarts.
 func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {

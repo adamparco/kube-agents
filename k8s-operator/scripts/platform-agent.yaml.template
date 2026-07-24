@@ -3,7 +3,11 @@ kind: PlatformAgent
 metadata:
   name: platform-agent
   namespace: "${NAMESPACE}"
+  labels:
+    kube-agents/tier: platform
 spec:
+  # Persona / containment level (06 §1.1). Immutable after creation.
+  tier: platform
   harness:
     clusterName: "${CLUSTER_NAME}"
     location: "${REGION}"

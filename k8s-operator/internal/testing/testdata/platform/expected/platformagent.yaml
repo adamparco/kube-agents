@@ -1,71 +1,4 @@
 apiVersion: v1
-kind: ServiceAccount
-metadata:
-  annotations:
-    iam.gke.io/gcp-service-account: kubeagents-platform-gsa@kube-agents-gkedemos.iam.gserviceaccount.com
-  creationTimestamp: null
-  name: kubeagents-platform-agent
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  creationTimestamp: null
-  name: kubeagents:viewer:kubeagents-system:platformagent
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: view
-subjects:
-  - kind: ServiceAccount
-    name: kubeagents-platform-agent
-    namespace: kubeagents-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  creationTimestamp: null
-  name: kubeagents:explorer:kubeagents-system:platformagent
-rules:
-  - apiGroups:
-      - ""
-    resources:
-      - nodes
-      - pods
-      - namespaces
-    verbs:
-      - get
-      - list
-  - apiGroups:
-      - apiextensions.k8s.io
-    resources:
-      - customresourcedefinitions
-    verbs:
-      - get
-      - list
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  creationTimestamp: null
-  name: kubeagents:explorer:kubeagents-system:platformagent
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: kubeagents:explorer:kubeagents-system:platformagent
-subjects:
-  - kind: ServiceAccount
-    name: kubeagents-platform-agent
-    namespace: kubeagents-system
----
-apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   creationTimestamp: null
@@ -130,11 +63,6 @@ data:
         - /opt/mcp-remote/dist/proxy.js
         - https://developerknowledge.googleapis.com/mcp
         command: node
-      gke:
-        args:
-        - /opt/mcp-remote/dist/proxy.js
-        - https://container.googleapis.com/mcp
-        command: node
       platform_control:
         args:
         - /opt/data/scripts/platform_mcp_server.py
@@ -164,13 +92,11 @@ data:
       - mcp-agent_common
       - mcp-platform_control
       - mcp-developer_knowledge
-      - mcp-gke
       cli:
       - hermes-cli
       - mcp-agent_common
       - mcp-platform_control
       - mcp-developer_knowledge
-      - mcp-gke
     platforms:
       google_chat:
         enabled: true
@@ -301,7 +227,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 7ca1c2642614b81bebaffedf427abe947f0e7f30c028f3047bd6ee083a2b101f
+        kubeagents.x-k8s.io/config-hash: ed39633c3076e97f62fb3e1c9f34f79cfe0f09ffea38a49c6eb957ca4eac324a
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
@@ -344,12 +270,11 @@ spec:
             - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
               value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
             - name: GOOGLE_CHAT_ALLOWED_USERS
+              value: users/REPLACE_WITH_PLATFORM_ADMIN_ID
             - name: GOOGLE_CHAT_HOME_CHANNEL
-            - name: GOOGLE_CHAT_ALLOW_ALL_USERS
-              value: "true"
             - name: TOKEN_BROKER_URL
               value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:v0.1.0
           imagePullPolicy: IfNotPresent
           name: platform-agent
           ports:
@@ -372,6 +297,7 @@ spec:
               name: platform-agent-data-vol
             - mountPath: /opt/data/config.yaml
               name: platform-agent-config-vol
+              readOnly: true
               subPath: config.yaml
             - mountPath: /opt/data/SETTINGS.md
               name: settings-volume
@@ -390,7 +316,7 @@ spec:
               value: /opt/data/home
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:v0.1.0
           imagePullPolicy: IfNotPresent
           name: platform-agent-dashboard
           ports:
@@ -461,7 +387,7 @@ spec:
                 secretKeyRef:
                   key: api-key
                   name: platformagent-secrets
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:v0.1.0
           imagePullPolicy: IfNotPresent
           name: event-watcher
           resources:

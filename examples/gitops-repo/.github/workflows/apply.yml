@@ -1,0 +1,164 @@
+# apply.yml — the actuation pipeline (reference)
+#
+# On merge to `main`, this workflow applies the changed desired-state to its target:
+#   - `kubectl apply` for Kubernetes / Config Connector (KCC) YAML
+#   - `terraform apply` for Terraform HCL (a provisioning dir containing *.tf)
+#
+# This is the **sole privileged writer** in the system (03 §4, 06 §4). kube-agents agents are
+# read-only and hold NO write credentials — they only author artifacts and open PRs
+# (`submit-suggestion`). Applying happens here, after a human reviews and merges the PR.
+#
+# Least privilege is expressed with one **GitHub Environment per target**: each environment holds
+# only its own target's deploy identity (a Workload Identity Federation provider + a per-target
+# Google service account scoped to just that cluster/project). A change to `cluster-a` can never
+# use `cluster-b`'s credentials. Add branch/reviewer protection rules per environment to gate the
+# apply itself.
+#
+# kube-agents is unopinionated about CI/CD (06 §4): GitHub Actions is the reference; CircleCI,
+# Jenkins, Argo, Flux, or Atlantis are equally valid. Adapt the auth + apply steps to your stack.
+#
+# NOTE: pin every `uses:` to an immutable commit SHA in production (shown here as major tags for
+# readability). The deploy service accounts must be least-privilege for their target only.
+
+name: apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "clusters/**"
+      - "fleet/**"
+
+# Never run two applies against the same target concurrently; do not cancel an in-flight apply.
+concurrency:
+  group: apply-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation (keyless auth)
+
+jobs:
+  # 1) Work out which targets the merged commit actually changed, and emit a matrix.
+  #    A target is either a single cluster (`cluster:<name>`) or `fleet`.
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.detect.outputs.targets }}
+      any: ${{ steps.detect.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need history to diff the merged range
+
+      - id: detect
+        name: Detect changed targets
+        run: |
+          set -euo pipefail
+          base="${{ github.event.before }}"
+          head="${{ github.sha }}"
+          # First push / force-push leaves `before` as the zero SHA — fall back to the parent.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-parse "${head}^" 2>/dev/null || echo "$head")"
+          fi
+
+          changed="$(git diff --name-only "$base" "$head" || true)"
+          echo "Changed files:"; echo "$changed"
+
+          targets=()
+          # Each cluster with a changed path under clusters/<name>/ is one target.
+          while IFS= read -r cluster; do
+            [ -n "$cluster" ] && targets+=("cluster:$cluster")
+          done < <(echo "$changed" | sed -n 's#^clusters/\([^/]*\)/.*#\1#p' | sort -u)
+          # A change anywhere under fleet/ is the fleet target.
+          if echo "$changed" | grep -q '^fleet/'; then
+            targets+=("fleet")
+          fi
+
+          if [ ${#targets[@]} -eq 0 ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "targets=[]" >> "$GITHUB_OUTPUT"
+          else
+            json="$(printf '%s\n' "${targets[@]}" | jq -R . | jq -cs .)"
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            echo "targets=$json" >> "$GITHUB_OUTPUT"
+            echo "Targets: $json"
+          fi
+
+  # 2) Apply each target independently, each with its own least-privilege environment/credentials.
+  apply:
+    needs: detect
+    if: needs.detect.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # one target's failure must not abort the others
+      matrix:
+        target: ${{ fromJson(needs.detect.outputs.targets) }}
+    # The environment name IS the target; its secrets/vars are that target's deploy identity only.
+    environment: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keyless auth via Workload Identity Federation — no long-lived JSON keys. The provider and
+      # service account are per-target (bound to this GitHub Environment), so each apply is scoped
+      # to exactly one cluster/project with least privilege.
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SERVICE_ACCOUNT }}
+
+      # For a cluster target, get credentials for that cluster. `fleet` applies KCC to the
+      # Config-Connector management cluster (its own env vars point there).
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GKE_LOCATION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Apply target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          # Apply one directory: Terraform if it holds *.tf, otherwise kubectl (KCC/K8s YAML).
+          apply_path() {
+            local dir="$1"
+            [ -d "$dir" ] || { echo "  (skip $dir — absent)"; return 0; }
+            if ls "$dir"/*.tf >/dev/null 2>&1; then
+              echo "  terraform apply → $dir"
+              terraform -chdir="$dir" init -input=false
+              terraform -chdir="$dir" apply -input=false -auto-approve
+            elif ls "$dir"/*.y*ml >/dev/null 2>&1; then
+              echo "  kubectl apply (server-side) → $dir"
+              # --server-side gives field-manager conflict detection; --prune is intentionally NOT
+              # enabled by default (deletions should be explicit, reviewed PRs — see README).
+              kubectl apply --server-side --recursive -f "$dir"
+            else
+              echo "  (skip $dir — no .tf or .yaml)"
+            fi
+          }
+
+          case "$TARGET" in
+            cluster:*)
+              name="${TARGET#cluster:}"
+              echo "Applying cluster '$name'"
+              # provisioning first (cluster/cloud resources), then namespaces, then agents.
+              apply_path "clusters/$name/provisioning"
+              for ns in clusters/"$name"/namespaces/*/; do apply_path "${ns%/}"; done
+              apply_path "clusters/$name/agents"
+              ;;
+            fleet)
+              echo "Applying fleet-level artifacts"
+              apply_path "fleet"
+              ;;
+            *)
+              echo "Unknown target '$TARGET'" >&2
+              exit 1
+              ;;
+          esac

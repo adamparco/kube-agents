@@ -25,7 +25,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,9 +33,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -53,10 +50,15 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims;configmaps;services,verbs=get;list;watch;create;update;patch;delete
+// serviceaccounts is read-only: the controller REFERENCES the pre-created agent KSA by name and never
+// mints or annotates it (P1-T5, 08 §4). Identity is pre-created & GitOps-managed.
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;pods;events;persistentvolumes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;bind
+// NOTE: the controller intentionally holds NO clusterroles/clusterrolebindings permissions. It no
+// longer mints agent RBAC at runtime (P1-T4, 08 §4); the read-only agent identity is pre-created via
+// GitOps (policy/rbac-overlay/) and enforced by vap-agent-readonly. Do not re-add RBAC write verbs.
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
 
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -69,30 +71,15 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	log.Info("Reconciling PlatformAgent", "name", instance.Name, "namespace", instance.Namespace)
 
-	// 1. Intercept Deletion
+	// 1. Intercept Deletion (only to strip a legacy finalizer; see handleDeletion).
 	if !instance.ObjectMeta.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, instance)
 	}
 
-	// 2. Add Finalizer if not present
-	if !controllerutil.ContainsFinalizer(instance, platformAgentFinalizer) {
-		controllerutil.AddFinalizer(instance, platformAgentFinalizer)
-		if err := r.Update(ctx, instance); err != nil {
-			return ctrl.Result{}, err
-		}
-		// Return immediately after update to fetch the fresh ResourceVersion, preventing OptimisticLockErrors
-		return ctrl.Result{}, nil
-	}
-
-	// 3. Reconcile Service Account (with Workload Identity annotation)
-	if err := r.reconcileServiceAccount(ctx, instance); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// 3b. Reconcile RBAC (ClusterRole and ClusterRoleBindings)
-	if err := r.reconcileRBAC(ctx, instance); err != nil {
-		return ctrl.Result{}, err
-	}
+	// The agent's ServiceAccount and RBAC are pre-created and GitOps-managed (policy/rbac-overlay/,
+	// fleet/); the controller only REFERENCES them by name. It no longer mints a KSA (P1-T5) or agent
+	// RBAC (P1-T4), so there is nothing cluster-scoped to clean up on deletion and no finalizer is
+	// added — owned workload resources are garbage-collected via OwnerReferences.
 
 	// 4. Reconcile PVC for agent persistent data
 	if err := r.reconcilePVC(ctx, instance); err != nil {
@@ -145,54 +132,19 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{}, r.updateStatusReady(ctx, instance)
 }
 
+// handleDeletion runs when a PlatformAgent is being deleted. The controller no longer mints RBAC or a
+// KSA (P1-T4/T5) and the pre-created identity is GitOps-managed, so there is nothing for the
+// controller to delete — owned workload resources (Deployment/PVC/ConfigMap/Service) are
+// garbage-collected via OwnerReferences. This only strips a legacy finalizer left by an older
+// controller so such CRs are not stuck terminating.
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
-		viewerBindingName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
-		explorerBindingName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
-		explorerRoleName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
-
-		// Delete Viewer ClusterRoleBinding
-		crbViewer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: viewerBindingName}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, crbViewer)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Delete Explorer ClusterRoleBinding
-		crbExplorer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: explorerBindingName}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, crbExplorer)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Delete Explorer ClusterRole
-		crExplorer := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: explorerRoleName}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, crExplorer)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Resource is deleted. Safe to remove finalizer and update.
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 	return ctrl.Result{}, nil
-}
-
-func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" && len(agent.Spec.Security.ServiceAccountAnnotations) == 0 {
-		return nil
-	}
-
-	saName := agent.Name
-	var annotations map[string]string
-	if agent.Spec.Security != nil {
-		if agent.Spec.Security.ServiceAccountName != "" {
-			saName = agent.Spec.Security.ServiceAccountName
-		}
-		annotations = agent.Spec.Security.ServiceAccountAnnotations
-	}
-
-	return ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, "platformagent-controller")
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -278,7 +230,10 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 }
 
 func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash string) error {
-	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash)
+	// Pod construction goes through the launcher seam (08 §2 Scion spike): native build by
+	// default, Scion launch primitive when gated on and available, always with native fallback.
+	launcher := selectPodLauncher(logf.FromContext(ctx))
+	dep := launcher.BuildDeployment(agent, configHash, fluentBitHash, settingsHash)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
@@ -291,30 +246,6 @@ func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *a
 		return err
 	}
 	return r.Patch(ctx, svc, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
-}
-
-func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	viewerBindingName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
-	crbViewer := buildClusterRoleBinding(agent, viewerBindingName, "view")
-	err := r.Patch(ctx, crbViewer, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
-	if err != nil {
-		return fmt.Errorf("failed to reconcile viewer ClusterRoleBinding: %w", err)
-	}
-
-	explorerRole := buildPlatformExplorerRole(agent)
-	err = r.Patch(ctx, explorerRole, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
-	if err != nil {
-		return fmt.Errorf("failed to reconcile explorer ClusterRole: %w", err)
-	}
-
-	explorerBindingName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
-	crbExplorer := buildClusterRoleBinding(agent, explorerBindingName, explorerRole.Name)
-	err = r.Patch(ctx, crbExplorer, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
-	if err != nil {
-		return fmt.Errorf("failed to reconcile explorer ClusterRoleBinding: %w", err)
-	}
-
-	return nil
 }
 
 func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -482,33 +413,14 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// The controller does not own the agent ServiceAccount or any RBAC — those are pre-created and
+	// GitOps-managed (P1-T4/T5). It watches only the workload resources it renders.
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&agentv1alpha1.PlatformAgent{}).
 		Owns(&appsv1.Deployment{}).
-		Owns(&corev1.ServiceAccount{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
-		Watches(
-			&rbacv1.ClusterRoleBinding{},
-			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-				parts := strings.Split(obj.GetName(), ":") // format: kubeagents:<role>:<namespace>:<name>
-				if len(parts) == 4 && parts[0] == "kubeagents" {
-					return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: parts[2], Name: parts[3]}}}
-				}
-				return nil
-			}),
-		).
-		Watches(
-			&rbacv1.ClusterRole{},
-			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-				parts := strings.Split(obj.GetName(), ":") // format: kubeagents:<role>:<namespace>:<name>
-				if len(parts) == 4 && parts[0] == "kubeagents" {
-					return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: parts[2], Name: parts[3]}}}
-				}
-				return nil
-			}),
-		).
 		Named("platformagent").
 		Complete(r)
 }

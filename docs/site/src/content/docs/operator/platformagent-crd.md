@@ -52,9 +52,10 @@ Default image: `ghcr.io/gke-labs/kube-agents/platform-agent`. Rebuild with `make
 
 The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by `provision_04_gcp_iam.sh` with one of these permission sets:
 
-- `read-only` (default)
-- `gke-admin`
-- `custom`
+- `read-only` (default) — viewer-only GKE, monitoring, and logging roles. The Platform Agent is read-only at the cloud boundary; the only write path is a reviewed GitOps PR applied by the CI/CD pipeline.
+- `custom` — explicit, named roles for operators who must extend the set (an auditable, opt-in deviation).
+
+The `gke-admin` preset is retired: a stale value is coerced to `read-only`, and any admin bindings left from a prior `gke-admin` run are actively removed on the next provision.
 
 ## `spec.integration`
 

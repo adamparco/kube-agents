@@ -66,12 +66,15 @@ verify_agent_iam() {
     echo "$project_roles" | grep -q "${role}" || return 1
   done
 
-  # Reconcile the legacy broad logging grant unless a custom role set still requests it.
-  if [[ ! " ${roles[*]} " =~ " roles/logging.admin " ]] && \
-     echo "$project_roles" | grep -Fxq "roles/logging.admin"; then
-    return 1
-  fi
-  
+  # A write-capable role the selected set does not request must not remain bound; if one
+  # is still present, report unconverged so execute reconciles it away.
+  for priv in "${PRIVILEGED_AGENT_ROLES[@]}"; do
+    if [[ ! " ${roles[*]} " =~ " ${priv} " ]] && \
+       echo "$project_roles" | grep -Fxq "${priv}"; then
+      return 1
+    fi
+  done
+
   return 0
 }
 
@@ -100,14 +103,18 @@ execute_agent_iam() {
         --quiet >/dev/null || return 1
   done
 
-  if [[ ! " ${roles[*]} " =~ " roles/logging.admin " ]]; then
-    gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
-        --member="serviceAccount:${gsa_email}" \
-        --role="roles/logging.admin" \
-        --condition=None \
-        --quiet >/dev/null 2>&1 || true
-  fi
-  
+  # Reconcile away any write-capable role the selected set does not request, so a GSA
+  # previously granted the retired 'gke-admin' preset converges to viewer-only.
+  for priv in "${PRIVILEGED_AGENT_ROLES[@]}"; do
+    if [[ ! " ${roles[*]} " =~ " ${priv} " ]]; then
+      gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
+          --member="serviceAccount:${gsa_email}" \
+          --role="${priv}" \
+          --condition=None \
+          --quiet >/dev/null 2>&1 || true
+    fi
+  done
+
   print_info "Binding Workload Identity for ${gsa_name} to ${ksa_name}..."
   local wi_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${ksa_name}]"
   gcloud iam service-accounts add-iam-policy-binding "${gsa_email}" \
@@ -154,6 +161,12 @@ execute_apis() {
 
 
 # Step 2: Configure Platform Agent IAM
+#
+# The Platform Agent is read-only at the cloud boundary: the only write path is a reviewed
+# GitOps PR applied by the CI/CD pipeline (Phase 1 A2; invariant: the cloud GSA stays
+# viewer-only). The 'gke-admin' preset is retired — 'read-only' is the default and any
+# stale 'gke-admin' value is coerced to it in common.sh. 'custom' remains for operators
+# who must extend the set with explicit, named roles (an auditable, opt-in deviation).
 get_platform_agent_roles() {
   local read_only_roles=(
     "roles/container.clusterViewer"
@@ -164,21 +177,8 @@ get_platform_agent_roles() {
     "roles/iam.securityReviewer"
     "roles/mcp.toolUser"
   )
-  local gke_admin_roles=(
-    "roles/container.clusterAdmin"
-    "roles/container.admin"
-    "roles/monitoring.admin"
-    # The agent can query logs for diagnostics but must not administer the audit-log sink.
-    "roles/logging.viewer"
-    "roles/iam.serviceAccountUser"
-    "roles/iam.securityReviewer"
-    "roles/mcp.toolUser"
-  )
 
-  case "${PLATFORM_AGENT_PERMISSION_SET:-gke-admin}" in
-    read-only)
-      echo "${read_only_roles[*]}"
-      ;;
+  case "${PLATFORM_AGENT_PERMISSION_SET:-read-only}" in
     custom)
       if declare -p PLATFORM_AGENT_CUSTOM_ROLES 2>/dev/null | grep -q 'declare -a'; then
         echo "${PLATFORM_AGENT_CUSTOM_ROLES[*]}"
@@ -187,11 +187,22 @@ get_platform_agent_roles() {
         echo "${custom_roles_str//,/ }"
       fi
       ;;
-    gke-admin|*)
-      echo "${gke_admin_roles[*]}"
+    read-only|*)
+      echo "${read_only_roles[*]}"
       ;;
   esac
 }
+
+# PRIVILEGED_AGENT_ROLES are write-capable roles that must never remain bound to the agent
+# GSA unless a 'custom' set explicitly requests one. Provisioning actively removes any that
+# the selected set does not request, so a GSA previously granted the retired 'gke-admin'
+# preset converges to viewer-only on the next run (invariant: the cloud GSA stays viewer-only).
+PRIVILEGED_AGENT_ROLES=(
+  "roles/container.clusterAdmin"
+  "roles/container.admin"
+  "roles/monitoring.admin"
+  "roles/logging.admin"
+)
 
 verify_platform_agent() {
   local -a roles=($(get_platform_agent_roles))
