@@ -230,7 +230,10 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 }
 
 func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash string) error {
-	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash)
+	// Pod construction goes through the launcher seam (08 §2 Scion spike): native build by
+	// default, Scion launch primitive when gated on and available, always with native fallback.
+	launcher := selectPodLauncher(logf.FromContext(ctx))
+	dep := launcher.BuildDeployment(agent, configHash, fluentBitHash, settingsHash)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
