@@ -1,0 +1,20 @@
+# clusters/cluster-a/namespaces/team-x/00-namespace.yaml
+#
+# The tenant namespace for team-x — the home + isolation boundary of ONE Developer Team Agent
+# (03 §3, §10; Phase 3). The cluster-admin tier owns tenancy: it proposes this Namespace (and the
+# quota + default-deny NetworkPolicy alongside it) via the F4 cascade (propose-developer-team,
+# submit-suggestion PR); a human reviews + merges; the customer's CI/CD applies it in the
+# `namespaces/` wave — BEFORE `agents/` and, within this directory, before the namespaced identity
+# and Agent CR (lexical file order: 00- first). The developer-team agent that lives here is READ-ONLY
+# and namespace-scoped; the namespace itself is the blast-radius boundary.
+#
+# The `kubernetes.io/metadata.name` label is auto-applied by the apiserver (NamespaceDefaultLabelName)
+# and is what the sibling NetworkPolicies use to select this namespace; `kube-agents/tenant` marks it
+# as a kube-agents-managed tenant for auditing/selection.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-x
+  labels:
+    kube-agents/tenant: team-x
+    app.kubernetes.io/managed-by: gitops

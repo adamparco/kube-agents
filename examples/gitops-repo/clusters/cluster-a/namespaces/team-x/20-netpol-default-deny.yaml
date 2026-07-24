@@ -1,0 +1,32 @@
+# clusters/cluster-a/namespaces/team-x/20-netpol-default-deny.yaml
+#
+# The namespace isolation BASELINE for team-x (03 §3, §10; Phase 3). An empty podSelector selects
+# EVERY pod in team-x; policyTypes [Ingress, Egress] with NO ingress/egress rules makes the namespace
+# default-deny in BOTH directions. From this zero-trust floor, reachability is added back explicitly:
+# the sibling `30-netpol-developer-team-egress.yaml` opens exactly the egress the agent pod needs, and
+# tenant workloads add their own allow-policies. NetworkPolicies are additive (a pod's allowed traffic
+# is the UNION of every policy that selects it), so this baseline can only ever be loosened by a named,
+# reviewed policy — never silently.
+#
+# Consequences that make this the load-bearing isolation control (03 §11 negatives):
+#   - The Developer Team Agent in team-x cannot reach pods in OTHER team namespaces (team-y, …): no
+#     egress rule admits them, and each tenant namespace default-denies ingress.
+#   - The agent pod has NO inbound reachability from anywhere (kubelet health probes come from the node
+#     and are not subject to NetworkPolicy; the controller reads pod/Service status via the API server,
+#     not a pod-to-pod connection; work is PULLED over PubSub egress, never pushed in).
+#   - The cloud metadata server and arbitrary hosts stay unreachable — they are simply absent from the
+#     egress allowlist (there is deliberately no 0.0.0.0/0 rule anywhere).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: team-x
+  labels:
+    kube-agents/tenant: team-x
+    app.kubernetes.io/managed-by: gitops
+spec:
+  podSelector: {} # every pod in team-x
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress/egress rules => deny all in both directions (the union starts empty).
