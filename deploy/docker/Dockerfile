@@ -8,6 +8,9 @@ WORKDIR /workspace
 COPY k8s-operator/ /workspace/k8s-operator/
 WORKDIR /workspace/k8s-operator
 RUN CGO_ENABLED=0 go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
+# eventingress: the deferrable cloud-push relay (Phase 4 D1). Shipped in the image so it can run as a
+# per-pod sidecar on scratch GKE; on Kind it is unused (delivery is proven via the synthetic terminus).
+RUN CGO_ENABLED=0 go build -ldflags="-w -s" -o /workspace/eventingress ./cmd/eventingress/
 
 FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
 
@@ -104,6 +107,16 @@ RUN chmod 755 /usr/local/bin/agent-entrypoint
 # Copy event-watcher binary from builder stage
 COPY --from=watcher-builder /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher
 RUN chmod 755 /usr/local/bin/k8s-event-watcher
+
+# Copy eventingress binary (deferrable cloud-push relay; sidecar on scratch GKE, unused on Kind)
+COPY --from=watcher-builder /workspace/eventingress /usr/local/bin/eventingress
+RUN chmod 755 /usr/local/bin/eventingress
+
+# Shared OKF frontmatter parser (Phase 4 D4). Baked in the shared base so EVERY tier's read-knowledge
+# skill imports the SAME file local-dev/okf-validate.py uses — no schema drift between "what CI
+# validates" and "what an agent reads". The per-tier `COPY agents/<tier>/scripts/` below merges on top
+# of this, so this file survives in all three tier images.
+COPY --chmod=0644 local-dev/okf_frontmatter.py /opt/defaults/scripts/okf_frontmatter.py
 
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642

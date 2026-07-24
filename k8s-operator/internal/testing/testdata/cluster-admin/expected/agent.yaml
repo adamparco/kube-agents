@@ -381,7 +381,7 @@ spec:
             - --cluster-name=cluster-a
             - --daemon-url=http://127.0.0.1:8699
             - --token-env=API_SERVER_KEY
-            - --owner=platform
+            - --owner=cluster-admin
             - --reason=FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled
           command:
             - /usr/local/bin/k8s-event-watcher

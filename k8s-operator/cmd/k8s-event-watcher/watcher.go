@@ -42,18 +42,28 @@ type watcher struct {
 	dispatcher   eventDispatcher
 	clusterName  string
 	resyncPeriod time.Duration
+	// scopeNamespace, when non-empty, restricts the event informer to a
+	// single namespace at the API-server level (server-side scoping). This
+	// is the isolation for namespace-scoped tiers (developer-team): the
+	// informer's List/Watch is issued against that namespace only, so the
+	// watcher cannot observe events outside its tenant even if its RBAC
+	// somehow permitted it. Empty = cluster-wide (platform, cluster-admin).
+	scopeNamespace string
 }
 
 // newWatcher constructs a watcher. resyncPeriod == 0 disables the
 // periodic resync (informer only fires on real API events); non-zero
 // values re-fire every registered event through the handler at that
 // cadence — usually not what you want, so default 0 in main.go.
-func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, clusterName string, resyncPeriod time.Duration) *watcher {
+// scopeNamespace == "" watches all namespaces; a non-empty value pins
+// the informer to that namespace (see the struct field).
+func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, clusterName string, resyncPeriod time.Duration, scopeNamespace string) *watcher {
 	return &watcher{
-		client:       client,
-		dispatcher:   dispatcher,
-		clusterName:  clusterName,
-		resyncPeriod: resyncPeriod,
+		client:         client,
+		dispatcher:     dispatcher,
+		clusterName:    clusterName,
+		resyncPeriod:   resyncPeriod,
+		scopeNamespace: scopeNamespace,
 	}
 }
 
@@ -63,7 +73,16 @@ func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, cluster
 // callers can distinguish "startup failed, restart me" from "clean
 // shutdown."
 func (w *watcher) Run(ctx context.Context) error {
-	factory := informers.NewSharedInformerFactory(w.client, w.resyncPeriod)
+	var factory informers.SharedInformerFactory
+	if w.scopeNamespace != "" {
+		// Namespace-scoped tier: List/Watch Events in this namespace only.
+		factory = informers.NewSharedInformerFactoryWithOptions(
+			w.client, w.resyncPeriod, informers.WithNamespace(w.scopeNamespace),
+		)
+		log.Printf("watcher: informer scoped to namespace %q", w.scopeNamespace)
+	} else {
+		factory = informers.NewSharedInformerFactory(w.client, w.resyncPeriod)
+	}
 	eventInformer := factory.Core().V1().Events().Informer()
 
 	handler, err := eventInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{

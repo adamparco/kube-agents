@@ -1,0 +1,9 @@
+# This directory holds OKF `escalation` entries (06 §5, type: escalation).
+#
+# A lower tier raises a cross-tier request here as `escalation/<slug>.md` via the
+# `raise-escalation` skill (which opens a reviewed PR through `submit-suggestion`);
+# the parent tier picks it up on its next proactive/heartbeat sweep with the
+# `read-knowledge` skill (`--type escalation`) and re-derives its own scope from
+# its own CR — never trusting the entry's `to:` field, and never calling the child
+# agent directly (invariant 3). The directory is kept in the reference template so
+# the write target exists before the first escalation is raised.

@@ -13,13 +13,14 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from contextlib import closing
 
 import logging
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import inject_auth
 
 # Configure logging
 logging.basicConfig(
@@ -84,14 +85,40 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
         logger.error(f"Failed to clean up old DB records: {exc}")
 
 
+def _require_inject_auth(authorization: Optional[str], x_asserted_caller: Optional[str]) -> None:
+    """Guard the machine-push seam (POST /sessions and /sessions/{id}/inject).
+
+    Enforces the per-pod bearer key (and optional owner allow-list) when API_SERVER_KEY is
+    set — which the operator always does in production. When it is unset (local dev / unit
+    tests) the seam is left open with a warning; the 127.0.0.1 bind is the unconditional
+    network-level backstop in that case. See inject_auth.check_inject_auth for the decision.
+    """
+    expected = inject_auth.expected_api_key()
+    if not expected:
+        logger.warning(
+            "API_SERVER_KEY unset — session-inject seam auth is DISABLED (dev/test only)"
+        )
+        return
+    err = inject_auth.check_inject_auth(
+        authorization, x_asserted_caller, expected, inject_auth.allowed_owners()
+    )
+    if err is not None:
+        status_code, detail = err
+        raise HTTPException(status_code=status_code, detail=detail)
+
+
 @app.get("/healthz")
 def healthz() -> Dict[str, str]:
     return {"status": "ok"}
 
 
 @app.post("/sessions", status_code=201)
-def create_session() -> Dict[str, str]:
+def create_session(
+    authorization: Optional[str] = Header(default=None),
+    x_asserted_caller: Optional[str] = Header(default=None),
+) -> Dict[str, str]:
     """Create a new session ID for the incoming incident."""
+    _require_inject_auth(authorization, x_asserted_caller)
     session_id = f"k8s-evt-{uuid.uuid4().hex[:8]}"
     
     # Save the session to the local metadata DB
@@ -151,6 +178,102 @@ def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
     else:
         return "🔵", "Info"
 
+
+# --- Inject-kind discriminator (Phase 4 / P4-T2, S2; 04 §4) -----------------------------
+# The machine-push seam multiplexes several signal sources. Each carries a top-level
+# "kind" so the daemon renders and frames the agent turn appropriately instead of coercing
+# every payload through the Kubernetes-event path. A missing/unknown kind is rejected (400).
+INJECT_KIND_K8S_EVENT = "k8s-event"
+INJECT_KIND_K8S_EVENT_FOLLOWUP = "k8s-event-followup"
+INJECT_KIND_ALERT = "alert"
+INJECT_KIND_GITHUB = "github"
+INJECT_KIND_ESCALATION = "escalation"
+
+_KNOWN_INJECT_KINDS = {
+    INJECT_KIND_K8S_EVENT,
+    INJECT_KIND_K8S_EVENT_FOLLOWUP,
+    INJECT_KIND_ALERT,
+    INJECT_KIND_GITHUB,
+    INJECT_KIND_ESCALATION,
+}
+
+
+def _format_k8s_event_card(payload: Dict[str, Any]) -> str:
+    """Render the notification card for a Kubernetes event (unchanged legacy format)."""
+    event_reason = payload.get("reason") or "Unknown"
+    namespace = payload.get("namespace") or "default"
+    object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
+    object_name = payload.get("name") or ""
+    message = payload.get("message") or ""
+    event_type = payload.get("type") or "Warning"
+
+    severity_emoji, severity_label = get_severity_details(event_type, event_reason)
+    clean_name = clean_workload_name(object_kind, object_name)
+    clean_reason = clean_reason_label(event_reason)
+    clean_msg = clean_event_message(message)
+    return (
+        f"{severity_emoji} *{severity_label}:* {clean_reason} `{namespace}/{clean_name}` — {clean_msg}\n"
+        f"🌱 _Digging down to the root cause..._"
+    )
+
+
+def _format_alert_card(payload: Dict[str, Any]) -> str:
+    """Render the card for a monitoring/alerting webhook (Cloud Monitoring, PagerDuty, …)."""
+    title = payload.get("summary") or payload.get("reason") or payload.get("message") or "Alert"
+    policy = payload.get("policy") or payload.get("name") or ""
+    severity = str(payload.get("severity") or payload.get("type") or "warning").lower()
+    emoji = "🔴" if severity in ("critical", "error", "page", "high") else "🟡"
+    scope = f" `{payload.get('namespace')}`" if payload.get("namespace") else ""
+    policy_suffix = f" ({policy})" if policy else ""
+    return (
+        f"{emoji} *Alert:* {title}{policy_suffix}{scope}\n"
+        f"🌱 _Investigating the alerting condition..._"
+    )
+
+
+def _format_github_card(payload: Dict[str, Any]) -> str:
+    """Render the card for a GitHub webhook (PR/issue/push activity on a watched repo)."""
+    action = payload.get("action") or payload.get("reason") or "event"
+    repo = payload.get("repo") or payload.get("repository") or ""
+    title = payload.get("title") or payload.get("message") or ""
+    number = payload.get("number")
+    ref = f" #{number}" if number is not None else ""
+    where = f" `{repo}`" if repo else ""
+    detail = f" — {title}" if title else ""
+    return (
+        f"🐙 *GitHub:* {action}{ref}{where}{detail}\n"
+        f"🌱 _Reviewing the change..._"
+    )
+
+
+def _format_escalation_card(payload: Dict[str, Any]) -> str:
+    """Render the card for an escalation surfaced from a lower tier (via shared knowledge state).
+
+    Note: this only *wakes* the parent to assess the escalation file — the parent re-derives
+    its own scope and acts via a GitOps PR. It is never a direct lower->parent call (invariant 4).
+    """
+    origin = payload.get("from") or payload.get("from_tier") or "a lower tier"
+    summary = payload.get("summary") or payload.get("message") or payload.get("reason") or "escalation raised"
+    scope = payload.get("namespace") or payload.get("scope") or ""
+    scope_suffix = f" `{scope}`" if scope else ""
+    return (
+        f"⏫ *Escalation from {origin}:*{scope_suffix} {summary}\n"
+        f"🌱 _Assessing whether this falls within my scope..._"
+    )
+
+
+def _format_inject_card(kind: str, payload: Dict[str, Any]) -> str:
+    """Dispatch to the per-kind notification card renderer."""
+    if kind in (INJECT_KIND_K8S_EVENT, INJECT_KIND_K8S_EVENT_FOLLOWUP):
+        return _format_k8s_event_card(payload)
+    if kind == INJECT_KIND_ALERT:
+        return _format_alert_card(payload)
+    if kind == INJECT_KIND_GITHUB:
+        return _format_github_card(payload)
+    if kind == INJECT_KIND_ESCALATION:
+        return _format_escalation_card(payload)
+    # Unreachable: inject_message validates kind before dispatch.
+    raise HTTPException(status_code=400, detail=f"unknown inject kind: {kind!r}")
 
 
 def get_active_platform() -> str:
@@ -242,17 +365,13 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
     return False
 
 
-def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
-    """Format a detailed Markdown diagnostic query for the Platform Agent."""
+def _k8s_event_query_head(session_id: str, payload: Dict[str, Any], cluster_name: str) -> str:
+    """Head of the agent query for a Kubernetes event (unchanged legacy framing)."""
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
     object_name = payload.get("name") or ""
     message = payload.get("message") or ""
-    cluster_name = os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
-    gcp_project = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GCP_PROJECT") or ""
-    project_query = f"?project={gcp_project}" if gcp_project else ""
-
     return (
         f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}' "
         f"for the active session '{session_id}'.\n\n"
@@ -260,6 +379,66 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"• *Resource:* {namespace}/{object_kind}/{object_name}\n"
         f"• *Event Reason:* {event_reason}\n"
         f"• *Warning Message:* {message}\n\n"
+    )
+
+
+def _alert_query_head(session_id: str, payload: Dict[str, Any], cluster_name: str) -> str:
+    """Head of the agent query for a monitoring/alerting webhook."""
+    title = payload.get("summary") or payload.get("reason") or "Alert"
+    policy = payload.get("policy") or payload.get("name") or "unknown-policy"
+    severity = str(payload.get("severity") or payload.get("type") or "warning")
+    namespace = payload.get("namespace") or "(cluster-wide)"
+    message = payload.get("message") or ""
+    return (
+        f"Investigate the following monitoring alert on GKE cluster '{cluster_name}' "
+        f"for the active session '{session_id}'.\n\n"
+        f"**Alert Details:**\n"
+        f"• *Policy:* {policy}\n"
+        f"• *Severity:* {severity}\n"
+        f"• *Scope:* {namespace}\n"
+        f"• *Summary:* {title}\n"
+        f"• *Detail:* {message}\n\n"
+    )
+
+
+def _github_query_head(session_id: str, payload: Dict[str, Any]) -> str:
+    """Head of the agent query for a GitHub webhook."""
+    action = payload.get("action") or "event"
+    repo = payload.get("repo") or payload.get("repository") or "(unknown repo)"
+    title = payload.get("title") or payload.get("message") or ""
+    number = payload.get("number")
+    ref = f"#{number}" if number is not None else ""
+    return (
+        f"Review the following GitHub activity for the active session '{session_id}'.\n\n"
+        f"**GitHub Details:**\n"
+        f"• *Repository:* {repo}\n"
+        f"• *Action:* {action} {ref}\n"
+        f"• *Title:* {title}\n\n"
+    )
+
+
+def _escalation_query_head(session_id: str, payload: Dict[str, Any]) -> str:
+    """Head of the agent query for an escalation surfaced from a lower tier."""
+    origin = payload.get("from") or payload.get("from_tier") or "a lower tier"
+    summary = payload.get("summary") or payload.get("message") or "escalation raised"
+    scope = payload.get("namespace") or payload.get("scope") or "(unspecified)"
+    ref = payload.get("ref") or payload.get("path") or ""
+    ref_line = f"• *Escalation record:* {ref}\n" if ref else ""
+    return (
+        f"An escalation was raised from {origin} for the active session '{session_id}'.\n\n"
+        f"**Escalation Details:**\n"
+        f"• *From:* {origin}\n"
+        f"• *Reported scope:* {scope}\n"
+        f"{ref_line}"
+        f"• *Summary:* {summary}\n\n"
+        f"Re-derive the affected scope yourself from read-only cluster state before acting; "
+        f"do not trust the reported scope blindly, and never contact the lower tier directly.\n\n"
+    )
+
+
+def _report_and_gitops_tail(session_id: str, project_query: str) -> str:
+    """Shared reporting-format + read-only GitOps-PR instruction tail for every kind."""
+    return (
         f"When calling your send_notification tool to report findings, you MUST pass this exact session ID: '{session_id}' as the session_id argument so it routes as a threaded reply to the warning alert.\n\n"
         f"When done, post your final diagnostic report to the chat platform (using your notification tool) formatted exactly like this:\n\n"
         f"📋 *Incident Triage*\n\n"
@@ -278,6 +457,30 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"2. Post a threaded response confirming the PR was created and include the clickable PR link.\n"
         f"3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster."
     )
+
+
+def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
+    """Format a detailed Markdown diagnostic query for the agent, framed by signal kind.
+
+    The k8s-event head is preserved verbatim; other kinds get a source-appropriate head so
+    the agent is not told to "analyze a Kubernetes event" for an alert/GitHub/escalation
+    signal. All kinds share the same read-only reporting + GitOps-PR tail.
+    """
+    cluster_name = os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
+    gcp_project = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GCP_PROJECT") or ""
+    project_query = f"?project={gcp_project}" if gcp_project else ""
+    kind = (payload.get("kind") or "").strip()
+
+    if kind == INJECT_KIND_ALERT:
+        head = _alert_query_head(session_id, payload, cluster_name)
+    elif kind == INJECT_KIND_GITHUB:
+        head = _github_query_head(session_id, payload)
+    elif kind == INJECT_KIND_ESCALATION:
+        head = _escalation_query_head(session_id, payload)
+    else:  # k8s-event / k8s-event-followup (default framing)
+        head = _k8s_event_query_head(session_id, payload, cluster_name)
+
+    return head + _report_and_gitops_tail(session_id, project_query)
 
 
 def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> None:
@@ -326,39 +529,38 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
 
 
 @app.post("/sessions/{session_id}/inject")
-def inject_message(session_id: str, request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
+def inject_message(
+    session_id: str,
+    request_data: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(default=None),
+    x_asserted_caller: Optional[str] = Header(default=None),
+) -> Dict[str, str]:
     """Receive the event payload and notify the Platform Agent via Google Chat."""
+    _require_inject_auth(authorization, x_asserted_caller)
     raw_message = request_data.get("message", "")
     if not raw_message:
         raise HTTPException(status_code=400, detail="message field is required")
-        
+
     try:
         payload = json.loads(raw_message)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse inner payload JSON: {exc}")
-        
-    event_reason = payload.get("reason") or "Unknown"
-    namespace = payload.get("namespace") or "default"
-    object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
-    object_name = payload.get("name") or ""
-    message = payload.get("message") or ""
-    count = payload.get("count") if payload.get("count") is not None else 1
-    event_type = payload.get("type") or "Warning"
 
-    severity_emoji, severity_label = get_severity_details(event_type, event_reason)
-    clean_name = clean_workload_name(object_kind, object_name)
-    clean_reason = clean_reason_label(event_reason)
-    clean_msg = clean_event_message(message)
+    # Route on the signal kind (04 §4). Missing/unknown kinds are rejected so a new source
+    # cannot be silently coerced through the Kubernetes-event rendering path.
+    kind = (payload.get("kind") or "").strip()
+    if kind not in _KNOWN_INJECT_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown or missing inject kind: {kind!r} (expected one of {sorted(_KNOWN_INJECT_KINDS)})",
+        )
 
-    # Construct a pretty notification alert
-    alert_msg = (
-        f"{severity_emoji} *{severity_label}:* {clean_reason} `{namespace}/{clean_name}` — {clean_msg}\n"
-        f"🌱 _Digging down to the root cause..._"
-    )
-    
+    alert_msg = _format_inject_card(kind, payload)
+
     # Delegate the heavy REST API call to FastAPI BackgroundTasks to keep response times sub-millisecond
     background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, payload)
-    
+
     return {"status": "injected"}
 
 

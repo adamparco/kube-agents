@@ -1,6 +1,30 @@
 {
   "jobs": [
     {
+      "id": "escalation-triage",
+      "name": "Escalation Triage",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 */4 * * *",
+        "display": "0 */4 * * *"
+      },
+      "prompt": "Triage cross-tier escalations raised by cluster admins. Read '/opt/defaults/governance/escalation_triage_sop.md', then use the read-knowledge skill to list open 'escalation' entries, re-derive your own scope from your own CR (ignore each entry's 'to:' field), and for any request within your platform authority propose the change via the submit-suggestion skill. You are read-only: never mutate directly and never contact the raising agent.",
+      "skills": ["read-knowledge", "submit-suggestion"],
+      "enabled": true
+    },
+    {
+      "id": "drift-detection",
+      "name": "Drift Detection",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 */6 * * *",
+        "display": "0 */6 * * *"
+      },
+      "prompt": "Detect fleet configuration drift and open corrective PRs unprompted. Read '/opt/defaults/governance/drift_detection_sop.md', then for each RBAC / NetworkPolicy / version object the GitOps repo declares, capture live state with a read-only get and run the detect-drift skill (desired-vs-live). On drift, emit a corrective PR via the same skill (submit-suggestion). You are read-only (SC4): never apply/edit/patch/delete a live object — the drifted object stays as found and reconciliation happens only when a human merges your PR.",
+      "skills": ["detect-drift", "submit-suggestion"],
+      "enabled": true
+    },
+    {
       "id": "blueprint-sync",
       "name": "Blueprint Sync",
       "schedule": {

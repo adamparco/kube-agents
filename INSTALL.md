@@ -21,6 +21,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 5. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
    - [Phase 2 — Kind inner loop (Cluster Admin Agent + cascade)](#phase-2--kind-inner-loop-cluster-admin-agent--cascade)
    - [Phase 3 — Kind inner loop (Developer Team Agent + namespace isolation)](#phase-3--kind-inner-loop-developer-team-agent--namespace-isolation)
+   - [Phase 4 — Coordination & knowledge (push-first proactivity + OKF)](#phase-4--coordination--knowledge-push-first-proactivity--okf)
 6. [Teardown & Cleanup](#teardown--cleanup)
 7. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
@@ -376,6 +377,51 @@ affinity, audit attribution). It reuses the Phase 2 stack on the same Kind clust
 2. **Egress enforcement** carries the same kindnet caveat as Phase 2 — `verify-phase3.sh` validates
    the egress policy **structurally** (shape, tier selector, zero `0.0.0.0/0`) and defers real
    enforcement (agent pod cannot reach `169.254.169.254` or the open internet) to a Calico cluster.
+
+### Phase 4 — Coordination & knowledge (push-first proactivity + OKF)
+
+Phase 4 turns on **indirect coordination** and **push-first proactivity** without loosening the
+read-only ceiling. Three deltas land: (1) **push-first event triggers** (04 §4) — a per-tier
+Kubernetes watch on the agent's **own** read-only SA (namespace-scoped for developer-team, cluster-wide
+for cluster-admin/platform, with a **fail-closed startup guard**), plus alert + GitHub webhooks funneled
+over a deferrable subscribe-only `eventingress` component — all delivering into the **local**
+session-inject seam (now bound to `127.0.0.1` and bearer/owner-authenticated); the **heartbeat is
+demoted to a backstop**; (2) **OKF read + escalation** (06 §5) — a `read-knowledge` skill does a sparse,
+read-only `knowledge/`-only checkout, and a lower tier raises a cross-tier request as a
+`knowledge/escalation/<slug>.md` PR that the **parent picks up on its next sweep** — never a direct
+agent-to-agent call (invariant 3); (3) **proactive SOPs** — the Platform Agent's **drift-detection SOP**
+opens a corrective PR unprompted (SC4, 01 §7), and per-tier **heartbeat SOPs** run scoped audits. A
+trigger changes only _when_ an agent wakes, never _what_ it may do — every resulting change still flows
+through a reviewed `submit-suggestion` PR.
+
+> **Same image-refresh caveat as Phase 3.** The watcher sidecar, the controller's per-tier watcher-arg
+> rendering, and the seam hardening all ship inside the operator/agent images at the shared `v0.1.0` tag.
+> The **live** Event→session spawn and the cloud transport legs therefore require a rebuild +
+> `kind load` + `rollout restart` before they can be trusted on Kind (a stale same-tag image reads green
+> while running Phase-3 code). The gate below proves the Phase-4 **logic** hermetically so it is
+> trustworthy without a rebuild; the live spawn/transport is explicitly deferred.
+
+1. **Run the consolidated Phase 4 gate** (the live regression is destructive and guarded to Kind
+   contexts; the hermetic acceptance runs anywhere, so this is CI-safe with no cluster):
+   ```bash
+   local-dev/kind/verify-phase4.sh kind-kube-agents-dev
+   ```
+   It proves 07 §2 Phase 4 Accept **(a)–(e)** hermetically — **(a)** per-tier scoped watcher +
+   fail-closed `validate()` + controller `--owner`/`--scope-namespace` rendering + the hardened
+   inject seam (bearer/owner auth, `kind` discriminator); **(b)** the escalation round-trip is
+   **indirect** (written via `submit-suggestion --dry-run`, read back via `read-knowledge`, with the
+   child egress NetworkPolicy carrying **no parent-tier destination** — cross-tier flow is GitOps +
+   loopback only); **(c)** a runbook is retrieved through the sparse read-only OKF path (which can
+   never push) with `okf-validate` green; **(d)** per-tier heartbeats run **scoped** audits
+   (cluster-admin over its cluster, developer-team over its namespace only) and route any change to a
+   PR; **(e)** injected drift yields a **corrective-PR artifact** while the drifted live object stays
+   present (detect-and-propose, never fix) — then re-runs the load-bearing **regression** live on Kind
+   (03 §11 `negative-attenuation.sh`, the dev-team read-only SAR under a trigger, and the 08 §7
+   controller-mints-no-RBAC golden).
+2. **Deferred, not faked:** the live Event→session spawn and the cloud transport (alert Pub/Sub
+   delivery, GitHub webhook HMAC) need the rebuilt Phase-4 image / scratch-GKE — the gate proves the
+   in-pod terminus and all rendering/scoping logic instead. **05 §8 chaos** (failure-isolation) is
+   Phase 6 and is marked N-A here rather than silently skipped.
 
 ## Teardown & Cleanup
 
