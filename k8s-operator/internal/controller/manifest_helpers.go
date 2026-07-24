@@ -28,7 +28,10 @@ import (
 )
 
 const (
-	defaultPlatformAgentImage = "ghcr.io/gke-labs/kube-agents/platform-agent:latest"
+	// defaultPlatformAgentImage is the fallback agent image when an Agent CR omits
+	// spec.deployment.image. Pinned to an immutable version tag (not :latest); shipped CRs
+	// pin explicitly and production should repin to a digest (platform-agent@sha256:...).
+	defaultPlatformAgentImage = "ghcr.io/gke-labs/kube-agents/platform-agent:v0.1.0"
 
 	// managedOTelEndpoint is the OTLP/HTTP endpoint of the GKE Managed OpenTelemetry
 	// collector. The same endpoint is already used by the LiteLLM integration, so agent

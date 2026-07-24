@@ -24,6 +24,13 @@ spec:
   # Infrastructure-as-code format the agent authors suggestions in (KCC by default; terraform opt-in).
   iac:
     format: kcc
+  # Agent runtime image, pinned to an immutable version tag (never :latest) so the deployed
+  # agent is reproducible. Repin to a content-addressable digest (…/platform-agent@sha256:…)
+  # in production once the image is published.
+  deployment:
+    image: "ghcr.io/gke-labs/kube-agents/platform-agent"
+    tag: "v0.1.0"
+    imagePullPolicy: "IfNotPresent"
   harness:
     clusterName: "cluster-a"
     location: "us-central1"

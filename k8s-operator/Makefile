@@ -1,5 +1,6 @@
-# Image URL to use all building/pushing image targets
-IMG ?= ghcr.io/gke-labs/kube-agents/k8s-operator:latest
+# Image URL to use all building/pushing image targets.
+# Pinned to an immutable version tag (not :latest); repin to a digest in production.
+IMG ?= ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 

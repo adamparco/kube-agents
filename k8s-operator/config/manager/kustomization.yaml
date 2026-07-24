@@ -5,4 +5,5 @@ kind: Kustomization
 images:
   - name: controller
     newName: controller
-    newTag: latest
+    # Immutable version tag (not :latest). Prefer `digest: sha256:...` here in production.
+    newTag: v0.1.0

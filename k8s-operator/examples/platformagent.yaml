@@ -38,7 +38,8 @@ spec:
   # +optional
   deployment:
     image: "ghcr.io/gke-labs/kube-agents/platform-agent"
-
+    # Pinned to an immutable version tag (not :latest); repin to a digest in production.
+    tag: "v0.1.0"
     imagePullPolicy: "IfNotPresent"
   security:
     serviceAccountName: "kubeagents-platform-agent"
