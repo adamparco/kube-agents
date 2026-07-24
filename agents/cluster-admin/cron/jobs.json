@@ -1,0 +1,64 @@
+{
+  "jobs": [
+    {
+      "id": "blueprint-sync",
+      "name": "Blueprint Sync",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 9 * * *",
+        "display": "0 9 * * *"
+      },
+      "prompt": "Execute blueprint alignment audit for this cluster. Read '/opt/defaults/governance/blueprint_sync_sop.md' and perform the daily compliance checks on this cluster's configuration and its namespaces against the master blueprints.",
+      "skills": [],
+      "enabled": true
+    },
+    {
+      "id": "compliance-audit",
+      "name": "Compliance Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 9 * * 0",
+        "display": "0 9 * * 0"
+      },
+      "prompt": "Execute security compliance audit for this cluster. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan this cluster's namespaces for deviations from corporate GKE security and network policies.",
+      "skills": [],
+      "enabled": true
+    },
+    {
+      "id": "policy-propagation",
+      "name": "Policy Propagation",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 * * * *",
+        "display": "0 * * * *"
+      },
+      "prompt": "Propagate updated operational policies within this cluster. Read '/opt/defaults/governance/policy_propagation_sop.md' and inspect the latest security policies and resource configs across this cluster's namespaces directly.",
+      "skills": [],
+      "enabled": true
+    },
+    {
+      "id": "standardization-validator",
+      "name": "Standardization Validator",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 10 * * 0",
+        "display": "0 10 * * 0"
+      },
+      "prompt": "Run weekly structural alignment audit for this cluster. Read '/opt/defaults/governance/standardization_validator_sop.md' to perform deep-diff analysis between this cluster's live namespace/workload states and the corporate standards.",
+      "skills": [],
+      "enabled": true
+    },
+    {
+      "id": "obtainability-audit",
+      "name": "Obtainability Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 12 * * *",
+        "display": "0 12 * * *"
+      },
+      "prompt": "Execute dynamic capacity pool alignment audit for this cluster. Read '/opt/defaults/governance/obtainability_audit_sop.md' to identify rigid workload allocations across this cluster's namespaces and generate YAML patches to align with flexible capacity.",
+      "skills": [],
+      "enabled": true
+    }
+  ]
+}
