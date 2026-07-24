@@ -249,7 +249,7 @@ spec:
         - name: SESSION_KV_DB_PATH
           value: /var/lib/kube-agents/session/session_kv.db
         - name: AGENT_TIER
-          value: platform
+          value: cluster-admin
         - name: OTEL_SERVICE_NAME
           value: agent-gateway
         - name: OTEL_EXPORTER_OTLP_ENDPOINT
@@ -270,13 +270,13 @@ spec:
         - name: GOOGLE_CHAT_PROJECT_ID
           value: kube-agents-gkedemos
         - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
-          value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
+          value: projects/kube-agents-gkedemos/subscriptions/kubeagents-cluster-admin-cluster-a-events-sub
         - name: GOOGLE_CHAT_ALLOWED_USERS
-          value: users/REPLACE_WITH_PLATFORM_ADMIN_ID
+          value: users/REPLACE_WITH_CLUSTER_ADMIN_ID
         - name: GOOGLE_CHAT_HOME_CHANNEL
         - name: TOKEN_BROKER_URL
           value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
-        image: ghcr.io/gke-labs/kube-agents/platform-agent:v0.1.0
+        image: ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0
         imagePullPolicy: IfNotPresent
         name: platform-agent
         ports:
@@ -318,7 +318,7 @@ spec:
           value: /opt/data/home
         - name: SESSION_KV_DB_PATH
           value: /var/lib/kube-agents/session/session_kv.db
-        image: ghcr.io/gke-labs/kube-agents/platform-agent:v0.1.0
+        image: ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0
         imagePullPolicy: IfNotPresent
         name: platform-agent-dashboard
         ports:
@@ -389,7 +389,7 @@ spec:
             secretKeyRef:
               key: api-key
               name: agent-secrets
-        image: ghcr.io/gke-labs/kube-agents/platform-agent:v0.1.0
+        image: ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0
         imagePullPolicy: IfNotPresent
         name: event-watcher
         resources:
@@ -410,7 +410,7 @@ spec:
         runAsUser: 10000
         seccompProfile:
           type: RuntimeDefault
-      serviceAccountName: kubeagents-platform-agent
+      serviceAccountName: cluster-admin-agent
       shareProcessNamespace: true
       volumes:
       - name: platform-agent-data-vol

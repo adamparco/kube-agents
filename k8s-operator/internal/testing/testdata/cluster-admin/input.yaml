@@ -1,0 +1,51 @@
+# Golden-test INPUT: a cluster-admin-tier Agent CR (Phase 2 P2-T11).
+#
+# This is the per-tier render fixture that locks the load-bearing properties of a cluster-admin pod
+# (06 §2; 03 §4/§11; Phase 2 acceptance b/d/e). The paired expected/agent.yaml asserts the operator:
+#   - resolves the cluster-admin image BY TIER (spec.deployment.image is intentionally OMITTED here, so
+#     the render must fall back to defaultImageForTier(cluster-admin) = cluster-admin-agent:v0.1.0);
+#   - injects AGENT_TIER=cluster-admin (so submit-suggestion branches under cluster-admin-agent/);
+#   - binds the pre-created read-only ServiceAccount cluster-admin-agent (controller references, never mints);
+#   - renders the CLOSED chat allowlist to GOOGLE_CHAT_ALLOWED_USERS and NEVER emits
+#     GOOGLE_CHAT_ALLOW_ALL_USERS (the permissive default an empty allowlist would trigger).
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: Agent
+metadata:
+  name: agent
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: cluster-admin
+spec:
+  tier: cluster-admin
+  scope:
+    projectId: kube-agents-gkedemos
+    clusterName: cluster-a
+  parentRef:
+    name: platform-agent
+  harness:
+    clusterName: cluster-a
+    location: us-central1-a
+    hermes:
+      dashboardEnabled: true
+      pluginsDebug: false
+      apiServerSecretRef:
+        name: agent-secrets
+        key: api-key
+  deployment:
+    # image intentionally omitted -> resolves to the cluster-admin tier default (proves T8 end-to-end).
+    imagePullPolicy: IfNotPresent
+  security:
+    serviceAccountName: cluster-admin-agent
+    serviceAccountAnnotations:
+      iam.gke.io/gcp-service-account: kubeagents-cluster-admin-gsa@kube-agents-gkedemos.iam.gserviceaccount.com
+  integration:
+    googleChat:
+      enabled: true
+      mode: default
+      projectId: kube-agents-gkedemos
+      topicName: kubeagents-cluster-admin-cluster-a-events
+      subscriptionName: kubeagents-cluster-admin-cluster-a-events-sub
+      # CLOSED allowlist (A4 / acceptance d): the render must carry these members and must NOT emit the
+      # GOOGLE_CHAT_ALLOW_ALL_USERS backstop (which only appears for an empty/absent allowlist).
+      allowedUsers:
+        - users/REPLACE_WITH_CLUSTER_ADMIN_ID

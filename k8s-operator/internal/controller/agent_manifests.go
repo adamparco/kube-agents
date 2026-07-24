@@ -297,7 +297,8 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 		saName = agent.Spec.Security.ServiceAccountName
 	}
 
-	image := resolveAgentImage(agent.Spec.Deployment, defaultImageForTier(agentindex.EffectiveTier(agent)))
+	tier := agentindex.EffectiveTier(agent)
+	image := resolveAgentImage(agent.Spec.Deployment, defaultImageForTier(tier))
 
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
@@ -355,6 +356,13 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 		{
 			Name:  "SESSION_KV_DB_PATH",
 			Value: sessionKVDBPath,
+		},
+		{
+			// AGENT_TIER is the persona/containment level (agentindex.EffectiveTier; empty -> platform).
+			// submit-suggestion reads it to namespace its PR branches (<tier>-agent/…), so a cluster-admin
+			// pod's proposals land under cluster-admin-agent/ and never masquerade as the platform tier.
+			Name:  "AGENT_TIER",
+			Value: string(tier),
 		},
 	}
 
