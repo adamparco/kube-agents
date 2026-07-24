@@ -523,6 +523,9 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 			Namespace: agent.Namespace,
 			Labels: map[string]string{
 				"app": agent.Name + "-gateway",
+				// The tier label lets a per-tier egress NetworkPolicy (03 §10) select every agent
+				// pod of a tier without knowing agent names. NOT part of the (immutable) selector.
+				"kube-agents/tier": string(tier),
 			},
 		},
 		Spec: appsv1.DeploymentSpec{
@@ -536,7 +539,8 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"app": agent.Name + "-gateway",
+						"app":              agent.Name + "-gateway",
+						"kube-agents/tier": string(tier),
 					},
 					Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 				},

@@ -290,6 +290,19 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected deployment name my-agent-gateway, got %s", dep.Name)
 	}
 
+	// The tier label must be stamped on both the Deployment and the pod template so a per-tier
+	// egress NetworkPolicy (03 §10) can select every agent pod of a tier by label. This agent has
+	// no explicit tier, so EffectiveTier defaults to platform. The pod selector must remain app-only.
+	if got := dep.Labels["kube-agents/tier"]; got != "platform" {
+		t.Errorf("expected deployment tier label platform, got %q", got)
+	}
+	if got := dep.Spec.Template.Labels["kube-agents/tier"]; got != "platform" {
+		t.Errorf("expected pod-template tier label platform, got %q", got)
+	}
+	if _, ok := dep.Spec.Selector.MatchLabels["kube-agents/tier"]; ok {
+		t.Error("tier label must NOT be part of the immutable pod selector")
+	}
+
 	if dep.Spec.Template.Annotations["kubeagents.x-k8s.io/config-hash"] != "abcd1234" {
 		t.Errorf("expected config-hash annotation to be abcd1234, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/config-hash"])
 	}

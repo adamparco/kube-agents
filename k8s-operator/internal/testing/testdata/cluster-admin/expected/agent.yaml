@@ -208,6 +208,7 @@ metadata:
   creationTimestamp: null
   labels:
     app: agent-gateway
+    kube-agents/tier: cluster-admin
   name: agent-gateway
   namespace: kubeagents-system
   ownerReferences:
@@ -233,6 +234,7 @@ spec:
       creationTimestamp: null
       labels:
         app: agent-gateway
+        kube-agents/tier: cluster-admin
     spec:
       containers:
       - env:
