@@ -174,12 +174,15 @@ func (v *AgentCustomValidator) validateAgent(ctx context.Context, agent *agentv1
 	return nil, nil
 }
 
-// validateScopeAndParent enforces the per-tier required scope fields and parentRef (06 §1.2, P2-T4):
+// validateScopeAndParent enforces the per-tier required scope fields, parentRef, and placement
+// (06 §1.2, P2-T4; developer-team placement is P3-T3):
 //   - platform: no requirement (projectId is conventional but scope may be nil here).
 //   - cluster-admin: scope.projectId + scope.clusterName required; parentRef.name required.
-//   - developer-team: scope.projectId + scope.clusterName + scope.namespace required; parentRef.name required.
+//   - developer-team: scope.projectId + scope.clusterName + scope.namespace required; parentRef.name
+//     required; and metadata.namespace MUST equal scope.namespace (the load-bearing placement clause).
 //
-// Presence only — the cross-object parent-tier / attenuation checks are deferred hardening (08 §5).
+// Presence + placement only — the cross-object parent-tier / attenuation checks are deferred hardening
+// (08 §5).
 func validateScopeAndParent(agent *agentv1alpha1.Agent) *field.Error {
 	tier := agentindex.EffectiveTier(agent)
 	if tier == agentv1alpha1.TierPlatform {
@@ -198,8 +201,26 @@ func validateScopeAndParent(agent *agentv1alpha1.Agent) *field.Error {
 	if clusterName == "" {
 		return field.Required(scopePath.Child("clusterName"), fmt.Sprintf("scope.clusterName is required for the %s tier", tier))
 	}
-	if tier == agentv1alpha1.TierDeveloperTeam && namespace == "" {
-		return field.Required(scopePath.Child("namespace"), "scope.namespace is required for the developer-team tier")
+	if tier == agentv1alpha1.TierDeveloperTeam {
+		if namespace == "" {
+			return field.Required(scopePath.Child("namespace"), "scope.namespace is required for the developer-team tier")
+		}
+		// Placement clause (A1, load-bearing). A developer-team Agent MUST be created in the namespace it
+		// scopes. The controller renders every sub-resource (pod, SA binding, and — via the tier label —
+		// the target of the per-namespace default-deny NetworkPolicy + ResourceQuota) into
+		// metadata.namespace, while the (tier, scope) cardinality key is derived from scope.namespace
+		// INDEPENDENTLY of metadata.namespace. Without this clause an Agent in, e.g., kubeagents-system
+		// could declare scope.namespace=team-x: it would pass the cardinality webhook yet place the pod
+		// OUTSIDE team-x's isolation controls — a namespace-isolation escape (03 §3, §11). Rendering into
+		// scope.namespace from a foreign metadata.namespace is not an option either: cross-namespace
+		// ownerRefs break garbage collection and a namespaced SA can only bind a pod in its own namespace.
+		if agent.Namespace != namespace {
+			return field.Invalid(
+				field.NewPath("metadata", "namespace"),
+				agent.Namespace,
+				fmt.Sprintf("a developer-team Agent must be created in its scoped namespace: metadata.namespace must equal spec.scope.namespace (%q)", namespace),
+			)
+		}
 	}
 
 	if agent.Spec.ParentRef == nil || agent.Spec.ParentRef.Name == "" {

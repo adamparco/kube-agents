@@ -270,12 +270,19 @@ func TestAgentScopeAndParent(t *testing.T) {
 		},
 		{
 			name:    "developer-team missing namespace is rejected",
-			agent:   withParent(agentWithScope("dt", "ns", agentv1alpha1.TierDeveloperTeam, "project-x", "cluster-1", ""), "parent"),
+			agent:   withParent(agentWithScope("dt", "team-ns", agentv1alpha1.TierDeveloperTeam, "project-x", "cluster-1", ""), "parent"),
 			wantErr: true,
 		},
 		{
-			name:    "complete developer-team is allowed",
-			agent:   withParent(agentWithScope("dt", "ns", agentv1alpha1.TierDeveloperTeam, "project-x", "cluster-1", "team-ns"), "parent"),
+			// Placement clause (A1, load-bearing): a CR whose metadata.namespace differs from
+			// scope.namespace would place the pod outside the scoped namespace's isolation controls.
+			name:    "developer-team with metadata.namespace != scope.namespace is rejected",
+			agent:   withParent(agentWithScope("dt", "kubeagents-system", agentv1alpha1.TierDeveloperTeam, "project-x", "cluster-1", "team-ns"), "parent"),
+			wantErr: true,
+		},
+		{
+			name:    "complete developer-team placed in its scoped namespace is allowed",
+			agent:   withParent(agentWithScope("dt", "team-ns", agentv1alpha1.TierDeveloperTeam, "project-x", "cluster-1", "team-ns"), "parent"),
 			wantErr: false,
 		},
 	}
