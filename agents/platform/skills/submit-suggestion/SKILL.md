@@ -60,6 +60,22 @@ override it. It enforces that `--branch` starts with `<tier>-agent/`, then handl
 token exchange, git credential setup, branch push, and PR creation, and returns the clean, live
 GitHub PR URL dynamically!
 
+#### Dry run (preview the corrective PR without pushing)
+
+Pass `--dry-run` to **halt after the local branch + commit**: the script runs the same tier-scoping
+guardrails, then emits the corrective-PR artifact — the branch name and the diff versus `main` — with
+**no `git push` and no PR**. It is fully hermetic (it never contacts the token broker), so an
+autonomous SOP (drift detection, heartbeat) can produce a reviewable proposal even where there is no
+real GitHub. Add `--artifact-dir <dir>` to also write `branch.txt`, `suggestion.diff`, and `pr.md`
+for a caller to inspect:
+
+```bash
+./skills/submit-suggestion/scripts/submit_suggestion.py \
+  --branch "<tier>-agent/<change_type>-<target_id>" \
+  --title "<pr_title>" --body "<pr_body>" \
+  --dry-run --artifact-dir ./.suggestion-artifact
+```
+
 ### Step 3: Confirm Suggestion
 
 Record the PR link returned by the script, update the pending status inside your local state registry (if applicable), and present a clean, human-readable confirmation containing the PR URL link back to the user.
