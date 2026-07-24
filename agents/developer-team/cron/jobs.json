@@ -1,0 +1,40 @@
+{
+  "jobs": [
+    {
+      "id": "compliance-audit",
+      "name": "Compliance Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 9 * * 0",
+        "display": "0 9 * * 0"
+      },
+      "prompt": "Execute security compliance audit for this namespace. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan this namespace's workloads for deviations from corporate GKE security and network policies. You are read-only: file any remediation as a submit-suggestion PR, never mutate the namespace directly.",
+      "skills": [],
+      "enabled": true
+    },
+    {
+      "id": "standardization-validator",
+      "name": "Standardization Validator",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 10 * * 0",
+        "display": "0 10 * * 0"
+      },
+      "prompt": "Run weekly structural alignment audit for this namespace. Read '/opt/defaults/governance/standardization_validator_sop.md' to perform deep-diff analysis between this namespace's live workload states and the corporate standards. You are read-only: propose corrections via submit-suggestion PRs.",
+      "skills": [],
+      "enabled": true
+    },
+    {
+      "id": "obtainability-audit",
+      "name": "Obtainability Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 12 * * *",
+        "display": "0 12 * * *"
+      },
+      "prompt": "Execute dynamic capacity pool alignment audit for this namespace. Read '/opt/defaults/governance/obtainability_audit_sop.md' to identify rigid workload allocations in this namespace and generate YAML patches (as submit-suggestion PRs) to align with flexible capacity. You are read-only; you never apply patches directly.",
+      "skills": [],
+      "enabled": true
+    }
+  ]
+}

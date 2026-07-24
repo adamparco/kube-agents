@@ -1,0 +1,50 @@
+# MCP Servers configuration.
+mcp_servers:
+  platform_control:
+    command: "/opt/hermes/.venv/bin/python3"
+    args:
+      - "/opt/data/scripts/platform_mcp_server.py"
+    connect_timeout: 120
+    # 5-minute timeout to support long GKE reasoning chains
+    timeout: 300
+    env:
+      KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
+      KUBERNETES_SERVICE_PORT: "${KUBERNETES_SERVICE_PORT}"
+      HERMES_HOME: "${HERMES_HOME}"
+      GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
+      GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
+      API_SERVER_KEY: "${API_SERVER_KEY}"
+  # NOTE: the cluster-mutating `gke` remote MCP proxy (container.googleapis.com) is intentionally
+  # omitted so the Developer Team Agent is read-only (03 §4, 06 §9). This tier reads ONLY its one
+  # assigned namespace — enforced by RBAC (a namespaced read-only Role, not the persona) and the VAP
+  # backstop, not by this config. This baked config is a fallback; the operator's renderConfigYAML()
+  # is runtime-authoritative and also omits the write proxy. Every change goes through the
+  # submit-suggestion GitOps skill (a reviewed PR), never a direct cluster write. As the leaf tier,
+  # this persona ships NO propose-child cascade skill.
+
+# Explicitly list platform_toolsets
+# platform_toolsets is a reserved framework key in Hermes.
+platform_toolsets:
+  cli:
+    - hermes-cli
+    - mcp-agent_common
+    - mcp-platform_control
+    - mcp-developer_knowledge
+  api_server:
+    - hermes-api-server
+    - mcp-agent_common
+    - mcp-platform_control
+    - mcp-developer_knowledge
+
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  provider: multiuser_memory
+
+plugins:
+  enabled:
+    - hermes_otel
+    - session_store
+    - session_otel_bridge
+    - tool_call_audit
+    - incident_context
