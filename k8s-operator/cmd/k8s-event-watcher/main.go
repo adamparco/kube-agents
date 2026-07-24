@@ -43,6 +43,7 @@ type flags struct {
 	reasons           string
 	namespaces        string
 	excludeNamespaces string
+	scopeNamespace    string
 	dedupWindow       time.Duration
 	dedupPersist      string
 	unhealthyMinCount int
@@ -54,6 +55,12 @@ type flags struct {
 	metricsAddr       string
 	snapshotInterval  time.Duration
 }
+
+// ownerDeveloperTeam is the --owner value for the namespace-scoped tier. It mirrors
+// agentv1alpha1.TierDeveloperTeam; the watcher is a standalone binary that does not import
+// the operator API, so the canonical owner string is duplicated here for the fail-closed
+// scope check in validate().
+const ownerDeveloperTeam = "developer-team"
 
 // parseFlags reads command-line arguments into the flags struct.
 func parseFlags(args []string) (*flags, error) {
@@ -71,8 +78,9 @@ func parseFlags(args []string) (*flags, error) {
 
 	// Event filtering.
 	fs.StringVar(&f.reasons, "reason", "", "Comma-separated allow-list of Event.Reason values. Empty = shipped default set.")
-	fs.StringVar(&f.namespaces, "namespace", "", "Comma-separated allow-list of namespaces. Empty = all namespaces.")
+	fs.StringVar(&f.namespaces, "namespace", "", "Comma-separated allow-list of namespaces (client-side filter). Empty = all namespaces.")
 	fs.StringVar(&f.excludeNamespaces, "exclude-namespace", "", "Comma-separated deny-list of namespaces.")
+	fs.StringVar(&f.scopeNamespace, "scope-namespace", "", "Restrict the event informer to this single namespace at the API server (server-side scoping). Required for namespace-scoped tiers (--owner=developer-team).")
 
 	// Dedup.
 	fs.DurationVar(&f.dedupWindow, "dedup-window", 5*time.Minute, "Rolling window for (uid,reason) dedup.")
@@ -121,6 +129,13 @@ func (f *flags) validate() error {
 		}
 	default:
 		return fmt.Errorf("--mode must be per-incident or shared (got %q)", f.mode)
+	}
+	// Fail closed: a namespace-scoped tier must run a namespaced watch. Reject at startup
+	// rather than silently running cluster-wide (the tier's namespaced RBAC would deny the
+	// cluster-wide List anyway, but a loud rejection beats a crash loop and, more importantly,
+	// prevents a mis-rendered sidecar from ever observing events outside its tenant).
+	if f.owner == ownerDeveloperTeam && f.scopeNamespace == "" {
+		return errors.New("--scope-namespace is required when --owner=developer-team (a namespace-scoped tier must not watch cluster-wide)")
 	}
 	if f.dedupWindow <= 0 {
 		return errors.New("--dedup-window must be > 0")
@@ -392,7 +407,7 @@ func realMain(argv []string) error {
 		return err
 	}
 
-	w := newWatcher(client, disp, f.clusterName, 0)
+	w := newWatcher(client, disp, f.clusterName, 0, f.scopeNamespace)
 	log.Printf("k8s-event-watcher: starting on cluster %q → daemon %s (mode=%s, owner=%s)",
 		f.clusterName, f.daemonURL, f.mode, f.owner)
 	err = w.Run(ctx)

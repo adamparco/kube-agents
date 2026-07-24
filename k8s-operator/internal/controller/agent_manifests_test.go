@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -1106,5 +1107,109 @@ func TestGetConfigMapHash(t *testing.T) {
 
 	if hash1 == hash2 {
 		t.Errorf("expected different hashes for different configmap data")
+	}
+}
+
+// findWatcherArgs returns the args of the event-watcher sidecar, or fails the
+// test if the container is absent. Shared by the per-tier scoping assertions.
+func findWatcherArgs(t *testing.T, dep *appsv1.Deployment) []string {
+	t.Helper()
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.Name == "event-watcher" {
+			return c.Args
+		}
+	}
+	t.Fatalf("event-watcher sidecar not found in deployment %q", dep.Name)
+	return nil
+}
+
+// hasArg reports whether want appears verbatim in args.
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// hasArgPrefix reports whether any arg starts with prefix (for flags we assert
+// the presence of without pinning the value).
+func hasArgPrefix(args []string, prefix string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestWatcherArgsPerTierScoping locks D2 (Phase 4 / P4-T3): the event-watcher
+// sidecar's --owner must be derived from the agent's effective tier (not
+// hardcoded), and a namespace-scoped tier (developer-team) must additionally
+// carry --scope-namespace so its informer List/Watch is pinned server-side to
+// its own namespace. Cluster-wide tiers (platform, cluster-admin) must NOT
+// carry --scope-namespace (an empty value would still watch cluster-wide, but
+// omitting the flag keeps the fail-closed validate() in main.go meaningful).
+func TestWatcherArgsPerTierScoping(t *testing.T) {
+	tests := []struct {
+		name          string
+		tier          agentv1alpha1.AgentTier
+		scopeNS       string
+		wantOwner     string
+		wantScopeFlag bool
+		wantScopeArg  string
+	}{
+		{
+			name:          "platform is cluster-wide, no scope-namespace",
+			tier:          "",
+			wantOwner:     "--owner=platform",
+			wantScopeFlag: false,
+		},
+		{
+			name:          "cluster-admin is cluster-wide, no scope-namespace",
+			tier:          agentv1alpha1.TierClusterAdmin,
+			wantOwner:     "--owner=cluster-admin",
+			wantScopeFlag: false,
+		},
+		{
+			name:          "developer-team is namespace-scoped, carries scope-namespace",
+			tier:          agentv1alpha1.TierDeveloperTeam,
+			scopeNS:       "team-a",
+			wantOwner:     "--owner=developer-team",
+			wantScopeFlag: true,
+			wantScopeArg:  "--scope-namespace=team-a",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := &agentv1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-agent",
+					Namespace: "my-ns",
+				},
+				Spec: agentv1alpha1.AgentSpec{
+					Tier: tt.tier,
+				},
+			}
+			if tt.scopeNS != "" {
+				agent.Spec.Scope = &agentv1alpha1.ScopeSpec{Namespace: tt.scopeNS}
+			}
+
+			dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+			args := findWatcherArgs(t, dep)
+
+			if !hasArg(args, tt.wantOwner) {
+				t.Errorf("expected watcher args to contain %q, got %v", tt.wantOwner, args)
+			}
+			gotScopeFlag := hasArgPrefix(args, "--scope-namespace=")
+			if gotScopeFlag != tt.wantScopeFlag {
+				t.Errorf("scope-namespace flag present = %v, want %v (args %v)", gotScopeFlag, tt.wantScopeFlag, args)
+			}
+			if tt.wantScopeFlag && !hasArg(args, tt.wantScopeArg) {
+				t.Errorf("expected watcher args to contain %q, got %v", tt.wantScopeArg, args)
+			}
+		})
 	}
 }

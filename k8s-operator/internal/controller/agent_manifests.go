@@ -747,7 +747,25 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 		},
 	})
 
-	// Inject the k8s-event-watcher sidecar container to capture GKE warnings and stream them to the local REST bridge
+	// Inject the k8s-event-watcher sidecar container to capture GKE warnings and stream them to the local REST bridge.
+	// The watcher's --owner is the agent's effective tier (its X-Asserted-Caller identity), and a namespace-scoped
+	// developer-team agent additionally pins the watcher's informer to its own namespace (server-side scoping) so it
+	// can never observe events outside its tenant.
+	watcherTier := agentindex.EffectiveTier(agent)
+	watcherArgs := []string{
+		"--cluster-name=" + clusterName,
+		"--daemon-url=http://127.0.0.1:8699",
+		"--token-env=API_SERVER_KEY",
+		"--owner=" + string(watcherTier),
+		"--reason=FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
+	}
+	if watcherTier == agentv1alpha1.TierDeveloperTeam {
+		scopeNS := ""
+		if agent.Spec.Scope != nil {
+			scopeNS = agent.Spec.Scope.Namespace
+		}
+		watcherArgs = append(watcherArgs, "--scope-namespace="+scopeNS)
+	}
 	containers = append(containers, corev1.Container{
 		Name:            "event-watcher",
 		Image:           image,
@@ -755,13 +773,7 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 		Command: []string{
 			"/usr/local/bin/k8s-event-watcher",
 		},
-		Args: []string{
-			"--cluster-name=" + clusterName,
-			"--daemon-url=http://127.0.0.1:8699",
-			"--token-env=API_SERVER_KEY",
-			"--owner=platform",
-			"--reason=FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
-		},
+		Args: watcherArgs,
 		Env: []corev1.EnvVar{
 			{
 				Name: "API_SERVER_KEY",
