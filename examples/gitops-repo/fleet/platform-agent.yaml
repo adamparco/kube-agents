@@ -1,0 +1,47 @@
+# fleet/platform-agent.yaml — the project-scoped platform `Agent` CR (06 §1.1, §2).
+#
+# This is the Platform Agent's desired state. One platform agent per project; its home scope is the
+# whole project. The kube-agents controller REFERENCES the pre-created read-only identity by name
+# (spec.security.serviceAccountName); it never mints RBAC or the KSA (08 §4). That identity —
+# ServiceAccount + read-only ClusterRole/Binding + Workload Identity — lives in
+# ../policy/rbac-overlay/platform.yaml and is applied by CI/CD alongside this CR.
+#
+# Applied by CI/CD on merge; human-reviewed (see ../CODEOWNERS). The agent is READ-ONLY: it proposes
+# infrastructure changes as GitOps PRs (submit-suggestion), never by mutating the cluster/cloud.
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: platform-agent
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: platform
+spec:
+  # Persona / containment level. Immutable after creation (06 §1.1).
+  tier: platform
+  # Project-scoped: the platform tier's home is the whole GCP project (one per project).
+  scope:
+    projectId: "your-gcp-project-id" # substituted per project by CI/CD
+  # Infrastructure-as-code format the agent authors suggestions in (KCC by default; terraform opt-in).
+  iac:
+    format: kcc
+  harness:
+    clusterName: "cluster-a"
+    location: "us-central1"
+    hermes:
+      dashboardEnabled: true
+      apiServerSecretRef:
+        name: platform-agent-secrets
+        key: API_SERVER_KEY
+  # The controller references this pre-created SA; it does not create or annotate it (08 §4).
+  security:
+    serviceAccountName: platform-agent
+  integration:
+    googleChat:
+      enabled: true
+      projectId: "your-gcp-project-id"
+      topicName: "kubeagents-google-chat-events"
+      subscriptionName: "kubeagents-google-chat-events-sub"
+      # CLOSED allowlist (A4): ONLY these humans can reach the agent. An empty or absent list means
+      # ALL users are allowed — never ship that. Replace with your platform team's Chat member IDs.
+      allowedUsers:
+        - "users/REPLACE_WITH_PLATFORM_ADMIN_ID"
