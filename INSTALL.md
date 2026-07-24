@@ -305,6 +305,49 @@ For developer testing on a workstation against a local cluster (e.g., Kind) or r
    make dev-rebuild-agent ARGS="platform"
    ```
 
+### Kind inner loop — build & load your **local** images first (read this before any phase)
+
+The Kind phases below all assume the cluster is running **your working-tree code**, not the
+upstream published image. Two things make this non-obvious, and both have bitten this repo:
+
+- **`make deploy` does _not_ build.** It only runs `kustomize set image` + `kubectl apply`. So
+  `make deploy IMG=ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0` deploys the **upstream**
+  binary and compiles nothing of yours. To test your changes you must build a **local** image,
+  `kind load` it, and point the workload at it.
+- **There are two image families**, built by two different Makefiles:
+  - **operator image** (the controller + webhook) — `k8s-operator/Makefile`, target `docker-build`
+  - **agent images** (`platform` / `cluster-admin` / `developer-team`) — the **root** `Makefile`,
+    target `docker-build-agents`
+
+Use the helper — it does build → `kind load` → repoint the running workload, and is guarded to
+Kind/scratch-GKE contexts so it can never touch a real cluster:
+
+```bash
+# operator (controller + webhook): build kube-agents/k8s-operator:dev, load it, restart the controller
+local-dev/kind/reload-images.sh operator kind-kube-agents-dev
+
+# agent images: build kube-agents/<tier>-agent:latest and load them
+local-dev/kind/reload-images.sh agents   kind-kube-agents-dev
+
+# both
+local-dev/kind/reload-images.sh all      kind-kube-agents-dev
+```
+
+Two rules the helper encodes so you don't get silently-stale results:
+
+- **`imagePullPolicy` trap.** The controller renders agent pods with `imagePullPolicy: PullAlways`
+  by **default**, which makes the kubelet ignore your `kind load`ed image and re-pull from the
+  registry (i.e. run the **upstream** image). For local Kind testing, the Agent CR must set
+  `spec.deployment.imagePullPolicy: IfNotPresent` (the example CRs already do). The operator
+  Deployment itself already uses `IfNotPresent`.
+- **Stale-image rule.** Local images reuse a fixed tag (`:dev`, `:latest`). Same tag +
+  `IfNotPresent` means the kubelet will **not** refresh a copy it already has — so after **any**
+  source change you must rebuild **and** reload **and** restart. The helper always does all three.
+
+> If you only want the upstream published image (a quick smoke test, not testing your code), you
+> can `cd k8s-operator && make deploy IMG=ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0` — but
+> understand that this tests **upstream**, not your working tree.
+
 ### Phase 2 — Kind inner loop (Cluster Admin Agent + cascade)
 
 Phase 2 adds the tier-discriminated `Agent` CRD (renamed from `PlatformAgent`), the read-only
@@ -314,14 +357,17 @@ and the **spoke bootstrap** ordered apply waves. Verify the whole inner loop on 
 
 1. **Create a Kind cluster** (K8s ≥ 1.30 — the VAP requires `ValidatingAdmissionPolicy` GA):
    ```bash
-   export PATH="$HOME/go/bin:$PATH"          # kind is installed under ~/go/bin
    kind create cluster --name kube-agents-dev --image kindest/node:v1.31.2
    ```
-2. **Deploy the stack** (cert-manager → controller/CRD/webhooks/router → VAP):
+2. **Deploy the stack** (cert-manager → controller/CRD/webhooks/router → VAP). Build & load your
+   **local** operator image first (see "Kind inner loop" above), then deploy that tag — do **not**
+   deploy the upstream `ghcr.io/...:v0.1.0` tag if you want to test your working tree:
    ```bash
    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.7/cert-manager.yaml
    kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=180s
-   cd k8s-operator && make deploy IMG=ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0 && cd ..
+   make -C k8s-operator docker-build IMG=kube-agents/k8s-operator:dev
+   kind load docker-image kube-agents/k8s-operator:dev --name kube-agents-dev
+   cd k8s-operator && make deploy IMG=kube-agents/k8s-operator:dev && cd ..
    kubectl apply -f examples/gitops-repo/policy/vap-agent-readonly.yaml
    ```
 3. **Run the consolidated verification gate** (destructive; guarded to Kind contexts only):
@@ -347,16 +393,23 @@ placement clause** (a developer-team `Agent` must be created in the namespace it
 Cluster Admin Agent, and the router completion (NL confidence/clarify, candidate validity, thread
 affinity, audit attribution). It reuses the Phase 2 stack on the same Kind cluster.
 
-> **Image refresh (important).** The webhook/controller run inside the operator image, and the
-> `Agent` CRD keeps the same `v0.1.0` tag across phases. After **any** change to
-> `k8s-operator/internal/webhook` or `.../controller`, refresh the running image before verifying —
-> a same-tag image with `imagePullPolicy: IfNotPresent` will otherwise keep serving the stale build
-> and can **silently under-enforce** an admission invariant (this is exactly how a Phase 3 placement
-> escape first slipped through):
+> **Image refresh (important).** The webhook/controller run inside the operator image. After **any**
+> change to `k8s-operator/internal/webhook` or `.../controller`, refresh the running image before
+> verifying — a same-tag image with `imagePullPolicy: IfNotPresent` will otherwise keep serving the
+> stale build and can **silently under-enforce** an admission invariant (this is exactly how a
+> Phase 3 placement escape first slipped through). The helper does build → `kind load` → restart in
+> one guarded step:
 >
 > ```bash
-> cd k8s-operator && make docker-build IMG=ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0 && cd ..
-> kind load docker-image ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0 --name kube-agents-dev
+> local-dev/kind/reload-images.sh operator kind-kube-agents-dev
+> ```
+>
+> Equivalent longhand, if you prefer to see each step:
+>
+> ```bash
+> make -C k8s-operator docker-build IMG=kube-agents/k8s-operator:dev
+> kind load docker-image kube-agents/k8s-operator:dev --name kube-agents-dev
+> kubectl -n kubeagents-system set image deploy/kubeagents-controller-manager manager=kube-agents/k8s-operator:dev
 > kubectl -n kubeagents-system rollout restart deploy/kubeagents-controller-manager
 > kubectl -n kubeagents-system rollout status  deploy/kubeagents-controller-manager --timeout=120s
 > ```
