@@ -16,4 +16,8 @@ Reference workflows:
   harness runner on PRs touching guarded paths; block merge on unmitigated high/critical findings
   (Phase 5, 06 §7).
 
-GitHub Actions is the reference; CircleCI/Jenkins/Argo/Flux/Atlantis are equally valid (06 §4).
+GitHub Actions is the reference; CircleCI/Jenkins/Argo/Flux/Atlantis are equally valid (06 §4). A
+**second, equivalent** pipeline ships as [`../../.circleci/config.yml`](../../.circleci/config.yml)
+(CircleCI) — same KCC/HCL dispatch, same per-target least-privilege creds, same merge-to-`main`
+trigger — demonstrating actuation is genuinely pipeline-agnostic (Phase 7, 07 §2 Accept (b)). The two
+are kept in parity by `local-dev/tests/circleci-parity.py`.

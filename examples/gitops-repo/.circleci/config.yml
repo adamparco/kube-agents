@@ -1,0 +1,173 @@
+# .circleci/config.yml — SECOND reference actuation pipeline (CircleCI).
+#
+# The parity twin of ../.github/workflows/apply.yml (GitHub Actions). It proves kube-agents actuation
+# is genuinely UNOPINIONATED about CI/CD (06 §4; 07 "Phase 7" Accept (b)): the same KCC/HCL dispatch,
+# the same per-target least-privilege deploy credentials, and the same merge-to-`main` trigger — just
+# expressed for a different pipeline.
+#
+# TRUST BOUNDARY (unchanged — invariant 2): the pipeline is the SOLE privileged writer (03 §4, 06 §4).
+# kube-agents agents are read-only and hold NO write credential; they only author artifacts and open
+# PRs (submit-suggestion). Applying happens HERE, after a human reviews and merges. Adding this second
+# pipeline introduces no new write path from any agent (docs/build/phase-7.md D4).
+#
+# LEAST PRIVILEGE: one CircleCI **context per target** — the analogue of apply.yml's per-target GitHub
+# Environment. Each context holds only its own target's keyless OIDC deploy identity (a Workload
+# Identity Federation provider + a per-target Google service account scoped to just that
+# cluster/project). A change to cluster-a can never use cluster-b's credentials. Mark each context as a
+# CircleCI "restricted context" (security-group gated) to gate the apply itself.
+#
+# KEYLESS: auth is OIDC (CIRCLE_OIDC_TOKEN → Workload Identity Federation); there are NO long-lived
+# JSON service-account keys. `circleci config validate` is the schema check; it is deferred-not-faked
+# here (CLI absent on the build host) — structure + dispatch parity is proven by
+# local-dev/tests/circleci-parity.py instead (same pattern as Calico standing in for kindnet).
+
+version: 2.1
+
+jobs:
+  apply:
+    parameters:
+      target:
+        type: string
+        description: "cluster-a | cluster-b | fleet — the single target this job applies."
+    docker:
+      # cloud-sdk provides gcloud + kubectl; Terraform is installed in-step (pin in production).
+      - image: google/cloud-sdk:slim
+    steps:
+      - checkout
+
+      - run:
+          name: Skip if target << parameters.target >> is unchanged
+          command: |
+            set -euo pipefail
+            base="$(git rev-parse "HEAD^" 2>/dev/null || echo HEAD)"
+            changed="$(git diff --name-only "$base" HEAD || true)"
+            t="<< parameters.target >>"
+            if [ "$t" = "fleet" ]; then pat='^fleet/'; else pat="^clusters/$t/"; fi
+            if ! echo "$changed" | grep -q "$pat"; then
+              echo "No changes for $t in this merge — halting."
+              circleci-agent step halt
+            fi
+
+      - run:
+          name: Authenticate to Google Cloud (keyless — OIDC → Workload Identity Federation)
+          command: |
+            set -euo pipefail
+            # No long-lived JSON key. The per-target CONTEXT supplies WIF_PROVIDER + DEPLOY_SERVICE_ACCOUNT
+            # (+ GCP_PROJECT_ID) and nothing else — least privilege scoped to exactly this target.
+            echo "$CIRCLE_OIDC_TOKEN" > /tmp/oidc-token
+            gcloud iam workload-identity-pools create-cred-config "$WIF_PROVIDER" \
+              --service-account="$DEPLOY_SERVICE_ACCOUNT" \
+              --credential-source-file=/tmp/oidc-token \
+              --output-file=/tmp/gcp-creds.json
+            gcloud auth login --brief --cred-file=/tmp/gcp-creds.json
+            gcloud config set project "$GCP_PROJECT_ID"
+
+      - run:
+          name: Get GKE credentials
+          command: |
+            set -euo pipefail
+            # A cluster target points GKE_CLUSTER/GKE_LOCATION at that cluster; `fleet` points them at
+            # the Config-Connector management cluster (its own context vars).
+            gcloud container clusters get-credentials "$GKE_CLUSTER" --location "$GKE_LOCATION"
+
+      - run:
+          name: Install Terraform
+          command: |
+            set -euo pipefail
+            apt-get update -qq && apt-get install -y -qq wget unzip
+            ver="1.9.5"
+            wget -q "https://releases.hashicorp.com/terraform/${ver}/terraform_${ver}_linux_amd64.zip"
+            unzip -o "terraform_${ver}_linux_amd64.zip" -d /usr/local/bin
+
+      - run:
+          name: Apply target << parameters.target >>
+          command: |
+            set -euo pipefail
+
+            # Apply one directory: Terraform if it holds *.tf, otherwise kubectl (KCC/K8s YAML).
+            # IDENTICAL dispatch to apply.yml apply_path() — this is the seam that must not drift.
+            apply_path() {
+              local dir="$1"
+              [ -d "$dir" ] || { echo "  (skip $dir — absent)"; return 0; }
+              if ls "$dir"/*.tf >/dev/null 2>&1; then
+                echo "  terraform apply → $dir"
+                terraform -chdir="$dir" init -input=false
+                terraform -chdir="$dir" apply -input=false -auto-approve
+              elif ls "$dir"/*.y*ml >/dev/null 2>&1; then
+                echo "  kubectl apply (server-side) → $dir"
+                kubectl apply --server-side --recursive -f "$dir"
+              else
+                echo "  (skip $dir — no .tf or .yaml)"
+              fi
+            }
+
+            # Apply clusters/<name>/bootstrap/ in ORDERED waves with readiness gates (05 §7): cert-manager
+            # → controller webhook → VAP-before-identity. Mirrors apply.yml apply_bootstrap().
+            apply_bootstrap() {
+              local root="$1"
+              [ -d "$root" ] || { echo "  (skip $root — no bootstrap)"; return 0; }
+              local wave
+              for wave in "$root"/*/; do
+                wave="${wave%/}"
+                [ -d "$wave" ] || continue
+                if [ -f "$wave/kustomization.yaml" ] || [ -f "$wave/kustomization.yml" ]; then
+                  echo "  kubectl apply -k → $wave"
+                  kubectl apply --server-side -k "$wave"
+                else
+                  apply_path "$wave"
+                fi
+                case "$(basename "$wave")" in
+                  00-cert-manager)
+                    kubectl -n cert-manager rollout status deploy/cert-manager --timeout=300s
+                    kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=300s
+                    kubectl -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=300s
+                    ;;
+                  10-controller)
+                    kubectl -n kubeagents-system rollout status deploy/kubeagents-controller-manager --timeout=300s
+                    ;;
+                esac
+              done
+            }
+
+            t="<< parameters.target >>"
+            if [ "$t" = "fleet" ]; then
+              echo "Applying fleet-level artifacts"
+              apply_path "fleet"
+            else
+              echo "Applying cluster '$t'"
+              # Order matters (05 §7): provisioning → bootstrap → namespaces → agents (identity before pod).
+              apply_path "clusters/$t/provisioning"
+              apply_bootstrap "clusters/$t/bootstrap"
+              for ns in clusters/"$t"/namespaces/*/; do apply_path "${ns%/}"; done
+              apply_path "clusters/$t/agents"
+            fi
+
+workflows:
+  apply:
+    jobs:
+      # One job per target, each bound to its OWN least-privilege context (per-target deploy identity).
+      # The whole workflow is filtered to `main` — applies happen only after a reviewed PR is merged.
+      - apply:
+          name: apply-cluster-a
+          target: cluster-a
+          context:
+            - kube-agents-apply-cluster-a
+          filters:
+            branches:
+              only: main
+      - apply:
+          name: apply-cluster-b
+          target: cluster-b
+          context:
+            - kube-agents-apply-cluster-b
+          filters:
+            branches:
+              only: main
+      - apply:
+          name: apply-fleet
+          target: fleet
+          context:
+            - kube-agents-apply-fleet
+          filters:
+            branches:
+              only: main

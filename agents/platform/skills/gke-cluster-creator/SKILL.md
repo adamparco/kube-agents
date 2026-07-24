@@ -280,9 +280,9 @@ spec:
 - **WARN** the user about cost if they select GPU or regional clusters.
 - **AUTHOR, DON'T EXECUTE**: write the finished artifact to
   `clusters/<cluster_name>/provisioning/<cluster_name>.yaml` in the GitOps repo (use the Terraform
-  equivalent under the same path if `spec.iac.format` is `terraform`). Do **not** attempt to run
-  `gcloud`, `kubectl apply`, or any cluster-creating tool — there is none, and direct mutation is
-  forbidden.
+  equivalent under the same path if `spec.iac.format` is `terraform` — see **Terraform alternative**
+  below). Do **not** attempt to run `gcloud`, `kubectl apply`, or any cluster-creating tool — there is
+  none, and direct mutation is forbidden.
 - **PROPOSE**: invoke the [submit-suggestion](../submit-suggestion/SKILL.md) skill with a branch named
   `platform-agent/provision-<cluster_name>`, staging only the provisioning files you authored. Present
   the returned PR URL to the user. The cluster is created only on human merge, when the CI/CD pipeline
@@ -294,8 +294,23 @@ If the agent's `spec.iac.format` is `terraform`, author the equivalent HCL inste
 `google_container_cluster` (with `remove_default_node_pool`, `networking_mode = "VPC_NATIVE"`,
 `workload_identity_config`, `release_channel`, `private_cluster_config`) plus one or more
 `google_container_node_pool` resources carrying the same machine type, autoscaling, shielded-node, and
-accelerator settings shown above. Write it to the same `clusters/<cluster_name>/provisioning/` path; the
-pipeline runs `terraform apply` on merge.
+accelerator settings shown above.
+
+**Match the canonical exemplar shape.** The repo ships a matched, parity-checked pair of committed
+exemplars — copy their structure rather than inventing your own so the artifact matches the tested
+shape:
+
+- **KCC** (`iac.format: kcc`, default) —
+  `examples/gitops-repo/clusters/cluster-a/provisioning/cluster-a.yaml`
+- **Terraform** (`iac.format: terraform`) —
+  `examples/gitops-repo/clusters/cluster-b/provisioning/{cluster.tf,variables.tf}`
+
+The two are asserted **semantically equivalent** by `local-dev/tests/iac-parity.py` (same location,
+release channel, node machine type/count, VPC-native / Workload-Identity / Shielded / private shape).
+Keep each format in its **own** cluster dir: the actuation pipeline dispatches per directory (`*.tf` →
+`terraform apply`, else `*.y*ml` → `kubectl apply`), so `.tf` and `.yaml` in one provisioning dir would
+collide. Write the Terraform artifact to the cluster's own `clusters/<cluster_name>/provisioning/`
+path; the pipeline runs `terraform apply` on merge.
 
 ## example_usage
 

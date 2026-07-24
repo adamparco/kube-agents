@@ -10,6 +10,29 @@ Audit, verify, and troubleshoot the logging, metrics, and distributed tracing ob
 > [!TIP]
 > The provided Python scripts in the `scripts/` subdirectory are parameterized reference implementations. When troubleshooting, you can run them directly, customize their parameters, or write custom just-in-time scripts/commands to query more specific metrics, endpoints, or time ranges as required by the task context.
 
+# Backend selection (provider-neutral seam)
+
+Google Cloud is the **default** backend, but the endpoints are **not hardcoded** — they resolve from
+the environment via [`scripts/obs_backend.py`](scripts/obs_backend.py) (Phase 7, 01 §6). This keeps
+kube-agents from being wired to GCP while leaving existing GKE installs unchanged when the knobs are
+unset.
+
+- **`KUBEAGENTS_OBS_BACKEND`** — backend profile. `gcp` (**default**) resolves metrics/trace/logging to
+  Cloud Monitoring / Cloud Trace / Cloud Logging (the historical behavior; unset ⇒ no change). Any
+  other value is a non-GCP backend and **requires** the explicit base URLs below.
+- **`OBS_MONITORING_BASE_URL` / `OBS_TRACE_BASE_URL` / `OBS_LOGGING_BASE_URL`** — explicit per-signal
+  base-URL overrides. When set they win (they work even with the `gcp` profile), so a single signal can
+  point at, e.g., an in-cluster Prometheus (`http://prometheus-server.monitoring.svc.cluster.local`)
+  without switching the whole profile.
+- **`OTEL_EXPORTER_OTLP_ENDPOINT`** — the OTLP _export_ endpoint the agent ships spans to. Baked to the
+  GKE managed-OTel collector by default; set this standard OTEL env to target any OTLP collector on a
+  non-GKE cluster (resolved by `docker-entrypoint.sh`).
+
+**Non-GCP path (documented):** point the base URLs at your metrics/trace/logging stack (Prometheus /
+Tempo / Loki or a vendor OTLP endpoint). Query **translation** for a non-GCP backend (Cloud Monitoring
+MQL → PromQL, Cloud Trace → Tempo, GCP-managed-Prometheus metric names → native names) is
+backend-specific and is deferred (D3) — only the _endpoint_ is provider-neutral today.
+
 # Workflow
 
 ## Logging

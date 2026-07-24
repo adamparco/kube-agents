@@ -1,10 +1,16 @@
 import argparse
 import json
+import os
 import re
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+
+# Resolve the logging endpoint from the provider-neutral seam (default: Cloud Logging). See obs_backend.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from obs_backend import logging_base_url  # noqa: E402
 
 # Parse arguments
 parser = argparse.ArgumentParser(description="List users and message counts who interacted with the system via chat in the last 24 hours")
@@ -29,8 +35,8 @@ except subprocess.CalledProcessError as e:
     print(f"Error retrieving active access token: {e}")
     exit(1)
 
-# Cloud Logging API endpoint
-url = "https://logging.googleapis.com/v2/entries:list"
+# Cloud Logging API endpoint (base URL resolved via the provider-neutral seam)
+url = f"{logging_base_url()}/v2/entries:list"
 
 # Request payload
 filter_query = f'resource.type="k8s_container" "Logging incoming GChat event" timestamp >= "{start_str}"'

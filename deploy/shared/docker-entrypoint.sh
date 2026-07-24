@@ -37,6 +37,21 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" 2>/dev/null || true
 fi
 
+# 4b. Resolve the OTLP exporter endpoint from the environment (provider-neutral observability seam;
+#     Phase 7 P7-T3, 01 §6, D3). The image BAKES the GKE managed-OTel collector as the default (see
+#     deploy/docker/Dockerfile step 5.5), so an UNSET environment leaves that default byte-for-byte
+#     (no regression on GKE). Set the standard OTEL_EXPORTER_OTLP_ENDPOINT to point the exporter at any
+#     OTLP-compatible collector (a Prometheus/Tempo stack, a vendor OTLP endpoint, ...) on a non-GKE
+#     target — only then do we rewrite the backend endpoint.
+DEFAULT_OTLP_ENDPOINT="http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces"
+OTEL_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-$DEFAULT_OTLP_ENDPOINT}"
+if [ -n "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ] \
+    && [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] \
+    && [ -w "$TARGET_DIR/plugins/hermes_otel/config.yaml" ]; then
+    echo "OTLP exporter endpoint overridden via OTEL_EXPORTER_OTLP_ENDPOINT: $OTEL_ENDPOINT"
+    "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {}; b = c.setdefault('backends', [{}]); b[0].update({'name': b[0].get('name', 'otlp'), 'type': 'otlp', 'endpoint': sys.argv[2]}); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" "$OTEL_ENDPOINT" 2>/dev/null || true
+fi
+
 # 5. Start background microservices (FastAPI proxy)
 mkdir -p "$TARGET_DIR/logs"
 if [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
