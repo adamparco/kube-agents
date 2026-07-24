@@ -41,6 +41,17 @@ else
   exit 0
 fi
 
+# ─── Step 1b: Remove agent admission policies ─────────────────────────────────
+# Mirrors step 4 of provision_03. Cluster-scoped, so `make undeploy` does not touch them.
+echo -e "  ${C_CYAN}ℹ Removing agent admission policies (VAP)...${C_RESET}"
+if [ "${DRY_RUN:-0}" -eq 1 ]; then
+  echo -e "  ${C_GREEN}[DRY-RUN] Would delete ValidatingAdmissionPolicies kube-agents-agent-readonly and kube-agents-agent-pod-hardening.${C_RESET}"
+else
+  kubectl delete validatingadmissionpolicybinding kube-agents-agent-readonly kube-agents-agent-pod-hardening --ignore-not-found 2>/dev/null || true
+  kubectl delete validatingadmissionpolicy kube-agents-agent-readonly kube-agents-agent-pod-hardening --ignore-not-found 2>/dev/null || true
+  echo -e "  ${C_GREEN}✓ Agent admission policies removed.${C_RESET}"
+fi
+
 # ─── Step 2: Undeploy Operator Manager ────────────────────────────────────────
 OPERATOR_DEPLOYED=""
 if [ "${DRY_RUN:-0}" -ne 1 ]; then

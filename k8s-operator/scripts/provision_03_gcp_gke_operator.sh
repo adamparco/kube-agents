@@ -87,14 +87,86 @@ verify_operator() {
 execute_operator() {
   print_info "Installing Custom Resource Definitions (CRDs)..."
   make -C "$OPERATOR_DIR" install || return 1
+
+  # Honour OPERATOR_IMAGE / ROUTER_IMAGE from vars.sh. Without this, `make deploy` falls back to
+  # the Makefile defaults (ghcr.io/gke-labs/...:v0.1.0) and silently ships the PUBLISHED images
+  # even when the operator was built from local source into the project's Artifact Registry.
+  local -a deploy_args=()
+  if [ -n "${OPERATOR_IMAGE:-}" ]; then
+    print_info "Deploying controller image ${OPERATOR_IMAGE}"
+    deploy_args+=("IMG=${OPERATOR_IMAGE}")
+  fi
+  # `make deploy` only rewrites the controller image; the router is pinned in
+  # config/router/kustomization.yaml, so repoint it here.
+  if [ -n "${ROUTER_IMAGE:-}" ]; then
+    print_info "Deploying kage-router image ${ROUTER_IMAGE}"
+    (cd "$OPERATOR_DIR/config/router" && "$OPERATOR_DIR/bin/kustomize" edit set image "kage-router=${ROUTER_IMAGE}") || return 1
+  fi
+
   print_info "Deploying Operator Controller Manager to the GKE cluster..."
-  make -C "$OPERATOR_DIR" deploy || return 1
+  make -C "$OPERATOR_DIR" deploy "${deploy_args[@]}" || return 1
   wait_for_k8s_resource "deployment/kubeagents-controller-manager" "${NAMESPACE:-kubeagents-system}" "Available" "180s" || return 1
+}
+
+# The Phase 5 admission layer: the read-only RBAC ceiling and the agent pod hardening rule.
+# These are cluster-scoped and must exist BEFORE any Agent CR is applied (step 08), so a
+# non-conforming agent pod or a write-capable tier role is rejected at admission rather than
+# grandfathered in. Both match ONLY resources labelled kube-agents/tier.
+verify_policy() {
+  kubectl get validatingadmissionpolicy kube-agents-agent-readonly >/dev/null 2>&1 &&
+    kubectl get validatingadmissionpolicy kube-agents-agent-pod-hardening >/dev/null 2>&1
+}
+execute_policy() {
+  local policy_dir="$OPERATOR_DIR/../examples/gitops-repo/policy"
+  if [ ! -d "$policy_dir" ]; then
+    print_info "Policy directory not found at ${policy_dir}. Skipping."
+    return 0
+  fi
+  print_info "Applying agent admission policies (read-only ceiling + pod hardening)..."
+  kubectl apply -f "${policy_dir}/vap-agent-readonly.yaml" || return 1
+  kubectl apply -f "${policy_dir}/vap-agent-pod-hardening.yaml" || return 1
+}
+
+# The kage-router is the Google CHAT front door: it drains an inbound Pub/Sub subscription and
+# re-publishes to per-agent topics. config/router ships it with replicas: 1 and REPLACE_WITH_*
+# placeholders, so on a Slack-only (or un-wired) install it crash-loops on startup with
+# "InvalidArgument ... REPLACE_WITH_PROJECT_ID". Park it at zero unless Chat is actually wired.
+verify_router_config() {
+  # Always reconcile: `make deploy` in step 3 resets replicas/env from the kustomize base.
+  return 1
+}
+execute_router_config() {
+  local ns="${NAMESPACE:-kubeagents-system}"
+  if ! kubectl get deployment kubeagents-router -n "$ns" >/dev/null 2>&1; then
+    print_info "kage-router not deployed. Skipping."
+    return 0
+  fi
+
+  if [ "${GOOGLE_CHAT_ENABLED:-false}" != "true" ] || [ -z "${CHAT_SUB_NAME:-}" ]; then
+    print_info "Google Chat disabled (or no inbound subscription). Parking kage-router at 0 replicas."
+    kubectl scale deployment/kubeagents-router -n "$ns" --replicas=0 || return 1
+    kubectl annotate deployment/kubeagents-router -n "$ns" \
+        kube-agents/parked-reason="Google Chat disabled; no inbound subscription to drain" \
+        --overwrite >/dev/null || return 1
+    return 0
+  fi
+
+  print_info "Wiring kage-router to subscription ${CHAT_SUB_NAME}..."
+  # Workload Identity for the router KSA (its GSA is created in provision_04 step 6).
+  kubectl annotate serviceaccount "${ROUTER_KSA_NAME:-kubeagents-router}" -n "$ns" \
+      iam.gke.io/gcp-service-account="${ROUTER_GSA_NAME:-kubeagents-router-gsa}@${PROJECT_ID}.iam.gserviceaccount.com" \
+      --overwrite || return 1
+  kubectl set env deployment/kubeagents-router -n "$ns" \
+      KAGE_PROJECT_ID="${PROJECT_ID}" \
+      KAGE_INBOUND_SUBSCRIPTION="${CHAT_SUB_NAME}" || return 1
+  kubectl scale deployment/kubeagents-router -n "$ns" --replicas=1 || return 1
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
 run_deploy_step "2. Ensure cert-manager" verify_cert_manager execute_cert_manager 5
 run_deploy_step "3. Deploy Kubernetes Operator" verify_operator execute_operator 0
+run_deploy_step "4. Apply agent admission policies (VAP)" verify_policy execute_policy 5
+run_deploy_step "5. Configure kage-router" verify_router_config execute_router_config 5
 
 print_success "Kubernetes Operator deployed successfully!"

@@ -230,9 +230,136 @@ execute_github_minter_iam() {
   execute_agent_iam "GitHub Token Minter" "${GITHUB_MINTER_KSA_NAME}" "${GITHUB_MINTER_GSA_NAME}"
 }
 
+# ─── Child agent tiers (Phase 2 cluster-admin, Phase 3 developer-team) ────────
+#
+# Each non-platform tier needs its own GSA + Workload Identity binding before its Agent CR is
+# applied (identity-before-pod). Both stay VIEWER-ONLY: invariant #1 says the agent's cloud
+# identity never holds a write role — the only mutation path is a reviewed GitOps PR.
+#
+# Unlike the platform/minter helpers above, the developer-team KSA does NOT live in ${NAMESPACE}
+# (it lives in its tenant namespace), so these use a namespace-aware variant.
+
+CLUSTER_ADMIN_GSA_NAME="${CLUSTER_ADMIN_GSA_NAME:-kubeagents-cluster-admin-gsa}"
+CLUSTER_ADMIN_KSA_NAME="${CLUSTER_ADMIN_KSA_NAME:-cluster-admin-agent}"
+CLUSTER_ADMIN_ROLES=(
+  "roles/container.clusterViewer"
+  "roles/container.viewer"
+  "roles/monitoring.viewer"
+  "roles/logging.viewer"
+  "roles/iam.securityReviewer"
+)
+
+# Tenant namespace for the developer-team tier. Set DEVELOPER_TEAM_NAMESPACE to provision a
+# different tenant; empty disables the step.
+DEVELOPER_TEAM_NAMESPACE="${DEVELOPER_TEAM_NAMESPACE:-team-x}"
+DEVELOPER_TEAM_GSA_NAME="${DEVELOPER_TEAM_GSA_NAME:-kubeagents-developer-team-gsa}"
+DEVELOPER_TEAM_KSA_NAME="${DEVELOPER_TEAM_KSA_NAME:-developer-team-agent}"
+# Narrower than cluster-admin: no IAM review, no cluster-wide container viewer.
+DEVELOPER_TEAM_ROLES=(
+  "roles/container.viewer"
+  "roles/monitoring.viewer"
+  "roles/logging.viewer"
+)
+
+# kage-router is NOT an agent — it only drains the inbound Chat subscription, so it gets
+# pubsub.subscriber and nothing else. Only needed when Google Chat is enabled.
+ROUTER_GSA_NAME="${ROUTER_GSA_NAME:-kubeagents-router-gsa}"
+ROUTER_KSA_NAME="${ROUTER_KSA_NAME:-kubeagents-router}"
+ROUTER_ROLES=("roles/pubsub.subscriber")
+
+# Namespace-aware twin of execute_agent_iam (which always binds WI in ${NAMESPACE}).
+execute_tier_iam() {
+  local agent_name=$1
+  local ksa_namespace=$2
+  local ksa_name=$3
+  local gsa_name=$4
+  shift 4
+  local roles=("$@")
+
+  local gsa_email="${gsa_name}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+  if ! gcloud iam service-accounts describe "${gsa_email}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    print_info "Creating GSA ${gsa_name} for ${agent_name}..."
+    gcloud iam service-accounts create "${gsa_name}" \
+        --display-name="${agent_name} GSA (viewer-only)" \
+        --project="${PROJECT_ID}" || return 1
+    # IAM propagation: a freshly created SA is briefly invisible to the policy service, and
+    # add-iam-policy-binding then fails with "Service account does not exist".
+    sleep 15
+  fi
+
+  print_info "Configuring viewer-only IAM roles for ${gsa_name}..."
+  for role in "${roles[@]}"; do
+    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+        --member="serviceAccount:${gsa_email}" \
+        --role="${role}" \
+        --condition=None \
+        --quiet >/dev/null || return 1
+  done
+
+  # Same viewer-only reconciliation as the platform tier: strip any write-capable role.
+  for priv in "${PRIVILEGED_AGENT_ROLES[@]}"; do
+    if [[ ! " ${roles[*]} " =~ " ${priv} " ]]; then
+      gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
+          --member="serviceAccount:${gsa_email}" \
+          --role="${priv}" \
+          --condition=None \
+          --quiet >/dev/null 2>&1 || true
+    fi
+  done
+
+  print_info "Binding Workload Identity for ${gsa_name} to ${ksa_namespace}/${ksa_name}..."
+  gcloud iam service-accounts add-iam-policy-binding "${gsa_email}" \
+      --role="roles/iam.workloadIdentityUser" \
+      --member="serviceAccount:${PROJECT_ID}.svc.id.goog[${ksa_namespace}/${ksa_name}]" \
+      --project="${PROJECT_ID}" \
+      --quiet >/dev/null || return 1
+}
+
+verify_tier_iam() {
+  local gsa_name=$1
+  gcloud iam service-accounts describe "${gsa_name}@${PROJECT_ID}.iam.gserviceaccount.com" \
+      --project="${PROJECT_ID}" >/dev/null 2>&1
+}
+
+verify_cluster_admin_iam() { verify_tier_iam "${CLUSTER_ADMIN_GSA_NAME}"; }
+execute_cluster_admin_iam() {
+  execute_tier_iam "Cluster Admin Agent" "${NAMESPACE}" \
+      "${CLUSTER_ADMIN_KSA_NAME}" "${CLUSTER_ADMIN_GSA_NAME}" "${CLUSTER_ADMIN_ROLES[@]}"
+}
+
+verify_developer_team_iam() {
+  [ -z "${DEVELOPER_TEAM_NAMESPACE}" ] && return 0
+  verify_tier_iam "${DEVELOPER_TEAM_GSA_NAME}"
+}
+execute_developer_team_iam() {
+  if [ -z "${DEVELOPER_TEAM_NAMESPACE}" ]; then
+    print_info "DEVELOPER_TEAM_NAMESPACE unset. Skipping developer-team IAM setup."
+    return 0
+  fi
+  execute_tier_iam "Developer Team Agent" "${DEVELOPER_TEAM_NAMESPACE}" \
+      "${DEVELOPER_TEAM_KSA_NAME}" "${DEVELOPER_TEAM_GSA_NAME}" "${DEVELOPER_TEAM_ROLES[@]}"
+}
+
+verify_router_iam() {
+  [ "${GOOGLE_CHAT_ENABLED:-false}" != "true" ] && return 0
+  verify_tier_iam "${ROUTER_GSA_NAME}"
+}
+execute_router_iam() {
+  if [ "${GOOGLE_CHAT_ENABLED:-false}" != "true" ]; then
+    print_info "Google Chat disabled. Skipping kage-router IAM setup."
+    return 0
+  fi
+  execute_tier_iam "kage-router" "${NAMESPACE}" \
+      "${ROUTER_KSA_NAME}" "${ROUTER_GSA_NAME}" "${ROUTER_ROLES[@]}"
+}
+
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Enable APIs" verify_apis execute_apis 10
 run_step "2. Configure Platform Agent Workload Identity & GCP IAM" verify_platform_agent execute_platform_agent 5
 run_step "3. Configure GitHub Token Minter Workload Identity" verify_github_minter_iam execute_github_minter_iam 5
+run_step "4. Configure Cluster Admin Agent Workload Identity & GCP IAM" verify_cluster_admin_iam execute_cluster_admin_iam 5
+run_step "5. Configure Developer Team Agent Workload Identity & GCP IAM" verify_developer_team_iam execute_developer_team_iam 5
+run_step "6. Configure kage-router Workload Identity & GCP IAM" verify_router_iam execute_router_iam 5
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Controller & Agent GCP Permissions Configured Successfully!  <<<${C_RESET}"

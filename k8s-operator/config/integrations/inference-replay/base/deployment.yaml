@@ -12,10 +12,25 @@ spec:
       labels:
         app: standalone-replay
     spec:
+      # The operator namespace enforces the `restricted` Pod Security Standard (05 §pod hardening,
+      # set on the namespace in config/manager/manager.yaml), so this pod must satisfy it or it is
+      # rejected at admission — which would break inference, since the `litellm` Service fronts
+      # this proxy once the integration is deployed.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: replay-proxy-container
           image: ${REPLAY_IMAGE}
           imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - containerPort: 8080
           env:

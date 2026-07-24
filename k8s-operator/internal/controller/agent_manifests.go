@@ -265,6 +265,12 @@ func buildPVC(agent *agentv1alpha1.Agent) *corev1.PersistentVolumeClaim {
 	}
 }
 
+// systemPVCName is the per-agent name of the system-metadata claim. Kept in one place so the PVC
+// and the Deployment's volume reference can never drift apart.
+func systemPVCName(agent *agentv1alpha1.Agent) string {
+	return agent.Name + "-system-metadata"
+}
+
 func buildSystemPVC(agent *agentv1alpha1.Agent) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		TypeMeta: metav1.TypeMeta{
@@ -272,7 +278,12 @@ func buildSystemPVC(agent *agentv1alpha1.Agent) *corev1.PersistentVolumeClaim {
 			Kind:       "PersistentVolumeClaim",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "system-metadata",
+			// Per-agent, like the data PVC (agent.Name + "-data"). A namespace-shared name here
+			// would be ReadWriteOnce-multi-attached the moment a second agent lands in the same
+			// namespace — which is the designed topology for kubeagents-system, where the
+			// cluster-admin tier sits alongside the platform tier — leaving the second pod stuck
+			// in ContainerCreating forever.
+			Name:      systemPVCName(agent),
 			Namespace: agent.Namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -879,7 +890,7 @@ func buildDefaultVolumes(agent *agentv1alpha1.Agent) []corev1.Volume {
 			Name: "system-metadata",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: "system-metadata",
+					ClaimName: systemPVCName(agent),
 				},
 			},
 		},

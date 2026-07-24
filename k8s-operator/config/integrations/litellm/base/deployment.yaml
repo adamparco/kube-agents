@@ -17,10 +17,24 @@ spec:
       labels:
         app: litellm
     spec:
+      # The operator namespace enforces the `restricted` Pod Security Standard (05 §pod hardening,
+      # set on the namespace in config/manager/manager.yaml). A pod that does not satisfy it is
+      # rejected at admission, so the gateway must carry the baseline here too.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: litellm-container
           image: ghcr.io/berriai/litellm:v1.92.0
           args: ["--config", "/app/config.yaml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests:
               cpu: "100m"

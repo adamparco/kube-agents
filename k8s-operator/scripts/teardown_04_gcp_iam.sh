@@ -112,4 +112,19 @@ cleanup_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${p
 # Clean up GitHub Token Minter GSA
 cleanup_agent_iam "${GITHUB_MINTER_KSA_NAME}" "${GITHUB_MINTER_GSA_NAME}"
 
+# Clean up the child agent tiers (Phase 2 cluster-admin, Phase 3 developer-team) and the
+# kage-router — mirrors the GSAs created in provision_04_gcp_iam.sh.
+cleanup_agent_iam "${CLUSTER_ADMIN_KSA_NAME:-cluster-admin-agent}" \
+  "${CLUSTER_ADMIN_GSA_NAME:-kubeagents-cluster-admin-gsa}" \
+  "roles/container.clusterViewer" "roles/container.viewer" \
+  "roles/monitoring.viewer" "roles/logging.viewer" "roles/iam.securityReviewer"
+
+cleanup_agent_iam "${DEVELOPER_TEAM_KSA_NAME:-developer-team-agent}" \
+  "${DEVELOPER_TEAM_GSA_NAME:-kubeagents-developer-team-gsa}" \
+  "roles/container.viewer" "roles/monitoring.viewer" "roles/logging.viewer"
+
+cleanup_agent_iam "${ROUTER_KSA_NAME:-kubeagents-router}" \
+  "${ROUTER_GSA_NAME:-kubeagents-router-gsa}" \
+  "roles/pubsub.subscriber"
+
 echo -e "\n${C_GREEN}${C_BOLD}✅ Controller & Agent GCP IAM configurations fully cleaned up!${C_RESET}"
