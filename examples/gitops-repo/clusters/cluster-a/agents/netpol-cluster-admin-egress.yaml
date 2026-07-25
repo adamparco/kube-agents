@@ -1,9 +1,9 @@
 # netpol-agent-egress.yaml.template
 #
 # The per-tier DEFAULT-DENY egress NetworkPolicy for an agent pod (03 §9/§10), rendered by
-# `provision_13_apply_egress_policies.sh` and applied by it. The three committed exemplars under
+# `provision_13_apply_network_policies.sh` and applied by it. The three committed exemplars under
 # examples/gitops-repo/ are the REFERENCE RENDER of this template, byte-for-byte, and
-# local-dev/tests/egress-policy-render.py fails if they drift — edit this file, then regenerate them.
+# local-dev/tests/reference-render.py fails if they drift — edit this file, then regenerate them.
 #
 # SHAPE = PURE ALLOWLIST. `policyTypes: [Egress]` plus a podSelector makes egress default-deny for the
 # selected pods; only what is listed is reachable. There is deliberately NO 0.0.0.0/0 rule: a broad

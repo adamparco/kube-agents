@@ -599,7 +599,7 @@ render_egress_policy() {
   # exactly one. Without this the manifest ends with a stray blank line whenever
   # EGRESS_OPTIONAL_BLOCKS is empty (the common case), which put two gates in
   # direct conflict: Prettier deletes the blank line in the committed exemplars,
-  # and egress-policy-render.py requires them to be byte-identical to this render.
+  # and reference-render.py requires them to be byte-identical to this render.
   # Fixing it here rather than exempting either gate keeps both true at once.
   local rendered
   rendered="$(
@@ -612,6 +612,85 @@ render_egress_policy() {
       <"${template}"
   )"
   printf '%s\n' "${rendered}"
+}
+
+# ------------------------------------------------------------------------------
+# Tenant isolation: the ResourceQuota and the namespace default-deny
+# ------------------------------------------------------------------------------
+# Both manifests existed in examples/gitops-repo/ from Phase 3 and NO INSTALL PATH APPLIED EITHER —
+# the same defect class as the egress policies (LSN-006/LSN-007). They are rendered here rather than
+# read out of the reference tree for two reasons: the namespace is a variable, and P8-T2 found that
+# two copies of a security manifest drift in the direction where the copy a human reads stays right
+# and the copy that lands on the cluster goes wrong. One source, one render, exemplar derived.
+
+# The per-tenant blast-radius knobs. Defaults match the Phase 3 reference bundle; a real tenant
+# should be sized deliberately. Object counts beyond `pods` are fixed in the template — they are
+# namespace hygiene, not blast-radius controls.
+render_tenant_quota() { # render_tenant_quota <namespace>
+  local namespace="$1"
+  local template="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/tenant-quota.yaml.template"
+
+  if [ ! -f "${template}" ]; then
+    print_error "Tenant quota template not found: ${template}"
+    exit 1
+  fi
+
+  local rendered
+  rendered="$(
+    TENANT_NAMESPACE="${namespace}" \
+      TENANT_QUOTA_NAME="${TENANT_QUOTA_NAME:-${namespace}-quota}" \
+      TENANT_QUOTA_REQUESTS_CPU="${TENANT_QUOTA_REQUESTS_CPU:-8}" \
+      TENANT_QUOTA_REQUESTS_MEMORY="${TENANT_QUOTA_REQUESTS_MEMORY:-16Gi}" \
+      TENANT_QUOTA_LIMITS_CPU="${TENANT_QUOTA_LIMITS_CPU:-16}" \
+      TENANT_QUOTA_LIMITS_MEMORY="${TENANT_QUOTA_LIMITS_MEMORY:-32Gi}" \
+      TENANT_QUOTA_PODS="${TENANT_QUOTA_PODS:-50}" \
+      envsubst '${TENANT_NAMESPACE} ${TENANT_QUOTA_NAME} ${TENANT_QUOTA_REQUESTS_CPU} ${TENANT_QUOTA_REQUESTS_MEMORY} ${TENANT_QUOTA_LIMITS_CPU} ${TENANT_QUOTA_LIMITS_MEMORY} ${TENANT_QUOTA_PODS}' \
+      <"${template}"
+  )"
+  printf '%s\n' "${rendered}"
+}
+
+render_tenant_default_deny() { # render_tenant_default_deny <namespace>
+  local namespace="$1"
+  local template="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/netpol-tenant-default-deny.yaml.template"
+
+  if [ ! -f "${template}" ]; then
+    print_error "Tenant default-deny template not found: ${template}"
+    exit 1
+  fi
+
+  local rendered
+  rendered="$(
+    TENANT_NAMESPACE="${namespace}" \
+      TENANT_DENY_NAME="${TENANT_DENY_NAME:-default-deny-all}" \
+      envsubst '${TENANT_NAMESPACE} ${TENANT_DENY_NAME}' \
+      <"${template}"
+  )"
+  printf '%s\n' "${rendered}"
+}
+
+# Applies the quota to a tenant namespace. Called from provision_12 BEFORE the agent pod is created,
+# so a pod that does not fit is rejected on the step that creates it rather than on a later rollout —
+# see the template header for why that ordering is the whole point.
+apply_tenant_quota() { # apply_tenant_quota <namespace>
+  local namespace="$1" rendered
+
+  if [ "${TENANT_QUOTA_ENABLED:-true}" != "true" ]; then
+    print_warning "TENANT_QUOTA_ENABLED=${TENANT_QUOTA_ENABLED} — skipping. '${namespace}' will have NO compute bound."
+    return 0
+  fi
+
+  rendered="$(render_tenant_quota "${namespace}")" || return 1
+
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    print_info "[dry-run] would apply ResourceQuota in ${namespace}"
+    printf '%s\n' "${rendered}" | kubectl apply --dry-run=server -f - >/dev/null || return 1
+    print_success "ResourceQuota validates against the API server"
+    return 0
+  fi
+
+  printf '%s\n' "${rendered}" | kubectl apply -f - || return 1
+  print_success "ResourceQuota applied in ${namespace} — every pod here must now declare requests+limits."
 }
 
 confirm_action() {

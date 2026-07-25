@@ -146,6 +146,7 @@ execute_developer_team() {
   # The Namespace is in the template, but the Secret must exist before the pod starts.
   kubectl create namespace "${DEVELOPER_TEAM_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   ensure_api_secret "${DEVELOPER_TEAM_KSA_NAME}-secrets" "${DEVELOPER_TEAM_NAMESPACE}" || return 1
+  apply_tenant_quota "${DEVELOPER_TEAM_NAMESPACE}" || return 1
 
   print_info "Rendering and applying developer-team tier (image ${DEVELOPER_TEAM_IMAGE}:${DEVELOPER_TEAM_TAG})..."
   envsubst "${TIER_VARS}" < "${SCRIPT_DIR}/developer-team-agent.yaml.template" \

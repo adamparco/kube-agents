@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🛡️  Step 13: Apply the per-tier default-deny egress NetworkPolicies
+# 🛡️  Step 13: Apply the agent network policies — per-tier egress allowlist, then the tenant floor
 # ==============================================================================
-# Three correct per-tier egress policies have existed since Phase 5 and NO INSTALL PATH APPLIED ANY
-# OF THEM. A policy that is written, reviewed, structurally validated and never applied contains
-# nothing — this is LSN-006 ("well-formed is not enforced") in its purest form, and it is why 09
-# separates "the manifest is correct" from "the dataplane refuses the packet".
+# Three correct per-tier egress policies have existed since Phase 5, and a tenant default-deny since
+# Phase 3, and NO INSTALL PATH APPLIED ANY OF THEM. A policy that is written, reviewed, structurally
+# validated and never applied contains nothing — this is LSN-006 ("well-formed is not enforced") in
+# its purest form, and it is why 09 separates "the manifest is correct" from "the dataplane refuses
+# the packet".
 #
-# This step renders netpol-agent-egress.yaml.template per tier and applies it. It runs last, after
-# every agent tier exists, because applying a default-deny egress policy to a namespace whose
-# supporting Services are not up yet turns a slow rollout into a confusing one.
+# This step renders netpol-agent-egress.yaml.template per tier and applies it, then renders
+# netpol-tenant-default-deny.yaml.template and applies the tenant namespace's zero-trust floor. It
+# runs last, after every agent tier exists, because applying a default-deny policy to a namespace
+# whose supporting Services are not up yet turns a slow rollout into a confusing one.
+#
+# ORDER WITHIN THIS STEP: allowlist first, floor second. NetworkPolicies are additive so the end
+# state is identical either way, but floor-first opens a window in which a Ready agent pod is fully
+# cut off from DNS and inference, and it is cut off for exactly as long as the next kubectl call
+# takes. Allowlist-first has no such window. See the template header.
 #
 # ENFORCEMENT IS A PROPERTY OF THE CNI, NOT OF THIS SCRIPT. kindnet accepts a NetworkPolicy and
 # enforces nothing; GKE enforces only with Dataplane V2 or Calico. This step therefore reports
@@ -126,7 +133,31 @@ if [ -n "${DEVELOPER_TEAM_NAMESPACE}" ]; then
   apply_tier_policy "developer-team-egress" "${DEVELOPER_TEAM_NAMESPACE}" "developer-team"
 fi
 
-print_step "Egress policies applied"
+# ------------------------------------------------------------------------------
+# The tenant floor — applied last, deliberately (see the header)
+# ------------------------------------------------------------------------------
+# The per-tier policy above governs egress for pods carrying `kube-agents/tier`. It says nothing
+# about ingress, and nothing at all about the tenant's own workloads. This floor covers both: every
+# pod in the namespace, both directions, deny by default.
+print_step "Applying the tenant namespace default-deny floor"
+
+if [ -z "${DEVELOPER_TEAM_NAMESPACE}" ]; then
+  print_info "DEVELOPER_TEAM_NAMESPACE is empty — no tenant namespace to isolate."
+elif ! kubectl get namespace "${DEVELOPER_TEAM_NAMESPACE}" >/dev/null 2>&1; then
+  print_info "Namespace '${DEVELOPER_TEAM_NAMESPACE}' does not exist — skipping the default-deny floor."
+else
+  DENY="$(render_tenant_default_deny "${DEVELOPER_TEAM_NAMESPACE}")"
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    print_info "[dry-run] would apply the default-deny floor in ${DEVELOPER_TEAM_NAMESPACE}"
+    printf '%s\n' "${DENY}" | kubectl apply --dry-run=server -f - >/dev/null
+    print_success "Tenant default-deny validates against the API server"
+  else
+    printf '%s\n' "${DENY}" | kubectl apply -f -
+    print_success "Tenant default-deny applied in ${DEVELOPER_TEAM_NAMESPACE} (ingress + egress)."
+  fi
+fi
+
+print_step "Network policies applied"
 if [ "${WORKLOAD_IDENTITY_ENABLED}" = "true" ]; then
   print_info "Workload Identity metadata allow: RENDERED (dataplane=${GKE_DATAPLANE}, ports only)."
 else
