@@ -168,6 +168,51 @@ This is what a reviewer reads to understand choices the specs didn't dictate.
 
 ---
 
+## Outer loop: first full install on a live cloud (2026-07-24)
+
+Phases 0–7 were verified on Kind plus targeted scratch-GKE checks. This is the record of the
+first **end-to-end install onto a real GKE cluster** (`adamparco-kage` / `platform-agent-host`,
+us-east4) with **every first-party image built from source**. Three defects only reproduce on a
+clean cluster — each had been masked by an environment that predated the constraint it violates.
+
+### Defects found and fixed
+
+| #   | Defect                                                                                                                                                                                                                                                                        | Why it was invisible until now                                                                                                                                                                                                                        | Fix                                                                                                    |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| 1   | **`system-metadata` PVC was namespace-scoped, not per-agent.** The data PVC was already `agent.Name + "-data"`, but the system claim was a fixed name with `ReadWriteOnce`, so the **second** agent in a namespace deadlocked in `ContainerCreating` on a multi-attach error. | Every prior test ran **one** agent per namespace. The designed topology puts the cluster-admin tier alongside the platform tier in `kubeagents-system`, so no two-tier install could ever have come up.                                               | `systemPVCName(agent)` → `<agent>-system-metadata`; goldens + unit tests updated.                      |
+| 2   | **Bundled LiteLLM and inference-replay pods violate the namespace's own Pod Security Standard.** Phase 5 labelled `kubeagents-system` `enforce: restricted` but never gave those two a `securityContext`, so both are rejected at admission.                                  | PSA does not evict running pods. The existing install's namespace predated the label, grandfathering both. Recreating the namespace breaks **inference outright**, because the `litellm` Service fronts the replay proxy once that integration is on. | Added `runAsNonRoot`/`seccompProfile`/`allowPrivilegeEscalation: false`/`drop: ALL` to both manifests. |
+| 3   | **`provision_03` ignored `OPERATOR_IMAGE`.** It called `make deploy` with no `IMG`, silently shipping the published `ghcr.io/gke-labs` controller even when the operator had been built from local source into the project's registry.                                        | Nothing failed — the wrong image simply ran, which is precisely the stale-image trap recorded for Phases 3 and 6, in a new place.                                                                                                                     | Step 3 now passes `IMG`/`ROUTER_IMG` through and repoints the router's kustomize image.                |
+
+### Decisions
+
+| Date       | Decision                                                                                                                                                                                                                                                                                                                                                                                                                     | Rationale                                                                                                                                                                                                                                                                                                                                                          | Spec touched |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------ |
+| 2026-07-24 | The Minty key import uses **openssl + gcloud** instead of cloning and `go run`-ing the upstream `abcxyz/github-token-minter` CLI. `gcloud kms keys versions import` wraps the key client-side; the only gap is GitHub issuing PKCS#1 where KMS wants PKCS#8, which is one openssl call. Where gcloud's own wrapping is unavailable, the RSA-OAEP/AES-KWP blob can be built with openssl and passed via `--wrapped-key-file`. | Removes a Go toolchain requirement, a network clone, and third-party code handling the App private key. It is also strictly more portable: `--target-key-file` needs the `cryptography` library inside the gcloud SDK's Python, which is absent and uninstallable on some hosts — the openssl path has no such dependency.                                         | 06 §4        |
+| 2026-07-24 | **kage-router is parked at 0 replicas unless Google Chat is wired.** `provision_03` scales it down and annotates why; it is only scaled up when `GOOGLE_CHAT_ENABLED=true` and `CHAT_SUB_NAME` is set.                                                                                                                                                                                                                       | `config/router` ships `replicas: 1` with `REPLACE_WITH_*` env, so on a Slack-only install the router crash-loops immediately on `InvalidArgument`. A permanently failing pod in the control-plane namespace trains operators to ignore red status. Parking is honest: the component has no work to do.                                                             | 06 §2b       |
+| 2026-07-24 | **Minty requires the GitOps repo and the GitHub App to live in a GitHub Organization.** Documented as a hard prerequisite rather than worked around.                                                                                                                                                                                                                                                                         | `pkg/server/source/github.go` calls `InstallationForOrg` unconditionally, and `GET /orgs/{name}/installation` 404s for personal accounts — so a user-owned repo can never mint a token, and installing the App does not help. The alternative (forking Minty to call `InstallationForRepo`) means maintaining a forked broker for a constraint a free org removes. | 06 §3        |
+| 2026-07-24 | Child agent tiers are provisioned by a new **step 12** (`provision_12_deploy_agent_tiers.sh`) from committed templates, pinning `spec.deployment.image` from `AGENT_IMAGE`'s registry.                                                                                                                                                                                                                                       | The cluster-admin and developer-team tiers previously had no provisioning path at all — they existed only as GitOps exemplars, so bringing up the full hierarchy was manual. Pinning the image matters because `defaultImageForTier` silently resolves a `ghcr.io` default when the CR omits it, which would mix published and source-built images in one install. | 06 §1.1, §2  |
+
+### Verified live
+
+Platform, cluster-admin, and developer-team agents all `Ready` and running **source-built images
+only** (zero `ghcr.io/gke-labs` containers; running digests match the Artifact Registry digests).
+Inference reaches Gemini end-to-end through the replay proxy. The Phase 5 admission policies were
+exercised negatively on the live cluster: a write-verb tier role and an unhardened agent pod were
+both **rejected** (the pod test made PSA-compliant first, so the VAP was provably the rejector).
+Namespace isolation and the read-only ceiling were re-confirmed by SAR against the live SAs.
+Minty brokers a real token: the platform agent opened
+[gke-agentic/adamparco-infra#1](https://github.com/gke-agentic/adamparco-infra/pull/1) using a
+short-lived installation token, holding no long-lived GitHub credential.
+
+### Still manual (cannot be automated)
+
+Creating the GitHub App and installing it on the repository require a browser session — GitHub
+exposes no API for either, and the App's private key is shown exactly once at generation. The
+org requirement above is a hard prerequisite, not a script's job. Everything downstream of
+"App exists, key downloaded" is automated by `provision_10`.
+
+---
+
 ## Blockers
 
 Open items that halt autonomous progress. Clear a row when resolved (move detail to the PR).

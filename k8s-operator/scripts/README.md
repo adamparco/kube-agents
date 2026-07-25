@@ -6,6 +6,17 @@ This directory contains the automation scripts for provisioning and tearing down
 
 All scripts are modular and idempotent. They share a single configuration state stored in a local [vars.sh](vars.sh) file (which is git-ignored).
 
+Start from the annotated template — it documents every variable, including the ones that are
+easy to get wrong (image registry and region, the Minty organization requirement, Slack
+allowlists):
+
+```bash
+cp vars.sh.example vars.sh && $EDITOR vars.sh
+```
+
+A fully populated `vars.sh` makes the whole pipeline non-interactive; anything left unset is
+prompted for on first run.
+
 When any script is run:
 
 1. It checks if [vars.sh](vars.sh) exists.
@@ -36,13 +47,16 @@ When any script is run:
 3. **[provision_03_gcp_gke_operator.sh](provision_03_gcp_gke_operator.sh)**
    - Installs `cert-manager` (`v1.14.4`) if not present (including leader-election compatibility patching for GKE Autopilot clusters).
    - Installs Custom Resource Definitions (CRDs) for `Agent`.
-   - Deploys the Operator controller manager into the GKE cluster.
+   - Deploys the Operator controller manager into the GKE cluster, honouring `OPERATOR_IMAGE` and `ROUTER_IMAGE` from [vars.sh](vars.sh). Leave them unset to run the published `ghcr.io/gke-labs` images; set them to run images built from this source tree.
+   - Applies the agent admission policies (`kube-agents-agent-readonly`, `kube-agents-agent-pod-hardening`). These are cluster-scoped and applied **before** any `Agent` CR, so a write-capable tier role or an unhardened agent pod is rejected at admission rather than grandfathered in.
+   - Configures **kage-router**: parked at 0 replicas unless `GOOGLE_CHAT_ENABLED=true` and `CHAT_SUB_NAME` is set, since the router only drains an inbound Chat subscription and would otherwise crash-loop on its placeholder configuration.
 4. **[provision_04_gcp_iam.sh](provision_04_gcp_iam.sh)**
    - Enables GCP Service APIs (`container.googleapis.com` and `cloudresourcemanager.googleapis.com`).
    - Pre-provisions GCP Service Accounts (GSAs) for the Platform Agent and conditionally for the GitHub Token Minter.
    - Configures Workload Identity policy bindings mapping the Kubernetes SAs to the GCP GSAs.
    - Grants read-only GKE and monitoring permissions to the Platform Agent GSA based on the selected permission set (`read-only` (default) or `custom`). The agent is read-only at the cloud boundary — the retired `gke-admin` preset is coerced to `read-only`, and any stale admin bindings are actively removed.
    - Configures Workload Identity policy bindings and annotations for the GitHub Token Minter GSA/KSA if GitHub integration is configured.
+   - Creates the viewer-only GSAs and Workload Identity bindings for the **cluster-admin** and **developer-team** tiers, and for the **kage-router** (`roles/pubsub.subscriber` only, and only when `GOOGLE_CHAT_ENABLED=true`). Child tiers are read-only at the cloud boundary just like the platform tier.
 5. **[provision_05_gcp_gchat.sh](provision_05_gcp_gchat.sh)**
    - Enables GCP Service APIs (`pubsub.googleapis.com` and `chat.googleapis.com`).
    - Sets up the Pub/Sub Topic and Subscription for Google Chat events (skipped if `GOOGLE_CHAT_ENABLED=false`).
@@ -66,12 +80,19 @@ When any script is run:
 10. **[provision_10_deploy_github_minter.sh](provision_10_deploy_github_minter.sh)**
     - Enables Cloud KMS API (`cloudkms.googleapis.com`).
     - Sets up Google Cloud KMS keyrings and keys for token signing and grants signer/verifier roles to the Minter GSA.
-    - Imports GitHub App private keys (`GITHUB_PEM_PATH`) into Cloud KMS when configured.
-    - Deploys the GitHub Token Minter into the cluster.
+    - Preflights the GitHub side: warns when the target repository has no commits, since agents deliver changes as pull requests and a repo with no default branch cannot accept one.
+    - Imports the GitHub App private key (`GITHUB_PEM_PATH`) into Cloud KMS using `openssl` + `gcloud` (creates the KMS import job and waits for it to become `ACTIVE`). Deploys the highest **ENABLED** key version, so disable superseded versions after rotating.
+    - Deploys the GitHub Token Minter and waits for it to become `Available`, reporting a missing KMS key version as the likely cause on failure.
+    - **Requires `GITHUB_ORG` to be a real GitHub Organization** — Minty resolves installations via `GET /orgs/{org}/installation`, which 404s for personal user accounts. See [the integration README](../config/integrations/github/README.md).
 11. **[provision_11_deploy_inference_replay.sh](provision_11_deploy_inference_replay.sh)**
     - Opt-in via `INFERENCE_REPLAY_ENABLED=true`; otherwise skipped.
     - Prompts for `REPLAY_IMAGE` (the proxy container image).
     - Deploys the Inference Replay proxy: PVC + ConfigMap (mode=off pass-through), Deployment, a `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service routing traffic through the proxy. Toggle caching on at runtime via `kubectl patch configmap inference-replay-config -n <ns> --type merge -p '{"data":{"mode":"on"}}'`.
+
+12. **[provision_12_deploy_agent_tiers.sh](provision_12_deploy_agent_tiers.sh)**
+    - Deploys the **cluster-admin** and **developer-team** tiers below the platform agent: read-only identity, per-agent API-server Secret, and the `Agent` CR for each, applied identity-before-pod.
+    - Skips with `CLUSTER_ADMIN_ENABLED=false`, or `DEVELOPER_TEAM_NAMESPACE=''` for just the tenant tier. The developer-team tier requires the cluster-admin tier, whose `parentRef` must resolve or the webhook rejects the CR.
+    - Derives the child images from `AGENT_IMAGE`'s registry so a source-built install stays consistent. Without an explicit image the controller falls back to the per-tier `ghcr.io/gke-labs` default baked into the binary.
 
 ### Auxiliary & Development Scripts
 
@@ -131,3 +152,112 @@ For example, if you want to update IAM configurations:
 ```bash
 ./provision_04_gcp_iam.sh
 ```
+
+---
+
+## Troubleshooting
+
+Failure modes hit during real installs, and what they actually mean. Most present as something
+unrelated to the true cause.
+
+### Images
+
+**Agent pods `CrashLoopBackOff` with `exec format error`.** The agent images are `amd64`. A local
+`docker build` on Apple silicon produces `arm64` images the GKE nodes cannot execute. Build with
+Cloud Build (`make cloud-build-push` from the repo root), which builds natively as `amd64` and
+pushes straight to Artifact Registry.
+
+**Images push to a registry the cluster never pulls from.** The root `Makefile` defaults to
+`LOCATION ?= us-central1`. If your cluster and Artifact Registry live elsewhere you must pass it
+explicitly, or the push silently succeeds into the wrong region:
+
+```bash
+make docker-push LOCATION=us-east4
+```
+
+**The deploy runs published images even though you built from source.** `make deploy` falls back
+to the Makefile's `IMG`/`ROUTER_IMG` defaults (`ghcr.io/gke-labs/...`). Set `OPERATOR_IMAGE` and
+`ROUTER_IMAGE` in `vars.sh` — `provision_03` passes them through. For the child tiers, the
+controller resolves a per-tier `ghcr.io` default unless the `Agent` CR pins
+`spec.deployment.image`; `provision_12` sets it from `AGENT_IMAGE`'s registry.
+
+**A rebuilt image doesn't take effect.** Same-tag images are not re-pulled when
+`imagePullPolicy: IfNotPresent` and the tag already exists on the node. Use an immutable tag (a
+git SHA) rather than `:latest`, so what is running is provable and every change forces a pull.
+
+### Pods that never start
+
+**`FailedCreate: ... violates PodSecurity "restricted"`.** The operator namespace is labelled
+`pod-security.kubernetes.io/enforce: restricted`, so every pod in it needs `runAsNonRoot`,
+`seccompProfile: RuntimeDefault`, `allowPrivilegeEscalation: false` and `capabilities.drop:
+["ALL"]`. Note this only bites on a **freshly created namespace** — pods admitted before the
+label existed are grandfathered, so an in-place upgrade can look healthy while a clean install
+fails.
+
+**`FailedCreate: error looking up service account`.** The agent's KSA is created by
+`provision_04`, not by the controller (the controller only _references_ it — 08 §4). Deleting and
+recreating the namespace removes the KSA and its Workload Identity annotation; re-run
+`provision_04`.
+
+**`Multi-Attach error for volume`.** Two agents in one namespace both mounting the same
+`ReadWriteOnce` claim. Each agent gets its own `<agent-name>-system-metadata` PVC; if you see a
+shared `system-metadata` claim, the controller predates that fix — rebuild it.
+
+**`Pending` with no node.** With `ENABLE_GVISOR=true` the agent pod requests
+`runtimeClassName: gvisor` and only schedules onto the gVisor node pool. Confirm the pool exists
+(`provision_02`).
+
+### kage-router
+
+**Router `CrashLoopBackOff` with `InvalidArgument ... REPLACE_WITH_PROJECT_ID`.** The router is
+the **Google Chat** front door and ships with placeholder env. With `GOOGLE_CHAT_ENABLED=false`,
+`provision_03` parks it at 0 replicas; this error means that step was skipped or `make deploy`
+re-applied the base manifest afterwards. Re-run `provision_03`.
+
+**Router `PermissionDenied` on the Pub/Sub subscription.** Its KSA needs a Workload Identity
+annotation pointing at a GSA holding `roles/pubsub.subscriber` (`provision_04` step 6, which only
+runs when `GOOGLE_CHAT_ENABLED=true`).
+
+### Minty / GitHub
+
+**The agent reports it cannot resolve `github-token-minter...svc.cluster.local`.** Usually Minty
+is not deployed, or its pods are unready so the Service has no endpoints — an unready Service
+looks like a DNS failure from the client side. Check `kubectl get deploy github-token-minter -n
+kubeagents-system` before assuming a networking problem.
+
+**Minty pods never become Ready.** It signs with KMS on every request; a key with no `ENABLED`
+version fails the probe. Confirm with `gcloud kms keys versions list`.
+
+**`failed to get access token url for org <name>: ... 404`.** `GITHUB_ORG` is a personal user
+account. Minty calls `GET /orgs/{org}/installation`, which does not exist for users. Installing
+the App does not help — the repository must live in an Organization, and the App must be owned by
+that org. See [the integration README](../config/integrations/github/README.md).
+
+**Tokens mint but GitHub rejects them.** The KMS key version is not the App's key. Compare public
+moduli (see the integration README) — a mismatch produces JWTs GitHub silently refuses.
+
+**The agent cannot open a pull request against an empty repository.** A repo with no commits has
+no default branch. Seed it with a README first; `provision_10` warns when it finds none.
+
+### Slack
+
+**The agent connects but never responds.** Almost always the bot is not in any channel — invite
+it with `/invite @your-agent`. Verify the tokens independently:
+
+```bash
+curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" https://slack.com/api/auth.test
+curl -s -X POST -H "Authorization: Bearer $SLACK_APP_TOKEN" https://slack.com/api/apps.connections.open
+```
+
+`users.conversations` returning zero channels confirms it. Also note that an empty
+`SLACK_ALLOWED_USERS` lets **every** workspace user drive the agent — set a closed allowlist.
+
+### Scripts
+
+**A step blocks waiting for input.** `init_var` prompts for anything unset, including optional
+values such as `GITHUB_ORG`. Pre-populate `vars.sh` (start from `vars.sh.example`) for a
+non-interactive run.
+
+**A step reports "Already completed" but you changed something.** Steps are idempotent and skip
+when their verify function passes. Change the underlying value in `vars.sh`, or delete the
+resource, then re-run.

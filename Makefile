@@ -5,7 +5,7 @@ REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core
 
 BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
-.PHONY: default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write validate
+.PHONY: cloud-build-push default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write validate
 
 AGENTS := $(notdir $(patsubst %/,%,$(wildcard agents/*/)))
 
@@ -36,6 +36,24 @@ docker-push-credential-proxy: docker-build-credential-proxy
 
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@$(MAKE) -C k8s-operator dev-rebuild-agent ARGS="$(ARGS)"
+
+# Cloud Build produces amd64 images regardless of the host architecture, so this is the path to
+# use from an arm64 machine (Apple silicon) — a local `docker build` there yields images the GKE
+# nodes cannot run. It also pushes straight into the project's Artifact Registry.
+.PHONY: cloud-build-push
+cloud-build-push: ## Build+push all agent images via Cloud Build (LOCATION and TAG overridable).
+	@set -e; \
+	. ./tags.env; \
+	TAG=$${TAG:-src-$$(git rev-parse --short HEAD)}; \
+	REPO=$(LOCATION)-docker.pkg.dev/$$(gcloud config get core/project 2>/dev/null)/kube-agents; \
+	echo "Building into $$REPO with tag $$TAG"; \
+	for target in $(AGENTS) credential-proxy; do \
+	  case $$target in credential-proxy) name=credential-proxy ;; *) name=$$target-agent ;; esac; \
+	  echo ">>> $$name"; \
+	  gcloud builds submit --config deploy/docker/cloudbuild.yaml \
+	    --substitutions=_IMAGE_URI=$$REPO/$$name:$$TAG,_IMAGE_URI_LATEST=$$REPO/$$name:latest,_TARGET=$$target,_HERMES_AGENT_TAG=$$HERMES_AGENT_TAG; \
+	done; \
+	echo "Done. Set AGENT_IMAGE=$$REPO/platform-agent and AGENT_TAG=$$TAG in k8s-operator/scripts/vars.sh"
 
 
 status:
