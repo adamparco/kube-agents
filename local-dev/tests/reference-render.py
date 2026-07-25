@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""Egress-policy render golden (kube-agents Phase 8, P8-T2).
+"""Reference-tree render golden (kube-agents Phase 8, P8-T2, extended P8-T3).
 
-The three per-tier egress NetworkPolicies exist twice: once as the template the
-installer renders (`k8s-operator/scripts/netpol-agent-egress.yaml.template`) and
-once as committed exemplars in the reference GitOps tree. Two copies of a
-security policy drift, and the direction they drift in is not symmetric — the
-exemplar is what a human reads and copies, the template is what actually lands
-on the cluster. Phase 5 shipped both; by Phase 8 the exemplars allowed
+Every security manifest in this repo exists twice: once as the template the
+installer renders (`k8s-operator/scripts/*.template`) and once as a committed
+exemplar in the reference GitOps tree. Two copies of a security manifest drift,
+and the direction they drift in is not symmetric — the exemplar is what a human
+reads and copies, the template is what actually lands on the cluster. Phase 5
+shipped both copies of the egress policies; by Phase 8 the exemplars allowed
 `REPLACE_WITH_HUB_INFERENCE_CIDR` (un-appliable) and the platform/cluster-admin
 copies had **no rule at all** for the in-cluster LiteLLM/minter hop, which
 default-deny egress also governs. Nothing noticed, because nothing compared them.
 
-This check makes the exemplars a *derived artifact*: they must be byte-identical
-to `render_egress_policy` from `k8s-operator/scripts/common.sh`, called with each
-tier's name/namespace/tier and no optional blocks. There is no tolerance and no
+This check makes the exemplars a *derived artifact*: each must be byte-identical
+to the corresponding `render_*` helper in `k8s-operator/scripts/common.sh`,
+called the way the install path calls it. There is no tolerance and no
 normalisation — a whitespace-only difference is still a diff, because the thing
 being protected is "these were regenerated", not "these look similar".
+
+Covered (P8-T2): the three per-tier egress NetworkPolicies.
+Covered (P8-T3): the tenant ResourceQuota and the tenant default-deny floor —
+added when those two were wired into the install path, because the moment an
+installer renders a manifest, the committed copy stops being the source of truth
+and becomes a thing that can silently disagree with what ships.
 
 Checks (all must pass for exit 0):
 
@@ -39,9 +45,14 @@ Negative control (`--self-test`): each check is re-run against a fixture that
 reintroduces the defect it guards, and must fail. A check that cannot fail is not
 evidence (09 §6, V-MET-014).
 
+  6. **The tenant quota and default-deny exemplars equal their renders**, and the
+     quota actually bounds something — a ResourceQuota with no `requests.*` /
+     `limits.*` entries caps nothing and, worse, stops forcing pods to declare
+     them, which is the property provision_12 orders itself around.
+
 Usage:
-    python3 local-dev/tests/egress-policy-render.py [REPO_ROOT]
-    python3 local-dev/tests/egress-policy-render.py --self-test
+    python3 local-dev/tests/reference-render.py [REPO_ROOT]
+    python3 local-dev/tests/reference-render.py --self-test
 
 Exit 0 = the exemplars are the render and the render is sound; 1 = violations
 (prints a unified diff for a drifted exemplar). Stdlib only, no cluster.
@@ -74,6 +85,19 @@ TIERS = {
     ),
 }
 
+# The tenant-isolation pair, added in P8-T3 when they were wired into the install
+# path. Keyed by the common.sh helper that renders each one; the namespace is the
+# helper's only argument, and it is the reference bundle's tenant.
+TENANT_NAMESPACE = "team-x"
+TENANT = {
+    "render_tenant_quota": (
+        "examples/gitops-repo/clusters/cluster-a/namespaces/team-x/10-resourcequota.yaml"
+    ),
+    "render_tenant_default_deny": (
+        "examples/gitops-repo/clusters/cluster-a/namespaces/team-x/20-netpol-default-deny.yaml"
+    ),
+}
+
 PLACEHOLDER = re.compile(r"REPLACE_WITH_|PLACEHOLDER")
 
 # The dataplane-specific metadata pairings, from
@@ -102,6 +126,70 @@ def render(repo: Path, tier: str, env: dict[str, str] | None = None) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"render_egress_policy({tier}) failed: {proc.stderr.strip()}")
     return proc.stdout
+
+
+def render_tenant(repo: Path, helper: str) -> str:
+    """Call a tenant render helper exactly as provision_12/13 do."""
+    scripts = repo / "k8s-operator" / "scripts"
+    script = (
+        f'SCRIPT_DIR="{scripts}"; source "{scripts}/common.sh" --dry-run >/dev/null 2>&1; '
+        f'{helper} "{TENANT_NAMESPACE}"'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=str(scripts),
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"},
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"{helper}({TENANT_NAMESPACE}) failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def check_tenant_exemplars(repo: Path, rendered: dict[str, str]) -> list[str]:
+    bad = []
+    for helper, rel in TENANT.items():
+        path = repo / rel
+        if not path.is_file():
+            bad.append(f"{rel}: exemplar missing — the reference tree lost a tenant manifest")
+            continue
+        actual = path.read_text()
+        if actual != rendered[helper]:
+            diff = "\n".join(
+                list(
+                    difflib.unified_diff(
+                        rendered[helper].splitlines(),
+                        actual.splitlines(),
+                        fromfile=f"{helper}({TENANT_NAMESPACE})",
+                        tofile=rel,
+                        lineterm="",
+                    )
+                )[:40]
+            )
+            bad.append(
+                f"{rel}: DRIFTED from the template render. Regenerate it; do not hand-edit.\n{diff}"
+            )
+    return bad
+
+
+def check_quota_bounds_compute(quota: str) -> list[str]:
+    """A quota with no compute bounds is not a blast-radius control.
+
+    This is not pedantry about completeness. `provision_12` applies the quota
+    *before* the agent pod specifically because a quota carrying `requests.*` /
+    `limits.*` forces every pod in the namespace to declare them — that coupling
+    is the reason for the ordering. Drop those four entries and the quota still
+    applies, still looks like a quota, and silently stops doing either job.
+    """
+    required = ("requests.cpu", "requests.memory", "limits.cpu", "limits.memory")
+    missing = [k for k in required if not re.search(rf"^\s*{re.escape(k)}:", quota, re.M)]
+    if missing:
+        return [
+            f"tenant quota: no {', '.join(missing)} — this quota bounds no compute, and pods in "
+            f"the namespace are no longer forced to declare requests+limits"
+        ]
+    return []
 
 
 def check_exemplars_match(repo: Path, rendered: dict[str, str]) -> list[str]:
@@ -196,12 +284,15 @@ def check_wi_pairs(wi_render: str) -> list[str]:
 def run_all(repo: Path) -> list[str]:
     rendered = {t: render(repo, t) for t in TIERS}
     wi = render(repo, "platform", {"WORKLOAD_IDENTITY_ENABLED": "true", "GKE_DATAPLANE": "auto"})
+    tenant = {h: render_tenant(repo, h) for h in TENANT}
     return (
         check_exemplars_match(repo, rendered)
         + check_no_placeholder(rendered)
         + check_no_open_egress(rendered)
         + check_metadata_absent_by_default(rendered)
         + check_wi_pairs(wi)
+        + check_tenant_exemplars(repo, tenant)
+        + check_quota_bounds_compute(tenant["render_tenant_quota"])
     )
 
 
@@ -239,6 +330,21 @@ def self_test() -> int:
                 "      ports:\n        - protocol: TCP\n          port: 988\n"
             ),
         ),
+        (
+            "drifted tenant exemplar rejected",
+            lambda: check_tenant_exemplars(Path("/nonexistent"), {h: "x" for h in TENANT}),
+        ),
+        (
+            "quota with no compute bounds rejected",
+            lambda: check_quota_bounds_compute('spec:\n  hard:\n    pods: "50"\n'),
+        ),
+        (
+            "quota missing only limits.memory rejected",
+            lambda: check_quota_bounds_compute(
+                'spec:\n  hard:\n    requests.cpu: "8"\n    requests.memory: 16Gi\n'
+                '    limits.cpu: "16"\n'
+            ),
+        ),
     ]
     failures = 0
     for name, fn in controls:
@@ -261,12 +367,13 @@ def main() -> int:
         print(f"FAIL: {exc}")
         return 1
     if violations:
-        print("Egress-policy render violations:\n")
+        print("Reference-tree render violations:\n")
         for v in violations:
             print(f"  - {v}")
         return 1
-    print("Egress policy render: OK — the three exemplars are the template render, the base")
-    print("  allowlist is placeholder-free and metadata-free, and the WI rules are correctly paired.")
+    print("Reference render: OK — all five exemplars are the template render, the base allowlist")
+    print("  is placeholder-free and metadata-free, the WI rules are correctly paired, and the")
+    print("  tenant quota bounds compute.")
     return 0
 
 

@@ -25,18 +25,18 @@
 apiVersion: v1
 kind: ResourceQuota
 metadata:
-  name: team-x-quota
-  namespace: team-x
+  name: ${TENANT_QUOTA_NAME}
+  namespace: ${TENANT_NAMESPACE}
   labels:
-    kube-agents/tenant: team-x
+    kube-agents/tenant: ${TENANT_NAMESPACE}
     app.kubernetes.io/managed-by: gitops
 spec:
   hard:
-    requests.cpu: "8"
-    requests.memory: 16Gi
-    limits.cpu: "16"
-    limits.memory: 32Gi
-    pods: "50"
+    requests.cpu: "${TENANT_QUOTA_REQUESTS_CPU}"
+    requests.memory: ${TENANT_QUOTA_REQUESTS_MEMORY}
+    limits.cpu: "${TENANT_QUOTA_LIMITS_CPU}"
+    limits.memory: ${TENANT_QUOTA_LIMITS_MEMORY}
+    pods: "${TENANT_QUOTA_PODS}"
     services: "20"
     count/configmaps: "50"
     count/secrets: "50"

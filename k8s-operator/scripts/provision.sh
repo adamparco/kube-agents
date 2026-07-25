@@ -31,6 +31,9 @@ echo -e "${C_MAGENTA}${C_BOLD}🚀 Starting GKE Platform Agent provisioning pipe
 "${SCRIPT_DIR}/provision_10_deploy_github_minter.sh" $DRY_RUN_ARG
 "${SCRIPT_DIR}/provision_11_deploy_inference_replay.sh" $DRY_RUN_ARG
 "${SCRIPT_DIR}/provision_12_deploy_agent_tiers.sh" $DRY_RUN_ARG
+# Containment lands last, once every tier it governs exists — applying a default-deny policy to a
+# namespace whose Services are not up yet turns a slow rollout into a confusing one.
+"${SCRIPT_DIR}/provision_13_apply_network_policies.sh" $DRY_RUN_ARG
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Infrastructure & Cloud Resources Provisioned Successfully!  <<<${C_RESET}"
 

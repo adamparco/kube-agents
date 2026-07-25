@@ -35,10 +35,10 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: default-deny-all
-  namespace: team-x
+  name: ${TENANT_DENY_NAME}
+  namespace: ${TENANT_NAMESPACE}
   labels:
-    kube-agents/tenant: team-x
+    kube-agents/tenant: ${TENANT_NAMESPACE}
     app.kubernetes.io/managed-by: gitops
 spec:
   podSelector: {} # every pod in the namespace
