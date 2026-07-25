@@ -1,0 +1,37 @@
+# The L2 regression chain — checks that need a real cluster, and cannot run in PR CI.
+#
+# Companion to L0-CHAIN.txt. Split because the two have genuinely different triggers, not because
+# L2 matters less: the load-bearing security negatives (egress actually denied, admission actually
+# rejecting, isolation actually isolating) all live here. L0 proves a manifest is well-formed; L2 is
+# the only thing that proves it is enforced. That distinction is LSN-006, and it is why a lesson may
+# legitimately be closed by a script in this file even though no pull request runs it.
+#
+# Each line takes a --context argument. Every one of these is a DESTRUCTIVE test target: they apply
+# deliberately-bad RBAC, delete pods, and exercise denial paths. The guard in each script is an
+# anchored `case` on kind-* / gke-scratch-* and invariants-gate.py asserts it stays anchored —
+# a substring match is LSN-005, and the live GKE cluster is one `*` away.
+#
+# Every line takes the context as its one argument, and NOT every line takes the same one. There
+# are two Kind targets on purpose: `kind-kube-agents-dev` runs kindnet, `kind-kube-agents-egress`
+# runs Calico, and precondition P4 says an egress claim is `deferred` and never `pass` on kindnet.
+# So the egress and gitops/tenant lines want the Calico cluster; the rest are happy on either.
+#
+# Run (Calico target):  while read -r c; do eval "$c kind-kube-agents-egress"; done < local-dev/L2-CHAIN.txt
+#
+# Precondition P1 applies to every line: rebuild -> `kind load` -> `rollout restart` -> assert the
+# running imageID digest equals the build under test. A green here against a stale image is
+# LSN-001, and no line of this file can detect that on its own.
+
+# --- the standing regression suite ----------------------------------------------------------
+# verify-phase7.sh is the whole prior build in one command: it runs verify-phase{2,3,4,5,6}.sh,
+# chaos C1-C4, 03 §11 negative attenuation, the goldens and `go test ./...`. It is listed FIRST
+# because a phase's new L2 evidence is worth nothing if it was gathered on a cluster where the
+# previous phases had already broken.
+bash local-dev/kind/verify-phase7.sh
+
+# --- Phase 8 L2 checks ------------------------------------------------------------------------
+bash local-dev/kind/egress-enforcement-l2.sh
+bash local-dev/kind/tenant-isolation-l2.sh
+bash local-dev/kind/closed-allowlist-l2.sh
+bash local-dev/kind/gitops-tree-applies-l2.sh
+bash local-dev/kind/multi-agent-namespace-l2.sh

@@ -12,6 +12,15 @@ Detailed in `docs/design/03-security-model.md`.
 
 Answer each as PASS / FAIL / N-A with one line of evidence (a file, a test name, a command output).
 
+> **Six of these now fail a build instead of asking you.** `local-dev/tests/invariants-gate.py`
+> (P8-T6) runs in the L0 chain on every PR and mechanizes **7**, **8**, **12** and **13**, plus the
+> destructive-test guard below and the build targets' `--context` discipline. The rest are
+> judgements about intent that a script cannot make and stay answered per PR — mechanizing four of
+> thirteen is not "the gate is done", it is four fewer places where being tired is the same as
+> being dishonest. Each mechanized item is marked **[gated]** below with the function that enforces
+> it. Before recording any lint result as evidence, run `local-dev/toolchain-preflight.sh`
+> (LSN-020): a green from a tool is evidence only for the rules that tool actually ran.
+
 1. **Agents act.** The change does not make an agent file a proposal, open a ticket, or ask a human
    to run a command for work that is in scope, reversible, and below the gate threshold.
    - Check: no new "propose"/"suggest"/"open a PR" terminus on a remediation path; the path ends in
@@ -47,16 +56,25 @@ Answer each as PASS / FAIL / N-A with one line of evidence (a file, a test name,
 
 ## Conversion-specific ordering checks (07 §5)
 
-7. **Authority never precedes machinery.** No change grants an agent identity a write verb before the
-   Action Broker, the risk classifier, the journal, and the undo path exist and are tested.
+7. **Authority never precedes machinery.** [gated: `check_write_verbs_have_machinery`] No change
+   grants an agent identity a write verb before the Action Broker, the risk classifier, the journal,
+   and the undo path exist and are tested.
    - Check: if the diff adds a write verb to any agent RBAC or cloud IAM binding, the broker,
      classifier, `ActionRecord`, and undo path must already be present and covered by tests. An agent
      with write RBAC and no journal is worse than either the old system or the new one.
+   - Mechanized against an **allow**-list (`get`/`list`/`watch`), not a deny-list of write verbs:
+     LSN-004 is that `escalate`, `bind` and `impersonate` are not writes and are worse than most
+     writes. An identity is an agent identity iff it carries `kube-agents/tier` — the same predicate
+     the cluster's `is-agent-rbac` VAP uses, so gate and runtime agree by construction.
 
-8. **Tests are replaced, never deleted.** A check asserting read-only-ness is removed only in the
-   same commit that adds its imperative counterpart.
+8. **Tests are replaced, never deleted.** [gated: `check_assertion_ratchet`, V-MET-003] A check
+   asserting read-only-ness is removed only in the same commit that adds its imperative counterpart.
    - Check: the PR names the pair. A change that reduces the total number of security assertions is
      wrong.
+   - The ratchet counts assertions against `local-dev/assertion-baseline.json`. Lowering it needs
+     `--update-baseline` and a diff a reviewer sees, which is the point: the count may fall, but not
+     quietly. Paired with `check_retirements_name_replacements` (V-MET-004) so a retired check ID
+     keeps a pointer to what replaced it instead of evaporating.
 
 ## Harness self-discipline (`.claude/harness/PROTOCOL.md` §10, `SELF-IMPROVEMENT.md` §4)
 
@@ -78,15 +96,24 @@ Each maps to a named hack in `SELF-IMPROVEMENT.md` §4.
     - Check: every `pass` in the run manifest has a non-empty `evidence_ref`; a pass without one is
       recorded as `skipped`. No security or safety check was retried to green.
 
-12. **Every deferral names an external blocker.** Deferral is legitimate; using it to hide a failure
-    is not.
+12. **Every deferral names an external blocker.** [gated: `check_deferrals_name_blockers`,
+    V-MET-006] Deferral is legitimate; using it to hide a failure is not.
     - Check: each `deferred` result names a blocker outside the harness's control, and no
       BLOCKING-ALWAYS check is deferred.
+    - Mechanized over the ledger's Deferrals table: every row must carry a blocker, a named owner
+      and a promotion condition, and no row may cite a BLOCKING-ALWAYS suite (V-CTN, V-BRK, V-REV,
+      V-ISO, V-ADV, V-MET). A blank owner cell fails the build.
 
-13. **Every failure leaves a lesson.** A halt, a rework, or a discovered false green closes with a
-    lesson record, and a lesson closes only with a mechanization ID or an argued refusal.
+13. **Every failure leaves a lesson.** [gated: `check_closed_lessons_are_executable`, LSN-019] A
+    halt, a rework, or a discovered false green closes with a lesson record, and a lesson closes only
+    with a mechanization ID or an argued refusal.
     - Check: `LESSONS.md` has an entry for this run's failures; the open-lesson count did not grow
       silently.
+    - What the gate enforces is the harder half: a **closed** lesson must name a file that exists and
+      that something automatic actually runs — a line in `L0-CHAIN.txt` or `L2-CHAIN.txt`, or a
+      workflow with a real trigger. Closing against a check ID, a `binding.md` clause or a spec
+      section does not close a lesson, because none of those fail. This check reopened 13 of 17
+      lessons the first time it ran.
 
 ---
 
@@ -99,6 +126,13 @@ Each maps to a named hack in `SELF-IMPROVEMENT.md` §4.
 - Push PR branches to a fork, not upstream. Stage only targeted files.
 - **Rebuild → load/push → restart before trusting any live gate.** A stale same-tag image with
   `imagePullPolicy: IfNotPresent` silently under-enforces admission and reads as green.
+- **Every cluster-addressing `make` target names its cluster.**
+  [gated: `check_make_targets_are_context_explicit`, LSN-018] Recipes go through `$(KUBECTL)`, never
+  a bare `kubectl`; the context comes from `KUBE_CONTEXT=`, and `KUBECTL=` is rejected outright
+  because it was once accepted and silently ignored. With `KUBE_CONTEXT` unset, `ctx-guard` accepts
+  the ambient context only if it is anchored `kind-*` / `gke-scratch-*` and refuses otherwise with
+  the command that would name it. Deliberately deploying to a live cluster is a real operation;
+  forgetting which cluster you are on is not.
 
 ## Destructive-test guard
 
@@ -106,3 +140,10 @@ Before any test that deletes/kills resources, applies deliberately-bad RBAC, or 
 destructive **action** through the broker, confirm the target context is **Kind** or an **ephemeral
 scratch GKE** cluster. If it is anything else (esp. a prod context), **halt and surface** — do not
 run.
+
+[gated: `check_destructive_guards_are_anchored`, LSN-005] The guard is a shell `case` on the caller's
+`$CTX` whose accepting arms are **anchored** — `kind-*`, `gke-scratch-*` — and whose `*)` arm exits
+non-zero. A substring test (`*kind*`) is the LSN-005 failure and passes for a cluster merely named
+`my-kind-of-prod`; the gate rejects any arm that does not start at the left edge, and any default arm
+that does not exit. The live GKE cluster `platform-agent-host` is one `*` away from every one of
+these scripts.

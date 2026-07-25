@@ -1,0 +1,37 @@
+# The L0 regression chain — every check that runs with no cluster and no network.
+#
+# THIS FILE IS THE SINGLE DEFINITION SITE (V-MET-013). Three consumers read it and there is no
+# second list to drift from:
+#
+#   1. .github/workflows/l0-checks.yml   — runs every line on every PR. Until 2026-07-25 CI ran
+#                                          NONE of these, so every mechanization the harness built
+#                                          across phases 2-8 was enforced only when a human
+#                                          remembered to run it. That is LSN-007 ("built, tested,
+#                                          and unreachable") pointed at the verification machinery
+#                                          itself, and it is the reason this file exists.
+#   2. local-dev/tests/invariants-gate.py — asserts every LESSONS.md entry marked `closed` names an
+#                                          artifact that appears HERE. A lesson closed against a
+#                                          command nobody runs is not closed (LSN-019).
+#   3. the harness REGRESS step           — runs the chain before any CHECKPOINT.
+#
+# Format: one shell command per line, run from the repository root, expected to exit 0.
+# Blank lines and #-comments ignored. Keep one command per line: the gate matches artifacts by
+# substring, and a compound line hides what it runs.
+
+# --- unittest modules (local-dev/test_*.py) -------------------------------------------------
+# Discovered as one command; 69 tests at time of writing. Individually re-runnable with
+# `python3 -m unittest local-dev.test_<name>`.
+python3 -m unittest discover local-dev
+
+# --- standalone L0 checks (local-dev/tests/*.py) --------------------------------------------
+python3 local-dev/tests/install-path-wired.py
+python3 local-dev/tests/closed-allowlist.py
+python3 local-dev/tests/reference-render.py
+python3 local-dev/tests/circleci-parity.py
+python3 local-dev/tests/iac-parity.py
+python3 local-dev/tests/observability-seam.py
+python3 local-dev/okf-validate.py
+
+# --- the invariants gate itself (P8-T6) -----------------------------------------------------
+# Runs last: it reads this file, and several of its checks are about the chain above.
+python3 local-dev/tests/invariants-gate.py

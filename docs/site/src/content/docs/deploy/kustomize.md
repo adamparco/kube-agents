@@ -66,6 +66,7 @@ The exposed ports:
 Deploy these via `make deploy-*` from `k8s-operator/`:
 
 ```bash
+export KUBE_CONTEXT=kind-kube-agents-dev   # required unless your current context is kind-*/gke-scratch-*
 make deploy                     # operator
 make deploy-litellm             # inference gateway
 make deploy-github              # Minty

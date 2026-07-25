@@ -18,11 +18,22 @@ jobs:
 
       - name: Install actionlint
         env:
-          ACTIONLINT_VERSION: 1.7.7
+          # Kept equal to the version the harness runs locally. A skew here is LSN-020's shape --
+          # two runs of "the same" linter with different rule sets and the same exit code -- and
+          # toolchain-preflight.sh reads this literal to notice when they drift apart.
+          ACTIONLINT_VERSION: 1.7.12
         run: |
           curl -sSfL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" -o actionlint.tar.gz
           tar -xzf actionlint.tar.gz actionlint
           sudo mv actionlint /usr/local/bin/actionlint
+
+      # actionlint delegates every `run:` block to shellcheck and says NOTHING when it is absent.
+      # P8-T5 recorded a local "actionlint -> exit 0" as evidence and went red here on four SC2140
+      # findings, because this runner has shellcheck and that host did not. The preflight makes the
+      # difference an error instead of a quieter run -- in both directions: if a future runner image
+      # drops shellcheck, this job would silently stop checking shell and keep reporting green.
+      - name: Toolchain preflight (LSN-020)
+        run: bash local-dev/toolchain-preflight.sh
 
       - name: Run actionlint
         run: actionlint -color

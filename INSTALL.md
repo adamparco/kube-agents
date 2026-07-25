@@ -236,9 +236,18 @@ make docker-push IMG=$IMG
 Install the Custom Resource Definitions (CRDs) and deploy the controller manager deployment:
 
 ```bash
+export KUBE_CONTEXT=$(kubectl config current-context)   # name the cluster; see the note below
 make install
 make deploy IMG=$IMG
 ```
+
+> **`KUBE_CONTEXT` is how these targets choose a cluster.** Every target under `##@ Deployment`
+> passes `--context` explicitly. Leave `KUBE_CONTEXT` unset and the target reads your ambient
+> context, but **refuses** to proceed unless it looks like a throwaway (`kind-*`, `gke-scratch-*`)
+> — it prints the command that would name it deliberately and exits 2. Passing a whole command
+> line (`KUBECTL="kubectl --context …"`) is rejected outright: `make` accepts any assignment
+> whether or not the Makefile reads one, and that override used to be silently discarded, which
+> is worse than having none.
 
 Verify controller readiness:
 
@@ -290,10 +299,11 @@ For developer testing on a workstation against a local cluster (e.g., Kind) or r
    ```bash
    kubectl config current-context
    ```
-2. **Install CRDs**:
+2. **Install CRDs**: (`KUBE_CONTEXT` is required unless the context above is `kind-*` /
+   `gke-scratch-*` — see the note in Step 4)
    ```bash
    cd k8s-operator
-   make install
+   make install KUBE_CONTEXT=$(kubectl config current-context)
    ```
 3. **Run the controller locally with webhooks disabled**:
    ```bash
@@ -681,6 +691,7 @@ To uninstall the operator controller and CRDs manually:
 
 ```bash
 cd k8s-operator
+export KUBE_CONTEXT=$(kubectl config current-context)
 make undeploy
 make uninstall
 ```
