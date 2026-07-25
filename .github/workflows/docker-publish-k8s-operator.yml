@@ -1,8 +1,10 @@
 name: Publish Controller to GHCR
 
+# Same two-trigger, immutable-only tag scheme as docker-publish-ghcr.yml -- see the comment there.
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -17,6 +19,25 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Load tags
+        run: cat tags.env >> "$GITHUB_ENV"
+
+      - name: Resolve image tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            if [ "$REF_NAME" != "$KAGE_IMAGE_VERSION" ]; then
+              echo "::error::git tag $REF_NAME does not match KAGE_IMAGE_VERSION=$KAGE_IMAGE_VERSION in tags.env. Bump tags.env in the commit you are tagging."
+              exit 1
+            fi
+            echo "KAGE_TAG=$REF_NAME" >> "$GITHUB_ENV"
+          else
+            echo "KAGE_TAG=$SHA" >> "$GITHUB_ENV"
+          fi
 
       - name: Downcase repository name
         env:
@@ -42,17 +63,34 @@ jobs:
           file: k8s-operator/Dockerfile
           push: true
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: |
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator:latest
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator:${{ github.sha }}
+          cache-from: type=gha,scope=k8s-operator
+          cache-to: type=gha,mode=max,scope=k8s-operator
+          tags: ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator:${{ env.KAGE_TAG }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      # The kage-router is C15, the read-only ChatOps front door. config/router/kustomization.yaml
+      # has pinned ghcr.io/gke-labs/kube-agents/kage-router:v0.1.0 since Phase 6 and no workflow has
+      # ever built it -- the Dockerfile was written, the kustomize base shipped, and the image never
+      # existed. It builds from the k8s-operator context like the controller does, just a different
+      # entrypoint (cmd/router), so it belongs in this workflow and shares the module cache.
+      - name: Build and Push kage-router Image
+        uses: docker/build-push-action@v7
+        id: build-router
+        with:
+          context: k8s-operator
+          file: k8s-operator/Dockerfile.router
+          push: true
+          provenance: false
+          cache-from: type=gha,scope=k8s-operator
+          tags: ghcr.io/${{ env.IMAGE_REPOSITORY }}/kage-router:${{ env.KAGE_TAG }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.1.2
 
-      - name: Sign the image
+      - name: Sign the images
         run: |
           cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator@${{ steps.build-controller.outputs.digest }}"
+          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/kage-router@${{ steps.build-router.outputs.digest }}"

@@ -44,7 +44,10 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
-init_var "REPLAY_IMAGE" "ghcr.io/gke-labs/kube-agents/replay-proxy:latest" "Enter Replay Proxy container image"
+# Pinned to the release tag, not :latest — the publish workflows no longer produce a :latest, so
+# this default used to name an image that could not be pulled. Keep in step with KAGE_IMAGE_VERSION
+# in tags.env; V-CMP-002 (local-dev/test_image_provenance.py) fails if it drifts.
+init_var "REPLAY_IMAGE" "ghcr.io/gke-labs/kube-agents/replay-proxy:v0.1.0" "Enter Replay Proxy container image"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 

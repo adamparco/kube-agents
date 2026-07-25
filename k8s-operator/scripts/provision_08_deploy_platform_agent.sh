@@ -42,7 +42,11 @@ export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
 
 DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent"
 init_var "AGENT_IMAGE" "$DEFAULT_AGENT_IMAGE" "Enter Platform Agent Image Path"
-init_var "AGENT_TAG" "latest" "Enter Platform Agent Image Tag"
+# The release tag, not :latest — the publish workflows produce :${git-sha} on main and the release
+# tag on a v* tag, and nothing named :latest, so this default used to be unpullable. A source-built
+# install overrides it with the src-<sha> tag `make cloud-build-push` prints. Keep in step with
+# KAGE_IMAGE_VERSION in tags.env; V-CMP-002 fails if it drifts.
+init_var "AGENT_TAG" "v0.1.0" "Enter Platform Agent Image Tag"
 init_var "MEMORY_ENABLED" "false" "Enable agent memory persistence? (true/false)"
 init_var "MEMORY_PROVIDER" "multiuser_memory" "Enter agent memory provider"
 init_var "USER_PROFILE_ENABLED" "false" "Enable per-user memory profiling? (true/false)"

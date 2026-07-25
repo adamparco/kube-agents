@@ -1,5 +1,14 @@
 name: Docker Build
 
+# Build-only validation for every image the publish workflows push. The set here and the set in
+# docker-publish-ghcr.yml / docker-publish-k8s-operator.yml must match: an image whose first build
+# happens on main, after merge, has no PR that could have caught it breaking. That is how
+# cluster-admin-agent, developer-team-agent and kage-router reached Phase 8 with Dockerfile targets
+# that nothing ever built.
+#
+# The tiers all derive FROM agent-base, so they share one gha cache scope and the expensive Hermes
+# layer is built once per run rather than once per tier. Tags are :ci -- these are never pushed, and
+# naming them :latest made a local throwaway look like the registry tag this repo no longer ships.
 on:
   pull_request:
     branches: [main]
@@ -27,13 +36,70 @@ jobs:
           file: deploy/docker/Dockerfile
           target: platform
           push: false
-          tags: platform-agent:latest
+          cache-from: type=gha,scope=agent-base
+          cache-to: type=gha,mode=max,scope=agent-base
+          tags: platform-agent:ci
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      - name: Build Cluster-Admin Agent
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: cluster-admin
+          push: false
+          cache-from: type=gha,scope=agent-base
+          tags: cluster-admin-agent:ci
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      - name: Build Developer-Team Agent
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: developer-team
+          push: false
+          cache-from: type=gha,scope=agent-base
+          tags: developer-team-agent:ci
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      - name: Build Credential Sidecar
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: credential-proxy
+          push: false
+          cache-from: type=gha,scope=agent-base
+          tags: credential-proxy:ci
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      - name: Build Controller
+        uses: docker/build-push-action@v7
+        with:
+          context: k8s-operator
+          file: k8s-operator/Dockerfile
+          push: false
+          cache-from: type=gha,scope=k8s-operator
+          cache-to: type=gha,mode=max,scope=k8s-operator
+          tags: k8s-operator:ci
+
+      - name: Build kage-router
+        uses: docker/build-push-action@v7
+        with:
+          context: k8s-operator
+          file: k8s-operator/Dockerfile.router
+          push: false
+          cache-from: type=gha,scope=k8s-operator
+          tags: kage-router:ci
 
       - name: Build Replay Proxy
         uses: docker/build-push-action@v7
         with:
           context: examples/inference-replay/replay-proxy
           push: false
-          tags: replay-proxy:latest
+          tags: replay-proxy:ci

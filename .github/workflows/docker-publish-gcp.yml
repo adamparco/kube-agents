@@ -1,8 +1,12 @@
 name: Publish to GCP Artifact Registry
 
+# Same two-trigger, immutable-only tag scheme as docker-publish-ghcr.yml -- see the comment there.
+# The GAR mirror publishes the same image set as GHCR, or "fall back to the GAR copy" quietly means
+# "fall back to a copy missing three of the seven images".
 on:
   push:
     branches: [main]
+    tags: ["v*"]
 
 jobs:
   publish-gcp:
@@ -19,6 +23,22 @@ jobs:
 
       - name: Load tags
         run: cat tags.env >> "$GITHUB_ENV"
+
+      - name: Resolve image tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            if [ "$REF_NAME" != "$KAGE_IMAGE_VERSION" ]; then
+              echo "::error::git tag $REF_NAME does not match KAGE_IMAGE_VERSION=$KAGE_IMAGE_VERSION in tags.env. Bump tags.env in the commit you are tagging."
+              exit 1
+            fi
+            echo "KAGE_TAG=$REF_NAME" >> "$GITHUB_ENV"
+          else
+            echo "KAGE_TAG=$SHA" >> "$GITHUB_ENV"
+          fi
 
       - name: Authenticate to Google Cloud
         id: auth
@@ -38,42 +58,55 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v3
 
-      - name: Build and Push Platform Agent (GCP Cloud Build)
-        id: gcp-platform
+      - name: Build and Push Agent Tiers + Credential Sidecar (GCP Cloud Build)
+        id: gcp-agents
         run: |
-          gcloud builds submit \
-            --config=deploy/docker/cloudbuild.yaml \
-            --substitutions=_IMAGE_URI=${{ env.GCP_REGISTRY }}/platform-agent:${{ github.sha }},_IMAGE_URI_LATEST=${{ env.GCP_REGISTRY }}/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }} \
-            .
-          DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/platform-agent:${{ github.sha }}" --format="value(image_summary.digest)")
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          for spec in platform:platform-agent cluster-admin:cluster-admin-agent developer-team:developer-team-agent credential-proxy:credential-proxy; do
+            target="${spec%%:*}"; name="${spec##*:}"
+            echo ">>> $name"
+            gcloud builds submit \
+              --config=deploy/docker/cloudbuild.yaml \
+              --substitutions=_IMAGE_URI="${GCP_REGISTRY}/${name}:${KAGE_TAG}",_CACHE_URI="${GCP_REGISTRY}/${name}:buildcache",_TARGET="${target}",_HERMES_AGENT_TAG="${HERMES_AGENT_TAG}" \
+              .
+            digest=$(gcloud artifacts docker images describe "${GCP_REGISTRY}/${name}:${KAGE_TAG}" --format="value(image_summary.digest)")
+            echo "${name}=${digest}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Build and Push Controller + kage-router (GCP Cloud Build)
+        id: gcp-operator
+        run: |
+          set -euo pipefail
+          for spec in k8s-operator:k8s-operator/Dockerfile kage-router:k8s-operator/Dockerfile.router; do
+            name="${spec%%:*}"; dockerfile="${spec##*:}"
+            echo ">>> $name"
+            gcloud builds submit \
+              --config=deploy/docker/cloudbuild.yaml \
+              --substitutions=_IMAGE_URI="${GCP_REGISTRY}/${name}:${KAGE_TAG}",_CACHE_URI="${GCP_REGISTRY}/${name}:buildcache",_CONTEXT=k8s-operator,_DOCKERFILE="${dockerfile}" \
+              .
+            digest=$(gcloud artifacts docker images describe "${GCP_REGISTRY}/${name}:${KAGE_TAG}" --format="value(image_summary.digest)")
+            echo "${name}=${digest}" >> "$GITHUB_OUTPUT"
+          done
 
       - name: Build and Push Replay Proxy (GCP Cloud Build)
         id: gcp-replay-proxy
         run: |
+          set -euo pipefail
           gcloud builds submit examples/inference-replay/replay-proxy \
-            --tag=${{ env.GCP_REGISTRY }}/replay-proxy:${{ github.sha }}
-          gcloud artifacts docker tags add \
-            ${{ env.GCP_REGISTRY }}/replay-proxy:${{ github.sha }} \
-            ${{ env.GCP_REGISTRY }}/replay-proxy:latest
-          DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/replay-proxy:${{ github.sha }}" --format="value(image_summary.digest)")
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-
-      - name: Build and Push Credential Sidecar (GCP Cloud Build)
-        id: gcp-credential-proxy
-        run: |
-          gcloud builds submit \
-            --config=deploy/docker/cloudbuild.yaml \
-            --substitutions=_IMAGE_URI=${{ env.GCP_REGISTRY }}/credential-proxy:${{ github.sha }},_IMAGE_URI_LATEST=${{ env.GCP_REGISTRY }}/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }} \
-            .
-          DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/credential-proxy:${{ github.sha }}" --format="value(image_summary.digest)")
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+            --tag="${GCP_REGISTRY}/replay-proxy:${KAGE_TAG}"
+          digest=$(gcloud artifacts docker images describe "${GCP_REGISTRY}/replay-proxy:${KAGE_TAG}" --format="value(image_summary.digest)")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.1.2
 
       - name: Sign the images
         run: |
-          cosign sign --yes "${{ env.GCP_REGISTRY }}/platform-agent@${{ steps.gcp-platform.outputs.digest }}"
-          cosign sign --yes "${{ env.GCP_REGISTRY }}/replay-proxy@${{ steps.gcp-replay-proxy.outputs.digest }}"
-          cosign sign --yes "${{ env.GCP_REGISTRY }}/credential-proxy@${{ steps.gcp-credential-proxy.outputs.digest }}"
+          set -euo pipefail
+          cosign sign --yes "${GCP_REGISTRY}/platform-agent@${{ steps.gcp-agents.outputs.platform-agent }}"
+          cosign sign --yes "${GCP_REGISTRY}/cluster-admin-agent@${{ steps.gcp-agents.outputs.cluster-admin-agent }}"
+          cosign sign --yes "${GCP_REGISTRY}/developer-team-agent@${{ steps.gcp-agents.outputs.developer-team-agent }}"
+          cosign sign --yes "${GCP_REGISTRY}/credential-proxy@${{ steps.gcp-agents.outputs.credential-proxy }}"
+          cosign sign --yes "${GCP_REGISTRY}/k8s-operator@${{ steps.gcp-operator.outputs.k8s-operator }}"
+          cosign sign --yes "${GCP_REGISTRY}/kage-router@${{ steps.gcp-operator.outputs.kage-router }}"
+          cosign sign --yes "${GCP_REGISTRY}/replay-proxy@${{ steps.gcp-replay-proxy.outputs.digest }}"
