@@ -168,6 +168,14 @@ rejects them again if the broker is bypassed.
 3. **Control-plane tampering** — the kube-agents controller, any Action Broker (including its own),
    the admission policies (`vap-agent-scope`, `vap-agent-pod-hardening`), the `Agent` CRD, its own
    `Agent` CR or a parent's, the journal store, or the pause/freeze objects.
+   **The brake fields are carved out of the whole lineage:** no agent may write
+   `spec.operations.paused` or `pauseReason` on **any** `Agent` CR — its own, a parent's, a
+   sibling's, or **a child's** — even though a parent legitimately holds write on its children's CRs
+   in order to provision them (§4.2). Without this carve-out a parent could simply unpause a child
+   the humans had stopped, and the brake would bound nothing. Enforced field-level, against
+   whole-object replacement as well as merge patches, so it cannot be evaded by rewriting the CR
+   with another field also changed. `resume` is a roster action
+   ([06](06-api-and-data-contracts.md) §4.4), never an agent one.
 4. **Audit and journal tampering** — deleting or mutating `ActionRecord`s, log sinks, audit
    configuration, or the SLI alert policies.
 5. **Cross-scope writes** — any object outside the tier's scope, regardless of verb.
@@ -531,6 +539,12 @@ Two specifics the tables above rely on:
 - Locking to GCP primitives; controls are expressed in portable K8s terms where possible.
 
 ## 11. Verification
+
+> **Indexed in [09](09-verification-and-validation.md) §6.** That document is the
+> authoritative index of every check in the set: it assigns each of the checks below a stable
+> `V-<SUITE>-<nnn>` ID, a verification level (L0 static → L4 soak), a gate class, and the roadmap
+> phase by which it must be green. The suites drawn from this section are **V-CTN, V-BRK, V-REV, V-GAT, V-ADV**. This
+> section states what to check and why; 09 states how it is run, gated, and proved complete.
 
 The load-bearing security properties are checked with concrete, mostly-**negative** tests; the
 harness iterates until all pass. Tests marked **(carried)** existed in the read-only generation and

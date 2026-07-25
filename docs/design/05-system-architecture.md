@@ -703,6 +703,12 @@ These are **defaults for a builder**, not commitments; revisit under load testin
 
 ## 8. Verification
 
+> **Indexed in [09](09-verification-and-validation.md) §6.** That document is the
+> authoritative index of every check in the set: it assigns each of the checks below a stable
+> `V-<SUITE>-<nnn>` ID, a verification level (L0 static → L4 soak), a gate class, and the roadmap
+> phase by which it must be green. The suites drawn from this section are **V-ISO (CH1–CH9 ≡ V-ISO-001…009), V-CMP, V-NFR, V-OBS**. This
+> section states what to check and why; 09 states how it is run, gated, and proved complete.
+
 The failure-isolation / chaos suite. Scenarios are labelled **CH1–CH9**; **CH1–CH4 are the
 scenarios `local-dev/kind/verify-phase6.sh` labels `C1`–`C4`** (renamed here so scenario labels do
 not collide with the component IDs of §1). CH5–CH9 are created by the imperative model. Each is a

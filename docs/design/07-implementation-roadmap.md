@@ -311,7 +311,13 @@ items 4–7 must be backed by a continuous SLI rather than a point-in-time test.
 ## 5. Verification loop (how the harness iterates to "done")
 
 Every spec carries a **Verification** section — 02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7 — and
-every phase in §2 has acceptance criteria. Build by phase and, after each phase, run:
+every phase in §2 has acceptance criteria. **[09](09-verification-and-validation.md) is the
+authoritative conformance specification**: it assigns each check a stable ID, a level (L0 static →
+L4 soak), and a gate class, defines the fixtures, and carries the **phase ratchet** (09 §10) that
+says which suites must be green at the end of each phase below and stay green thereafter. This
+section states the loop; 09 states the checks.
+
+Build by phase and, after each phase, run:
 
 1. the **phase acceptance** for the current phase (§2),
 2. the **Verification** checks of every spec whose surface that phase touched, and

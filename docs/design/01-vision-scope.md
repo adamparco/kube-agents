@@ -247,6 +247,9 @@ achieved by thrashing.
 ## 8. Verification
 
 The §7 success criteria are the top-level acceptance. Each is made concrete and machine-checkable in
-the relevant spec's **Verification** section (02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7) and the
+the relevant spec's **Verification** section (02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7), indexed
+and gated by [09-verification-and-validation.md](09-verification-and-validation.md), and the
 per-phase acceptance + **verification loop** in [07-implementation-roadmap.md](07-implementation-roadmap.md)
-§2/§5. A build is "working" only when all of those checks pass.
+§2/§5. A build is "working" only when all of those checks pass at the level 09 requires — the four
+SLIs in §7 are verified by `V-OBS-001…004`, which assert each alert exists, reads zero, **and fires
+when deliberately tripped**.

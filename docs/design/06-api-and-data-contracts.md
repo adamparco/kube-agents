@@ -545,6 +545,47 @@ lose:**
    ([03](03-security-model.md) §3.3 rule 6) is enforced by the broker and by `vap-agent-scope`,
    which denies writes into protected namespaces except a named add-on allowlist.
 
+#### 2.2.1 Broker operations grant (all tiers, identical)
+
+The three actor templates above cover what an agent **acts on**. They do not cover what the broker
+needs to **run its own pipeline** — and without this block the system cannot satisfy invariant 3,
+because the broker would have no permission to write the journal it is required to write. Every
+actor identity additionally receives exactly this rule set, byte-identical across tiers:
+
+```yaml
+# Broker operations — appended verbatim to every actor Role/ClusterRole.
+- apiGroups: [authentication.k8s.io] # step 1: authenticate the calling agent
+  resources: [tokenreviews]
+  verbs: [create]
+- apiGroups: [kubeagents.x-k8s.io] # step 11: journal — the broker owns its own records
+  resources: [actionrecords]
+  verbs: [get, list, watch, create]
+- apiGroups: [kubeagents.x-k8s.io]
+  resources: [actionrecords/status]
+  verbs: [get, update, patch]
+- apiGroups: [kubeagents.x-k8s.io] # step 5: brake — MUST be readable by every tier
+  resources: [fleetfreezes]
+  verbs: [get, list, watch]
+- apiGroups: [kubeagents.x-k8s.io] # step 5: its own pause state
+  resources: [agents]
+  verbs: [get, list, watch]
+- apiGroups: [kubeagents.x-k8s.io] # steps 4 and 7: classification and approval inputs
+  resources: [changepolicies, approvalrosters]
+  verbs: [get, list, watch]
+```
+
+Three properties of this grant are load-bearing and are asserted separately (09 §6.14,
+`V-BRK-013`):
+
+- **`create` but never `update`/`delete` on `actionrecords`.** The broker appends to the journal and
+  advances `status`; it can never rewrite or remove a record, including its own. Tampering with the
+  journal stays in the forbidden set (§3.3 rule 4) for every identity without exception.
+- **`fleetfreezes` is readable by _every_ tier.** A tier that cannot read the freeze object fails
+  closed permanently (§4.4), so omitting this grant does not fail safe — it bricks the tier.
+- **The grant is identical across tiers and is not scoped.** It confers no authority over tenant
+  resources, so widening it does not widen an agent's reach; keeping it uniform means one rule set
+  to review rather than three.
+
 ### 2.3 Cloud IAM mapping (Workload Identity)
 
 One Google service account per identity, bound to the KSA by the standard
@@ -719,13 +760,27 @@ in-cluster and the mirror records them.
 Configured per agent by `spec.integration.github.mirror` (§1.1). Executed by the broker **after**
 step 11 of the pipeline — the `ActionRecord` is durable first, always.
 
-| Field         | Type                       | Default            | Meaning                                                                              |
-| ------------- | -------------------------- | ------------------ | ------------------------------------------------------------------------------------ |
-| `enabled`     | bool                       | `false`            | Mirroring off by default; the journal is the system of record                        |
-| `mode`        | `state` \| `log` \| `both` | `both`             | `state` writes desired-state files; `log` appends `journal/…ndjson`                  |
-| `branch`      | string                     | `main`             | Target branch. Commits are **direct** — no PR, because there is no review to perform |
-| `paths`       | []string                   | derived from scope | Restricts what this agent may mirror; defaults to its own scope's subtree            |
-| `batchWindow` | duration                   | `5m`               | Coalesce actions into one commit to avoid a commit per pod restart                   |
+| Field         | Type                       | Default            | Meaning                                                                                                                               |
+| ------------- | -------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`     | bool                       | `false`            | Mirroring off by default; the journal is the system of record                                                                         |
+| `mode`        | `state` \| `log` \| `both` | `both`             | `state` writes desired-state files; `log` appends `journal/…ndjson`                                                                   |
+| `branch`      | string                     | `main`             | Target branch. Commits are **direct** — no PR, because there is no review to perform                                                  |
+| `paths`       | []string                   | derived from scope | Restricts what this agent may mirror; defaults to its own scope's subtree                                                             |
+| `batchWindow` | duration                   | `5m`               | **`log` mode only.** Coalesce journal appends into one commit to avoid a commit per pod restart. Ignored for `state` mode — see below |
+
+**`state` commits are synchronous; `log` commits may batch.** This distinction is load-bearing, not
+an optimisation detail. [04](04-workflow-model.md) §6 rests the `mirror`-mode race mitigation on the
+commit being "part of the action rather than a later batch" — a five-minute coalescing window would
+widen exactly the window in which a GitOps engine reverts the agent. So:
+
+- **`state`** — the desired-state write is performed **within the action**, immediately after step
+  11, before the action is reported complete. `batchWindow` does not apply. Its latency is measured
+  and bounded (09 §12, `V-PRO-014`).
+- **`log`** — the journal append is an audit record with no reconciliation semantics, so coalescing
+  it is safe and `batchWindow` applies.
+- **`both`** — the state write is synchronous; the log append batches.
+
+A mirror failure never blocks, delays, or reverts the action itself; it is retried and surfaced.
 
 **Commit shape.** Conventional Commit, subject `chore(mirror): <intent>`, with trailers:
 
@@ -1249,6 +1304,15 @@ status:
           passed: true,
           detail: "0 container restarts since apply",
         }
+  recovery: # the recovery ladder (04 §5), recorded so it is observable
+    rung: 1 # 1 retry · 2 alternative · 3 rollback · 4 escalate · 5 page
+    transitions: # append-only; a skipped rung MUST carry a reason
+      - { at: "2026-07-24T18:02:55Z", from: 0, to: 1, reason: conflict-retry }
+  report: # the four beats (02 §2.5.4) as STRUCTURED fields, not prose
+    noticed: "checkout OOMKilled every ~40s against a 256Mi limit"
+    did: "raised limits.memory to 512Mi (elevated)"
+    verified: "3/3 pods Ready, restart count flat for 6m"
+    undo: "kage undo 01J8Z2K9Q7V3X5M6N8P0R2T4W6"
   approvals: # present only for gated actions
     required: 1
     granted: []
@@ -1265,6 +1329,19 @@ status:
     verified: "2026-07-24T18:03:11Z"
   message: "raised memory limit to 512Mi and restarted api-gateway"
 ```
+
+**`status.report` is structured, and the chat text is rendered from it — never the reverse.** The
+four beats of [02](02-agent-personas.md) §2.5.4 are fields, not prose the harness has to parse back
+out of a chat message. This is what makes the character and honesty requirements _mechanically_
+checkable rather than a matter for an LLM judge: a report claiming a fix can be compared directly
+against `status` and `verification.passed`, and a missing beat is a schema failure. An
+implementation that emits chat prose and derives the fields afterwards is non-conforming, because
+the two can then disagree.
+
+**`status.recovery` makes the ladder observable.** [04](04-workflow-model.md) §5 requires that the
+agent never skips a rung silently and never restarts at the bottom for the same target after a
+rollback. Neither is checkable unless the rung is recorded, so it is: `transitions` is append-only,
+non-decreasing in `rung`, and any skip carries a `reason`.
 
 **Status lifecycle.**
 
@@ -1677,6 +1754,12 @@ and their entire safety story is that there is nothing to escalate.
 
 ## 10. Verification
 
+> **Indexed in [09](09-verification-and-validation.md) §6.** That document is the
+> authoritative index of every check in the set: it assigns each of the checks below a stable
+> `V-<SUITE>-<nnn>` ID, a verification level (L0 static → L4 soak), a gate class, and the roadmap
+> phase by which it must be green. The suites drawn from this section are **V-CTR, V-CMP**. This
+> section states what to check and why; 09 states how it is run, gated, and proved complete.
+
 Contract-level checks. Security behaviour is verified in [03](03-security-model.md) §11; these
 verify that the **shapes** in this document are real.
 
@@ -1709,7 +1792,12 @@ verify that the **shapes** in this document are real.
 - `kubectl auth can-i --as=system:serviceaccount:…`: every reader returns **no** for
   `create|update|patch|delete` on everything, universally; every actor returns **yes** in scope for
   its templated resources and **no** out of scope, for `escalate`/`bind`/`impersonate`, and for
-  writes to `agents`/`actionrecords`/`changepolicies`/`fleetfreezes`/`approvalrosters`.
+  writes to `changepolicies`/`fleetfreezes`/`approvalrosters`. On `actionrecords` an actor returns
+  **yes** for `create` and for `update` on `actionrecords/status`, and **no** for `update`/`delete`
+  of the record itself (§2.2.1) — the append-only property, asserted in both directions. On
+  `agents` a non-platform actor returns **yes** only for creating/patching a **child** CR within
+  its scope, and **no** for its own CR, a parent's, and for `spec.operations.paused` on any CR
+  ([03](03-security-model.md) §3.3 rule 3).
 - Cloud: no actor GSA holds `roles/owner`, `roles/editor`, `roles/iam.securityAdmin`,
   `roles/resourcemanager.projectIamAdmin`, or `iam.serviceAccounts.setIamPolicy`; every actor GSA
   binding carries the scope IAM condition from §2.3.

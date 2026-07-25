@@ -668,6 +668,12 @@ joins the reconcile loop ([07](07-implementation-roadmap.md)).
 
 ## 10. Verification
 
+> **Indexed in [09](09-verification-and-validation.md) §6.** That document is the
+> authoritative index of every check in the set: it assigns each of the checks below a stable
+> `V-<SUITE>-<nnn>` ID, a verification level (L0 static → L4 soak), a gate class, and the roadmap
+> phase by which it must be green. The suites drawn from this section are **V-CTN, V-MSH, V-CHR, V-PRO**. This
+> section states what to check and why; 09 states how it is run, gated, and proved complete.
+
 Checks a harness runs against this doc. **(carried)** existed in the read-only generation and must
 stay green; **(inverted)** replaces a check the conversion deliberately removes; **(new)** is
 created by the imperative model.

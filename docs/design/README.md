@@ -103,25 +103,27 @@ The vocabulary changed with the model. Use these terms; do not reintroduce the o
 
 ## The design set
 
-Two tiers, meant to be read in order **01 → 08**:
+Two tiers, meant to be read in order **01 → 08**, plus **09**, which verifies the rest:
 
 - **Foundational (north star) — 01–04:** _what_ we are building and _why_.
 - **Buildable (bridging) — 05–08:** _how_ it is assembled.
 
-| #   | Document                                                     | Covers                                                                                                                                                                                                 |
-| --- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 01  | [Vision & scope](01-vision-scope.md)                         | The "agents operate the fleet, humans set intent and supervise" thesis, in/out of scope, success criteria and the continuous SLIs                                                                      |
-| 02  | [Agent personas](02-agent-personas.md)                       | The three-persona roster, their authority and limits, the high-agency operating character, direct delegation/escalation, cascading provisioning, ChatOps addressing                                    |
-| 03  | [Security & trust model](03-security-model.md)               | Scoped write identity, the forbidden set, the Action Broker as the sole writer, risk classification, undo/pause/freeze, AI-agent threats, continuous assurance                                         |
-| 04  | [Workflow model](04-workflow-model.md)                       | The observe → decide → act → verify → report loop, autonomy by default and the gated exception class, relentless proactivity with initiative budgets, the recovery ladder, failure isolation           |
-| 05  | [System architecture](05-system-architecture.md)             | Component inventory (Action Broker, journal store, undo controller, agent mesh, ChatOps router), hub-and-spoke topology, data flows, shared services, scale/NFR targets                                |
-| 06  | [API & data contracts](06-api-and-data-contracts.md)         | The `Agent` CRD, the per-tier read-write identity contract, the Action Envelope / `ActionRecord` / risk-class / undo contracts, the agent-mesh contract, OKF schema, ChatOps routing, MCP tool surface |
-| 07  | [Implementation roadmap](07-implementation-roadmap.md)       | The phased conversion from today's read-only codebase to the imperative end state, per-phase acceptance criteria, the verification loop, the definition of done, and risks                             |
-| 08  | [Agent runtime & identity](08-agent-runtime-and-identity.md) | The kube-agents controller reconciling each `Agent` CR (Hermes harness) into an isolated pod with a per-pod scoped read-write Workload-Identity SA, the broker sidecar seam, what is deferred and why  |
+| #   | Document                                                       | Covers                                                                                                                                                                                                                         |
+| --- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 01  | [Vision & scope](01-vision-scope.md)                           | The "agents operate the fleet, humans set intent and supervise" thesis, in/out of scope, success criteria and the continuous SLIs                                                                                              |
+| 02  | [Agent personas](02-agent-personas.md)                         | The three-persona roster, their authority and limits, the high-agency operating character, direct delegation/escalation, cascading provisioning, ChatOps addressing                                                            |
+| 03  | [Security & trust model](03-security-model.md)                 | Scoped write identity, the forbidden set, the Action Broker as the sole writer, risk classification, undo/pause/freeze, AI-agent threats, continuous assurance                                                                 |
+| 04  | [Workflow model](04-workflow-model.md)                         | The observe → decide → act → verify → report loop, autonomy by default and the gated exception class, relentless proactivity with initiative budgets, the recovery ladder, failure isolation                                   |
+| 05  | [System architecture](05-system-architecture.md)               | Component inventory (Action Broker, journal store, undo controller, agent mesh, ChatOps router), hub-and-spoke topology, data flows, shared services, scale/NFR targets                                                        |
+| 06  | [API & data contracts](06-api-and-data-contracts.md)           | The `Agent` CRD, the per-tier read-write identity contract, the Action Envelope / `ActionRecord` / risk-class / undo contracts, the agent-mesh contract, OKF schema, ChatOps routing, MCP tool surface                         |
+| 07  | [Implementation roadmap](07-implementation-roadmap.md)         | The phased conversion from today's read-only codebase to the imperative end state, per-phase acceptance criteria, the verification loop, the definition of done, and risks                                                     |
+| 08  | [Agent runtime & identity](08-agent-runtime-and-identity.md)   | The kube-agents controller reconciling each `Agent` CR (Hermes harness) into an isolated pod with a per-pod scoped read-write Workload-Identity SA, the broker sidecar seam, what is deferred and why                          |
+| 09  | [Verification & validation](09-verification-and-validation.md) | The conformance suite: completeness vs correctness, verification levels L0–L4, the `V-<SUITE>-<nnn>` check catalog, fixtures and golden corpora, traceability, gate classes, the phase ratchet, and the anti-false-green rules |
 
 Each document opens with a **TL;DR** and closes with a **Verification** section of concrete,
-mostly-runnable checks; most also carry **Goals / Non-goals**. The three decisive verification
-suites are named in step 8 below.
+mostly-runnable checks; most also carry **Goals / Non-goals**.
+[09](09-verification-and-validation.md) is the authoritative index of those checks — it assigns
+every check a stable ID, a verification level, and a gate class, and proves coverage.
 
 ---
 
@@ -155,7 +157,10 @@ To build kube-agents end-to-end from this design set:
    SOPs), packaged as an `Agent` CR running the **Hermes** harness and reconciled by the
    **kube-agents controller** (the extended `k8s-operator/`). Per-agent identity is pre-created
    KSA / RBAC / Workload-Identity manifests the controller **references**, never mints.
-8. **Verification checks are load-bearing, not extras.** The three decisive suites are the
+8. **Verification checks are load-bearing, not extras.** [09](09-verification-and-validation.md) is
+   the conformance specification: it decides what "complete" and "correct" mean, at which level each
+   property must be proven, and what halts a build. Read it before writing tests, and note §11 —
+   the anti-false-green rules, each drawn from a real incident in this repo. The decisive suites are
    **containment negative tests** (03 §11 — scope ceiling, no self-escalation, no cross-tenant
    write), the **reversibility tests** (03 §11 — every action undoable, undo actually restores), and
    the **failure-isolation chaos tests** (05 §8). A build is not done until all three are green.

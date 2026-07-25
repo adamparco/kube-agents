@@ -471,6 +471,12 @@ None are required for v1; each is additive and can be adopted independently.
 
 ## 7. Verification
 
+> **Indexed in [09](09-verification-and-validation.md) §6.** That document is the
+> authoritative index of every check in the set: it assigns each of the checks below a stable
+> `V-<SUITE>-<nnn>` ID, a verification level (L0 static → L4 soak), a gate class, and the roadmap
+> phase by which it must be green. The suites drawn from this section are **V-RUN, V-CTN**. This
+> section states what to check and why; 09 states how it is run, gated, and proved complete.
+
 Runtime-level checks. Marked **(carried)** where the check survives the inversion unchanged,
 **(inverted)** where it replaces a read-only-generation check, **(new)** where the two-workload
 model creates it. Security-property tests live in [03](03-security-model.md) §11; these prove the
