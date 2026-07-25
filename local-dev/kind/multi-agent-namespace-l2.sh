@@ -33,6 +33,18 @@
 # two Agent CRs, so the guard is load-bearing.
 # Exit: 0 = PROVEN · 1 = FAILED · 2 = refused target · 3 = DEFERRED.
 # Usage: local-dev/kind/multi-agent-namespace-l2.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). Declared, not assumed: LSN-001 and LSN-002 each
+# recurred against scripts whose authors believed the preconditions held.
+#   P1 image-under-test:  kubeagents-system/control-plane=controller-manager — CLAIM 1 is a controller-OUTPUT property
+#      (per-agent PVC naming), decided by the running operator at reconcile time. A stale operator
+#      reproduces the old bare-namespace claim and the check reads it as a regression, or worse,
+#      the fixed operator is absent and the run is green about code that is not there.
+#   P3 admission-recreate: both Agent CRs and the namespace. Section 1 creates them fresh in a per-run namespace, so the
+#      Deployments and PVCs are produced by the operator under the rules currently in force.
+#   P6 runtime-authoritative: the live PersistentVolumeClaims and Deployments the operator produced. Not agent_manifests.go's
+#      naming function — that is asserted separately at L1, and the two are the point of the pair.
 set -uo pipefail
 
 CTX="${1:-kind-kube-agents-dev}"
@@ -75,16 +87,18 @@ if ! $K -n kubeagents-system get deploy kubeagents-controller-manager >/dev/null
   exit 3
 fi
 
-# P1: the running operator must be the build under test. Without this the whole run reports on
-# whatever image happens to be loaded, which is how a fixed defect keeps passing against stale bits.
-RUNNING_ID="$($K -n kubeagents-system get pods -l control-plane=controller-manager \
-  -o jsonpath='{.items[0].status.containerStatuses[0].imageID}' 2>/dev/null)"
-if [ -z "$RUNNING_ID" ]; then
-  echo "DEFERRED: could not read the controller-manager's running imageID (P1 unverifiable)."
-  exit 3
-fi
-pass "operator running, imageID ${RUNNING_ID##*@}"
-echo "  NOTE (P1): rebuild + kind load + rollout restart before trusting a green run here."
+# P1: the running operator must BE the build under test. This used to read the imageID, print it,
+# and follow it with a note reminding the reader to rebuild -- which is addressed to whoever already
+# knows, and is why LSN-001 recurred three times. p1_assert_build_under_test compares the digest and
+# returns three states, so "could not look" is a deferral and "does not match" is a failure.
+. "$(dirname "$0")/lib/preconditions.sh"
+p1_assert_build_under_test "$K" kubeagents-system control-plane=controller-manager
+case "$?" in
+  0) pass "P1: the running operator is the build under test" ;;
+  3) echo "DEFERRED: P1 unverifiable (see above); every claim below would be about unknown code."
+     exit 3 ;;
+  *) bad "P1: the cluster is not running the build under test"; exit 1 ;;
+esac
 
 # --- 1) two agents, ONE namespace ---------------------------------------------------------------
 echo "== 1) creating two Agent CRs in namespace $NS =="

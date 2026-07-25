@@ -55,6 +55,23 @@
 # DESTRUCTIVE-TEST GUARD: only runs against a Kind context (verify-phase6 → chaos-suite scales/deletes
 # reversible, single-object, self-cleaning fixtures; guarded the same way in every prior phase).
 # Usage: local-dev/kind/verify-phase7.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). Declared, not assumed: LSN-001 and LSN-002 each
+# recurred against scripts whose authors believed the preconditions held.
+#   P1 image-under-test:  kubeagents-system/control-plane=controller-manager — sections B3 and C run
+#      verify-phase{2,3,6}.sh, whose subjects are the cardinality webhook, the operator's rendered
+#      Deployments and the chaos recovery path. Every one of those is served by the operator image,
+#      so a stale operator makes the largest block of L2 evidence in this build a statement about
+#      code that is not in the tree. Asserted via p1_assert_build_under_test; section A is hermetic
+#      and is unaffected.
+#   P3 admission-recreate: none — this script creates no object of its own. Each sub-script owns the
+#      fixtures for the admission property it claims, and its own declaration is the right place for
+#      that answer; asserting one here on the caller's behalf would be a guess about code I would
+#      have to read anyway. The sub-scripts' blocks are a recorded deferral, not an omission.
+#   P6 runtime-authoritative: the live objects each sub-script reads back from the API server, and —
+#      where a config claim is made — the operator-rendered ConfigMap, never the image-baked
+#      /opt/data/config.yaml that it is mounted over (LSN-003).
 set -uo pipefail
 
 CTX="${1:-kind-kube-agents-dev}"
@@ -78,6 +95,22 @@ echo "===================================================================="
 
 reachable=1
 kubectl --context "$CTX" version >/dev/null 2>&1 || reachable=0
+
+# P1 — is the operator in this cluster the build under test? Sections B3 and C are the answer to
+# "did the whole prior build survive", and that answer is worthless if it was gathered against an
+# image from three phases ago. This used to be a line in the runbook; LSN-001 recurred three times
+# against runbooks. `live_ok` carries the three states forward so that "could not look" reaches the
+# report as a deferral and "does not match" reaches it as a failure — never as a skip.
+. "$REPO_ROOT/local-dev/kind/lib/preconditions.sh"
+live_ok=1
+if [ "$reachable" -eq 1 ]; then
+  p1_assert_build_under_test "kubectl --context $CTX" kubeagents-system control-plane=controller-manager
+  case "$?" in
+    0) pass "P1: the running operator is the build under test" ;;
+    3) live_ok=3 ;;
+    *) bad "P1: the cluster is not running the build under test"; live_ok=0 ;;
+  esac
+fi
 
 # ==== A. NET-NEW seam artifacts (T1–T3) — hermetic (structural + semantic; no cluster) ===============
 echo; echo "== A. Cloud-agnostic seam artifacts (hermetic) — T1 IaC parity, T2 pipeline parity, T3 obs seam =="
@@ -165,7 +198,7 @@ echo "           identities is the one GKE-specific binding a 2nd cloud swaps fo
 
 # --- B3: live core concepts on this vanilla target — verify-phase{2,3}.sh ----------------------------
 echo; echo "-- B3: live core concepts on vanilla Kind — read-only SAR, isolation, cardinality webhook, VAP --"
-if [ "$reachable" -eq 1 ]; then
+if [ "$reachable" -eq 1 ] && [ "$live_ok" -eq 1 ]; then
   if bash local-dev/kind/verify-phase2.sh "$CTX" >/tmp/p7-phase2.log 2>&1; then
     pass "verify-phase2.sh green on vanilla Kind (cluster-admin read-only SAR + cardinality webhook + VAP attenuation)"
   else
@@ -178,13 +211,16 @@ if [ "$reachable" -eq 1 ]; then
     bad "verify-phase3.sh FAILED on vanilla Kind — namespace isolation / SAR does not hold on the 2nd target (HALT)"
     tail -25 /tmp/p7-phase3.log
   fi
+elif [ "$live_ok" -eq 3 ]; then
+  defer "B3 live core-concept checks — P1 unverifiable, so a green here would be about unknown code."
 else
-  note "SKIP B3 live core-concept checks — context '$CTX' unreachable (B1/B2 above are cluster-independent)"
+  note "SKIP B3 live core-concept checks — context '$CTX' unreachable or not running the build under"
+  note "  test (B1/B2 above are cluster-independent and still ran)"
 fi
 
 # ==== C. P7-T5 — full regression (HALT on any failure) ==============================================
 echo; echo "== C. Full regression — verify-phase6.sh (=> chaos C1–C4 + verify-phase{2,3,4,5} + 03 §11 + goldens + go test) =="
-if [ "$reachable" -eq 1 ]; then
+if [ "$reachable" -eq 1 ] && [ "$live_ok" -eq 1 ]; then
   if bash local-dev/kind/verify-phase6.sh "$CTX" >/tmp/p7-regress.log 2>&1; then
     pass "verify-phase6.sh green — 05 §8 chaos + Phases 2–5 Accept + 03 §11 negatives + goldens + go test NOT regressed"
     grep -E 'chaos suite green|verify-phase[2345]\.sh green|negative-attenuation suite green|go test \./\.\.\. green|ALL CHECKS PASSED' \
@@ -193,8 +229,13 @@ if [ "$reachable" -eq 1 ]; then
     bad "verify-phase6.sh FAILED — a load-bearing suite (chaos / 03 §11) or a prior phase regressed (HALT). Log: /tmp/p7-regress.log"
     tail -40 /tmp/p7-regress.log
   fi
+elif [ "$live_ok" -eq 3 ]; then
+  defer "the full regression — P1 unverifiable. This is a deferral and NOT a pass: the suite is"
+  echo "           load-bearing, so a run that cannot establish which code it exercised does not"
+  echo "           discharge it. Rebuild, kind load, rollout restart, and run this again."
+  fail=1
 else
-  bad "context '$CTX' unreachable — the full regression (chaos + prior gates) is load-bearing and cannot be skipped"
+  bad "context '$CTX' unreachable or not running the build under test — the full regression (chaos + prior gates) is load-bearing and cannot be skipped"
 fi
 
 # ==== D. Deferrals (printed, never asserted green) ==================================================

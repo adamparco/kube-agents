@@ -171,6 +171,8 @@ Each component gets **three** probes. Existence alone is never sufficient — th
 | C17      | Event ingress relay         | Image published                                     | Deployed by a provisioning path (not a manual patch); a real alert spawns a session | V-PRO-001    |
 | **C-AB** | **Action Broker**           | Image published                                     | One broker Deployment per `Agent` CR, bound to that CR's actor SA                   | V-BRK-\*     |
 | **C-JS** | **Journal store**           | `ActionRecord` CRD installed                        | Records are written before execution and survive pod restart                        | V-REV, V-BRK |
+| **C-JR** | **Journal reconciler**      | Controller hosts the reconciler; log sink exists    | It reads a real audit-log stream and raises a write with no `ActionRecord`          | V-BRK-003    |
+| **C-AD** | **Anomaly detector**        | Controller hosts the detector                       | A trip auto-pauses the agent **through `C-BR`** — an alert alone is not wired       | V-ADV-005    |
 | **C-UC** | **Undo controller**         | Deployed                                            | `undo <id>` restores prior state with the originating agent paused                  | V-REV-002    |
 | **C-AM** | **Agent mesh**              | Service + NetworkPolicy per agent                   | A parent reaches its child and **cannot** reach a sibling                           | V-MSH-\*     |
 | **C-BR** | **Brake surface**           | `FleetFreeze` CRD; `spec.operations.paused` field   | `pause` and `freeze` take effect with inference down                                | V-RUN, V-ISO |
@@ -196,17 +198,25 @@ check that proves they left the critical path.
 
 Every schema in 06 must exist as a real type whose shape matches the spec.
 
-| Contract                                         | Source  | Completeness check                                                                       |
-| ------------------------------------------------ | ------- | ---------------------------------------------------------------------------------------- |
-| `Agent` CRD                                      | 06 §1   | Generated CRD ⊇ every specified field, with specified types, defaults, and enums         |
-| Reader/actor RBAC templates (×6)                 | 06 §2   | Six rendered manifests exist and match the spec's rule sets exactly                      |
-| Action Envelope                                  | 06 §4.1 | Type exists; every specified field present; refused-key list enforced                    |
-| `ChangePolicy`                                   | 06 §4.2 | CRD exists; stricter-only enforced                                                       |
-| `ActionRecord`                                   | 06 §4.3 | CRD exists; full status lifecycle representable                                          |
-| `FleetFreeze` / `UndoRequest` / `ApprovalRoster` | 06 §4.4 | CRDs exist and are honoured by the broker                                                |
-| Mesh request/response                            | 06 §7   | Type exists; authn and loop-prevention fields present                                    |
-| `ChatOpsConfig` (cluster-scoped singleton)       | 06 §1.1 | CRD exists; exactly one instance named `default`; holds the fleet-level Slack app config |
-| Audit/attribution record                         | 06 §8   | Trace fields present end to end                                                          |
+| Contract                                         | Source  | Completeness check                                                                         |
+| ------------------------------------------------ | ------- | ------------------------------------------------------------------------------------------ |
+| `Agent` CRD                                      | 06 §1   | Generated CRD ⊇ every specified field, with specified types, defaults, and enums           |
+| Reader/actor RBAC templates (×6)                 | 06 §2   | Six rendered manifests exist and match the spec's rule sets exactly                        |
+| Action Envelope                                  | 06 §4.1 | Type exists; every specified field present; refused-key list enforced                      |
+| `ChangePolicy`                                   | 06 §4.2 | CRD exists; stricter-only enforced                                                         |
+| `ActionRecord`                                   | 06 §4.3 | CRD exists; full status lifecycle representable                                            |
+| `FleetFreeze` / `UndoRequest` / `ApprovalRoster` | 06 §4.4 | CRDs exist and are honoured by the broker                                                  |
+| Mesh request/response                            | 06 §7   | Type exists; authn and loop-prevention fields present                                      |
+| `ChatOpsConfig` (cluster-scoped singleton)       | 06 §1.1 | CRD exists; exactly one instance named `default`; holds the fleet-level Slack app config   |
+| Audit/attribution record                         | 06 §8   | Trace fields present end to end                                                            |
+| ChatOps addressing & routing                     | 06 §2b  | Every addressing form and operational verb resolves to a route; V-CMP-023 pairs surfaces   |
+| OKF knowledge entry                              | 06 §5   | Every shipped entry validates against the frontmatter schema (`local-dev/okf-validate.py`) |
+| IaC mirror layout                                | 06 §3.1 | The rendered mirror tree matches the specified paths — for C13, an **optional** component  |
+
+Deferred by design and asserted **absent**, exactly as in §5.1: the user-authorization down-scoping
+contract (06 §2a) and the session-state contract's mem0 backing (06 §6). Absent means the harness
+asserts no type, CRD, or code path implements them — a partially-built deferral is the failure this
+row exists to catch.
 
 - **V-CMP-010** — for each contract, a **field-level diff** between the spec's schema block and the
   generated OpenAPI/type: any field in the spec and missing from the code fails; any field in the
@@ -608,17 +618,21 @@ The mapping is a generated artifact, not prose:
 - The harness emits `verification/traceability.yaml` (requirement → checks → level → phase → last
   result) on every full run.
 
-| ID        | Meta-check                                                                                                                                                                                              | Lvl |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- |
-| V-MET-001 | Every check ID in §6 exists in the implemented suite, and every implemented test declares a known check ID ¬                                                                                            | L0  |
-| V-MET-002 | **Full coverage of the load-bearing suites** — every normative requirement owned by V-CTN, V-BRK, V-REV, V-ISO or V-ADV maps to ≥1 check. An unmapped requirement in these categories fails the build ¬ | L0  |
-| V-MET-008 | **Coverage ratchet elsewhere** — for the remaining suites coverage may not fall below the recorded baseline (§8.1); a new normative statement arrives with a check or a named deferral ¬                | L0  |
-| V-MET-009 | The **uncovered list itself** is published on every full run, not merely counted ¬                                                                                                                      | L0  |
-| V-MET-003 | **Assertion ratchet** — the count of security assertions (V-CTN, V-BRK, V-REV, V-ADV) never decreases between commits ¬                                                                                 | L0  |
-| V-MET-004 | No check ID is reused or renumbered; retired IDs retain a replacement pointer ¬                                                                                                                         | L0  |
-| V-MET-005 | Classifier rules and corpus cases stay in sync (§7.1) ¬                                                                                                                                                 | L0  |
-| V-MET-006 | Every deferred check names a blocker, an owner, and a promotion condition; none is recorded as passing ¬                                                                                                | L0  |
-| V-MET-007 | Every BLOCKING-ALWAYS check ran in the last full run — a suite that silently skipped is a failure ¬                                                                                                     | L0  |
+The meta suite is self-referential: its `Source` is a section of **this** document, because what it
+verifies is this document's own machinery. Every other suite sources a spec — a check whose Source
+cell is empty has no stated rationale anywhere, which `local-dev/tests/spec-ids.py` now rejects.
+
+| ID        | Meta-check                                                                                                                                                                                              | Source        | Lvl |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | --- |
+| V-MET-001 | Every check ID in §6 exists in the implemented suite, and every implemented test declares a known check ID ¬                                                                                            | this doc §6   | L0  |
+| V-MET-002 | **Full coverage of the load-bearing suites** — every normative requirement owned by V-CTN, V-BRK, V-REV, V-ISO or V-ADV maps to ≥1 check. An unmapped requirement in these categories fails the build ¬ | this doc §8   | L0  |
+| V-MET-008 | **Coverage ratchet elsewhere** — for the remaining suites coverage may not fall below the recorded baseline (§8.1); a new normative statement arrives with a check or a named deferral ¬                | this doc §8.1 | L0  |
+| V-MET-009 | The **uncovered list itself** is published on every full run, not merely counted ¬                                                                                                                      | this doc §9.4 | L0  |
+| V-MET-003 | **Assertion ratchet** — the count of security assertions (V-CTN, V-BRK, V-REV, V-ADV) never decreases between commits ¬                                                                                 | this doc §8.1 | L0  |
+| V-MET-004 | No check ID is reused or renumbered; retired IDs retain a replacement pointer ¬                                                                                                                         | this doc §9.6 | L0  |
+| V-MET-005 | Classifier rules and corpus cases stay in sync (§7.1) ¬                                                                                                                                                 | this doc §7.1 | L0  |
+| V-MET-006 | Every deferred check names a blocker, an owner, and a promotion condition; none is recorded as passing ¬                                                                                                | this doc §9.6 | L0  |
+| V-MET-007 | Every BLOCKING-ALWAYS check ran in the last full run — a suite that silently skipped is a failure ¬                                                                                                     | this doc §9.5 | L0  |
 
 ### 8.1 The coverage baseline, and why it is a ratchet
 
@@ -905,15 +919,30 @@ than absorbed, because an unowned requirement is exactly what §12.2 existed to 
 ## 14. Verification of this document
 
 - **V-MET-010** — every check ID referenced anywhere in specs 01–08 exists in §6 of this document,
-  and every §6 ID is referenced by or traceable to a spec section. `L0`
+  and every §6 ID is referenced by or traceable to a spec section. `L0` — **implemented**:
+  `local-dev/tests/spec-ids.py`, in `local-dev/L0-CHAIN.txt`. A check's source is read from its
+  `Source` cell, or from its section preamble where the table has no such column; the target must
+  resolve to a real heading (or, for `05 C15`, a real component).
 - **V-MET-011** — every bullet in every spec Verification section (02 §10, 03 §11, 04 §9, 05 §8,
   06 §10, 08 §7) resolves to at least one §6 check ID in the generated
   `verification/traceability.yaml`; an unmapped bullet fails the lint. The mapping is **generated,
   not inline** — the specs stay readable prose and the harness owns the correspondence, so the two
-  cannot drift without the lint noticing. `L0`
+  cannot drift without the lint noticing. `L0` — **not implemented; scheduled as P8-T10, and it
+  gates the Phase 8 milestone.** It was written here as a deferral first, and the ledger's V-MET-006
+  lint refused the row: V-MET is BLOCKING-ALWAYS and such a check may not be deferred (§9.6). The
+  refusal is right, and the reason is worth keeping. A deferral names an **external** blocker; the
+  blocker here was "the generator has not been written", which is unwritten work wearing a
+  deferral's label — the reward hack SELF-IMPROVEMENT §4 names. The work is real and bounded: 176
+  bullets across the six Verification sections, each needing at least one check ID, and it is
+  **curated, not fuzzy-matched** — a mapping produced by text similarity would assert coverage
+  nobody established, which is V-MET-014 with extra steps.
 - **V-MET-012** — §5.1 of this document lists every component ID from
   [05](05-system-architecture.md) §1, and §5.2 lists every contract defined in
-  [06](06-api-and-data-contracts.md). `L0`
+  [06](06-api-and-data-contracts.md). `L0` — **implemented**: same script. Its first run found
+  `C-JR` and `C-AD` — both **New (v1, load-bearing)** in 05 §1 — absent from §5.1 entirely, and five
+  06 contracts missing from §5.2. Neither gap was visible while §14 was prose.
 
 These three keep this document from drifting away from the set it verifies — the same failure mode
-as §11.7, applied to the verification layer itself.
+as §11.7, applied to the verification layer itself. All three were unimplemented for as long as they
+existed, which is §11.7 again: the lint that polices vacuous checks was itself one. Two are now
+implemented and the third is scheduled with a phase gate rather than an excuse.

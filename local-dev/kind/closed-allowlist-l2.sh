@@ -29,6 +29,18 @@
 #
 # DESTRUCTIVE-TEST GUARD: Kind / scratch-GKE contexts only.
 # Usage: local-dev/kind/closed-allowlist-l2.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). Declared, not assumed: LSN-001 and LSN-002 each
+# recurred against scripts whose authors believed the preconditions held.
+#   P1 image-under-test:  kubeagents-system/control-plane=controller-manager — the webhook and CRD under test are served
+#      BY the operator image. A stale operator validates with the old rules and every negative in
+#      L2-2 passes for the wrong reason. Asserted via p1_assert_build_under_test.
+#   P3 admission-recreate: the CRD itself (L2-1 re-applies it server-side before anything is asserted about its rules) and
+#      every Agent fixture, all of which are submitted with --dry-run=server so admission runs in
+#      full on a fresh object each time.
+#   P6 runtime-authoritative: the live CRD and the live Deployments the operator rendered — not the checked-in CRD YAML, which
+#      is an input. L2-4 reads the running Deployment's env, which is what the router actually sees.
 set -uo pipefail
 
 CTX="${1:-kind-kube-agents-dev}"
@@ -55,6 +67,21 @@ echo " V-CTR-002 (V-7) + V-CTR-014 — live allowlist enforcement — ctx: $CTX"
 echo "===================================================================="
 
 $K version >/dev/null 2>&1 || { echo "FAIL: context '$CTX' is not reachable." >&2; exit 1; }
+
+# --- P1: the webhook doing the rejecting must be the build under test ---------------------------
+# L2-2 asserts that four degenerate allowlist shapes are REFUSED. A stale operator refuses them with
+# the old rules -- or, if the CRD's CEL is doing the work, refuses them for a reason the webhook
+# change under test had nothing to do with. Either way the run is green about code that is not
+# there, which is LSN-001's shape and the reason it recurred three times.
+. "$REPO_ROOT/local-dev/kind/lib/preconditions.sh"
+p1_assert_build_under_test "$K" "$NS" control-plane=controller-manager
+case "$?" in
+  0) pass "P1: the running operator is the build under test" ;;
+  3) echo "DEFERRED: P1 unverifiable (see above). L2-1 and the CEL claims below would still be"
+     echo "  meaningful, but L2-2/L2-4 are webhook and controller behaviour and would not be."
+     exit 3 ;;
+  *) bad "P1: the cluster is not running the build under test"; exit 1 ;;
+esac
 
 # --- L2-1: the CRD installs (this is what compiles the CEL) -----------------------------------
 echo; echo "== L2-1: CRD applies (compiles every CEL rule) =="
