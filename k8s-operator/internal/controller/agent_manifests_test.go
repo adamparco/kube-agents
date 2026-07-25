@@ -710,40 +710,102 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	}
 }
 
-func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
+// TestBuildDeploymentGoogleChatAllowedUsersDegenerate replaces the former
+// TestBuildDeploymentGoogleChatAllowedUsersEmpty, which asserted the opposite:
+// that an empty allowlist renders GOOGLE_CHAT_ALLOW_ALL_USERS=true. P8-T1
+// deleted that backstop (V-CTR-014), so the property under test is inverted —
+// a degenerate allowlist must produce no permissive env at all.
+//
+// Admission rejects these CRs (06 §1.2 V-7), so this is defense in depth for the
+// path where a CR predates the rule or the webhook is unavailable: the renderer
+// must still fail closed rather than open.
+func TestBuildDeploymentGoogleChatAllowedUsersDegenerate(t *testing.T) {
+	cases := map[string][]string{
+		"nil":            nil,
+		"empty":          {},
+		"single blank":   {""},
+		"all whitespace": {"  ", "\t"},
+	}
+
+	for name, allowed := range cases {
+		t.Run(name, func(t *testing.T) {
+			agent := &agentv1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-agent",
+					Namespace: "my-ns",
+				},
+				Spec: agentv1alpha1.AgentSpec{
+					Deployment: &agentv1alpha1.DeploymentSpec{
+						Image: "gcr.io/my-proj/agent",
+					},
+					Integration: &agentv1alpha1.AgentIntegrationSpec{
+						GoogleChat: &agentv1alpha1.GoogleChatSpec{
+							Enabled:          ptr.To(true),
+							ProjectID:        "my-gcp-project",
+							SubscriptionName: "chat-sub",
+							AllowedUsers:     allowed,
+							HomeChannel:      "spaces/123",
+						},
+					},
+				},
+			}
+
+			dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+			container := dep.Spec.Template.Spec.Containers[0]
+			envMap := make(map[string]corev1.EnvVar)
+			for _, env := range container.Env {
+				envMap[env.Name] = env
+			}
+
+			if got := envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value; got != "" {
+				t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS empty, got %q", got)
+			}
+			if _, present := envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"]; present {
+				t.Error("GOOGLE_CHAT_ALLOW_ALL_USERS is set: the permissive backstop was deleted in P8-T1 and must never be rendered")
+			}
+		})
+	}
+}
+
+// TestBuildDeploymentAllowedUsersDropsBlankEntries proves the partially-blank
+// case: a list mixing real principals with blanks renders only the principals,
+// so a stray comma cannot smuggle a meaningless member into the in-pod allowlist.
+func TestBuildDeploymentAllowedUsersDropsBlankEntries(t *testing.T) {
 	agent := &agentv1alpha1.Agent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-agent",
-			Namespace: "my-ns",
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
 		Spec: agentv1alpha1.AgentSpec{
-			Deployment: &agentv1alpha1.DeploymentSpec{
-				Image: "gcr.io/my-proj/agent",
-			},
+			Deployment: &agentv1alpha1.DeploymentSpec{Image: "gcr.io/my-proj/agent"},
 			Integration: &agentv1alpha1.AgentIntegrationSpec{
 				GoogleChat: &agentv1alpha1.GoogleChatSpec{
 					Enabled:          ptr.To(true),
 					ProjectID:        "my-gcp-project",
 					SubscriptionName: "chat-sub",
-					AllowedUsers:     []string{},
-					HomeChannel:      "spaces/123",
+					AllowedUsers:     []string{"user-a@example.com", "", "  ", "user-b@example.com"},
+				},
+				Slack: &agentv1alpha1.SlackSpec{
+					Enabled:      ptr.To(true),
+					AllowedUsers: []string{"", "U123", " "},
 				},
 			},
 		},
 	}
 
 	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
-	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
-	for _, env := range container.Env {
+	for _, env := range dep.Spec.Template.Spec.Containers[0].Env {
 		envMap[env.Name] = env
 	}
 
-	if envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value != "" {
-		t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS empty, got %s", envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value)
+	if got, want := envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value, "user-a@example.com,user-b@example.com"; got != want {
+		t.Errorf("GOOGLE_CHAT_ALLOWED_USERS = %q, want %q", got, want)
 	}
-	if envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value != "true" {
-		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS true, got %s", envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value)
+	if got, want := envMap["SLACK_ALLOWED_USERS"].Value, "U123"; got != want {
+		t.Errorf("SLACK_ALLOWED_USERS = %q, want %q", got, want)
+	}
+	for _, name := range []string{"GOOGLE_CHAT_ALLOW_ALL_USERS", "SLACK_ALLOW_ALL_USERS"} {
+		if _, present := envMap[name]; present {
+			t.Errorf("%s is set: the permissive backstop was deleted in P8-T1", name)
+		}
 	}
 }
 
@@ -797,7 +859,13 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	}
 }
 
-func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
+// TestBuildDeploymentSlackDegenerateAllowlistFailsClosed replaces the former
+// TestBuildDeploymentSlackAllowAllUsers, which asserted that `allowedUsers: [""]`
+// — the exact shape an unset envsubst variable produced — renders
+// SLACK_ALLOW_ALL_USERS=true. That was the bypass. P8-T1 deleted it, so the
+// inverted property is asserted here: the pod gets an empty allowlist and no
+// permissive flag, and the in-pod authorizer therefore admits nobody.
+func TestBuildDeploymentSlackDegenerateAllowlistFailsClosed(t *testing.T) {
 	agent := &agentv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-agent",
@@ -820,11 +888,11 @@ func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 		envMap[env.Name] = env
 	}
 
-	if _, ok := envMap["SLACK_ALLOWED_USERS"]; ok {
-		t.Errorf("expected SLACK_ALLOWED_USERS not to be set when allowedUsers is empty")
+	if got := envMap["SLACK_ALLOWED_USERS"].Value; got != "" {
+		t.Errorf("expected SLACK_ALLOWED_USERS empty for a blank-only allowlist, got %q", got)
 	}
-	if envMap["SLACK_ALLOW_ALL_USERS"].Value != "true" {
-		t.Errorf("expected SLACK_ALLOW_ALL_USERS true, got %s", envMap["SLACK_ALLOW_ALL_USERS"].Value)
+	if _, present := envMap["SLACK_ALLOW_ALL_USERS"]; present {
+		t.Error("SLACK_ALLOW_ALL_USERS is set: the permissive backstop was deleted in P8-T1 and must never be rendered")
 	}
 }
 

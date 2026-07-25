@@ -7,7 +7,7 @@
 #   - injects AGENT_TIER=cluster-admin (so submit-suggestion branches under cluster-admin-agent/);
 #   - binds the pre-created read-only ServiceAccount cluster-admin-agent (controller references, never mints);
 #   - renders the CLOSED chat allowlist to GOOGLE_CHAT_ALLOWED_USERS and NEVER emits
-#     GOOGLE_CHAT_ALLOW_ALL_USERS (the permissive default an empty allowlist would trigger).
+#     GOOGLE_CHAT_ALLOW_ALL_USERS, which P8-T1 deleted outright (V-CTR-014).
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: Agent
 metadata:
@@ -45,7 +45,7 @@ spec:
       projectId: kube-agents-gkedemos
       topicName: kubeagents-cluster-admin-cluster-a-events
       subscriptionName: kubeagents-cluster-admin-cluster-a-events-sub
-      # CLOSED allowlist (A4 / acceptance d): the render must carry these members and must NOT emit the
-      # GOOGLE_CHAT_ALLOW_ALL_USERS backstop (which only appears for an empty/absent allowlist).
+      # CLOSED allowlist (A4 / acceptance d, 06 §1.2 V-7): the render must carry these members and must
+      # NOT emit the GOOGLE_CHAT_ALLOW_ALL_USERS backstop, which no longer exists anywhere (V-CTR-014).
       allowedUsers:
         - users/REPLACE_WITH_CLUSTER_ADMIN_ID

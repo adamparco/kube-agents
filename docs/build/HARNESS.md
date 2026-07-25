@@ -52,19 +52,19 @@ Each invocation of `/harness-run` does **one coherent unit of work** and then ch
 
 The seven steps, as encoded in `harness-run`:
 
-| Step             | What happens                                                                                     |
-| ---------------- | ------------------------------------------------------------------------------------------------ |
-| 0. Orient        | Read the ledger, the invariants, and the current phase in the roadmap. Stop if a blocker/halt is open. |
-| 1. Pick the unit | First `todo`/`in-progress` task in the current phase breakdown. Keep it finishable in one run.    |
-| 2. Break down    | On entering a new phase, expand its **Work** items into individually-verifiable tasks (`P<N>-T1`…). |
-| 3. Detailed design | Only for architecturally non-trivial or spec-silent tasks; otherwise skip to implement.        |
-| 4. Implement     | Branch, ground new code on existing patterns, format + build, Conventional Commits, scoped staging. |
-| 5. Verify        | Run phase **Accept** + touched **Verification** suites on the right target. Evidence required.    |
-| 6. Regress       | Re-run prior-phase Accept + the two load-bearing suites. A regression is a halt, not a note.      |
-| 7. Gate + checkpoint | Run the invariants checklist, update the ledger, open a PR, advance the phase.                |
+| Step                 | What happens                                                                                           |
+| -------------------- | ------------------------------------------------------------------------------------------------------ |
+| 0. Orient            | Read the ledger, the invariants, and the current phase in the roadmap. Stop if a blocker/halt is open. |
+| 1. Pick the unit     | First `todo`/`in-progress` task in the current phase breakdown. Keep it finishable in one run.         |
+| 2. Break down        | On entering a new phase, expand its **Work** items into individually-verifiable tasks (`P<N>-T1`…).    |
+| 3. Detailed design   | Only for architecturally non-trivial or spec-silent tasks; otherwise skip to implement.                |
+| 4. Implement         | Branch, ground new code on existing patterns, format + build, Conventional Commits, scoped staging.    |
+| 5. Verify            | Run phase **Accept** + touched **Verification** suites on the right target. Evidence required.         |
+| 6. Regress           | Re-run prior-phase Accept + the two load-bearing suites. A regression is a halt, not a note.           |
+| 7. Gate + checkpoint | Run the invariants checklist, update the ledger, open a PR, advance the phase.                         |
 
 **Verification is adversarial.** A negative test that silently no-ops reads as green, so every
-"passed" negative test is re-confirmed: did the admission policy actually *deny* (non-zero apply,
+"passed" negative test is re-confirmed: did the admission policy actually _deny_ (non-zero apply,
 explicit policy message), or was the manifest just malformed? "Verified" is never reported without a
 command, log, or PR as evidence.
 
@@ -72,15 +72,15 @@ command, log, or PR as evidence.
 
 ## 3. Components and where they live
 
-| Piece               | Path                                        | Role                                                        |
-| ------------------- | ------------------------------------------- | ---------------------------------------------------------- |
-| Design set          | `docs/design/` (01–08)                      | Source of truth; roadmap in `07-implementation-roadmap.md` |
-| Ledger              | `docs/build/LEDGER.md`                       | Persistent build state; read first, updated last every run |
-| Phase breakdowns    | `docs/build/phase-<N>.md`                    | Concrete task list for a phase, created on entry           |
-| Orchestrator skill  | `.claude/skills/harness-run/SKILL.md`        | The per-phase loop (the 7 steps above)                     |
-| Verify skill        | `.claude/skills/harness-verify/SKILL.md`     | Runs Accept + Verification suites, logs results with evidence |
-| Invariants gate     | `.claude/harness/invariants.md`              | Load-bearing rules, checked before every merge             |
-| Verify workflow     | `.claude/harness/verify-phase.workflow.js`   | Optional parallel fan-out: one agent per suite, then adversarial confirm |
+| Piece              | Path                                       | Role                                                                     |
+| ------------------ | ------------------------------------------ | ------------------------------------------------------------------------ |
+| Design set         | `docs/design/` (01–08)                     | Source of truth; roadmap in `07-implementation-roadmap.md`               |
+| Ledger             | `docs/build/LEDGER.md`                     | Persistent build state; read first, updated last every run               |
+| Phase breakdowns   | `docs/build/phase-<N>.md`                  | Concrete task list for a phase, created on entry                         |
+| Orchestrator skill | `.claude/skills/harness-run/SKILL.md`      | The per-phase loop (the 7 steps above)                                   |
+| Verify skill       | `.claude/skills/harness-verify/SKILL.md`   | Runs Accept + Verification suites, logs results with evidence            |
+| Invariants gate    | `.claude/harness/invariants.md`            | Load-bearing rules, checked before every merge                           |
+| Verify workflow    | `.claude/harness/verify-phase.workflow.js` | Optional parallel fan-out: one agent per suite, then adversarial confirm |
 
 The **verify workflow** is an optimization: instead of running verification suites serially, it
 dispatches each suite to its own subagent (`pipeline`, no barrier), then pipes each result into a
@@ -146,16 +146,16 @@ harness also stops on its own at any halt condition and surfaces the reason in t
 Run over 2026-07-23 → 2026-07-24, the harness built kube-agents end-to-end: **all eight roadmap
 phases (0–7) delivered and merged to `main`**, each as its own PR with green CI.
 
-| Phase | Scope                                             | PR  |
-| ----- | ------------------------------------------------- | --- |
+| Phase | Scope                                             | PR    |
+| ----- | ------------------------------------------------- | ----- |
 | 0     | Foundations (CRD, controller, admission backstop) | #1/#2 |
-| 1     | Read-only Platform Agent + GitOps loop            | #3  |
-| 2     | Cluster Admin Agent + cascade + router            | #4  |
-| 3     | Developer Team Agent + namespace-isolation proof  | #5  |
-| 4     | Coordination & knowledge (push-first + OKF)       | #6  |
-| 5     | Security gate & hardening                          | #7  |
-| 6     | Failure-isolation & resilience (chaos suite)      | #8  |
-| 7     | Cloud-agnostic seams                              | #9  |
+| 1     | Read-only Platform Agent + GitOps loop            | #3    |
+| 2     | Cluster Admin Agent + cascade + router            | #4    |
+| 3     | Developer Team Agent + namespace-isolation proof  | #5    |
+| 4     | Coordination & knowledge (push-first + OKF)       | #6    |
+| 5     | Security gate & hardening                         | #7    |
+| 6     | Failure-isolation & resilience (chaos suite)      | #8    |
+| 7     | Cloud-agnostic seams                              | #9    |
 
 Verification ran on a live Kind cluster (inner loop) with scratch-cloud checks flagged and deferred
 where infra wasn't provisioned — **deferred, never faked.** Each phase left a consolidated,

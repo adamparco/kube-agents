@@ -90,5 +90,7 @@ spec:
   integration:
     googleChat:
       enabled: ${DEVELOPER_TEAM_GOOGLE_CHAT_ENABLED}
+${DEVELOPER_TEAM_ALLOWED_USERS_BLOCK}
     slack:
       enabled: ${DEVELOPER_TEAM_SLACK_ENABLED}
+${DEVELOPER_TEAM_SLACK_ALLOWED_USERS_BLOCK}

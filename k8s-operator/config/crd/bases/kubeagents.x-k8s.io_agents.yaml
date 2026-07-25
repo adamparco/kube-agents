@@ -7111,11 +7111,20 @@ spec:
                       description: GoogleChat configures the Google Chat integration.
                       properties:
                         allowedUsers:
-                          description:
-                            AllowedUsers is a list of allowed users. If not
-                            present, all users will be allowed.
+                          description: |-
+                            AllowedUsers is the closed allowlist of Google Chat principals. When the
+                            integration is enabled it must contain at least one non-blank entry; an
+                            empty or all-blank list is not an allowlist, and there is no permissive
+                            fallback (06 §1.2 V-7).
+
+                            The bounds are load-bearing, not cosmetic: the API server refuses to install
+                            a CRD whose CEL rules it cannot cost-bound, and a per-entry rule over an
+                            unbounded list of unbounded strings is unbounded. MaxItems/MaxLength are what
+                            make the V-7 rule above installable at all.
                           items:
+                            maxLength: 253
                             type: string
+                          maxItems: 256
                           type: array
                           x-kubernetes-list-type: set
                         enabled:
@@ -7155,21 +7164,26 @@ spec:
                             "!has(self.enabled) || self.enabled == false || (has(self.projectId)
                             && has(self.topicName) && has(self.subscriptionName))"
                         - message:
-                            allowedUsers must be non-empty when the Google Chat
-                            integration is enabled (an empty allowlist admits all authenticated
-                            users)
+                            spec.integration.googleChat.allowedUsers must contain
+                            at least one non-blank entry when the Google Chat integration
+                            is enabled (an empty or all-blank allowlist is not an allowlist)
                           rule:
                             "!has(self.enabled) || self.enabled == false || (has(self.allowedUsers)
-                            && size(self.allowedUsers) > 0)"
+                            && self.allowedUsers.exists(u, u.trim().size() > 0))"
                     slack:
                       description: Slack configures the Slack integration.
                       properties:
                         allowedUsers:
-                          description:
-                            AllowedUsers is a list of allowed member IDs.
-                            If not present, all users will be allowed.
+                          description: |-
+                            AllowedUsers is the closed allowlist of Slack member IDs. When the
+                            integration is enabled it must contain at least one non-blank entry; an
+                            empty or all-blank list is not an allowlist, and there is no permissive
+                            fallback (06 §1.2 V-7). The bounds make the V-7 CEL rule cost-boundable and
+                            therefore installable — see the GoogleChatSpec field above.
                           items:
+                            maxLength: 253
                             type: string
+                          maxItems: 256
                           type: array
                           x-kubernetes-list-type: set
                         appTokenSecretRef:
@@ -7251,11 +7265,12 @@ spec:
                             "!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef)
                             && has(self.appTokenSecretRef))"
                         - message:
-                            allowedUsers must be non-empty when the Slack integration
-                            is enabled (an empty allowlist admits all authenticated users)
+                            spec.integration.slack.allowedUsers must contain at
+                            least one non-blank entry when the Slack integration is enabled
+                            (an empty or all-blank allowlist is not an allowlist)
                           rule:
                             "!has(self.enabled) || self.enabled == false || (has(self.allowedUsers)
-                            && size(self.allowedUsers) > 0)"
+                            && self.allowedUsers.exists(u, u.trim().size() > 0))"
                   type: object
                 parentRef:
                   description:

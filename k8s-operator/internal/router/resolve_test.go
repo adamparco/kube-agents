@@ -380,13 +380,15 @@ func TestAuthorize_FailClosed(t *testing.T) {
 	}
 }
 
-// TestAuthorize_IgnoresPodEnvAllowAllDefault documents the load-bearing inversion: the operator renders
-// GOOGLE_CHAT_ALLOW_ALL_USERS=true for an empty allowlist (permissive in-pod default), but the router,
-// given that SAME empty allowlist, refuses — it reads only AllowedUsers, never an ALLOW_ALL flag.
-func TestAuthorize_IgnoresPodEnvAllowAllDefault(t *testing.T) {
-	// This is exactly the CR state that makes the operator emit ALLOW_ALL_USERS=true.
-	permissiveInPod := Target{Handle: "@cluster-admin-cluster-a", AllowedUsers: nil}
-	if d := Authorize(permissiveInPod, "users/anyone"); d.Allowed {
-		t.Fatalf("router honored the pod ALLOW_ALL default: allowed=%v reason=%q; must be fail-closed", d.Allowed, d.Reason)
+// TestAuthorize_EmptyAllowlistRefusesEveryone pins the rule that made the router
+// the one layer never affected by the pre-P8-T1 bypass: given an allowlist that
+// names nobody, it refuses everybody. It reads only AllowedUsers and no
+// environment flag, so the deleted *_ALLOW_ALL_USERS backstop could not reach it
+// then and nothing can widen it now (V-CTR-014).
+func TestAuthorize_EmptyAllowlistRefusesEveryone(t *testing.T) {
+	// This is the CR state that used to make the operator emit ALLOW_ALL_USERS=true.
+	namesNobody := Target{Handle: "@cluster-admin-cluster-a", AllowedUsers: nil}
+	if d := Authorize(namesNobody, "users/anyone"); d.Allowed {
+		t.Fatalf("router allowed a sender against an allowlist that names nobody: allowed=%v reason=%q; must be fail-closed", d.Allowed, d.Reason)
 	}
 }

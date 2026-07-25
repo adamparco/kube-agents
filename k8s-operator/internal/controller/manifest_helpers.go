@@ -187,6 +187,25 @@ func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSp
 // annotates the agent KSA at runtime; the ServiceAccount (with its Workload Identity annotation) is
 // pre-created via GitOps (examples/gitops-repo/policy/rbac-overlay/) and only referenced by name.
 
+// joinNonBlank renders an allowlist for the pod environment, dropping entries
+// that are empty or pure whitespace.
+//
+// A blank entry names no principal, so carrying it into the pod can only make
+// the in-pod allowlist look non-empty when it is not. Admission already rejects
+// an all-blank list (06 §1.2 V-7); this keeps a partially-blank one from
+// smuggling a meaningless member past the authorizer. There is deliberately no
+// "allow all" branch here — an allowlist that names nobody is a configuration
+// error, and the permissive *_ALLOW_ALL_USERS backstop was removed in P8-T1.
+func joinNonBlank(users []string) string {
+	kept := make([]string, 0, len(users))
+	for _, u := range users {
+		if trimmed := strings.TrimSpace(u); trimmed != "" {
+			kept = append(kept, trimmed)
+		}
+	}
+	return strings.Join(kept, ",")
+}
+
 // defaultSecretRef returns ref if provided, otherwise defaults to secretName with defaultKey.
 func defaultSecretRef(ref *corev1.SecretKeySelector, secretName, defaultKey string) *corev1.SecretKeySelector {
 	if ref != nil {

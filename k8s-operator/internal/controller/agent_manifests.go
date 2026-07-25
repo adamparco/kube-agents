@@ -430,23 +430,13 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 				},
 				{
 					Name:  "GOOGLE_CHAT_ALLOWED_USERS",
-					Value: strings.Join(gchat.AllowedUsers, ","),
+					Value: joinNonBlank(gchat.AllowedUsers),
 				},
 				{
 					Name:  "GOOGLE_CHAT_HOME_CHANNEL",
 					Value: gchat.HomeChannel,
 				},
 			}...)
-			allowAll := len(gchat.AllowedUsers) == 0
-			if len(gchat.AllowedUsers) == 1 && gchat.AllowedUsers[0] == "" {
-				allowAll = true
-			}
-			if allowAll {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "GOOGLE_CHAT_ALLOW_ALL_USERS",
-					Value: "true",
-				})
-			}
 		}
 		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
 			envVars = append(envVars,
@@ -459,18 +449,10 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.AppTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_APP_TOKEN")},
 				},
 			)
-			allowAllSlack := len(slack.AllowedUsers) == 0 || (len(slack.AllowedUsers) == 1 && slack.AllowedUsers[0] == "")
-			if allowAllSlack {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "SLACK_ALLOW_ALL_USERS",
-					Value: "true",
-				})
-			} else {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "SLACK_ALLOWED_USERS",
-					Value: strings.Join(slack.AllowedUsers, ","),
-				})
-			}
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "SLACK_ALLOWED_USERS",
+				Value: joinNonBlank(slack.AllowedUsers),
+			})
 			if slack.HomeChannel != "" {
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "SLACK_HOME_CHANNEL",

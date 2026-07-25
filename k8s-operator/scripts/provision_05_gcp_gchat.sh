@@ -58,8 +58,8 @@ if [ -z "${PROJECT_NUMBER:-}" ]; then
   print_success "Project Number resolved: $PROJECT_NUMBER"
 fi
 
-DEFAULT_USERS=""
-init_var "ALLOWED_USERS" "$DEFAULT_USERS" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
+# The allowlist is closed: there is no "leave it empty to allow everyone" option.
+init_var_required "ALLOWED_USERS" "Enter Allowed Google Chat Users (comma separated). At least one is required — there is no allow-all option"
 init_var "CHAT_TOPIC_NAME" "platform-agent-chat-events" "Enter Pub/Sub Topic Name"
 init_var "CHAT_SUB_NAME" "platform-agent-chat-events-sub" "Enter Pub/Sub Subscription Name"
 init_var "GOOGLE_CHAT_MODE" "default" "Enter Google Chat Output Mode (default or debug)"
