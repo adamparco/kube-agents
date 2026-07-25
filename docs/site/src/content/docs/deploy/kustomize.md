@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-The shipping Kustomize base at [`deploy/kustomize/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize) is intentionally small — the operator lays down most of the concrete Kubernetes objects (`Deployment`, `ConfigMap`s, RBAC) itself when it reconciles a `PlatformAgent` CR.
+The shipping Kustomize base at [`deploy/kustomize/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize) is intentionally small — the operator lays down most of the concrete Kubernetes objects (`Deployment`, `ConfigMap`s, RBAC) itself when it reconciles an `Agent` CR.
 
 ## What's in the repo today
 
@@ -55,7 +55,7 @@ The exposed ports:
 
 `k8s-operator/config/` holds larger Kustomize bases the operator manager uses. Notable subtrees:
 
-- `config/crd/` — the `PlatformAgent` CRD.
+- `config/crd/` — the `Agent` CRD.
 - `config/rbac/` — ClusterRoles + bindings for the manager.
 - `config/webhook/` — admission webhook config (validating + mutating).
 - `config/manager/` — Deployment for the controller manager.

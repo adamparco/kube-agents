@@ -1,8 +1,8 @@
 # Kubernetes Agentic Harness Operator
 
-This directory contains the Kubernetes Operator for the `kube-agents` harness. The operator defines and manages the lifecycle of agent custom resources:
+This directory contains the Kubernetes Operator for the `kube-agents` harness. The operator defines and manages the lifecycle of one agent custom resource:
 
-- **PlatformAgent**: Manages platform-level configuration and capabilities.
+- **Agent** (`kubeagents.x-k8s.io/v1alpha1`): one kind for all three tiers, discriminated by `spec.tier` — `platform` (fleet-scoped), `cluster-admin` (one per cluster), and `developer-team` (one per tenant namespace). The tier is immutable after creation, and every non-platform tier must name a `parentRef` that resolves.
 
 The operator is built using the Kubebuilder framework and is written in Go.
 
@@ -58,6 +58,8 @@ graph TD
     A --> J[provision_09_deploy_litellm.sh]
     A --> K[provision_10_deploy_github_minter.sh]
     A --> L[provision_11_deploy_inference_replay.sh]
+    A --> M[provision_12_deploy_agent_tiers.sh]
+    A --> N[provision_13_apply_network_policies.sh]
 ```
 
 1. **[provision_01_gcp_cluster.sh](scripts/provision_01_gcp_cluster.sh)**:
@@ -84,11 +86,11 @@ graph TD
    - Enables GCP Service APIs (`pubsub.googleapis.com` and `chat.googleapis.com`).
    - Creates the Pub/Sub Chat Event Topic and Subscriber Subscription for Google Chat events (skipped if `GOOGLE_CHAT_ENABLED=false`).
    - Configures IAM policy bindings allowing the Platform Agent GSA to read incoming messages from the Pub/Sub subscription.
-   - Note: Access can be restricted to specific users by configuring `GOOGLE_CHAT_ALLOWED_USERS`.
+   - Note: `ALLOWED_USERS` is required when Google Chat is enabled — it renders into the pod's `GOOGLE_CHAT_ALLOWED_USERS`, and an empty allowlist is rejected by admission.
 
 6. **[provision_06_slack.sh](scripts/provision_06_slack.sh)**:
    - Configures Slack integration parameters, bot tokens, app tokens, and home channel settings (skipped if `SLACK_ENABLED=false`).
-   - Note: Access can be restricted to specific users by configuring `SLACK_ALLOWED_USERS`.
+   - Note: `SLACK_ALLOWED_USERS` is required when Slack is enabled — an empty allowlist is rejected by admission, not silently opened up.
 
 7. **[provision_07_gcp_k8s_secrets.sh](scripts/provision_07_gcp_k8s_secrets.sh)**:
    - Prompts for or reads the `MODEL_PROVIDER` and corresponding `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`.
@@ -115,6 +117,17 @@ graph TD
     - Opt-in step (skipped unless `INFERENCE_REPLAY_ENABLED=true`).
     - Deploys the Inference Replay proxy in front of the LiteLLM gateway: a PVC-backed cache, a renamed `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service that routes through the proxy. Always installs in pass-through mode (`mode=off`); toggle to `on` at runtime via `kubectl patch configmap inference-replay-config`.
     - For background and usage, see the [Inference Replay README](../examples/inference-replay/README.md).
+
+12. **[provision_12_deploy_agent_tiers.sh](scripts/provision_12_deploy_agent_tiers.sh)**:
+    - Deploys the two tiers below the platform agent, so a fresh install exercises the full hierarchy rather than a single agent.
+    - For each of the **cluster-admin** and **developer-team** tiers: creates the in-cluster identity, the API-server secret, and the `Agent` CR. The GSAs and Workload Identity bindings come from step 04.
+    - `CLUSTER_ADMIN_ENABLED=false` skips the cluster-admin tier; `DEVELOPER_TEAM_NAMESPACE=''` skips the tenant tier. The developer-team tier requires the cluster-admin tier — the webhook rejects a child whose `parentRef` does not resolve.
+
+13. **[provision_13_apply_network_policies.sh](scripts/provision_13_apply_network_policies.sh)**:
+    - Applies the per-tier egress allowlist to every agent, then the tenant namespace's default-deny floor. Allowlist first, floor second: floor-first would cut a Ready agent pod off from DNS and inference until the next `kubectl` call lands.
+    - Runs last, after every tier exists.
+    - **Enforcement is a property of the CNI, not of this step.** A cluster accepts `NetworkPolicy` objects whether or not it enforces them: GKE enforces only with Dataplane V2 or Calico, and kindnet enforces nothing. The step reports which case it is in rather than implying containment it cannot deliver.
+    - Knobs: `EGRESS_POLICIES_ENABLED=false`, `WORKLOAD_IDENTITY_ENABLED=true`, `GKE_DATAPLANE=auto|v1|v2`, `HUB_INFERENCE_CIDR` / `HUB_MINTY_CIDR` / `MCP_GROUNDING_CIDRS`.
 
 #### Fast Local Development & Testing
 
@@ -154,7 +167,9 @@ Or run the master teardown script directly:
 
 ```mermaid
 graph TD
-    A[teardown.sh] --> B[teardown_11_deploy_inference_replay.sh]
+    A[teardown.sh] --> A1[teardown_13_apply_network_policies.sh]
+    A --> A2[teardown_12_deploy_agent_tiers.sh]
+    A --> B[teardown_11_deploy_inference_replay.sh]
     A --> C[teardown_10_deploy_github_minter.sh]
     A --> D[teardown_09_deploy_litellm.sh]
     A --> E[teardown_08_deploy_platform_agent.sh]
@@ -168,33 +183,41 @@ graph TD
     A --> M[teardown_01_gcp_cluster.sh]
 ```
 
-1. **[teardown_10_deploy_github_minter.sh](scripts/teardown_10_deploy_github_minter.sh)**:
+1. **[teardown_13_apply_network_policies.sh](scripts/teardown_13_apply_network_policies.sh)**:
+   - Removes the per-tier egress NetworkPolicies and the tenant default-deny floor.
+
+2. **[teardown_12_deploy_agent_tiers.sh](scripts/teardown_12_deploy_agent_tiers.sh)**:
+   - Deletes the cluster-admin and developer-team `Agent` CRs and the identities and secrets created for them.
+
+3. **[teardown_10_deploy_github_minter.sh](scripts/teardown_10_deploy_github_minter.sh)**:
    - Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
 
-2. **[teardown_09_deploy_litellm.sh](scripts/teardown_09_deploy_litellm.sh)**:
+4. **[teardown_09_deploy_litellm.sh](scripts/teardown_09_deploy_litellm.sh)**:
    - Undeploys the LiteLLM Gateway from the cluster.
 
-3. **[teardown_08_deploy_platform_agent.sh](scripts/teardown_08_deploy_platform_agent.sh)**:
-   - Deletes the applied `PlatformAgent` Custom Resource (safely handling finalizer blocks if they timeout).
+5. **[teardown_08_deploy_platform_agent.sh](scripts/teardown_08_deploy_platform_agent.sh)**:
+   - Deletes the applied platform-tier `Agent` Custom Resource (safely handling finalizer blocks if they timeout).
    - Deletes the local generated `platform-agent.yaml` manifest.
 
-4. **[teardown_07_gcp_k8s_secrets.sh](scripts/teardown_07_gcp_k8s_secrets.sh)**:
+6. **[teardown_07_gcp_k8s_secrets.sh](scripts/teardown_07_gcp_k8s_secrets.sh)**:
    - Deletes the GKE secret `platform-agent-secrets`.
 
-5. **[teardown_06_slack.sh](scripts/teardown_06_slack.sh)**:
+7. **[teardown_06_slack.sh](scripts/teardown_06_slack.sh)**:
    - Resets Slack integration settings in `vars.sh`.
 
-6. **[teardown_05_gcp_gchat.sh](scripts/teardown_05_gcp_gchat.sh)**:
+8. **[teardown_05_gcp_gchat.sh](scripts/teardown_05_gcp_gchat.sh)**:
    - Deletes Google Chat Pub/Sub subscriptions and topics.
 
-7. **[teardown_04_gcp_iam.sh](scripts/teardown_04_gcp_iam.sh)**:
+9. **[teardown_04_gcp_iam.sh](scripts/teardown_04_gcp_iam.sh)**:
    - Removes GSA project-level IAM bindings and GKE Workload Identity bindings for the Platform Agent and GitHub Token Minter, and deletes their GSAs.
 
-8. **[teardown_03_gcp_gke_operator.sh](scripts/teardown_03_gcp_gke_operator.sh)**:
-   - Removes the Operator controller manager deployment and CRDs.
+10. **[teardown_03_gcp_gke_operator.sh](scripts/teardown_03_gcp_gke_operator.sh)**:
 
-9. **[teardown_02_gvisor_nodepool.sh](scripts/teardown_02_gvisor_nodepool.sh)**:
-   - Deletes the dedicated GKE Sandbox (gVisor) node pool (defaults to `gvisor-pool`, configurable via `GVISOR_POOL_NAME`) from Google Cloud to deprovision compute without destroying the cluster.
+- Removes the Operator controller manager deployment and CRDs.
+
+11. **[teardown_02_gvisor_nodepool.sh](scripts/teardown_02_gvisor_nodepool.sh)**:
+
+- Deletes the dedicated GKE Sandbox (gVisor) node pool (defaults to `gvisor-pool`, configurable via `GVISOR_POOL_NAME`) from Google Cloud to deprovision compute without destroying the cluster.
 
 - **[dev/teardown_dev_01_gcp_artifact_registry.sh](scripts/dev/teardown_dev_01_gcp_artifact_registry.sh)** (Optional Dev):
   - Deletes the GCP Artifact Registry repository created during local dev rebuilds.
@@ -257,7 +280,7 @@ You can execute individual provisioning steps in order:
    ```bash
    make gcp-provision-07-secrets
    ```
-8. **Step 8: Deploy the PlatformAgent Custom Resource**
+8. **Step 8: Deploy the platform-tier Agent Custom Resource**
    ```bash
    make gcp-provision-08-deploy
    ```
@@ -290,7 +313,7 @@ You can clean up specific layers of the deployment:
    ```bash
    make gcp-teardown-09-litellm
    ```
-4. **Step 8 Teardown: Delete the PlatformAgent Custom Resource**
+4. **Step 8 Teardown: Delete the platform-tier Agent Custom Resource**
    ```bash
    make gcp-teardown-08-deploy
    ```
@@ -378,13 +401,13 @@ ENABLE_WEBHOOKS=false go run ./cmd/main.go
 In another terminal window, apply the sample custom resources to test the controllers:
 
 ```bash
-kubectl apply -f examples/platformagent.yaml
+kubectl apply -f examples/agent.yaml
 ```
 
 Verify that the resources are created and recognized:
 
 ```bash
-kubectl get platformagents --all-namespaces
+kubectl get agents --all-namespaces
 ```
 
 You should see reconciliation logs printed in the terminal where the operator process is running.
@@ -535,7 +558,7 @@ The [Makefile](Makefile) provides several targets to automate development workfl
 
 | Target                                    | Description                                                              |
 | :---------------------------------------- | :----------------------------------------------------------------------- |
-| `make gcp-provision`                      | Bootstraps all GCP, GKE resources, and deploys the PlatformAgent.        |
+| `make gcp-provision`                      | Bootstraps all GCP, GKE resources, and deploys every agent tier.         |
 | `make gcp-teardown`                       | Cleans up and deletes all provisioned GKE/GCP resources.                 |
 | `make gcp-provision-01-cluster`           | Step 1: Provision GKE cluster and initial GCP environment.               |
 | `make gcp-provision-02-gvisor`            | Step 2: Provision gVisor node pool for GKE Sandbox.                      |
@@ -544,15 +567,19 @@ The [Makefile](Makefile) provides several targets to automate development workfl
 | `make gcp-provision-05-gchat`             | Step 5: Setup Google Chat Pub/Sub topic and subscription.                |
 | `make gcp-provision-06-slack`             | Step 6: Setup Slack integration configuration.                           |
 | `make gcp-provision-07-secrets`           | Step 7: Configure secrets directly in GKE.                               |
-| `make gcp-provision-08-deploy`            | Step 8: Deploy the PlatformAgent Custom Resource.                        |
+| `make gcp-provision-08-deploy`            | Step 8: Deploy the platform-tier Agent Custom Resource.                  |
 | `make gcp-provision-09-litellm`           | Step 9: Deploy LiteLLM Gateway.                                          |
 | `make gcp-provision-10-github`            | Step 10: Deploy GitHub Token Minter.                                     |
 | `make gcp-provision-11-inference-replay`  | Step 11: Deploy Inference Replay proxy.                                  |
+| `make gcp-provision-12-agent-tiers`       | Step 12: Deploy the cluster-admin and developer-team Agent CRs.          |
+| `make gcp-provision-13-network-policies`  | Step 13: Apply per-tier egress allowlist + tenant default-deny floor.    |
 | `make dev-rebuild-agent`                  | Fast local iteration: rebuild and redeploy an agent image.               |
+| `make gcp-teardown-13-network-policies`   | Teardown Step 13: Remove agent egress and tenant default-deny policies.  |
+| `make gcp-teardown-12-agent-tiers`        | Teardown Step 12: Remove the cluster-admin and developer-team tiers.     |
 | `make gcp-teardown-11-inference-replay`   | Teardown Step 11: Undeploy Inference Replay proxy.                       |
 | `make gcp-teardown-10-github`             | Teardown Step 10: Delete GitHub Token Minter resources.                  |
 | `make gcp-teardown-09-litellm`            | Teardown Step 9: Undeploy LiteLLM Gateway.                               |
-| `make gcp-teardown-08-deploy`             | Teardown Step 8: Delete the PlatformAgent Custom Resource.               |
+| `make gcp-teardown-08-deploy`             | Teardown Step 8: Delete the platform-tier Agent Custom Resource.         |
 | `make gcp-teardown-07-secrets`            | Teardown Step 7: Clean up Kubernetes secrets.                            |
 | `make gcp-teardown-06-slack`              | Teardown Step 6: Reset Slack integration settings.                       |
 | `make gcp-teardown-05-gchat`              | Teardown Step 5: Delete Google Chat Pub/Sub resources.                   |
@@ -581,6 +608,6 @@ The [Makefile](Makefile) provides several targets to automate development workfl
 
 - **Main Entrypoint**: [main.go](cmd/main.go)
 - **Controllers**:
-  - [PlatformAgent Controller](internal/controller/platformagent_controller.go)
-- **Example Resource**: [platformagent.yaml](examples/platformagent.yaml)
+  - [Agent Controller](internal/controller/agent_controller.go)
+- **Example Resource**: [agent.yaml](examples/agent.yaml)
 - **Makefile**: [Makefile](Makefile)

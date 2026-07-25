@@ -28,7 +28,7 @@ Both accept `--dry-run` to print planned actions without applying them.
 
 ### 03. Operator CRDs + controller
 
-`provision_03_gcp_gke_operator.sh` — Installs the `PlatformAgent` CRD and deploys the operator controller manager into the cluster.
+`provision_03_gcp_gke_operator.sh` — Installs the `Agent` CRD and deploys the operator controller manager into the cluster.
 
 ### 04. IAM + Workload Identity
 
@@ -40,19 +40,19 @@ Both accept `--dry-run` to print planned actions without applying them.
 
 ### 06. Slack (opt-in)
 
-`provision_06_slack.sh` — Only configures Slack if `SLACK_ENABLED=true`. Collects bot token, app token, allowed users, and home channel, and stores them as Kubernetes secrets.
+`provision_06_slack.sh` — Only configures Slack if `SLACK_ENABLED=true`. Collects bot token, app token, allowed users, and home channel, and stores them as Kubernetes secrets. `SLACK_ALLOWED_USERS` is required when Slack is enabled: an empty allowlist is rejected by admission, not silently opened up.
 
 ### 07. LLM API key Secret
 
 `provision_07_gcp_k8s_secrets.sh` — Prompts for the model provider (`gemini` / `anthropic` / `openai`) and API key, and creates the `platform-agent-secrets` Secret in the target namespace.
 
-### 08. PlatformAgent CR
+### 08. Platform-tier Agent CR
 
-`provision_08_deploy_platform_agent.sh` — Renders `platform-agent.yaml` from a template (via `envsubst`), then `kubectl apply`s the `PlatformAgent` CR to trigger the operator's reconciliation.
+`provision_08_deploy_platform_agent.sh` — Renders `platform-agent.yaml` from a template (via `envsubst`), then `kubectl apply`s the platform-tier `Agent` CR to trigger the operator's reconciliation.
 
 ### 09. LiteLLM Gateway
 
-`provision_09_deploy_litellm.sh` — Deploys the LiteLLM Deployment + Service. The `PlatformAgent` config references this Service (`litellm`) as its Completions API endpoint.
+`provision_09_deploy_litellm.sh` — Deploys the LiteLLM Deployment + Service. The `Agent` config references this Service (`litellm`, port 80 → container port 4000) as its Completions API endpoint.
 
 ### 10. Minty (GitHub Token Minter)
 
@@ -61,6 +61,22 @@ Both accept `--dry-run` to print planned actions without applying them.
 ### 11. Inference replay (opt-in)
 
 `provision_11_deploy_inference_replay.sh` — Only runs if `INFERENCE_REPLAY_ENABLED=true`. Deploys the [inference-replay proxy](/kube-agents/concepts/inference-gateway/#inference-replay) with a PVC for the cache and re-points the `litellm` Service to route through the proxy.
+
+### 12. Child agent tiers
+
+`provision_12_deploy_agent_tiers.sh` — Step 08 deploys the platform tier; this step adds the two tiers below it, so a fresh install exercises the full hierarchy instead of a single agent. For each of the **cluster-admin** and **developer-team** tiers it creates the in-cluster identity, the API-server secret, and the `Agent` CR. The GSAs and Workload Identity bindings come from step 04.
+
+Set `CLUSTER_ADMIN_ENABLED=false` to skip the cluster-admin tier, or `DEVELOPER_TEAM_NAMESPACE=''` to skip the tenant tier. The developer-team tier requires the cluster-admin tier — the webhook rejects a child whose `parentRef` does not resolve.
+
+### 13. Network policies
+
+`provision_13_apply_network_policies.sh` — Applies the per-tier egress allowlist to each agent, then the tenant namespace's default-deny floor. Runs last, after every tier exists: allowlist first and floor second, because floor-first would cut a Ready agent pod off from DNS and inference for as long as the next `kubectl` call takes.
+
+:::caution[Enforcement is a property of the CNI, not of this step]
+A cluster accepts `NetworkPolicy` objects whether or not it can enforce them. On GKE, enforcement needs **Dataplane V2 or Calico**; kindnet accepts every policy and enforces nothing. The step reports which case it is in rather than implying containment it cannot deliver, and the verification harness treats an egress claim on a non-enforcing dataplane as `deferred`, never `pass`.
+:::
+
+Knobs: `EGRESS_POLICIES_ENABLED=false` to skip entirely, `WORKLOAD_IDENTITY_ENABLED=true` to append the narrow metadata-server allow, `GKE_DATAPLANE=auto|v1|v2`, and `HUB_INFERENCE_CIDR` / `HUB_MINTY_CIDR` / `MCP_GROUNDING_CIDRS` for remote-hub topology.
 
 ## Teardown steps
 
@@ -73,6 +89,6 @@ Mirror the provisioning steps in reverse. Full table on [Uninstall](/kube-agents
 
 ## Common gotchas
 
-- **cert-manager missing.** Step 02 will fail if cert-manager isn't installed. Install it once per cluster; the provisioner is idempotent so you can re-run.
+- **cert-manager.** The operator's admission webhook needs it. Step 03 installs it for you when `certificates.cert-manager.io` is absent, so there is nothing to do by hand; on Autopilot it is deployed with leader election disabled.
 - **`vars.sh` collision.** If you rerun the provisioner against a different project without wiping `vars.sh`, you'll target the previous project. Delete `vars.sh` to reset.
 - **Autopilot leader election.** cert-manager on Autopilot needs leader election disabled — see [Prerequisites](/kube-agents/install/prerequisites/#gke-autopilot-install).

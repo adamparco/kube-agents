@@ -29,7 +29,7 @@ import { Aside, CardGrid, LinkCard } from "@astrojs/starlight/components";
 
 It ships as a small set of components:
 
-- A **Kubernetes operator** (`k8s-operator`, Go / Kubebuilder) that reconciles a `PlatformAgent` custom resource.
+- A **Kubernetes operator** (`k8s-operator`, Go / Kubebuilder) that reconciles an `Agent` custom resource (one kind, three tiers).
 - A **Platform Agent** Deployment (running the [Hermes runtime](https://github.com/NousResearch/hermes-agent), `nousresearch/hermes-agent`) with an opinionated persona, an MCP-based Kubernetes toolset, and a library of skills.
 - An **inference gateway** — [LiteLLM](https://litellm.ai) for hosted models (Gemini, Anthropic, OpenAI) or [vLLM](https://vllm.ai) for local models on GPU nodes.
 
@@ -99,7 +99,7 @@ flowchart LR
     GC -->|Pub/Sub| PA
     SL -->|Socket Mode| PA
     CR -->|scheduled prompts| PA
-    OP -->|reconciles PlatformAgent CR| PA
+    OP -->|reconciles Agent CR| PA
     PA -->|Completions API| LM
     LM --> LLM
     PA -->|submit-suggestion skill| MT

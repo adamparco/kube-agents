@@ -38,6 +38,11 @@ python3 local-dev/tests/cli-contract.py
 # 09 §14's own lints (V-MET-010/012/013-for-check-IDs). They were written `L0` and never built, so
 # 09 §5.1 lost two load-bearing components and 09 §5.2 five contracts with nothing to notice (LSN-014).
 python3 local-dev/tests/spec-ids.py
+# Documentation a reader ACTS on, checked against the build (P8-T7). Three of the 74 falsehoods it
+# first found were created by earlier units of phase 8 itself: P8-T1 deleted the allow-all escape
+# hatch and left two documents still promising it, and P8-T3 shipped provisioning step 13 with no
+# `make` target while every step list stopped at 11. Docs drift on the same schedule as code.
+python3 local-dev/tests/docs-truth.py
 
 # --- repository mechanics (LSN-012) ---------------------------------------------------------
 # Which remote carries the work, and does `main` point at it? Local main tracked `upstream/main`

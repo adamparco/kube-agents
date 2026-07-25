@@ -65,8 +65,9 @@ export ALLOWED_USERS=''
 # ─── Slack ────────────────────────────────────────────────────────────────────
 # Socket Mode. The bot token is xoxb-…, the app token xapp-… . Two things are easy to miss:
 #   * The bot must be invited to a channel (`/invite @your-agent`) or it sees no messages at all.
-#   * An empty SLACK_ALLOWED_USERS means ALL workspace users may drive the agent. Ship a closed
-#     allowlist of Slack member IDs (04 A4).
+#   * SLACK_ALLOWED_USERS is required, not advisory. With SLACK_ENABLED=true, an empty or
+#     all-blank allowlist is REJECTED by the validating webhook and the Agent CR is never
+#     created (06 §1.2 V-7). There is no permissive default: list Slack member IDs (U…).
 export SLACK_ENABLED=false
 export SLACK_BOT_TOKEN=''
 export SLACK_APP_TOKEN=''

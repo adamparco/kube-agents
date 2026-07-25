@@ -249,8 +249,39 @@ curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" https://slack.com/api/auth.t
 curl -s -X POST -H "Authorization: Bearer $SLACK_APP_TOKEN" https://slack.com/api/apps.connections.open
 ```
 
-`users.conversations` returning zero channels confirms it. Also note that an empty
-`SLACK_ALLOWED_USERS` lets **every** workspace user drive the agent — set a closed allowlist.
+`users.conversations` returning zero channels confirms it.
+
+**The Agent CR is rejected with `allowedUsers must contain at least one non-blank entry`.**
+`SLACK_ALLOWED_USERS` is empty (or holds only whitespace) while the Slack integration is enabled.
+This is admission refusing to create the agent at all, not a warning: an empty allowlist is not an
+allowlist, and there is no permissive fallback to fall back to. Set `SLACK_ALLOWED_USERS` to a
+comma-separated list of Slack member IDs (`U…`) in `vars.sh` and re-run the step.
+
+**`@mentions` work but DMs go nowhere.** Two different switches, and only one of them is the
+obvious one. In the Slack App config, **App Home → Show Tabs → Messages Tab** makes the tab visible;
+the **"Allow users to send Slash Commands and messages from the messages tab"** checkbox _under_ it
+is what actually delivers DMs. Enable the checkbox, not just the tab. Nothing in the token or scope
+output distinguishes this case — `auth.test` passes either way.
+
+**Required scopes.** Bot: `app_mentions:read`, `channels:read`, `channels:history`, `groups:read`,
+`groups:history`, `im:read`, `im:history`, `mpim:read`, `mpim:history`, `chat:write`, `users:read`.
+App-level token: `connections:write`.
+
+### Inference
+
+**`connection refused` to the gateway on port 4000.** The `litellm` Service listens on **port 80**
+and forwards to container port 4000. In-cluster clients use `http://litellm` (or
+`http://litellm.<namespace>.svc.cluster.local`) with no port. Only a `kubectl port-forward` straight
+at the pod sees 4000.
+
+**Gemini 3 tool calls fail with `400 INVALID_ARGUMENT: Function call is missing a
+thought_signature`.** Google requires an encrypted `thought_signature` on every multi-turn tool call
+from a Gemini 3.x model, and LiteLLM injects the required placeholder only when the configured model
+name literally contains the substring `gemini-3`. A name that Google _serves_ as Gemini 3.x but that
+does not match that substring — `gemini-pro-latest` was the one that bit us — gets no injection and
+fails on the second turn of any tool-using conversation. Keep `MODEL_DEFAULT_NAME` on a name
+containing `gemini-3` (the shipped default, `gemini-3.5-flash`, does) and keep LiteLLM at
+≥ v1.80.5.
 
 ### Scripts
 
