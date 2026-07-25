@@ -31,6 +31,19 @@ python3 local-dev/tests/circleci-parity.py
 python3 local-dev/tests/iac-parity.py
 python3 local-dev/tests/observability-seam.py
 python3 local-dev/okf-validate.py
+# Callers vs parsers. P8-T4 removed `--github-cidrs` from the developer-team renderer and left
+# verify-phase3.sh passing it: argparse exited 2, stderr went to /dev/null, and P3-K7 verified
+# nothing for a day (LSN-021). Nothing in L0 looked at a CLI's callers until this line existed.
+python3 local-dev/tests/cli-contract.py
+# 09 §14's own lints (V-MET-010/012/013-for-check-IDs). They were written `L0` and never built, so
+# 09 §5.1 lost two load-bearing components and 09 §5.2 five contracts with nothing to notice (LSN-014).
+python3 local-dev/tests/spec-ids.py
+
+# --- repository mechanics (LSN-012) ---------------------------------------------------------
+# Which remote carries the work, and does `main` point at it? Local main tracked `upstream/main`
+# (gke-labs) for the whole of phases 2-8: a bare `git pull` would have fetched a tree with none of
+# this build in it. Resolved by CONTENT, never by remote name -- the name has already changed once.
+bash local-dev/git-preflight.sh
 
 # --- the invariants gate itself (P8-T6) -----------------------------------------------------
 # Runs last: it reads this file, and several of its checks are about the chain above.

@@ -31,6 +31,19 @@
 # DESTRUCTIVE-TEST GUARD: Kind / scratch-GKE contexts only, anchored (never a substring glob).
 # Exit: 0 = V-CTN-020 (L2 half) PROVEN · 1 = FAILED (halt) · 2 = refused target · 3 = DEFERRED.
 # Usage: local-dev/kind/egress-enforcement-l2.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). Declared, not assumed: LSN-001 and LSN-002 each
+# recurred against scripts whose authors believed the preconditions held.
+#   P1 image-under-test:  none — nothing here is served by an operator image. The policy under test is rendered by this
+#      script through the installer's own `render_egress_policy`, and enforcement is Calico's, not
+#      the operator's. A stale operator cannot make an off-allowlist packet arrive.
+#   P3 admission-recreate: the NetworkPolicy objects and every probe pod. Section 3 deletes and re-applies the policy
+#      between stages, and each probe pod is created after the policy it is probing — a pod that
+#      predated the policy would be reporting on the rules in force when it started.
+#   P6 runtime-authoritative: the rendered policy YAML this script produces from `common.sh`, plus the live NetworkPolicy
+#      objects read back from the API server. Not the checked-in exemplars, which are a derived
+#      artifact and can drift from the renderer without either side noticing.
 set -uo pipefail # -e omitted deliberately: probe exit codes are inspected, not fatal.
 
 CTX="${1:-kind-kube-agents-egress}"

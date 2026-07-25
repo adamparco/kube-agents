@@ -158,10 +158,16 @@ echo "  NOTE: kindnet does not enforce NetworkPolicy — egress ENFORCEMENT is p
 echo; echo "== P3-K7: cascade render -> VAP dry-run =="
 if command -v python3 >/dev/null 2>&1; then
   TMP="$(mktemp -d)"
-  agents/cluster-admin/skills/propose-developer-team/scripts/render_developer_team.py \
+  # No --github-cidrs: P8-T4 removed it (GitHub's blocks are fixed in the egress template, rule 4).
+  # This line kept passing it for a day, argparse exited 2, the bundle was never written, and the
+  # only symptom was "no identity file" below. Hence the rc capture — a renderer that fails must say
+  # WHY, not leave the next reader to guess from an absent file. Mechanized in
+  # local-dev/tests/cli-contract.py, which now fails L0 if any caller passes a flag no parser has.
+  render_err="$(agents/cluster-admin/skills/propose-developer-team/scripts/render_developer_team.py \
       --cluster cluster-a --namespace team-x --project-id demo-proj --location us-central1 \
       --team-lead-chat-id users/1 --hub-inference-cidr 10.8.0.16/32 --hub-minty-cidr 10.8.0.32/32 \
-      --github-cidrs 140.82.112.0/20 --mcp-cidrs 10.8.0.64/32 --repo-root "$TMP" >/dev/null 2>&1
+      --mcp-cidrs 10.8.0.64/32 --repo-root "$TMP" 2>&1 >/dev/null)"; render_rc=$?
+  [ "$render_rc" -eq 0 ] || bad "renderer exited $render_rc: $render_err"
   RID="$TMP/clusters/cluster-a/namespaces/team-x/50-developer-team-identity.yaml"
   if [ -f "$RID" ]; then
     $K apply --server-side --dry-run=server -f "$RID" >/dev/null 2>&1 && pass "rendered dev-team identity admitted by VAP (dry-run)" || bad "rendered identity rejected (unexpected)"

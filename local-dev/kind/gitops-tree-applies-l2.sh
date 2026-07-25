@@ -27,6 +27,17 @@
 # without an explicit scratch target.
 # Exit: 0 = V-CMP-003 PROVEN · 1 = FAILED · 2 = refused target · 3 = DEFERRED.
 # Usage: local-dev/kind/gitops-tree-applies-l2.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). Declared, not assumed: LSN-001 and LSN-002 each
+# recurred against scripts whose authors believed the preconditions held.
+#   P1 image-under-test:  none — this is a server-side dry-run of shipped YAML against the API server's own validators.
+#      No first-party image participates; the operator is not even required to be installed.
+#   P3 admission-recreate: none — no admission property is claimed about a persisted object. Every apply is
+#      --dry-run=server, which runs admission in full and persists nothing, so there is no object
+#      that could have been grandfathered.
+#   P6 runtime-authoritative: examples/gitops-repo/ as shipped, plus the rendered egress policies. The tree IS the artifact
+#      under test here; there is no rendered layer above it.
 set -uo pipefail
 
 CTX="${1:-kind-kube-agents-egress}"

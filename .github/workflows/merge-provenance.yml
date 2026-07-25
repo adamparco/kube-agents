@@ -1,0 +1,57 @@
+name: Merge Provenance
+
+# LSN-011 — nothing on `main` arrived past a red check.
+#
+# This is the after-the-fact audit, and it is deliberately NOT a pull-request check. `--admin` and
+# `--no-verify` defeat the gate at merge time; the only place the truth survives is the forge's
+# record of the check runs against the merged PR's head SHA. So this runs AFTER a merge lands, and
+# on a schedule so that a merge made while Actions was degraded still gets looked at.
+#
+# It is not in local-dev/L0-CHAIN.txt on purpose: L0 means no cluster and no network, and the
+# evidence for this check is only reachable over the API. Putting it there would make every offline
+# L0 run report a failure it cannot fix, and the chain would stop being run.
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 06:17 UTC. Off the hour because everything else in the world runs at :00.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+
+jobs:
+  provenance:
+    name: Merge provenance (LSN-011)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          # The audit walks first-parent history from the fork point. Depth-1 has no history to walk
+          # and the check would exit 2 forever, which is honest but useless.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Audit every merge on main
+        env:
+          # `gh api` reads this. Without it the script exits 2 ("could not run"), never 0.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          python3 local-dev/tests/merge-provenance.py
+          status=$?
+          case "$status" in
+            0) echo "merge provenance green" ;;
+            2) echo "::error::the merge-provenance audit COULD NOT RUN (exit 2). That is not a pass."
+               exit 1 ;;
+            *) echo "::error::a merge on main went past a red check (LSN-011)"
+               exit "$status" ;;
+          esac

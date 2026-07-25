@@ -31,6 +31,15 @@
 # pods and policies, so the guard is load-bearing rather than a formality.
 # Exit: 0 = PROVEN · 1 = FAILED · 2 = refused target · 3 = DEFERRED.
 # Usage: local-dev/kind/tenant-isolation-l2.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). Declared, not assumed: LSN-001 and LSN-002 each
+# recurred against scripts whose authors believed the preconditions held.
+#   P1 image-under-test:  none — the ResourceQuota and default-deny under test are rendered by this script from
+#      `common.sh`, and enforced by the API server and Calico. No operator code path is involved.
+#   P3 admission-recreate: every probe pod and every fixture pod. Section 2 submits pods AFTER the quota is in force, which
+#      is the only way to observe a quota refusal; a pod admitted before it would keep running.
+#   P6 runtime-authoritative: the rendered manifests from `common.sh` and the live objects read back from the API server.
 set -uo pipefail
 
 CTX="${1:-kind-kube-agents-egress}"

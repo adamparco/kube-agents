@@ -769,6 +769,228 @@ def check_deferrals_name_blockers() -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------
+# LSN-001 / LSN-002 / LSN-003 — an L2 script declares its preconditions, and the declaration is
+# backed by code
+# ---------------------------------------------------------------------------------------------
+#
+# All three lessons are the same shape: a run was green, the green was about the wrong artifact, and
+# nobody could tell from the output. LSN-001 (stale image) recurred THREE times, LSN-002
+# (grandfathered object) once, LSN-003 (the image-baked config.yaml shadowed by the operator-rendered
+# ConfigMap) once. Each was closed against a precondition ID in binding.md, and binding.md does not
+# execute.
+#
+# Declaring is the cheap half and it is not nothing: the recurrences all happened to authors who
+# believed the precondition held and had never been asked to write down why. But a declaration alone
+# is a comment, so each non-`none` answer must be BACKED by something in the script — a P1 that names
+# a workload must be followed by a real digest assertion, a P3 that names an object must be followed
+# by a delete or a server-dry-run. And `none` must carry a reason, because "none" with no argument is
+# how a precondition gets waived by whoever is in the biggest hurry.
+
+PRECOND_LINE = re.compile(
+    r"^#\s+(P1|P3|P6) (image-under-test|admission-recreate|runtime-authoritative):\s*(.*)$"
+)
+PRECOND_CONT = re.compile(r"^#\s{5,}(\S.*)$")
+PRECOND_FIELDS = {
+    "P1": "image-under-test",
+    "P3": "admission-recreate",
+    "P6": "runtime-authoritative",
+}
+# How much argument a waiver owes. Short enough that an honest one-liner passes ("none — no
+# first-party image participates"), long enough that a bare "none" or "n/a" cannot.
+MIN_WAIVER_REASON = 30
+# What counts as actually re-running admission on a fresh object: the helper, an explicit delete, or
+# a server-side dry run (which admits in full and persists nothing, so nothing can be grandfathered).
+P3_BACKING = ("p3_force_recreate", " delete ", "dry-run=server")
+# ConfigMap data keys the operator emits at runtime. A file of the same basename in the image is
+# SHADOWED by this at runtime, so reading the file is reading an input, not the artifact.
+CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
+# How many scripts L2-CHAIN.txt named when this check was written. A ratchet, not a constant: it is
+# here because the first version's floor was 5 against a 6-line chain, so deleting a line from the
+# chain left the check green over the remaining five. A floor below the real count is a check that
+# tolerates exactly the change it exists to notice.
+L2_CHAIN_FLOOR = 6
+
+
+def _declared_preconditions(text: str) -> dict[str, str]:
+    """{'P1': 'value with continuations folded in', ...} from a script's header block."""
+    out: dict[str, str] = {}
+    cur: str | None = None
+    for line in text.splitlines():
+        m = PRECOND_LINE.match(line)
+        if m:
+            cur = m.group(1)
+            out[cur] = m.group(3).strip()
+            continue
+        if cur is None:
+            continue
+        c = PRECOND_CONT.match(line)
+        if c:
+            out[cur] += " " + c.group(1).strip()
+        else:
+            cur = None
+    return out
+
+
+def _l2_chain_scripts() -> list[Path]:
+    """Every .sh named by a live line of L2-CHAIN.txt, INCLUDING ones that do not exist.
+
+    Silently dropping a missing path would make a typo'd chain line look like a shorter chain, and
+    a shorter chain is exactly what the floor check below is trying to notice.
+    """
+    if not L2_CHAIN.exists():
+        return []
+    out = []
+    for line in L2_CHAIN.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for token in line.split():
+            if token.endswith(".sh"):
+                out.append(REPO / token)
+    return out
+
+
+def _shadowed_basenames() -> set[str]:
+    """Basenames the operator writes into a ConfigMap, derived rather than listed.
+
+    Hardcoding {'config.yaml'} would make this check a memorial to LSN-003 instead of a guard: the
+    next renderer to emit a second key would not be covered, and nothing would say so.
+    """
+    keys: set[str] = set()
+    src = REPO / "k8s-operator/internal"
+    if not src.is_dir():
+        return keys
+    for go in src.rglob("*.go"):
+        if go.name.endswith("_test.go"):
+            continue
+        keys |= set(CM_DATA_KEY.findall(go.read_text()))
+    return keys
+
+
+def _code_lines(text: str) -> str:
+    """The script with its comments removed — what it DOES, not what it says about itself.
+
+    Shell has no block comments, so dropping `#`-leading lines and everything after an unquoted
+    ` #` is the whole job. Quote tracking is deliberately naive (it counts unescaped `'` and `"`
+    before the `#`): the only cost of getting it wrong is keeping a line that is really a comment,
+    which is the safe direction for a check that fails when the string is ABSENT.
+    """
+    out = []
+    for line in text.splitlines():
+        s = line.lstrip()
+        if s.startswith("#"):
+            continue
+        cut = -1
+        sq = dq = 0
+        for i, ch in enumerate(line):
+            if ch == "'" and dq % 2 == 0:
+                sq += 1
+            elif ch == '"' and sq % 2 == 0:
+                dq += 1
+            elif ch == "#" and sq % 2 == 0 and dq % 2 == 0 and i > 0 and line[i - 1] in " \t":
+                cut = i
+                break
+        out.append(line if cut < 0 else line[:cut])
+    return "\n".join(out)
+
+
+def check_l2_scripts_declare_preconditions() -> list[str]:
+    """LSN-001/002/003. Every L2 script says which artifact it is judging, and proves it.
+
+    Scoped to the lines of L2-CHAIN.txt, NOT to their transitive callees. verify-phase{2..6}.sh and
+    chaos-suite.sh are reached through verify-phase7.sh and are not covered here — determining their
+    real preconditions means reading each one, and a declaration written on a script's behalf by its
+    caller is a guess wearing the costume of a fact. That gap is a recorded deferral in
+    docs/build/LEDGER.md with an owner and a promotion condition; it is not a silent cap.
+    """
+    scripts = _l2_chain_scripts()
+    if len(scripts) < L2_CHAIN_FLOOR:
+        return [
+            f"VACUOUS: resolved {len(scripts)} scripts from {L2_CHAIN.relative_to(REPO)}; there "
+            f"were {L2_CHAIN_FLOOR} when this was written. A line left the chain, or the chain "
+            f"format changed and this check went quiet over the scripts it stopped seeing. "
+            f"Retiring an L2 check is a deliberate act (V-MET-004) — raise or lower this floor "
+            f"in the same commit that changes the chain, never afterwards."
+        ]
+
+    shadowed = _shadowed_basenames()
+    failures = []
+    for path in scripts:
+        rel = path.relative_to(REPO).as_posix()
+        if not path.exists():
+            failures.append(
+                f"{L2_CHAIN.relative_to(REPO)} runs {rel!r}, which does not exist. The chain is "
+                f"the definition site for what L2 evidence means; a line that cannot run is a "
+                f"suite silently missing from every 'full L2 run' claim."
+            )
+            continue
+        text = path.read_text()
+        declared = _declared_preconditions(text)
+
+        missing = [f"{k} {v}" for k, v in PRECOND_FIELDS.items() if k not in declared]
+        if missing:
+            failures.append(
+                f"{rel} declares no {', '.join(missing)}. An L2 script that does not say which "
+                f"artifact it is judging cannot be read as evidence about any particular one "
+                f"(LSN-001/002/003)."
+            )
+            continue
+
+        for key, value in sorted(declared.items()):
+            low = value.lower()
+            if low.startswith("none"):
+                reason = value[4:].lstrip(" —-:").strip()
+                if len(reason) < MIN_WAIVER_REASON:
+                    failures.append(
+                        f"{rel} waives {key} with {value!r} and no argument. A waiver is a claim "
+                        f"about the script — say why the precondition cannot bite here."
+                    )
+                continue
+            if len(value) < 12:
+                failures.append(
+                    f"{rel} declares {key} as {value!r}, which names nothing specific enough to "
+                    f"check against."
+                )
+
+        # CODE, not prose. Every backing test below asks "does the script DO this", and the
+        # PRECONDITIONS block it just read is a paragraph that SAYS this — "Asserted via
+        # p1_assert_build_under_test" in verify-phase7.sh, in a comment, four lines above. A
+        # whole-text substring search cannot tell the claim from the act, so deleting the call
+        # and keeping the sentence left this check green (found by mutation, 2026-07-25; LSN-023).
+        code = _code_lines(text)
+
+        p1 = declared["P1"]
+        if not p1.lower().startswith("none") and "p1_assert_build_under_test" not in code:
+            failures.append(
+                f"{rel} declares P1 against {p1.split('—')[0].strip()!r} but never calls "
+                f"p1_assert_build_under_test. The declaration is ahead of the code: the script "
+                f"asserts nothing about the digest it just said it depends on, which is LSN-001 "
+                f"with a paragraph in front of it."
+            )
+
+        p3 = declared["P3"]
+        if not p3.lower().startswith("none") and not any(b in code for b in P3_BACKING):
+            failures.append(
+                f"{rel} declares P3 against a live object but contains no delete, no "
+                f"p3_force_recreate and no --dry-run=server. Admission does not evict what already "
+                f"exists, so the claim would be about the rules in force when the object was "
+                f"created (LSN-002)."
+            )
+
+        p6 = declared["P6"]
+        for base in shadowed:
+            # A P6 that points at a FILE PATH whose basename the operator also renders is naming the
+            # input, not the runtime artifact -- unless it says so and names the rendered one too.
+            if re.search(rf"[\w./-]+/{re.escape(base)}\b", p6) and "configmap" not in p6.lower():
+                failures.append(
+                    f"{rel} declares P6 as a path ending in {base!r}, which the operator renders "
+                    f"into a ConfigMap and mounts OVER the image-baked copy. The file is an input; "
+                    f"the ConfigMap is the artifact that runs (LSN-003). Name the rendered one."
+                )
+    return failures
+
+
+# ---------------------------------------------------------------------------------------------
 
 CHECKS = [
     ("invariant 7 — authority never precedes machinery", check_write_verbs_have_machinery),
@@ -777,6 +999,10 @@ CHECKS = [
     ("LSN-005 — destructive-test guards stay anchored", check_destructive_guards_are_anchored),
     ("LSN-018 — build targets name their cluster", check_make_targets_are_context_explicit),
     ("V-MET-006 / LSN-008 — deferrals name a blocker", check_deferrals_name_blockers),
+    (
+        "LSN-001/002/003 — L2 scripts declare and back their preconditions",
+        check_l2_scripts_declare_preconditions,
+    ),
     ("invariant 13 / LSN-019 — closed lessons are executable", check_closed_lessons_are_executable),
     ("L0 chain is runnable and wired to CI", check_l0_chain_is_runnable),
 ]

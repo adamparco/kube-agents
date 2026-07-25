@@ -29,6 +29,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          # git-preflight.sh identifies the work-carrying remote by reading
+          # `refs/remotes/<r>/main:docs/build/LEDGER.md`. The default depth-1 checkout has no such
+          # ref, so the check would report NOT APPLICABLE on every run -- green, and about nothing.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
