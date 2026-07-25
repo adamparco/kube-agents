@@ -81,5 +81,7 @@ spec:
   integration:
     googleChat:
       enabled: ${CLUSTER_ADMIN_GOOGLE_CHAT_ENABLED}
+${CLUSTER_ADMIN_ALLOWED_USERS_BLOCK}
     slack:
       enabled: ${CLUSTER_ADMIN_SLACK_ENABLED}
+${CLUSTER_ADMIN_SLACK_ALLOWED_USERS_BLOCK}

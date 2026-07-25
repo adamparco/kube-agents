@@ -24,11 +24,11 @@ import "strings"
 // Fail-closed, by three rules that never fall through to "allow":
 //
 //  1. Empty sender ⇒ deny. An unauthenticated/unidentified requester is never authorized.
-//  2. Empty or absent allowlist ⇒ deny ALL. This is the load-bearing inversion of the pod default:
-//     the operator renders GOOGLE_CHAT_ALLOW_ALL_USERS=true for an empty allowlist (the in-pod
-//     gateway's permissive v1 behavior), but the ROUTER refuses. Authorize reads ONLY the target CR's
-//     AllowedUsers — it never consults any *_ALLOW_ALL_USERS env, so the permissive default cannot leak
-//     into the central pre-dispatch check. A closed allowlist must be set explicitly to reach an agent.
+//  2. Empty or absent allowlist ⇒ deny ALL. Authorize reads ONLY the target CR's AllowedUsers and
+//     consults no environment flag of any kind, so no pod-level configuration can widen it. This rule
+//     was the only layer that already behaved correctly while the operator still rendered
+//     GOOGLE_CHAT_ALLOW_ALL_USERS=true for an empty allowlist; P8-T1 deleted that backstop (V-CTR-014)
+//     and every layer now agrees. A closed allowlist must be set explicitly to reach an agent.
 //  3. Sender ∈ allowlist ⇒ allow; otherwise deny.
 //
 // Routing is never an authz signal: Authorize depends only on (target, sender), not on how the target

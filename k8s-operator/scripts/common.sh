@@ -135,6 +135,42 @@ init_var() {
   fi
 }
 
+# init_var_required <var> <prompt>
+#
+# Like init_var, but the value is mandatory: there is no default to fall back to
+# and a blank answer re-prompts. Used for closed allowlists (06 §1.2 V-7), where
+# "leave it empty" used to mean "admit every authenticated user" — a default that
+# silently opens the human→agent boundary at the moment an operator is least
+# likely to be paying attention. Non-interactive runs fail loudly instead of
+# accepting the empty value.
+init_var_required() {
+  local var_name=$1
+  local prompt_msg=$2
+  local current_val="${!var_name:-}"
+
+  if [ -n "$(printf '%s' "$current_val" | tr -d '[:space:]')" ]; then
+    return 0
+  fi
+
+  if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+    print_error "${var_name} is required and has no safe default."
+    print_error "Set it in vars.sh (or the environment) before running non-interactively."
+    exit 1
+  fi
+
+  local input_val=""
+  while [ -z "$(printf '%s' "$input_val" | tr -d '[:space:]')" ]; do
+    echo -ne "  ${C_CYAN}${prompt_msg}: ${C_RESET}"
+    read -r input_val
+    if [ -z "$(printf '%s' "$input_val" | tr -d '[:space:]')" ]; then
+      print_warning "A value is required — there is no permissive default."
+    fi
+  done
+
+  export "${var_name}=${input_val}"
+  save_var "$var_name" "$input_val"
+}
+
 init_var_model_provider() {
   init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
 
@@ -367,10 +403,61 @@ wait_for_k8s_resource() {
   print_success "${resource} reached state: ${condition}."
 }
 
+# render_allowlist_block <enabled> <comma-separated-users> <field-label>
+#
+# Emits the `allowedUsers:` YAML block for an Agent CR chat integration, indented
+# to sit under `spec.integration.<platform>`, and writes it to stdout.
+#
+# Two rules, both load-bearing (06 §1.2 V-7, 03 §4a):
+#
+#   1. When the integration is DISABLED, emit nothing. The previous template
+#      unconditionally rendered `allowedUsers: [ "${ALLOWED_USERS}" ]`, so an
+#      unset variable produced a one-element list whose only element was the
+#      empty string — a list of size 1 that names nobody. Every size-based guard
+#      passed and the controller then treated it as "allow everyone".
+#
+#   2. When the integration is ENABLED, the list must name at least one
+#      principal. An empty or all-blank value is a provisioning error and we
+#      fail here rather than shipping a CR the API server would reject with a
+#      less obvious message — or, worse, one that admits the world.
+#
+# Blank entries are dropped, so "U1,,U2" and " , " are handled the same way the
+# webhook and the renderer handle them.
+render_allowlist_block() {
+  local enabled="$1"
+  local raw="$2"
+  local label="$3"
+
+  if [ "${enabled}" != "true" ]; then
+    return 0
+  fi
+
+  local entries=()
+  local IFS=','
+  local u
+  for u in ${raw}; do
+    u="$(printf '%s' "$u" | tr -d '[:space:]')"
+    [ -n "$u" ] && entries+=("$u")
+  done
+  unset IFS
+
+  if [ ${#entries[@]} -eq 0 ]; then
+    print_error "${label} is enabled but its allowlist is empty."
+    print_error "An empty or all-blank allowlist is not an allowlist — there is no permissive fallback."
+    print_error "Set the allowlist variable to at least one principal ID in vars.sh, or disable the integration."
+    exit 1
+  fi
+
+  echo "      allowedUsers:"
+  for u in "${entries[@]}"; do
+    echo "        - \"${u}\""
+  done
+}
+
 confirm_action() {
   local warning_msg=$1
   shift
-  
+
   if [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
     return 0
   fi

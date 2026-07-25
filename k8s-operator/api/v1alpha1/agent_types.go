@@ -38,7 +38,13 @@ type AgentIntegrationSpec struct {
 // GoogleChatSpec contains the configuration for the Google Chat integration,
 // enabling communication and event routing via Google Chat.
 // +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.projectId) && has(self.topicName) && has(self.subscriptionName))",message="projectId, topicName, and subscriptionName are required when Google Chat integration is enabled"
-// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.allowedUsers) && size(self.allowedUsers) > 0)",message="allowedUsers must be non-empty when the Google Chat integration is enabled (an empty allowlist admits all authenticated users)"
+// The allowlist predicate is written with size() rather than a comparison against an empty string
+// literal on purpose: gofmt rewrites a pair of adjacent ASCII apostrophes inside a line comment
+// into a typographic close-quote (U+201D), which silently turns the marker into CEL the API server
+// cannot compile — and it does so AFTER controller-gen has already emitted a correct CRD, so the
+// corruption only surfaces on the next generation. A quote-free predicate cannot be mangled by the
+// formatter (LSN-016).
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.allowedUsers) && self.allowedUsers.exists(u, u.trim().size() > 0))",message="spec.integration.googleChat.allowedUsers must contain at least one non-blank entry when the Google Chat integration is enabled (an empty or all-blank allowlist is not an allowlist)"
 type GoogleChatSpec struct {
 	// Enabled toggles the Google Chat integration.
 	// +kubebuilder:default=false
@@ -57,8 +63,18 @@ type GoogleChatSpec struct {
 	// +optional
 	SubscriptionName string `json:"subscriptionName,omitempty"`
 
-	// AllowedUsers is a list of allowed users. If not present, all users will be allowed.
+	// AllowedUsers is the closed allowlist of Google Chat principals. When the
+	// integration is enabled it must contain at least one non-blank entry; an
+	// empty or all-blank list is not an allowlist, and there is no permissive
+	// fallback (06 §1.2 V-7).
+	//
+	// The bounds are load-bearing, not cosmetic: the API server refuses to install
+	// a CRD whose CEL rules it cannot cost-bound, and a per-entry rule over an
+	// unbounded list of unbounded strings is unbounded. MaxItems/MaxLength are what
+	// make the V-7 rule above installable at all.
 	// +listType=set
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MaxLength=253
 	// +optional
 	AllowedUsers []string `json:"allowedUsers,omitempty"`
 
@@ -77,7 +93,8 @@ type GoogleChatSpec struct {
 
 // SlackSpec contains the configuration for the Slack integration.
 // +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef) && has(self.appTokenSecretRef))",message="botTokenSecretRef and appTokenSecretRef are required when Slack integration is enabled"
-// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.allowedUsers) && size(self.allowedUsers) > 0)",message="allowedUsers must be non-empty when the Slack integration is enabled (an empty allowlist admits all authenticated users)"
+// The size() form is deliberate — see the GoogleChatSpec marker above (LSN-016).
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.allowedUsers) && self.allowedUsers.exists(u, u.trim().size() > 0))",message="spec.integration.slack.allowedUsers must contain at least one non-blank entry when the Slack integration is enabled (an empty or all-blank allowlist is not an allowlist)"
 type SlackSpec struct {
 	// Enabled toggles the Slack integration.
 	// +kubebuilder:default=false
@@ -92,8 +109,14 @@ type SlackSpec struct {
 	// +optional
 	AppTokenSecretRef *corev1.SecretKeySelector `json:"appTokenSecretRef,omitempty"`
 
-	// AllowedUsers is a list of allowed member IDs. If not present, all users will be allowed.
+	// AllowedUsers is the closed allowlist of Slack member IDs. When the
+	// integration is enabled it must contain at least one non-blank entry; an
+	// empty or all-blank list is not an allowlist, and there is no permissive
+	// fallback (06 §1.2 V-7). The bounds make the V-7 CEL rule cost-boundable and
+	// therefore installable — see the GoogleChatSpec field above.
 	// +listType=set
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MaxLength=253
 	// +optional
 	AllowedUsers []string `json:"allowedUsers,omitempty"`
 

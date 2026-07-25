@@ -40,8 +40,7 @@ spec:
       projectId: "${PROJECT_ID}"
       topicName: "${CHAT_TOPIC_NAME}"
       subscriptionName: "${CHAT_SUB_NAME}"
-      allowedUsers:
-        - "${ALLOWED_USERS}"
+${ALLOWED_USERS_BLOCK}
       homeChannel: ""
     slack:
       enabled: ${SLACK_ENABLED}
@@ -51,7 +50,6 @@ spec:
       appTokenSecretRef:
         name: platform-agent-secrets
         key: SLACK_APP_TOKEN
-      allowedUsers:
-        - "${SLACK_ALLOWED_USERS}"
+${SLACK_ALLOWED_USERS_BLOCK}
       homeChannel: "${SLACK_HOME_CHANNEL}"
       homeChannelName: "${SLACK_HOME_CHANNEL_NAME}"

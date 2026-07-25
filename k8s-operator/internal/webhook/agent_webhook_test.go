@@ -18,6 +18,7 @@ package webhook
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -314,11 +315,51 @@ func TestAgentClosedAllowlist(t *testing.T) {
 		}
 	}
 
-	t.Run("rejects google chat enabled with an empty allowlist", func(t *testing.T) {
-		if _, err := val.ValidateCreate(ctx, googleChatAgent(true, nil)); err == nil {
-			t.Error("expected rejection: enabled Google Chat with an empty allowlist is open to all users")
+	slackAgent := func(enabled bool, allowed []string) *agentv1alpha1.Agent {
+		return &agentv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: "slack-agent", Namespace: "kubeagents-system"},
+			Spec: agentv1alpha1.AgentSpec{
+				Integration: &agentv1alpha1.AgentIntegrationSpec{
+					Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(enabled), AllowedUsers: allowed},
+				},
+			},
 		}
-	})
+	}
+
+	// 06 §1.2 V-7: an all-blank list is not an allowlist, it is empty. Each of
+	// these shapes has size >= 1, so every size-based guard admits them — which
+	// is exactly how the provisioning template's `allowedUsers: [ "" ]` slipped
+	// through before P8-T1. V-CTR-002 additionally requires the field path in
+	// the rejection message, so a caller can tell which allowlist is wrong.
+	degenerate := map[string][]string{
+		"absent":         nil,
+		"empty":          {},
+		"single blank":   {""},
+		"single space":   {" "},
+		"tab and spaces": {"\t", "   "},
+	}
+
+	for name, allowed := range degenerate {
+		t.Run("rejects google chat enabled with a "+name+" allowlist", func(t *testing.T) {
+			_, err := val.ValidateCreate(ctx, googleChatAgent(true, allowed))
+			if err == nil {
+				t.Fatal("expected rejection: an allowlist that names nobody must never mean everybody")
+			}
+			if want := "spec.integration.googleChat.allowedUsers"; !strings.Contains(err.Error(), want) {
+				t.Errorf("rejection message must carry the field path %q (V-CTR-002), got: %v", want, err)
+			}
+		})
+
+		t.Run("rejects slack enabled with a "+name+" allowlist", func(t *testing.T) {
+			_, err := val.ValidateCreate(ctx, slackAgent(true, allowed))
+			if err == nil {
+				t.Fatal("expected rejection: an allowlist that names nobody must never mean everybody")
+			}
+			if want := "spec.integration.slack.allowedUsers"; !strings.Contains(err.Error(), want) {
+				t.Errorf("rejection message must carry the field path %q (V-CTR-002), got: %v", want, err)
+			}
+		})
+	}
 
 	t.Run("allows google chat enabled with a non-empty allowlist", func(t *testing.T) {
 		if _, err := val.ValidateCreate(ctx, googleChatAgent(true, []string{"users/admin"})); err != nil {
@@ -326,23 +367,17 @@ func TestAgentClosedAllowlist(t *testing.T) {
 		}
 	})
 
-	t.Run("allows google chat disabled with an empty allowlist", func(t *testing.T) {
-		if _, err := val.ValidateCreate(ctx, googleChatAgent(false, nil)); err != nil {
-			t.Errorf("unexpected rejection when the integration is disabled: %v", err)
+	// The positive control matters as much as the negatives: without it, a
+	// validator that rejected every allowlist would pass the whole table.
+	t.Run("allows a list whose only non-blank entry is real", func(t *testing.T) {
+		if _, err := val.ValidateCreate(ctx, slackAgent(true, []string{"", "U123", " "})); err != nil {
+			t.Errorf("unexpected rejection: the list names a real principal: %v", err)
 		}
 	})
 
-	t.Run("rejects slack enabled with an empty allowlist", func(t *testing.T) {
-		slackAgent := &agentv1alpha1.Agent{
-			ObjectMeta: metav1.ObjectMeta{Name: "slack-agent", Namespace: "kubeagents-system"},
-			Spec: agentv1alpha1.AgentSpec{
-				Integration: &agentv1alpha1.AgentIntegrationSpec{
-					Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
-				},
-			},
-		}
-		if _, err := val.ValidateCreate(ctx, slackAgent); err == nil {
-			t.Error("expected rejection: enabled Slack with an empty allowlist is open to all users")
+	t.Run("allows google chat disabled with an empty allowlist", func(t *testing.T) {
+		if _, err := val.ValidateCreate(ctx, googleChatAgent(false, nil)); err != nil {
+			t.Errorf("unexpected rejection when the integration is disabled: %v", err)
 		}
 	})
 }

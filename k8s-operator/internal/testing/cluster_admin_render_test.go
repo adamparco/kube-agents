@@ -107,7 +107,8 @@ func TestClusterAdminRender_LoadBearing(t *testing.T) {
 	}
 
 	// (d) The CLOSED chat allowlist renders to GOOGLE_CHAT_ALLOWED_USERS, and the permissive backstop
-	// GOOGLE_CHAT_ALLOW_ALL_USERS must be ABSENT (it is emitted only for an empty/absent allowlist).
+	// GOOGLE_CHAT_ALLOW_ALL_USERS must be ABSENT. P8-T1 deleted that env entirely (V-CTR-014); this
+	// assertion is retained as the per-tier rendered-pod instance of the rule.
 	if got := env["GOOGLE_CHAT_ALLOWED_USERS"]; got != "users/REPLACE_WITH_CLUSTER_ADMIN_ID" {
 		t.Errorf("GOOGLE_CHAT_ALLOWED_USERS = %q, want the closed list", got)
 	}

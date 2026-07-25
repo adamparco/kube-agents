@@ -19,6 +19,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -230,25 +231,46 @@ func validateScopeAndParent(agent *agentv1alpha1.Agent) *field.Error {
 	return nil
 }
 
-// validateClosedAllowlist enforces A4: an enabled chat integration must carry a non-empty allowlist.
-// An empty/absent allowlist means "all authenticated users", which is the open default we must close.
-// This is also enforced by CEL on the CRD; the webhook check keeps it unit-testable and defense-in-depth.
+// hasNonBlankEntry reports whether the list contains at least one entry that is
+// not empty and not pure whitespace.
+//
+// Counting entries is not enough. A provisioning template that renders
+// `allowedUsers: [ "${ALLOWED_USERS}" ]` from an unset variable produces a list
+// of length one whose only element is "", which satisfies any size check while
+// naming no principal at all. 06 §1.2 V-7 is explicit: an all-blank list is not
+// an allowlist, it is empty.
+func hasNonBlankEntry(users []string) bool {
+	for _, u := range users {
+		if strings.TrimSpace(u) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// validateClosedAllowlist enforces A4 / 06 §1.2 V-7: an enabled chat integration
+// must carry an allowlist with at least one non-blank entry. There is no
+// permissive fallback — an allowlist that names nobody is a configuration error,
+// never an instruction to admit everybody.
+//
+// This is also enforced by CEL on the CRD; the webhook check keeps it
+// unit-testable and defense-in-depth.
 func validateClosedAllowlist(agent *agentv1alpha1.Agent) *field.Error {
 	integration := agent.Spec.Integration
 	if integration == nil {
 		return nil
 	}
 	base := field.NewPath("spec", "integration")
-	if gc := integration.GoogleChat; gc != nil && gc.Enabled != nil && *gc.Enabled && len(gc.AllowedUsers) == 0 {
+	if gc := integration.GoogleChat; gc != nil && gc.Enabled != nil && *gc.Enabled && !hasNonBlankEntry(gc.AllowedUsers) {
 		return field.Required(
 			base.Child("googleChat", "allowedUsers"),
-			"allowedUsers must be non-empty when the Google Chat integration is enabled (an empty allowlist admits all authenticated users)",
+			"allowedUsers must contain at least one non-blank entry when the Google Chat integration is enabled (an empty or all-blank allowlist is not an allowlist)",
 		)
 	}
-	if sl := integration.Slack; sl != nil && sl.Enabled != nil && *sl.Enabled && len(sl.AllowedUsers) == 0 {
+	if sl := integration.Slack; sl != nil && sl.Enabled != nil && *sl.Enabled && !hasNonBlankEntry(sl.AllowedUsers) {
 		return field.Required(
 			base.Child("slack", "allowedUsers"),
-			"allowedUsers must be non-empty when the Slack integration is enabled (an empty allowlist admits all authenticated users)",
+			"allowedUsers must contain at least one non-blank entry when the Slack integration is enabled (an empty or all-blank allowlist is not an allowlist)",
 		)
 	}
 	return nil

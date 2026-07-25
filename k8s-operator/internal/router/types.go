@@ -89,7 +89,7 @@ type Target struct {
 	TopicName string
 	// AllowedUsers is the target CR's integration.googleChat.allowedUsers — the CLOSED trusted-human
 	// allowlist Authorize checks BEFORE dispatch. Empty/absent ⇒ the router refuses ALL (fail-closed);
-	// it never reads the pod-env *_ALLOW_ALL_USERS flag the operator renders for the permissive default.
+	// it reads no pod environment flag, so no pod-level configuration can widen it.
 	AllowedUsers []string
 }
 

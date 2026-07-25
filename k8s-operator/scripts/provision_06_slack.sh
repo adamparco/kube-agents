@@ -123,7 +123,8 @@ if [ -z "${SLACK_APP_TOKEN:-}" ]; then
 fi
 save_var "SLACK_APP_TOKEN" "${SLACK_APP_TOKEN:-}"
 
-init_var "SLACK_ALLOWED_USERS" "" "Enter Allowed Slack User IDs (comma separated). Leaving empty allows all users."
+# The allowlist is closed: there is no "leave it empty to allow everyone" option.
+init_var_required "SLACK_ALLOWED_USERS" "Enter Allowed Slack User IDs (comma separated). At least one is required — there is no allow-all option"
 init_var "SLACK_HOME_CHANNEL" "" "Enter Slack Home Channel ID (optional)."
 init_var "SLACK_HOME_CHANNEL_NAME" "" "Enter Slack Home Channel Name (optional)."
 

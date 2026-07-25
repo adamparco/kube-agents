@@ -54,18 +54,33 @@ else
 fi
 
 # Child tiers default to no chat integration: a single Slack app token supports one Socket Mode
-# connection, which the platform tier already holds. An enabled integration with an empty
-# allowlist is also rejected by the CEL validation.
+# connection, which the platform tier already holds.
 export CLUSTER_ADMIN_GOOGLE_CHAT_ENABLED="${CLUSTER_ADMIN_GOOGLE_CHAT_ENABLED:-false}"
 export CLUSTER_ADMIN_SLACK_ENABLED="${CLUSTER_ADMIN_SLACK_ENABLED:-false}"
 export DEVELOPER_TEAM_GOOGLE_CHAT_ENABLED="${DEVELOPER_TEAM_GOOGLE_CHAT_ENABLED:-false}"
 export DEVELOPER_TEAM_SLACK_ENABLED="${DEVELOPER_TEAM_SLACK_ENABLED:-false}"
 
+# If a child tier does enable chat, it needs its own closed allowlist (06 §1.2 V-7).
+# render_allowlist_block emits nothing when the integration is off and fails the
+# run when it is on with an empty or all-blank list — previously these templates
+# carried no allowedUsers key at all, so enabling chat produced a CR the API
+# server rejected with a message that pointed at the CRD rather than at vars.sh.
+export CLUSTER_ADMIN_ALLOWED_USERS_BLOCK
+CLUSTER_ADMIN_ALLOWED_USERS_BLOCK="$(render_allowlist_block "${CLUSTER_ADMIN_GOOGLE_CHAT_ENABLED}" "${CLUSTER_ADMIN_ALLOWED_USERS:-}" "cluster-admin Google Chat (CLUSTER_ADMIN_ALLOWED_USERS)")"
+export CLUSTER_ADMIN_SLACK_ALLOWED_USERS_BLOCK
+CLUSTER_ADMIN_SLACK_ALLOWED_USERS_BLOCK="$(render_allowlist_block "${CLUSTER_ADMIN_SLACK_ENABLED}" "${CLUSTER_ADMIN_SLACK_ALLOWED_USERS:-}" "cluster-admin Slack (CLUSTER_ADMIN_SLACK_ALLOWED_USERS)")"
+export DEVELOPER_TEAM_ALLOWED_USERS_BLOCK
+DEVELOPER_TEAM_ALLOWED_USERS_BLOCK="$(render_allowlist_block "${DEVELOPER_TEAM_GOOGLE_CHAT_ENABLED}" "${DEVELOPER_TEAM_ALLOWED_USERS:-}" "developer-team Google Chat (DEVELOPER_TEAM_ALLOWED_USERS)")"
+export DEVELOPER_TEAM_SLACK_ALLOWED_USERS_BLOCK
+DEVELOPER_TEAM_SLACK_ALLOWED_USERS_BLOCK="$(render_allowlist_block "${DEVELOPER_TEAM_SLACK_ENABLED}" "${DEVELOPER_TEAM_SLACK_ALLOWED_USERS:-}" "developer-team Slack (DEVELOPER_TEAM_SLACK_ALLOWED_USERS)")"
+
 TIER_VARS='$NAMESPACE $PROJECT_ID $REGION $CLUSTER_NAME
 $CLUSTER_ADMIN_KSA_NAME $CLUSTER_ADMIN_GSA_NAME $CLUSTER_ADMIN_AGENT_NAME
 $CLUSTER_ADMIN_IMAGE $CLUSTER_ADMIN_TAG $CLUSTER_ADMIN_GOOGLE_CHAT_ENABLED $CLUSTER_ADMIN_SLACK_ENABLED
+$CLUSTER_ADMIN_ALLOWED_USERS_BLOCK $CLUSTER_ADMIN_SLACK_ALLOWED_USERS_BLOCK
 $DEVELOPER_TEAM_NAMESPACE $DEVELOPER_TEAM_KSA_NAME $DEVELOPER_TEAM_GSA_NAME $DEVELOPER_TEAM_AGENT_NAME
-$DEVELOPER_TEAM_IMAGE $DEVELOPER_TEAM_TAG $DEVELOPER_TEAM_GOOGLE_CHAT_ENABLED $DEVELOPER_TEAM_SLACK_ENABLED'
+$DEVELOPER_TEAM_IMAGE $DEVELOPER_TEAM_TAG $DEVELOPER_TEAM_GOOGLE_CHAT_ENABLED $DEVELOPER_TEAM_SLACK_ENABLED
+$DEVELOPER_TEAM_ALLOWED_USERS_BLOCK $DEVELOPER_TEAM_SLACK_ALLOWED_USERS_BLOCK'
 
 # Each agent's Hermes API server reads its key from its own Secret.
 ensure_api_secret() {
