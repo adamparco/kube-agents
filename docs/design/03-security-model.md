@@ -19,7 +19,10 @@ defends against the threats unique to autonomous AI agents that hold real author
 2. **The Action Broker is the only writer** — agent pods hold **no** cluster or cloud write
    credential at all. Every mutation is submitted as an **Action Envelope** to a per-scope broker
    that runs deterministic code **outside the LLM loop**: classify → gate → snapshot → execute →
-   verify → journal. Bypassing the journal is not forbidden, it is **impossible** (§4).
+   verify → journal. There is no code path through the broker that skips the journal. Against a
+   bypass — a leaked actor token, a rogue broker — the backstop is **admission for
+   create/update/patch**, and **reconciliation within a stated SLO for deletes, subresource writes,
+   and cloud calls**, where admission structurally cannot see the write (§4.3).
 3. **Risk classification in code** — `routine` / `elevated` / `gated` / `forbidden`, decided by a
    deterministic classifier the model cannot argue with. Most work is routine; the gated class is
    small, explicit, and cannot be widened by configuration or by a prompt (§5).
@@ -244,7 +247,11 @@ When a parent provisions a child ([02](02-agent-personas.md) §6), it creates th
   a namespace tier. It selects agent RBAC by the **`kube-agents/tier` and `kube-agents/role`
   labels** the template stamps. This is the same policy object as the read-only generation's
   `vap-agent-readonly`, **inverted**: reader SAs keep the read-verb allow-list; actor SAs get a
-  scope-and-template allow-list instead of a blanket write denial.
+  scope-and-template allow-list instead of a blanket write denial. "Exceeds its tier template" is
+  decidable in CEL **only because the template is compiled into the policy as a literal
+  allow-list**, generated from the same source as the rendered manifests; the policy never reads a
+  template object at admission time, because it cannot. §4.3 tabulates which obligations this
+  affords the VAP and which fall to the webhook.
 - **The cross-object child ⊆ parent webhook — v1, not deferred.** Pure CEL cannot compare a child's
   requested scope against its parent's actual scope, and under an imperative model a parent holds
   real authority to create children. The kube-agents controller already runs a webhook server for
@@ -258,36 +265,115 @@ no authority over RBAC naming agent identities (§3.3 rule 1).
 
 ### 4.3 Admission as the independent backstop
 
-`vap-agent-scope` runs on the API server and therefore applies **regardless of who submits the
-write** — a buggy broker, a leaked actor token, or a human with the actor's kubeconfig are all
-subject to it. It enforces, independently of the broker:
+Admission applies **regardless of who submits the write** — a buggy broker, a leaked actor token, or
+a human with the actor's kubeconfig are all subject to it. The backstop is **two objects, not one**
+([05](05-system-architecture.md) `C-AS`), and the split is not an implementation detail: **in-tree
+CEL cannot read another object.** Every obligation below that needs a second object — an ancestry
+walk up `parentRef`, a tier-template lookup, an `OwnerReference` chain — is therefore **not
+expressible in a `ValidatingAdmissionPolicy`** and must live in the controller's validating webhook.
+Writing those rules into `vap-agent-scope` produces a policy that either fails to compile or
+silently passes; both have shipped in real systems.
 
-- reader SAs may not write **anything**;
-- actor SAs may write only within their declared scope, and only resources in their tier template;
-- nothing may create RBAC/IAM naming an agent identity outside the attenuation rules;
-- nothing may modify the control-plane or journal objects (§3.3 rules 3–4);
-- writes by an actor SA must carry the `kube-agents/action-id` annotation, so an **unjournaled write
-  is rejected at admission**, not merely detected afterwards;
-- **a pod may bind an actor SA only if its `kube-agents/tier`, `kube-agents/scope` and
-  `kube-agents/role` labels match that SA.** This one is easy to overlook and load-bearing: the
-  ability to create a pod referencing a ServiceAccount **is** the ability to use that identity, so
-  without this rule anything that can schedule a pod in the right namespace inherits an actor's
-  authority. Pinning the SA to the labels closes it
-  ([08](08-agent-runtime-and-identity.md) §2.5).
+| Obligation                                                                                               | Enforced by                                     | Why there                                                                                                                                                                         |
+| -------------------------------------------------------------------------------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Reader SAs may not write **anything**                                                                    | `vap-agent-scope` (in-tree CEL)                 | Single-object: verb + authenticated user                                                                                                                                          |
+| Actor SAs may write only within their **declared scope** (namespace/cluster/project of the request)      | `vap-agent-scope`                               | Single-object: the request's namespace vs the scope encoded in the SA name                                                                                                        |
+| Actor SAs may write only resources **in their tier template**                                            | `vap-agent-scope`, from an **inlined** template | Needs the template. Expressible **only** if the template is compiled into the policy as a literal allow-list, regenerated with it — never read from a ConfigMap at admission time |
+| No RBAC/IAM object **naming an agent identity** may be created or modified outside the attenuation rules | `vap-agent-scope`                               | Single-object: the rules are in the submitted object                                                                                                                              |
+| No write to control-plane or journal objects (§3.3 rules 3–4), including the brake-field carve-out       | `vap-agent-scope`                               | Single-object, field-level                                                                                                                                                        |
+| **Child `Agent` scope ⊆ parent's** (§4.2)                                                                | **Controller validating webhook**               | Requires reading the parent `Agent` CR                                                                                                                                            |
+| **No write to an `Agent` CR whose identity is an ancestor of the writer's**                              | **Controller validating webhook**               | Requires walking `parentRef` to the root — an unbounded cross-object traversal                                                                                                    |
+| **Actor writes stay inside the live tier template** when the template is versioned per deployment        | **Controller validating webhook**               | Requires reading the template object                                                                                                                                              |
+| **Pod → actor SA binding** (below)                                                                       | **Controller validating webhook**               | Requires resolving the pod's `OwnerReference` chain to an `Agent` CR                                                                                                              |
+
+**The webhook is `failurePolicy: Fail`. Not negotiable.** Every row it owns is a containment check
+with no in-tree equivalent, so `failurePolicy: Ignore` would mean a webhook outage — a crash-loop, an
+expired serving certificate, an evicted controller pod — **silently opens the ancestry check and the
+pod-binding rule** while the cluster keeps accepting writes and nothing looks wrong. Failing closed
+costs an availability incident when the controller is down; failing open costs the invariant. The
+webhook's `namespaceSelector`/`objectSelector` are scoped tightly (agent-labelled RBAC, `Agent` CRs,
+and pods binding a `kube-agents/*` SA) precisely so that fail-closed does not take the cluster with
+it, and the controller is deployed with ≥2 replicas and a PDB for the same reason
+([05](05-system-architecture.md) §6).
+
+**Journal enforcement: what admission covers, and what it does not.** Writes by an actor SA must
+carry the `kube-agents/action-id` annotation. State the boundary of that rule precisely, because it
+is easy to read it as universal and it is not:
+
+| Write                                                          | Enforcement                                                    | Why                                                                                                                   |
+| -------------------------------------------------------------- | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `create` / `update` / `patch` of the primary resource          | **Rejected at admission** — hard, synchronous, pre-persistence | The request carries the object, so the annotation is present and checkable                                            |
+| `delete`                                                       | **Detected by reconciliation** (`C-JR`) — not preventable      | A `DELETE` admission request carries **no client-supplied object**. There is nothing to annotate and nothing to read  |
+| `deletecollection`                                             | **Detected by reconciliation** (`C-JR`)                        | Same, and the affected set is not enumerated in the request at all                                                    |
+| Subresource writes (`/scale`, `/status`, `/eviction`, `/exec`) | **Detected by reconciliation** (`C-JR`)                        | The submitted object is the subresource, not the annotated parent; annotating it does not annotate the object changed |
+| Cloud API mutations                                            | **Detected by reconciliation** (`C-JR`) from Cloud Audit Logs  | Outside Kubernetes admission entirely                                                                                 |
+
+So the honest claim is: **an unjournaled create/update/patch of a primary resource is impossible; an
+unjournaled delete, subresource write, or cloud mutation is _detectable_, not impossible.** For that
+second class the enforcement is the **journal reconciler `C-JR`** ([05](05-system-architecture.md)
+§1), which joins the Kubernetes and Cloud audit logs against exported `ActionRecord`s and, on a
+mismatch, raises a P1, auto-pauses the implicated agent (§6), and drives SLI 2
+([01](01-vision-scope.md) §7). Its detection SLO — owned by [05](05-system-architecture.md) §1.6 and
+restated here because the security claim is unreadable without it — is **p95 ≤ 5 min / p99 ≤ 15 min**
+for Kubernetes mutations and **p95 ≤ 15 min / p99 ≤ 30 min** for cloud mutations, from the
+audit-log event to the alert, measured continuously by injecting a synthetic unjournaled delete
+(§11). That window is the true exposure for the detect-only class, and it is a real one — an
+attacker with a leaked actor token can delete in-scope objects and be alerted on, not blocked.
+
+**This does not weaken invariant 3** ([README](README.md)) — every mutation is still brokered,
+journaled and reversible, and the broker still has no path that skips the journal. What is narrowed
+is the claim about the _backstop_: admission catches a broker bypass on writes that carry an object,
+and reconciliation catches it within the SLO on writes that do not. Three further controls bound the
+detect-only class independently: destructive deletes are `gated` and so never autonomous (§5.2),
+`ActionRecord`s are themselves in the forbidden set so the evidence cannot be erased (§3.3 rule 4),
+and the actor's scope still bounds _what_ can be deleted.
+
+**Pod → actor SA binding: ownership and image, not labels.** The ability to create a pod referencing
+a ServiceAccount **is** the ability to use that identity, so this rule is what stops anything that
+can schedule a pod in the right namespace from inheriting an actor's authority. A pod may bind an
+actor SA only if **all four** hold:
+
+1. its `kube-agents/tier`, `kube-agents/scope` and `kube-agents/role: actor` labels match that SA
+   ([08](08-agent-runtime-and-identity.md) §2.5);
+2. it is **transitively owned, via `OwnerReference`, by the `Agent` CR from whose `tier` + `scope`
+   that actor SA is derived** — pod → ReplicaSet → Deployment → `Agent`, with the chain resolved and
+   the terminal CR's identity compared, not merely "an owner exists";
+3. its container image is the **broker image** (`kube-agents-broker`), matched by repository and
+   verified by digest against the controller's configured allow-list;
+4. it is in the **same namespace** as the SA, which Kubernetes enforces anyway.
+
+**Why label-matching alone is insufficient — this is the whole point of the rule.** Rule 1 on its
+own is a bound only against a principal that cannot set labels. The controller _sets these labels
+itself_: it is the component that stamps `tier`, `scope` and `role` on both pod templates
+([08](08-agent-runtime-and-identity.md) §2.5), and it is explicitly **inside the trust boundary**
+([08](08-agent-runtime-and-identity.md) §4). A compromised controller therefore satisfies rule 1 for
+free — it writes the labels that the check reads — and the "smuggled pod is rejected at admission"
+mitigation evaporates against precisely the adversary it was written for. Rules 2 and 3 do not have
+that property: the controller can create an `Agent` CR, but the ceiling and cardinality webhooks
+constrain what CRs may exist, and an ownership chain terminating at a _real_ `Agent` CR means the SA
+it binds is that CR's own — so a compromised controller reaches only identities already delegated to
+existing agents, never a fabricated pairing. Rule 3 removes the last degree of freedom: whatever pod
+it stands up must run the deterministic broker binary — no shell, no model, no arbitrary payload —
+so the credential is bound to code that classifies, gates, snapshots and journals. Rules 2 and 3
+both need a cross-object read, which is why this rule sits in the webhook and not in the VAP.
 
 **The controller is inside the trust boundary.** It creates the broker pod and sets its
 `serviceAccountName`, so a compromised controller can _use_ any actor identity it can name — even
 though it can **mint** none. That is the sharpest residual risk in the design, and it is bounded
-rather than eliminated: the controller holds no RBAC-write verb (it cannot create new authority),
-its pod writes are confined to `kubeagents-system` and agent placement namespaces, the
-label↔SA admission rule above rejects a smuggled pod, and every resulting write is still
-scope-bounded, still needs an `action-id`, and still shows up in journal-completeness
-reconciliation. Treat controller changes with the same review weight as broker changes
+rather than eliminated: the controller holds no RBAC-write verb (it cannot create new authority), no
+read verb on `Secrets` (it cannot lift an actor token), and no cluster-wide pod-creating grant — its
+workload writes are confined to `kubeagents-system` and agent placement namespaces by
+**per-namespace `RoleBinding`s applied at provisioning time**
+([08](08-agent-runtime-and-identity.md) §2.7), so it cannot stand up a pod in a namespace no bundle
+admitted it to. The ownership + image rule above rejects a smuggled pod, and every resulting write is
+still scope-bounded, still needs an `action-id`, and still shows up in `C-JR` reconciliation. Treat
+controller changes with the same review weight as broker changes
 ([08](08-agent-runtime-and-identity.md) §4).
 
-Cloud resources are outside Kubernetes admission. There, the controls are the actor GSA's scoped
-IAM (with conditions binding it to its own cluster/project), organization policy, and the
-`zero unjournaled mutations` SLI evaluated from Cloud Audit Logs.
+Cloud resources are outside Kubernetes admission entirely — there is no admission chain to attach a
+policy to. There, the controls are the actor GSA's scoped IAM (with conditions binding it to its own
+cluster/project), organization policy, and the `zero unjournaled mutations` SLI evaluated from Cloud
+Audit Logs by `C-JR` — detect-only, like deletes, under the cloud SLO above.
 
 ### 4.4 Reversibility as a security property
 
@@ -430,14 +516,16 @@ its assertions re-aimed by the inversion. Two orchestrators:
 **What changes.** Every check that treats "the agent SA has no write verb" as the pass condition
 must be re-pointed, or it will report the whole system as critical-severity broken:
 
-| Old assertion                           | New assertion                                                                                                   |
-| --------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| Agent SA holds no write verbs           | **Reader** SA holds no write verbs; **actor** SA holds only its tier template, scoped, with no escalation verbs |
-| No write-capable tool reaches the agent | No tool reaches the **cluster/cloud APIs** except through the broker; the agent pod holds no write credential   |
-| Every mutation is a merged PR           | Every mutation has an `ActionRecord` with a valid undo plan, and no write exists without one                    |
-| No break-glass path                     | No path widens an agent's authority; `pause`/`freeze` are effective and cannot be overridden by an agent        |
+| Old assertion                           | New assertion                                                                                                                                                                                          |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Agent SA holds no write verbs           | **Reader** SA holds no write verbs; **actor** SA holds only its tier template, scoped, with no escalation verbs                                                                                        |
+| No write-capable tool reaches the agent | No tool reaches the **cluster/cloud APIs** except through the broker; the agent pod holds no write credential                                                                                          |
+| Every mutation is a merged PR           | Every mutation has an `ActionRecord` with a valid undo plan; a write without one is refused at admission (create/update/patch) or flagged by `C-JR` within the §4.3 SLO (deletes, subresources, cloud) |
+| No break-glass path                     | No path widens an agent's authority; `pause`/`freeze` are effective and cannot be overridden by an agent                                                                                               |
 
-**New checks the suite gains:** journal completeness (audit-log writes ↔ `ActionRecord`s), undo
+**New checks the suite gains:** journal completeness (audit-log writes ↔ `ActionRecord`s, run by
+`C-JR` — [05](05-system-architecture.md) §1 — and covering the delete/subresource/cloud class that
+admission cannot see, §4.3), undo
 health (plans present and replayable), classifier integrity (the floor cannot be lowered by
 config), broker isolation (one actor identity per scope, no fleet-wide writer), and brake liveness
 (`pause` works with inference down).
@@ -497,18 +585,18 @@ Two specifics the tables above rely on:
   budget, rate limit, scoped logging); physically separate proxies only if data sensitivity later
   requires it.
 
-| Layer         | Control                                                                                                                                                        |
-| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Identity      | Split reader/actor SAs per agent; per-tier Workload Identity; least-privilege cloud SA with scope conditions                                                   |
-| Authorization | Read-only reader; scope-templated write for the actor; forbidden set; downward attenuation enforced by template + VAP + cross-object webhook                   |
-| Write path    | **Action Broker is the sole writer** — classify → gate → snapshot → execute → verify → journal, outside the LLM loop; unjournaled writes rejected at admission |
-| Human→agent   | Trusted-human access (`allowedUsers`, checked before dispatch); gated class routed to an approval roster; routing is never an authz signal                     |
-| Human control | `pause` / `freeze` / `undo` / `contested`, effective with inference down; auto-brake on anomaly                                                                |
-| Network       | Default-deny NetworkPolicy; allowlisted egress; control-loop/sandbox split                                                                                     |
-| Runtime       | Hardened pod-security context (v1); gVisor `RuntimeClass` deferred with untrusted code execution                                                               |
-| Secrets       | Brokered short-lived tokens (Minty + KMS), no static creds, no write credential in the agent pod                                                               |
-| Change        | Brokered, classified, snapshotted, verified, journaled, reversible                                                                                             |
-| Assurance     | Continuous security-review suite; four SLIs off the audit log and journal ([01](01-vision-scope.md) §7)                                                        |
+| Layer         | Control                                                                                                                                                                                                                                                          |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Identity      | Split reader/actor SAs per agent; per-tier Workload Identity; least-privilege cloud SA with scope conditions                                                                                                                                                     |
+| Authorization | Read-only reader; scope-templated write for the actor; forbidden set; downward attenuation enforced by template + VAP + cross-object webhook                                                                                                                     |
+| Write path    | **Action Broker is the sole writer** — classify → gate → snapshot → execute → verify → journal, outside the LLM loop; unjournaled create/update/patch rejected at admission, unjournaled deletes/subresource/cloud writes detected by `C-JR` within the §4.3 SLO |
+| Human→agent   | Trusted-human access (`allowedUsers`, checked before dispatch); gated class routed to an approval roster; routing is never an authz signal                                                                                                                       |
+| Human control | `pause` / `freeze` / `undo` / `contested`, effective with inference down; auto-brake on anomaly                                                                                                                                                                  |
+| Network       | Default-deny NetworkPolicy; allowlisted egress; control-loop/sandbox split                                                                                                                                                                                       |
+| Runtime       | Hardened pod-security context (v1); gVisor `RuntimeClass` deferred with untrusted code execution                                                                                                                                                                 |
+| Secrets       | Brokered short-lived tokens (Minty + KMS), no static creds, no write credential in the agent pod                                                                                                                                                                 |
+| Change        | Brokered, classified, snapshotted, verified, journaled, reversible                                                                                                                                                                                               |
+| Assurance     | Continuous security-review suite; four SLIs off the audit log and journal ([01](01-vision-scope.md) §7)                                                                                                                                                          |
 
 ## 10. Goals & non-goals
 
@@ -569,15 +657,40 @@ removes; **(new)** is created by the imperative model.
   cluster-scoped grant to a namespace tier, is rejected by `vap-agent-scope`.
 - **(new) Cross-object ceiling:** a parent attempting to provision a child whose scope is not a
   strict subset of its own is rejected by the controller's webhook.
+- **(new) Ancestry denial:** an actor SA attempting to write the `Agent` CR of any ancestor in its
+  `parentRef` chain — grandparent as well as immediate parent — is rejected by the webhook (§4.3).
+- **(new) The webhook fails closed:** with the controller's webhook endpoint unavailable (scale the
+  controller to zero, or revoke its serving certificate), the writes the webhook owns —
+  child-`Agent` creation, ancestry writes, and a pod binding an actor SA — are all **rejected**, not
+  admitted. Assert `failurePolicy: Fail` statically in the `ValidatingWebhookConfiguration` **and**
+  prove it dynamically; the static assertion alone has been passed by a config that a Helm value
+  later overrode.
+- **(new) Pod binding needs ownership and the broker image:** four negative cases, each created by a
+  principal with the controller's own permissions, must be rejected — a pod with correct labels but
+  **no** `OwnerReference` chain to an `Agent` CR; one whose chain terminates at a **different**
+  `Agent` CR than the SA derives from; one owned correctly but running a **non-broker image**; and
+  one running the broker image at an **unlisted digest** (§4.3). A pod with only the labels correct
+  must **not** be admitted — that case is the G-6 regression test.
 
 **The broker is the only writer**
 
 - **(new) No bypass:** from inside the agent container, a direct API write with the pod's token
   fails (no RBAC), and a forged envelope claiming another scope is rejected by the broker (scope
   comes from the authenticated caller).
-- **(new) No unjournaled write:** every write in the Kubernetes and Cloud audit logs attributed to
-  an actor identity has a matching `ActionRecord`; an action applied with the annotation stripped is
-  **rejected at admission**. This is SLI 2 ([01](01-vision-scope.md) §7) run as a test.
+- **(new) No unjournaled write — enforced half:** a `create`, `update`, or `patch` submitted with an
+  actor token and the `kube-agents/action-id` annotation stripped is **rejected at admission**, and
+  the object is unchanged afterwards.
+- **(new) No unjournaled write — detected half:** using an actor token directly, perform (a) a
+  `delete`, (b) a `deletecollection`, (c) a `/scale` subresource write, and (d) a cloud mutation,
+  each with no `ActionRecord`. Assert each **succeeds** — it must, since admission cannot see it —
+  and that `C-JR` raises the mismatch, auto-pauses the agent, and moves SLI 2 within the §4.3 SLO
+  (p95 ≤ 5 min for a–c, ≤ 15 min for d). A run in which the delete is _blocked_ is a **failing**
+  run: it means the implementation is asserting a property Kubernetes does not provide, and the
+  detection path is untested. Together these two checks are SLI 2 ([01](01-vision-scope.md) §7) run
+  as a test.
+- **(new) Detection SLO holds under load:** the synthetic unjournaled delete is injected
+  continuously; p95 and p99 detection latency stay inside §4.3's bounds while the fleet is at its
+  §6 action-rate target.
 - **(new) Fail-closed:** with the journal store unavailable, the broker refuses to execute rather
   than executing unjournaled.
 

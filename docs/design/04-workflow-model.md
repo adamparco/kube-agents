@@ -202,8 +202,13 @@ remains deferred hardening, with the broker as its natural host
 4. **Execute or discard.** On approval the broker re-runs its pipeline from the top — scope,
    classification, brake, and a **freshness check** against the snapshot — before executing. An
    approval is permission, not a bypass: if the world changed while it waited, it re-gates.
-5. **Expire.** Unapproved actions expire after a TTL (default 24h) and are recorded as `Expired`. A
-   stale approval is more dangerous than a missed one.
+5. **Expire.** Unapproved actions expire after a TTL and are recorded as `Expired`. **The default is
+   24 h**, and there is exactly one place it is configured: `ApprovalRoster.spec.ttl`
+   ([06](06-api-and-data-contracts.md) §4.4), which owns the field and the default. No other value
+   appears in this document — a second copy would drift, and a shorter default would silently expire
+   gated actions raised overnight, which is the case the gate exists for. A roster may set a
+   **shorter** TTL; a stale approval is more dangerous than a missed one, and expiry is not a
+   rejection — the agent may re-raise the action, which re-classifies and re-gates from the top.
 
 **The agent does not block.** While an action is parked it continues with everything else, including
 the ungated parts of the same task. An agent idling on a pending approval is a defect.
@@ -447,7 +452,9 @@ check the conversion deliberately removes; **(new)** is created by the imperativ
   a parent cannot approve a child's; approval by a non-roster human is rejected.
 - **(new) Approval is not a bypass.** An approved action whose snapshot has gone stale re-gates
   rather than executing against changed state.
-- **(new) Expiry.** An unapproved action expires at its TTL and is never executed afterwards.
+- **(new) Expiry.** An unapproved action expires at its TTL — **24 h by default**, read from
+  `ApprovalRoster.spec.ttl` ([06](06-api-and-data-contracts.md) §4.4) and asserted against that
+  field rather than against a value hard-coded in the test — and is never executed afterwards.
 - **(new) Parked work does not block.** With an action pending approval, the agent demonstrably
   continues other work.
 

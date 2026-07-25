@@ -31,9 +31,10 @@ reader SA cannot write anyway.
 The controller still **mints no identity**: both SAs are pre-created, GitOps-managed manifests it
 references **by name**, derived from `tier` + `scope` ([03](03-security-model.md) §3.4). It owns
 workload lifecycle, `(tier, scope)` cardinality, placement, the **cross-object child ⊆ parent
-ceiling webhook** (v1-required as of [03](03-security-model.md) §4.2), the pod labels
-(`kube-agents/tier` / `scope` / `parent` / **`role: reader|actor`**), and the hardened pod-security
-context. The **Scion** launch-primitive seam is retained, still gated off, native build the default.
+ceiling webhook** (v1-required as of [03](03-security-model.md) §4.2), the **five** pod labels
+(`kube-agents/tier` / `scope` / `parent` / `agent` / **`role: reader|actor`**), and the hardened
+pod-security context. The **Scion** launch-primitive seam is retained, still gated off, native build
+the default — and **pair-atomic**: no launch path may bring up an agent without its broker (§2.6).
 Deferred: the untrusted-code-execution sandbox (§5.1) and per-request user down-scoping (§5.2).
 Trade-offs in §4 — the inversion buys capability and **spends** several of the previous
 generation's simplifications; §3 says which.
@@ -71,9 +72,23 @@ runtime _realises_ them.
 | **Agent pod**     | `<agent>-gateway` | `<tier>-agent` (reader) | `<tier>-agent:<tag>` (baked per tier)     | Hermes harness, `SOUL.md`, skills, cron, ChatOps                          | **Read-only**, scoped to the tier. No write verb, anywhere.                                       |
 | **Action Broker** | `<agent>-broker`  | `<tier>-<scope>-actor`  | `kube-agents-broker:<tag>` (tier-neutral) | Deterministic Go: classify → gate → snapshot → execute → verify → journal | **Read-write within the tier's scope**, minus the forbidden set ([03](03-security-model.md) §3.3) |
 
-Both names are **derived from `tier` + `scope`** and looked up by name; neither is settable in a way
-that could widen authority ([03](03-security-model.md) §3.4). The `Agent` CRD carries **no** field
-naming an actor SA. (Delta: today's `spec.security.serviceAccountName` override applies to the
+**Canonical workload names.** These are cited by [05](05-system-architecture.md) §1,
+[06](06-api-and-data-contracts.md) §1.1/§4.1 and by the §7 checks, so they are fixed here and
+nowhere else:
+
+| Object              | Name              | Notes                                                                                    |
+| ------------------- | ----------------- | ---------------------------------------------------------------------------------------- |
+| Agent `Deployment`  | `<agent>-gateway` | `<agent>` is the `Agent` CR name                                                         |
+| Agent `Service`     | `<agent>`         | Port `8444/TCP` (`mesh`) — delegation/escalation ([06](06-api-and-data-contracts.md) §7) |
+| Broker `Deployment` | `<agent>-broker`  | —                                                                                        |
+| Broker `Service`    | `<agent>-broker`  | Port `8443/TCP` (`envelope`) — the Action Envelope endpoint (§2.3)                       |
+
+The Deployment and the Service of the agent pod deliberately differ (`<agent>-gateway` vs
+`<agent>`); the broker's Deployment and Service deliberately share one name (`<agent>-broker`).
+
+Both SA names are **derived from `tier` + `scope`** and looked up by name; neither is settable in a
+way that could widen authority ([03](03-security-model.md) §3.4). The `Agent` CRD carries **no**
+field naming an actor SA. (Delta: today's `spec.security.serviceAccountName` override applies to the
 **reader** only and is constrained by admission to the tier template's name pattern;
 [07](07-implementation-roadmap.md) converges the code.)
 
@@ -112,10 +127,16 @@ call, not a loopback**, and must be authenticated as such (§2.3).
 ### 2.3 The agent → broker path
 
 - **Service.** The controller reconciles a headless-capable ClusterIP Service `<agent>-broker` in
-  the agent's namespace, port `8643/TCP` (`envelope`), selecting `kube-agents/role: actor` +
-  `kube-agents/agent: <cr-name>`. The agent's own Service (`<agent>`, `8642`) is unchanged.
+  the agent's namespace, port **`8443/TCP`** (`envelope`), selecting `kube-agents/role: actor` +
+  `kube-agents/agent: <cr-name>`. The agent's own Service (`<agent>`) serves the **mesh** on
+  **`8444/TCP`** ([06](06-api-and-data-contracts.md) §7); the two ports are distinct and neither is
+  configurable.
+- **Transport: HTTP+JSON over TLS, not gRPC.** The agent submits an Action Envelope with
+  `POST /v1alpha1/actions` and reads liveness from `GET /healthz`. The wire schema is owned by
+  [06](06-api-and-data-contracts.md) §4.1; this doc owns only where it is served. A gRPC broker
+  would be a contradiction of that contract, not an implementation choice.
 - **Discovery.** The controller injects `KUBEAGENTS_BROKER_ENDPOINT` =
-  `https://<agent>-broker.<ns>.svc.cluster.local:8643` into the agent container. The agent does not
+  `https://<agent>-broker.<ns>.svc.cluster.local:8443` into the agent container. The agent does not
   discover brokers dynamically and cannot be pointed at another agent's broker: the endpoint is
   operator-rendered config on a read-only mount, and a foreign broker would reject the caller in any
   case (below).
@@ -214,29 +235,109 @@ which is the selection convention `vap-agent-scope` keys on ([06](06-api-and-dat
   is the v1 default**, and the Scion launch primitive
   ([GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion) `pkg/api/types.go`,
   `pkg/runtime/k8s_runtime.go`) sits behind the `KUBEAGENTS_SCION_LAUNCH` gate with a mandatory
-  native fallback and an availability probe. The inversion adds one requirement to that seam: the
-  `LaunchSpec` contract must be able to express **both** members of the pair, so a future Scion path
-  cannot launch an agent without its broker.
+  native fallback and an availability probe.
+- **The launch seam is pair-atomic — a hard requirement, not a preference.** An agent running
+  without its broker is the one startup state the design must not produce: the pod would be up,
+  addressable, and answering, with no writer behind it and no component whose absence is obvious
+  from the CR. So the seam is constrained three ways. (a) A single `LaunchSpec` must express **both**
+  members of the pair — the broker's workload, Service, certificate and SA binding alongside the
+  agent's — so "launch an agent" is not an expressible operation on its own. (b) The **broker is
+  launched first**, as in the native path (§2.4). (c) If the broker launch fails or does not become
+  `BrokerReady` within the bounded timeout, the launcher must **not** proceed to the agent, and must
+  **roll back** any partially-created broker objects; the `Agent` CR stays `NotReady` with the
+  failure surfaced, and the controller retries the pair from the top. A launcher that can leave an
+  agent up with no broker fails the §7 pair checks and may not be enabled, gate or no gate. This
+  applies to the native `PodLauncher` too — Scion is simply the path most likely to violate it,
+  because its launch primitive is agent-shaped.
 
 ### 2.7 The controller mints no identity — and what it may do instead
 
 The controller's own RBAC is deliberately narrow and, critically, **contains no verb that grants
 authority to anything**:
 
-- **May:** get/list/watch/create/update/patch/delete `Deployments`, `Services`, `ConfigMaps`, and
-  `PersistentVolumeClaims` in `kubeagents-system` and each agent's placement namespace; read
-  `ServiceAccounts`, `Namespaces`, `Nodes`, `Pods`, `Events`, `RuntimeClasses`; manage `Agent` CRs
-  and their status; run its webhooks.
+- **May:** get/list/watch/create/update/patch/delete `Deployments`, `Services`, `ConfigMaps`,
+  `PersistentVolumeClaims`, `NetworkPolicies`, and **a narrowly scoped class of `Secrets`** (below)
+  in `kubeagents-system` and each agent's placement namespace; read `ServiceAccounts`, `Namespaces`,
+  `Nodes`, `Pods`, `Events`, `RuntimeClasses`; manage `Agent` CRs and their status; export
+  `ActionRecord`s (read + status only); run its webhooks.
 - **May not:** create or modify **any** `Role`, `ClusterRole`, `RoleBinding`, `ClusterRoleBinding`,
   ServiceAccount, IAM binding, or Workload-Identity binding. It cannot annotate a KSA either — the
   Workload-Identity annotation is part of the pre-created manifest, not something the runtime
-  applies. It has **no** write access to tenant workloads, cloud resources, or `ActionRecord`s.
+  applies. It has **no** write access to tenant workloads, cloud resources, or `ActionRecord`
+  `spec`s.
 
-Both SAs, their RBAC, and their Workload-Identity bindings are ordinary manifests rendered from the
-**tier template** and applied by the customer's pipeline ([06](06-api-and-data-contracts.md) §2,
-[03](03-security-model.md) §4.2). Nothing grants RBAC at runtime. The controller consumes identity;
-it never produces it. That is what keeps "an agent cannot widen its own authority" true even if the
-controller itself is buggy — though not if it is fully compromised, which §4 states honestly.
+**The `Secrets` and `NetworkPolicies` grants, and why they are on the list.** §2.4 has the
+controller render the pair's **certificate Secret**, and [05](05-system-architecture.md) §1 (C1) has
+it reconcile the per-agent Service, the mesh certificate, and the pair's NetworkPolicies. An earlier
+version of this list omitted both, which made C1 unimplementable as specified. They are granted, and
+scoped:
+
+| Grant                                  | Scope                                                                                                                                                                                       |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NetworkPolicies` — full CRUD          | Only in `kubeagents-system` and placement namespaces, and only objects the controller owns via `OwnerReference`. It may not write a tenant's own policies.                                  |
+| `Secrets` — create/update/patch/delete | **Only** `kubeagents.x-k8s.io/purpose: agent-mesh-tls` / `broker-tls` Secrets it owns. Where cert-manager is present the controller creates the `Certificate` and touches no Secret at all. |
+| `Secrets` — **`get`/`list`/`watch`**   | **Not granted at all.** See below.                                                                                                                                                          |
+
+**The controller must not be able to read agent token Secrets.** A `list secrets` verb in any
+namespace hosting an agent would hand the controller every projected-token and Workload-Identity
+Secret in that namespace — i.e. the actor credentials themselves — collapsing the §4 "it can _use_
+an actor SA but cannot _mint_ authority" bound into "it holds the credential outright". The
+controller therefore holds **no read verb on `Secrets`**: it writes its own TLS Secrets blind
+(server-side apply with a known name), and observes their readiness through the Deployment's
+rollout, not by reading the contents. If an implementation finds it needs `get secrets`, that is a
+design change requiring the §4 residual-risk table to be re-derived, not a convenience.
+
+**How "in `kubeagents-system` and each agent's placement namespace" is actually enforced.** This
+phrase is load-bearing — it is the bound §4 places on a compromised controller — and it is **not
+expressible in a single cluster-scoped grant**. Placement namespaces are created as agents are
+provisioned, so there is no static list to enumerate and RBAC has no dynamic namespace selector.
+The natural Kubebuilder scaffold emits one `ClusterRole` + one `ClusterRoleBinding`, which grants
+`create pods` in **every** namespace and voids the mitigation entirely: a compromised controller
+could then stand up a pod bound to any actor SA anywhere. Say plainly what is required instead:
+
+> **Normative: per-namespace `RoleBinding`s, created at provisioning time. The controller holds no
+> cluster-wide write verb on any workload or Secret resource.**
+>
+> - The controller's workload authority lives in a **namespaced `Role`** (`Deployments`, `Services`,
+>   `ConfigMaps`, `PersistentVolumeClaims`, `NetworkPolicies`, scoped `Secrets`, `Pods` — read),
+>   bound by a **`RoleBinding` per namespace**: one in `kubeagents-system`, and one created in each
+>   placement namespace **at the moment that namespace is provisioned**, as part of the same
+>   rendered bundle that carries the agent's reader/actor SAs and their RBAC
+>   ([06](06-api-and-data-contracts.md) §2).
+> - The controller's `ClusterRole` retains **only** cluster-scoped **reads** (`Namespaces`, `Nodes`,
+>   `RuntimeClasses`, `ServiceAccounts`) and the cluster-scoped objects it must own (`Agent` CRs and
+>   their status, `FleetFreeze`, its own webhook configurations). It carries **no**
+>   `create`/`update`/`patch`/`delete` on `Pods`, `Deployments`, `Secrets`, `Services`,
+>   `NetworkPolicies`, `ConfigMaps`, or `PersistentVolumeClaims` at cluster scope. A
+>   `ClusterRoleBinding` conferring any of those is a **conformance failure**, not a shortcut (§7).
+
+**Why this and not a `ValidatingAdmissionPolicy` on the controller's identity.** A VAP restricting
+the controller to namespaces carrying a placement label would also work, and is the obvious
+alternative. It is rejected as the _primary_ control for two reasons. First, it is **deny by
+policy** layered over a grant that is still cluster-wide: delete or misconfigure the policy and the
+authority is instantly universal, with nothing else standing in the way — whereas an absent
+`RoleBinding` fails safe by construction, and the API server needs no extra object to refuse.
+Second, the `RoleBinding` costs no new machinery: identity for an agent is _already_ a pre-created,
+pipeline-applied manifest bundle (§2.7 above), and the ordering dependency it introduces — the
+controller cannot reconcile into a namespace until that namespace's bundle is applied — **already
+exists**, because the agent's own SAs arrive the same way. A VAP on the controller's identity
+remains a reasonable **defense-in-depth addition**; it is not the bound this design rests on.
+
+**Consequence for §4.** The "compromised controller" row's mitigation ("its Deployment/Pod writes
+are limited to `kubeagents-system` and agent placement namespaces") is now true **by construction**
+rather than by assertion, and the residual narrows accordingly: a compromised controller can re-use
+an actor identity only in a namespace where a human-applied bundle deliberately admitted it, and it
+cannot manufacture such a namespace — it holds no `create namespaces` verb and no RBAC-write verb
+with which to bind itself there. It therefore reaches, at worst, the union of scopes already
+delegated to existing agents, and **no scope beyond them**. That is a real bound; it is not zero,
+and §4 keeps the row.
+
+Both SAs, their RBAC, their Workload-Identity bindings, and the controller's per-namespace
+`RoleBinding` are ordinary manifests rendered from the **tier template** and applied by the
+customer's pipeline ([06](06-api-and-data-contracts.md) §2, [03](03-security-model.md) §4.2).
+Nothing grants RBAC at runtime. The controller consumes identity; it never produces it. That is what
+keeps "an agent cannot widen its own authority" true even if the controller itself is buggy — though
+not if it is fully compromised, which §4 states honestly.
 
 ## 3. Deliberately out of scope — and what the inversion spent
 
@@ -342,16 +443,16 @@ than of agent behaviour:
 
 ### Residual risks & mitigations
 
-| Risk                                                                                                          | Bound / mitigation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Compromised or injected agent pod**                                                                         | Holds no write credential; can only submit envelopes, each classified, gated, scope-checked, budgeted, journaled and undoable ([03](03-security-model.md) §4.1, §5, §8.1). Worst case is an in-scope, reversible, fully-attributed action — plus an anomaly-rate auto-pause ([03](03-security-model.md) §6)                                                                                                                                                                                                                                                                                                                                                                                     |
-| **Compromised broker** (the new high-value target)                                                            | One scope only; no model and no untrusted-input parsing inside it; minimal image, read-only rootfs, no shell; `vap-agent-scope` applies **independently of the broker**, so a rogue broker still cannot write out of scope, touch the forbidden set, or write without an `action-id` ([03](03-security-model.md) §4.3)                                                                                                                                                                                                                                                                                                                                                                          |
-| **Compromised controller** — it can bind an actor SA to a pod it creates, which is effectively use of that SA | The sharpest residual risk in this doc, and stated as such. Bounded by: the controller holds **no** RBAC/SA-write verb (it cannot create a _new_ authority, only re-use existing ones); its Deployment/Pod writes are limited to `kubeagents-system` and agent placement namespaces; `vap-agent-pod-hardening` requires the `kube-agents/role` label to match the bound SA class, so a smuggled pod is rejected at admission; every resulting write is still scope-bounded, still needs an `action-id`, and journal-completeness reconciliation flags fabricated ones ([01](01-vision-scope.md) §7 SLI 2). Treat the controller as **in the trust boundary** and review its changes accordingly |
-| **Forged or replayed envelope**                                                                               | mTLS + audience-bound `TokenReview`; scope derived from the authenticated caller, never the body; a broker accepts exactly one reader identity; NetworkPolicy admits only its own agent (§2.3)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| **Broker unavailable at a critical moment**                                                                   | Agent degrades to observe-and-report and says so; work queue preserved; no direct-write fallback exists (§2.4). Availability targets and chaos coverage in [05](05-system-architecture.md) §6, §8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| **Wrong-but-authorized action** (autonomy failure)                                                            | Not a runtime control — verify-then-rollback, initiative budgets, flap detection, `contested` markers ([04](04-workflow-model.md) §4.2, §5), undo and pause ([03](03-security-model.md) §6)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| **Confused deputy** — a trusted human drives the agent beyond their own rights                                | Accepted in v1, and a **larger** trade than in the read-only generation because it now exposes writes. Bounded by trusted-human access, the scope ceiling, and the gated class ([03](03-security-model.md) §4a); per-request down-scoping is the deferred fix (§5.2)                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| **Cron self-triggered by a compromised pod**                                                                  | Runs at reader authority; any change goes through the same broker, gates and journal — no privilege path                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Risk                                                                                                          | Bound / mitigation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Compromised or injected agent pod**                                                                         | Holds no write credential; can only submit envelopes, each classified, gated, scope-checked, budgeted, journaled and undoable ([03](03-security-model.md) §4.1, §5, §8.1). Worst case is an in-scope, reversible, fully-attributed action — plus an anomaly-rate auto-pause ([03](03-security-model.md) §6)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **Compromised broker** (the new high-value target)                                                            | One scope only; no model and no untrusted-input parsing inside it; minimal image, read-only rootfs, no shell; `vap-agent-scope` applies **independently of the broker**, so a rogue broker still cannot write out of scope, touch the forbidden set, or write without an `action-id` ([03](03-security-model.md) §4.3)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **Compromised controller** — it can bind an actor SA to a pod it creates, which is effectively use of that SA | The sharpest residual risk in this doc, and stated as such. Bounded by: the controller holds **no** RBAC/SA-write verb (it cannot create a _new_ authority, only re-use existing ones); its Deployment/Pod/Secret writes are confined to `kubeagents-system` and agent placement namespaces **by per-namespace `RoleBinding`, with nothing granted cluster-wide** (§2.7) — so it cannot create a pod in a namespace no bundle admitted it to, and cannot manufacture such a namespace; it holds **no read verb on `Secrets`**, so it cannot exfiltrate an agent token directly; the ownership+image pinning rule of [03](03-security-model.md) §4.3 rejects a pod that binds an actor SA without being transitively owned by that SA's `Agent` CR **and** running the broker image, so a smuggled pod is rejected at admission — label-matching alone would not have caught it, since the controller sets the labels; every resulting write is still scope-bounded, still needs an `action-id`, and `C-JR` journal reconciliation ([05](05-system-architecture.md) §1) flags fabricated ones ([01](01-vision-scope.md) §7 SLI 2). **Residual after all of that:** re-use of already-delegated actor identities, within their own scopes, for the duration of the compromise. Treat the controller as **in the trust boundary** and review its changes accordingly |
+| **Forged or replayed envelope**                                                                               | mTLS + audience-bound `TokenReview`; scope derived from the authenticated caller, never the body; a broker accepts exactly one reader identity; NetworkPolicy admits only its own agent (§2.3)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| **Broker unavailable at a critical moment**                                                                   | Agent degrades to observe-and-report and says so; work queue preserved; no direct-write fallback exists (§2.4). Availability targets and chaos coverage in [05](05-system-architecture.md) §6, §8                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| **Wrong-but-authorized action** (autonomy failure)                                                            | Not a runtime control — verify-then-rollback, initiative budgets, flap detection, `contested` markers ([04](04-workflow-model.md) §4.2, §5), undo and pause ([03](03-security-model.md) §6)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **Confused deputy** — a trusted human drives the agent beyond their own rights                                | Accepted in v1, and a **larger** trade than in the read-only generation because it now exposes writes. Bounded by trusted-human access, the scope ceiling, and the gated class ([03](03-security-model.md) §4a); per-request down-scoping is the deferred fix (§5.2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| **Cron self-triggered by a compromised pod**                                                                  | Runs at reader authority; any change goes through the same broker, gates and journal — no privilege path                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 ## 5. Future hardening (only if/when needed)
 
@@ -487,6 +588,15 @@ runtime _shape_.
 - **(new) Two workloads, and no more.** For each `Agent` CR, exactly one `<agent>-gateway` and one
   `<agent>-broker` Deployment exist, both with an `OwnerReference` to the CR; the controller creates
   no third workload and no ServiceAccount. Deleting the CR removes both and leaves both SAs intact.
+- **(new) Names and ports are the canonical ones.** Deployments `<agent>-gateway` and
+  `<agent>-broker`; Services `<agent>` on `8444` (mesh) and `<agent>-broker` on `8443` (envelope);
+  the broker answers `POST /v1alpha1/actions` over HTTP+JSON and serves no gRPC reflection service
+  (§2.1, §2.3). Cross-check against [06](06-api-and-data-contracts.md) §4.1 and §7 from the same
+  fixture, so a divergence fails rather than being resolved by whichever doc the reader opened.
+- **(new) The launch seam is pair-atomic.** With the broker's launch forced to fail (bad image ref,
+  or the Scion probe returning unavailable), assert that **no agent pod is created**, any partial
+  broker objects are removed, and the CR reports `BrokerReady: False` with `Ready: False` (§2.6).
+  Run this against **both** `PodLauncher` implementations, native and Scion-gated.
 - **(new) Correct identity on each.** The agent Deployment's `spec.serviceAccountName` is the
   `<tier>-agent` reader SA; the broker Deployment's is the `<tier>-<scope>-actor` actor SA. Neither
   is settable to the other's value (admission rejects).
@@ -515,17 +625,32 @@ runtime _shape_.
   `get;list;watch` on ServiceAccounts (assert by parsing the generated RBAC, not by inspection); the
   agent SAs, their RBAC, and their WI bindings exist only as pre-created manifests in the repo
   (grep + audit-log check that no runtime principal created them).
+- **(new) The controller holds nothing cluster-wide that can create a pod.** Parse the generated
+  RBAC: no `ClusterRole` bound by a `ClusterRoleBinding` to the controller's SA carries
+  `create|update|patch|delete` on `pods`, `deployments`, `secrets`, `services`, `networkpolicies`,
+  `configmaps`, or `persistentvolumeclaims` (§2.7). Then prove it live: as the controller's SA,
+  `kubectl auth can-i create deployments -n <a namespace with no agent bundle>` returns **no**, and
+  creating a pod there fails. This is the G-5 check — a `ClusterRoleBinding` here silently voids the
+  §4 compromised-controller bound, so it is asserted statically **and** dynamically.
+- **(new) The controller cannot read Secrets.** As the controller's SA,
+  `kubectl auth can-i get|list|watch secrets` returns **no** in every namespace, including
+  `kubeagents-system` and every placement namespace (§2.7). It must still be able to
+  create/update its own `broker-tls` / `agent-mesh-tls` Secrets.
 
 **Labels and selection**
 
-- **(new) All four labels are stamped and selectable.**
-  `kubectl get pods -l kube-agents/role=reader` returns exactly the agent pods;
-  `-l kube-agents/role=actor` exactly the brokers;
+- **(new) All five labels are stamped and selectable** — `kube-agents/role`, `/agent`, `/tier`,
+  `/scope`, `/parent` (§2.5). `kubectl get pods -l kube-agents/role=reader` returns exactly the
+  agent pods; `-l kube-agents/role=actor` exactly the brokers;
   `-l kube-agents/agent=<name>` returns exactly that CR's pair; `kube-agents/tier`,
   `kube-agents/scope`, and `kube-agents/parent` carry the derived values, and the scope label is a
   valid DNS-safe label value for a maximally long scope.
 - **(new) The role label is enforced, not decorative.** A pod carrying `kube-agents/role: reader`
   but binding an actor SA (and the converse) is **rejected by `vap-agent-pod-hardening`**.
+- **(new) Labels are not the whole bound.** A pod that carries a perfectly consistent label set and
+  binds an actor SA, but has **no `OwnerReference` chain to that SA's `Agent` CR** or does **not**
+  run the broker image, is still rejected ([03](03-security-model.md) §4.3). Run this test with the
+  pod created by a principal impersonating the controller, since that is the threat it exists for.
 
 **Behaviour**
 
