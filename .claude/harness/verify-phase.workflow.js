@@ -1,60 +1,168 @@
 export const meta = {
-  name: 'verify-phase',
-  description: 'Run kube-agents verification suites in parallel and adversarially confirm each result',
-  whenToUse: 'After a build phase/task is implemented, to run acceptance + spec Verification suites concurrently and get a per-suite PASS/FAIL with evidence.',
+  name: "verify-phase",
+  description:
+    "Run a set of conformance checks (by ID, from docs/design/09) in parallel and adversarially confirm each result",
+  whenToUse:
+    "After a unit or phase is implemented, to execute many check IDs concurrently at their assigned levels and get a per-check PASS/FAIL/DEFERRED with evidence. Use when the serial harness-verify loop would be slow — typically a phase gate or a full regress.",
   phases: [
-    { title: 'Run suites', detail: 'one agent per verification suite in scope' },
-    { title: 'Confirm', detail: 'adversarially re-check each PASS/FAIL (negative tests must truly deny)' },
+    {
+      title: "Preconditions",
+      detail: "environment trust checks before any live result is believed",
+    },
+    {
+      title: "Run",
+      detail: "one agent per check ID, at that check’s assigned level",
+    },
+    {
+      title: "Confirm",
+      detail: "adversarially re-check every PASS on a negative-control check",
+    },
   ],
+};
+
+// args: {
+//   checkIds: ["V-CTN-004", ...]   // the checks to run
+//   target:   "kind" | "gke" | "none"
+//   phase:    number | string
+//   skipPreconditions: boolean     // only legitimate for an L0/L1-only run
+// }
+//
+// This workflow deliberately holds NO check definitions. They live in
+// docs/design/09-verification-and-validation.md §6 and are read by the agents at run time, so this
+// file cannot drift from the conformance spec the way its predecessor did — that version hardcoded
+// the read-only generation's checks and silently inverted when the design became imperative.
+
+const target = (args && args.target) || "kind";
+const phaseArg = args && args.phase != null ? args.phase : "current";
+const checkIds = (args && args.checkIds) || [];
+
+if (!checkIds.length) {
+  log(
+    "No checkIds supplied — pass the IDs the unit claims plus every BLOCKING-ALWAYS check.",
+  );
+  return { aborted: "no-checks" };
 }
 
-// args: { phase: number, target: 'kind'|'gke', suites: [{ id, spec, section, target, prompt }] }
-// Each suite prompt should tell the agent exactly which checks to run (from harness-verify) and to
-// return evidence. Falls back to a default suite list if args.suites is omitted.
-const target = (args && args.target) || 'kind'
-const phase = (args && args.phase != null) ? args.phase : 'current'
-
-const DEFAULT_SUITES = [
-  { id: '03-11-readonly-sar', spec: '03', section: '§11', prompt: 'Run the read-only per-tier SAR checks (kubectl auth can-i ... --as=<agent-sa>): create|update|delete must be "no" for every resource, get|list|watch "yes" only within tier scope. Report each command and result.' },
-  { id: '03-11-no-write-tools', spec: '03', section: '§11', prompt: 'Grep the operator-RENDERED config (renderConfigYAML / mounted ConfigMap, not just baked config.yaml): confirm no create_cluster, gke MCP read-only, apply_manifest/delete_cluster_manifest removed.' },
-  { id: '03-11-attenuation', spec: '03', section: '§11', prompt: 'Apply a Role/ClusterRole granting an agent SA a write verb (and a cluster-scoped binding to a namespace-tier SA). Confirm the ValidatingAdmissionPolicy REJECTS it at apply time (non-zero apply, denial message).' },
-  { id: '03-11-no-breakglass', spec: '03', section: '§11', prompt: 'Attempt a direct kubectl apply / cloud write with an agent identity. Confirm it is forbidden; only a merged PR actuated by CI/CD succeeds.' },
-  { id: '05-08-chaos', spec: '05', section: '§8', prompt: 'Failure-isolation chaos: kill hub (spoke workloads keep running, agents pause), kill controller (running pods continue, no new reconciles), kill a Cluster Admin Agent (its Dev Team Agents keep running), confirm controller relaunches killed agent pods.' },
-]
-
-const SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['id', 'result', 'evidence'],
+const RESULT = {
+  type: "object",
+  required: ["checkId", "result", "level", "evidence"],
   properties: {
-    id: { type: 'string' },
-    result: { enum: ['PASS', 'FAIL', 'SKIP'] },
-    evidence: { type: 'string', description: 'command(s) + output snippet or PR/commit link' },
-    notes: { type: 'string' },
+    checkId: { type: "string" },
+    result: { type: "string", enum: ["pass", "fail", "deferred", "skipped"] },
+    level: { type: "string", enum: ["L0", "L1", "L2", "L3", "L4"] },
+    gateClass: { type: "string" },
+    evidence: {
+      type: "string",
+      description:
+        "command run and its salient output, or an artifact reference",
+    },
+    negativeControl: {
+      type: "string",
+      description: "the deliberately-bad input tried, and that it was rejected",
+    },
+    blocker: {
+      type: "string",
+      description: "required when result is deferred",
+    },
+    notes: { type: "string" },
   },
+};
+
+const CONFIRM = {
+  type: "object",
+  required: ["checkId", "upheld", "reasoning"],
+  properties: {
+    checkId: { type: "string" },
+    upheld: { type: "boolean" },
+    reasoning: { type: "string" },
+    suspectedFalseGreen: { type: "boolean" },
+  },
+};
+
+// ---- Preconditions -----------------------------------------------------------------------------
+// Each of these exists because it has already produced a false green here. A live result that has
+// not cleared them is not evidence.
+if (!(args && args.skipPreconditions) && target !== "none") {
+  phase("Preconditions");
+  const pre = await agent(
+    `Read .claude/harness/binding.md §Preconditions and docs/design/09-verification-and-validation.md §9.3.
+Verify, against target "${target}", every environment precondition: deployed first-party image digests match the build under test; any freshly-created admission policy binding is actually live (poll a dry-run until it rejects); the network substrate genuinely enforces NetworkPolicy if any egress check is in scope; and the destructive-test guard matches the context with an ANCHORED pattern.
+Report each as pass/fail with the command and output. Do not fix anything — just report.`,
+    { label: "preconditions", phase: "Preconditions", schema: RESULT },
+  );
+  if (pre && pre.result === "fail") {
+    log(
+      `PRECONDITIONS FAILED — no live result from this run may be trusted. ${pre.evidence || ""}`,
+    );
+    return { aborted: "preconditions", detail: pre };
+  }
 }
 
-const suites = (args && args.suites) || DEFAULT_SUITES
-log(`Verifying phase ${phase} on ${target}: ${suites.length} suites`)
-
-// pipeline: each suite runs, then is adversarially confirmed — no barrier between suites.
+// ---- Run + Confirm -----------------------------------------------------------------------------
+// Pipelined: each check is adversarially confirmed as soon as it finishes, rather than waiting for
+// the slowest check in the batch.
 const results = await pipeline(
-  suites,
-  (s) => agent(
-    `Verification suite ${s.id} (spec ${s.spec} ${s.section}) on target ${s.target || target}.\n${s.prompt}\nReturn PASS only if the check truly held. For a negative test, PASS means the bad action was DENIED.`,
-    { label: `verify:${s.id}`, phase: 'Run suites', schema: SCHEMA }
-  ),
-  (r, s) => r == null
-    ? null
-    : agent(
-        `Adversarially confirm this verification result for suite ${s.id}: ${JSON.stringify(r)}.\n` +
-        `A check that silently no-ops must NOT count as PASS. For negative tests, confirm the denial was real (e.g. non-zero apply, explicit policy message), not a malformed manifest. Return the corrected verdict.`,
-        { label: `confirm:${s.id}`, phase: 'Confirm', schema: SCHEMA }
-      )
-)
+  checkIds,
+  (id) =>
+    agent(
+      `You are running conformance check **${id}** for phase ${phaseArg} of the kube-agents build.
 
-const clean = results.filter(Boolean)
-const failed = clean.filter((r) => r.result === 'FAIL')
-log(`Done: ${clean.filter((r) => r.result === 'PASS').length} pass, ${failed.length} fail, ${clean.filter((r) => r.result === 'SKIP').length} skip`)
+1. Read its definition in docs/design/09-verification-and-validation.md §6 — the assertion, the source spec section, its assigned LEVEL, and its gate class.
+2. Read the source spec section it cites, so you assert the actual requirement rather than your paraphrase of the ID.
+3. Run it AT ITS ASSIGNED LEVEL against target "${target}". Do NOT substitute a lower level: proving at L0 something the spec assigns to L2/L3 is the most common false green in this project. If the assigned level cannot be run here, return "deferred" with a named blocker — never "pass".
+4. If the check carries a negative control (marked ¬), you MUST run the deliberately-bad input and confirm it is REJECTED. A check that only demonstrates the happy path is not evidence.
+5. Return the command(s) you ran and their salient output as evidence. A pass with no evidence is a "skipped".
 
-return { phase, target, results: clean, failed, allGreen: failed.length === 0 }
+Consult .claude/harness/binding.md for build/test entry points and target names.`,
+      { label: `run:${id}`, phase: "Run", schema: RESULT },
+    ),
+  (res, id) => {
+    if (!res || res.result !== "pass") return { run: res, confirm: null };
+    return agent(
+      `Adversarially review this reported PASS for conformance check **${id}**.
+
+Reported evidence:
+${JSON.stringify(res, null, 2)}
+
+Your job is to try to REFUTE it. Read the check in docs/design/09 §6 and the spec section it cites, then ask:
+- Does the evidence actually demonstrate the asserted property, or something weaker that resembles it?
+- Was it run at the assigned level, on a substrate that can actually enforce the property?
+- If a negative control was required, was a deliberately-bad input genuinely rejected — or merely absent?
+- Could this pass while the underlying property is broken? Consult docs/design/09 §11 for the ways this codebase has been fooled before.
+
+Default to upheld=false if the evidence is thin. A confident PASS on weak evidence is worse than a FAIL.`,
+      { label: `confirm:${id}`, phase: "Confirm", schema: CONFIRM },
+    ).then((c) => ({ run: res, confirm: c }));
+  },
+);
+
+// ---- Summarize ---------------------------------------------------------------------------------
+const rows = results.filter(Boolean);
+const failed = rows.filter((r) => r.run && r.run.result === "fail");
+const deferred = rows.filter((r) => r.run && r.run.result === "deferred");
+const skipped = rows.filter((r) => r.run && r.run.result === "skipped");
+const refuted = rows.filter((r) => r.confirm && r.confirm.upheld === false);
+
+log(
+  `checks=${rows.length} failed=${failed.length} deferred=${deferred.length} skipped=${skipped.length} refuted-on-review=${refuted.length}`,
+);
+if (refuted.length) {
+  log(
+    "REFUTED PASSES — treat these as failures until the evidence is strengthened.",
+  );
+}
+
+return {
+  phase: phaseArg,
+  target,
+  counts: {
+    total: rows.length,
+    failed: failed.length,
+    deferred: deferred.length,
+    skipped: skipped.length,
+    refuted: refuted.length,
+  },
+  // Green only if nothing failed, nothing was silently skipped, and no PASS was refuted on review.
+  green: failed.length === 0 && skipped.length === 0 && refuted.length === 0,
+  results: rows,
+};

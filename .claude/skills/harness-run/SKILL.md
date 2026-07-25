@@ -1,83 +1,143 @@
 ---
 name: harness-run
-description: Drive the kube-agents build forward one unit of work. Reads docs/build/LEDGER.md, picks the next task in the current roadmap phase, runs the break-down → implement → verify → regress loop, and checkpoints the ledger. Use to start or continue the autonomous build of kube-agents from docs/design/.
+description: Drive the autonomous build forward by exactly one bounded unit of work — orient from the ledger, select or finish a unit, implement, verify by check ID, checkpoint. Use to start or continue the harness build, to resume after an interruption or a killed session, or when a scheduled firing asks for "the next unit". Not for running checks alone (use harness-verify), closing a phase (harness-milestone), or mechanizing lessons (harness-improve).
 ---
 
-# harness-run — the kube-agents build loop
+# harness-run — one bounded unit, then checkpoint
 
-You are driving the autonomous build of kube-agents from its design set (`docs/design/` 01–08),
-following the roadmap in `docs/design/07-implementation-roadmap.md`. Do **one coherent unit of work**
-per invocation, then checkpoint. State lives in `docs/build/LEDGER.md`.
+Executes the loop in `.claude/harness/PROTOCOL.md` §2: ORIENT → SELECT → [PLAN] → IMPLEMENT →
+VERIFY → CHECKPOINT. **One unit per invocation.** Do not try to finish a phase in one run.
 
-## 0. Orient (always do this first)
+Project-specific values — ledger path, build commands, branch names, cluster targets, cadence —
+come from `.claude/harness/binding.md`. Never hardcode them here or in the work.
 
-1. Read `docs/build/LEDGER.md` — current phase, current task, blockers, halt conditions.
-2. Read `.claude/harness/invariants.md` — the gate every change must pass.
-3. Read the current phase in `docs/design/07-implementation-roadmap.md` §2 (its **Work** items and
-   **Accept** criteria) and the phase breakdown `docs/build/phase-<N>.md` if it exists.
-4. If there are open **Blockers** or a triggered **halt condition**, do not proceed autonomously —
-   summarize the blocker and stop.
+---
 
-## 1. Pick the next unit
+## 1. ORIENT — always first, in this order
 
-- If the current phase has **no** `docs/build/phase-<N>.md`, the unit is **break down the phase**
-  (see §2). Otherwise pick the first task with status `todo`/`in-progress` in that file.
-- Keep a unit small enough to finish + verify in one run. Prefer finishing an in-progress task over
-  starting a new one.
+Context does not survive; files do. "I remember where I was" is false.
 
-## 2. Break down a phase (when entering a new phase)
+1. **Ledger** (`binding.md` §State) — current phase, current unit, blockers, halt flags, deferral
+   list, metrics.
+2. **`.claude/harness/invariants.md`** — the gate every change must pass.
+3. **Current phase** in `docs/design/07-implementation-roadmap.md` §2, plus its breakdown file if
+   one exists.
+4. **`.claude/harness/LESSONS.md`** — read every lesson tagged to the area you are about to touch,
+   and every open lesson. PROTOCOL §4 names this the easiest step to skip and the one that stops
+   the harness repeating itself. Skipping it is how a fixed problem comes back.
+5. **Halts and blockers.** If either is set: summarize and stop. The harness never self-clears a
+   halt (PROTOCOL §8).
 
-Create `docs/build/phase-<N>.md`:
+**Resuming a killed session.** If the ledger shows a unit `in-progress` with uncommitted work,
+first establish whether that work is sound (build clean + its claimed checks green). Then either
+finish it or revert it cleanly. Never build on top of an unverified partial unit.
 
-- Expand the phase's **Work** items into concrete, individually-verifiable tasks (`P<N>-T1`, …), each
-  with: what to build, which spec sections it implements (cite doc + §), files it will touch, and the
-  **acceptance signal** (which phase-accept bullet and/or spec Verification check proves it).
-- List the **Verification suites** this phase touches — always a subset of: 02 §10, 03 §11, 04 §9,
-  05 §8, 06 §10, 08 §7 — plus the phase's own **Accept** bullets.
-- Mirror the task list into `LEDGER.md`'s phase table and set status 🟡.
+---
 
-## 3. Detailed design (only when a task warrants it)
+## 2. SELECT — one unit
 
-For a task that is architecturally non-trivial or spec-silent, write
-`docs/build/phase-<N>/<task>.md` with an implementation plan before coding. For mechanical tasks,
-skip straight to §4. If a spec is genuinely silent, pick the simplest option consistent with the
-invariants and record it in the ledger's **Decisions & deviations** table (README rule #3).
+| Situation                                                        | Unit                                                   |
+| ---------------------------------------------------------------- | ------------------------------------------------------ |
+| Phase has no breakdown file                                      | **Break down the phase** (§3). That is the whole unit. |
+| A unit is `in-progress`                                          | Finish it. Prefer this over starting anything new.     |
+| Open lessons over the `binding.md` threshold, or cadence reached | Invoke `harness-improve`. Nothing else this run.       |
+| Phase acceptance appears met                                     | Invoke `harness-milestone`.                            |
+| Otherwise                                                        | The first `todo` task in the breakdown.                |
 
-## 4. Implement
+**Sizing.** A unit must be implementable, verifiable, and checkpointable in this session with
+margin. If it turns out oversized: split it in the breakdown, record the split in the ledger, and
+do the first half. Do not carry an oversized unit forward.
 
-- Work on a branch (fork per `AGENTS.md`); use a git worktree if parallel tasks would conflict.
-- Ground new code on existing patterns — new personas follow `agents/platform/` shape; runtime work
-  extends `k8s-operator/`; the review gate reuses `.agents/skills/review-security-k8s-*`.
-- Before committing: `npx prettier --write` changed md/json/yaml; `make`/`go build` if
-  `k8s-operator/` changed; `docker build` the relevant target if an image changed.
-- Conventional Commits, scoped staging, PR template — never `gh pr create --fill`.
+---
 
-## 5. Verify (invoke `harness-verify`)
+## 3. PLAN — phase breakdown (only when entering a phase)
 
-Run the phase **Accept** criteria + the **Verification** suites the task touched, on the right target
-(Kind for inner loop; scratch GKE for identity/cloud criteria). Record every result in the ledger's
-**Verification log** with evidence. Fix and re-run until green — do not advance on a failing suite.
+Write the phase breakdown file (`binding.md` §State). For each task record:
 
-## 6. Regress
+- what to build;
+- the spec sections it implements (doc + §);
+- the files it will touch;
+- **the check IDs from `docs/design/09-verification-and-validation.md` §6 that prove it**, each
+  with its level and gate class;
+- weight.
 
-Re-run prior phases' **Accept** criteria plus the two load-bearing suites — security negative tests
-(03 §11) and chaos (05 §8) — to confirm the new work didn't break the rest of the design. A
-regression is a halt condition, not a "note and move on."
+Then bind **every phase acceptance bullet to at least one check ID**. An acceptance bullet with no
+check is a planning defect — resolve it now by naming an existing check, or by opening a lesson if
+none exists. Do not proceed with an unbound bullet.
 
-## 7. Gate + checkpoint
+Record the phase ratchet (09 §10) for this phase — the suites newly required at its end. Mirror the
+task list into the ledger.
 
-1. Run the invariants checklist (`.claude/harness/invariants.md`); every item PASS or justified N-A.
-2. Update `LEDGER.md`: task status, verification log, decisions, blockers, `Last updated`.
-3. If the phase's **Accept** all pass and invariants hold: open a PR (per `AGENTS.md`), mark the
-   phase 🟢/✅ in the ledger, and — since autonomy is **fully autonomous** — advance to the next
-   phase. **Halt instead** if any load-bearing halt condition (ledger §Status) is triggered.
+---
 
-## Halt conditions (stop, surface, do not auto-advance)
+## 4. IMPLEMENT
 
-- A security negative test (03 §11) or chaos test (05 §8) fails.
-- A change would violate an invariant.
-- A destructive test would run anywhere but Kind / scratch GKE.
-- A spec conflict with no simplest-option resolution, or an unresolved blocker.
+- Work on the phase branch (`binding.md` §Branching).
+- Ground new code on existing patterns in the repo rather than inventing a parallel shape.
+- If a spec is genuinely silent, pick the simplest option consistent with every invariant and record
+  it in the ledger's decisions table. If a spec is genuinely **contradictory**, that is a halt
+  (PROTOCOL §8.5) — do not pick a side.
+- Before verifying: run the project's build, format, and lint (`binding.md` §Build).
 
-Keep each run tight: orient → one unit → verify → checkpoint. The ledger, not memory, carries state
-to the next run.
+**Guardrails you will actually hit here** (PROTOCOL §10):
+
+- A check fails and the smallest diff to green is editing the check, a threshold, or the spec.
+  **That is a different unit of work.** Diagnose, record the finding, and take it to
+  `harness-improve`. Never change a check in the same unit as the implementation whose failure
+  motivated the change.
+- If the check in question is **BLOCKING-ALWAYS** (V-CTN, V-BRK, V-REV, V-ISO, V-ADV, V-MET),
+  weakening it is a **halt for human review**, however good the argument.
+- Retire, never delete: an obsolete check keeps its ID with status `RETIRED` and a pointer to its
+  replacement, which must exist first.
+- A destructive test outside a sanctioned ephemeral target is a halt, not a judgement call.
+
+---
+
+## 5. VERIFY
+
+Invoke **`harness-verify`** with the unit's claimed check IDs. It selects, runs at level, checks
+environment preconditions, and writes evidence.
+
+On failure: fix and re-run. Do not advance, and do not record a partial result as a pass. **Three
+failures on the same unit with no new information is a halt** (PROTOCOL §8.7) — grinding past that
+point means the diagnosis is wrong.
+
+---
+
+## 6. CHECKPOINT
+
+A unit is done only when all four hold (PROTOCOL §3):
+
+1. Build, format, and lint pass.
+2. Every claimed check ID ran and is green, each with an `evidence_ref`.
+3. The ledger is updated: task status, verification log rows, decisions, any lesson opened.
+4. Work is committed on the phase branch, Conventional Commits, scoped staging.
+
+Then stop. If the phase is now complete, hand to **`harness-milestone`** — do not merge from here.
+
+---
+
+## 7. Halt conditions (PROTOCOL §8)
+
+Stop and surface. Do not retry around, do not switch to other work, do not clear it yourself.
+
+1. A BLOCKING-ALWAYS check fails or cannot run.
+2. A previously-green suite goes red.
+3. A change would violate an invariant.
+4. A destructive operation targets anything but a sanctioned ephemeral environment.
+5. A spec contradiction with no invariant-preserving resolution.
+6. A change that would weaken a spec, check, or gate in a way §10 forbids.
+7. The same unit fails verification three times with no new information.
+8. Resource or credential exhaustion, or an unrebuildable environment.
+
+Record in the ledger: trigger, what was tried, believed cause, and **the narrowest question a human
+could answer to unblock it**.
+
+---
+
+## 8. Every invocation must end in one of these
+
+A completed unit · a recorded halt · a recorded lesson · a completed improvement pass. Ending with
+none of these is itself a defect — open a lesson saying so (PROTOCOL §9).
+
+A clean stop mid-phase is free. An unclean stop mid-unit costs a session. Checkpoint early.

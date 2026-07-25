@@ -1,70 +1,129 @@
 ---
 name: harness-verify
-description: Run the kube-agents verification suites for the current build phase — phase acceptance criteria plus the touched specs' Verification sections (02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7) — on Kind or scratch GKE, and record results in docs/build/LEDGER.md. Use after implementing a task, before advancing a phase, or to check for regressions.
+description: Run conformance checks by stable ID (V-<SUITE>-<nnn>) from docs/design/09-verification-and-validation.md at their assigned level, assert environment preconditions before trusting any live result, and record an evidence row per check in the ledger. Use after implementing a unit, at a phase gate, when re-running the ratchet for regression, or to re-test a deferred check whose blocker has cleared. Does not implement fixes — hand failures back to harness-run.
 ---
 
-# harness-verify — run and log the verification suites
+# harness-verify — run checks by ID, record evidence
 
-Runs the concrete checks the design set defines and records every result in the ledger's
-**Verification log**. Never report "verified" without a command/log/PR as evidence.
+The harness does not invent tests. It runs the checks `docs/design/09-verification-and-validation.md`
+defines, **by ID**, at **their** level, and records evidence (PROTOCOL §6).
 
-## Inputs
+Targets, cluster names, and build commands come from `.claude/harness/binding.md`.
 
-- Current phase + task from `docs/build/LEDGER.md`.
-- The phase's **Accept** bullets (`docs/design/07-implementation-roadmap.md` §2).
-- The **Verification** sections of the specs the task touched. The full map:
-  - 01 §8 — product acceptance (Definition of Done cross-check)
-  - 02 §10 — persona/ChatOps routing checks
-  - 03 §11 — **security negative tests (load-bearing)**
-  - 04 §9 — workflow / propose-review-reconcile + push-trigger checks
-  - 05 §8 — **failure-isolation chaos tests (load-bearing)**
-  - 06 §10 — API/CRD/contract checks
-  - 08 §7 — runtime/identity/pod-spec checks
+---
 
-## Targets
+## 1. Select the check set
 
-- **Kind** (default inner loop): SAR checks, `ValidatingAdmissionPolicy` denial tests, controller
-  pod-spec assertions, chaos kills, config greps. K8s ≥1.30.
-- **Scratch GKE** (ephemeral): criteria needing real Workload Identity / cloud IAM — e.g. the cloud
-  GSA viewer-only assertion, real WI binding on the agent KSA. Tear the cluster down after.
-- **Destructive-test guard:** confirm the kube context is Kind or a scratch GKE cluster before any
-  delete/kill/bad-RBAC-apply. Otherwise **halt** (see `.claude/harness/invariants.md`).
+| Trigger          | Run                                                                          |
+| ---------------- | ---------------------------------------------------------------------------- |
+| A unit           | The check IDs the unit claims **+ every BLOCKING-ALWAYS check**              |
+| A phase gate     | The above **+ the phase ratchet** (09 §10) **+ every prior phase's ratchet** |
+| Regression sweep | Every suite green at the end of the previous phase. The ratchet only grows.  |
+| Deferral re-test | The deferred IDs whose named blocker has cleared                             |
 
-## The two load-bearing suites (must be green before "done")
+BLOCKING-ALWAYS suites: **V-CTN, V-BRK, V-REV, V-ISO, V-ADV, V-MET**.
 
-**Security negative tests — 03 §11** (mostly _expect failure_):
+Resolve each ID to its row in 09 §6 and record its level, gate class, and negative-control
+requirement (`¬`) before running anything. A check marked `¬` whose negative control did not run is
+not a pass.
 
-- **Read-only per tier (SAR):** for each agent SA,
-  `kubectl auth can-i create|update|delete <res> --as=<agent-sa>` → **no** for every resource;
-  `get|list|watch` → **yes** only within tier scope. Dev Team SA → **no** reads in other namespaces;
-  Cluster Admin SA → **no** for other clusters; Platform SA → **no** for other projects.
-- **No write tools:** grep the **operator-rendered** config (`renderConfigYAML()` / mounted ConfigMap,
-  not just the baked `agents/platform/config.yaml`) — no `create_cluster`, `gke` MCP read-only,
-  `apply_manifest`/`delete_cluster_manifest` removed.
-- **Attenuation admission:** apply a `Role`/`ClusterRole` granting an agent SA a write verb (or a
-  cluster-scoped binding to a namespace-tier SA) → **rejected** by the `ValidatingAdmissionPolicy`.
-- **No break-glass:** a direct `kubectl apply` / cloud write with an agent identity → **forbidden**;
-  the only successful mutation is a merged PR actuated by CI/CD.
-- **Trusted-human access:** unauthenticated / non-`AllowedUsers` request (incl. via ChatOps slash /
-  `@handle` / NL) → **refused**; the gateway checks the _target_ agent's allowlist before dispatch.
-- **Egress default-deny:** from an agent pod, only allowlisted endpoints reachable; metadata server
-  and arbitrary hosts **not**.
+---
 
-**Failure-isolation chaos — 05 §8 / 07 Phase 6:**
+## 2. Assert environment preconditions — before trusting any L2/L3 result
 
-- Kill the hub → spoke workloads keep running (agents pause), resume on recovery.
-- Kill the controller in a cluster → running agent pods continue, no new reconciles.
-- Kill a Cluster Admin Agent → its Developer Team Agents keep running.
-- Controller relaunches agent pods after pod kill.
+Every one of these has produced a real green on a broken property in this repo (09 §11). Assert them
+first; a result gathered before they hold is discarded, not adjusted.
 
-## Procedure
+1. **Image freshness** (09 §11.1). Rebuild → load/push → restart, then assert every deployed
+   first-party image **digest** matches the build under test. A same-tag image with
+   `imagePullPolicy: IfNotPresent` is not refreshed — the cluster silently runs old admission logic
+   and reads green.
+2. **Policy activation** (09 §9.3.2). A freshly created `ValidatingAdmissionPolicyBinding` takes
+   time to become effective. Poll a dry-run until it actually **rejects** before judging any
+   admission property.
+3. **No grandfathered objects** (09 §11.2). Admission does not evict existing pods. Force recreation
+   before judging; a running object's state is not evidence the policy works.
+4. **An enforcing network substrate** (09 §11.6). kindnet ignores NetworkPolicy entirely. Egress
+   checks require Calico / Dataplane V2 — otherwise record `deferred`, never `pass`.
+5. **Anchored destructive-test guard** (09 §11.5). Before any test that deletes, kills, applies
+   deliberately-bad RBAC, or drives a destructive action through the broker: confirm the context
+   matches the sanctioned ephemeral pattern with an **anchored** match. Substring matching would
+   accept a prod lookalike. Anything else → **halt**.
 
-1. Determine the suites in scope (phase Accept + touched specs).
-2. For parallel speed, dispatch independent suites to subagents (Agent tool) — or run the optional
-   `.claude/harness/verify-phase.workflow.js` workflow (needs explicit workflow opt-in). Each suite
-   returns: suite id, target, PASS/FAIL, evidence (command + output snippet / PR link).
-3. **Adversarially confirm** any negative test that "passed" — a check that silently no-ops reads as
-   green. E.g. confirm the admission policy actually denied (non-zero apply), not that the manifest
-   was malformed.
-4. Append/update one row per suite in `LEDGER.md` **Verification log**. On any FAIL: do not advance;
-   hand back to `harness-run` §5 to fix, or raise a **Blocker** if unresolvable.
+Also confirm you are asserting against the **runtime-authoritative** artifact, not a baked one that
+the runtime shadows (09 §11.3), and name which artifact in the check's notes.
+
+---
+
+## 3. Run
+
+Order L0 → L1 → L2 → L3 → L4 (09 §9.2). **Exception:** BLOCKING-ALWAYS suites run in full even
+after an earlier level fails — knowing whether containment also broke is worth the minutes.
+
+**Never substitute a lower level.** The level is a property of the requirement, not of convenience
+(09 §3). Specifically: a structural check does not stand in for an enforcement check. Grepping that
+a NetworkPolicy file exists is not evidence egress is denied; asserting the classifier returned
+`gated` is not evidence the action did not execute — assert the target object is **unchanged**
+(09 §11.10); asserting an undo plan exists is not evidence it restores (09 §11.11).
+
+For checks that "passed" negatively, confirm the denial was the expected one. A malformed manifest
+also fails to apply.
+
+Independent suites may be dispatched in parallel; each returns its own evidence.
+
+---
+
+## 4. Record evidence — one row per check (09 §9.4)
+
+```
+check_id, suite, level, target(kind|gke|none), result(pass|fail|deferred|skipped|quarantined),
+requirement_ids[], evidence_ref, duration_s, started_at, image_digests[], notes
+```
+
+`evidence_ref` points at the real artifact: command output, the denial message, an `ActionRecord`
+ID, an audit-log query. **A `pass` with no evidence reference is recorded as `skipped`** — not as a
+pass with a note.
+
+Write rows to the ledger's verification log (`binding.md` §State), and emit/refresh the run manifest
+and `verification/traceability.yaml` on a full run.
+
+---
+
+## 5. Handle results by gate class (09 §9.5)
+
+| Class               | Action                                                                                            |
+| ------------------- | ------------------------------------------------------------------------------------------------- |
+| **BLOCKING-ALWAYS** | **Halt immediately.** Do not merge, do not advance, do not continue to other work. Surface.       |
+| **BLOCKING-PHASE**  | Blocks advancing past the owning phase. Hand back to `harness-run` to fix.                        |
+| **ADVISORY**        | Record. Report a regression against the recorded baseline as a failure; a missed absolute is not. |
+| **DEFERRED**        | Record with a **named blocker, owner, and promotion condition**. Never as a pass.                 |
+
+**Deferral discipline.** A BLOCKING-ALWAYS check may **not** be deferred. If it cannot run, the
+build is not verifiable — that is the finding, and it is a halt (09 §9.6). Reclassifying a failure
+as a deferral is a named reward hack (SELF-IMPROVEMENT §4); a deferral without an external blocker
+is a failure wearing a different label.
+
+Checks marked **†** in 09 §6.14 are blocked on a §12 specification tightening. Record them
+`deferred` with that §12 row as the blocker. Do not let the implementation pick its own threshold.
+
+---
+
+## 6. Flakes (09 §9.7)
+
+- **V-CTN, V-BRK, V-REV, V-ADV, V-MET are never retried to green.** A flaky containment test is a
+  failure until the non-determinism is explained. Retry-to-green on a control is how a real gap gets
+  papered over.
+- Other suites may retry **once**. A check that needed a retry is **quarantined** and tracked, not
+  ignored. Record the retry count.
+- Quarantine is time-boxed and visible in the manifest. A quarantined BLOCKING-ALWAYS check blocks.
+
+---
+
+## 7. Close out
+
+- Every selected ID has a row. A silently skipped BLOCKING-ALWAYS check fails V-MET-007.
+- Update the deferral list and the metrics snapshot in the ledger.
+- Return to the caller: IDs run, results by class, evidence refs, and any halt.
+
+Do not fix anything from inside this skill. Failures go back to `harness-run`; check or spec changes
+go to `harness-improve`.

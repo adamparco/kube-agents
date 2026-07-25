@@ -58,6 +58,36 @@ Answer each as PASS / FAIL / N-A with one line of evidence (a file, a test name,
    - Check: the PR names the pair. A change that reduces the total number of security assertions is
      wrong.
 
+## Harness self-discipline (`.claude/harness/PROTOCOL.md` §10, `SELF-IMPROVEMENT.md` §4)
+
+These bind the **harness**, not the product. They exist because the harness can edit its own specs
+and its own checks, which means the cheapest way to turn a build green is always to lower the bar.
+Each maps to a named hack in `SELF-IMPROVEMENT.md` §4.
+
+9. **No weakening to pass.** No spec, check, threshold, level, or gate is changed in the same unit of
+   work as the implementation whose failure motivated the change.
+   - Check: the diff does not modify both an implementation and the check that was failing it.
+     Diagnose, record a lesson, and change the check as a separate, argued unit.
+
+10. **Load-bearing suites are not autonomously weakenable.** Any change removing, relaxing, narrowing,
+    or demoting the level of a BLOCKING-ALWAYS check is a **halt for human review**.
+    - Check: the diff touches no BLOCKING-ALWAYS check definition. However good the argument, the
+      harness does not get to make this call alone.
+
+11. **Every pass carries evidence.** No check is recorded green without an evidence reference.
+    - Check: every `pass` in the run manifest has a non-empty `evidence_ref`; a pass without one is
+      recorded as `skipped`. No security or safety check was retried to green.
+
+12. **Every deferral names an external blocker.** Deferral is legitimate; using it to hide a failure
+    is not.
+    - Check: each `deferred` result names a blocker outside the harness's control, and no
+      BLOCKING-ALWAYS check is deferred.
+
+13. **Every failure leaves a lesson.** A halt, a rework, or a discovered false green closes with a
+    lesson record, and a lesson closes only with a mechanization ID or an argued refusal.
+    - Check: `LESSONS.md` has an entry for this run's failures; the open-lesson count did not grow
+      silently.
+
 ---
 
 ## Also enforce (repo mechanics, from AGENTS.md)

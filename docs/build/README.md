@@ -1,73 +1,70 @@
-# The kube-agents build harness
+# Build state
 
-A Claude Code harness that builds kube-agents end-to-end from the design set in `docs/design/`
-(01–08), phase by phase, verifying and regression-checking after each phase, iterating until the
-**Definition of Done** ([07 §3](../design/07-implementation-roadmap.md)) passes.
+This directory holds the **state** of the autonomous build of kube-agents. The harness that produces
+it lives in [`.claude/harness/`](../../.claude/harness/) — start at
+[`.claude/harness/README.md`](../../.claude/harness/README.md).
 
-It is not a separate program — it's a set of Claude Code skills, a persistent ledger, a verification
-workflow, and a schedule that together drive the roadmap's verification loop
-([07 §5](../design/07-implementation-roadmap.md)) autonomously.
+| File                     | Role                                                                                                                                                                                                                                      |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`LEDGER.md`](LEDGER.md) | **The single source of truth for build progress.** Read first, written last, on every run. Status, phase table, verification results by check ID, metrics, lessons pointer, deferrals, decisions, blockers, and the history of Phases 0–7 |
+| `phase-<N>.md`           | The task breakdown for phase _N_, written on entering the phase; each task names the spec sections it implements and the **check IDs** that prove it                                                                                      |
+| `phase-5/`, `spikes/`    | Supporting notes from earlier phases                                                                                                                                                                                                      |
+| `../../verification/`    | Generated: the per-run evidence manifest (09 §9.4) and `traceability.yaml` (V-MET-011)                                                                                                                                                    |
 
-## How it works
-
-```
-          ┌─────────────────────────────────────────────────────────────┐
-          │  read LEDGER.md → pick next unit of work                      │
-          └───────────────┬─────────────────────────────────────────────┘
-                          ▼
-   break down ─▶ (detailed design) ─▶ implement ─▶ verify ─▶ regress ─▶ PR
-      │  read the phase's Work items + referenced spec sections            │
-      │  code on a branch; prettier/make/go build; Conventional Commits    │
-      │  run phase acceptance + touched specs' Verification sections       │
-      │  re-run prior-phase acceptance + load-bearing suites               │
-      └─▶ iterate until green ─▶ update LEDGER ─▶ advance phase ───────────┘
-```
-
-- **Break down / implement / verify / regress** are the steps of `harness-run`.
-- **State** persists in [`LEDGER.md`](LEDGER.md) so any session (day 2, day 5) resumes correctly.
-- **Guardrails**: every change is checked against [`.claude/harness/invariants.md`](../../.claude/harness/invariants.md)
-  before it can merge. The existing `.agents/skills/review-security-k8s-*` suite is the review gate.
-
-## Components
-
-| Piece              | Path                                       | Role                                                       |
-| ------------------ | ------------------------------------------ | ---------------------------------------------------------- |
-| Ledger             | `docs/build/LEDGER.md`                     | Persistent build state; read first, updated last every run |
-| Phase breakdowns   | `docs/build/phase-<N>.md`                  | Concrete task list for a phase (created on entry)          |
-| Orchestrator skill | `.claude/skills/harness-run/SKILL.md`      | The per-phase loop                                         |
-| Verify skill       | `.claude/skills/harness-verify/SKILL.md`   | Runs acceptance + Verification suites, logs results        |
-| Invariants gate    | `.claude/harness/invariants.md`            | 5 load-bearing rules, checked before merge                 |
-| Verify workflow    | `.claude/harness/verify-phase.workflow.js` | Optional parallel fan-out of all suites                    |
-
-## Running it
-
-**Manual (recommended to start):**
+## How the build runs
 
 ```
-/harness-run          # do the next unit of work, then checkpoint the ledger
-/harness-verify       # run current phase's acceptance + touched Verification suites
+ORIENT ─▶ SELECT ─▶ [PLAN] ─▶ IMPLEMENT ─▶ VERIFY ─▶ CHECKPOINT
+                                              │           │
+                                              └── fail ───┘   (fix, re-verify; no advance)
+   phase complete ─▶ REGRESS ─▶ MILESTONE ─▶ next phase
+   blocker ────────────────────────────────▶ HALT (human only)
 ```
 
-**Autonomous (multi-day):** a durable scheduled task re-enqueues `/harness-run` on an interval so
-the build progresses unattended. Claude Code cron tasks auto-expire after 7 days and fire only while
-the REPL is idle — re-arm as needed. See "Stopping" below.
+One invocation of `/harness-run` performs **one bounded unit of work** and checkpoints the ledger —
+it does not try to finish a phase in one session. A unit is done only when its code builds, every
+check ID it claims is green **with an evidence reference**, the ledger is updated, and the work is
+committed on the phase branch. A phase closes via `/harness-milestone`, which runs the full gate
+(phase acceptance + the 09 §10 ratchet + regression + `invariants.md`) before any PR opens.
+
+The state machine, halt conditions, and merge rules are in
+[`.claude/harness/PROTOCOL.md`](../../.claude/harness/PROTOCOL.md). Every project-specific value —
+which cluster, which command, which remote, which threshold — is in
+[`.claude/harness/binding.md`](../../.claude/harness/binding.md), not here and not in a skill.
+
+## What decides "done"
+
+- **What to build:** `docs/design/` 01–09. Never contradict a spec; if a spec is genuinely silent,
+  pick the simplest option consistent with the invariants and record it under **Decisions &
+  deviations** in the ledger.
+- **In what order:** [`docs/design/07-implementation-roadmap.md`](../design/07-implementation-roadmap.md)
+  §2 (phases 8–15 and their acceptance criteria), §3 (Definition of Done), §5 (the verification loop).
+- **Whether it is proven:** [`docs/design/09-verification-and-validation.md`](../design/09-verification-and-validation.md)
+  is the authoritative conformance spec — every check has a stable ID (`V-<SUITE>-<nnn>`), a level
+  (L0 static → L4 soak), and a gate class. The harness runs checks by ID; it does not invent tests.
+- **Whether it may merge:** [`.claude/harness/invariants.md`](../../.claude/harness/invariants.md).
 
 ## Safety posture
 
-- **The product is read-only by design.** Agents never mutate cluster/cloud APIs; the only write
-  path is a reviewed PR applied by the customer's CI/CD (invariant #1–2). This holds for the build
-  process too.
-- **Destructive tests** (negative security, chaos — deleting agents, killing the hub, bad-RBAC
-  applies) run **only on Kind or an ephemeral scratch GKE cluster**, never on production. The harness
-  halts if a destructive test is aimed anywhere else.
-- **PRs, not direct pushes.** Per [AGENTS.md](../../AGENTS.md): Conventional Commits, PR template,
-  format before commit, stage only targeted files, push branches to a fork.
-- **Load-bearing halts.** The harness stops and surfaces rather than auto-advancing when a security
-  negative test (03 §11) or chaos test (05 §8) fails, or an invariant would break.
+- **Destructive tests** (chaos, deliberately-bad RBAC, brokered destructive actions) run **only**
+  against an ephemeral target matched by an **anchored** pattern — `kind-*` or `gke-scratch-*`.
+  Anything else is a halt, not a judgement call.
+- **Load-bearing suites halt the build.** V-CTN, V-BRK, V-REV, V-ISO, V-ADV and V-MET are
+  BLOCKING-ALWAYS: a failure stops everything, and they may not be deferred, quarantined, retried to
+  green, or weakened.
+- **Deferred, never faked.** A check that cannot run is recorded `deferred` with a named blocker; a
+  `pass` with no evidence reference is recorded as `skipped`.
+- **PRs, not direct pushes.** Conventional Commits, the PR template, scoped staging, format against
+  the base branch, push to the fork. Required checks are never bypassed — no `--admin`,
+  no `--no-verify`.
+- **A halt is cleared by a human.** The harness records what it tried, what it believes the cause is,
+  and the narrowest question that would unblock it.
 
-## Stopping / pausing
+## Prior generation
 
-- Pause autonomy: delete the scheduled task (`/harness-run` won't self-trigger). Use the task list
-  UI or ask "stop the harness schedule."
-- The `/goal` Stop hook (if set) keeps the session working toward completion; clear it with
-  `/goal clear` to let the session stop.
+Phases 0–7 built the **read-only** generation — agents that proposed GitOps PRs and held no write
+verb. Their history, verification results, decisions and the first live-install findings are
+preserved in `LEDGER.md`. On 2026-07-24 the model was inverted to **imperative agents that act**
+through a per-scope Action Broker; the roadmap restarts at Phase 8 and `invariants.md` was
+re-derived. The old results stay in the ledger as history — they are where most of
+[`LESSONS.md`](../../.claude/harness/LESSONS.md) came from.
