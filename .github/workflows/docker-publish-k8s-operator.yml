@@ -21,7 +21,12 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Load tags
-        run: cat tags.env >> "$GITHUB_ENV"
+        # Only the KEY=value lines. $GITHUB_ENV is not a shell and not a make include: it rejects a
+        # comment line outright ("Invalid format"), so `cat` worked only while tags.env was a single
+        # bare assignment. It has three consumers with three different grammars -- this one, `include
+        # tags.env` in the Makefile, and `. ./tags.env` in shell -- and the file must satisfy all
+        # three. local-dev/test_image_provenance.py asserts exactly that.
+        run: grep -E '^[A-Z][A-Z0-9_]*=' tags.env >> "$GITHUB_ENV"
 
       - name: Resolve image tag
         env:

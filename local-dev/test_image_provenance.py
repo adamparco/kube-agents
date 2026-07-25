@@ -389,6 +389,54 @@ class TestImageProvenance(unittest.TestCase):
         self.assertFalse(TEMPLATED.search("v0.1.0"))
         self.assertFalse(TEMPLATED.search("latest"))
 
+    def test_tags_env_parses_under_all_three_of_its_grammars(self):
+        """tags.env is read by three consumers that do not share a grammar.
+
+        `. ./tags.env` (shell), `include tags.env` (make), and `>> $GITHUB_ENV` (neither -- a
+        key=value list that rejects a comment line outright with "Invalid format"). Satisfying two
+        of the three is not a property anyone can see from inside the file: it looks like a normal
+        commented config, and the consumer that cannot read it fails at a distance, in CI, as a
+        step that never loaded a variable it then silently treats as empty.
+
+        Every publish workflow depends on this parse, so a tags.env only two consumers can read
+        means no image publishes at all -- which is the same outcome V-CMP-002 exists to prevent,
+        arrived at from the other side.
+        """
+        text = (REPO / "tags.env").read_text()
+        assignments = {}
+        for n, line in enumerate(text.splitlines(), 1):
+            if not line.strip() or COMMENT.match(line):
+                continue
+            self.assertRegex(
+                line,
+                r"^[A-Z][A-Z0-9_]*=\S*$",
+                f"tags.env:{n} is neither blank, a comment, nor a bare KEY=value assignment. "
+                f"Shell and make tolerate more than $GITHUB_ENV does; write to the strictest.",
+            )
+            k, _, v = line.partition("=")
+            assignments[k] = v
+
+        # Every workflow that loads it must filter, not `cat`: the comments above are legal shell
+        # and legal make, and $GITHUB_ENV errors on the first one.
+        for wf in [*GHCR_PUBLISH, GAR_PUBLISH, PR_BUILD]:
+            body = wf.read_text()
+            if "tags.env" not in body:
+                continue
+            self.assertNotIn(
+                'cat tags.env >> "$GITHUB_ENV"',
+                body,
+                f"{wf.name} pipes tags.env into $GITHUB_ENV unfiltered — it will fail on the "
+                f"first comment line. Filter with grep -E '^[A-Z][A-Z0-9_]*='.",
+            )
+
+        # The keys the rest of this module and the workflows actually read.
+        for key in ("HERMES_AGENT_TAG", "KAGE_IMAGE_VERSION"):
+            self.assertIn(key, assignments, f"tags.env no longer defines {key}")
+        self.assertTrue(
+            VERSION_TAG.match(assignments["KAGE_IMAGE_VERSION"]),
+            "KAGE_IMAGE_VERSION must be a vN.N.N release tag — it is what every manifest pins",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
