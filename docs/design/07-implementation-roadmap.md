@@ -1,261 +1,362 @@
 # Design 07: Implementation Roadmap
 
-**Status:** ✅ Agreed
+**Status:** ✅ Agreed — **rewritten** for the imperative model. Supersedes the read-only roadmap.
 
-**Overview:** [README.md](README.md) · **Depends on:** 01–06 · **Tier:** Buildable (bridging)
+**Overview:** [README.md](README.md) · **Depends on:** 01–06, 08 · **Tier:** Buildable (bridging)
 
 ---
 
 ## TL;DR
 
-The sequence to build kube-agents from its current state (direct-mutation agents, only
-`PlatformAgent`) to the end state (three read-only, scope-bounded personas — each an **`Agent` CR**
-running the **Hermes** harness, reconciled by the **kube-agents controller** on **Scion**'s verified
-per-pod model — coordinating via GitOps + OKF; semantic-recall/mem0 deferred post-v1). Eight phases,
-each with **acceptance criteria** that gate advancement. Every design decision a builder needs lives
-in the specs (01–06, 08); this doc is sequencing only. The **Definition of Done** makes
-[01](01-vision-scope.md) §7 concrete.
+The shipped system is the **previous generation**: read-only agents that opened GitOps pull
+requests, applied by the customer's CI/CD, forbidden from calling each other. Phases 0–7 of the old
+roadmap built that faithfully and it works. This roadmap **converts it into the imperative system**
+described by 01–06 and 08: agents that hold scoped write authority, act on what they find, and are
+kept safe by the **Action Broker**, the **journal**, **undo**, and **the brake** rather than by a
+merge gate.
+
+Eight phases, **8–15**, continuing the existing numbering so the build ledger stays coherent.
+
+**The ordering is the single most important thing in this document.** Build the safety machinery
+**before** the authority:
+
+> Phase 8 contains the pod. Phase 9 builds the broker with **zero** write authority. Only in Phase
+> 10 does the first agent get a write credential — and by then the classifier, the journal, the
+> undo path, and the brake all exist and are tested. **An agent with write RBAC and no journal is
+> strictly worse than either the system we have or the one we want.** Do not reorder these phases.
+
+Two further rules govern the whole conversion. **Tests are replaced, never deleted** — several
+currently-green checks assert read-only-ness and must fail by design; each is swapped for its
+imperative counterpart _in the same phase that removes it_ (§5). And the **containment** properties
+(scope ceiling, no self-escalation, no cross-tenant reach) stay green from the first commit to the
+last; they are the one thing the inversion does not touch.
 
 ---
 
-## 1. Current state → end state (delta summary)
+## 1. Current state → intended state (delta summary)
 
-| Aspect             | Current                                                                                                                                                        | End state                                                                                                                                                                                                          |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Agents             | 1 (Platform); K8s RBAC **already read-only**, but a **direct-mutation tool** (remote `gke` MCP `create_cluster`, a cloud write via the cloud SA's IAM) remains | 3 tiers, **read-only** (the tool + cloud-IAM write paths removed)                                                                                                                                                  |
-| Mutation path      | Direct API / KCC CR written by agent                                                                                                                           | GitOps PR → **customer's CI/CD pipeline** applies (KCC YAML or Terraform HCL)                                                                                                                                      |
-| Agent runtime      | single `PlatformAgent` CRD + Kubebuilder operator (mints RBAC)                                                                                                 | **kube-agents controller** (the operator, generalized to a tier-discriminated `Agent` CRD) reconciles each agent (Hermes) into an isolated pod on **Scion**'s verified per-pod model; controller mints **no** RBAC |
-| Actuation          | external (customer's existing CI/CD, outside this repo); not yet wired to the agent loop                                                                       | **Customer CI/CD** (GitHub Actions / CircleCI / …); unopinionated, no bundled GitOps engine                                                                                                                        |
-| Coordination       | ad-hoc / per-user memory                                                                                                                                       | GitOps repo + OKF, indirect (mem0 deferred post-v1)                                                                                                                                                                |
-| Human→agent access | anyone who can reach the agent                                                                                                                                 | **Trusted-human access** (authenticated + `AllowedUsers`) + **read-only agent ceiling**; per-request user down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5)                                        |
-| Chat routing       | single Hermes gateway → the one Platform Agent                                                                                                                 | **ChatOps gateway** resolves `(tier,scope)` by slash / `@handle` / NL and dispatches to per-tier pods, enforcing each target's `allowedUsers` ([06](06-api-and-data-contracts.md) §2b)                             |
-| Proactivity        | scheduled (cron) tasks + heartbeat polling                                                                                                                     | **push-first** — K8s watches + alert/GitHub webhooks (Pub/Sub); cron for genuinely scheduled work; heartbeat backstop ([04](04-workflow-model.md) §4)                                                              |
-| Security gate      | none in CI                                                                                                                                                     | review-gate on PR + heartbeat audit                                                                                                                                                                                |
+| Aspect          | Current (the read-only generation, shipped)                                                                              | Intended (imperative)                                                                                                              |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Agent authority | Read-only by construction: pre-created `view` + a `get/list/watch` explorer ClusterRole per tier; cloud GSAs viewer-only | Split **reader/actor** identities per agent; the actor holds scoped write, minus the forbidden set ([03](03-security-model.md) §3) |
+| Write path      | `submit-suggestion` opens a PR; `apply.yml` applies it on merge                                                          | **Action Broker** — one per `Agent` CR, holding the only write credential ([05](05-system-architecture.md) C-AB)                   |
+| Admission       | `vap-agent-readonly` — a read-verb allow-list denying every write verb to an agent identity                              | **`vap-agent-scope`** — readers still write nothing; actors write only their tier template, in scope, journaled                    |
+| Approval        | Every change, via branch protection + CODEOWNERS                                                                         | The **gated class** only, classified in code ([03](03-security-model.md) §5)                                                       |
+| Reversibility   | `git revert` + pipeline re-apply                                                                                         | `ActionRecord` + pre-state snapshot + **undo plan**; `undo <id>` is one command                                                    |
+| Agent-to-agent  | Forbidden; coordination via repo + OKF polling                                                                           | **Direct delegation and escalation** over the mesh; the callee re-authorizes in its own scope                                      |
+| Proactivity     | Watch → diagnose → **propose** → wait                                                                                    | Watch → diagnose → **fix** → verify → report, under initiative budgets                                                             |
+| Human control   | Approve every merge                                                                                                      | **`pause` / `freeze` / `undo` / `contested`**, instant, no merge                                                                   |
+| Tool surface    | Write tools deliberately removed                                                                                         | Write tooling returns as **envelope builders** — no tool calls a mutating API itself                                               |
+| Customer CI/CD  | The privileged writer, in the critical path                                                                              | Out of the critical path; optional **write-behind IaC mirror** ([04](04-workflow-model.md) §6)                                     |
+
+**What already exists and is directly reusable** — the conversion is far less than a rewrite:
+
+- The `Agent` CRD (`tier`/`scope`/`parentRef`), its controller, and its validating webhook.
+- The per-tier identity manifests and the render templates — the shape is right; the rules change.
+- The admission-policy machinery — the same object, inverted.
+- The Kubernetes event watcher, `eventingress`, and the drift detector: **the entire detection half
+  of proactivity is built and working.** It currently ends in a PR; it needs to end in an action.
+- The ChatOps router, the per-tier personas and skills, OKF, session state, attribution plumbing,
+  the chaos suite, and the whole Kind verification harness.
 
 ## 2. Phases
 
 Each phase is independently shippable and leaves the system working. Do not advance until
-acceptance criteria pass.
+acceptance criteria pass. Task IDs are stable handles for `docs/build/phase-<N>.md` breakdowns.
 
-### Phase 0 — Foundations
+### Phase 8 — Contain the pod, close the boundary, make the install real
 
-- **Goal:** repo layout + guardrails + a test cluster exist before behavior changes.
-- **Work:** scaffold the **customer GitOps repo layout** ([06](06-api-and-data-contracts.md) §3 — it
-  does not exist yet); scaffold `knowledge/` OKF base with `index.md` + one `cluster-blueprint` and an
-  **OKF validator script** (valid `type` frontmatter + resolving links); add the per-tier **read-only
-  RBAC render overlay** (SA/Role/RoleBinding) and branch protection requiring human review on
-  `**/agents/**`, `**/namespaces/**`, and `**/policy/**`; stand up a **test cluster** (`local-dev/` Kind
-  bootstrap or a scratch GKE cluster — neither exists yet; **K8s ≥1.30** for `ValidatingAdmissionPolicy`
-  GA) for the negative tests; ship the **`ValidatingAdmissionPolicy`** that hard-denies any
-  `Role`/`ClusterRole` whose rules grant an **agent ServiceAccount** a write verb or a wrong-scope (e.g.
-  cluster-scoped for a namespace tier) grant — selecting agent RBAC by the **`kube-agents/tier` label**
-  the **render overlay** stamps on the pre-created `Role`/`ClusterRole` (the reliable selector; agent SAs
-  are also named `<tier>-agent`), the controller minting no RBAC to label, with CEL scoped to a role's own
-  `rules` — the runtime backstop for attenuation
-  ([03](03-security-model.md) §4). (Automated review-gate
-  CI lands in Phase 5; the cross-object child ⊆ parent validating webhook is deferred hardening,
-  [08](08-agent-runtime-and-identity.md) §5.)
-- **Accept:** repo tree matches 06 §3; the **pre-created RBAC overlay + CI are the only RBAC path
-  exercised in Phase 0** (the controller isn't deployed to the Phase-0 negative-test cluster yet —
-  removing its runtime RBAC-minting is **Phase 1**); a deliberately-bad RBAC PR (agent write verb) is
-  caught by human review **and**, if merged anyway, is **rejected at apply time by the
-  `ValidatingAdmissionPolicy`** on the test cluster; the **OKF validator script passes** on `knowledge/`.
+- **Goal:** everything that must be true **before** any agent gets write authority. This phase adds
+  no imperative capability at all; it removes the reasons it would be unsafe to start.
+- **Why first:** the live install today has an open human→agent boundary, no enforced egress, and a
+  multi-tier install that does not work without a local build. Granting write authority on top of
+  that would compound three known defects instead of fixing them.
 
-### Phase 1 — Read-only Platform Agent + GitOps loop
+| Task  | Work                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Spec   | Weight       |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------ |
+| P8-T1 | **Close the `allowedUsers` bypass.** The provisioning template renders `allowedUsers: [""]` from an empty `envsubst` var — size 1, so `validateClosedAllowlist` and both CRD CEL rules pass; the controller then reads the lone empty entry and emits `SLACK_ALLOW_ALL_USERS=true`. Fix all four layers: count **non-empty** entries in the webhook; CEL → `self.allowedUsers.exists(u, u != "")`; emit the list conditionally in all three templates and fail fast in provisioning; **delete the `*_ALLOW_ALL_USERS` escape hatch entirely.** Ships first and alone if necessary — it is an open hole on a running deployment, and it becomes a write-authority hole in Phase 10. | 03 §4a | load-bearing |
+| P8-T2 | **Enforce egress.** No install path applies any NetworkPolicy and the live cluster has no Dataplane V2, so the three correct per-tier policies are inert exemplars full of `REPLACE_WITH_*` placeholders. Enable an enforcing dataplane, render real CIDRs, apply them. **Resolve the metadata-server conflict first** — the policies deny `169.254.169.254`, which is how Workload Identity mints tokens on GKE.                                                                                                                                                                                                                                                                  | 03 §9  | load-bearing |
+| P8-T3 | Apply the tenant isolation manifests provisioning currently skips: ResourceQuota and the namespace default-deny.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | 03 §9  | medium       |
+| P8-T4 | **Make a multi-tier install work.** Replace the `mcp-remote` OAuth bridge that hangs headless with a metadata-token stdio→HTTP bridge; give the dashboard container the rendered config and telemetry env it currently lacks; ship the `ExternalName` service aliases without which a developer-team agent's inference and token-broker calls fail DNS in its own namespace.                                                                                                                                                                                                                                                                                                       | 05 §5  | high         |
+| P8-T5 | **Image provenance.** Publish `kage-router`, `cluster-admin-agent`, `developer-team-agent` (none are published today); make `:v0.1.0` real or repin every reference to a tag CI produces; add a Cloud Build path for the operator and router; document the Apple-Silicon `PREBUILT_BINARY` escape hatch; stop pushing `:latest`.                                                                                                                                                                                                                                                                                                                                                   | 05 §3  | high         |
+| P8-T6 | **Enforce the harness invariants gate.** `.claude/harness/invariants.md` has already been re-derived from the six new invariants and now carries the two conversion-specific checks — _authority never precedes machinery_ and _tests are replaced, never deleted_. The remaining work is to make them **mechanical** rather than a checklist: a pre-merge script that fails any diff adding a write verb to an agent identity while the broker, classifier, journal, or undo path is absent, and that flags a net reduction in security assertions.                                                                                                                               | README | load-bearing |
+| P8-T7 | Documentation truth: the retired `PlatformAgent` kind still appears in `INSTALL.md` (including a command that fails), the pipeline list stops at step 11, and the live-install learnings live only in `k8s-operator/scripts/README.md`. Fold them in; fix the Minty org prerequisite, the Slack App-Home DM checkbox, and the LiteLLM port-80 detail.                                                                                                                                                                                                                                                                                                                              | —      | low          |
+| P8-T8 | Consolidated gate `local-dev/kind/verify-phase8.sh` + a live-target checklist; regression `verify-phase7.sh`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 07 §5  | load-bearing |
 
-- **Goal:** close the biggest delta — remove direct mutation from the Platform Agent.
-- **Work:** extend `k8s-operator/` into the **kube-agents controller** — generalize `PlatformAgent` →
-  the tier-discriminated **`Agent` CRD** (add `tier`/`scope`/`parentRef`), **stop minting RBAC** (the
-  `view` binding + "explorer" ClusterRole become pre-created manifests), and add the **`(tier,scope)`
-  cardinality validating webhook** ([06](06-api-and-data-contracts.md) §1, §1.2,
-  [08](08-agent-runtime-and-identity.md)); pin the controller image + deploy manifests
-  ([05](05-system-architecture.md) §3); author the **platform-tier `Agent` CR** (Hermes harness),
-  migrating today's `PlatformAgent`. **Spike:** wire the controller's pod-construction to Scion's launch
-  primitive ([08](08-agent-runtime-and-identity.md) §2), falling back to the operator's native Deployment
-  build if Scion's K8s mode is not ready. Pre-create the platform read-only KSA/RBAC/WI (applied by CI)
-  and reference it via the CR's `serviceAccountName`, **unifying the canonical `<tier>-agent` KSA** the
-  pre-created view/explorer manifests bind to; make the agent read-only by editing the operator's
-  **`renderConfigYAML()`** — the runtime-authoritative config; the baked `agents/platform/config.yaml` is
-  shadowed at runtime — so no cluster-creating tool reaches it and the `gke` MCP is describe/list only
-  ([06](06-api-and-data-contracts.md) §9), and **retire the `gke-cluster-creator` skill's `create_cluster`
-  call**; **scope the cloud GSA to viewer-only IAM** — the real cloud-write delta, since the agent's K8s
-  RBAC is **already read-only** (runtime-minted `view` + a get/list "explorer" `ClusterRole`, no write
-  verbs to strip) — and remove the dead `kubectl` apply/delete helpers; mount the config ConfigMap
-  `readOnly: true`; **stop runtime-minting** that `view`/explorer RBAC (move it into the pre-created
-  manifests above) and **drop the controller's RBAC-granting kubebuilder markers**
-  (`clusterroles`/`clusterrolebindings` create/bind) so it mints no RBAC
-  ([08](08-agent-runtime-and-identity.md) §4); add the CRD's `iac.format` field (default `kcc`,
-  [06](06-api-and-data-contracts.md) §1.1); wire an **actuation pipeline** (the customer's CI/CD — reference: a GitHub
-  Actions workflow) that applies merged artifacts (KCC YAML or Terraform HCL) to the target
-  ([06](06-api-and-data-contracts.md) §4); route all infra changes through `submit-suggestion`; lock the
-  human→agent boundary to **trusted-human access** — authenticated chat + an explicit `AllowedUsers`
-  allowlist ([03](03-security-model.md) §4a, [08](08-agent-runtime-and-identity.md) §2). (Per-request
-  user-scoped authorization + the external gateway are deferred hardening,
-  [08](08-agent-runtime-and-identity.md) §5.)
-- **Accept:** Platform Agent can provision a cluster **only** by opening a PR with a KCC or Terraform
-  artifact that the CI/CD pipeline applies on merge; a direct-mutation attempt fails (no RBAC/tool);
-  audit record ties the change to requester + PR; **only allowlisted (trusted) humans can reach the
-  agent, and the agent can only read within its tier + propose** (no direct mutation, no reads outside
-  tier).
+- **Accept:** **(a)** a clean-clone install onto an empty project brings all three tiers to Ready
+  using **published** images; **(b)** every tier completes an inference call and mints a token from
+  its own namespace; **(c)** an `Agent` CR with an empty **or blank** allowlist and chat enabled is
+  rejected at admission, and no rendered pod carries a `*_ALLOW_ALL_USERS` env; **(d)** off-allowlist
+  egress is blocked on the live cluster while Workload Identity still works; **(e)** the invariants
+  gate reflects the imperative model; **(f)** `verify-phase7.sh` regression green.
 
-### Phase 2 — Cluster Admin Agent + cascade
+### Phase 9 — The Action Broker, dark
 
-- **Goal:** second tier, provisioned by the first.
-- **Work:** **build the cluster-admin baked image** (`cluster-admin-agent:<tag>` from
-  `agents/cluster-admin/`, per the decided per-tier-image mapping — [08](08-agent-runtime-and-identity.md)
-  §2, [06](06-api-and-data-contracts.md) §1.1) so a non-platform persona is buildable; author a
-  **cluster-admin `Agent` CR** + its cluster-scoped read-only KSA/RBAC/WI manifests (applied by the CI/CD
-  pipeline, §2 — not minted at runtime); **wire the spoke bootstrap** — the cluster-provisioning PR also
-  installs cert-manager + the controller and applies `clusters/<self>/agents/`, resolving the
-  chicken-and-egg ([05](05-system-architecture.md) §7); **build the ChatOps multi-tier router
-  (deterministic modes)** — extend the Hermes gateway from single-agent fan-in to resolving `(tier,scope)`
-  by **slash command** and **`@handle`** and dispatching to the correct per-tier pod, enforcing the target
-  CR's `allowedUsers` **before** dispatch ([06](06-api-and-data-contracts.md) §2b,
-  [05](05-system-architecture.md) C15/F5); Platform Agent proposes the agent via GitOps (cascade F4); the
-  controller reconciles the pod bound to that SA; a per-target actuation pipeline.
-  RBAC least-privilege is enforced by the `ValidatingAdmissionPolicy` (Phase 0); the cross-object
-  child ⊆ parent ceiling webhook is deferred hardening ([03](03-security-model.md) §4,
-  [08](08-agent-runtime-and-identity.md) §5).
-- **Accept:** Platform Agent proposes a cluster-admin agent; after human approval + merge, the
-  controller runs it with read-only cluster identity and it can read only its cluster; a slash command /
-  `@cluster-<c>` handle routes to it **without** an inference call, and a message from a
-  non-`allowedUsers` requester is **refused before dispatch**; RBAC granting an agent SA a write verb or a
-  wrong-scope binding is **rejected at apply time by the `ValidatingAdmissionPolicy`**, even if merged.
+- **Goal:** build the entire safety machinery — broker, envelope, classifier, journal, undo, brake —
+  and exercise it end-to-end **with no write authority anywhere**. The actor ServiceAccounts are
+  created but bound to **empty** roles; the broker runs every action in dry-run.
+- **Why this shape:** it lets the hardest and most novel code land, be reviewed, and be tested
+  against real clusters while the worst possible bug is still a no-op. Phase 10 then becomes a
+  permission change rather than a leap.
 
-### Phase 3 — Developer Team Agent + isolation proof
+| Task  | Work                                                                                                                                                                                                                                                                                                                             | Spec             | Weight       |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- | ------------ |
+| P9-T1 | **`ActionRecord` CRD + journal store.** Schema per [06](06-api-and-data-contracts.md) §4.3: attribution, classification, targets, pre-state snapshot, applied diff, verification result, undo plan, status lifecycle, TTL. Include the retention and audit-export path.                                                          | 06 §4.3          | high         |
+| P9-T2 | **Action Envelope + broker skeleton.** The service, its API, mTLS + `TokenReview` authentication, and the rule that `(tier, scope)` is derived from the **authenticated caller** and never from envelope contents. Reject scope-spoofing envelopes with a test that proves it.                                                   | 06 §4.1; 03 §4.1 | load-bearing |
+| P9-T3 | **The risk classifier.** Deterministic, table-driven, with the §5.2 inputs: scope, forbidden-set match, reversibility, destructiveness, security direction, blast radius, environment, traffic impact, object override, novelty. Plus the `ChangePolicy` resource that may only make classification **stricter** than the floor. | 03 §5; 06 §4.2   | load-bearing |
+| P9-T4 | **Undo-plan generation** for every supported verb — create → delete, update → restore prior object, delete → recreate from snapshot — with an explicit "cannot generate" path that **reclassifies the action as gated**. This rule is what makes reversibility true rather than aspirational; test it directly.                  | 06 §4.3          | load-bearing |
+| P9-T5 | **Snapshot, execute, verify** stages, with server-side apply, a stable field manager, dry-run first where supported, and per-kind verification predicates ([04](04-workflow-model.md) §5.1).                                                                                                                                     | 04 §1, §5.1      | high         |
+| P9-T6 | **The brake.** `spec.operations.paused`, the cluster-scoped `FleetFreeze`, the `contested` marker, and the undo controller. All must work through `kubectl` and the API **with inference down** — no dependency on the model, the router, or the agent pod.                                                                      | 03 §6; 06 §4.4   | load-bearing |
+| P9-T7 | **Controller reconciles the pair.** Extend the controller to build the broker Deployment alongside the agent Deployment for each `Agent` CR, bound to the actor SA; stamp `kube-agents/role`, `scope`, and `parent` labels; keep minting no RBAC. Regenerate goldens.                                                            | 08 §2            | high         |
+| P9-T8 | **Shadow mode.** The agent's `apply-change` path submits real envelopes; the broker classifies, plans undo, and journals a **would-have-executed** `ActionRecord` without calling a mutating API. Run it against real clusters for the duration of the phase and mine the journal for classifier gaps.                           | 04 §1            | high         |
+| P9-T9 | Consolidated gate `local-dev/kind/verify-phase9.sh`: envelope round-trip, scope-spoof rejection, classifier fixture corpus, undo-plan coverage, brake liveness with inference down, fail-closed on journal loss. Regression through `verify-phase8.sh`.                                                                          | 07 §5            | load-bearing |
 
-- **Goal:** third tier + the load-bearing isolation property.
-- **Work:** author a **developer-team `Agent` CR** + namespace-scoped read-only identity
-  manifests; Cluster Admin Agent proposes them; the controller reconciles them in the team's namespace;
-  default-deny NetworkPolicy + ResourceQuota per namespace; **complete the ChatOps router** — add the
-  **NL-inference** mode (low-confidence → ask a clarifying question, never guess) and thread affinity
-  across all three tiers, with the model output **never** trusted for authorization
-  ([06](06-api-and-data-contracts.md) §2b, [03](03-security-model.md) §4a).
-- **Accept:** a Developer Team Agent operates only in its namespace; it is **provably unable** to
-  read another namespace or escalate (negative test passes) — this holds regardless of who is asking,
-  because the agent's SA is namespace-scoped; cross-tier requests go via shared state, never a direct
-  call; an **ambiguous NL message** triggers a clarifying question rather than a mis-route
-  ([06](06-api-and-data-contracts.md) §10). (Per-user confused-deputy protection is deferred,
-  [03](03-security-model.md) §4a.)
+- **Accept:** **(a)** an envelope flows end-to-end in shadow mode and produces a well-formed
+  `ActionRecord` with a valid undo plan; **(b)** the classifier's decisions match a fixture corpus
+  covering all four classes, and a `ChangePolicy` can tighten but provably **cannot** loosen;
+  **(c)** an envelope claiming a scope other than the caller's is rejected; **(d)** `pause` and
+  `freeze` take effect with the inference stack down, and the broker refuses to act when the journal
+  is unavailable; **(e)** **no agent identity anywhere in the fleet holds a write verb** — verified
+  by a full `auth can-i` sweep, exactly as in the read-only generation.
 
-### Phase 4 — Coordination & knowledge
+### Phase 10 — First authority: the Developer Team tier
 
-- **Goal:** turn on indirect coordination (GitOps + OKF; no vector store in v1).
-- **Work:** wire OKF read/update into all tiers ([06](06-api-and-data-contracts.md) §5); **wire the
-  push-first event triggers** ([04](04-workflow-model.md) §4) — Kubernetes watches/informers on each
-  agent's read-only SA (the `k8s-event-watcher` binary already built into the agent image, `deploy/docker/`)
-  plus alert + GitHub webhooks delivered over **Pub/Sub** (the Google Chat ingress already uses Pub/Sub,
-  `INSTALL.md`) — keeping the heartbeat only as a backstop; define per-tier heartbeat SOPs for Cluster
-  Admin + Developer Team, **including the Platform Agent's drift-detection SOP that opens a corrective PR
-  unprompted**. (Semantic recall / mem0 is **deferred post-v1** — [02](02-agent-personas.md) §2.3.)
-- **Accept:** a Kubernetes watch fires an agent reaction (e.g. a crash-looping workload) **without**
-  waiting for the next heartbeat poll; an escalation written by a lower tier is picked up by its parent
-  (no direct call); an agent retrieves a runbook via OKF; per-tier heartbeats run scoped audits; **inject
-  drift** (RBAC / NetworkPolicy / version skew) → the Platform Agent detects it and opens a
-  **corrective PR unprompted** — never a direct fix (satisfies [01](01-vision-scope.md) §7 SC4).
+- **Goal:** one tier, the smallest blast radius, becomes genuinely imperative. A Developer Team
+  Agent fixes things in its own namespace, autonomously, and everything about that is observable and
+  reversible.
+- **Why this tier first:** namespace scope is the tightest containment boundary in the system, the
+  isolation proof for it is already the strongest tested property in the codebase, and a mistake is
+  bounded to one tenant.
 
-### Phase 5 — Security gate & hardening
+| Task   | Work                                                                                                                                                                                                                                                                                                  | Spec         | Weight       |
+| ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ | ------------ |
+| P10-T1 | **Flip the admission policy.** `vap-agent-readonly` → `vap-agent-scope`: readers still write nothing; actors may write only their tier template, only in scope, and **only carrying the `kube-agents/action-id` annotation** — so an unjournaled write is rejected at admission, not merely detected. | 03 §4.3      | load-bearing |
+| P10-T2 | **Developer-team actor identity.** Namespaced `Role` from the tier template ([06](06-api-and-data-contracts.md) §2), bound to the broker's actor SA. No cluster-scoped rule, no RBAC verbs, no escalation verbs.                                                                                      | 06 §2; 03 §3 | load-bearing |
+| P10-T3 | Turn shadow mode off for this tier and let the broker execute. Wire the `apply-change` skill (replacing `submit-suggestion` for this tier) and the reporting format from [02](02-agent-personas.md) §2.5.                                                                                             | 02 §2.5      | high         |
+| P10-T4 | **Gated-action approval flow**, end to end: park as `PendingApproval`, notify the roster, approve/reject/expire, and resume ([04](04-workflow-model.md) §3).                                                                                                                                          | 04 §3        | high         |
+| P10-T5 | **Verify-then-rollback** live: an action whose verification fails is rolled back automatically and reported as a failure ([04](04-workflow-model.md) §5.1).                                                                                                                                           | 04 §5.1      | load-bearing |
+| P10-T6 | Consolidated gate `local-dev/kind/verify-phase10.sh` + the live-target run; regression.                                                                                                                                                                                                               | 07 §5        | load-bearing |
 
-- **Goal:** make the security model continuously enforced.
-- **Work:** review-gate CI ([06](06-api-and-data-contracts.md) §7) on PR + heartbeat, run via the
-  headless harness runner (the skills are agent-driven, [06](06-api-and-data-contracts.md) §7); egress
-  allowlists per tier; the hardened pod-security context on every agent pod; end-to-end attribution.
-  (Attenuation `ValidatingAdmissionPolicy` already landed in Phase 0; the cross-object webhook and the
-  **gVisor execution sandbox** — the latter deferred with the untrusted-code-execution capability, since
-  v1 agents don't run untrusted code — are deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)
-- **Accept:** a PR with an unmitigated high finding is blocked; egress outside the allowlist is
-  denied; every agent pod runs under the hardened security context; every mutation is attributable.
+- **Accept:** **(a)** a Developer Team Agent detects a crash-looping workload in its namespace and
+  **fixes it** without a human, journaling an `ActionRecord`; **(b)** `undo <action-id>` restores the
+  prior state exactly; **(c)** every write outside its namespace is refused by the broker **and**
+  by admission when attempted directly with the actor token; **(d)** a gated action (delete a PVC)
+  parks and does **not** execute — including when a chat message or injected content insists it is
+  safe and urgent; **(e)** an action whose verification fails is rolled back automatically;
+  **(f)** the reader SA still holds no write verb anywhere.
 
-### Phase 6 — Failure-isolation & resilience validation
+### Phase 11 — Full authority: Cluster Admin and Platform, with the ceiling enforced
 
-- **Goal:** prove no cascade failure ([04](04-workflow-model.md) §6).
-- **Work:** chaos tests killing the hub, a Cluster Admin Agent, and the controller.
-- **Accept:** hub down → spoke clusters keep running their **last-applied state** (workloads keep
-  running; the external CI/CD can still apply already-merged changes), though spoke **agents pause**
-  (hub-hosted inference/Minty — [04](04-workflow-model.md) §6) and resume on recovery; Cluster Admin
-  down → its Dev Team Agents keep running, new provisioning pauses and resumes on recovery; the
-  controller relaunches agent pods.
+- **Goal:** the remaining two tiers become imperative, and provisioning a child agent becomes a
+  direct action rather than a pull request — which is exactly when the attenuation ceiling stops
+  being theoretical.
 
-### Phase 7 — Cloud-agnostic seams (later)
+| Task   | Work                                                                                                                                                                                                                                                                                                               | Spec    | Weight       |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- | ------------ |
+| P11-T1 | Cluster-admin and platform actor identities from their tier templates, with the forbidden set excluded at the RBAC level as well as in the broker.                                                                                                                                                                 | 06 §2   | load-bearing |
+| P11-T2 | **The cross-object child ⊆ parent webhook — now required, no longer deferred.** Pure CEL cannot compare a child's requested scope to its parent's actual scope, and a parent now holds real authority to create children. Host it in the controller's existing webhook server alongside cardinality and placement. | 03 §4.2 | load-bearing |
+| P11-T3 | **Cloud IAM attenuation.** Every tier GSA is currently bound at the **project** level with `--condition=None` — tolerable when they were viewer-only, unacceptable once they can write. Scope each actor GSA to its own cluster/project with IAM Conditions or per-scope service accounts.                         | 03 §3.2 | load-bearing |
+| P11-T4 | Convert the cascade skills: `propose-cluster-admin` / `propose-developer-team` become direct provisioning actions that render the child CR + reader/actor identities from the tier template and submit them as one envelope.                                                                                       | 02 §6   | high         |
+| P11-T5 | Blast-radius caps and the per-tier `ChangePolicy` defaults — start strict at the two upper tiers (a broad gated set) and narrow with evidence ([03](03-security-model.md) §5.3).                                                                                                                                   | 03 §5.3 | medium       |
+| P11-T6 | Gate `verify-phase11.sh` + live run; regression.                                                                                                                                                                                                                                                                   | 07 §5   | load-bearing |
 
-- **Goal:** reduce GKE coupling ([01](01-vision-scope.md) §6).
-- **Work:** exercise the already-unopinionated seams — generate Terraform HCL as well as KCC YAML,
-  actuate via a second CI/CD (e.g. CircleCI), and abstract observability behind provider-neutral
-  seams.
-- **Accept:** a second target (EKS/AKS/vanilla) passes the Phase 1–3 acceptance on core concepts,
-  using the customer's IaC + pipeline of choice.
+- **Accept:** **(a)** the Platform Agent provisions a cluster and a Cluster Admin Agent directly,
+  end to end, journaled and undoable; **(b)** a parent attempting to provision a child whose scope
+  exceeds its own is **rejected by the webhook**; **(c)** a tier's actor GSA is provably unable to
+  reach another cluster or project **at the cloud layer**; **(d)** no agent can modify its own or any
+  agent's RBAC, IAM, `Agent` CR, or the control plane — the forbidden set holds against direct
+  attempts with the actor token; **(e)** full containment suite green across all three tiers.
+
+### Phase 12 — The mesh: delegation and escalation
+
+- **Goal:** replace indirect coordination with direct calls, without turning delegation into
+  privilege escalation.
+
+| Task   | Work                                                                                                                                                                                                                         | Spec    | Weight       |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- | ------------ |
+| P12-T1 | The mesh transport and discovery: how an agent finds its parent and children, mTLS + `TokenReview` authn, and the request/response schema ([06](06-api-and-data-contracts.md) §7).                                           | 06 §7   | high         |
+| P12-T2 | **Callee re-authorization** — the load-bearing rule. A delegated request is classified and scope-checked by the **callee's** broker under the **callee's** identity and gates. Authority is never inherited from the caller. | 02 §2.3 | load-bearing |
+| P12-T3 | Refusal, timeout, paused-callee, and loop-prevention semantics (depth limit + visited list).                                                                                                                                 | 06 §7   | medium       |
+| P12-T4 | Retire the polling coordination: `raise-escalation` becomes a mesh call; the parent no longer polls the repo for escalation files.                                                                                           | 02 §2.3 | medium       |
+| P12-T5 | Gate `verify-phase12.sh`; regression.                                                                                                                                                                                        | 07 §5   | load-bearing |
+
+- **Accept:** **(a)** a parent delegates work into a child's scope and the child executes it under
+  its own identity, with its own `ActionRecord`; **(b)** a delegation asking a child to act **outside
+  the child's** scope is refused by the child — proving authority is not inherited; **(c)** a
+  delegation to a **paused** child is refused, not queued into a bypass; **(d)** a cyclic delegation
+  chain terminates; **(e)** a child escalates a need beyond its scope and the parent acts on it.
+
+### Phase 13 — Relentless proactivity
+
+- **Goal:** the detection machinery that already exists stops filing proposals and starts fixing
+  things — with the anti-thrash controls that make that safe.
+- **Note:** this is the phase the product promise lives in, and it is deliberately late. Everything
+  before it exists so that an agent acting thousands of times a day is a good idea.
+
+| Task   | Work                                                                                                                                                                                                                                                                                                                                                                                    | Spec          | Weight       |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | ------------ |
+| P13-T1 | Convert every detection path to end in remediation: the Kubernetes event watcher, the drift detector, alert and webhook ingress, and the per-tier heartbeat SOPs. The detection code is built and working — this is rewiring its terminus, not new detection.                                                                                                                           | 04 §4.1       | high         |
+| P13-T2 | **Initiative budgets and anti-thrash**: per-agent rate budget, flap detection with escalate-instead-of-retry, cooldown after a failed remediation, and enforcement of the `contested` marker. Exhaustion escalates and notifies; it never silently drops work.                                                                                                                          | 04 §4.2       | load-bearing |
+| P13-T3 | The **self-generated work queue** — improvements found while doing other things, prioritized and worked when idle.                                                                                                                                                                                                                                                                      | 04 §4.1       | medium       |
+| P13-T4 | **Coexistence with other controllers**: HPAs, operators, and a customer's GitOps engine. Objects under a foreign field manager or an engine's control are treated as gated or off-limits, and write-behind sync lands before the engine reconciles ([04](04-workflow-model.md) §6).                                                                                                     | 04 §6         | high         |
+| P13-T5 | **Persona conversion**: rewrite the three `SOUL.md`s and the governance SOPs to the operating character in [02](02-agent-personas.md) §2.5 — bias to action, the report format, and the honesty rules. Fix the skill allocation, which currently gives the Developer Team **none** of the seven workload skills 02 §2.1 assigns it while the Platform Agent carries the whole superset. | 02 §2.1, §2.5 | high         |
+| P13-T6 | Provision the alert and webhook ingress that exists in code but is deployed only by a manual patch full of placeholders; retire the 30-minute GitHub issue poll.                                                                                                                                                                                                                        | 04 §4.1       | medium       |
+| P13-T7 | Gate `verify-phase13.sh` + live soak; regression.                                                                                                                                                                                                                                                                                                                                       | 07 §5         | load-bearing |
+
+- **Accept:** **(a)** an injected drift is **remediated unprompted** and reported with its undo
+  handle — no PR anywhere in the path; **(b)** a deliberately flapping condition trips the flap
+  detector and escalates instead of looping; **(c)** a human-undone change is **not** redone;
+  **(d)** budget exhaustion escalates rather than silently stopping; **(e)** the agent does not
+  fight a GitOps engine over a shared object; **(f)** each tier's skills match its 02 §2.1 row,
+  asserted by a test.
+
+### Phase 14 — Continuous assurance
+
+- **Goal:** the properties this design claims are measured continuously in production, not proven
+  once in a test.
+
+| Task   | Work                                                                                                                                                                                                                                                                                                                                                  | Spec         | Weight       |
+| ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ | ------------ |
+| P14-T1 | The four SLIs as audit-log-derived alerts: **zero cross-scope escapes**, **zero unjournaled mutations**, **zero self-escalations**, **undo health** ([01](01-vision-scope.md) §7). Nothing continuous exists today — no log-based metric, no alert policy.                                                                                            | 01 §7; 05 §5 | load-bearing |
+| P14-T2 | The proactivity metrics: MTTR by severity, share of issues resolved without a human, actions per agent per day, and the flap/revert counters as the counterweight.                                                                                                                                                                                    | 01 §7        | medium       |
+| P14-T3 | **Re-aim the security-review suite.** Every check that treats "the agent SA has no write verb" as the pass condition will otherwise report the whole system as critically broken. Re-point them per [03](03-security-model.md) §7 and add the new checks (journal completeness, undo health, classifier integrity, broker isolation, brake liveness). | 03 §7        | load-bearing |
+| P14-T4 | **Write-behind IaC sync**: mirror executed desired state to the customer's repo so their IaC does not drift, with the race and conflict semantics stated honestly.                                                                                                                                                                                    | 04 §6        | medium       |
+| P14-T5 | Per-tier LiteLLM virtual keys (budget, rate limit, scoped logging) — the shipped config is five lines with `api_key: none`.                                                                                                                                                                                                                           | 03 §9        | medium       |
+| P14-T6 | Gate `verify-phase14.sh`; regression.                                                                                                                                                                                                                                                                                                                 | 07 §5        | load-bearing |
+
+- **Accept:** **(a)** all four SLIs exist, read zero in steady state, and fire when deliberately
+  tripped on a scratch cluster; **(b)** the security-review suite passes against the imperative
+  system and **fails** when the classifier floor is lowered, the journal is bypassed, or a reader SA
+  gains a write verb; **(c)** a change made by an agent appears in the customer's repo without a
+  human step; **(d)** per-tier inference spend is attributable and independently rate-limited.
+
+### Phase 15 — Reach and scale
+
+- **Goal:** the remaining carried work — the ChatOps front door and the multi-cluster topology.
+
+| Task   | Work                                                                                                                                                                                                                                                                                                                                                                                                                  | Spec      | Weight       |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | ------------ |
+| P15-T1 | **Make the router real.** It is fully built and unit-tested but has never carried traffic: parked at 0 replicas, image unpublished, Google-Chat-only, and child tiers have no per-agent topic to dispatch to. Publish, deploy, and provision per-agent topics; decide the Slack-vs-Chat ingress shape (one Slack app token permits one Socket Mode connection, which is why child tiers ship `slack.enabled: false`). | 06 §2b    | high         |
+| P15-T2 | **The imperative command set in chat**: `pause`, `resume`, `freeze`, `undo`, `approve`, `reject`, `status` — with approval-roster authorization distinct from the chat allowlist. The brake must already work via `kubectl` from Phase 9; this is the convenient surface, never the only one.                                                                                                                         | 06 §2b    | high         |
+| P15-T3 | The production NL inferer and the outbound replier, both of which are complete seams with `nil` implementations today — so NL routing refuses every message and clarifications are audited then dropped. Wire thread affinity, which is built and unwired.                                                                                                                                                            | 06 §2b    | medium       |
+| P15-T4 | Hub-and-spoke on real clusters: private hub endpoints, a real spoke bootstrapped from empty, and the carried scratch-GKE cloud checks. **Verify the brokers keep executing local remediation during a hub outage** — if they cannot, a hub blip stops all self-healing fleet-wide ([05](05-system-architecture.md) §2).                                                                                               | 05 §2, §8 | load-bearing |
+| P15-T5 | Gate `verify-phase15.sh`; full regression including the chaos suite.                                                                                                                                                                                                                                                                                                                                                  | 07 §5     | load-bearing |
+
+- **Accept:** **(a)** all three tiers are addressable live by slash command and `@handle` with zero
+  inference calls; **(b)** `undo` and `pause` work from chat **and** from `kubectl`; **(c)** an
+  ambiguous message produces a clarifying question the human actually receives; **(d)** a spoke's
+  agents keep remediating their own scope through a hub outage, and agent **reasoning** pauses and
+  resumes as designed; **(e)** full regression green.
 
 ## 3. Definition of Done (product-level acceptance)
 
-Built end-to-end means all of these pass — the concrete form of [01](01-vision-scope.md) §7:
+The concrete form of [01](01-vision-scope.md) §7. Every item must hold **on a live install**, and
+items 4–7 must be backed by a continuous SLI rather than a point-in-time test.
 
-1. A platform operator provisions a cluster **only** through the Platform Agent (PR → CI/CD pipeline
-   applies KCC YAML or Terraform), zero manual `kubectl`/console, fully attributed.
-2. A cluster admin provisions a namespace + Developer Team Agent through the Cluster Admin Agent,
-   within Platform-set guardrails, human-approved.
-3. A developer team self-serves a workload via its agent and is **provably unable** to affect
-   another namespace or escalate.
-4. All three agents are **read-only** on cluster/cloud APIs; the only write path is a reviewed PR.
-5. Agents coordinate **only** indirectly (GitOps + OKF); a negative test confirms no direct
-   agent-to-agent call path exists.
-6. The review-gate blocks an unmitigated high-severity change; every mutation is attributable and
-   revertible.
-7. Failure-isolation chaos tests (Phase 6) pass — no cascade.
-8. **The human→agent boundary is secured by trusted-human access + the read-only ceiling** — only
-   authenticated, allowlisted humans can reach an agent, and no human (trusted or not) can drive it to
-   mutate or read outside its tier ([03](03-security-model.md) §4a). _(Per-request user down-scoping —
-   the confused-deputy fix — is deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)_
-9. The Platform Agent detects an **injected drift** (RBAC / NetworkPolicy / version) and opens a
-   **corrective PR unprompted** — never a direct fix (SC4, [01](01-vision-scope.md) §7).
+1. A platform operator states an intent and the Platform Agent **completes it** — provisioning a
+   cluster or onboarding a tenant end-to-end, with no manual `kubectl`/console step and no human
+   approval for the reversible parts.
+2. A Cluster Admin Agent **creates and configures** a namespace and its Developer Team Agent
+   directly, within the Platform Agent's guardrails.
+3. A Developer Team Agent **fixes** a workload problem in its namespace unprompted, and is provably
+   unable to affect another namespace or escalate.
+4. **Nothing writes but the broker.** Every mutation in the Kubernetes and Cloud audit logs
+   attributed to an agent identity has a matching `ActionRecord`; unjournaled writes are rejected at
+   admission and alert continuously.
+5. **Everything is reversible.** 100% of executed non-gated actions carry a validated undo plan, and
+   `undo <action-id>` restores prior state across all three tiers.
+6. **Scope holds.** No agent reads or writes outside its tier, and no agent can modify any agent's
+   RBAC, IAM, `Agent` CR, or the control plane — proven by negative tests and watched by an SLI.
+7. **The gated class holds.** Irreversible and security-loosening actions stop for a human, and the
+   floor cannot be lowered by configuration, by chat, or by injected content.
+8. **The brake works.** `pause`, `freeze`, and `undo` are effective within seconds, with the
+   inference stack down, and a human-reverted change is not redone.
+9. Agents **coordinate directly** — delegation and escalation both work, and the callee
+   re-authorizes rather than inheriting authority.
+10. Agents are **relentlessly proactive**: detected issues are remediated without a human in the
+    majority of cases, measured, with flap and revert counters healthy.
+11. Failure-isolation chaos tests pass with **no cascade**, including broker-down (fail closed, no
+    fallback to direct writes) and journal-down (refuse to act).
 
 ## 4. Risks
 
-- **Runtime coupling to Hermes** — the persona model assumes the Hermes agent runtime; the
-  framework-portability non-goal ([02](02-agent-personas.md) §9) bounds this.
-- **Scion integration maturity** — Scion's K8s runtime is early; v1 does **not** depend on it for
-  lifecycle (the kube-agents controller owns that). Wiring the controller's pod-construction to Scion's
-  launch primitive is a Phase-1 **spike** with a fallback to the operator's native Deployment build
-  ([08](08-agent-runtime-and-identity.md) §2), so a Scion gap cannot block the build.
-- **IaC coverage** — a chosen artifact format may not cover every resource (not every GCP resource
-  has a KCC CRD; a Terraform provider may lag); gaps may force switching format for that resource or a
-  documented, audited exception path (never silent direct mutation).
-- **Pipeline as privileged writer** — actuation moves the write credentials into the customer's CI/CD
-  ([03](03-security-model.md) §4). That pipeline is a high-value target: require least-privilege
-  scoped deploy credentials, apply only on merged/reviewed state, and audit every run.
-- **Migration window** — the direct-write path today is a **tool + cloud IAM**, not K8s RBAC (which is
-  already read-only): Phase 1 removes the `create_cluster` tool and tightens the **cloud GSA to viewer
-  IAM**. Sequence the tool removal and the IAM tightening together so there is no period where agents can
-  both mutate directly _and_ via PR.
-- **ChatOps router is net-new behavior** — the multi-tier gateway (slash / `@handle` / NL resolution,
-  cross-pod dispatch, gateway-side `allowedUsers` enforcement) has **no implementation today** — only a
-  single-agent Hermes fan-in exists. Build it incrementally (Phase 2 deterministic modes, Phase 3 NL
-  fallback) and keep routing **out of the trust path**: a mis-route must never bypass an allowlist, and
-  the per-pod gateway stays as an enforcement backstop ([03](03-security-model.md) §4a,
-  [06](06-api-and-data-contracts.md) §2b).
-- **Cross-cluster networking** — spoke agents depend on **private** reachability to the hub's inference
-  - Minty ([05](05-system-architecture.md) §5); a missing egress-allowlist entry or VPC-peering gap
-    silently pauses a spoke's agents (reconciled state keeps running). Validate hub connectivity as an
-    explicit step of the Phase-2 spoke bootstrap, not an afterthought.
-- **mem0/Qdrant operational cost (deferred)** — a stateful vector store was the cost concern; v1
-  **defers mem0 entirely** and coordinates on GitOps + OKF, removing this footprint. Revisit only with
-  evidence that semantic recall over OKF is insufficient.
-- **Hub is a shared-fate dependency for agent reasoning** — inference + Minty are hub-hosted
-  ([05](05-system-architecture.md) §3), so a hub outage pauses spoke _agents_ (reconciled cluster
-  state keeps running). Phase 6 chaos tests must assert the honest property ([04](04-workflow-model.md)
-  §6), not "agents keep operating." Regional/per-spoke inference is the (deferred) mitigation.
+- **The inversion invalidates green tests.** Several currently-passing safety checks assert
+  read-only-ness. Deleting them silently would erase the record of a deliberate trade. §5 makes
+  replacement mandatory and same-phase.
+- **The broker is a new high-value target.** It holds the only write credential. Mitigations are
+  structural: one broker per scope so there is no fleet-wide writer, no LLM inside it, minimal
+  parsing of untrusted input, and admission enforcing scope independently of it.
+- **The broker is also a new dependency.** If it is down, nothing can be remediated. The chosen
+  failure mode is **fail closed** — never a fallback to direct writes — which trades availability
+  for containment. Phase 15 must prove a hub outage does not take every broker with it.
+- **Undo plans can lie.** A snapshot captures the object, not the side effects: a deleted PVC's data,
+  a released load-balancer IP, a rotated credential, a downstream webhook that already fired. The
+  design's answer is that anything in that category is **gated**, not undone — but the boundary is
+  drawn by the classifier, so classifier gaps become reversibility gaps. Mine shadow-mode data
+  (P9-T8) for exactly this.
+- **Wrong-but-authorized actions.** The hardest residual class: in scope, correctly classified, well
+  executed, and based on a bad diagnosis. Verification, budgets, and undo bound it; nothing
+  prevents it. Expect the first real incidents to come from here rather than from a boundary breach.
+- **Agent versus controller.** HPAs, operators, and GitOps engines all reconcile too. Without P13-T4
+  the agent will fight them, and the flap detector will only turn a fight into an escalation.
+- **Injected intent within scope.** A successful prompt injection can cause any action the agent was
+  already authorized to take ([03](03-security-model.md) §8.1). The dial is the size of the ungated
+  class; start it broad.
+- **Trust ramp.** Teams will not accept an agent with namespace-wide write on day one. The
+  `ChangePolicy` stricter-only mechanism is the adoption path — ship with a broad gated set and
+  narrow it with evidence from the journal.
+- **Approval fatigue in reverse.** If the gated class is too broad the system degrades to the
+  read-only generation with extra steps; too narrow and the first irreversible mistake is
+  unrecoverable. This boundary needs review with real data after Phase 13, not just at design time.
 
 ## 5. Verification loop (how the harness iterates to "done")
 
-Every spec carries a **Verification** section of concrete, mostly-runnable checks — 02 §10, 03 §11,
-04 §9, 05 §8, 06 §10, 08 §7 — and every phase in §2 has **acceptance criteria**. Build by phase and,
-after each phase, run:
+Every spec carries a **Verification** section — 02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7 — and
+every phase in §2 has acceptance criteria. Build by phase and, after each phase, run:
 
 1. the **phase acceptance** for the current phase (§2),
 2. the **Verification** checks of every spec whose surface that phase touched, and
 3. the **Definition of Done** (§3) once all phases are complete.
 
-**Iterate until green.** If any check fails, fix and re-run — do not advance a phase (or open the final
-PR) until its checks pass. The two load-bearing suites are the **negative security tests** (03 §11 —
-read-only, attenuation, no-break-glass, isolation) and the **failure-isolation chaos tests** (05 §8); a
-build is not "done" until both are green. Record which checks ran (and any deliberately skipped, e.g.
-deferred-hardening items) in the PR.
+**Iterate until green.** If any check fails, fix and re-run — do not advance a phase until its
+checks pass.
+
+**Rules specific to this conversion:**
+
+- **Replace tests, never delete them.** A check that asserts read-only-ness is removed only in the
+  same commit that adds its imperative counterpart, and the phase notes must name the pair. A phase
+  that reduces the number of security assertions is wrong.
+- **Containment never goes red.** Scope ceiling, no self-escalation, no cross-tenant reach: green
+  from the first commit to the last. These are the only assertions the inversion does not touch, and
+  they are the reason it is safe at all.
+- **Three load-bearing suites**, any of which failing halts the build: **containment** (03 §11),
+  **reversibility** (03 §11 — undo coverage and undo actually restoring), and **failure isolation**
+  (05 §8, extended with broker-down and journal-down).
+- **Authority never precedes machinery.** A pre-merge check must fail any change that grants an
+  agent identity a write verb before the broker, classifier, journal, and undo path are present and
+  tested (P8-T6).
+- **Refresh the image before trusting a live gate.** A stale same-tag image with `imagePullPolicy:
+IfNotPresent` silently under-enforces admission and reads as green — it has already masked a
+  namespace-isolation escape, missing pod hardening, and a wrong controller entirely. Rebuild →
+  load/push → restart is a gate step, not a note. This matters more now: a stale admission policy
+  under an imperative agent under-enforces **writes**.
+- **Three rungs, in order: hermetic → Kind → live target.** Kind remains the fast inner loop; the
+  live target is where cloud IAM, egress, and the SLIs are actually proven.
+- **Deferred, never faked.** If a check cannot run, record it as deferred with the blocker named —
+  never assert it green.
+
+## 6. Standing deferrals (not scheduled)
+
+| Deferred                                            | Why deferred                                                                                                                                | Promote when                                                                                      |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Per-request user down-scoping (confused deputy)     | v1 bounds it with trusted-human access, the scope ceiling, and the gated class. The broker is now its natural host, so the cost has dropped | Access extends beyond fully trusted humans, or an audit demands per-user attribution of authority |
+| gVisor execution sandbox + untrusted code execution | Ship together; v1 agents run no untrusted code. `RuntimeClassName` plumbing already exists                                                  | An agent gains a code-execution capability                                                        |
+| L7 hostname-precise egress proxy                    | L3/L4 policy cannot express hostnames; CIDR allowlists are the v1 approximation                                                             | The CIDR allowlist proves too coarse                                                              |
+| Co-located multi-tenant broker                      | **Explicitly rejected for v1** — it would reintroduce a fleet-wide writer and undo the one-scope blast radius                               | Per-agent broker cost becomes prohibitive **and** a per-scope credential isolation story exists   |
+| Semantic recall / mem0 + Qdrant                     | The journal and OKF cover recall adequately; a stateful vector store was the cost concern                                                   | Evidence that recall over the journal and OKF is insufficient                                     |
+| Scion launch primitive                              | Blocked upstream; the seam is built and parity-tested, native is default                                                                    | Scion's K8s mode supports long-lived supervision                                                  |
+| Second cloud (EKS / AKS)                            | No account or cluster; the cloud-neutral core already passes on vanilla Kubernetes                                                          | A real second-cloud target exists                                                                 |
+
+**Promoted out of deferral by the inversion:** the **cross-object child ⊆ parent admission webhook**
+was deferred hardening in the read-only design and is a **v1 requirement** here (P11-T2) — when a
+parent can only propose a child, an over-grant is caught in review; when a parent can create one, it
+must be caught in admission.
