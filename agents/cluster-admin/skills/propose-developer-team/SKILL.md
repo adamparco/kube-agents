@@ -61,22 +61,37 @@ substitution over `assets/`) — no credentials, no mutation:
   --project-id <gcp-project-id> \
   --location <region> \
   --team-lead-chat-id users/<CHAT_USER_ID> \
-  --hub-inference-cidr <hub LiteLLM private CIDR> \
-  --hub-minty-cidr <hub Minty private CIDR> \
-  --github-cidrs <GitHub egress CIDR> \
-  --mcp-cidrs <MCP grounding CIDR> \
+  [--workload-identity [--gke-dataplane auto|v1|v2]] \
+  [--hub-inference-cidr <hub LiteLLM private CIDR>] \
+  [--hub-minty-cidr <hub Minty private CIDR>] \
+  [--mcp-cidrs <MCP grounding CIDRs>] \
   --repo-root .
 ```
 
 `--parent` defaults to `cluster-admin-<cluster>` (this Cluster Admin Agent — the F4 parent of the leaf
-tier); pass it only to override. Any flag you omit is written as a `REPLACE_WITH_*` placeholder for the
-reviewer to fill — the diff is still reviewable. A placeholder **CIDR** is an invalid value that
-`kubectl apply` rejects, so the pipeline cannot silently apply a half-configured egress policy; a
-placeholder **chat ID** is a valid string that applies but fails closed (it matches no real user, so the
-router refuses everyone). Prefer to supply real values you already know (project, cluster, namespace,
-location, the team lead's Chat ID). The hub/GitHub/MCP CIDRs come from the fleet's networking config; if
-you don't have them, leave the placeholders and call it out in the PR body so the reviewer fills them
-before merge. The script prints exactly which files it wrote — stage **only** those.
+tier); pass it only to override.
+
+The bracketed flags are **egress widenings**, and each is absent from the bundle unless you pass it.
+They are not placeholders you can leave for the reviewer: a `REPLACE_WITH_*` in a `cidr:` field is not
+a CIDR, the API server rejects the object, and the whole bundle stops applying (V-CMP-003). Omitting a
+rule you needed produces a narrower policy and a connection that fails loudly; stubbing it produced a
+bundle that could not be applied at all. GitHub is not a flag — its four published IPv4 blocks are
+fixed in the egress template, the same for every tenant.
+
+`--workload-identity` is the one widening you must match to the cluster rather than to the tenant. On a
+GKE cluster with Workload Identity the tenant agent has **no cloud identity at all** without it; on a
+cluster without WI it makes the raw node service account reachable. `--gke-dataplane` narrows the
+IP↔port pairing once the cluster's dataplane is known (the two pairings are not interchangeable, and
+the wrong one fails as an authentication timeout that never mentions the network).
+
+The `--team-lead-chat-id` is the one value that still has a placeholder default: it applies cleanly and
+matches no user, so the agent is unreachable until someone fills it in — reviewable and fail-closed.
+Prefer to supply real values you already know (project, cluster, namespace, location, the team lead's
+Chat ID). The script prints exactly which files it wrote — stage **only** those.
+
+The four isolation manifests it emits (`10`/`20`/`30`/`40`) are the **same bytes** the installer applies
+from `k8s-operator/scripts/*.template`; `local-dev/test_skill_templates.py` fails if they ever differ.
+Do not hand-edit the assets — edit the installer template and regenerate.
 
 ### Step 2: Verify before proposing
 

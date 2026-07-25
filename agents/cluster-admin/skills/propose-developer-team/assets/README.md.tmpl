@@ -26,7 +26,12 @@ The Developer Team Agent that lives here is **read-only** and confined to this o
 (a namespaced `Role`) + the agent-read-only ValidatingAdmissionPolicy backstop; its only write path is
 proposing changes to this namespace as a reviewed GitOps PR.
 
-> Fill any `REPLACE_WITH_*` placeholders (the team lead's Google Chat ID, the hub/GitHub/MCP egress
-> CIDRs) before the pipeline applies this bundle. A placeholder CIDR is rejected by `kubectl apply`
-> (fail-safe); a placeholder chat ID applies but matches no user, so the router refuses everyone
-> (fail-closed).
+> Fill the `REPLACE_WITH_TEAM_LEAD_ID` placeholder (the team lead's Google Chat ID) before the
+> pipeline applies this bundle. It applies as-is but matches no user, so the router refuses everyone
+> until it is set — fail-closed, and deliberately left loud rather than seeded with a plausible-looking
+> number somebody would ship by accident.
+>
+> The egress policy no longer carries placeholders. It renders from
+> `k8s-operator/scripts/netpol-agent-egress.yaml.template` with concrete CIDRs, and the remote-hub and
+> Workload-Identity rules are **absent unless configured** rather than stubbed: a `REPLACE_WITH_*` in a
+> `cidr:` field is rejected by `kubectl apply`, which made the whole bundle un-appliable (V-CMP-003).

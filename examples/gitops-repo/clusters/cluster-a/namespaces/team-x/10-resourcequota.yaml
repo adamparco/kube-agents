@@ -1,10 +1,12 @@
 # tenant-quota.yaml.template
 #
 # Blast-radius bound for a tenant namespace (03 §3 isolation; Phase 3), rendered by
-# `provision_12_deploy_agent_tiers.sh` and applied by it BEFORE the agent pod is created. The
-# committed exemplar under examples/gitops-repo/ is the REFERENCE RENDER of this template,
-# byte-for-byte, and local-dev/tests/reference-render.py fails if they drift — edit this file, then
-# regenerate it.
+# `provision_12_deploy_agent_tiers.sh` and applied by it BEFORE the agent pod is created. THIS FILE
+# IS THE SOURCE. Two copies are DERIVED from it and must never be hand-edited: the committed
+# exemplar under examples/gitops-repo/ (checked byte-for-byte by
+# local-dev/tests/reference-render.py) and the matching propose-developer-team skill asset with the
+# tenant namespace parameterised (checked by local-dev/test_skill_templates.py). Edit this template,
+# then regenerate both.
 #
 # A ResourceQuota caps the aggregate compute + object footprint of EVERYTHING in the namespace — the
 # Developer Team Agent pod AND the tenant's own workloads — so a runaway rollout (or a compromised or

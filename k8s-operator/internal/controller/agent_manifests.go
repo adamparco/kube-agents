@@ -157,9 +157,17 @@ func renderConfigYAML(agent *agentv1alpha1.Agent) string {
 			"command": "/opt/hermes/.venv/bin/python3",
 			"args":    []string{"/opt/data/scripts/agent_common_server.py"},
 		},
+		// Bridged with the pod's own Workload Identity token, not an OAuth flow. `mcp-remote`
+		// authenticates by opening a browser and listening for a loopback redirect; a pod has
+		// neither, so it hung on startup rather than failing, and a headless multi-tier install
+		// could not come up (Phase 8 P8-T4). The timeouts are set here for the same reason the
+		// bridge answers every request even when the remote is broken: an MCP server that never
+		// answers is indistinguishable from one that is still starting.
 		"developer_knowledge": map[string]any{
-			"command": "node",
-			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://developerknowledge.googleapis.com/mcp"},
+			"command":         "/opt/hermes/.venv/bin/python3",
+			"args":            []string{"/opt/data/scripts/mcp_http_bridge.py", "https://developerknowledge.googleapis.com/mcp"},
+			"connect_timeout": 30,
+			"timeout":         120,
 		},
 		// NOTE: the remote `gke` MCP proxy (container.googleapis.com) is intentionally NOT wired here.
 		// It exposes cluster-mutating tools (e.g. create_cluster), and a remote MCP's toolset cannot be
@@ -655,10 +663,35 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 			},
 		}
 
+		// The dashboard used to ship with no telemetry configuration at all, so it exported
+		// nothing while sitting in the same pod as a fully instrumented agent — the container a
+		// human is looking at was the one component invisible in the traces. It gets the agent's
+		// values verbatim (see selectEnvVars: they share a config file on the PVC), plus one
+		// resource attribute so its spans are still separable from the agent's.
+		dashboardEnvVars = append(dashboardEnvVars, selectEnvVars(envVars, telemetryEnvNames)...)
+		for i := range dashboardEnvVars {
+			if dashboardEnvVars[i].Name == "OTEL_RESOURCE_ATTRIBUTES" && dashboardEnvVars[i].ValueFrom == nil {
+				dashboardEnvVars[i].Value += ",kubeagents.component=dashboard"
+			}
+		}
+
 		dashboardVolumeMounts := []corev1.VolumeMount{
 			{
 				Name:      "platform-agent-data-vol",
 				MountPath: homeDir,
+			},
+			{
+				// The operator-rendered config, on the same terms as the main container.
+				// Without this mount the dashboard read the image-baked /opt/defaults copy that
+				// the entrypoint seeds onto the PVC — the one renderConfigYAML exists to shadow.
+				// The two disagree by construction: the render is where per-Agent settings
+				// (model endpoint, enabled chat platforms, memory) live, so the dashboard
+				// displayed a different agent's worth of configuration than the agent was
+				// running. This is LSN-003's shape, and the fix is to read the same bytes.
+				Name:      "platform-agent-config-vol",
+				MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
+				SubPath:   "config.yaml",
+				ReadOnly:  true,
 			},
 			{
 				Name:      "system-metadata",

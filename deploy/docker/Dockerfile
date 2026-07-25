@@ -77,15 +77,14 @@ RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed
 RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/tools/send_message_tool.py'); c = p.read_text(); t = 'def _parse_target_ref(platform_name: str, target_ref: str):\n    \"\"\"Parse a tool target into chat_id/thread_id and whether it is explicit.\"\"\"'; r = t + '\n    if platform_name == \"google_chat\":\n        parts = target_ref.split(\":\", 1)\n        if len(parts) == 2 and parts[0].startswith(\"spaces/\"):\n            return parts[0].strip(), parts[1].strip(), True\n        elif target_ref.startswith(\"spaces/\"):\n            return target_ref.strip(), None, True'; p.write_text(c.replace(t, r)) if t in c else exit(1)"
 
 
-# 4. Clone and build mcp-remote proxy
-RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
-    cd /opt/mcp-remote && \
-    git checkout 2ff8f16753d8c744e6982b99e6ed5ab62f44f311 && \
-    npm install && \
-    npm run build && \
-    npm prune --production && \
-    npm cache clean --force && \
-    rm -rf .git
+# 4. (removed in Phase 8 P8-T4) The `mcp-remote` OAuth proxy used to be cloned and built here.
+#    Its only consumer was the `developer_knowledge` MCP server, which now runs
+#    deploy/shared/defaults/scripts/mcp_http_bridge.py — a stdio<->HTTP bridge that authenticates
+#    with the pod's Workload Identity token. `mcp-remote` authenticates by opening a browser and
+#    waiting on a loopback redirect, so in a pod it hung instead of failing, and a headless install
+#    never finished coming up. Deleting the clone rather than leaving it unused also drops a
+#    build-time `git clone` of a third-party fork pinned to a bare commit SHA, and the Node
+#    toolchain's install output, from every agent image.
 
 # 5. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults

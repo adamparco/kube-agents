@@ -76,6 +76,38 @@ func otelTelemetryEnvVars(agentType, name, namespace string) []corev1.EnvVar {
 	}
 }
 
+// telemetryEnvNames are the variables a container needs to report to the same OTel backend as the
+// agent. Selected by name out of the already-merged env rather than recomputed, so a per-agent
+// override in spec.deployment.env reaches every container that reports telemetry, not just the
+// first one. See selectEnvVars for why they must not diverge.
+var telemetryEnvNames = []string{
+	"OTEL_SERVICE_NAME",
+	"OTEL_EXPORTER_OTLP_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_PROTOCOL",
+	"OTEL_RESOURCE_ATTRIBUTES",
+}
+
+// selectEnvVars returns the entries of src whose names appear in want, in src order.
+//
+// Sidecars that share the agent's PVC must be given the SAME telemetry values, not their own
+// copy: docker-entrypoint.sh step 4 writes $OTEL_SERVICE_NAME into
+// $PLATFORM_AGENT_HOME/plugins/hermes_otel/config.yaml, and that path is on the shared volume.
+// Two containers computing the endpoint independently would race on one file and the winner
+// would depend on start order. Selecting from one list makes the race idempotent.
+func selectEnvVars(src []corev1.EnvVar, want []string) []corev1.EnvVar {
+	wanted := make(map[string]struct{}, len(want))
+	for _, n := range want {
+		wanted[n] = struct{}{}
+	}
+	out := make([]corev1.EnvVar, 0, len(want))
+	for _, e := range src {
+		if _, ok := wanted[e.Name]; ok {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // defaultImageForTier returns the baked default image for a tier, used when an Agent CR omits
 // spec.deployment.image (07 §2(a)). Each tier ships its own read-only persona baked into its own
 // image; spec.deployment.image still overrides. An unknown/empty tier falls back to the platform

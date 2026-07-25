@@ -1,14 +1,29 @@
-# clusters/@@CLUSTER@@/namespaces/@@NAMESPACE@@/10-resourcequota.yaml
+# tenant-quota.yaml.template
 #
-# Blast-radius bound for the @@NAMESPACE@@ tenant (03 §3 isolation; Phase 3). A ResourceQuota caps the
-# aggregate compute + object footprint of EVERYTHING in @@NAMESPACE@@ — the Developer Team Agent pod AND the
-# tenant's own workloads — so a runaway rollout (or a compromised/looping agent) cannot starve the
-# cluster or other tenants. The @@CLUSTER@@dmin tier proposes this alongside the namespace + default-deny
-# NetworkPolicy (propose-developer-team cascade); a human reviews + merges; CI/CD applies it.
+# Blast-radius bound for a tenant namespace (03 §3 isolation; Phase 3), rendered by
+# `provision_12_deploy_agent_tiers.sh` and applied by it BEFORE the agent pod is created. THIS FILE
+# IS THE SOURCE. Two copies are DERIVED from it and must never be hand-edited: the committed
+# exemplar under examples/gitops-repo/ (checked byte-for-byte by
+# local-dev/tests/reference-render.py) and the matching propose-developer-team skill asset with the
+# tenant namespace parameterised (checked by local-dev/test_skill_templates.py). Edit this template,
+# then regenerate both.
 #
-# Because a quota with `requests.*`/`limits.*` is set, every pod in @@NAMESPACE@@ MUST declare resource
-# requests+limits or admission rejects it — the agent pod's rendered spec already does (the controller
-# stamps requests/limits), and tenant workloads inherit the same discipline. Tune the numbers per tenant.
+# A ResourceQuota caps the aggregate compute + object footprint of EVERYTHING in the namespace — the
+# Developer Team Agent pod AND the tenant's own workloads — so a runaway rollout (or a compromised or
+# looping agent) cannot starve the cluster or other tenants. The cluster-admin tier proposes this
+# alongside the namespace and the default-deny NetworkPolicy (propose-developer-team cascade); a human
+# reviews and merges; CI/CD applies it.
+#
+# WHY THIS IS APPLIED BEFORE THE AGENT POD, NOT AFTER. Once a quota sets `requests.*`/`limits.*`, every
+# pod in the namespace MUST declare requests+limits or admission rejects it. Applying the quota first
+# means a mis-sized agent fails loudly during install, on the step that created it. Applying it after
+# means the install goes green and the namespace is left holding a trap that springs on some later
+# rollout, in front of whoever triggered it rather than whoever caused it. The controller stamps
+# requests+limits on all four agent containers, so the rendered pod satisfies this — the ordering is
+# what keeps that true rather than merely true today.
+#
+# The compute bounds and the pod cap are the per-tenant knobs (see common.sh for the defaults). The
+# remaining object counts are namespace hygiene rather than blast-radius controls and are fixed here.
 apiVersion: v1
 kind: ResourceQuota
 metadata:
