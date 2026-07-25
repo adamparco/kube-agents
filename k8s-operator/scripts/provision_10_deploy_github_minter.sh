@@ -115,46 +115,66 @@ execute_github_minter() {
   local versions=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" --filter="state=ENABLED" --format="value(name)" 2>/dev/null)
   if [ -z "$versions" ]; then
     if [ -n "${GITHUB_PEM_PATH}" ] && [ -f "${GITHUB_PEM_PATH}" ]; then
-      if ! command -v go &>/dev/null; then
-        print_warning "Go is required to run the Minty CLI tool for importing the private key."
+      # Import with openssl + gcloud only. `gcloud kms keys versions import` performs the
+      # RSA-OAEP/AES wrapping against the import job's public key client-side, so the only
+      # gap is GitHub issuing PKCS#1 while KMS requires PKCS#8 — one openssl call. This
+      # replaces cloning and `go run`-ing the upstream Minty CLI: no Go toolchain, no network
+      # clone, and no third-party code executed against the private key.
+      if ! command -v openssl &>/dev/null; then
+        print_warning "openssl is required to convert the GitHub private key to PKCS#8."
         print_warning "Skipping automatic import. You must import the key manually later."
       else
         print_info "Importing GitHub Private Key PEM into KMS..."
-        
-        # We clone the Minty CLI here because it abstracts away all the complexity
-        # of uploading asymmetric private keys to KMS, making the process much
-        # more straightforward than using native gcloud commands.
-        local tmp_dir=$(mktemp -d)
-        print_info "Cloning github-token-minter CLI tool (v2.7.1) for secure cryptographic wrapping..."
-        if git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git "$tmp_dir" >/dev/null 2>&1; then
-          local abs_pem=$(realpath "${GITHUB_PEM_PATH}")
-          local import_success=0
-          (
-            cd "$tmp_dir"
-            retry 6 5 go run ./cmd/minty tools import-pk \
-                -project-id="${PROJECT_ID}" \
-                -location="${REGION}" \
-                -key-ring="${KMS_KEYRING}" \
-                -key="${KMS_KEY}" \
-                -private-key="@${abs_pem}"
-          ) && import_success=1
-          rm -rf "$tmp_dir"
-          
-          if [ "$import_success" -eq 1 ]; then
-            print_success "Successfully imported GitHub Private Key to KMS via Minty CLI."
+
+        local import_job="${KMS_IMPORT_JOB:-kage-minty-import-job}"
+        if ! gcloud kms import-jobs describe "${import_job}" --location="${REGION}" \
+              --keyring="${KMS_KEYRING}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+          print_info "Creating KMS import job '${import_job}'..."
+          gcloud kms import-jobs create "${import_job}" \
+              --location="${REGION}" \
+              --keyring="${KMS_KEYRING}" \
+              --import-method=rsa-oaep-3072-sha256-aes-256 \
+              --protection-level=software \
+              --project="${PROJECT_ID}" >/dev/null 2>&1 || true
+        fi
+
+        # A freshly created import job generates its wrapping key asynchronously.
+        local job_state=""
+        for _ in $(seq 1 30); do
+          job_state=$(gcloud kms import-jobs describe "${import_job}" --location="${REGION}" \
+              --keyring="${KMS_KEYRING}" --project="${PROJECT_ID}" --format='value(state)' 2>/dev/null || echo "")
+          [ "$job_state" = "ACTIVE" ] && break
+          sleep 10
+        done
+
+        if [ "$job_state" != "ACTIVE" ]; then
+          print_error "KMS import job '${import_job}' never became ACTIVE (state=${job_state:-unknown})."
+        else
+          local tmp_dir; tmp_dir=$(mktemp -d); chmod 700 "$tmp_dir"
+          if openssl pkcs8 -topk8 -inform PEM -outform DER -nocrypt \
+               -in "${GITHUB_PEM_PATH}" -out "${tmp_dir}/key.pkcs8.der" 2>/dev/null &&
+             gcloud kms keys versions import \
+                --project="${PROJECT_ID}" \
+                --location="${REGION}" \
+                --keyring="${KMS_KEYRING}" \
+                --key="${KMS_KEY}" \
+                --import-job="${import_job}" \
+                --algorithm=rsa-sign-pkcs1-2048-sha256 \
+                --target-key-file="${tmp_dir}/key.pkcs8.der" >/dev/null 2>&1; then
+            rm -rf "$tmp_dir"
+            print_success "Successfully imported GitHub Private Key into KMS."
           else
+            rm -rf "$tmp_dir"
             print_error "Failed to import GitHub Private Key to KMS. You must import it manually."
           fi
-        else
-          rm -rf "$tmp_dir"
-          print_error "Failed to clone github-token-minter repo for CLI tools. You must import it manually."
         fi
       fi
     else
       print_warning "No GitHub Private Key PEM path provided or file not found."
       print_warning "KMS Key '${KMS_KEY}' has no active version. Minter will fail to start until you import the key."
       print_warning "You can import it later manually using Minty CLI:"
-      print_warning "  git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty && cd /tmp/minty && go run ./cmd/minty tools import-pk -project-id=${PROJECT_ID} -location=${REGION} -key-ring=${KMS_KEYRING} -key=${KMS_KEY} -private-key=@/path/to/pem"
+      print_warning "  openssl pkcs8 -topk8 -inform PEM -outform DER -nocrypt -in /path/to/pem -out /tmp/key.der && \\"
+      print_warning "  gcloud kms keys versions import --project=${PROJECT_ID} --location=${REGION} --keyring=${KMS_KEYRING} --key=${KMS_KEY} --import-job=${KMS_IMPORT_JOB:-kage-minty-import-job} --algorithm=rsa-sign-pkcs1-2048-sha256 --target-key-file=/tmp/key.der"
     fi
   fi
 
@@ -183,13 +203,58 @@ execute_github_minter() {
     print_error "GitHub integration directory not found at ${GITHUB_INTEGRATION_DIR}"
     return 1
   fi
+
+  # Minty signs its GitHub App JWT with the KMS key on every request, so a key with no
+  # ENABLED version fails the readiness probe rather than erroring at deploy time. Surface
+  # that here instead of leaving a silently unready Service the agent cannot resolve.
+  if ! wait_for_k8s_resource "deployment/github-token-minter" "${NAMESPACE}" "Available" "180s"; then
+    print_error "github-token-minter did not become Available."
+    print_error "Most common cause: KMS key '${KMS_KEY}' has no ENABLED version (the GitHub App"
+    print_error "private key was never imported). Check: kubectl logs -n ${NAMESPACE} deploy/github-token-minter"
+    return 1
+  fi
+}
+
+# Preflight the GitHub side. Neither check can be done from inside the cluster, and both
+# produce confusing downstream failures: an uninitialised repo has no default branch, so the
+# agent's PR (its only sanctioned write path) cannot be opened at all.
+verify_github_preflight() {
+  # Advisory only — never block provisioning on a missing local gh CLI.
+  return 0
+}
+execute_github_preflight() {
+  if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_REPO:-}" ]; then
+    return 0
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    print_info "gh CLI not found; skipping GitHub-side preflight."
+    return 0
+  fi
+
+  local slug="${GITHUB_ORG}/${GITHUB_REPO}"
+  if ! gh repo view "$slug" >/dev/null 2>&1; then
+    print_warning "Repository ${slug} is not reachable with the current gh credentials."
+    return 0
+  fi
+
+  local branches
+  branches=$(gh api "repos/${slug}/branches" --jq 'length' 2>/dev/null || echo "0")
+  if [ "${branches:-0}" -eq 0 ]; then
+    print_warning "Repository ${slug} has no commits (no default branch)."
+    print_warning "Agents cannot open pull requests against an empty repository."
+    print_warning "Seed it first, e.g.: gh api repos/${slug}/contents/README.md -X PUT \\"
+    print_warning "  -f message='chore: initialize' -f content=\"\$(printf '# %s' '${GITHUB_REPO}' | base64)\""
+  else
+    print_success "Repository ${slug} is initialized (${branches} branch(es))."
+  fi
 }
 
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
 run_step "2. Enable Cloud KMS API" verify_kms_api execute_kms_api 0
-run_step "3. Deploy GitHub Token Minter" verify_github_minter execute_github_minter 10
+run_step "3. Preflight GitHub repository" verify_github_preflight execute_github_preflight 0
+run_step "4. Deploy GitHub Token Minter" verify_github_minter execute_github_minter 10
 
 # ─── Conclusion Checklist ─────────────────────────────────────────────────────
 echo -e "\n${C_GREEN}${C_BOLD}✓ GitHub Token Minter deployed successfully to GKE!${C_RESET}"

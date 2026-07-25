@@ -1,0 +1,94 @@
+# Developer Team Agent (tier 3): namespace, read-only identity, and Agent CR for one tenant.
+#
+# Rendered by provision_12_deploy_agent_tiers.sh. In steady state the Cluster Admin Agent
+# proposes this bundle as a GitOps PR; provisioning renders the same shape so a fresh install
+# has a working tenant to exercise.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${DEVELOPER_TEAM_NAMESPACE}
+  labels:
+    kube-agents/tenant: ${DEVELOPER_TEAM_NAMESPACE}
+    # Agent pods are rendered hardened; enforce that at the namespace boundary too.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${DEVELOPER_TEAM_KSA_NAME}
+  namespace: ${DEVELOPER_TEAM_NAMESPACE}
+  labels:
+    kube-agents/tier: developer-team
+  annotations:
+    iam.gke.io/gcp-service-account: "${DEVELOPER_TEAM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+---
+# A namespaced Role, deliberately NOT a ClusterRole: the tenant boundary is structural, so the
+# agent cannot read another team's namespace even if it tried.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ${DEVELOPER_TEAM_KSA_NAME}-explorer
+  namespace: ${DEVELOPER_TEAM_NAMESPACE}
+  labels:
+    kube-agents/tier: developer-team
+rules:
+  - apiGroups: ["", "apps", "batch", "networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ${DEVELOPER_TEAM_KSA_NAME}-explorer
+  namespace: ${DEVELOPER_TEAM_NAMESPACE}
+  labels:
+    kube-agents/tier: developer-team
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ${DEVELOPER_TEAM_KSA_NAME}-explorer
+subjects:
+  - kind: ServiceAccount
+    name: ${DEVELOPER_TEAM_KSA_NAME}
+    namespace: ${DEVELOPER_TEAM_NAMESPACE}
+---
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: Agent
+metadata:
+  # PLACEMENT (A1): metadata.namespace MUST equal spec.scope.namespace or the admission webhook
+  # rejects the CR. This is what keeps the agent pod inside the tenant's isolation controls.
+  name: ${DEVELOPER_TEAM_AGENT_NAME}
+  namespace: ${DEVELOPER_TEAM_NAMESPACE}
+  labels:
+    kube-agents/tier: developer-team
+spec:
+  tier: developer-team
+  scope:
+    projectId: "${PROJECT_ID}"
+    clusterName: "${CLUSTER_NAME}"
+    namespace: "${DEVELOPER_TEAM_NAMESPACE}"
+  parentRef:
+    name: ${CLUSTER_ADMIN_AGENT_NAME}
+  iac:
+    format: kcc
+  deployment:
+    # Pin explicitly; see the note in cluster-admin-agent.yaml.template.
+    image: "${DEVELOPER_TEAM_IMAGE}"
+    tag: "${DEVELOPER_TEAM_TAG}"
+    imagePullPolicy: "IfNotPresent"
+  harness:
+    clusterName: "${CLUSTER_NAME}"
+    location: "${REGION}"
+    hermes:
+      dashboardEnabled: true
+      apiServerSecretRef:
+        name: ${DEVELOPER_TEAM_KSA_NAME}-secrets
+        key: API_SERVER_KEY
+  security:
+    serviceAccountName: ${DEVELOPER_TEAM_KSA_NAME}
+  integration:
+    googleChat:
+      enabled: ${DEVELOPER_TEAM_GOOGLE_CHAT_ENABLED}
+    slack:
+      enabled: ${DEVELOPER_TEAM_SLACK_ENABLED}

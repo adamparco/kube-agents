@@ -180,8 +180,10 @@ func TestBuildSystemPVC(t *testing.T) {
 	}
 
 	pvc := buildSystemPVC(agent)
-	if pvc.Name != "system-metadata" {
-		t.Errorf("expected PVC name system-metadata, got %s", pvc.Name)
+	// Per-agent, not a namespace-shared name: two agents in one namespace (platform +
+	// cluster-admin both live in kubeagents-system) would otherwise collide on the same RWO claim.
+	if pvc.Name != "test-agent-system-metadata" {
+		t.Errorf("expected PVC name test-agent-system-metadata, got %s", pvc.Name)
 	}
 	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 	if storageReq.String() != "1Gi" {
@@ -546,8 +548,8 @@ func TestBuildDeployment(t *testing.T) {
 		v := volumesMap["system-metadata"]
 		if v.PersistentVolumeClaim == nil {
 			t.Errorf("expected system-metadata to be a PVC")
-		} else if v.PersistentVolumeClaim.ClaimName != "system-metadata" {
-			t.Errorf("expected system-metadata claim system-metadata, got %s", v.PersistentVolumeClaim.ClaimName)
+		} else if v.PersistentVolumeClaim.ClaimName != "my-agent-system-metadata" {
+			t.Errorf("expected system-metadata claim my-agent-system-metadata, got %s", v.PersistentVolumeClaim.ClaimName)
 		}
 	}
 

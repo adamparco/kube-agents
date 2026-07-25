@@ -1,0 +1,103 @@
+# Configuration state for the provisioning scripts.
+#
+# Copy to `vars.sh` (git-ignored) and fill in. Any variable left unset is prompted for on the
+# first run and appended to vars.sh; anything already set makes the run non-interactive, which
+# is what you want for CI or a repeatable rebuild.
+#
+#   cp vars.sh.example vars.sh && $EDITOR vars.sh && make gcp-provision
+#
+# vars.sh holds real secrets (API keys, Slack tokens) and is git-ignored. Keep it that way.
+
+# ─── Core GCP / GKE ───────────────────────────────────────────────────────────
+export PROJECT_ID=your-gcp-project-id
+export REGION=us-east4
+export CLUSTER_NAME=platform-agent-host
+
+# ─── Model provider ───────────────────────────────────────────────────────────
+# gemini | chatgpt | claude. LiteLLM fronts this and exposes it to agents as `model-default`.
+export MODEL_PROVIDER=gemini
+export MODEL_DEFAULT_NAME=gemini-3.5-flash
+
+# ─── Images ───────────────────────────────────────────────────────────────────
+# Leave the *_IMAGE vars unset to run the published ghcr.io/gke-labs images.
+#
+# To run images built from THIS source tree, set them to your Artifact Registry and build with
+# the root Makefile. Two things bite here:
+#   * The root Makefile defaults to LOCATION=us-central1. If your cluster/registry is anywhere
+#     else you MUST pass LOCATION=<region>, or images land in a registry the cluster won't pull.
+#         make docker-push LOCATION=us-east4
+#   * The agent images are amd64. Building on an arm64 machine (Apple silicon) produces images
+#     the GKE nodes cannot run — build with Cloud Build (deploy/docker/cloudbuild.yaml), or pass
+#     an explicit --platform linux/amd64.
+# Prefer an immutable tag (a git SHA or a digest) over :latest, so what is deployed is provable.
+export GCP_ARTIFACT_REGISTRY_REPO_NAME=kube-agents
+export OPERATOR_IMAGE=
+export ROUTER_IMAGE=
+export AGENT_IMAGE=
+export AGENT_TAG=
+export REPLAY_IMAGE=
+
+# ─── Agent options ────────────────────────────────────────────────────────────
+# read-only is the only supported value; the retired `gke-admin` preset is coerced to read-only
+# because the agent's cloud identity must never hold a write role (invariant #1).
+export PLATFORM_AGENT_PERMISSION_SET=read-only
+export MEMORY_ENABLED=false
+export MEMORY_PROVIDER=multiuser_memory
+export USER_PROFILE_ENABLED=false
+
+# ─── gVisor sandbox ───────────────────────────────────────────────────────────
+export ENABLE_GVISOR=true
+export GVISOR_POOL_NAME=gvisor-pool
+
+# ─── Inference Replay proxy ───────────────────────────────────────────────────
+# When enabled, the `litellm` Service is repointed at the replay proxy and the real gateway
+# moves to `litellm-gateway`. If the replay pod cannot start, inference breaks for every agent.
+export INFERENCE_REPLAY_ENABLED=false
+
+# ─── Google Chat ──────────────────────────────────────────────────────────────
+# When false, provision_03 parks kage-router at 0 replicas: the router only drains an inbound
+# Chat subscription, and with the shipped REPLACE_WITH_* placeholders it would crash-loop.
+export GOOGLE_CHAT_ENABLED=false
+export CHAT_TOPIC_NAME=''
+export CHAT_SUB_NAME=''
+export ALLOWED_USERS=''
+
+# ─── Slack ────────────────────────────────────────────────────────────────────
+# Socket Mode. The bot token is xoxb-…, the app token xapp-… . Two things are easy to miss:
+#   * The bot must be invited to a channel (`/invite @your-agent`) or it sees no messages at all.
+#   * An empty SLACK_ALLOWED_USERS means ALL workspace users may drive the agent. Ship a closed
+#     allowlist of Slack member IDs (04 A4).
+export SLACK_ENABLED=false
+export SLACK_BOT_TOKEN=''
+export SLACK_APP_TOKEN=''
+export SLACK_ALLOWED_USERS=''
+export SLACK_HOME_CHANNEL=''
+export SLACK_HOME_CHANNEL_NAME=''
+
+# ─── GitHub Token Minter (Minty) ──────────────────────────────────────────────
+# Brokers short-lived GitHub installation tokens so no agent holds a long-lived credential.
+# Leave GITHUB_ORG/GITHUB_REPO/GITHUB_APP_ID empty to skip Minty entirely.
+#
+# GITHUB_ORG MUST BE A GITHUB ORGANIZATION, NOT A PERSONAL USER ACCOUNT.
+# Minty looks up the installation with GET /orgs/{org}/installation, which 404s for user
+# accounts, so token minting can never succeed for a personal repo. The GitHub App should also
+# be owned by that organization — a private App owned by a user cannot be installed on an org.
+# See config/integrations/github/README.md for the full setup.
+#
+# The target repo must have at least one commit: agents open pull requests, which is impossible
+# against a repository with no default branch. provision_10 warns when it is empty.
+export GITHUB_ORG=''
+export GITHUB_REPO=
+export GITHUB_APP_ID=
+# Absolute path to the App's .pem. provision_10 converts it to PKCS#8 and imports it into KMS;
+# the key is never mounted into the cluster. Only needed for the initial import.
+export GITHUB_PEM_PATH=
+export KMS_KEYRING=github-token-minter-keyring
+export KMS_KEY=github-token-minter-key
+
+# ─── Secrets ──────────────────────────────────────────────────────────────────
+# Auto-generated if left empty.
+export API_SERVER_KEY=
+export GEMINI_API_KEY=
+export OPENAI_API_KEY=placeholder
+export ANTHROPIC_API_KEY=placeholder

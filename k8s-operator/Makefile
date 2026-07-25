@@ -268,11 +268,21 @@ gcp-provision-11-inference-replay: ## Step 11: Deploy Inference Replay proxy.
 	@chmod +x scripts/*.sh
 	@./scripts/provision_11_deploy_inference_replay.sh $(ARGS)
 
+.PHONY: gcp-provision-12-agent-tiers
+gcp-provision-12-agent-tiers: ## Step 12: Deploy the cluster-admin and developer-team agent tiers.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_12_deploy_agent_tiers.sh $(ARGS)
+
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
 
+
+.PHONY: gcp-teardown-12-agent-tiers
+gcp-teardown-12-agent-tiers: ## Teardown Step 12: Remove the cluster-admin and developer-team agent tiers.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_12_deploy_agent_tiers.sh $(ARGS)
 
 .PHONY: gcp-teardown-11-inference-replay
 gcp-teardown-11-inference-replay: ## Teardown Step 11: Undeploy Inference Replay proxy.

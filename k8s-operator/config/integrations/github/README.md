@@ -18,13 +18,67 @@ Minty itself does not natively possess access to any GitHub repositories. The **
 
 By installing the GitHub App into a target repository, explicit authorization is granted to that machine identity. Minty's role is strictly to ensure that only authorized internal workloads are permitted to generate tokens on behalf of the App.
 
+### The organization requirement (read this first)
+
+> [!IMPORTANT]
+> **The target repository must live in a GitHub Organization, and the GitHub App must be owned
+> by that same organization. A personal user account will not work.**
+
+Minty resolves the installation with `InstallationForOrg`, i.e. `GET /orgs/{org}/installation`
+(`pkg/server/source/github.go`; the call is unconditional and there is no configuration to make
+it use the user or repo variant). GitHub's `/orgs/...` endpoints return `404` for personal
+accounts, so against a user-owned repo every mint fails with:
+
+```
+error generating access token: errors retrieving GitHub installation:
+failed to get access token url for org <name>: ... retryable status code: 404
+```
+
+This looks like a permissions or installation problem, but installing the App does not fix it —
+the endpoint simply does not exist for user accounts. Two consequences:
+
+- `GITHUB_ORG` must name a real organization. Check with `gh api /orgs/<name>`; a `404` there
+  means it is a user account and Minty cannot work with it.
+- The App must be **created under the organization**, not under your personal account. A
+  private ("only on this account") App owned by a user cannot be installed on an org at all,
+  and an org-owned App keeps the GitOps identity with the org rather than an individual.
+
+Creating a free organization and moving the repo into it is the shortest path.
+
 ### Setting up the GitHub App
 
-1. Navigate to your GitHub Organization (or personal settings) -> **Developer Settings** -> **GitHub Apps** -> **New GitHub App**.
-2. Assign a name and configure the required repository permissions (e.g., `Contents: Read & write`, `Pull requests: Read & write`).
-3. Once created, note the **App ID**.
-4. Scroll down and click **Generate a private key**. This will download a `.pem` file to your local machine.
-5. Navigate to the target repository the agent is intended to manage, go to **Settings** -> **GitHub Apps**, and install the newly created App.
+1. Go to **the organization's** settings -> **Developer settings** -> **GitHub Apps** ->
+   **New GitHub App** (`https://github.com/organizations/<ORG>/settings/apps/new`).
+2. Assign a name, set **Homepage URL** to the target repo, and disable **Webhook -> Active**
+   (Minty never receives webhooks).
+3. Under **Repository permissions** set `Contents: Read & write`, `Pull requests: Read & write`,
+   `Metadata: Read-only` — these must be a superset of the `permissions:` in the scope rule in
+   `configmap.yaml.template`.
+4. Create the App and note the **App ID** (`GITHUB_APP_ID`).
+5. Click **Generate a private key**; a `.pem` downloads. Point `GITHUB_PEM_PATH` at it. The key
+   is shown exactly once — if you lose it, generate another.
+6. Click **Install App** and install it on the target repository.
+
+Verify the whole App before provisioning — this mints a JWT and asks GitHub who it is, which
+catches a wrong App ID, a mismatched key, and a missing installation in one shot:
+
+```bash
+APP_ID=<your-app-id>; PEM=<path-to-pem>; ORG=<your-org>
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+NOW=$(date +%s)
+HDR=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+PAY=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((NOW-60)) $((NOW+540)) "$APP_ID" | b64url)
+JWT="$HDR.$PAY.$(printf '%s.%s' "$HDR" "$PAY" | openssl dgst -sha256 -sign "$PEM" | b64url)"
+
+# Should print the app slug and an Organization owner:
+curl -s -H "Authorization: Bearer $JWT" https://api.github.com/app | jq '{slug, owner: .owner.login, type: .owner.type}'
+# Should return 200 — this is the exact call Minty makes:
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $JWT" \
+  "https://api.github.com/orgs/${ORG}/installation"
+```
+
+Finally, the repository needs **at least one commit**. Agents deliver changes as pull requests,
+and a repo with no default branch cannot accept one; `provision_10` warns when it finds none.
 
 ### Provisioning Configuration Variables
 
@@ -42,13 +96,52 @@ Minty was originally designed for integration with GitHub Actions, which inheren
 - **KSA Tokens are Unsupported:** Native Kubernetes Service Account (KSA) tokens do not support the injection of arbitrary custom claims such as `"repository"`. Consequently, Minty's default validation engine will reject KSA tokens due to the missing claim.
 - **GSA Tokens (The Solution):** To resolve this, Workload Identity is utilized to provide Google Service Account (GSA) OIDC tokens. Minty implements a specific exemption for tokens where the issuer is `https://accounts.google.com`. When processing a Google-issued token, Minty bypasses the `"repository"` claim requirement. Instead, it validates the caller's identity via the `assertion.email` rule and derives the target repository directly from the JSON POST payload.
 
-## Cryptographic Key Import via Minty CLI
+## Cryptographic key import (openssl + gcloud)
 
-During provisioning, the scripts clone the `github-token-minter` repository to leverage its included CLI tool (`minty tools import-pk`) for uploading the GitHub `.pem` file to Google Cloud KMS.
+`provision_10` imports the GitHub App `.pem` into Cloud KMS using only `openssl` and `gcloud`.
+It creates the KMS import job if missing, waits for it to reach `ACTIVE` (a new job generates
+its wrapping key asynchronously), converts the key, and imports it as a new key version.
 
-This approach is required due to the cryptographic wrapping prerequisites of the Google Cloud KMS API. Uploading an asymmetric private key natively via the Google Cloud CLI (`gcloud kms keys versions import`) strictly requires that the target key be explicitly converted from PKCS#1 into an unencrypted PKCS#8 format, and necessitates the provisioning of a separate KMS "Import Job" to facilitate secure RSA-OAEP wrapping.
+GitHub issues the App key as **PKCS#1** (`BEGIN RSA PRIVATE KEY`) while KMS requires **PKCS#8**,
+so the script converts it first; `gcloud kms keys versions import --target-key-file` then
+performs the RSA-OAEP/AES wrapping client-side.
 
-The Minty CLI abstracts this complex cryptographic workflow. It automatically provisions the KMS Import Job, securely reformats the PKCS#1 string into PKCS#8 in-memory, performs the RSA-OAEP wrapping, and uploads the payload securely to KMS, ensuring a robust and standardized key import process.
+> [!NOTE]
+> `--target-key-file` requires the `cryptography` library inside the gcloud SDK's own Python. On
+> hosts where that is unavailable (and cannot be installed), do the wrapping with openssl and
+> pass the finished blob to `--wrapped-key-file` instead. For `RSA_OAEP_3072_SHA256_AES_256` the
+> payload is `RSA-OAEP-SHA256(ephemeral 256-bit AES key) || AES-KWP(target PKCS#8 DER)`:
+>
+> ```bash
+> openssl pkcs8 -topk8 -inform PEM -outform DER -nocrypt -in app.pem -out target.der
+> gcloud kms import-jobs describe "$JOB" --location="$REGION" --keyring="$KEYRING" \
+>   --format='value(publicKey.pem)' > wrap_pub.pem
+> openssl rand -out aes.key 32
+> openssl enc -id-aes256-wrap-pad -K "$(xxd -p -c 64 < aes.key | tr -d '\n')" -iv a65959a6 \
+>   -in target.der -out wrapped_target.bin
+> openssl pkeyutl -encrypt -pubin -inkey wrap_pub.pem -pkeyopt rsa_padding_mode:oaep \
+>   -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 -in aes.key -out enc_aes.bin
+> cat enc_aes.bin wrapped_target.bin > wrapped_key.bin
+> gcloud kms keys versions import --key="$KEY" --keyring="$KEYRING" --location="$REGION" \
+>   --import-job="$JOB" --algorithm=rsa-sign-pkcs1-2048-sha256 --wrapped-key-file=wrapped_key.bin
+> ```
+
+Confirm the imported key really is the App's key by comparing public moduli — a mismatch here
+produces JWTs GitHub silently rejects:
+
+```bash
+gcloud kms keys versions get-public-key <VERSION> --key="$KEY" --keyring="$KEYRING" \
+  --location="$REGION" --output-file=kms_pub.pem
+openssl rsa -pubin -in kms_pub.pem -noout -modulus | openssl sha256
+openssl rsa -in app.pem -pubout | openssl rsa -pubin -noout -modulus | openssl sha256
+```
+
+Rotating the App (or moving to an org-owned one) means importing a new version. `provision_10`
+always deploys the **highest ENABLED** version, so disable superseded ones to keep it obvious:
+
+```bash
+gcloud kms keys versions disable <OLD_VERSION> --key="$KEY" --keyring="$KEYRING" --location="$REGION"
+```
 
 ## Manual Testing
 
