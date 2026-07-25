@@ -1,35 +1,25 @@
-# clusters/cluster-a/namespaces/team-x/30-netpol-developer-team-egress.yaml
+# netpol-agent-egress.yaml.template
 #
-# The per-tier DEFAULT-DENY egress allowlist for team-x's Developer Team Agent pod (03 §10; Phase 3).
-# It layers on top of `20-netpol-default-deny.yaml`: the baseline denies all egress for every pod in
-# team-x; this policy adds back — for the agent pod ONLY (selected by the tier label the controller
-# stamps, `kube-agents/tier: developer-team`) — exactly the destinations the agent needs. Tenant
-# workloads are unaffected (different/no selector) and stay default-denied until they add their own
-# policy. SHAPE = PURE ALLOWLIST: there is deliberately NO 0.0.0.0/0 rule, so the cloud metadata server
-# (169.254.169.254), other team namespaces, and arbitrary hosts are unreachable by omission (03 §11).
+# The per-tier DEFAULT-DENY egress NetworkPolicy for an agent pod (03 §9/§10), rendered by
+# `provision_13_apply_egress_policies.sh` and applied by it. The three committed exemplars under
+# examples/gitops-repo/ are the REFERENCE RENDER of this template, byte-for-byte, and
+# local-dev/tests/egress-policy-render.py fails if they drift — edit this file, then regenerate them.
 #
-# A4 GRAFT — why an in-cluster hop to kubeagents-system (load-bearing). The controller renders the
-# agent's config with hostnames hard-coded to the POD's OWN namespace:
-#     model.baseURL      = http://litellm.team-x.svc.cluster.local/v1              (agent_manifests.go)
-#     GITHUB_TOKEN_URL   = http://github-token-minter.team-x.svc.cluster.local:8080/token
-# Those names don't exist in team-x, so `40-service-aliases.yaml` creates ExternalName aliases
-# `litellm`/`github-token-minter` in team-x that point at the shared services in kubeagents-system. The
-# agent thus consumes the CLUSTER's inference + token-minter (it gets no hub connection of its own).
-# This policy must therefore admit that hop — rule (2) allows egress to the kubeagents-system namespace
-# on the litellm (80) and minter (8080) ports. On Kind (the inner-loop verification target) those are
-# real in-cluster services, so rule (2) is the working path. In production kubeagents-system may itself
-# front the hub via ExternalName; rules (3)/(4) then cover the resolved hub CIDR. Both are present so the
-# policy is correct under either topology.
+# SHAPE = PURE ALLOWLIST. `policyTypes: [Egress]` plus a podSelector makes egress default-deny for the
+# selected pods; only what is listed is reachable. There is deliberately NO 0.0.0.0/0 rule: a broad
+# allow-with-exceptions would make "arbitrary hosts are unreachable" false, and every destination
+# below had to be argued for individually.
 #
-# EXTERNAL CIDRS (rules 3–6) are REPLACE_WITH_* placeholders substituted per environment by the
-# propose-developer-team cascade (mirrors the cluster-admin egress policy). They are validated
-# structurally in the Kind gate (policy parses, selects the pod by tier label, zero 0.0.0.0/0);
-# enforcement of the isolation negatives is proven on a Calico cluster (see verify-phase3).
+# WHAT IS *NOT* HERE, AND WHY THAT IS THE POINT. The cloud metadata server is absent from the base
+# allowlist, so raw node credentials are unreachable by omission rather than by a deny rule that a
+# later edit could reorder away. When Workload Identity genuinely needs the metadata server, the
+# install path appends the NARROW, PORT-BOUND block below (WORKLOAD_IDENTITY_METADATA_BLOCK) — never
+# a whole-host allow. See common.sh:render_wi_metadata_block for the exact IP↔port pairings, which
+# are dataplane-specific and are the single easiest thing in this file to get wrong.
 #
-# LIMITATION (hostname precision) & GKE Workload-Identity metadata note: identical to the cluster-admin
-# egress policy — NetworkPolicy is L3/L4 (CIDRs drift; the hostname-precise L7 proxy is Phase 5), and
-# WI token fetches via 169.254.169.254 are intentionally NOT allowed (the load-bearing negative is that
-# raw metadata / node credentials are unreachable; on Kind there is no metadata server).
+# LIMITATION (hostname precision): NetworkPolicy is L3/L4 and cannot express hostnames, so GitHub is
+# allowlisted by published IP CIDRs, which drift. Refresh them from https://api.github.com/meta. The
+# hostname-precise L7 egress proxy remains deferred hardening (08 §5).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -45,8 +35,8 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # 1) DNS — cluster resolution (and the ExternalName CNAME chain in rule 2). Without this, every
-    #    name-based egress fails before it starts.
+    # 1) DNS — cluster resolution. Without this, every name-based egress fails before it starts,
+    #    including the ExternalName CNAME chain rule 2 depends on.
     - to:
         - namespaceSelector:
             matchLabels:
@@ -56,10 +46,17 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # 2) Shared cluster services in kubeagents-system — the A4 alias targets. Inference (LiteLLM, :80)
-    #    and the GitHub/Workload-Identity token broker (github-token-minter, :8080). The agent reaches
-    #    these via the team-x ExternalName aliases; this is the ONLY cross-namespace egress it gets, and
-    #    it is one-way to the cluster's own control namespace — never to another tenant.
+    # 2) The cluster's shared agent services in kubeagents-system — Inference (LiteLLM, :80, the
+    #    ONLY inference path, per-tier virtual key) and the GitHub/Workload-Identity token broker
+    #    (github-token-minter, :8080, short-lived scoped tokens; the agent holds no long-lived write
+    #    credential). The controller renders both hostnames into the POD'S OWN namespace, so a
+    #    developer-team agent reaches them through the ExternalName aliases in its namespace; this
+    #    rule is what admits that hop. It is one-way into the cluster's control namespace and never
+    #    toward another tenant.
+    #
+    #    Default-deny applies to same-namespace traffic too, so the platform and cluster-admin tiers
+    #    need this rule just as much as a developer-team agent does — their pods happen to already be
+    #    in kubeagents-system, which does not exempt them.
     - to:
         - namespaceSelector:
             matchLabels:
@@ -69,44 +66,30 @@ spec:
           port: 80
         - protocol: TCP
           port: 8080
-    # 3) Hub Inference (LiteLLM) — used when kubeagents-system fronts the hub via ExternalName, so the
-    #    resolved connection lands on the hub's VPC-internal private endpoint. TCP 443.
-    - to:
-        - ipBlock:
-            cidr: REPLACE_WITH_HUB_INFERENCE_CIDR # e.g. 10.10.0.0/28 — the hub LiteLLM private endpoint
-      ports:
-        - protocol: TCP
-          port: 443
-    # 4) Hub Minty — the Workload-Identity / GitHub token broker, when fronted from the hub. TCP 443.
-    - to:
-        - ipBlock:
-            cidr: REPLACE_WITH_HUB_MINTY_CIDR # e.g. 10.10.0.16/28 — the hub Minty private endpoint
-      ports:
-        - protocol: TCP
-          port: 443
-    # 5) Google cloud APIs via Private Google Access (restricted.googleapis.com). Stable range — reads
-    #    only (the agent's cloud GSA is viewer-only; the write path is a GitOps PR). This ALSO carries
-    #    the eventingress Pub/Sub SUBSCRIBE leg (Phase 4 D1, 04 §4): pubsub.googleapis.com resolves to
-    #    the same restricted VIP, so draining PRE-CREATED alert/GitHub subscriptions needs no new
-    #    CIDR/port. Subscribe-only — eventingress never creates a topic/subscription and never publishes.
+    # 3) Google cloud APIs via Private Google Access (restricted.googleapis.com). Stable, well-known
+    #    range — reads only (the agent's cloud GSA is viewer-only; the write path is a GitOps PR).
+    #    This ALSO carries the eventingress Pub/Sub SUBSCRIBE leg (04 §4): pubsub.googleapis.com
+    #    resolves to the same restricted VIP, so draining PRE-CREATED subscriptions needs no new
+    #    CIDR or port. Subscribe-only — eventingress never creates a topic/subscription or publishes.
     - to:
         - ipBlock:
             cidr: 199.36.153.8/30
       ports:
         - protocol: TCP
           port: 443
-    # 6) GitHub — the agent pushes suggestion branches / opens PRs (submit-suggestion) with a Minty-
-    #    minted token. Allowlisted by GitHub's published IP ranges (https://api.github.com/meta).
+    # 4) GitHub — the agent pushes suggestion/provisioning branches and opens PRs with a Minty-minted
+    #    token. GitHub's four published, stable IPv4 blocks (api + git + web, api.github.com/meta).
+    #    The per-region /32s in that feed are deliberately omitted: they churn weekly and an
+    #    allowlist nobody refreshes is an allowlist that silently breaks.
     - to:
         - ipBlock:
-            cidr: REPLACE_WITH_GITHUB_CIDRS # e.g. 140.82.112.0/20 (see api.github.com/meta)
-      ports:
-        - protocol: TCP
-          port: 443
-    # 7) MCP grounding endpoints the agent reads live docs from (developer_knowledge — 03 §10).
-    - to:
+            cidr: 192.30.252.0/22
         - ipBlock:
-            cidr: REPLACE_WITH_MCP_GROUNDING_CIDRS # e.g. the hub MCP endpoint CIDR
+            cidr: 185.199.108.0/22
+        - ipBlock:
+            cidr: 140.82.112.0/20
+        - ipBlock:
+            cidr: 143.55.64.0/20
       ports:
         - protocol: TCP
           port: 443

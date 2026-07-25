@@ -23,15 +23,15 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: cluster-admin-egress
-  namespace: kubeagents-system
+  name: ${NETPOL_NAME}
+  namespace: ${AGENT_NAMESPACE}
   labels:
-    kube-agents/tier: cluster-admin
+    kube-agents/tier: ${AGENT_TIER}
     app.kubernetes.io/managed-by: gitops
 spec:
   podSelector:
     matchLabels:
-      kube-agents/tier: cluster-admin
+      kube-agents/tier: ${AGENT_TIER}
   policyTypes:
     - Egress
   egress:
@@ -46,7 +46,7 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # 2) The cluster's shared agent services in kubeagents-system — Inference (LiteLLM, :80, the
+    # 2) The cluster's shared agent services in ${CONTROL_NAMESPACE} — Inference (LiteLLM, :80, the
     #    ONLY inference path, per-tier virtual key) and the GitHub/Workload-Identity token broker
     #    (github-token-minter, :8080, short-lived scoped tokens; the agent holds no long-lived write
     #    credential). The controller renders both hostnames into the POD'S OWN namespace, so a
@@ -56,11 +56,11 @@ spec:
     #
     #    Default-deny applies to same-namespace traffic too, so the platform and cluster-admin tiers
     #    need this rule just as much as a developer-team agent does — their pods happen to already be
-    #    in kubeagents-system, which does not exempt them.
+    #    in ${CONTROL_NAMESPACE}, which does not exempt them.
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: kubeagents-system
+              kubernetes.io/metadata.name: ${CONTROL_NAMESPACE}
       ports:
         - protocol: TCP
           port: 80
@@ -93,3 +93,4 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+${EGRESS_OPTIONAL_BLOCKS}

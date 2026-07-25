@@ -75,6 +75,11 @@ FORBIDDEN_IDENT = "ALLOW_ALL_USERS"
 DOC_ALLOWLIST = (
     "docs/design/",
     "docs/build/",
+    # The harness's own prose — LESSONS.md exists to record that this hatch was
+    # removed and why, which it cannot do without naming it. Same rationale as
+    # docs/build/; it was missing only because nothing under .claude/harness/ had
+    # ever mentioned the identifier until LSN-017 was written.
+    ".claude/harness/",
     "local-dev/tests/closed-allowlist.py",
 )
 
@@ -88,6 +93,10 @@ ASSERTION_FILES = (
     "k8s-operator/internal/router/resolve_test.go",
     "k8s-operator/internal/router/authorize.go",
     "k8s-operator/internal/controller/manifest_helpers.go",
+    # The live half of V-CTR-014: it exists to prove no rendered Deployment carries
+    # the env var, so it has to be able to name it. The emission guard below still
+    # applies — it may assert the absence, never render one.
+    "local-dev/kind/closed-allowlist-l2.sh",
 )
 
 # A size-only guard on an allowlist: the predicate the bypass satisfied.
@@ -128,16 +137,43 @@ TEMPLATES = (
 PROVISION_GLOB = "k8s-operator/scripts/provision_*.sh"
 
 
+# Paths that live in .git/info/exclude and are force-added on commit (the harness
+# tree, the build ledger, the local-dev suites). `git ls-files --others
+# --exclude-standard` deliberately hides them, so they are walked directly.
+FORCE_ADDED_ROOTS = (".claude/harness", ".claude/skills", "docs/build", "local-dev")
+SOURCE_SUFFIXES = (".go", ".py", ".sh", ".yaml", ".yml", ".md", ".template", ".json")
+
+
 def tracked_files(root: Path) -> list[str]:
-    """Every file git tracks. Using git rather than a walk keeps generated
-    artifacts, vendored trees and local scratch out of the corpus."""
-    out = subprocess.run(
-        ["git", "-C", str(root), "ls-files"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return [line for line in out.stdout.splitlines() if line]
+    """The corpus: every tracked file, plus every new file not yet added.
+
+    This used to be `git ls-files` alone, and that made the check blind in the one
+    window where it matters most. A unit writes a new script, runs this validator
+    (green — the file is untracked, so it was never scanned), records the green in
+    the ledger, and only then commits. The evidence was gathered against a tree
+    that did not contain the work. P8-T1 shipped exactly that way: the violation in
+    `closed-allowlist-l2.sh` surfaced one commit later, in P8-T2 (LSN-017).
+
+    So the corpus is the working tree as it will exist after the commit, not as git
+    currently indexes it: tracked files, untracked-but-not-ignored files, and a
+    direct walk of the force-added roots that `--exclude-standard` would drop.
+    """
+    seen: dict[str, None] = {}
+
+    for args in (["ls-files"], ["ls-files", "--others", "--exclude-standard"]):
+        out = subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True, text=True, check=True
+        )
+        for line in out.stdout.splitlines():
+            if line:
+                seen.setdefault(line, None)
+
+    for base in FORCE_ADDED_ROOTS:
+        for path in (root / base).rglob("*"):
+            if path.is_file() and path.suffix in SOURCE_SUFFIXES:
+                seen.setdefault(str(path.relative_to(root)), None)
+
+    return sorted(seen)
 
 
 def read(root: Path, rel: str) -> str:

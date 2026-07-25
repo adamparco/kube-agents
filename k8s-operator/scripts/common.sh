@@ -454,6 +454,166 @@ render_allowlist_block() {
   done
 }
 
+# render_wi_metadata_block
+#
+# Emits the NARROW cloud-metadata allow rules for the per-tier egress policy, or
+# nothing at all. Written to stdout, indented to sit under `spec.egress`.
+#
+# THE CONFLICT THIS RESOLVES. The per-tier policies are a pure allowlist, so the
+# cloud metadata server is unreachable by omission — and 03 §11's load-bearing
+# negative is exactly that raw node credentials cannot be read. But on GKE,
+# Workload Identity mints the agent's tokens *through* that same metadata
+# service, so shipping the policies as-is takes every tier's identity away.
+# 03 §9 names both halves: allowlist the agent's real destinations, and "must
+# not accidentally deny the metadata server that Workload Identity depends on."
+#
+# The resolution is conditional and port-bound, never a whole-host allow:
+#
+#   * WORKLOAD_IDENTITY_ENABLED != true  -> emit NOTHING. On Kind, on a non-WI
+#     GKE cluster, and on any other target, 169.254.169.254:80 is the RAW
+#     metadata endpoint serving the NODE's service account — the classic
+#     escalation. Denying it is correct, and silence here is what denies it.
+#
+#   * WORKLOAD_IDENTITY_ENABLED == true  -> emit the metadata rules for the
+#     cluster's dataplane, bound to the metadata ports only. GKE's own metadata
+#     concealment keeps the node-SA paths unreachable, so what is opened is the
+#     pod's own (viewer-only) GSA and nothing more.
+#
+# THE IP↔PORT PAIRINGS ARE DATAPLANE-SPECIFIC AND ARE NOT INTERCHANGEABLE
+# (https://cloud.google.com/kubernetes-engine/docs/how-to/network-policy):
+#
+#     Dataplane V1 / Calico, GKE >= 1.21.0-gke.1000 : 169.254.169.252/32  TCP 988, 987
+#     Dataplane V2                                  : 169.254.169.254/32  TCP 80, 8080
+#
+# Both are emitted by default (GKE_DATAPLANE=auto) because a policy that names
+# the wrong pair for the cluster it lands on fails as a timeout inside the
+# client library — an authentication error with no mention of networking, which
+# is close to undebuggable in the field. Set GKE_DATAPLANE=v1|v2 to narrow it
+# once the cluster's dataplane is known.
+render_wi_metadata_block() {
+  local enabled="${WORKLOAD_IDENTITY_ENABLED:-false}"
+  local dataplane="${GKE_DATAPLANE:-auto}"
+
+  if [ "${enabled}" != "true" ]; then
+    return 0
+  fi
+
+  echo "    # 5) GKE metadata server — Workload Identity ONLY, bound to the metadata ports. This is the"
+  echo "    #    single widening in this policy; it is narrow on purpose. WI's metadata concealment keeps"
+  echo "    #    the node service account unreachable, so what this opens is the pod's own viewer-only"
+  echo "    #    GSA. Rendered only because WORKLOAD_IDENTITY_ENABLED=true (common.sh:render_wi_metadata_block)."
+  if [ "${dataplane}" = "auto" ] || [ "${dataplane}" = "v1" ]; then
+    echo "    #    Dataplane V1 / Calico (GKE >= 1.21.0-gke.1000)."
+    echo "    - to:"
+    echo "        - ipBlock:"
+    echo "            cidr: 169.254.169.252/32"
+    echo "      ports:"
+    echo "        - protocol: TCP"
+    echo "          port: 988"
+    echo "        - protocol: TCP"
+    echo "          port: 987"
+  fi
+  if [ "${dataplane}" = "auto" ] || [ "${dataplane}" = "v2" ]; then
+    echo "    #    Dataplane V2."
+    echo "    - to:"
+    echo "        - ipBlock:"
+    echo "            cidr: 169.254.169.254/32"
+    echo "      ports:"
+    echo "        - protocol: TCP"
+    echo "          port: 80"
+    echo "        - protocol: TCP"
+    echo "          port: 8080"
+  fi
+}
+
+# render_remote_hub_block
+#
+# Emits the ipBlock allow rules for a REMOTE-HUB topology, or nothing.
+#
+# In the reference topology LiteLLM and github-token-minter run in the cluster's
+# own control namespace, and rule 2 of the template is the working path. A
+# remote hub — the spoke consuming the hub's VPC-internal private endpoints
+# (05 §5) — needs two extra CIDRs, and grounding against an MCP endpoint that
+# lives outside the cluster needs a third.
+#
+# These used to ship as `REPLACE_WITH_HUB_INFERENCE_CIDR` and friends. That is
+# not a fillable template: `REPLACE_WITH_*` is not a CIDR, so the manifest was
+# rejected outright by the API server and the reference GitOps tree could not be
+# applied at all (V-CMP-003). Absent-unless-configured is both applicable and
+# strictly narrower than a placeholder nobody filled in.
+render_remote_hub_block() {
+  local inference="${HUB_INFERENCE_CIDR:-}"
+  local minty="${HUB_MINTY_CIDR:-}"
+  local mcp="${MCP_GROUNDING_CIDRS:-}"
+
+  _emit_cidr_rule() { # _emit_cidr_rule <comment> <cidr-csv> <port>
+    local comment="$1" csv="$2" port="$3" c
+    [ -z "$(printf '%s' "$csv" | tr -d '[:space:]')" ] && return 0
+    echo "    # ${comment}"
+    echo "    - to:"
+    local IFS=','
+    for c in ${csv}; do
+      c="$(printf '%s' "$c" | tr -d '[:space:]')"
+      [ -n "$c" ] && echo "        - ipBlock:
+            cidr: ${c}"
+    done
+    unset IFS
+    echo "      ports:"
+    echo "        - protocol: TCP"
+    echo "          port: ${port}"
+  }
+
+  _emit_cidr_rule "6) Hub Inference (LiteLLM) over the hub's VPC-internal private endpoint (05 §5)." \
+    "${inference}" 443
+  _emit_cidr_rule "7) Hub Minty — the GitHub/Workload-Identity token broker, VPC-internal (05 §5)." \
+    "${minty}" 443
+  _emit_cidr_rule "8) MCP grounding endpoints the agent reads live docs from (03 §10)." \
+    "${mcp}" 443
+
+  unset -f _emit_cidr_rule
+}
+
+# render_egress_policy <netpol-name> <namespace> <tier>
+#
+# Renders k8s-operator/scripts/netpol-agent-egress.yaml.template for one tier and
+# writes the manifest to stdout. The optional blocks are composed here so the
+# template stays a single flat allowlist that reads top to bottom.
+render_egress_policy() {
+  local netpol_name="$1"
+  local namespace="$2"
+  local tier="$3"
+  local template="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/netpol-agent-egress.yaml.template"
+
+  if [ ! -f "${template}" ]; then
+    print_error "Egress policy template not found: ${template}"
+    exit 1
+  fi
+
+  local optional
+  optional="$(
+    render_wi_metadata_block
+    render_remote_hub_block
+  )"
+
+  # Command substitution strips every trailing newline, so `printf '%s\n'` leaves
+  # exactly one. Without this the manifest ends with a stray blank line whenever
+  # EGRESS_OPTIONAL_BLOCKS is empty (the common case), which put two gates in
+  # direct conflict: Prettier deletes the blank line in the committed exemplars,
+  # and egress-policy-render.py requires them to be byte-identical to this render.
+  # Fixing it here rather than exempting either gate keeps both true at once.
+  local rendered
+  rendered="$(
+    NETPOL_NAME="${netpol_name}" \
+      AGENT_NAMESPACE="${namespace}" \
+      AGENT_TIER="${tier}" \
+      CONTROL_NAMESPACE="${CONTROL_NAMESPACE:-kubeagents-system}" \
+      EGRESS_OPTIONAL_BLOCKS="${optional}" \
+      envsubst '${NETPOL_NAME} ${AGENT_NAMESPACE} ${AGENT_TIER} ${CONTROL_NAMESPACE} ${EGRESS_OPTIONAL_BLOCKS}' \
+      <"${template}"
+  )"
+  printf '%s\n' "${rendered}"
+}
+
 confirm_action() {
   local warning_msg=$1
   shift
