@@ -128,9 +128,11 @@ execute_policy() {
 }
 
 # The kage-router is the Google CHAT front door: it drains an inbound Pub/Sub subscription and
-# re-publishes to per-agent topics. config/router ships it with replicas: 1 and REPLACE_WITH_*
-# placeholders, so on a Slack-only (or un-wired) install it crash-loops on startup with
-# "InvalidArgument ... REPLACE_WITH_PROJECT_ID". Park it at zero unless Chat is actually wired.
+# re-publishes to per-agent topics. config/router ships it with replicas: 1 and both env values
+# EMPTY (V-CMP-003 — a REPLACE_WITH_* placeholder there used to reach a running pod and fail as a
+# credentials error that never mentioned the real cause). So on a Slack-only or un-wired install it
+# still crash-loops until this step runs — now with "missing required --project-id" — which is why
+# this step always reconciles: park it at zero unless Chat is actually wired.
 verify_router_config() {
   # Always reconcile: `make deploy` in step 3 resets replicas/env from the kustomize base.
   return 1

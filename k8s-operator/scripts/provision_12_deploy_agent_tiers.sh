@@ -147,6 +147,11 @@ execute_developer_team() {
   kubectl create namespace "${DEVELOPER_TEAM_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   ensure_api_secret "${DEVELOPER_TEAM_KSA_NAME}-secrets" "${DEVELOPER_TEAM_NAMESPACE}" || return 1
   apply_tenant_quota "${DEVELOPER_TEAM_NAMESPACE}" || return 1
+  # Before the CR, not after: the controller renders this pod's model endpoint as
+  # litellm.<its own namespace>.svc, which does not exist in a tenant namespace until these aliases
+  # do. Applied afterwards, the pod's first inference call fails on NXDOMAIN while the readiness
+  # wait below counts down against an error that never mentions DNS.
+  apply_tenant_service_aliases "${DEVELOPER_TEAM_NAMESPACE}" || return 1
 
   print_info "Rendering and applying developer-team tier (image ${DEVELOPER_TEAM_IMAGE}:${DEVELOPER_TEAM_TAG})..."
   envsubst "${TIER_VARS}" < "${SCRIPT_DIR}/developer-team-agent.yaml.template" \

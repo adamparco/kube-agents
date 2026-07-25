@@ -22,6 +22,9 @@ Covered (P8-T3): the tenant ResourceQuota and the tenant default-deny floor —
 added when those two were wired into the install path, because the moment an
 installer renders a manifest, the committed copy stops being the source of truth
 and becomes a thing that can silently disagree with what ships.
+Covered (P8-T4): the tenant ExternalName aliases, on the same terms and for the
+same reason — until Phase 8 nothing applied them, so a dev-team agent's model
+endpoint resolved to NXDOMAIN on every real multi-tier install.
 
 Checks (all must pass for exit 0):
 
@@ -96,7 +99,12 @@ TENANT = {
     "render_tenant_default_deny": (
         "examples/gitops-repo/clusters/cluster-a/namespaces/team-x/20-netpol-default-deny.yaml"
     ),
+    "render_tenant_service_aliases": (
+        "examples/gitops-repo/clusters/cluster-a/namespaces/team-x/40-service-aliases.yaml"
+    ),
 }
+
+CONTROL_NAMESPACE = "kubeagents-system"
 
 PLACEHOLDER = re.compile(r"REPLACE_WITH_|PLACEHOLDER")
 
@@ -190,6 +198,39 @@ def check_quota_bounds_compute(quota: str) -> list[str]:
             f"the namespace are no longer forced to declare requests+limits"
         ]
     return []
+
+
+def check_aliases_point_at_the_control_namespace(aliases: str) -> list[str]:
+    """The aliases must be ExternalName, and must point somewhere else.
+
+    Two ways this manifest can be wrong while still applying cleanly. It can name
+    the right services with the wrong `type` — a ClusterIP Service with no
+    selector resolves to a black hole rather than an error, so the agent's model
+    calls hang instead of failing. Or an alias can CNAME a name to itself
+    (`litellm.team-x` -> `litellm.team-x`), which is what a copy-paste of the
+    tenant namespace into the target produces; the resolver loops and the failure
+    surfaces as a timeout somewhere else entirely.
+    """
+    bad = []
+    body_text = body(aliases)
+    for svc in ("litellm", "github-token-minter"):
+        target = f"{svc}.{CONTROL_NAMESPACE}.svc.cluster.local"
+        if f"externalName: {target}" not in body_text:
+            bad.append(
+                f"service aliases: no ExternalName for {svc} pointing at {target} — the "
+                f"dev-team agent's rendered config resolves to nothing"
+            )
+    kinds = re.findall(r"^\s*type: (\S+)", body_text, re.M)
+    for k in kinds:
+        if k != "ExternalName":
+            bad.append(f"service aliases: a Service of type {k} — only ExternalName is a DNS alias")
+    for m in re.finditer(r"^\s*externalName: (\S+)", body_text, re.M):
+        if f".{CONTROL_NAMESPACE}." not in m.group(1):
+            bad.append(
+                f"service aliases: {m.group(1)} does not resolve into {CONTROL_NAMESPACE} — an "
+                f"alias to its own namespace is a CNAME loop"
+            )
+    return bad
 
 
 def check_exemplars_match(repo: Path, rendered: dict[str, str]) -> list[str]:
@@ -293,6 +334,7 @@ def run_all(repo: Path) -> list[str]:
         + check_wi_pairs(wi)
         + check_tenant_exemplars(repo, tenant)
         + check_quota_bounds_compute(tenant["render_tenant_quota"])
+        + check_aliases_point_at_the_control_namespace(tenant["render_tenant_service_aliases"])
     )
 
 
@@ -339,6 +381,22 @@ def self_test() -> int:
             lambda: check_quota_bounds_compute('spec:\n  hard:\n    pods: "50"\n'),
         ),
         (
+            "alias of the wrong Service type rejected",
+            lambda: check_aliases_point_at_the_control_namespace(
+                "spec:\n  type: ClusterIP\n  externalName: litellm.kubeagents-system.svc.cluster.local\n"
+                "---\nspec:\n  type: ExternalName\n"
+                "  externalName: github-token-minter.kubeagents-system.svc.cluster.local\n"
+            ),
+        ),
+        (
+            "alias CNAMEing to its own namespace rejected",
+            lambda: check_aliases_point_at_the_control_namespace(
+                "spec:\n  type: ExternalName\n  externalName: litellm.team-x.svc.cluster.local\n"
+                "---\nspec:\n  type: ExternalName\n"
+                "  externalName: github-token-minter.kubeagents-system.svc.cluster.local\n"
+            ),
+        ),
+        (
             "quota missing only limits.memory rejected",
             lambda: check_quota_bounds_compute(
                 'spec:\n  hard:\n    requests.cpu: "8"\n    requests.memory: 16Gi\n'
@@ -371,9 +429,10 @@ def main() -> int:
         for v in violations:
             print(f"  - {v}")
         return 1
-    print("Reference render: OK — all five exemplars are the template render, the base allowlist")
-    print("  is placeholder-free and metadata-free, the WI rules are correctly paired, and the")
-    print("  tenant quota bounds compute.")
+    n = len(TIERS) + len(TENANT)
+    print(f"Reference render: OK — all {n} exemplars are the template render, the base allowlist is")
+    print("  placeholder-free and metadata-free, the WI rules are correctly paired, the tenant quota")
+    print("  bounds compute, and the service aliases resolve into the control namespace.")
     return 0
 
 

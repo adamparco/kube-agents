@@ -13,9 +13,9 @@
 #     model.baseURL    = http://litellm.<ns>.svc.cluster.local/v1
 #     GITHUB_TOKEN_URL = http://github-token-minter.<ns>.svc.cluster.local:8080/token
 # For a dev-team pod the A1 placement clause forces metadata.namespace == the tenant namespace, so
-# those resolve to `litellm.team-x.svc` and
-# `github-token-minter.team-x.svc` — names that do not exist. The real services live
-# once per cluster in kubeagents-system, alongside the cluster-admin agent, which uses them
+# those resolve to `litellm.${TENANT_NAMESPACE}.svc` and
+# `github-token-minter.${TENANT_NAMESPACE}.svc` — names that do not exist. The real services live
+# once per cluster in ${CONTROL_NAMESPACE}, alongside the cluster-admin agent, which uses them
 # directly and needs no alias. These ExternalName Services CNAME the in-namespace names to the
 # shared ones, so the rendered config works unmodified without teaching the controller
 # per-namespace service topology.
@@ -30,7 +30,7 @@
 #
 # ExternalName is pure DNS: no ClusterIP, no proxying, and NO PORT REMAPPING. The client connects to
 # whatever port the rendered URL specifies (80 for litellm, 8080 for the minter), and that port must
-# exist on the target Service in kubeagents-system — changing a shared Service's port silently
+# exist on the target Service in ${CONTROL_NAMESPACE} — changing a shared Service's port silently
 # breaks every tenant, because nothing here would need to change to stay wrong. The developer-team
 # egress NetworkPolicy admits the resulting hop (netpol-agent-egress.yaml.template, rule 2); the
 # alias resolves the name, the policy permits the packet, and BOTH are required.
@@ -38,22 +38,22 @@ apiVersion: v1
 kind: Service
 metadata:
   name: litellm
-  namespace: team-x
+  namespace: ${TENANT_NAMESPACE}
   labels:
-    kube-agents/tenant: team-x
+    kube-agents/tenant: ${TENANT_NAMESPACE}
     app.kubernetes.io/managed-by: gitops
 spec:
   type: ExternalName
-  externalName: litellm.kubeagents-system.svc.cluster.local
+  externalName: litellm.${CONTROL_NAMESPACE}.svc.cluster.local
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: github-token-minter
-  namespace: team-x
+  namespace: ${TENANT_NAMESPACE}
   labels:
-    kube-agents/tenant: team-x
+    kube-agents/tenant: ${TENANT_NAMESPACE}
     app.kubernetes.io/managed-by: gitops
 spec:
   type: ExternalName
-  externalName: github-token-minter.kubeagents-system.svc.cluster.local
+  externalName: github-token-minter.${CONTROL_NAMESPACE}.svc.cluster.local

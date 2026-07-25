@@ -345,8 +345,30 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.ImagePullPolicy != corev1.PullAlways {
 			t.Errorf("expected dashboard container image pull policy Always, got %s", dashboardC.ImagePullPolicy)
 		}
-		if len(dashboardC.VolumeMounts) != 4 {
-			t.Errorf("expected 4 volume mounts on dashboard container (2 base + 1 tmp + 1 extra), got %d", len(dashboardC.VolumeMounts))
+		if len(dashboardC.VolumeMounts) != 5 {
+			t.Errorf("expected 5 volume mounts on dashboard container (2 base + 1 tmp + 1 extra + config), got %d", len(dashboardC.VolumeMounts))
+		}
+		// P8-T4: the dashboard renders the SAME config the agent runs on. Before this it mounted no
+		// config at all and fell back to the image-baked copy, so the UI could describe a model,
+		// toolset and integration set the running agent had not used since the CR last changed
+		// (LSN-003 — assert against the operator-rendered ConfigMap, not the baked file).
+		// The path follows the agent's own agentHome (/var/agent in this fixture), not a fixed
+		// /opt/data — the mount has to shadow the config file wherever THIS agent's home puts it.
+		var dashConfigMount *corev1.VolumeMount
+		for i := range dashboardC.VolumeMounts {
+			if dashboardC.VolumeMounts[i].MountPath == "/var/agent/config.yaml" {
+				dashConfigMount = &dashboardC.VolumeMounts[i]
+			}
+		}
+		if dashConfigMount == nil {
+			t.Errorf("dashboard container has no /var/agent/config.yaml mount — it would fall back to the image-baked config")
+		} else {
+			if dashConfigMount.SubPath != "config.yaml" {
+				t.Errorf("expected dashboard config mount subPath config.yaml, got %q", dashConfigMount.SubPath)
+			}
+			if !dashConfigMount.ReadOnly {
+				t.Errorf("dashboard config mount must be readOnly")
+			}
 		}
 		if dashboardC.SecurityContext == nil || dashboardC.SecurityContext.AllowPrivilegeEscalation == nil || *dashboardC.SecurityContext.AllowPrivilegeEscalation {
 			t.Errorf("expected SecurityContext.AllowPrivilegeEscalation false on dashboard container")
@@ -357,12 +379,26 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
 			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
 		}
-		if len(dashboardC.Env) != 3 {
-			t.Errorf("expected 3 env vars on dashboard container, got %d", len(dashboardC.Env))
-		} else {
+		if len(dashboardC.Env) != 7 {
+			t.Errorf("expected 7 env vars on dashboard container (3 base + 4 OTEL), got %d", len(dashboardC.Env))
+		}
+		{
 			dashboardEnvMap := make(map[string]corev1.EnvVar)
 			for _, env := range dashboardC.Env {
 				dashboardEnvMap[env.Name] = env
+			}
+			// P8-T4: the dashboard emits its own traces. Without these four it was the one
+			// container in the pod invisible to the collector — so a dashboard-side failure left
+			// no span at all and looked like the agent had simply not been asked anything.
+			for _, name := range []string{
+				"OTEL_SERVICE_NAME",
+				"OTEL_EXPORTER_OTLP_ENDPOINT",
+				"OTEL_EXPORTER_OTLP_PROTOCOL",
+				"OTEL_RESOURCE_ATTRIBUTES",
+			} {
+				if dashboardEnvMap[name].Value == "" {
+					t.Errorf("dashboard container is missing telemetry env %s", name)
+				}
 			}
 			if dashboardEnvMap["PLATFORM_AGENT_HOME"].Value != "/var/agent" {
 				t.Errorf("expected PLATFORM_AGENT_HOME /var/agent, got %s", dashboardEnvMap["PLATFORM_AGENT_HOME"].Value)

@@ -37,12 +37,22 @@ spec:
           args:
             - --health-probe-bind-address=:8081
           env:
-            # REPLACE both values for the target environment. The router publishes into KAGE_PROJECT_ID
-            # and pulls inbound chat events from KAGE_INBOUND_SUBSCRIPTION; it fails fast if either is unset.
+            # Deliberately EMPTY, not a REPLACE_WITH_* placeholder (V-CMP-003). Both are set by
+            # provision_03 step 5 (`kubectl set env`), which either wires them to the real project +
+            # subscription or parks this Deployment at 0 replicas when no chat platform is configured.
+            #
+            # Empty is not laziness, it is the better failure. The router treats unset and empty
+            # identically and exits with "missing required --project-id / KAGE_PROJECT_ID"
+            # (cmd/router/main.go:71) — an error that names the variable to set. A placeholder value
+            # is syntactically valid, so it flows all the way into the Pub/Sub client and surfaces
+            # instead as `credentials: could not find default credentials`, which sends the reader
+            # to look for a missing service-account key that was never the problem. That is not
+            # hypothetical: it is what the local dev cluster's router had been reporting across 414
+            # CrashLoopBackOff restarts when P8-T4 found it.
             - name: KAGE_PROJECT_ID
-              value: "REPLACE_WITH_PROJECT_ID"
+              value: ""
             - name: KAGE_INBOUND_SUBSCRIPTION
-              value: "REPLACE_WITH_INBOUND_SUBSCRIPTION"
+              value: ""
           ports:
             - containerPort: 8081
               name: health

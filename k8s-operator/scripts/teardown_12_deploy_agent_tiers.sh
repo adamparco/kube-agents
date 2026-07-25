@@ -38,6 +38,14 @@ if [ -n "${DEVELOPER_TEAM_NAMESPACE}" ]; then
   kubectl delete role "${DEVELOPER_TEAM_KSA_NAME}-explorer" -n "${DEVELOPER_TEAM_NAMESPACE}" --ignore-not-found=true || true
   kubectl delete serviceaccount "${DEVELOPER_TEAM_KSA_NAME}" -n "${DEVELOPER_TEAM_NAMESPACE}" --ignore-not-found=true || true
   kubectl delete secret "${DEVELOPER_TEAM_KSA_NAME}-secrets" -n "${DEVELOPER_TEAM_NAMESPACE}" --ignore-not-found=true || true
+  # The ExternalName aliases provision_12 applied. Deleted only if they are still ExternalName:
+  # if someone has since replaced one with a real Service, that Service is theirs, and teardown of
+  # this platform is not a licence to delete it. The same asymmetry as the namespace below.
+  for _alias in litellm github-token-minter; do
+    if [ "$(kubectl get service "${_alias}" -n "${DEVELOPER_TEAM_NAMESPACE}" -o jsonpath='{.spec.type}' 2>/dev/null || echo "")" = "ExternalName" ]; then
+      kubectl delete service "${_alias}" -n "${DEVELOPER_TEAM_NAMESPACE}" --ignore-not-found=true || true
+    fi
+  done
   # The tenant namespace is intentionally left in place: it may hold workloads this platform
   # does not own. Delete it explicitly if you want it gone.
   echo -e "  ${C_GREEN}✓ developer-team tier removed (namespace ${DEVELOPER_TEAM_NAMESPACE} kept).${C_RESET}"

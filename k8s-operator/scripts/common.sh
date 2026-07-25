@@ -669,6 +669,25 @@ render_tenant_default_deny() { # render_tenant_default_deny <namespace>
   printf '%s\n' "${rendered}"
 }
 
+render_tenant_service_aliases() { # render_tenant_service_aliases <namespace>
+  local namespace="$1"
+  local template="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/tenant-service-aliases.yaml.template"
+
+  if [ ! -f "${template}" ]; then
+    print_error "Tenant service-alias template not found: ${template}"
+    exit 1
+  fi
+
+  local rendered
+  rendered="$(
+    TENANT_NAMESPACE="${namespace}" \
+      CONTROL_NAMESPACE="${CONTROL_NAMESPACE:-kubeagents-system}" \
+      envsubst '${TENANT_NAMESPACE} ${CONTROL_NAMESPACE}' \
+      <"${template}"
+  )"
+  printf '%s\n' "${rendered}"
+}
+
 # Applies the quota to a tenant namespace. Called from provision_12 BEFORE the agent pod is created,
 # so a pod that does not fit is rejected on the step that creates it rather than on a later rollout —
 # see the template header for why that ordering is the whole point.
@@ -691,6 +710,61 @@ apply_tenant_quota() { # apply_tenant_quota <namespace>
 
   printf '%s\n' "${rendered}" | kubectl apply -f - || return 1
   print_success "ResourceQuota applied in ${namespace} — every pod here must now declare requests+limits."
+}
+
+# Applies the ExternalName aliases to a tenant namespace. Called from provision_12 BEFORE the Agent
+# CR, so the pod's first inference call resolves — see the template header.
+#
+# Two refusals, both about not destroying something that already works:
+#
+#   1. NEVER in the control namespace. The aliases CNAME `litellm` to
+#      `litellm.${CONTROL_NAMESPACE}.svc.cluster.local`. Applied *in* the control namespace that is
+#      a CNAME to itself, and `kubectl apply` would convert the REAL Service into it — taking
+#      inference down for every tier at once. The tenant tier is never placed there (the A1
+#      placement clause forbids it), so reaching this arm means the caller is misconfigured.
+#
+#   2. Never convert a Service this platform did not create. A tenant namespace may already hold a
+#      `litellm` of its own; silently retyping someone else's Service to ExternalName would break
+#      their workload to fix ours.
+apply_tenant_service_aliases() { # apply_tenant_service_aliases <namespace>
+  local namespace="$1" rendered svc existing
+  local control="${CONTROL_NAMESPACE:-kubeagents-system}"
+
+  if [ "${TENANT_SERVICE_ALIASES_ENABLED:-true}" != "true" ]; then
+    print_warning "TENANT_SERVICE_ALIASES_ENABLED=${TENANT_SERVICE_ALIASES_ENABLED} — skipping. The agent's"
+    print_warning "rendered config points at litellm.${namespace}.svc, which will not resolve."
+    return 0
+  fi
+
+  if [ "${namespace}" = "${control}" ]; then
+    print_error "Refusing to apply service aliases in the control namespace '${control}':"
+    print_error "the aliases would CNAME the real litellm/github-token-minter Services to themselves."
+    return 1
+  fi
+
+  if [ "${DRY_RUN:-0}" -ne 1 ]; then
+    for svc in litellm github-token-minter; do
+      existing="$(kubectl get service "${svc}" -n "${namespace}" -o jsonpath='{.spec.type}' 2>/dev/null || echo "")"
+      if [ -n "${existing}" ] && [ "${existing}" != "ExternalName" ]; then
+        print_error "Service '${svc}' already exists in '${namespace}' as type ${existing}."
+        print_error "Refusing to retype a Service this install did not create. Remove it or set"
+        print_error "TENANT_SERVICE_ALIASES_ENABLED=false and provide the alias yourself."
+        return 1
+      fi
+    done
+  fi
+
+  rendered="$(render_tenant_service_aliases "${namespace}")" || return 1
+
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    print_info "[dry-run] would apply ExternalName aliases in ${namespace}"
+    printf '%s\n' "${rendered}" | kubectl apply --dry-run=server -f - >/dev/null || return 1
+    print_success "Service aliases validate against the API server"
+    return 0
+  fi
+
+  printf '%s\n' "${rendered}" | kubectl apply -f - || return 1
+  print_success "Service aliases applied in ${namespace} — litellm/github-token-minter now resolve to ${control}."
 }
 
 confirm_action() {

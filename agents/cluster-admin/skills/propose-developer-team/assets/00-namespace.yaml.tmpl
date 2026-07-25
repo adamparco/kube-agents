@@ -1,7 +1,7 @@
 # clusters/@@CLUSTER@@/namespaces/@@NAMESPACE@@/00-namespace.yaml
 #
 # The tenant namespace for @@NAMESPACE@@ — the home + isolation boundary of ONE Developer Team Agent
-# (03 §3, §10; Phase 3). The @@CLUSTER@@dmin tier owns tenancy: it proposes this Namespace (and the
+# (03 §3, §10; Phase 3). The cluster-admin tier owns tenancy: it proposes this Namespace (and the
 # quota + default-deny NetworkPolicy alongside it) via the F4 cascade (propose-developer-team,
 # submit-suggestion PR); a human reviews + merges; the customer's CI/CD applies it in the
 # `namespaces/` wave — BEFORE `agents/` and, within this directory, before the namespaced identity

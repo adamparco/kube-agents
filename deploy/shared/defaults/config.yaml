@@ -11,11 +11,18 @@ mcp_servers:
     command: "/opt/hermes/.venv/bin/python3"
     args:
       - "/opt/data/scripts/agent_common_server.py"
+  # Bridged with the pod's own Workload Identity token, NOT an OAuth flow. The previous
+  # `node /opt/mcp-remote/dist/proxy.js` wanted a browser and a loopback redirect, neither of
+  # which exists in a pod, so it hung on startup instead of failing (Phase 8 P8-T4). The
+  # timeouts are explicit for the same reason: an MCP server that never answers is worse than
+  # one that is absent, because it is indistinguishable from one that is still starting.
   developer_knowledge:
-    command: "node"
+    command: "/opt/hermes/.venv/bin/python3"
     args:
-      - "/opt/mcp-remote/dist/proxy.js"
+      - "/opt/data/scripts/mcp_http_bridge.py"
       - "https://developerknowledge.googleapis.com/mcp"
+    connect_timeout: 30
+    timeout: 120
   # NOTE: the cluster-mutating `gke` remote MCP proxy (container.googleapis.com) is intentionally
   # omitted so agents are read-only (03 §4, 06 §9). The operator's renderConfigYAML() is
   # runtime-authoritative and also omits it; this shared default must stay in sync. Provisioning
