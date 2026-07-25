@@ -1,0 +1,63 @@
+name: L0 Checks
+
+# Runs the L0 regression chain -- every check that needs no cluster and no network.
+#
+# This workflow did not exist until 2026-07-25, and its absence was the largest hole in the build.
+# Phases 2 through 8 built a mechanization for every lesson they closed -- install-path-wired.py,
+# closed-allowlist.py, reference-render.py, test_image_provenance.py and the rest -- and CI ran
+# NONE of them. Every one was enforced only when somebody remembered to type the command. That is
+# LSN-007 ("built, tested, and unreachable") aimed at the verification machinery itself: the checks
+# existed, passed, and could not fail a pull request.
+#
+# The command list lives in local-dev/L0-CHAIN.txt, not here. One definition site (V-MET-013), read
+# by this workflow, by the harness REGRESS step, and by invariants-gate.py -- which fails if a
+# lesson marked `closed` names an artifact that appears in no line of it.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  l0:
+    name: L0 regression chain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Nothing in the chain may reach the network or a cluster -- that is what L0 means. No
+      # dependencies are installed on purpose: a check that needs a package is not L0, and
+      # discovering that here is cheaper than discovering it in an air-gapped rerun.
+      - name: Run the L0 chain
+        run: |
+          set -uo pipefail
+          failed=0
+          while IFS= read -r cmd; do
+            case "$cmd" in ''|\#*) continue ;; esac
+            echo "::group::$cmd"
+            if eval "$cmd"; then
+              echo "PASS  $cmd"
+            else
+              status=$?
+              echo "::error::FAIL ($status) $cmd"
+              failed=$((failed + 1))
+            fi
+            echo "::endgroup::"
+          done < local-dev/L0-CHAIN.txt
+
+          echo
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::$failed L0 command(s) failed"
+            exit 1
+          fi
+          echo "L0 chain green"

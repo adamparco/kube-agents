@@ -21,6 +21,56 @@ CONTAINER_TOOL ?= docker
 SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
 
+# --- Cluster addressing (LSN-018) -------------------------------------------------------------
+# Which cluster the Deployment targets write to. Every recipe below that touches a cluster goes
+# through $(KUBECTL); none of them may name `kubectl` directly.
+#
+# The lesson: `make install KUBECTL="kubectl --context kind-kube-agents-egress"` was run, accepted,
+# and silently ignored -- the recipes piped into a bare `kubectl`, so the CRD went to whatever
+# `kubectl config current-context` happened to be. It was the right cluster by luck. A no-op
+# override is worse than no override, because it produces a false sense of having been explicit.
+#
+# `kubectl config current-context` on this host may be the live cluster `platform-agent-host`,
+# which `.claude/harness/binding.md` §Targets classifies as install-verification only. So an
+# UNSET context is only accepted when the ambient one is anchored `kind-*` / `gke-scratch-*`;
+# anything else must be named on the command line. Naming it is always allowed -- deliberately
+# deploying to the live cluster is a real operation, forgetting which cluster you are on is not.
+KUBE_CONTEXT ?=
+
+ifeq ($(origin KUBECTL), command line)
+  $(error KUBECTL= is not an override this Makefile reads. Use KUBE_CONTEXT=<context>. \
+    (LSN-018: passing KUBECTL= was accepted and ignored, and the object landed on the ambient context.))
+endif
+
+ifeq ($(strip $(KUBE_CONTEXT)),)
+  override KUBECTL := kubectl
+else
+  override KUBECTL := kubectl --context $(KUBE_CONTEXT)
+endif
+
+# Prerequisite of every cluster-addressing target. Prints the cluster it resolved to, always:
+# the failure this closes was not "the wrong flag", it was "no way to tell which cluster you just
+# wrote to".
+.PHONY: ctx-guard
+ctx-guard:
+	@ctx="$(KUBE_CONTEXT)"; explicit=yes; \
+	if [ -z "$$ctx" ]; then \
+	  explicit=no; ctx="$$(kubectl config current-context 2>/dev/null || true)"; \
+	fi; \
+	if [ -z "$$ctx" ]; then \
+	  echo "REFUSING: no KUBE_CONTEXT= given and kubectl has no current-context." >&2; exit 2; \
+	fi; \
+	if [ "$$explicit" = no ]; then \
+	  case "$$ctx" in \
+	    kind-* | gke-scratch-*) : ;; \
+	    *) echo "REFUSING: ambient context '$$ctx' is not kind-*/gke-scratch-*, and no" >&2; \
+	       echo "  KUBE_CONTEXT= was given. If you mean it, name it:" >&2; \
+	       echo "      make <target> KUBE_CONTEXT=$$ctx" >&2; \
+	       exit 2 ;; \
+	  esac; \
+	fi; \
+	echo "==> cluster: $$ctx (explicit=$$explicit)"
+
 .PHONY: all
 all: build
 
@@ -90,55 +140,55 @@ ifndef ignore-not-found
 endif
 
 .PHONY: install
-install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
+install: ctx-guard manifests kustomize ## Install CRDs into $(KUBE_CONTEXT), or the ambient context if it is kind-*/gke-scratch-*.
 	@out="$$( $(KUSTOMIZE) build config/crd 2>/dev/null || true )"; \
-	if [ -n "$$out" ]; then echo "$$out" | kubectl apply -f -; else echo "No CRDs to install; skipping."; fi
+	if [ -n "$$out" ]; then echo "$$out" | $(KUBECTL) apply -f -; else echo "No CRDs to install; skipping."; fi
 
 .PHONY: uninstall
-uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+uninstall: ctx-guard manifests kustomize ## Uninstall CRDs from $(KUBE_CONTEXT). Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	@out="$$( $(KUSTOMIZE) build config/crd 2>/dev/null || true )"; \
-	if [ -n "$$out" ]; then echo "$$out" | kubectl delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
+	if [ -n "$$out" ]; then echo "$$out" | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
 .PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+deploy: ctx-guard manifests kustomize ## Deploy controller to $(KUBE_CONTEXT), or the ambient context if it is kind-*/gke-scratch-*.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | kubectl apply -f -
+	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
-undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
+undeploy: ctx-guard kustomize ## Undeploy controller from $(KUBE_CONTEXT). Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
 .PHONY: deploy-litellm
-deploy-litellm: kustomize ## Deploy LiteLLM integration.
+deploy-litellm: ctx-guard kustomize ## Deploy LiteLLM integration.
 	@if [ "$$MODEL_PROVIDER" = "chatgpt" ]; then \
-		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | $(KUBECTL) apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
-		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
+		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | $(KUBECTL) apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi
 
 .PHONY: undeploy-litellm
-undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
+undeploy-litellm: ctx-guard kustomize ## Undeploy LiteLLM integration.
 	@if [ "$$MODEL_PROVIDER" = "chatgpt" ]; then \
-		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
-		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
+		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi
 
 .PHONY: deploy-inference-replay
-deploy-inference-replay: kustomize ## Deploy Inference Replay proxy integration.
-	$(KUSTOMIZE) build config/integrations/inference-replay/base | envsubst '$$NAMESPACE $$REPLAY_IMAGE' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
+deploy-inference-replay: ctx-guard kustomize ## Deploy Inference Replay proxy integration.
+	$(KUSTOMIZE) build config/integrations/inference-replay/base | envsubst '$$NAMESPACE $$REPLAY_IMAGE' | $(KUBECTL) apply -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: undeploy-inference-replay
-undeploy-inference-replay: kustomize ## Undeploy Inference Replay proxy integration.
-	$(KUSTOMIZE) build config/integrations/inference-replay/base | envsubst '$$NAMESPACE $$REPLAY_IMAGE' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
+undeploy-inference-replay: ctx-guard kustomize ## Undeploy Inference Replay proxy integration.
+	$(KUSTOMIZE) build config/integrations/inference-replay/base | envsubst '$$NAMESPACE $$REPLAY_IMAGE' | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: deploy-github
-deploy-github: kustomize ## Deploy GitHub integration.
-	$(KUSTOMIZE) build config/integrations/github | envsubst '$$NAMESPACE $$PROJECT_ID $$REGION $$CLUSTER_NAME $$KMS_KEYRING $$KMS_KEY $$KMS_KEY_VERSION $$GITHUB_ORG $$GITHUB_REPO $$GITHUB_MINTER_KSA_NAME $$GITHUB_MINTER_GSA_NAME $$PLATFORM_AGENT_GSA_NAME' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
+deploy-github: ctx-guard kustomize ## Deploy GitHub integration.
+	$(KUSTOMIZE) build config/integrations/github | envsubst '$$NAMESPACE $$PROJECT_ID $$REGION $$CLUSTER_NAME $$KMS_KEYRING $$KMS_KEY $$KMS_KEY_VERSION $$GITHUB_ORG $$GITHUB_REPO $$GITHUB_MINTER_KSA_NAME $$GITHUB_MINTER_GSA_NAME $$PLATFORM_AGENT_GSA_NAME' | $(KUBECTL) apply -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: undeploy-github
-undeploy-github: kustomize ## Undeploy GitHub integration.
-	$(KUSTOMIZE) build config/integrations/github | envsubst '$$NAMESPACE $$PROJECT_ID $$REGION $$CLUSTER_NAME $$KMS_KEYRING $$KMS_KEY $$KMS_KEY_VERSION $$GITHUB_ORG $$GITHUB_REPO $$GITHUB_MINTER_KSA_NAME $$GITHUB_MINTER_GSA_NAME $$PLATFORM_AGENT_GSA_NAME' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
+undeploy-github: ctx-guard kustomize ## Undeploy GitHub integration.
+	$(KUSTOMIZE) build config/integrations/github | envsubst '$$NAMESPACE $$PROJECT_ID $$REGION $$CLUSTER_NAME $$KMS_KEYRING $$KMS_KEY $$KMS_KEY_VERSION $$GITHUB_ORG $$GITHUB_REPO $$GITHUB_MINTER_KSA_NAME $$GITHUB_MINTER_GSA_NAME $$PLATFORM_AGENT_GSA_NAME' | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
 
 
 

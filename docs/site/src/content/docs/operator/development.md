@@ -37,11 +37,14 @@ The envtest binaries are downloaded to `bin/` on first run (`make setup-envtest`
 ## Run locally (against a real cluster)
 
 ```bash
-make install       # install CRDs into the cluster in ~/.kube/config
+export KUBE_CONTEXT=kind-kube-agents-dev   # which cluster; see below
+make install       # install CRDs into $KUBE_CONTEXT
 make run           # run the manager binary out-of-cluster, against the target cluster
 ```
 
 Kill the process with Ctrl-C. `make uninstall` removes the CRDs.
+
+Every target under `##@ Deployment` passes `--context` explicitly, taken from `KUBE_CONTEXT`. Leave it unset and the target reads your ambient context but **refuses** anything that is not `kind-*` or `gke-scratch-*`, printing the command that would name it deliberately. Deploying to a real cluster is fine — you just have to say which one. `KUBECTL="kubectl --context …"` is rejected: it looked like it worked for a long time and was silently discarded.
 
 ## Deploy the manager into a cluster
 
