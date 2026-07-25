@@ -44,8 +44,8 @@ if [ -n "${AGENT_IMAGE:-}" ]; then
   _reg="$(_registry_of "${AGENT_IMAGE}")"
   export CLUSTER_ADMIN_IMAGE="${CLUSTER_ADMIN_IMAGE:-${_reg}/cluster-admin-agent}"
   export DEVELOPER_TEAM_IMAGE="${DEVELOPER_TEAM_IMAGE:-${_reg}/developer-team-agent}"
-  export CLUSTER_ADMIN_TAG="${CLUSTER_ADMIN_TAG:-${AGENT_TAG:-latest}}"
-  export DEVELOPER_TEAM_TAG="${DEVELOPER_TEAM_TAG:-${AGENT_TAG:-latest}}"
+  export CLUSTER_ADMIN_TAG="${CLUSTER_ADMIN_TAG:-${AGENT_TAG:-v0.1.0}}"
+  export DEVELOPER_TEAM_TAG="${DEVELOPER_TEAM_TAG:-${AGENT_TAG:-v0.1.0}}"
 else
   export CLUSTER_ADMIN_IMAGE="${CLUSTER_ADMIN_IMAGE:-ghcr.io/gke-labs/kube-agents/cluster-admin-agent}"
   export DEVELOPER_TEAM_IMAGE="${DEVELOPER_TEAM_IMAGE:-ghcr.io/gke-labs/kube-agents/developer-team-agent}"

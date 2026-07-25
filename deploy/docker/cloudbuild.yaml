@@ -1,34 +1,52 @@
+# Cloud Build config for every first-party image in this repo.
+#
+# It covers three shapes, because they differ only in three substitutions:
+#   agent tiers / credential-proxy : _CONTEXT=.            _DOCKERFILE=deploy/docker/Dockerfile  _TARGET=<stage>
+#   controller                     : _CONTEXT=k8s-operator _DOCKERFILE=k8s-operator/Dockerfile
+#   kage-router                    : _CONTEXT=k8s-operator _DOCKERFILE=k8s-operator/Dockerfile.router
+# _TARGET is optional -- the operator and router Dockerfiles are single-purpose and have no stage to
+# select -- so the argument list is assembled in bash rather than declared statically.
+#
+# On _CACHE_URI. It is a BuildKit inline-cache tag (":buildcache"): pulled for --cache-from, pushed
+# so the next build can pull it. It is the one deliberately mutable tag this repo publishes, and it
+# is named so it cannot be mistaken for a release -- V-CMP-002 asserts no manifest references it.
+# It replaces the previous ":latest" cache tag, which was mutable AND looked deployable AND was
+# listed in `images:`, so anything pinning :latest silently got whatever the last build left behind.
 steps:
   - name: "gcr.io/cloud-builders/docker"
     entrypoint: "bash"
     args:
       - "-c"
-      - "docker pull $_IMAGE_URI_LATEST || true"
+      - "docker pull $_CACHE_URI || true"
   - name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
     env:
       - "DOCKER_BUILDKIT=1"
     args:
-      - "build"
-      - "-t"
-      - "$_IMAGE_URI"
-      - "-t"
-      - "$_IMAGE_URI_LATEST"
-      - "--cache-from"
-      - "$_IMAGE_URI_LATEST"
-      - "-f"
-      - "deploy/docker/Dockerfile"
-      - "--target"
-      - "$_TARGET"
-      - "--build-arg"
-      - "BUILDKIT_INLINE_CACHE=1"
-      - "--build-arg"
-      - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
-      - "."
+      - "-c"
+      - |
+        set -eu
+        # $_FOO is a Cloud Build substitution, expanded before bash ever runs. $$foo is escaped
+        # through to bash as $foo -- Cloud Build rejects a bare ${...} it does not recognise, so a
+        # shell variable has to be written $$foo or the build fails to even start.
+        target_arg=""
+        if [ -n "$_TARGET" ]; then target_arg="--target $_TARGET"; fi
+        hermes_arg=""
+        if [ -n "$_HERMES_AGENT_TAG" ]; then hermes_arg="--build-arg HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"; fi
+        # Unquoted on purpose: these are either empty (contributing no argument) or two words.
+        docker build \
+          -t "$_IMAGE_URI" -t "$_CACHE_URI" \
+          --cache-from "$_CACHE_URI" \
+          -f "$_DOCKERFILE" \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          $$target_arg $$hermes_arg "$_CONTEXT"
 images:
   - "$_IMAGE_URI"
-  - "$_IMAGE_URI_LATEST"
+  - "$_CACHE_URI"
 substitutions:
   _IMAGE_URI: ""
-  _IMAGE_URI_LATEST: ""
+  _CACHE_URI: ""
   _TARGET: ""
+  _CONTEXT: "."
+  _DOCKERFILE: "deploy/docker/Dockerfile"
   _HERMES_AGENT_TAG: ""
