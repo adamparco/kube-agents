@@ -49,25 +49,25 @@ they act on**, never in **whether they may act**.
 All three personas are the same _kind_ of thing — a scoped, persona-driven agent that acts —
 assembled from the same parts. This uniformity is what makes the roster extensible.
 
-| Part                     | What it is                                                                                                                        | Current reference                                        |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| **Identity (`SOUL.md`)** | The persona's core instructions, truths, and operating character (§2.5)                                                           | `agents/platform/SOUL.md`                                |
-| **Config**               | MCP servers, toolsets, memory, plugins available to the agent                                                                     | `agents/platform/config.yaml`                            |
-| **Skills**               | Scoped, loadable capabilities that **act** (each a `SKILL.md` + assets/scripts)                                                   | `agents/platform/skills/`                                |
-| **Governance SOPs**      | Standard operating procedures the agent follows for recurring duties                                                              | `agents/platform/governance/`                            |
-| **Memory**               | Durable, multi-user memory (pluggable provider)                                                                                   | `plugins/memory/multiuser_memory/`                       |
-| **Work queue**           | The agent's own backlog of in-scope improvements, worked when idle (§2.5.2)                                                       | new — [04](04-workflow-model.md) §4                      |
-| **Triggers + heartbeat** | Event triggers (watches, alert & webhooks) plus a scheduled tick as backstop — driving proactive audits and drift **remediation** | `INSTALL.md` §3, `cron/jobs.json` (+ Hermes event hooks) |
-| **Reader identity**      | A read-only, tier-scoped KSA on the agent pod. **No write verb, ever** ([03](03-security-model.md) §3.1)                          | kube-agents controller (`k8s-operator/`, extended)       |
-| **Action Broker**        | A companion Deployment holding the **actor** identity — the only thing in the scope that writes ([03](03-security-model.md) §4)   | new — [05](05-system-architecture.md) C-AB               |
-| **Mesh endpoint**        | An authenticated peer endpoint for delegation from its parent and escalation from its children (§2.3)                             | new — [06](06-api-and-data-contracts.md) §7              |
-| **Integrations**         | Chat entrypoint (Google Chat/Slack); optional write-behind IaC mirror ([04](04-workflow-model.md) §6)                             | `PlatformAgentIntegrationSpec`                           |
+| Part                     | What it is                                                                                                                                                                                                                                                  | Current reference                                                           |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| **Identity (`SOUL.md`)** | The persona's core instructions, truths, and operating character (§2.5)                                                                                                                                                                                     | `agents/platform/SOUL.md`                                                   |
+| **Config**               | MCP servers, toolsets, memory, plugins available to the agent                                                                                                                                                                                               | `agents/platform/config.yaml`                                               |
+| **Skills**               | Scoped, loadable capabilities that **act** (each a `SKILL.md` + assets/scripts)                                                                                                                                                                             | `agents/platform/skills/`                                                   |
+| **Governance SOPs**      | Standard operating procedures the agent follows for recurring duties                                                                                                                                                                                        | `agents/platform/governance/`                                               |
+| **Memory**               | Durable, multi-user memory (pluggable provider)                                                                                                                                                                                                             | `plugins/memory/multiuser_memory/`                                          |
+| **Work queue**           | The agent's own backlog of in-scope improvements, worked when idle (§2.5.2)                                                                                                                                                                                 | new — [04](04-workflow-model.md) §4                                         |
+| **Triggers + heartbeat** | Event triggers (watches, alert & webhooks) plus a scheduled tick as backstop — driving proactive audits and drift **remediation**                                                                                                                           | `INSTALL.md` §3, `cron/jobs.json` (+ Hermes event hooks)                    |
+| **Reader identity**      | A read-only, tier-scoped KSA on the agent pod. **No write verb, ever** ([03](03-security-model.md) §3.1)                                                                                                                                                    | kube-agents controller (`k8s-operator/`, extended)                          |
+| **Action Broker**        | A companion Deployment holding the **actor** identity — the only thing in the scope that writes ([03](03-security-model.md) §4)                                                                                                                             | new — [05](05-system-architecture.md) C-AB                                  |
+| **Mesh endpoint**        | An authenticated peer endpoint for delegation from its parent and escalation from its children (§2.3)                                                                                                                                                       | new — [06](06-api-and-data-contracts.md) §7                                 |
+| **Integrations**         | A **Slack channel bound to this agent** as its human entrypoint (Google Chat supported, opt-in), reached through the fleet's ChatOps router — the pod holds **no chat credential** (§2.4); optional write-behind IaC mirror ([04](04-workflow-model.md) §6) | chat: [05](05-system-architecture.md) C15 · mirror: `AgentSpec.integration` |
 
 **Design principle:** a new persona is defined by _changing the fills, not the frame_ — a different
 `SOUL.md`, a scoped skill set, and a scope-appropriate identity **pair**, deployed as an **`Agent`
 CR** (Hermes harness) with a different `tier`/`scope` (§8). Every persona also exposes its **own
-human chat entrypoint**, one per audience (§2.4): each is a genuine front door for its layer, not a
-silent internal tier.
+human chat entrypoint**, one per audience — on Slack, a channel bound to that agent (§2.4): each is a
+genuine front door for its layer, not a silent internal tier.
 
 ### 2.1 Skill allocation
 
@@ -211,40 +211,85 @@ provider, isolated per `user_id`) and belongs in neither OKF nor the mesh.
 
 ### 2.4 How humans address agents (the ChatOps gateway)
 
-Humans reach agents through chat (Google Chat / Slack). Because the roster spans three tiers across
-many scopes, a human needs an unambiguous way to say _which_ agent they mean. kube-agents provides a
-single chat **gateway** — the **`@kage`** bot — and **three ways to address an agent**, in strict
-precedence (deterministic first, inference last):
+**Slack is the reference chat platform.** Every example below is Slack, every default is Slack, and
+the provisioning path wires Slack first. **Google Chat is fully supported** — it is opt-in rather
+than default, and it behaves identically from this section's point of view, because the gateway
+normalizes both platforms into the same internal message before it resolves anything
+([05](05-system-architecture.md) §1.8, F5).
 
-| #   | Mode                            | Example                                                          | How the target is resolved                                           | Inference? |
-| --- | ------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------- | ---------- |
-| 1   | **Deterministic slash command** | `@kage /devteam-charlie why is checkout erroring?`               | Slash command → the handle it names; constant-time dispatch          | No         |
-| 2   | **Direct mention (handle)**     | `@cluster-bravo drain node-7`                                    | The `@<tier>-<scope>` handle → its `(tier, scope)` — an alias lookup | No         |
-| 3   | **Natural-language routing**    | `@kage why is my app crashing on the bravo cluster, charlie ns?` | The gateway's NL router infers tier + scope from the text and routes | Yes        |
+Because the roster spans three tiers across many scopes, a human needs an unambiguous way to say
+_which_ agent they mean. kube-agents provides **one gateway for the whole fleet** — the **`@kage`**
+Slack app, held by the ChatOps router ([05](05-system-architecture.md) C15), **not** by the agent
+pods — and **five ways to address an agent**, in strict precedence, deterministic first and
+inference last:
 
-**Handles are derived, not a registry.** An agent's handle is its `<tier>-<scope>` name (§6.1) —
-`@platform-<project>`, `@cluster-admin-<cluster>` (alias `@cluster-<cluster>`), and
-`@developer-team-<namespace>` (alias `@devteam-<namespace>`) — mapping deterministically to the
-unique `(tier, scope)` **`Agent` CR** the controller already keys cardinality on (§8), so no routing
-table can drift ([06](06-api-and-data-contracts.md) §2b). The **same** name keys the mesh endpoint
-(§2.3), so humans and agents address an agent identically.
+| #   | Mode                    | Example (Slack)                                                  | How the target is resolved                                                          | Inference? |
+| --- | ----------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------- | ---------- |
+| 1   | **Slash command**       | `/kage ask devteam-charlie why is checkout erroring?`            | The **one** `/kage` command's verb/target grammar → the handle it names             | No         |
+| 2   | **Mention with handle** | `@kage cluster-bravo drain node-7`                               | The `<tier>-<scope-leaf>` handle → its `(tier, scope)` — a derived lookup           | No         |
+| 3   | **Thread affinity**     | a bare reply in an existing `@kage` thread                       | The thread's `threadKey` (Slack `thread_ts`, normalized) → the agent it is bound to | No         |
+| 4   | **Channel binding**     | a bare message in `#kage-charlie`, bound to `devteam-charlie`    | The channel → the single agent bound to it. **No handle, no ambiguity**             | No         |
+| 5   | **Natural language**    | `@kage why is my app crashing on the bravo cluster, charlie ns?` | The router infers tier + scope from the text                                        | Yes        |
 
-**Precedence: deterministic over inference.** Modes 1 and 2 always win and spend **no** inference;
-mode 3 is the convenience fallback and, on low confidence, **asks rather than guesses**. Once a
-thread is routed, follow-ups stick to the same agent (thread affinity via the session store,
-[06](06-api-and-data-contracts.md) §6) unless re-addressed. Mode 2 _is_ the per-audience entrypoint:
-cluster admins reach `@cluster-<cluster>`, dev teams reach `@devteam-<namespace>`. The gateway is a
-**routing front door over separate per-tier pods** — not a "one pod hosts many agents" multiplexer
-(deferred, [08](08-agent-runtime-and-identity.md) §3), and not the agent mesh. It carries a
-_human's_ message; agent-to-agent traffic goes over the mesh (§2.3), never through the gateway.
+**One slash command, not one per agent — and this is forced, not stylistic.** Slack registers slash
+commands **statically, per app**. A per-agent command (`/devteam-charlie`) would mean editing the app
+manifest every time a team gets a namespace, which does not work for a fleet that grows one
+namespace at a time. So there is exactly one command, `/kage <verb> <target> …`, and the fleet's
+growth lives in its _arguments_ rather than in Slack's registry.
+[06](06-api-and-data-contracts.md) §2b owns the exact verb list and wire grammar; do not restate it.
+
+**Handles are derived, not a registry.** An agent's handle is its `<tier>-<scope-leaf>` name (§6.1) —
+`platform-<project>`, `cluster-admin-<cluster>` (alias `cluster-<cluster>`), and
+`developer-team-<namespace>` (alias `devteam-<namespace>`) — mapping deterministically to the unique
+`(tier, scope)` **`Agent` CR** the controller already keys cardinality on (§8), so no routing table
+can drift ([06](06-api-and-data-contracts.md) §2b). The grammar is **platform-neutral**: the same
+handle works on Slack and on Chat, and the **same** name keys the mesh endpoint (§2.3), so humans and
+agents address an agent identically.
+
+**Channel binding is the per-audience entrypoint, made Slack-idiomatic.** §2 says every persona
+exposes its own human entrypoint, one per audience. On Slack that entrypoint is a **channel bound to
+exactly one agent**: `#kage-platform` for the platform team, `#kage-cluster-bravo` for that cluster's
+admins, `#kage-charlie` for the `charlie` namespace's developers. Inside a bound channel a bare
+message routes **deterministically, with no handle and no inference** — which is a strengthening of
+the per-audience idea rather than a replacement for it, because the audience boundary is now a
+channel humans already understand, with its own membership, history, and notification settings.
+Handles keep working everywhere, including in unbound channels and DMs; binding just removes the
+ceremony where the audience is already established.
+
+**Precedence: deterministic over inference.** Modes 1–4 always win and spend **no** inference; mode 5
+is the convenience fallback and, on low confidence, **asks rather than guesses**. Threads bind on the
+first routed turn (affinity via the session store, [06](06-api-and-data-contracts.md) §6) and
+follow-ups stick to that agent unless re-addressed — so a debugging conversation costs one routing
+decision, not one per message. The gateway is a **routing front door over separate per-tier pods** —
+not a "one pod hosts many agents" multiplexer (deferred,
+[08](08-agent-runtime-and-identity.md) §3), and not the agent mesh. It carries a _human's_ message;
+agent-to-agent traffic goes over the mesh (§2.3), never through the gateway.
+
+**Identity is the platform's, qualified and immutable.** A requester is `slack:U0123ABCD` or
+`googlechat:users/123` — never a display name and never an email, both of which a user can change and
+an attacker can imitate. `allowedUsers` and the approval roster are written in that form
+([03](03-security-model.md) §4a, [06](06-api-and-data-contracts.md) §2b).
 
 **Routing is not an authorization signal, and it matters more now that agents write.** The gateway
 enforces the target agent's `allowedUsers` **before** dispatch ([03](03-security-model.md) §4a), and
-the NL router's output — like all model output — is never an authz signal. A mis-route can only land
-on an agent the human is _already_ allowed to reach, still bounded by that agent's scope ceiling,
-the forbidden set, and the gated class; see the accepted confused-deputy trade in
+the NL router's output — like all model output — is never an authz signal. **Being in a bound channel
+is not an authz signal either**: binding decides _which_ agent, never _whether_ this human may use
+it, so the allowlist check on the resolved agent is identical in all five modes. A mis-route can only
+land on an agent the human is _already_ allowed to reach, still bounded by that agent's scope
+ceiling, the forbidden set, and the gated class; see the accepted confused-deputy trade in
 [03](03-security-model.md) §4a. Every turn is audited with the requester, the resolved agent, and
 the routing mode ([06](06-api-and-data-contracts.md) §2b, §8).
+
+**Approvals are buttons, but the button is not the authority.** A gated action's prompt arrives in
+the thread as Block Kit buttons, with a typed `/kage approve <action-id>` always available as the
+fallback. The click is a convenience: the **broker** re-verifies the clicking principal against the
+approval roster before releasing anything ([05](05-system-architecture.md) §1.8,
+[04](04-workflow-model.md) §3).
+
+**The brake does not depend on chat.** `pause`, `freeze`, and `undo` are Kubernetes objects reachable
+by `kubectl` and by the API; the `/kage` forms are conveniences over them and must keep working when
+Slack is unreachable ([03](03-security-model.md) §6, [05](05-system-architecture.md) §1.5). A human
+entrypoint that is down is an inconvenience; a brake that is down would be a defect.
 
 ### 2.5 Operating character
 
@@ -303,12 +348,12 @@ should read like an excellent engineer who just fixed your problem and is briefl
 Past tense for what was done, present tense for what is being watched, no hedging about completed
 work.
 
-| Passive (previous generation)                                                                                                                                                             | Imperative (required)                                                                                                                                                                                                                                       |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| "The `checkout` deployment is in CrashLoopBackOff. The container is OOMKilled (exit 137) against a 256Mi limit. I recommend raising it to 512Mi. PR #142 is open for your review."        | "`checkout` was OOMKilling every ~40s against a 256Mi limit. I raised it to 512Mi. All three pods have been Ready for 6 minutes with a flat restart count. Undo: `kage undo act-7f3c21`."                                                                   |
-| "Fleet audit found 3 namespaces without NetworkPolicies (`tenant-a`, `tenant-b`, `tenant-c`), violating the isolation baseline. Suggested remediation attached; please review and merge." | "Three tenant namespaces were running with no NetworkPolicy. I applied the baseline default-deny plus the standard egress allowlist to `tenant-a`, `tenant-b`, and `tenant-c`. No connection errors in the 10 minutes since. Undo: `kage undo act-91ab04`." |
-| "The `payments-db-old` PVC appears orphaned. You may want to delete it."                                                                                                                  | "`payments-db-old` has had no consumer for 31 days, at roughly \$180/month. PVC deletion is gated, so I snapshotted it first and queued the delete for `@sre-oncall`. Approve with `kage approve act-3d10f8`."                                              |
-| "Pods are Pending. `default-pool` has no allocatable memory. This is cluster scope, outside my authority — I've filed an escalation entry for the Cluster Admin Agent."                   | "Your pods are Pending because `default-pool` is out of allocatable memory — cluster scope, not mine, so I asked `@cluster-bravo` to add capacity. It accepted and is scaling now. I'll place the pending workloads as soon as nodes are Ready."            |
+| Passive (previous generation)                                                                                                                                                             | Imperative (required)                                                                                                                                                                                                                                        |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| "The `checkout` deployment is in CrashLoopBackOff. The container is OOMKilled (exit 137) against a 256Mi limit. I recommend raising it to 512Mi. PR #142 is open for your review."        | "`checkout` was OOMKilling every ~40s against a 256Mi limit. I raised it to 512Mi. All three pods have been Ready for 6 minutes with a flat restart count. Undo: `/kage undo act-7f3c21`."                                                                   |
+| "Fleet audit found 3 namespaces without NetworkPolicies (`tenant-a`, `tenant-b`, `tenant-c`), violating the isolation baseline. Suggested remediation attached; please review and merge." | "Three tenant namespaces were running with no NetworkPolicy. I applied the baseline default-deny plus the standard egress allowlist to `tenant-a`, `tenant-b`, and `tenant-c`. No connection errors in the 10 minutes since. Undo: `/kage undo act-91ab04`." |
+| "The `payments-db-old` PVC appears orphaned. You may want to delete it."                                                                                                                  | "`payments-db-old` has had no consumer for 31 days, at roughly \$180/month. PVC deletion is gated, so I snapshotted it first and queued the delete for `@sre-oncall`. Approve with `/kage approve act-3d10f8`."                                              |
+| "Pods are Pending. `default-pool` has no allocatable memory. This is cluster scope, outside my authority — I've filed an escalation entry for the Cluster Admin Agent."                   | "Your pods are Pending because `default-pool` is out of allocatable memory — cluster scope, not mine, so I asked `@cluster-bravo` to add capacity. It accepted and is scaling now. I'll place the pending workloads as soon as nodes are Ready."             |
 
 #### 2.5.4 The standard report
 
@@ -319,7 +364,7 @@ step-by-step tool logs, no restatement of the request.
 What I noticed  — the symptom and the evidence that proves it (one line).
 What I did      — the change, the targets, and its risk class if it was not routine.
 How I verified  — the observation that proves it worked, with the time window.
-Undo            — kage undo <action-id>
+Undo            — /kage undo <action-id>
 ```
 
 Two variants. **Gated:** noticed → what was queued and why it is gated → who was asked → what was
@@ -362,7 +407,9 @@ measure of this section is **actions completed and verified**, not adjectives.
 ### Role
 
 The senior custodian and **operator of the fleet and of the other agents**. It is the primary human
-chat entrypoint into the harness and the acting authority at the project level.
+chat entrypoint into the harness and the acting authority at the project level. **Entrypoint:** the
+platform team's bound Slack channel — `#kage-platform` by convention — or the handle
+`platform-<project>` from anywhere (§2.4).
 
 ### Responsibilities
 
@@ -404,7 +451,8 @@ chat entrypoint into the harness and the acting authority at the project level.
 ### Role
 
 The operator of a **single cluster**. It runs everything cluster-scoped, within the policy the
-Platform Agent sets at the project level.
+Platform Agent sets at the project level. **Entrypoint:** that cluster's admins' bound Slack channel
+— `#kage-cluster-<cluster>` by convention — or the handle `cluster-<cluster>` from anywhere (§2.4).
 
 ### Responsibilities
 
@@ -443,7 +491,10 @@ Platform Agent sets at the project level.
 
 The self-service operator for a **single developer team**, confined to **one namespace**. This is
 the agent most application developers interact with day to day, and the one that does the most
-autonomous work per hour.
+autonomous work per hour. **Entrypoint:** the team's own bound Slack channel — `#kage-<namespace>` by
+convention — where a bare message reaches this agent with no handle and no inference; or the handle
+`devteam-<namespace>` from anywhere (§2.4). This tier is why channel binding matters: it is the most
+numerous tier and the one whose users are least interested in learning a routing grammar.
 
 ### Responsibilities
 
@@ -539,8 +590,9 @@ a side registry and the mesh topology (§2.3) derives from cluster state rather 
   (`agent` | `broker`) on each workload — enabling selector-based discovery and letting
   `vap-agent-scope` select agent RBAC by label ([03](03-security-model.md) §4.2).
 - **Naming convention:** agents are named for their scope — `platform-<project>`,
-  `cluster-admin-<cluster>`, `developer-team-<namespace>`. The same name is the chat handle (§2.4),
-  the mesh address (§2.3), and the field-manager suffix on every write the broker performs
+  `cluster-admin-<cluster>`, `developer-team-<namespace>`. The same name is the chat handle (§2.4) —
+  platform-neutral, identical on Slack and on Chat — the default bound-channel name, the mesh address
+  (§2.3), and the field-manager suffix on every write the broker performs
   (`kube-agents/<tier>/<scope>`), so one identifier ties a chat request, a mesh call, an
   `ActionRecord`, and an audit-log entry together.
 
@@ -622,11 +674,11 @@ legacy `spec.security.serviceAccountName` override applies to the **reader** onl
 by admission to the tier template's name pattern. Both SAs are referenced, never minted by the
 controller.
 
-| `tier`           | Scope key fields                  | Reader scope             | Actor scope (write)                 | Chat entrypoint / handle (§2.4)         |
-| ---------------- | --------------------------------- | ------------------------ | ----------------------------------- | --------------------------------------- |
-| `platform`       | project                           | project-wide, read fleet | Project: clusters, fleet policy     | Platform teams — `@platform-<project>`  |
-| `cluster-admin`  | project + cluster                 | single cluster           | One cluster, cluster-scoped objects | Cluster admins — `@cluster-<cluster>`   |
-| `developer-team` | project + cluster + **namespace** | single namespace         | One namespace                       | Developer team — `@devteam-<namespace>` |
+| `tier`           | Scope key fields                  | Reader scope             | Actor scope (write)                 | Chat entrypoint — bound Slack channel / handle (§2.4)            |
+| ---------------- | --------------------------------- | ------------------------ | ----------------------------------- | ---------------------------------------------------------------- |
+| `platform`       | project                           | project-wide, read fleet | Project: clusters, fleet policy     | Platform teams — `#kage-platform` / `platform-<project>`         |
+| `cluster-admin`  | project + cluster                 | single cluster           | One cluster, cluster-scoped objects | Cluster admins — `#kage-cluster-<cluster>` / `cluster-<cluster>` |
+| `developer-team` | project + cluster + **namespace** | single namespace         | One namespace                       | Developer team — `#kage-<namespace>` / `devteam-<namespace>`     |
 
 **Why one tier-discriminated CRD:** the personas differ only in `tier` + `scope` + `parentRef` +
 their templated identity pair — otherwise identical, so a single CRD expresses all three. The
@@ -755,9 +807,28 @@ created by the imperative model.
 **Chat entrypoints & routing (§2.4)**
 
 - **(carried) Deterministic addressing:** each persona exposes its own authenticated entrypoint (one
-  per audience); a slash command or `@<tier>-<scope>` handle resolves to the matching `(tier, scope)`
-  agent **without inference**, and that agent's `allowedUsers` is enforced **before** dispatch. NL
-  routing asks rather than guesses on low confidence.
+  per audience); `/kage <verb> <handle>` and a bare `<tier>-<scope-leaf>` handle each resolve to the
+  matching `(tier, scope)` agent **without inference**, and that agent's `allowedUsers` is enforced
+  **before** dispatch. NL routing asks rather than guesses on low confidence.
+- **(new) Channel binding routes with no handle:** a bare message in a channel bound to one agent
+  reaches that agent with **zero** inference calls, and the same message in an **unbound** channel
+  does **not** silently pick an agent — it asks. Rebinding a channel takes effect on the next turn;
+  a binding to a nonexistent or deleted agent refuses rather than falling through to inference.
+- **(new) Precedence holds under contention:** in a bound channel, an explicit handle for a
+  _different_ agent wins over the binding, and a `/kage` command wins over both; a bare reply in a
+  routed thread sticks to that thread's agent. Only the NL fallback increments the inference counter.
+- **(new) One fleet app, no per-pod relay:** no agent pod carries a Slack or Chat credential in its
+  env, volumes, or rendered config; every human turn is terminated by the ChatOps router
+  ([05](05-system-architecture.md) §1.8). A `slack.enabled` block on a child-tier `Agent` CR is a
+  conversion leftover and fails this check.
+- **(new) Principals are platform-qualified:** `allowedUsers` and roster entries are `slack:U…` /
+  `googlechat:users/…`; an entry that is a display name or an email is rejected, and a turn is
+  authorized on the platform ID rather than on anything the user can rename.
 - **(new) Routing grants nothing:** a routed message cannot cause an action outside the target
   agent's scope, in the forbidden set, or ungated when the classifier says gated — including when
-  the message asserts urgency or authority.
+  the message asserts urgency or authority, and including when it arrives in the agent's own bound
+  channel. **Channel membership is not authorization:** a human in a bound channel who is not on the
+  target agent's `allowedUsers` is refused before dispatch.
+- **(new) The brake survives chat:** with Slack unreachable, `pause`, `freeze`, and `undo` still work
+  via `kubectl` and the API, and agents keep acting — only the human entrypoint is down
+  ([05](05-system-architecture.md) §8 CH9).

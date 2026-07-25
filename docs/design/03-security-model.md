@@ -406,6 +406,15 @@ get the agent to do what the **agent itself** may do — bounded by the scope ce
 forbidden set (§3.3), and the gated class (§5), each enforced in the broker rather than by the
 agent's judgement.
 
+**Principals are platform-qualified immutable IDs — never display names.** An `allowedUsers` or
+approval-roster entry is `slack:U0123ABCD` or `googlechat:users/1234567890`
+([06](06-api-and-data-contracts.md) §2b), the platform's own immutable user identifier. Display
+names, `@handles`, and email addresses are **mutable and reassignable**: a workspace can rename a
+user, and a departed employee's handle can be taken by someone new — so an allowlist built on them
+silently transfers authority to whoever holds the name today. This is a quiet, high-consequence
+failure with no error at the moment it occurs, which is why the format is a validation rule
+([06](06-api-and-data-contracts.md) §1.2) and not a convention.
+
 **What v1 deliberately does _not_ do.** v1 does **not** verify the requester's own GCP/K8s
 permissions and does **not** union/intersect them with the agent's authority. A trusted human with
 narrow personal permissions can still direct the agent to act anywhere within the agent's tier

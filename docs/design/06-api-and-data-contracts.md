@@ -17,7 +17,10 @@ The exact interfaces a builder implements against, for a system whose agents **a
 - the **identity contract** — the **reader/actor split** ([03](03-security-model.md) §3.1): two
   ServiceAccounts per agent, with literal per-tier RBAC templates for all six identities and their
   cloud IAM mapping (§2);
-- the **ChatOps addressing & routing** contract, extended with the brake commands (§2b);
+- the **ChatOps addressing & routing** contract — **Slack-first**, one fleet-level Slack app held
+  by the router over Socket Mode, five-step deterministic resolution including **channel bindings**,
+  the single `/kage` verb/target grammar and its brake commands, with Google Chat as the supported
+  secondary platform (§2b);
 - the **journal & IaC-mirror repo layout** — the repo is a **mirror, not a control path** (§3);
 - **the action contracts** — the **Action Envelope** an agent submits (with its **anti-replay**
   freshness/nonce/key rules), the deterministic **risk classifier** and `ChangePolicy`, the
@@ -117,15 +120,34 @@ spec:
         enabled: true
         mode: both # state | log | both
         branch: main
-    googleChat:
+
+    # SLACK — the reference chat platform (§2b). Enabled by default on generated CRs.
+    # Only PER-AGENT facts live here. The Slack *app* (tokens, Socket Mode, the one registered
+    # slash command) is FLEET-LEVEL and lives on `ChatOpsConfig` — see below.
+    slack:
       enabled: true
-      projectId: my-project
+      allowedUsers: # closed allowlist — required when enabled (V-7)
+        - slack:U02ABCDEF # platform-qualified, immutable member ID (V-11).
+        - slack:U07GHIJKL # NEVER @handle, display name, or email — those are reassignable.
+      channelBindings: # OPTIONAL. A bound channel routes bare messages here (§2b, step 4).
+        - channelId: C01TEAMXOPS # Slack channel ID, never "#team-x-ops" — names are mutable.
+          channelName: team-x-ops # advisory, for humans and status; never matched on.
+          requireMention: false # true ⇒ only @kage-prefixed messages in this channel bind.
+      # Reports, gate prompts, and Block Kit approvals for this agent. Defaults to
+      # channelBindings[0].channelId, then the roster's notify.slack.channel (§4.4).
+      notifyChannel: C01TEAMXOPS
+
+    # GOOGLE CHAT — secondary, opt-in. Same routing semantics, different ingress (§2b parity).
+    googleChat:
+      enabled: false
+      projectId: my-project # project owning the Pub/Sub push subscription
       topicName: kage-chat
       subscriptionName: kage-chat-sub
-      allowedUsers: ["users/1234567890"] # closed allowlist — required when enabled (§1.2)
-    slack:
-      enabled: false
-      allowedUsers: []
+      allowedUsers: [] # e.g. ["googlechat:users/1234567890"] — required when enabled (V-7)
+      spaceBindings: # the Chat parity of channelBindings
+        - spaceId: spaces/AAAA
+          requireMention: true # Chat DMs deliver unprefixed; spaces normally require @kage
+      notifySpace: spaces/AAAA
 status:
   phase: Ready # Pending | Provisioning | Ready | Degraded | Paused | Failed
   address: developer-team-team-x.team-x.svc.cluster.local
@@ -134,6 +156,11 @@ status:
   deploymentStatus: { name: developer-team-team-x, readyReplicas: 1 }
   serviceStatus: { endpoint: https://developer-team-team-x.team-x.svc:8444 }
   storageStatus: { bound: true }
+  chatStatus: # what the router actually resolved for this agent (§2b)
+    primaryPlatform: slack # slack | googlechat | none
+    boundChannels: ["slack:C01TEAMXOPS"] # platform-qualified; conflicts are reported, not merged
+    notifyTarget: slack:C01TEAMXOPS
+    reachable: true # false ⇒ chat ingress is down; the kubectl/API brake is unaffected (§4.4)
 
   # ---- action-pipeline status (NEW) ----------------------------------------------------------
   operations:
@@ -196,6 +223,72 @@ its meaning narrows: it now selects the **mirror** artifact format (§3), not th
 **Retired.** Nothing in the CRD refers to proposals, suggestions, branches, or PRs. The
 `submit-suggestion` propose path is gone (§9).
 
+#### Chat app configuration is fleet-level — `ChatOpsConfig`
+
+**Slack app credentials and command registration are not per-agent facts, and the CRD must not
+pretend they are.** A Slack **app token permits exactly one Socket Mode connection**, and Slack
+registers **slash commands statically, per app** — so a per-agent Slack block carrying its own
+tokens is either unusable (the second agent's connection is refused) or a fleet-wide setting typed
+`n` times and free to disagree. This is the concrete reason the previous generation shipped
+`slack.enabled: false` on every child tier: the per-pod Slack relay could not serve more than one
+tier, so only one could have it. **That relay is retired.** The single connection is held by the
+**ChatOps router** ([05](05-system-architecture.md) C15), which turns a hard platform constraint
+into the reason the router exists — and, because Socket Mode is an outbound WebSocket, needs **no
+public ingress**, which is what makes it usable on a private cluster.
+
+The fleet-level configuration therefore lives in **one cluster-scoped singleton**, read **only** by
+the router's ServiceAccount, in `kubeagents-system`:
+
+```yaml
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: ChatOpsConfig
+metadata: { name: default } # singleton. A second object is rejected (V-13)
+spec:
+  defaultPlatform: slack # slack | googlechat. Governs generated CRs and `kubectl kage` output.
+  slack:
+    enabled: true
+    commandName: kage # THE one slash command: `/kage`. Registered once, in the Slack app manifest.
+    botUserId: U09KAGEBOT # the bot's own member ID — so its own messages are never re-ingested
+    teamId: T01ACME # the workspace this app is installed in; a foreign team_id is dropped
+    socketMode:
+      enabled: true # DEFAULT and reference path. Outbound WSS; no request URL, no ingress, no TLS.
+      appTokenSecretRef: # `xapp-…`, scope connections:write
+        { name: kage-slack, key: app-token }
+      maxConnections: 1 # CODE CONSTANT. Slack permits one per app token; >1 is rejected, not clamped.
+    botTokenSecretRef: { name: kage-slack, key: bot-token } # `xoxb-…` — chat.postMessage, views.*
+    signingSecretRef: { name: kage-slack, key: signing-secret } # only consulted when httpMode is on
+    httpMode:
+      enabled: false # Events API alternative. Requires public ingress; opt-in, never the default.
+      publicURL: ""
+    interactivity:
+      blockKit: true # approve/reject rendered as Block Kit buttons (§2b.1). Convenience, not authz.
+  googleChat: # secondary; unset when googleChat is disabled fleet-wide
+    enabled: false
+    appName: kage
+    projectId: my-project # Pub/Sub project for the push subscription
+    audience: "" # the Chat app's OIDC audience, verified on every inbound push
+status:
+  slack:
+    connected: true
+    connectionSince: "2026-07-24T17:12:03Z"
+    teamId: T01ACME
+    registeredCommands: ["/kage"] # reconciled against the app manifest; drift is a condition
+  googleChat: { connected: false }
+  boundChannels: 7 # total across the fleet
+  conditions: [] # SlackConnected, CommandsRegistered, ChannelBindingConflict, CredentialsValid
+```
+
+Secret refs resolve in `kubeagents-system` only — a cross-namespace `namespace:` field is
+deliberately absent, so no tenant can point the router at a Secret it controls.
+`ChatOpsConfig` **grants nothing**: it names no humans, carries no allowlist, and is absent from
+every actor template (§2.2), exactly like `FleetFreeze` and `ApprovalRoster` (§4.4). Who may talk to
+an agent stays on that agent's CR, where the scope that owns it can see it.
+
+**One connection ⇒ one active router.** The router Deployment runs a single active replica per
+Socket Mode connection; additional replicas stand by under lease-based leader election and hold no
+connection. Scaling chat ingress is therefore an availability problem, not a throughput one —
+which is acceptable because **dispatch is not chat-bound** (§2b) and the brake never is (§4.4).
+
 **Initiative budget, per class.** The budget is **not** class-agnostic. A single
 `actionsPerHour` number cannot express the agreed default — **50 `routine` + 10 `elevated` per agent
 per hour** ([05](05-system-architecture.md) §6) — because those two are different allowances that
@@ -257,10 +350,49 @@ the headroom an incident needs for its one `elevated` scale-up. The budget is th
 | **V-4**  | **Developer-team placement:** `metadata.namespace == spec.scope.namespace`                                                                                                                                                   | validating webhook                                                                        | `Invalid`                             |
 | **V-5**  | **`(tier, scope)` cardinality:** exactly one non-terminating `Agent` per identity key                                                                                                                                        | validating webhook (cluster-wide `List`)                                                  | `Duplicate`                           |
 | **V-6**  | **Cross-object ceiling — NEW, v1:** the child's scope must be a **strict subset** of `parentRef`'s scope, and the parent's tier must be the tier immediately above the child's                                               | validating webhook (reads the parent CR)                                                  | `Invalid`                             |
-| **V-7**  | **Closed allowlist:** an enabled chat integration must carry a non-empty `allowedUsers`                                                                                                                                      | CRD CEL + validating webhook                                                              | `Required`                            |
+| **V-7**  | **Closed allowlist:** an enabled chat integration (`slack` _or_ `googleChat`) must carry a non-empty `allowedUsers`, and an all-blank/whitespace list is **not** an allowlist — it is empty                                  | CRD CEL + validating webhook                                                              | `Required`                            |
 | **V-8**  | **Budget clamp, per class:** any `initiativeBudget` leaf above its code ceiling — or `flapWindow` below the 5m floor — is **rejected**, not silently clamped. Checked leaf-by-leaf against the §1.1 table                    | validating webhook                                                                        | `Invalid`                             |
 | **V-9**  | **No authority fields:** the schema is closed; an unknown field under `spec` — in particular anything named `rbac`, `rules`, `riskClass`, `allow`, `bypass`, `scopeOverride` — is pruned/refused                             | CRD structural schema (`x-kubernetes-preserve-unknown-fields` is **never** set on `spec`) | field pruned; CI test asserts absence |
 | **V-10** | **Reader-only SA override:** `spec.security.serviceAccountName` may name only the **reader** SA and must match the tier template pattern `^<tier>-agent$`. There is **no** field anywhere in the CRD that names the actor SA | validating webhook                                                                        | `Invalid`                             |
+| **V-11** | **Platform-qualified principals — NEW:** every `allowedUsers` entry matches `^(slack\|googlechat):\S+$` with a platform-native **immutable user ID**; a bare ID, `@handle`, display name, or email is refused                | CRD CEL pattern + validating webhook                                                      | `Invalid`                             |
+| **V-12** | **Channel binding is exclusive — NEW:** a `(platform, channelId)` / `(platform, spaceId)` pair may be bound by **at most one** `Agent` across the fleet; a second binding is a conflict, exactly like V-5's `(tier, scope)`  | validating webhook (cluster-wide `List` over the binding index)                           | `Duplicate`                           |
+| **V-13** | **`ChatOpsConfig` singleton — NEW:** at most one object, named `default`; `slack.socketMode.maxConnections` may only be `1`; a chat platform enabled on any `Agent` must be enabled in `ChatOpsConfig`                       | CRD CEL (`self.metadata.name == 'default'`) + validating webhook                          | `Invalid` / `Duplicate`               |
+
+**V-11 in detail — why the principal format is a hard schema rule, not a style guide.** An
+allowlist entry must be the platform's **immutable** identifier: a Slack member ID (`U…`, or `W…`
+on Enterprise Grid) or a Google Chat resource name (`users/<numeric-id>`). Display names, `@`
+handles, and email addresses are all **mutable and reassignable** — a departed employee's handle
+can be taken by a new hire, at which point an allowlist built on it silently transfers authority to
+a person nobody granted it to. Refusing the mutable forms at admission is the only place that
+failure mode is cheap to prevent.
+
+```text
+principal := <platform> ":" <id>
+  platform ∈ { slack, googlechat }
+  slack      → ^U[A-Z0-9]{6,}$ | ^W[A-Z0-9]{6,}$       e.g. slack:U02ABCDEF
+  googlechat → ^users/[0-9]{6,}$                        e.g. googlechat:users/1234567890
+
+REFUSED: "U02ABCDEF" (unqualified) · "slack:@aparco" · "slack:A. Parco"
+         "aparco@acme.com" · "" · "   " · "slack:" · "discord:1234"
+```
+
+The same canonical string is what §4.1's `requester` (`{platform, id}`) canonicalizes to, what
+§4.4's `ApprovalRoster.spec.approvers[]` entries canonicalize to (`platform` + `id` → `<platform>:<id>`),
+what `UndoRequest.spec.requestedBy` / `FleetFreeze.spec.requestedBy` carry, and what §8 records as
+`kubeagents.requester` — one comparison function, `internal/principal.Canonical`, used everywhere a
+human is matched against a list. A principal from one platform **never** matches a list entry from
+another: `slack:U02ABCDEF` and `googlechat:users/1234567890` are different principals even when
+they are the same human, because nothing in either platform proves that.
+
+**V-12 in detail — the channel is an address, never an authority.** A bound channel makes a bare
+message resolvable (§2b step 4); it does **not** admit the people in it. Every message from a bound
+channel is still checked against the target agent's `allowedUsers`, per turn, per sender. A channel
+bound to two agents would make a bare message ambiguous, and "ambiguous" is the one thing
+deterministic routing may not be — so the second binding is rejected at admission rather than
+resolved by a rule nobody can predict. Rejection is `Duplicate` on
+`spec.integration.slack.channelBindings[i].channelId`, naming the `Agent` that already holds it.
+Unbinding is deleting the entry; the router's binding index is **derived** from the CRs, so there
+is no separate table to drift (the same property §2b's handle map has).
 
 **V-6 in detail** (the difference between "a parent cannot express an over-grant" and "a parent
 cannot cause one"). For a candidate child `C` with parent `P`:
@@ -743,9 +875,31 @@ in §2.2 and is added only with this hardening.
 
 How a human names the agent they want ([02](02-agent-personas.md) §2.4). The **ChatOps gateway**
 ([05](05-system-architecture.md) C15) resolves every inbound message to exactly one `(tier, scope)`
-`Agent` CR, checks that agent's allowlist, and dispatches.
+`Agent` CR, checks that agent's allowlist, and dispatches. **Slack is the reference platform**;
+Google Chat is fully supported and secondary, with its deltas stated explicitly (parity table
+below) rather than assumed identical.
 
-**Handle grammar.** An agent's handle is `<tier>-<scope-leaf>`:
+**Ingress and dispatch are independent, and this is the load-bearing separation.** The router
+normalizes a Slack event (or a Chat push) into one internal `InboundMessage` and then dispatches
+over the **existing per-agent transport, unchanged**. Adding, changing, or losing a chat platform
+touches the normalizer and nothing else; a spoke agent is reached identically regardless of which
+platform the human typed into. This is why Chat stays supported without a second dispatch path.
+
+```yaml
+# The normalized message. Produced by exactly one adapter per platform; consumed by Resolve().
+InboundMessage:
+  platform: slack # slack | googlechat
+  principal: slack:U02ABCDEF # canonical, platform-qualified (V-11). The ONLY identity considered.
+  channel: C01TEAMXOPS # Slack channel ID | Chat space name
+  threadKey: slack:C01TEAMXOPS:1721840283.001900 # see "Thread affinity", below
+  text: "why is checkout erroring?"
+  command: kage # set only for a slash command; the verb/target grammar is parsed from `text`
+  mentionsBot: true
+  interaction: null # set for a Block Kit button / Chat card click (§2b.1)
+  receivedAt: "2026-07-24T17:58:01Z"
+```
+
+**Handle grammar (platform-neutral, unchanged).** An agent's handle is `<tier>-<scope-leaf>`:
 
 | Tier             | Canonical handle           | Short alias          | Resolves to `(tier, scope)` |
 | ---------------- | -------------------------- | -------------------- | --------------------------- |
@@ -756,13 +910,69 @@ How a human names the agent they want ([02](02-agent-personas.md) §2.4). The **
 Prefix matching is longest-first (`cluster-admin-` before `cluster-`); leaves are lower-cased and
 must be RFC-1123 labels, refused rather than coerced
 (`k8s-operator/internal/router/grammar.go`). The map is **derived** from the same `(tier, scope)`
-key the cardinality webhook enforces (§1.2) — there is no separate routing registry to drift.
+key the cardinality webhook enforces (§1.2) — there is no separate routing registry to drift. A
+handle is **text inside the message**, not a Slack `@`-mention of a real Slack user, so it survives
+both platforms and neither platform can rename it out from under the fleet.
 
-**Resolution order:** (1) slash command → (2) explicit `@handle` → (3) sticky thread affinity (§6)
-→ (4) NL inference (fallback; low confidence ⇒ clarify, never guess). Only mode 4 spends an
-inference call. **Routing is never an authz signal**: `Resolve()` only names a target;
-`Authorize()` independently reads the **target** CR's `allowedUsers`. The gateway is **fail-closed**
-— an empty or absent allowlist refuses everyone.
+**Resolution order — five steps, deterministic first, inference last.** `Resolve()` returns on the
+first step that yields exactly one agent; a step that yields two or more is a **clarify**, never a
+pick.
+
+| #   | Mode      | Slack (reference)                                | Google Chat (parity)                          | Inference? |
+| --- | --------- | ------------------------------------------------ | --------------------------------------------- | ---------- |
+| 1   | `slash`   | `/kage devteam-team-x why is checkout erroring?` | `/kage devteam-team-x …` (Chat slash command) | No         |
+| 2   | `handle`  | `@kage devteam-team-x drain node-7`              | `@kage devteam-team-x drain node-7`           | No         |
+| 3   | `thread`  | any reply in a thread already routed to an agent | same, keyed on the Chat thread name           | No         |
+| 4   | `channel` | a bare message in bound `#team-x-ops`            | a bare message in a bound space               | No         |
+| 5   | `nl`      | `@kage why is my app crashing in team-x?`        | same                                          | **Yes**    |
+
+Only mode 5 spends an inference call, and on low confidence it **asks one question** rather than
+guessing. The mode is recorded on every turn (§8) as `routingMode`, alongside the platform.
+
+**Why `channel` sits below `thread` and above `nl`.** A bound channel is the Slack-idiomatic form of
+[02](02-agent-personas.md) §2.4's per-audience entrypoint: `#team-x-ops` is already the place the
+team-x humans talk about team-x, so a bare message there needs neither a handle nor a guess. It sits
+_below_ thread affinity because an explicit routing decision already made in this thread is more
+specific than the room it happens in, and _above_ `nl` because it is deterministic and free. A
+channel binds to at most one agent (V-12), so step 4 can never be ambiguous by construction.
+
+**Thread affinity — `threadKey`.** Normalized, platform-qualified, and stable for the life of the
+thread:
+
+```text
+threadKey := "slack:" <channelId> ":" <thread_ts>          # Slack: thread_ts of the ROOT message
+           | "googlechat:" <spaceId> ":" <threadName>      # Chat:  the thread resource name
+```
+
+Slack's `thread_ts` is the root message's timestamp, so a top-level message uses its own `ts` and
+every reply carries the parent's — the key is identical for every turn in a thread without the
+router storing anything but the mapping. Semantics are **unchanged and deliberately narrow**:
+affinity names a _target_, never a _permission_. **Every turn re-authorizes**, and a **different**
+user posting in an already-routed thread is checked against the target agent's `allowedUsers` from
+scratch — they inherit nothing from the human who opened it. Affinity is dropped when the message
+re-addresses another agent explicitly (steps 1–2 always win over step 3).
+
+**Routing is never an authz signal.** `Resolve()` only names a target; `Authorize()` independently
+reads the **target** CR's `allowedUsers` and compares the canonical principal (V-11). The gateway is
+**fail-closed**: an empty, absent, or all-blank allowlist refuses everyone, and a principal that
+does not parse is refused rather than compared loosely. A mis-route can therefore only ever land on
+an agent the human was already allowed to reach ([03](03-security-model.md) §4a).
+
+**Slack ↔ Google Chat parity — where they genuinely differ.**
+
+| Concern              | Slack (reference)                                                               | Google Chat (secondary)                                                     |
+| -------------------- | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Transport            | **Socket Mode** — outbound WSS from the router; no public ingress               | HTTPS **Pub/Sub push** to the router; OIDC audience verified per message    |
+| Connection limit     | **One** Socket Mode connection per app token ⇒ one active router replica (§1.1) | None; the subscription fans out normally                                    |
+| Command registration | **Static, per app** — one `/kage` command for the whole fleet (§2b.1)           | Static, per app — one `/kage`; Chat also matches the bot mention            |
+| Interactivity        | **Block Kit** buttons for approve/reject/undo, delivered over the same socket   | Card `onclick` actions; same payload contract, same re-verification (§2b.1) |
+| Threading            | `thread_ts` (root message timestamp)                                            | thread resource name under the space                                        |
+| Principal format     | `slack:U02ABCDEF` (member ID; `W…` on Enterprise Grid)                          | `googlechat:users/1234567890`                                               |
+| Binding unit         | channel ID (`channelBindings`)                                                  | space name (`spaceBindings`)                                                |
+| Enabled by default   | **Yes** — generated CRs ship `slack.enabled: true`                              | No — opt-in per agent **and** fleet-wide in `ChatOpsConfig`                 |
+
+Both platforms may be enabled at once; they are independent ingresses onto the same dispatch path,
+and an agent reachable on both is reachable under **two** allowlists that are checked separately.
 
 ### 2b.1 Operational commands (new — the imperative model)
 
@@ -771,18 +981,73 @@ the controller against Kubernetes objects and **must work with the LLM, the agen
 inference stack all unavailable** ([03](03-security-model.md) §6). The gateway never forwards them
 to the agent for interpretation.
 
-| Command                          | Effect                                                                                   | Object touched                                      | Authorized by                                                                |
-| -------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `/<handle> pause [reason]`       | Broker refuses new envelopes immediately; in-flight action completes or rolls back       | `Agent.spec.operations.{paused,pauseReason}`        | the target agent's `allowedUsers`                                            |
-| `/<handle> resume`               | Clears the brake. Does **not** clear `contested` markers or a `FleetFreeze`              | `Agent.spec.operations.paused`                      | the target agent's **approval roster** (stricter than pause, deliberately)   |
-| `/freeze <scope> [reason] [ttl]` | Nothing executes anywhere in scope. Undo and rollback still work                         | creates a `FleetFreeze` (§4.4)                      | approval roster of the agent owning the scope, or its parent's roster        |
-| `/thaw <freeze-name>`            | Deletes the `FleetFreeze`                                                                | `FleetFreeze`                                       | the roster that created it, or a parent's roster                             |
-| `/undo <action-id> [reason]`     | Replays the recorded undo plan as a new, classified, journaled action                    | creates an `UndoRequest` (§4.4)                     | the owning agent's `allowedUsers`                                            |
-| `/approve <action-id> [note]`    | Releases a `PendingApproval` action to execute                                           | `ActionRecord.status` via the approvals subresource | **approval roster only**; never the requester of the action (§4.4 four-eyes) |
-| `/reject <action-id> [note]`     | Terminates a `PendingApproval` action as `Rejected`                                      | `ActionRecord.status`                               | approval roster only                                                         |
-| `/uncontest <action-id>`         | Clears a `contested` marker so the agent may act on that target again (§4.4)             | `ActionRecord.status.contested` + target annotation | **approval roster only** — never the agent, and never cleared by `resume`    |
-| `/<handle> status`               | Renders `Agent.status` — paused/frozen, budget, pending approvals, last action, counters | read-only                                           | the target agent's `allowedUsers`                                            |
-| `/actions [--since] [--class]`   | Lists recent `ActionRecord`s for the scope with their undo handles                       | read-only                                           | the target agent's `allowedUsers`                                            |
+**One command, a verb/target grammar.** Slack registers slash commands **statically, per app**
+(§1.1), so `/<handle> pause` — a command per agent — is unregisterable for a fleet that grows by
+one command per namespace. The grammar therefore puts the variable part in the **arguments**, where
+it costs nothing:
+
+```text
+/kage <handle> <intent…>          address an agent in natural language
+/kage <verb> [args…]              a control-plane command (table below)
+@kage <handle> <intent…>          bot mention; the handle is the FIRST token after the mention
+<bare message in a bound channel> address that channel's agent (§2b step 4)
+```
+
+`<handle>` is the §2b grammar (`devteam-team-x`, `cluster-bravo`, `platform-my-project`) — written
+without a leading `@` after `/kage`, and with or without one after `@kage`; both parse. The first
+token is a **verb** if it is in the closed set below, otherwise it is a handle; a token that is
+neither is refused with the two lists, never inferred. Google Chat registers the identical single
+`/kage` command, so the grammar is one parser (`internal/router/grammar.go`) for both platforms.
+
+| Command                               | Effect                                                                                                                                                                    | Object touched                                      | Authorized by                                                                |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `/kage pause <handle> [reason]`       | Broker refuses new envelopes immediately; in-flight action completes or rolls back                                                                                        | `Agent.spec.operations.{paused,pauseReason}`        | the target agent's `allowedUsers`                                            |
+| `/kage resume <handle>`               | Clears the brake. Does **not** clear `contested` markers or a `FleetFreeze`                                                                                               | `Agent.spec.operations.paused`                      | the target agent's **approval roster** (stricter than pause, deliberately)   |
+| `/kage freeze <scope> [reason] [ttl]` | Nothing executes anywhere in scope. Undo and rollback still work                                                                                                          | creates a `FleetFreeze` (§4.4)                      | approval roster of the agent owning the scope, or its parent's roster        |
+| `/kage thaw <freeze-name>`            | Deletes the `FleetFreeze`                                                                                                                                                 | `FleetFreeze`                                       | the roster that created it, or a parent's roster                             |
+| `/kage undo <action-id> [reason]`     | Replays the recorded undo plan as a new, classified, journaled action                                                                                                     | creates an `UndoRequest` (§4.4)                     | the owning agent's `allowedUsers`                                            |
+| `/kage approve <action-id> [note]`    | Releases a `PendingApproval` action to execute                                                                                                                            | `ActionRecord.status` via the approvals subresource | **approval roster only**; never the requester of the action (§4.4 four-eyes) |
+| `/kage reject <action-id> [note]`     | Terminates a `PendingApproval` action as `Rejected`                                                                                                                       | `ActionRecord.status`                               | approval roster only                                                         |
+| `/kage uncontest <action-id>`         | Clears a `contested` marker so the agent may act on that target again (§4.4)                                                                                              | `ActionRecord.status.contested` + target annotation | **approval roster only** — never the agent, and never cleared by `resume`    |
+| `/kage status [handle]`               | Renders `Agent.status` — paused/frozen, budget, pending approvals, last action, counters. With no handle: the agent bound to this channel or thread, else a fleet summary | read-only                                           | the target agent's `allowedUsers`                                            |
+| `/kage actions [--since] [--class]`   | Lists recent `ActionRecord`s for the scope with their undo handles                                                                                                        | read-only                                           | the target agent's `allowedUsers`                                            |
+| `/kage help`                          | Prints this grammar and the handles the caller may reach                                                                                                                  | read-only                                           | anyone in the workspace; lists **only** agents whose allowlist admits them   |
+
+`freeze` and `thaw` take a scope or freeze name rather than a handle because they are fleet
+controls, not agent controls; `/kage freeze` with no argument freezes the scope of the agent bound
+to the current channel and **says which scope it froze** before doing it.
+
+**Block Kit approvals — a convenience, never an authorization.** When an action parks as
+`PendingApproval`, the router posts an approval message to the roster's `notify.slack.channel`
+(§4.4) with the classification, blast radius, undo plan summary, and two Block Kit buttons:
+
+```json
+{
+  "type": "button",
+  "action_id": "kage_approve",
+  "style": "primary",
+  "text": { "type": "plain_text", "text": "Approve" },
+  "value": "{\"actionId\":\"01J8Z3A1B2C3D4E5F6G7H8J9K0\",\"agent\":\"developer-team/my-project/cluster-a/team-x\"}"
+}
+```
+
+A click arrives over the same Socket Mode connection as an `interaction` on the normalized message
+(§2b). **What the payload proves is that a Slack user clicked — nothing more.** It is not a
+credential, it is not an approval, and it carries no authority the same human typing
+`/kage approve <id>` would not have. On receipt the broker **re-runs the approval pipeline from the
+top** ([04](04-workflow-model.md) §3.1 step 4): it resolves the clicker's canonical principal from
+the verified Slack payload (never from the button `value`), re-checks it against the target's
+`ApprovalRoster`, re-applies `allowSelfApproval` and `minApprovals`, re-checks the TTL, and
+**re-classifies the action against current cluster state** — refusing if the class rose or the undo
+plan's `preconditions.uid` no longer matches. The `actionId` in `value` is a _lookup key_ that the
+broker independently validates against the record it renders; a tampered or replayed payload
+resolves to an action the clicker may not approve and is refused, journaled, and reported in-thread.
+Buttons are idempotent: a second click on an already-decided action re-renders the outcome.
+
+`/kage approve <action-id>` is the **fallback and the contract**; the button is sugar over it. Chat
+parity: the identical payload is delivered as a card `onclick` action and takes the identical path.
+When `ChatOpsConfig.spec.slack.interactivity.blockKit: false`, approvals are typed-command only and
+nothing else changes.
 
 **Two-tier authorization, stated plainly.** `allowedUsers` gates _talking to an agent and stopping
 it_; the **approval roster** gates _letting it proceed_ and _relaxing a stop_. Anyone trusted enough
@@ -790,9 +1055,16 @@ to use an agent is trusted enough to hit its brake — braking is always the saf
 the brake, approving a gated action, or thawing a freeze requires roster membership. `pause` and
 `undo` are therefore deliberately the **most** widely available commands in the system.
 
-**Equivalent non-chat paths (required, because chat may be the thing that is broken):**
+**The brake never depends on Slack.** Every command in the table above has an equivalent
+`kubectl` / API path, and Slack is the **most likely** thing to be unavailable at the moment someone
+needs the brake — a workspace outage, a revoked app token, a dropped Socket Mode connection, or a
+router pod that is itself the incident. `pause`, `freeze`, `thaw`, `undo`, `approve`, `reject`,
+`uncontest`, and `status` are therefore Kubernetes-object operations first and chat commands second;
+the router is a **convenience front end that holds no state the objects do not**. A build in which
+any brake control is reachable only through chat has the dependency backwards.
 
 ```bash
+# pause — Slack down, agent still stoppable
 kubectl patch agent developer-team-team-x -n team-x --type=merge \
   -p '{"spec":{"operations":{"paused":true,"pauseReason":"suspect rollout loop"}}}'
 
@@ -803,16 +1075,25 @@ metadata: { name: incident-4471 }
 spec:
   scope: { projectId: my-project }        # everything in the project
   reason: "INC-4471 — payments degraded"
+  requestedBy: slack:U02ABCDEF            # canonical principal (V-11), even off-platform
   expiresAt: "2026-07-24T22:00:00Z"
 EOF
 
 kubectl kage undo 01J8Z2K9Q7V3X5M6N8P0R2T4W6 --reason "wrong diagnosis"
+kubectl kage approve 01J8Z3A1B2C3D4E5F6G7H8J9K0 --note "INC-4471 change window"
+kubectl kage status --agent developer-team-team-x
 ```
 
+`kubectl kage` is a thin plugin over the same API surface the router calls
+(`POST /v1alpha1/actions/{actionId}/approve`, the approvals subresource, `UndoRequest`,
+`FleetFreeze`), authorized by the caller's **Kubernetes** identity mapped to a canonical principal —
+so roster membership, four-eyes, and TTL are enforced by the same code whichever door was used.
+
 **Attribution (extends §8).** Every chat turn's audit record carries the resolved agent
-(`tier`, `scope`), the **routing mode** (`slash` | `handle` | `sticky` | `inference`), the
-requester, the trace/session IDs, and — for the commands above — the **object mutated** and, for
-`approve`, the `action-id` released.
+(`tier`, `scope`), the **platform** (`slack` | `googlechat`), the **routing mode**
+(`slash` | `handle` | `thread` | `channel` | `nl`), the canonical requester, the `threadKey`, the
+trace/session IDs, and — for the commands above — the **object mutated**, whether the input was
+typed or a Block Kit interaction, and, for `approve`, the `action-id` released.
 
 ---
 
@@ -890,7 +1171,7 @@ chore(mirror): scale api-gateway to 6 replicas
 kube-agents-action-id: 01J8Z2K9Q7V3X5M6N8P0R2T4W6
 kube-agents-agent: developer-team/my-project/cluster-a/team-x
 kube-agents-risk-class: elevated
-kube-agents-requester: users/1234567890
+kube-agents-requester: slack:U02ABCDEF
 kube-agents-trace-id: 4bf92f3577b34da6a3ce929d0e0e4736
 [skip ci]
 ```
@@ -992,8 +1273,8 @@ operations:
 # ---- provenance -------------------------------------------------------------------------------
 requester:
   kind: human # human | agent | system
-  id: users/1234567890 # chat user id, agent identity key, or "" for system
-  platform: googlechat # googlechat | slack | kubectl | mesh | ""
+  id: slack:U02ABCDEF # canonical principal (§1.2 V-11), agent identity key, or "" for system
+  platform: slack # slack | googlechat | kubectl | mesh | ""
   displayName: "A. Parco"
   assertion: "" # router-signed JWT. Empty ⇒ ActionRecord marks attributionUnverified (§2a)
 trigger:
@@ -1004,7 +1285,7 @@ trace:
   traceId: 4bf92f3577b34da6a3ce929d0e0e4736 # W3C trace-id, 32 hex
   spanId: 00f067aa0ba902b7
   sessionId: hermes-9f21c4 # Hermes session
-  threadId: spaces/AAAA/threads/BBBB # chat thread, for the reply
+  threadId: slack:C01TEAMXOPS:1721840283.001900 # normalized threadKey (§2b), for the reply
 
 # ---- freshness & anti-replay (see "Anti-replay", below) ----------------------------------------
 issuedAt: "2026-07-24T17:58:01Z" # RFC-3339, UTC, from the agent pod. Freshness window applies
@@ -1525,8 +1806,8 @@ spec: # IMMUTABLE after creation (enforced by CEL + vap-agent-scope)
   requester:
     {
       kind: human,
-      id: users/1234567890,
-      platform: googlechat,
+      id: slack:U02ABCDEF,
+      platform: slack,
       displayName: "A. Parco",
     }
   attributionUnverified: false # true when no signed requester assertion was present
@@ -1752,20 +2033,20 @@ broker and the undo controller" is too loose to conformance-test — the check n
 and a field list. This is that list; `vap-agent-scope-journal` enforces it on
 `actionrecords/status`, and any principal or field pair not in the table is **denied**:
 
-| Principal                                                                      | Subresource            | May write                                                                                                                                        | Constraint                                                                                                                             |
-| ------------------------------------------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `system:serviceaccount:<ns>:<tier>-<scope>-actor` — **the owning broker**      | `actionrecords/status` | `phase`, `observedGeneration`, `applied`, `verification`, `recovery`, `report`, `timestamps`, `message`                                          | Only on records whose `spec.agentIdentity` equals the broker's own derived identity. **Never** `approvals`, `contested`, or `undoneBy` |
-| `system:serviceaccount:kubeagents-system:kube-agents-undo-controller` (`C-UC`) | `actionrecords/status` | `phase` (→ `Undone` only), `undoneBy`, `contested`, `message`                                                                                    | Any record in any namespace — undo must work for an agent that no longer exists ([05](05-system-architecture.md) §1.3)                 |
-| `system:serviceaccount:kubeagents-system:kube-agents-chatops-gateway`          | `actionrecords/status` | `approvals` (`granted`, `rejected`, `expiresAt`), `phase` (`PendingApproval` → `Pending`/`Rejected`), `contested` (clear only, for `/uncontest`) | Enforces the roster, four-eyes, and `minApprovals` before writing (§4.4). Cannot touch `applied` or `verification`                     |
-| `system:serviceaccount:kubeagents-system:kube-agents-retention-controller`     | (main resource)        | nothing — `delete` only                                                                                                                          | May `delete` only when `now > spec.retention.expiresAt` **and** the exporter has confirmed the record landed in the audit sink         |
-| **Every agent reader SA**                                                      | —                      | nothing                                                                                                                                          | `get`/`list`/`watch` only (§2.1)                                                                                                       |
-| **A human `cluster-admin`**                                                    | —                      | **nothing.** Explicitly denied                                                                                                                   | See below                                                                                                                              |
+| Principal                                                                      | Subresource            | May write                                                                                                                                             | Constraint                                                                                                                             |
+| ------------------------------------------------------------------------------ | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `system:serviceaccount:<ns>:<tier>-<scope>-actor` — **the owning broker**      | `actionrecords/status` | `phase`, `observedGeneration`, `applied`, `verification`, `recovery`, `report`, `timestamps`, `message`                                               | Only on records whose `spec.agentIdentity` equals the broker's own derived identity. **Never** `approvals`, `contested`, or `undoneBy` |
+| `system:serviceaccount:kubeagents-system:kube-agents-undo-controller` (`C-UC`) | `actionrecords/status` | `phase` (→ `Undone` only), `undoneBy`, `contested`, `message`                                                                                         | Any record in any namespace — undo must work for an agent that no longer exists ([05](05-system-architecture.md) §1.3)                 |
+| `system:serviceaccount:kubeagents-system:kube-agents-chatops-gateway`          | `actionrecords/status` | `approvals` (`granted`, `rejected`, `expiresAt`), `phase` (`PendingApproval` → `Pending`/`Rejected`), `contested` (clear only, for `/kage uncontest`) | Enforces the roster, four-eyes, and `minApprovals` before writing (§4.4). Cannot touch `applied` or `verification`                     |
+| `system:serviceaccount:kubeagents-system:kube-agents-retention-controller`     | (main resource)        | nothing — `delete` only                                                                                                                               | May `delete` only when `now > spec.retention.expiresAt` **and** the exporter has confirmed the record landed in the audit sink         |
+| **Every agent reader SA**                                                      | —                      | nothing                                                                                                                                               | `get`/`list`/`watch` only (§2.1)                                                                                                       |
+| **A human `cluster-admin`**                                                    | —                      | **nothing.** Explicitly denied                                                                                                                        | See below                                                                                                                              |
 
 **A human cluster-admin may not write `ActionRecord.status`, and this is deliberate.** The
 `vap-agent-scope-journal` policy matches on **all** principals, not just agent identities, so a
 `kubectl patch actionrecord … --subresource=status` by a human is rejected the same way an agent's
-is. Approving, rejecting, and un-contesting are done through `/approve`, `/reject`, `/uncontest`
-(§2b.1) or by creating the equivalent objects — paths that check the roster, record the human, and
+is. Approving, rejecting, and un-contesting are done through `/kage approve`, `/kage reject`, and
+`/kage uncontest` (§2b.1) or by creating the equivalent objects — paths that check the roster, record the human, and
 leave an audit trail — never by hand-editing the outcome of an action. Without this the four-eyes
 rule is decorative: any cluster-admin could mark their own gated action `granted` and execute it.
 
@@ -1888,7 +2169,7 @@ spec:
     clusterName: cluster-a # optional
     namespace: "" # optional
   reason: "INC-4471 — payments degraded, no automated changes"
-  requestedBy: users/1234567890
+  requestedBy: slack:U02ABCDEF
   expiresAt: "2026-07-24T22:00:00Z" # optional; a freeze with no expiry never self-clears
   allowUndo: true # default true — undo and rollback keep working during a freeze
   allowClasses: [] # default empty = nothing executes. May list ONLY `routine`; never `gated`
@@ -1904,7 +2185,7 @@ metadata: { name: undo-01j8z2k9q7v3x5m6n8p0r2t4w6, namespace: team-x }
 spec:
   actionRef: { name: ar-01j8z2k9q7v3x5m6n8p0r2t4w6 }
   reason: "wrong diagnosis — the OOM was upstream"
-  requestedBy: users/1234567890
+  requestedBy: slack:U02ABCDEF
   markContested: true # default true: also mark the target contested
 status:
   phase: Executed # Pending | Executing | Executed | Failed | Refused
@@ -1918,15 +2199,17 @@ kind: ApprovalRoster
 metadata: { name: team-x-approvers, namespace: team-x }
 spec:
   approvers:
-    - { platform: googlechat, id: "users/1234567890", displayName: "A. Parco" }
-    - { platform: slack, id: "U02ABCDEF", displayName: "R. Ops" }
+    # `platform` + `id` canonicalize to the §1.2 V-11 principal `<platform>:<id>`.
+    - { platform: slack, id: "U02ABCDEF", displayName: "A. Parco" }
+    - { platform: slack, id: "U07GHIJKL", displayName: "R. Ops" }
+    - { platform: googlechat, id: "users/1234567890", displayName: "J. Chat" }
   minApprovals: 1 # default 1
   allowSelfApproval: false # default false — the human who requested an action may not approve it
   ttl: 24h # DEFAULT 24h (canonical; 04 §3.1 references this field). Ceiling 72h, floor 1h.
   # A gated action past its TTL becomes `Expired` and is never executed afterwards.
-  notify: # where approval requests land
-    googleChat: { space: "spaces/AAAA" }
+  notify: # where approval requests land (Block Kit buttons on Slack — §2b.1)
     slack: { channel: "C01ABCDEF" }
+    googleChat: { space: "spaces/AAAA" }
   escalateTo: { name: cluster-a-approvers, namespace: kubeagents-system } # optional, on TTL
 ```
 
@@ -1961,7 +2244,7 @@ originating `ActionRecord` and indexes the target reference. A later envelope wh
 contested entry is refused with `403 target-contested` and the originating `actionId`. The index is
 authoritative because a deleted object cannot hold an annotation; where the object exists the broker
 **also** stamps `kube-agents/contested: <action-id>` on it as an advisory signal for humans. A
-contested marker is cleared only by an approval-roster member (`/uncontest <action-id>` or removing
+contested marker is cleared only by an approval-roster member (`/kage uncontest <action-id>` or removing
 the annotation and patching the record's status) — never by the agent, and never by `resume`.
 
 **Agents cannot touch any of it.** `Agent` CRs, `FleetFreeze`, `ApprovalRoster`, `ChangePolicy`, and
@@ -2050,8 +2333,9 @@ observations into OKF.
 platform/space/thread; per-user memory in `memories/users/<safe_user_id>.md`; shared SOPs in
 `memories/MEMORY.md`. Per-user isolation by runtime `user_id`. This stays as-is.
 
-Two consumers beyond the agent itself: the gateway uses `thread_id` / `chat_id` for **routing thread
-affinity** (§2b, mode `sticky`), and the broker uses `trace.threadId` to deliver the **action report
+Two consumers beyond the agent itself: the gateway keys **routing thread affinity** on the
+normalized `threadKey` (§2b, mode `thread` — `slack:<channel>:<thread_ts>` |
+`googlechat:<space>:<thread>`), and the broker uses `trace.threadId` to deliver the **action report
 and its undo handle back into the thread that triggered it** — including asynchronously, when a
 `gated` action is approved minutes later. Session state is never an authorization input.
 
@@ -2164,7 +2448,8 @@ Extends `docs/designs/audit-logging-user-attribution.md`. The requirement is a *
 chain** from the human's message to the row in the cloud audit log:
 
 ```text
-chat message            → requester + threadId + traceId          (router, §2b)
+chat message            → platform + routingMode + requester
+                          + threadKey + traceId                    (router, §2b)
   → Action Envelope     → same traceId, requester, trigger        (§4.1)
     → ActionRecord      → actionId + actorServiceAccount + traceId (§4.3)
       → Kubernetes write→ annotation kube-agents/action-id + field manager
@@ -2187,20 +2472,41 @@ accept either correlation path.
 
 **OTel resource/span attributes** emitted by the broker on every action:
 
-| Attribute                    | Example                                        |
-| ---------------------------- | ---------------------------------------------- |
-| `kubeagents.action_id`       | `01J8Z2K9Q7V3X5M6N8P0R2T4W6`                   |
-| `kubeagents.agent_identity`  | `developer-team/my-project/cluster-a/team-x`   |
-| `kubeagents.tier` / `.scope` | `developer-team` / `team-x`                    |
-| `kubeagents.actor_sa`        | `developer-team-team-x-actor`                  |
-| `kubeagents.risk_class`      | `elevated`                                     |
-| `kubeagents.trigger_source`  | `watch`                                        |
-| `kubeagents.requester`       | `users/1234567890`                             |
-| `kubeagents.routing_mode`    | `slash` \| `handle` \| `sticky` \| `inference` |
-| `kubeagents.undo_available`  | `true`                                         |
-| `kubeagents.approved_by`     | `users/9876543210` (gated actions only)        |
+| Attribute                    | Example                                                      |
+| ---------------------------- | ------------------------------------------------------------ |
+| `kubeagents.action_id`       | `01J8Z2K9Q7V3X5M6N8P0R2T4W6`                                 |
+| `kubeagents.agent_identity`  | `developer-team/my-project/cluster-a/team-x`                 |
+| `kubeagents.tier` / `.scope` | `developer-team` / `team-x`                                  |
+| `kubeagents.actor_sa`        | `developer-team-team-x-actor`                                |
+| `kubeagents.risk_class`      | `elevated`                                                   |
+| `kubeagents.trigger_source`  | `watch`                                                      |
+| `kubeagents.requester`       | `slack:U02ABCDEF` (canonical, V-11)                          |
+| `kubeagents.chat_platform`   | `slack` \| `googlechat` \| `""` (non-chat)                   |
+| `kubeagents.routing_mode`    | `slash` \| `handle` \| `thread` \| `channel` \| `nl` \| `""` |
+| `kubeagents.thread_key`      | `slack:C01TEAMXOPS:1721840283.001900`                        |
+| `kubeagents.interaction`     | `typed` \| `blockkit` \| `card` \| `kubectl`                 |
+| `kubeagents.undo_available`  | `true`                                                       |
+| `kubeagents.approved_by`     | `slack:U07GHIJKL` (gated actions only)                       |
 
-Chat turns additionally record the **resolved agent** and **routing mode** (§2b). The durable
+**Platform and routing mode are recorded as a pair, and both are required.** `routingMode` alone is
+ambiguous once two platforms are live — `channel` means a Slack channel binding or a Chat space
+binding, and the two have different administrators, different membership, and different failure
+modes. The attribution tuple is therefore
+`(platform, routingMode) ∈ {slack, googlechat} × {slash, handle, thread, channel, nl}`, recorded on
+**every** chat turn alongside the canonical requester, the `threadKey`, and the trace ID, and
+carried unchanged into the Action Envelope's `requester.platform` (§4.1) and the `ActionRecord`
+(§4.3). For a non-chat origin — `kubectl`, the API, the mesh, a watch — `chat_platform` and
+`routing_mode` are the empty string and `interaction` is `kubectl` or unset; they are **never**
+defaulted to `slack`, because "we do not know how this arrived" and "it arrived over Slack" must not
+render identically in an audit query.
+
+These are attribution fields only. Nothing in the tuple is read by the classifier, the roster check,
+or `Authorize()` — routing is never an authz signal (§2b), and an action's risk class is
+byte-identical whether it came from a slash command, a bound channel, or a Block Kit click.
+
+Chat turns additionally record the **resolved agent**, and — where the turn is a `gated` decision —
+whether the approval was typed or clicked (§2b.1), so a roster review can tell a deliberate
+`/kage approve` from a button press without changing what either was allowed to do. The durable
 attribution for a mutation is the **`ActionRecord`** — not a merge commit, not a PR URL. Where the
 mirror is enabled, the commit trailers (§3.1) provide a secondary, human-browsable index into it.
 
@@ -2259,13 +2565,14 @@ verify that the **shapes** in this document are real.
 
 - Every `Agent` CR in `examples/` and `deploy/` validates against the generated CRD; a round-trip
   (`kubectl apply` → `get -o yaml` → re-apply) is a no-op diff.
-- **V-1…V-10 each have a negative test**: wrong tier enum; tier mutation; missing per-tier scope
+- **V-1…V-13 each have a negative test**: wrong tier enum; tier mutation; missing per-tier scope
   field; missing `parentRef`; a developer-team `Agent` in the wrong `metadata.namespace`; a second
   CR for the same `(tier, scope)`; **a child whose scope is not a strict subset of its parent's, and
   a child whose parent is the wrong tier (V-6)**; an enabled chat integration with an empty
   `allowedUsers`; an `initiativeBudget` above the code ceiling; a
-  `spec.security.serviceAccountName` that is not the tier's reader SA. Each is rejected at apply
-  time with the field path in the message.
+  `spec.security.serviceAccountName` that is not the tier's reader SA; an unqualified or mutable
+  principal (V-11); a channel bound twice (V-12); a second `ChatOpsConfig` (V-13). Each is rejected
+  at apply time with the field path in the message.
 - **Per-class budget (§1.1):** each of the ten `initiativeBudget` leaves is rejected one above its
   ceiling and accepted at it; `flapWindow: 1m` is rejected; a CR carrying the retired flat
   `actionsPerHour` / `actionsPerDay` under `initiativeBudget` is **pruned or refused**, so the
@@ -2278,6 +2585,69 @@ verify that the **shapes** in this document are real.
   `spec.scopeOverride`, `spec.brokerServiceAccountName`, or `spec.actorServiceAccountName` is
   pruned/rejected; a test greps the generated CRD schema to assert none of those property names
   exists and that `spec` sets no `x-kubernetes-preserve-unknown-fields`.
+
+**Chat integration, addressing & routing (§1.1, §1.2, §2b, §2b.1)**
+
+- **Slack is the default, Chat is opt-in:** every `Agent` in `examples/` and `deploy/` ships
+  `integration.slack.enabled: true` with a non-empty, platform-qualified `allowedUsers`; a generated
+  CR sets `googleChat.enabled: false`. A grep test asserts no `slack: { enabled: false }` remains as
+  a shipped default and that the retired **per-agent Slack relay** is absent from the agent image —
+  the only Slack client in the build is the router's.
+- **Fleet-level config is fleet-level:** the `Agent` CRD schema contains **no** Slack token, app
+  token, signing secret, or command-name property (grep the generated CRD); `ChatOpsConfig` is
+  cluster-scoped, rejects a name other than `default`, rejects a second object, rejects
+  `socketMode.maxConnections: 2` rather than clamping it, and resolves Secret refs only in
+  `kubeagents-system` (a ref naming another namespace fails to compile — the field does not exist).
+  No actor SA can `get` a `ChatOpsConfig` or its Secrets.
+- **One connection:** with two router replicas running, exactly one holds the Socket Mode
+  connection and the standby holds none (assert on `status.slack.connected` and the Slack
+  `apps.connections.open` count); killing the leader re-establishes exactly one connection, and
+  never two.
+- **Principal format (V-11):** a table test over accepted forms (`slack:U02ABCDEF`, `slack:W…`,
+  `googlechat:users/1234567890`) and rejected forms (`U02ABCDEF`, `slack:@aparco`,
+  `aparco@acme.com`, `slack:A. Parco`, `""`, `"   "`, `slack:`, `discord:1234`). An all-blank list
+  is treated as **empty** and refused by V-7, not as an allowlist. `internal/principal.Canonical`
+  is the single comparison function — a grep asserts `allowedUsers`, `ApprovalRoster.approvers`,
+  `requestedBy`, and the envelope `requester` all route through it, and a cross-platform pair
+  (`slack:U02ABCDEF` vs `googlechat:users/1234567890`) never compares equal.
+- **Channel binding (V-12):** binding `C01TEAMXOPS` to a second `Agent` is rejected `Duplicate`
+  naming the incumbent; a bare message in a bound channel resolves with `routingMode: channel` and
+  **zero inference calls** (assert the inference client was not invoked); the same message in an
+  unbound channel falls through to `nl`; deleting the binding makes the channel fall through again
+  with no router restart. A user **not** in the target's `allowedUsers` posting in the bound channel
+  is refused — the binding addresses, it does not admit.
+- **Precedence (§2b):** a five-case table over one message text proves the order
+  slash → handle → thread → channel → nl, including the conflict cases: an explicit handle inside a
+  bound channel wins over the binding; a slash command inside an already-routed thread wins over
+  affinity and re-points the thread; and only the `nl` case spends an inference call.
+- **Thread affinity (§2b, §6):** `threadKey` is `slack:<channel>:<thread_ts>` where `thread_ts` is
+  the **root** message's timestamp for both the root and every reply; a Chat thread produces
+  `googlechat:<space>:<thread>`; and — the decisive one — a **different** user replying in a routed
+  thread is re-authorized against the target's `allowedUsers` and refused if absent, inheriting
+  nothing from the human who opened the thread.
+- **Grammar (§2b.1):** `/kage` is the only command in the Slack app manifest, and a test asserts the
+  manifest's command list equals `ChatOpsConfig.status.registeredCommands`; each verb in the table
+  parses with and without a leading `@` on the handle; an unknown first token is refused with the
+  verb and handle lists and is **never** treated as intent; `/kage status` with no handle resolves
+  via channel binding, then thread, then a fleet summary; `/kage help` lists only agents whose
+  allowlist admits the caller.
+- **Block Kit is not authorization (§2b.1):** a button click by a **non-roster** Slack user is
+  refused even though the payload is validly signed; a click whose `value` names a **different**
+  `actionId` than the message rendered is refused and journaled; a replayed payload is refused; a
+  second click on a decided action re-renders the outcome rather than approving twice; a click by
+  the action's own requester is refused under `allowSelfApproval: false`; and an action whose class
+  rose since it parked is refused at click time. For every case, the identical outcome is produced
+  by the typed `/kage approve <id>` — asserted as a paired table test, because "the button and the
+  command must not diverge" is the property.
+- **The brake survives Slack (§2b.1, §4.4):** with the router scaled to zero **and** the Slack app
+  token revoked, `pause`, `resume`, `freeze`, `thaw`, `undo`, `approve`, `reject`, `uncontest`, and
+  `status` all succeed via `kubectl` / the API with unchanged authorization semantics; a chaos run
+  that drops the Socket Mode connection mid-approval leaves no action auto-approved and no action
+  stuck outside its TTL.
+- **Chat parity (§2b):** the parity table is executed as a matrix — for each of the five routing
+  modes, the same logical message on Slack and on Google Chat resolves to the same agent, produces
+  the same dispatch over the per-agent transport, and differs only in `platform`, `threadKey`, and
+  principal format. Disabling Slack fleet-wide leaves Google Chat fully functional, and vice versa.
 
 **Identity templates match what admission enforces (§2)**
 
@@ -2417,7 +2787,7 @@ verify that the **shapes** in this document are real.
 - Approvals: `allowSelfApproval: false` refuses the requester's own approval; `minApprovals: 2`
   requires two distinct approvers; an empty roster never auto-approves.
 - `contested`: an undone change is not re-applied; only a roster member can clear the marker, and
-  `/uncontest <action-id>` (§2b.1) is the supported path — invoked by a non-roster member it is
+  `/kage uncontest <action-id>` (§2b.1) is the supported path — invoked by a non-roster member it is
   refused, and `resume` never clears it.
 - **Approval TTL:** the default resolves to **24 h** from `ApprovalRoster.spec.ttl` with no number
   hard-coded in the broker; a roster `ttl: 96h` is rejected against the 72 h ceiling; an action
@@ -2449,6 +2819,19 @@ verify that the **shapes** in this document are real.
 
 - **Trace continuity:** for a sampled chat-initiated action, one `traceId` links the chat audit
   record, the envelope, the `ActionRecord`, and the Kubernetes/Cloud audit entry.
+- **Platform × routing mode (§8):** every chat-originated action carries a non-empty
+  `kubeagents.chat_platform` **and** `kubeagents.routing_mode`, and the pair matches how the message
+  actually arrived — asserted across all ten `{slack, googlechat} × {slash, handle, thread, channel,
+nl}` cells. `kubeagents.requester` is the canonical `<platform>:<id>` form in every case, and
+  `kubeagents.thread_key` matches the router's `threadKey`. A `kubectl`-, mesh-, watch-, or
+  cron-originated action carries **empty** `chat_platform` and `routing_mode` — never `slack` by
+  default — and `interaction: kubectl` or unset; an audit query filtering `chat_platform=slack`
+  returns no non-chat actions.
+- **Attribution is not authority:** the same envelope classified with each of the ten
+  `(platform, routingMode)` pairs produces a byte-identical `classification` block, and a forged
+  `routingMode` or `chat_platform` changes the audit row and nothing else. For a `gated` action,
+  `interaction` distinguishes `blockkit` from `typed` while `approved_by` and the roster outcome are
+  identical.
 - Every object written by an actor SA carries `kube-agents/action-id`; a write with the annotation
   stripped is **rejected at admission**; deletes and cloud calls are correlated by the broker
   user-agent.
