@@ -233,6 +233,44 @@ two indistinguishable to the check.
 (`provision_12_deploy_agent_tiers.sh`). The live-install learnings live only in
 `k8s-operator/scripts/README.md`.
 
+**Outcome (2026-07-25): mechanized, not cleaned up.** Fixing the named lines would have left the
+next drift to be found by the next reader, so the deliverable is `local-dev/tests/docs-truth.py` —
+six checks, wired into `L0-CHAIN.txt`, five of them deriving their expectation from an artifact the
+build already maintains rather than from a second list to keep in sync. The plan named 5 stale
+lines. The lint found **74**, and the gap is the whole point: **three of the 74 were created by
+phase 8 itself**, in the days between writing this plan and running it.
+
+- **P8-T1 left two documents promising the hatch it had just deleted.** `scripts/README.md` and
+  `vars.sh.example` both said an empty `SLACK_ALLOWED_USERS` admits every workspace user. That is
+  false in the dangerous direction — admission now _rejects_ the CR — and `vars.sh.example` is the
+  file operators copy to `vars.sh` and run, which is why it is in the corpus despite not being prose.
+- **P8-T3 shipped provisioning step 13 with no `make` target.** Every step list in the tree stopped
+  at 11, so the documented per-step install path could not apply the tenant-isolation floor T2/T3
+  had just built. Added `gcp-provision-13-network-policies` and its teardown mirror.
+- **Step 12 was undocumented everywhere**, not just in `INSTALL.md`.
+
+Four more the plan did not know about: the cert-manager gotcha named the wrong step and told readers
+to do work step 03 does for them; the quickstart's mermaid was off-by-one _throughout_;
+`reference/config.md` presented the image-baked `config.yaml` as authoritative when the operator
+renders a ConfigMap over it (a **P6** violation living in the docs); and `agents/platform/SOUL.md` —
+a **live system prompt**, not prose — described the retired CRD to the running agent.
+
+**And one defect in the verification machinery.** `docs-truth.py` has to carry `ALLOW_ALL_USERS` in
+its `RETIRED` table in order to hunt it, so it needs the `ASSERTION_FILES` exemption in
+`closed-allowlist.py`. Granting that exemption exposed that the emission guard which makes the
+exemption safe — the thing separating "names the hatch" from "emits the hatch" — matched only the Go
+struct-literal shape. `export SLACK_ALLOW_ALL_USERS=true` appended to `closed-allowlist-l2.sh`
+passed cleanly, as did a YAML `- name:` entry in the exempted testdata: a blanket pass for five of
+its eight files, standing since P8-T1 and invisible because the negative control for it was a
+substring test that never touched the regex (V-MET-014). Emission is now two shapes matched across
+Go/YAML/shell/Python/JSON, against the **code half** of each line only — four exempted files carry
+comments narrating the removed assignment verbatim, and that prose is exactly what the exemption
+exists to permit. Controls **9 → 21**, half of them asserting a mention does _not_ read as an
+emission so the fix cannot collapse into a ban that gets the security assertions deleted.
+
+Evidence: **12/12 docs-truth mutations** caught (7 findings-shaped, 1 allowlist-suppression, 4
+could-not-run), **7/7 emission probes** RED — one per exempted file, in its own syntax.
+
 ---
 
 ## Planning defect found and resolved: Accept (c) was half-uncovered

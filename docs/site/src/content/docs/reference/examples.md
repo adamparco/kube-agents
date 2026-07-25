@@ -49,7 +49,7 @@ Both LiteLLM examples and `vllm-gemma` speak OpenAI-compatible Completions. You 
 
 ## Not shipped as examples (but reference-worthy)
 
-- `k8s-operator/examples/platformagent.yaml` — a working sample `PlatformAgent` custom resource.
+- `k8s-operator/examples/agent.yaml` — a working sample `Agent` custom resource.
 - `k8s-operator/testing/staging_workloads/` — a multi-cluster GKE staging PoC with workloads and traffic simulators.
 
 ## Where to go next

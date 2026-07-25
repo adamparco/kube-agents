@@ -8,11 +8,11 @@ import { Aside, Steps } from "@astrojs/starlight/components";
 The `./provision.sh` script bootstraps everything you need for a running Platform Agent on GKE: cluster, CRDs, IAM, secrets, Chat integration, inference gateway, and the token minter.
 
 <Aside type="note">
-  Prerequisites: a GCP project with billing enabled, `gcloud` authenticated, and
+  Prerequisites: a GCP project with billing enabled and `gcloud` authenticated.
+  If you're starting from a fresh project, the provisioner creates the cluster
+  for you. You do **not** need to install
   [cert-manager](/kube-agents/install/prerequisites/#cert-manager-on-the-target-cluster)
-  installed on the target cluster. If you're starting from a fresh project, the
-  provisioner will create the cluster for you — install cert-manager immediately
-  after step 1 completes.
+  by hand — step 03 installs it when it isn't already present.
 </Aside>
 
 ## Run the provisioner
@@ -41,18 +41,16 @@ The `./provision.sh` script bootstraps everything you need for a running Platfor
 
    The first run is interactive: it prompts for the values it needs (project ID, region, cluster name, model provider, API key, GitOps repo). Answers are cached in `k8s-operator/scripts/vars.sh` (git-ignored) so re-runs are non-interactive.
 
-3. **Install cert-manager after step 1 finishes** if you haven't already. See [Prerequisites → cert-manager](/kube-agents/install/prerequisites/#cert-manager-on-the-target-cluster). You can Ctrl-C `provision.sh` after step 1 emits the "GKE cluster ready" message, install cert-manager, then re-run — it's idempotent.
+3. **Configure Google Chat** in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com) to publish events to the Pub/Sub topic created in step 05. The provisioner prints the topic name when it finishes.
 
-4. **Configure Google Chat** in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com) to publish events to the Pub/Sub topic created in step 4. The provisioner prints the topic name when it finishes.
-
-5. **Verify.**
+4. **Verify.**
 
    ```bash
-   kubectl get platformagents -n kubeagents-system
+   kubectl get agents -A
    kubectl get pods -n kubeagents-system
    ```
 
-   You should see one `PlatformAgent` resource and pods for the operator, Platform Agent, LiteLLM, and Minty. When the Platform Agent pod is `Running`, DM your Chat app and it should reply.
+   With the default settings you should see three `Agent` resources — one per tier — and pods for the operator, the agents, LiteLLM, and Minty. When the platform agent pod is `Running`, DM your Chat app and it should reply.
 
 </Steps>
 
@@ -63,16 +61,18 @@ The `./provision.sh` script bootstraps everything you need for a running Platfor
 ```mermaid
 flowchart TB
     A[provision.sh] --> B["01: GKE cluster<br/>Workload Identity"]
-    A --> C["01a: gVisor node pool (opt-in)"]
-    A --> D["02: Operator CRDs + manager"]
-    A --> E["03: IAM + Workload Identity bindings"]
-    A --> F["04: Google Chat Pub/Sub"]
-    A --> G["05: Slack (opt-in)"]
-    A --> H["06: LLM API key Secret"]
-    A --> I["07: PlatformAgent CR"]
-    A --> J["08: LiteLLM Deployment"]
-    A --> K["09: Minty + GCP KMS"]
-    A --> L["10: inference-replay (opt-in)"]
+    A --> C["02: gVisor node pool (opt-in)"]
+    A --> D["03: cert-manager + operator CRDs + manager"]
+    A --> E["04: IAM + Workload Identity bindings"]
+    A --> F["05: Google Chat Pub/Sub"]
+    A --> G["06: Slack (opt-in)"]
+    A --> H["07: LLM API key Secret"]
+    A --> I["08: platform-tier Agent CR"]
+    A --> J["09: LiteLLM Deployment"]
+    A --> K["10: Minty + GCP KMS"]
+    A --> L["11: inference-replay (opt-in)"]
+    A --> M["12: cluster-admin + developer-team Agent CRs"]
+    A --> N["13: egress allowlist + tenant default-deny"]
 ```
 
 See [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) for the per-script breakdown.
@@ -80,9 +80,11 @@ See [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) for the 
 ## Common flags and toggles
 
 - `--dry-run` — prints what would be done without applying anything.
-- `ENABLE_GVISOR=true` — provisions the gVisor sandbox node pool in step 1a.
-- `SLACK_ENABLED=true` — configures Slack tokens in step 5 (otherwise step 5 no-ops).
-- `INFERENCE_REPLAY_ENABLED=true` — deploys the inference-replay proxy in step 10.
+- `ENABLE_GVISOR=true` — provisions the gVisor sandbox node pool in step 02.
+- `SLACK_ENABLED=true` — configures Slack tokens in step 06 (otherwise step 06 no-ops). `SLACK_ALLOWED_USERS` is required when it is on: an empty allowlist is rejected by admission.
+- `INFERENCE_REPLAY_ENABLED=true` — deploys the inference-replay proxy in step 11.
+- `CLUSTER_ADMIN_ENABLED=false` — skip the cluster-admin tier in step 12 (this also skips the developer-team tier, which needs it as a parent).
+- `EGRESS_POLICIES_ENABLED=false` — skip step 13. Leave it on: those policies are the containment story.
 
 Set these as environment variables before running, or accept the interactive defaults.
 

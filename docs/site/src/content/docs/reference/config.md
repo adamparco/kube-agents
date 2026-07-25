@@ -1,36 +1,58 @@
 ---
 title: Config reference
-description: agents/platform/config.yaml annotated.
+description: The agent's runtime Hermes config — what the operator renders, and what the baked file is for.
 sidebar:
   order: 1
 ---
 
-The Platform Agent's runtime wiring is declared in [`agents/platform/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/config.yaml). It tells Hermes which MCP servers to start, which toolsets to expose to which surfaces, and which plugins to load.
+The agent's runtime wiring tells Hermes which MCP servers to start, which toolsets to expose to which
+surfaces, and which plugins to load.
 
-## Full file
+:::note[Two files, one of them authoritative]
+[`agents/platform/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/config.yaml)
+is **baked into the agent image as a fallback**. At runtime the operator renders its own config into a
+`ConfigMap` and mounts it over that path, so the rendered ConfigMap is what the pod actually reads.
+The two are kept deliberately consistent, but when they disagree the render wins — and the render is
+the only one that knows the cluster's namespace, model endpoint, and enabled chat platforms.
+
+To see what a running agent is using, read the ConfigMap, not the image:
+
+```bash
+kubectl get configmap -n kubeagents-system -l kube-agents/tier=platform \
+  -o jsonpath='{.items[*].data.config\.yaml}'
+```
+
+:::
+
+## What the operator renders
 
 ```yaml
-# MCP Servers configuration.
 mcp_servers:
   platform_control:
-    command: "/opt/hermes/.venv/bin/python3"
+    command: /opt/hermes/.venv/bin/python3
     args:
-      - "/opt/data/scripts/platform_mcp_server.py"
+      - /opt/data/scripts/platform_mcp_server.py
     connect_timeout: 120
-    # 5-minute timeout to support long GKE reasoning chains
+    # 5-minute timeout to support long reasoning chains
     timeout: 300
     env:
-      KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
-      KUBERNETES_SERVICE_PORT: "${KUBERNETES_SERVICE_PORT}"
-      HERMES_HOME: "${HERMES_HOME}"
-      GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
-      GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
-      API_SERVER_KEY: "${API_SERVER_KEY}"
-  gke:
-    command: "node"
+      KUBERNETES_SERVICE_HOST: ${KUBERNETES_SERVICE_HOST}
+      KUBERNETES_SERVICE_PORT: ${KUBERNETES_SERVICE_PORT}
+      HERMES_HOME: ${HERMES_HOME}
+      GOOGLE_CHAT_PROJECT_ID: ${GOOGLE_CHAT_PROJECT_ID}
+      GOOGLE_CHAT_SUBSCRIPTION_NAME: ${GOOGLE_CHAT_SUBSCRIPTION_NAME}
+      API_SERVER_KEY: ${API_SERVER_KEY}
+  agent_common:
+    command: /opt/hermes/.venv/bin/python3
     args:
-      - "/opt/mcp-remote/dist/proxy.js"
-      - "https://container.googleapis.com/mcp"
+      - /opt/data/scripts/agent_common_server.py
+  developer_knowledge:
+    command: /opt/hermes/.venv/bin/python3
+    args:
+      - /opt/data/scripts/mcp_http_bridge.py
+      - https://developerknowledge.googleapis.com/mcp
+    connect_timeout: 30
+    timeout: 120
 
 platform_toolsets:
   cli:
@@ -38,13 +60,16 @@ platform_toolsets:
     - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
-    - mcp-gke
   api_server:
     - hermes-api-server
     - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
-    - mcp-gke
+
+model:
+  provider: custom
+  base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
+  default: model-default
 
 memory:
   memory_enabled: false
@@ -57,31 +82,55 @@ plugins:
     - session_store
     - session_otel_bridge
     - tool_call_audit
+    - incident_context
 ```
 
 ## Sections
 
 ### `mcp_servers`
 
-MCP servers Hermes starts and connects to.
+Every MCP server the agent runs is an **in-pod stdio process**. There is no remote MCP server in the
+config, by design.
 
-- **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles chat message routing, session state, and agent-internal ops. Env vars are injected from the pod's environment (Kubernetes DNS variables, Hermes home, Chat Pub/Sub config, API server key).
-- **`gke`** — Remote GKE MCP server proxied via `mcp-remote`. All Kubernetes/GKE reads and writes route through this endpoint.
+- **`platform_control`** — In-pod Python MCP server
+  ([`platform_mcp_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/platform_mcp_server.py)).
+  Chat message routing, session state, and agent-internal ops. Env vars are injected from the pod's
+  environment.
+- **`agent_common`** — Shared utilities available to every tier (`agent_common_server.py`).
+- **`developer_knowledge`** — Google's remote documentation MCP endpoint, reached through
+  `mcp_http_bridge.py`: a small stdio-to-HTTP bridge that runs in the pod. It is read-only
+  documentation lookup, and it is the only thing in the config that leaves the cluster.
 
-`connect_timeout: 120` allows for cold-start latency; `timeout: 300` accommodates long reasoning chains.
+`connect_timeout: 120` on `platform_control` allows for cold-start latency; `timeout: 300`
+accommodates long reasoning chains.
+
+:::caution[No cluster-mutating MCP]
+Earlier drafts proxied a remote GKE MCP endpoint that could create and modify clusters. It is
+deliberately gone. The agent is read-only at the cloud boundary; the only write path is the
+`submit-suggestion` skill, which opens a reviewed GitOps PR. See
+[Read-only by construction](/kube-agents/concepts/platform-agent/).
+:::
 
 ### `platform_toolsets`
 
 Toolsets group MCP servers into named bundles for different Hermes surfaces:
 
 - **`cli`** — Exposed to the Hermes CLI (interactive terminal usage inside the pod).
-- **`api_server`** — Exposed to the Hermes REST API (Chat integrations, external callers).
+- **`api_server`** — Exposed to the Hermes REST API (chat integrations, external callers).
 
-Both include the same MCP servers plus their respective Hermes-native tools (`hermes-cli` / `hermes-api-server`). `mcp-developer_knowledge` is a documentation MCP shipped by Hermes; `mcp-agent_common` is shared agent utilities.
+Both expose the same three MCP servers, differing only in their Hermes-native tool
+(`hermes-cli` / `hermes-api-server`).
+
+### `model`
+
+Rendered by the operator, not baked: `base_url` points at the in-cluster LiteLLM Service
+(`litellm`, port 80 → container port 4000) in the agent's own namespace. See
+[Inference gateway](/kube-agents/concepts/inference-gateway/).
 
 ### `memory`
 
-Explicitly disabled — the Platform Agent doesn't retain per-user memory across sessions. Every conversation starts fresh. The `multiuser_memory` provider name is set for future use.
+Explicitly disabled — the agent doesn't retain per-user memory across sessions. Every conversation
+starts fresh. The `multiuser_memory` provider name is set for future use.
 
 ### `plugins`
 
@@ -91,6 +140,7 @@ Hermes plugins enabled:
 - **`session_store`** — durable session state (writes to the pod's persistent volume if configured).
 - **`session_otel_bridge`** — enriches OTel spans with session context (see [Session metadata](/kube-agents/concepts/observability/#session-metadata-plumbing)).
 - **`tool_call_audit`** — writes per-tool-call records for audit and debug.
+- **`incident_context`** — attaches incident state to the conversation.
 
 ## Related files
 

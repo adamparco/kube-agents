@@ -24,12 +24,15 @@ The persona runs inside the Platform Agent Deployment on top of the [Hermes runt
 
 ### MCP servers
 
-| Server             | Where                                                    | Purpose                                                 |
-| ------------------ | -------------------------------------------------------- | ------------------------------------------------------- |
-| `platform_control` | In-pod, `agents/platform/scripts/platform_mcp_server.py` | Chat message handling, session, agent-internal ops.     |
-| `gke`              | Remote via `mcp-remote` → `container.googleapis.com/mcp` | Kubernetes/GKE cluster access (read-scoped by default). |
+| Server                | Where                                                                          | Purpose                                             |
+| --------------------- | ------------------------------------------------------------------------------ | --------------------------------------------------- |
+| `platform_control`    | In-pod, `agents/platform/scripts/platform_mcp_server.py`                       | Chat message handling, session, agent-internal ops. |
+| `agent_common`        | In-pod, `agents/platform/scripts/agent_common_server.py`                       | Utilities shared by every tier.                     |
+| `developer_knowledge` | In-pod bridge (`mcp_http_bridge.py`) → `developerknowledge.googleapis.com/mcp` | Read-only documentation lookup.                     |
 
-The `gke` MCP server proxies to Google's remote MCP endpoint for GKE, so cluster reads/writes go through a first-class MCP interface rather than shelling out to `kubectl` or `gcloud`.
+Every server is an in-pod stdio process. `developer_knowledge` is the only one that talks to anything outside the cluster, and it reaches it through `mcp_http_bridge.py` — a small stdio-to-HTTP bridge that runs in the pod, with no browser and no interactive OAuth.
+
+There is deliberately **no cluster-mutating MCP server**. An earlier draft proxied a remote GKE MCP endpoint that could create and modify clusters; it was removed, because a tool that can mutate a cluster directly is a tool that can bypass review. Cluster and cloud state is read through the Kubernetes API with viewer-only credentials, and changed only by a GitOps PR a human approves.
 
 ### Toolsets
 
@@ -38,7 +41,7 @@ The `gke` MCP server proxies to Google's remote MCP endpoint for GKE, so cluster
 - `cli` — used by the Hermes CLI (interactive terminal usage).
 - `api_server` — used by the Hermes REST API (Chat, external callers).
 
-Both include `hermes-cli`/`hermes-api-server` plus `mcp-agent_common`, `mcp-platform_control`, `mcp-developer_knowledge`, and `mcp-gke`.
+Both include `hermes-cli`/`hermes-api-server` plus `mcp-agent_common`, `mcp-platform_control`, and `mcp-developer_knowledge`.
 
 ### Plugins
 

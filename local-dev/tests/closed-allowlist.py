@@ -97,7 +97,60 @@ ASSERTION_FILES = (
     # the env var, so it has to be able to name it. The emission guard below still
     # applies — it may assert the absence, never render one.
     "local-dev/kind/closed-allowlist-l2.sh",
+    # The documentation half: docs-truth.py carries the identifier in its RETIRED
+    # table so it can fail any document that still promises the hatch. Two of the
+    # falsehoods it found on its first run were exactly that (P8-T7). It is an
+    # absence assertion aimed at prose rather than at source, which is why it
+    # belongs here and not in DOC_ALLOWLIST — the emission guard should keep
+    # applying to it like any other check.
+    "local-dev/tests/docs-truth.py",
 )
+
+# What "emitting" the hatch looks like, as opposed to naming it in an absence
+# assertion. The ASSERTION_FILES exemption is only worth granting if this can
+# tell the two apart, and until P8-T7 it could not: the single pattern was the Go
+# struct-literal shape `Name:  "FOO"`, so of the eight exempted files only the Go
+# sources were actually guarded. `export SLACK_ALLOW_ALL_USERS=true` appended to
+# closed-allowlist-l2.sh passed cleanly. An exemption whose guard does not speak
+# the exempted file's language is a blanket pass wearing a guard's clothes.
+#
+# Anchors stay narrow on purpose. The assertion files are full of lines like
+# `grep -q "ALLOW_ALL_USERS"` and `carries no *_ALLOW_ALL_USERS env var`, and
+# those must stay green — an emission binds the identifier to a value, a mention
+# does not.
+EMISSION_SHAPES = (
+    # Go struct literal, YAML mapping, JSON/Python dict: a name key bound to it.
+    # The `\\?` before each quote covers the same shape nested inside a string
+    # literal — a JSON blob in a Go const, a heredoc that writes a manifest.
+    (
+        "name-keyed",
+        re.compile(r"""\\?["']?[Nn]ame\\?["']?\s*:\s*\\?["']?[A-Z_]*ALLOW_ALL_USERS"""),
+    ),
+    # Shell/dotenv assignment, with or without `export`.
+    ("assignment", re.compile(r"(?:^|[\s;({])[A-Z_]*ALLOW_ALL_USERS\s*=")),
+)
+
+# Comment markers across the languages in ASSERTION_FILES (Go, shell, YAML,
+# Python). The shapes above are matched against the code half of the line only:
+# four of the exempted files carry comments like `// ... renders
+# GOOGLE_CHAT_ALLOW_ALL_USERS=true. P8-T1 deleted it`, which is the assignment
+# shape verbatim and is also the exact prose the exemption exists to permit.
+# Narrating the removed behaviour is the point; a comment cannot set an env var.
+#
+# This does mishandle a `#` inside a shell string (`echo "# FOO=true"` reads as
+# prose). That is the right trade: the failure mode is a missed emission that
+# only echoes text, and the alternative is deleting the comments that explain
+# why the hatch is gone.
+COMMENT_MARKERS = ("//", "#")
+
+
+def code_part(line: str) -> str:
+    """The line up to its first comment marker."""
+    cut = min(
+        (line.index(m) for m in COMMENT_MARKERS if m in line),
+        default=len(line),
+    )
+    return line[:cut]
 
 # A size-only guard on an allowlist: the predicate the bypass satisfied.
 SIZE_ONLY_GO = re.compile(r"len\(\s*\w*\.?AllowedUsers\s*\)\s*[=!]=\s*0")
@@ -198,10 +251,13 @@ def check_no_permissive_identifier(root: Path, files: list[str]) -> list[str]:
             for lineno, line in enumerate(text.splitlines(), 1):
                 if FORBIDDEN_IDENT not in line:
                     continue
-                if re.search(r'Name:\s*"[A-Z_]*ALLOW_ALL_USERS"', line):
-                    errors.append(
-                        f"{rel}:{lineno}: emits the retired {FORBIDDEN_IDENT} env var"
-                    )
+                for shape, pattern in EMISSION_SHAPES:
+                    if pattern.search(code_part(line)):
+                        errors.append(
+                            f"{rel}:{lineno}: emits the retired {FORBIDDEN_IDENT} "
+                            f"env var ({shape} form)"
+                        )
+                        break
             continue
         first = next(
             lineno
@@ -337,11 +393,59 @@ def run(root: Path) -> list[str]:
 # Each control reintroduces exactly one form of the defect and asserts the
 # corresponding matcher fires. Without these, a typo'd regex reads as green.
 
+def emits(line: str) -> bool:
+    """Would check_no_permissive_identifier call this line an emission?"""
+    return any(pattern.search(code_part(line)) for _, pattern in EMISSION_SHAPES)
+
+
 NEGATIVE_CONTROLS = (
+    # One control per emission shape, in the syntax of a file that is actually
+    # exempted. The control this replaced read `FORBIDDEN_IDENT in '...'` — a
+    # substring test that never touched the regex, so it stayed green through
+    # the entire period the shell and YAML shapes went unguarded (V-MET-014).
+    ("emitted env var (Go struct literal)", lambda: emits('Name:  "SLACK_ALLOW_ALL_USERS",')),
     (
-        "emitted env var",
-        lambda: 'Name:  "SLACK_ALLOW_ALL_USERS",' and FORBIDDEN_IDENT
-        in 'Name:  "SLACK_ALLOW_ALL_USERS",',
+        "emitted env var (Go struct literal nested in a string)",
+        lambda: emits(r'const j = "{\"Name\": \"SLACK_ALLOW_ALL_USERS\"}"'),
+    ),
+    ("emitted env var (YAML mapping)", lambda: emits("        - name: SLACK_ALLOW_ALL_USERS")),
+    (
+        "emitted env var (Python/JSON dict)",
+        lambda: emits('    {"Name": "SLACK_ALLOW_ALL_USERS", "Value": "true"},'),
+    ),
+    ("emitted env var (shell export)", lambda: emits("export SLACK_ALLOW_ALL_USERS=true")),
+    ("emitted env var (bare shell assignment)", lambda: emits("SLACK_ALLOW_ALL_USERS=true")),
+    # And the other half: the lines the assertion files really contain must NOT
+    # read as emissions, or the exemption collapses into a ban and the security
+    # assertions get deleted to make the lint pass.
+    ("mention in a grep is not an emission", lambda: not emits('  grep -q "ALLOW_ALL_USERS"')),
+    (
+        "mention in prose is not an emission",
+        lambda: not emits('pass "no Deployment carries a *_ALLOW_ALL_USERS env var"'),
+    ),
+    (
+        "Go map lookup is not an emission",
+        lambda: not emits('\tif _, ok := envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"]; ok {'),
+    ),
+    (
+        "Go comment narrating the removed assignment is not an emission",
+        lambda: not emits(
+            "// that an empty allowlist renders GOOGLE_CHAT_ALLOW_ALL_USERS=true. P8-T1"
+        ),
+    ),
+    (
+        "YAML comment narrating it is not an emission",
+        lambda: not emits("#     GOOGLE_CHAT_ALLOW_ALL_USERS, which P8-T1 deleted outright"),
+    ),
+    (
+        "code before a comment is still checked",
+        lambda: emits("export SLACK_ALLOW_ALL_USERS=true  # deleted in P8-T1"),
+    ),
+    (
+        "Go range over names is not an emission",
+        lambda: not emits(
+            '\tfor _, name := range []string{"GOOGLE_CHAT_ALLOW_ALL_USERS", "SLACK_ALLOW_ALL_USERS"} {'
+        ),
     ),
     (
         "size-only Go guard",

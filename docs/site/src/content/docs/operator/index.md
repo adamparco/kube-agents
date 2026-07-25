@@ -1,11 +1,11 @@
 ---
 title: Operator overview
-description: The Kubebuilder-based Go controller that reconciles PlatformAgent custom resources.
+description: The Kubebuilder-based Go controller that reconciles Agent custom resources.
 sidebar:
   order: 0
 ---
 
-The `k8s-operator` is a Kubernetes controller that turns a `PlatformAgent` custom resource into a running Platform Agent Deployment plus everything it needs — Service, ServiceAccount, RBAC, ConfigMaps for persona and skills, and the container image reference.
+The `k8s-operator` is a Kubernetes controller that turns an `Agent` custom resource into a running agent Deployment plus everything it needs — Service, ServiceAccount, RBAC, ConfigMaps for persona and skills, and the container image reference.
 
 Source: [`k8s-operator/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator). Full README: [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md).
 
@@ -13,11 +13,11 @@ Source: [`k8s-operator/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-
 
 ```text
 k8s-operator/
-├── api/v1alpha1/           # PlatformAgent type definitions (Kubebuilder)
+├── api/v1alpha1/           # Agent type definitions (Kubebuilder)
 ├── cmd/                    # manager entrypoint
 ├── config/                 # Kustomize base for the operator + integrations
 ├── internal/               # controller reconciler logic
-├── examples/               # sample PlatformAgent CR
+├── examples/               # sample Agent CR
 ├── scripts/                # provision + teardown scripts
 ├── testing/staging_workloads/  # multi-cluster staging PoC
 ├── Dockerfile              # controller manager image
@@ -26,15 +26,16 @@ k8s-operator/
 
 ## What the operator manages
 
-A single custom resource today:
+A single custom resource, serving all three tiers:
 
-- **`PlatformAgent`** in the `kubeagents.x-k8s.io/v1alpha1` API group.
+- **`Agent`** in the `kubeagents.x-k8s.io/v1alpha1` API group, discriminated by `spec.tier`
+  (`platform`, `cluster-admin`, `developer-team`).
 
-The controller reconciles a `PlatformAgent` into:
+The controller reconciles an `Agent` into:
 
-- A `Deployment` for the Platform Agent (running the Hermes runtime).
+- A `Deployment` for the agent (running the Hermes runtime).
 - A `Service` fronting the Deployment.
-- A `ServiceAccount` (annotated for Workload Identity) plus RBAC.
+- A `ServiceAccount` (annotated for Workload Identity) plus RBAC scoped to the tier.
 - `ConfigMap`s mounting the persona (`SOUL.md`), skills, governance SOPs, and cron jobs into `/opt/data/` inside the pod.
 - Optional integrations: Google Chat Pub/Sub subscription config, Slack tokens, Minty client config.
 
@@ -42,11 +43,14 @@ The controller reconciles a `PlatformAgent` into:
 
 ```yaml
 apiVersion: kubeagents.x-k8s.io/v1alpha1
-kind: PlatformAgent
+kind: Agent
 metadata:
-  name: platformagent
+  name: agent
   namespace: kubeagents-system
+  labels:
+    kube-agents/tier: platform
 spec:
+  tier: platform
   harness:
     clusterName: cluster-a
     location: us-central1-a
@@ -54,7 +58,7 @@ spec:
       dashboardEnabled: true
       pluginsDebug: false
       apiServerSecretRef:
-        name: platformagent-secrets
+        name: platform-agent-secrets
         key: api-key
   deployment:
     image: ghcr.io/gke-labs/kube-agents/platform-agent
@@ -68,7 +72,7 @@ spec:
       # subscription config...
 ```
 
-Full walkthrough: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/).
+Full walkthrough: [Agent CRD](/kube-agents/operator/agent-crd/).
 
 ## Related resources
 

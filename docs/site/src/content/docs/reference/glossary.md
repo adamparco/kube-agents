@@ -37,7 +37,7 @@ The agent runtime the Platform Agent runs on ([nousresearch/hermes-agent](https:
 
 ### MCP (Model Context Protocol)
 
-Anthropic's protocol for exposing tools and data sources to LLMs. `kube-agents` uses MCP for the `gke` remote server and the in-pod `platform_control` server.
+Anthropic's protocol for exposing tools and data sources to LLMs. `kube-agents` runs its MCP servers in-pod — `platform_control`, `agent_common`, and `developer_knowledge` — and reaches remote HTTP MCP endpoints through the in-pod `mcp_http_bridge.py` stdio bridge.
 
 ### LiteLLM
 

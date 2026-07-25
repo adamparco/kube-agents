@@ -9,17 +9,17 @@ description: The concrete artifacts that make up kube-agents — what installs w
 
 ### 1. Kubernetes operator (`k8s-operator/`)
 
-A Go controller built with [Kubebuilder](https://kubebuilder.io) that defines the `PlatformAgent` custom resource and reconciles it into a running Platform Agent Deployment, Service, ServiceAccount, RBAC bindings, and a `ConfigMap` for the persona and skills. Source: [`k8s-operator/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator).
+A Go controller built with [Kubebuilder](https://kubebuilder.io) that defines the `Agent` custom resource — one kind discriminated by `spec.tier` — and reconciles it into a running agent Deployment, Service, ServiceAccount, RBAC bindings, and a `ConfigMap` for the persona and skills. Source: [`k8s-operator/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator).
 
 ### 2. Platform Agent (k8s-deployment)
 
-The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime](https://github.com/NousResearch/hermes-agent) (`nousresearch/hermes-agent`). Inside the pod:
+The platform-tier `Agent` CR reconciles into a Deployment running the [Hermes runtime](https://github.com/NousResearch/hermes-agent) (`nousresearch/hermes-agent`). Inside the pod:
 
 - **Persona (`SOUL.md`)** — the system prompt. Describes the Platform Agent's role, safety rails, autonomous recovery ladder, and reporting style.
 - **Skills** (`agents/platform/skills/*/SKILL.md`) — Claude-style skill bundles the agent loads on demand.
 - **Governance SOPs** (`agents/platform/governance/*.md`) — standard operating procedures the cron watchdogs invoke.
 - **Cron watchdogs** (`agents/platform/cron/jobs.json`) — scheduled autonomous jobs, each pointing at a governance SOP.
-- **MCP servers** — declared in `agents/platform/config.yaml`. Shipping today: `platform_control` (an in-pod Python MCP server for chat + agent-internal tooling) and `gke` (the [remote GKE MCP server](https://container.googleapis.com/mcp) via `mcp-remote`).
+- **MCP servers** — rendered by the operator into the pod's config (the file baked at `agents/platform/config.yaml` is a fallback). Shipping today, all in-pod: `platform_control` (chat + agent-internal tooling), `agent_common` (utilities shared by every tier), and `developer_knowledge` (read-only documentation lookup, reached through the in-pod `mcp_http_bridge.py`). There is deliberately no cluster-mutating MCP server.
 - **Toolsets** — `cli` and `api_server` variants aggregate the MCP servers into what the Hermes CLI and REST API surface.
 
 ### 3. Inference gateway
@@ -40,7 +40,8 @@ Once the [provisioning script](/kube-agents/install/quickstart-gke/) finishes, y
 
 - A GKE cluster with Workload Identity.
 - The operator controller manager Deployment.
-- One `PlatformAgent` custom resource and the reconciled Platform Agent Deployment, running Hermes.
+- Three `Agent` custom resources — platform, cluster-admin, developer-team — and the reconciled agent Deployments, running Hermes.
+- Per-tier egress NetworkPolicies and a default-deny floor on the tenant namespace (enforced only on Dataplane V2 or Calico).
 - A LiteLLM Deployment (or vLLM if you opted in).
 - A Minty Deployment plus a GCP KMS keyring and key.
 - A Google Chat Pub/Sub topic + subscription and a Kubernetes `Secret` holding your model provider API key.

@@ -19,7 +19,7 @@ flowchart TB
 
     subgraph Cluster["Kubernetes cluster"]
         OP[k8s-operator<br/>controller manager]
-        CRD[PlatformAgent CR]
+        CRD[Agent CR<br/>platform / cluster-admin / developer-team]
         PA["Platform Agent<br/>(k8s-deployment)"]
         SEC[Secret<br/>API keys, tokens]
         LM[LiteLLM / vLLM]

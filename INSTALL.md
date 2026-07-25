@@ -35,7 +35,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous **Platform Agent (`platform`)** acting as the master custodian and architect.
 
 - **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), scheduled governance jobs (`cron/jobs.json`), operational playbooks (`governance/`), and reusable skills (`skills/`).
-- **Kubernetes Operator (`k8s-operator`)**: A Kubebuilder-powered Go operator that manages Custom Resource Definitions (`PlatformAgent`) and reconciles cluster lifecycle state.
+- **Kubernetes Operator (`k8s-operator`)**: A Kubebuilder-powered Go operator that manages the `Agent` Custom Resource Definition — one kind discriminated by `spec.tier` into `platform`, `cluster-admin`, and `developer-team` — and reconciles cluster lifecycle state.
 - **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, OpenAI, Anthropic) and enterprise messaging bridges (Google Chat, Slack).
 
 ---
@@ -70,10 +70,12 @@ The automated installer executes idempotent stages sequentially:
 5. **05: Google Chat Pub/Sub Topic** (`make gcp-provision-05-gchat`)
 6. **06: Slack Configuration** (`make gcp-provision-06-slack`)
 7. **07: Kubernetes API Secrets** (`make gcp-provision-07-secrets`)
-8. **08: PlatformAgent CR Deployment** (`make gcp-provision-08-deploy`)
+8. **08: Platform-tier Agent CR** (`make gcp-provision-08-deploy`)
 9. **09: LiteLLM Gateway** (`make gcp-provision-09-litellm`)
 10. **10: GitHub Token Minter** (`make gcp-provision-10-github`)
 11. **11: Inference Replay Proxy** (`make gcp-provision-11-inference-replay`)
+12. **12: Child Agent Tiers** (`make gcp-provision-12-agent-tiers`) — cluster-admin + developer-team
+13. **13: Network Policies** (`make gcp-provision-13-network-policies`) — per-tier egress allowlist, then the tenant default-deny floor
 
 ### Step-by-Step Execution
 
@@ -116,7 +118,7 @@ Verify that the operator, LiteLLM gateway, and custom resources are healthy:
 ```bash
 kubectl get deployments -n kubeagents-system
 kubectl get pods -n kubeagents-system
-kubectl get platformagents --all-namespaces
+kubectl get agents --all-namespaces
 ```
 
 #### Step 4: ChatGPT OAuth Authentication (If Applicable)
@@ -282,11 +284,11 @@ make deploy-github
 
 ### Step 6: Apply Custom Resources
 
-Submit a sample `PlatformAgent` Custom Resource to activate cluster governance (run inside `k8s-operator/`):
+Submit a sample `Agent` Custom Resource to activate cluster governance (run inside `k8s-operator/`):
 
 ```bash
-kubectl apply -f examples/platformagent.yaml
-kubectl get platformagents -A
+kubectl apply -f examples/agent.yaml
+kubectl get agents -A
 ```
 
 ---
@@ -360,7 +362,7 @@ Two rules the helper encodes so you don't get silently-stale results:
 
 ### Phase 2 — Kind inner loop (Cluster Admin Agent + cascade)
 
-Phase 2 adds the tier-discriminated `Agent` CRD (renamed from `PlatformAgent`), the read-only
+Phase 2 adds the tier-discriminated `Agent` CRD, the read-only
 **Cluster Admin Agent** persona, the standalone **kage-router** ChatOps front door, the **F4
 provisioning cascade** (the Platform Agent proposes a subordinate cluster-admin bundle as a GitOps PR),
 and the **spoke bootstrap** ordered apply waves. Verify the whole inner loop on a local Kind cluster:
@@ -673,10 +675,12 @@ make gcp-teardown
 
 You can also run step-specific teardowns:
 
+- `make gcp-teardown-13-network-policies`: Remove the agent egress and tenant default-deny policies
+- `make gcp-teardown-12-agent-tiers`: Remove the cluster-admin and developer-team tiers
 - `make gcp-teardown-11-inference-replay`: Undeploy Inference Replay proxy
 - `make gcp-teardown-10-github`: Remove GitHub Token Minter
 - `make gcp-teardown-09-litellm`: Undeploy LiteLLM Gateway
-- `make gcp-teardown-08-deploy`: Delete PlatformAgent CR
+- `make gcp-teardown-08-deploy`: Delete the platform-tier Agent CR
 - `make gcp-teardown-07-secrets`: Delete Kubernetes secrets
 - `make gcp-teardown-06-slack`: Reset Slack configuration
 - `make gcp-teardown-05-gchat`: Remove Google Chat Pub/Sub resources

@@ -323,11 +323,21 @@ gcp-provision-12-agent-tiers: ## Step 12: Deploy the cluster-admin and developer
 	@chmod +x scripts/*.sh
 	@./scripts/provision_12_deploy_agent_tiers.sh $(ARGS)
 
+.PHONY: gcp-provision-13-network-policies
+gcp-provision-13-network-policies: ## Step 13: Apply the per-tier egress allowlist and the tenant default-deny floor.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_13_apply_network_policies.sh $(ARGS)
+
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
 
+
+.PHONY: gcp-teardown-13-network-policies
+gcp-teardown-13-network-policies: ## Teardown Step 13: Remove the agent egress and tenant default-deny NetworkPolicies.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_13_apply_network_policies.sh $(ARGS)
 
 .PHONY: gcp-teardown-12-agent-tiers
 gcp-teardown-12-agent-tiers: ## Teardown Step 12: Remove the cluster-admin and developer-team agent tiers.
