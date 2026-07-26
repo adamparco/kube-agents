@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -38,6 +39,25 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 LIB = REPO / "dev/lib/substrate-capacity.sh"
+
+# The library's ENTIRE external tool surface, plus the bash that runs it. `printf` and `command` are
+# builtins; everything else substrate-capacity.sh invokes is here. PATH for these subprocesses is
+# built from this list and nothing else.
+#
+# WHY A CURATED FARM AND NOT `/usr/bin:/bin`, measured 2026-07-26. Debian packages gcloud to
+# /usr/bin/gcloud, and so does GitHub's ubuntu-latest runner. So the previous PATH --
+# `{stub_dir}:/usr/bin:/bin`, written with a comment explaining that it keeps "a real gcloud further
+# down the path" out -- kept nothing out on Linux. The `stub is None` scenario, whose entire subject
+# is a host with NO gcloud on it, instead reached this harness's live project and printed its real
+# CPU quota (32 used of 200, us-east4): an authenticated API call, from a file whose own docstring
+# promises "no project, no credentials, no network", inside a chain whose header defines L0 as
+# needing neither cluster nor network. macOS hid it for the entire life of the Mac-only inner loop
+# for the dullest possible reason -- Homebrew and the SDK tarball both install gcloud OUTSIDE
+# /usr/bin, so the scrub happened to work on exactly one platform, the one it was written on.
+#
+# The farm also makes the dependency set explicit rather than ambient: if the library grows a call
+# to `sed`, these tests fail with `sed: command not found` instead of silently borrowing the host's.
+LIB_TOOLS = ("bash", "awk", "cat", "grep", "head", "tr", "wc")
 
 # The exact shape of the first-run defect: `gcloud compute regions describe` was passed `--filter`,
 # which is a LIST flag, so gcloud rejected the arguments and exited 2 before printing any quota.
@@ -82,12 +102,34 @@ def run_preflight(stub: str | None, env: dict[str, str] | None = None) -> subpro
             "assert_project_capacity\n"
             "echo CALLER-SURVIVED\n"
         )
-        # PATH is the stub directory ALONE plus the system minimum: a real gcloud further down the
-        # path would turn every scenario here into a test of the developer's own GCP project.
+        # PATH is the stub directory plus a farm holding ONLY the tools in LIB_TOOLS, symlinked in
+        # by name. See LIB_TOOLS for why "the system minimum" was not minimal enough.
+        toolbin = Path(tmp) / "tools"
+        toolbin.mkdir()
+        for tool in LIB_TOOLS:
+            real = shutil.which(tool)
+            if real is None:
+                raise AssertionError(
+                    f"cannot build a sanitized PATH: {tool!r} is not on this host's PATH. "
+                    f"Failing loudly rather than skipping — a skipped hermeticity test is the "
+                    f"same green as a passing one (LSN-021)."
+                )
+            (toolbin / tool).symlink_to(real)
+
         e = dict(os.environ)
         e.pop("PROJECT_ID", None)
-        e["PATH"] = f"{bindir}:/usr/bin:/bin"
+        e["PATH"] = f"{bindir}:{toolbin}"
         e.update(env or {})
+        # The sanitization, asserted rather than assumed. It was an assumption for the life of this
+        # file and the assumption was false on Linux; a comment describing an intended property is
+        # the thing that failed here, so the property gets checked on every single call.
+        reachable = shutil.which("gcloud", path=e["PATH"])
+        expected = str(bindir / "gcloud") if stub is not None else None
+        if reachable != expected:
+            raise AssertionError(
+                f"PATH leaks a gcloud this test did not put there: found {reachable!r}, "
+                f"expected {expected!r}. Every scenario below would be measuring a real project."
+            )
         return subprocess.run(
             ["bash", "-c", script], capture_output=True, text=True, env=e, timeout=60
         )

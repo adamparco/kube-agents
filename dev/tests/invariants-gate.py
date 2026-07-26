@@ -1531,6 +1531,97 @@ def check_cluster_creating_scripts_assert_capacity() -> list[str]:
     return failures
 
 
+def check_platform_idioms_are_gnu_first() -> list[str]:
+    """LSN-029. Where BSD and GNU spell a flag differently, the GNU arm is tried FIRST.
+
+    Every shell script in this tree was written on a Mac and now runs on Linux -- Cloud Build
+    containers, the ubuntu-latest CI runner, cluster nodes. For most idioms the difference is
+    cosmetic. For a few, the same letter means two unrelated things, and those do not degrade, they
+    LIE:
+
+        stat -f   BSD: a format string (`%m` = mtime).   GNU: FILESYSTEM status; `%m` is invalid.
+        date -r   BSD: render this epoch.                GNU: render this FILE's mtime.
+        date -j   BSD: do not set the clock.             GNU: no such flag.
+
+    `stat -f` is the dangerous one and it is worth spelling out why, because the failure survives
+    the guard people reach for. GNU `stat -f` writes the filesystem block to STDOUT and only then
+    exits 1. So in the natural-looking
+
+        stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+
+    the `2>/dev/null` catches nothing (the noise came out of stdout), `||` fires, and the epoch is
+    appended to six lines of block-size trivia. The caller's `[ "$m" -ge N ]` then exits 2 -- not
+    true, not false, and silent. P1 answered STALE for every build on Linux for as long as that
+    line existed, and nothing noticed while the inner loop was Mac-only.
+
+    WHY A LINT AND NOT "CI RUNS ON LINUX NOW". CI running on Linux is what FOUND this, on its first
+    green-to-red transition after the move. It is not what closes it: it only catches an idiom on a
+    path some test happens to execute, and the three `date -r` calls it did not catch sat inside a
+    P1 failure message -- a branch no green run enters, on the platform where P1 now runs. LSN-019
+    is explicit that a lesson closed against "somebody would notice" is not closed. This reads the
+    text instead, so an unexecuted branch is judged the same as an executed one.
+
+    THE RULE IS ORDER, NOT ABSENCE. Both arms are wanted -- the tree still has to work on the Mac
+    it is developed on. So a BSD form is fine exactly when its GNU counterpart appears within the
+    preceding few code lines, which covers both shapes in use here: the one-line `A || B` chain,
+    and a multi-line `case` that validates A's output before falling through to B. Scanned on code
+    lines only (LSN-023), or this docstring and the ones in preconditions.sh would trip it.
+    """
+    # (gnu, bsd, label). `date -u -d` is the same GNU arm with a timezone flag wedged in.
+    PAIRS = (
+        (re.compile(r"\bstat\s+-c\b"), re.compile(r"\bstat\s+-f\b"), "stat -c before stat -f"),
+        (
+            re.compile(r"\bdate\s+(?:-u\s+)?-d\b"),
+            re.compile(r"\bdate\s+(?:-u\s+)?-r\b"),
+            "date -d before date -r",
+        ),
+        (
+            re.compile(r"\bdate\s+(?:-u\s+)?-d\b"),
+            re.compile(r"\bdate\s+-j\b"),
+            "date -d before date -j",
+        ),
+    )
+    WINDOW = 12  # code lines; wide enough for a case/esac fallthrough, narrow enough to mean pairing
+
+    scripts = sorted(
+        p
+        for d in ("dev", "hack", "k8s-operator/scripts")
+        if (REPO / d).is_dir()
+        for p in (REPO / d).rglob("*.sh")
+    )
+    if len(scripts) < 20:
+        return [
+            f"VACUOUS: found {len(scripts)} shell scripts to scan; this tree had 60+ when the "
+            f"check was written. The directories moved and the lint stopped linting."
+        ]
+
+    failures = []
+    for path in scripts:
+        raw = path.read_text()
+        lines = _code_lines(raw).splitlines()
+        # _code_lines drops comment lines, so its indices are not file line numbers. Recover the
+        # real one by matching the text back -- a reviewer needs a number they can jump to, and a
+        # wrong-but-plausible number is the same species of defect this check is about.
+        original = raw.splitlines()
+        for gnu, bsd, label in PAIRS:
+            for i, line in enumerate(lines):
+                if not bsd.search(line):
+                    continue
+                if any(gnu.search(w) for w in lines[max(0, i - WINDOW) : i + 1]):
+                    continue
+                real = next(
+                    (n for n, r in enumerate(original, 1) if r.strip() == line.strip()), None
+                )
+                where = f"{path.relative_to(REPO)}:{real}" if real else path.relative_to(REPO)
+                failures.append(
+                    f"{where} uses a BSD-only idiom with no GNU arm within {WINDOW} code lines "
+                    f"above it — wanted {label}. On Linux the BSD form does not fail cleanly, so "
+                    f"the caller gets a plausible wrong answer rather than an error:\n"
+                    f"        {line.strip()}"
+                )
+    return failures
+
+
 CHECKS = [
     ("invariant 7 — authority never precedes machinery", check_write_verbs_have_machinery),
     ("invariant 8 / V-MET-003 — assertion ratchet", check_assertion_ratchet),
@@ -1552,6 +1643,10 @@ CHECKS = [
     (
         "LSN-027 — cluster-creating scripts measure their substrate first",
         check_cluster_creating_scripts_assert_capacity,
+    ),
+    (
+        "LSN-029 — BSD/GNU flag collisions are written GNU-first",
+        check_platform_idioms_are_gnu_first,
     ),
     ("L0 chain is runnable and wired to CI", check_l0_chain_is_runnable),
 ]

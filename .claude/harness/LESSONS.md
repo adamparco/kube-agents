@@ -57,8 +57,9 @@ will start selecting.
 | **LSN-026** | checks, infrastructure | Several unrelated security properties all "fail" at once, and the cluster is what is broken | closed | `invariants-gate.py` `check_l2_scripts_assert_cluster_health` (P10, L0-CHAIN) · `preconditions.sh` |
 | **LSN-027** | infrastructure, preflight | A preflight reports the host is fine, and the cluster still refuses to start | closed | `invariants-gate.py` `check_cluster_creating_scripts_assert_capacity` · `lib/substrate-capacity.sh` |
 | **LSN-028** | netpol, substrate | An allowlist denies the destination it lists, and the over-block reads as a fixture bug | closed | `egress-enforcement.sh` §3/§4 (run by `verify-phase7.sh` → phase5, L2-CHAIN) |
+| **LSN-029** | portability, substrate | A portability fallback runs the wrong tool first, and the failure arrives on stdout | closed | `invariants-gate.py` `check_platform_idioms_are_gnu_first` (L0-CHAIN) · `test_build_under_test_precondition.py` |
 
-**Open: 0 of 27.**
+**Open: 0 of 29.**
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -1186,3 +1187,67 @@ external arm live: on-allowlist in-cluster (10.68.0.53) ALLOWED, off-allowlist i
 (10.68.0.54) DENIED, on-allowlist EXTERNAL (1.1.1.1:443) ALLOWED by ipBlock, off-allowlist EXTERNAL
 (8.8.8.8:443) DENIED — `EGRESS ENFORCEMENT: PROVEN`. See also [[lsn-026]] and [[lsn-027]], the other
 two entries whose trigger was a change of substrate.
+
+---
+
+## LSN-029 — A portability fallback runs the wrong tool first, and the failure arrives on stdout
+
+`portability, substrate` · **closed** 2026-07-26 (P8-T8c)
+
+**Trigger.** The L0 chain was green on the Mac for the whole campaign and red the first time it ran on
+Linux. Moving the inner loop to remote GKE is what put it there: L0 now runs on `ubuntu-latest` and
+inside Cloud Build, and both reported exactly one failure —
+`test_a_dirty_build_newer_than_the_edit_is_fresh` in `dev/test_build_under_test_precondition.py`.
+One test, on the machine that had never run the suite before, in code that had been stable for phases.
+
+**Root cause.** `_p1_mtime` in `dev/lib/preconditions.sh` was written
+`stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null` — BSD first, GNU as the fallback. The two
+`stat` implementations do not merely spell the flag differently, they **collide**: BSD `-f` takes a
+format string (`%m` = mtime), GNU `-f` reports **filesystem** status and ignores the argument as a
+format. GNU then does the one thing the `A || B` idiom cannot absorb — it writes its answer to
+**stdout**, not stderr, and exits non-zero. Measured on coreutils 9.7: 245 bytes across 6 lines of
+filesystem block, after which `||` fires, the GNU branch appends the real epoch, and the caller
+captures all seven lines as "the mtime". The comparison against it exits **rc 2**, which is neither of
+the two values P1's three-state contract defines. `2>/dev/null` suppressed nothing, because nothing
+had gone to stderr. Eleven lines below, `date -u -d … || date -j -u -f …` was already GNU-first and
+already correct — the file contained both orderings and no rule saying which was which. Three more
+`date -r` calls sat in P1's FAILURE messages, BSD-first, in a branch no green run has ever entered.
+
+**Generalize.** **The `A || B` portability idiom is only sound when the losing branch is silent, and
+"silent" is a property of the specific flag collision, not of the tool.** Where the flags merely
+differ, the wrong one exits with a usage error on stderr and the fallback works. Where they collide —
+`stat -f`, `date -r`, `date -j` — the wrong one succeeds at something else and pollutes stdout, so the
+fallback runs but its output is a suffix. The rule that follows is one-directional and therefore
+checkable: **write the GNU form first**, because GNU is the side whose collisions produce output.
+Second: **a portability bug in a failure branch is invisible to every green run**, so CI running on
+Linux does not find it — only reading the text does. The same substrate change surfaced a second bug
+of the identical shape: `dev/test_capacity_preflight.py` scrubbed `PATH` to
+`{stub_dir}:/usr/bin:/bin`, which hides the real `gcloud` on macOS (Homebrew and the SDK tarball
+install elsewhere) and **exposes** it on Debian, where the SDK package ships `/usr/bin/gcloud`. A
+hermetic, no-network L0 test was making live authenticated GCP calls and printing the project's real
+CPU quota. One host assumption in a flag, one in a path, both invisible until the host changed —
+which is [[lsn-026]], [[lsn-027]] and [[lsn-028]] arriving through the toolchain instead of through
+the cluster.
+
+**Mechanization.** **`invariants-gate.py` `check_platform_idioms_are_gnu_first`**, on the L0 chain. It
+scans every `*.sh` under `dev/`, `hack/` and `k8s-operator/scripts/` for the three colliding pairs
+(`stat -c` before `stat -f`, `date -d` before `date -r`, `date -d` before `date -j`) inside a 12-line
+window, reading `_code_lines` so a comment describing the idiom cannot satisfy it ([[lsn-023]]), and
+reporting `VACUOUS` rather than green if fewer than 20 scripts are in scope. It recovers the real file
+line by matching the stripped text back to the original, so its finding is a clickable location and
+not an index into a filtered list. `_p1_mtime` is now GNU-first with an explicit numeric validation on
+each branch — `case "$t" in '' | *[!0-9]*)` — so a stdout leak from any future third implementation
+is rejected rather than compared, and the three `date -r` call sites route through one
+`_p1_human_epoch` helper. The hermeticity hole is closed by an **asserted post-condition** in
+`dev/test_capacity_preflight.py`: after the scrub, `shutil.which("gcloud", path=e["PATH"])` must
+resolve to the stub or to nothing, and a missing tool in the curated symlink farm raises
+`AssertionError` — never `SkipTest`, because a skipped hermeticity test is the same green as a passing
+one ([[lsn-021]]).
+
+**Verify.** Both platforms, measured. Old `_p1_mtime` on GNU coreutils 9.7 returns the 6-line
+filesystem block plus the epoch and drives the caller to rc 2; new `_p1_mtime` returns the exact epoch
+3/3 on macOS and 3/3 on Linux, and rc 1 with empty output on a missing file. `test_build_under_test_precondition.py`
+is 12/12 on each. The full L0 chain is **13/13 on macOS and 13/13 on Linux** — the Linux run inside
+Cloud Build against the whole tree, with `gcloud` at `/usr/bin/gcloud` to keep the leak reachable had
+it survived. The gate check was mutation-tested: reverting `_p1_mtime` to BSD-first fails the gate and
+reports `dev/lib/preconditions.sh:98`, the actual line; restored, the gate is 14/14.

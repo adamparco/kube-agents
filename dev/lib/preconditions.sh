@@ -75,8 +75,42 @@ _p1_build_inputs() {
   esac
 }
 
+# _p1_mtime <path> -> the file's mtime as a unix epoch; rc 1 and NO output if it cannot be read.
+#
+# GNU FIRST, and the order is the whole point. BSD and GNU `stat` do not merely spell this flag
+# differently, they assign OPPOSITE MEANINGS to the same letter: BSD `-f` takes a format string
+# (`%m` = mtime), GNU `-f` reports FILESYSTEM status and does not accept `%m` at all. So the
+# obvious-looking `stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null` is not a fallback
+# chain on Linux. GNU `stat -f` PRINTS THE FILESYSTEM BLOCK TO STDOUT and only then exits 1, so
+# `||` fires, the `-c %Y` epoch is appended to the block already emitted, and the caller's
+# `[ "$m" -ge N ]` gets a multi-line string and exits 2 — neither true nor false, and silent,
+# because the 2>/dev/null that was meant to hide the error hides nothing (the noise came out of
+# stdout). That is the bug this replaced: P1 reported STALE for every build on Linux, which nobody
+# saw for the whole life of the Mac-only inner loop, and which went red the first CI run after the
+# move. `date -u -d ... || date -j -u -f ...` eleven lines down at the timestamp parser was already
+# doing it in this order; only this function was inverted.
+#
+# Validating the output rather than trusting the exit status is the other half. It costs one case
+# per arm and it is what makes the arms independent — a future third platform that also exits 0 on
+# garbage falls through to the next arm instead of poisoning the comparison.
 _p1_mtime() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+  local t
+  t="$(stat -c %Y "$1" 2>/dev/null)" || t=""
+  case "$t" in '' | *[!0-9]*) t="$(stat -f %m "$1" 2>/dev/null)" ;; esac
+  case "$t" in '' | *[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$t"
+}
+
+# _p1_human_epoch <epoch> -> that epoch as a readable local timestamp; the bare epoch if it cannot be.
+#
+# `date -r` is the same trap as `stat -f`, one notch less harmful. BSD `-r` takes an EPOCH; GNU `-r`
+# takes a FILENAME, so `date -r 1700000000` on Linux looks for a file with that name, fails, and the
+# `|| echo "$epoch"` fallback prints the raw number. Nothing is corrupted -- but the only place these
+# three calls appear is inside a P1 FAILURE message, so the degradation lands exactly where a human
+# is trying to read a timestamp under pressure, on the platform where P1 now runs. GNU first for the
+# same reason as above, then BSD, then the number.
+_p1_human_epoch() {
+  date -d "@$1" 2>/dev/null || date -r "$1" 2>/dev/null || echo "$1"
 }
 
 # _p1_newest_dirty_epoch <path> -> newest mtime among DIRTY files under <path>; EMPTY if none.
@@ -194,7 +228,7 @@ _p1_assert_tag_is_current() {
   fi
   if [ -z "$cand_epoch" ]; then
     echo "P1 FAILED: the deployed image is a clean build of $cand_sha, and $inputs has UNCOMMITTED"
-    echo "  changes that are not in it (newest edit $(date -r "$dirty" 2>/dev/null || echo "$dirty"))."
+    echo "  changes that are not in it (newest edit $(_p1_human_epoch "$dirty"))."
     echo "  The commit is right and the code under test is not. Rebuild:"
     echo "      dev/cluster/reload-images.sh operator <kube-context>"
     return 1
@@ -203,8 +237,8 @@ _p1_assert_tag_is_current() {
     return 0
   fi
   echo "P1 FAILED: the deployed image was built from a dirty tree BEFORE the newest edit under $inputs."
-  echo "    image built: $(date -r "$cand_epoch" 2>/dev/null || echo "$cand_epoch")  ($cand)"
-  echo "    last edited: $(date -r "$dirty" 2>/dev/null || echo "$dirty")"
+  echo "    image built: $(_p1_human_epoch "$cand_epoch")  ($cand)"
+  echo "    last edited: $(_p1_human_epoch "$dirty")"
   echo "  Rebuild, do not skip:"
   echo "      dev/cluster/reload-images.sh operator <kube-context>"
   return 1
