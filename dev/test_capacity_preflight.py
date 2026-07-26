@@ -83,6 +83,31 @@ def gcloud_stub(**verdicts: object) -> str:
     return f'#!/bin/sh\ncase "$*" in\n{arms}\n  *) exit 0 ;;\nesac\n'
 
 
+def _lib_env_knobs() -> set[str]:
+    """Every environment variable the library reads, PARSED OUT OF THE LIBRARY.
+
+    This scrub used to be `e.pop("PROJECT_ID")` and nothing else, while `substrate-capacity.sh`
+    reads six: PROJECT_ID, REGION, AR_REPO, CAP_NEED_VCPU, CAP_REQUIRED_APIS, ALLOW_TIGHT_QUOTA.
+    Measured before changing it, and stated as measured: the hole is LATENT, not live. Re-running
+    the suite with `REGION=europe-west9` exported under the old scrub is still 9/9, because no
+    scenario here asserts on the region today. It is closed now rather than when one does, because
+    the failure it would produce -- a green on this Mac and a red on the runner, or worse the
+    reverse -- is the one this whole file was just repaired for, one layer out.
+
+    Parsed rather than listed for the reason the LSN-027 gate arm parses `# @covers:` instead of
+    carrying a table: a hardcoded list goes stale silently the first time a knob is added, and the
+    staleness looks exactly like a passing test.
+    """
+    knobs = set(re.findall(r"\$\{([A-Z_][A-Z0-9_]*)(?::[-=]|-)", LIB.read_text()))
+    if len(knobs) < 5:
+        raise AssertionError(
+            f"parsed only {len(knobs)} env knobs out of {LIB.name} ({sorted(knobs)}); it read six "
+            f"when this was written. The parse broke, so the scrub is not scrubbing — failing "
+            f"loudly rather than running a test whose inputs come partly from this shell."
+        )
+    return knobs
+
+
 def run_preflight(stub: str | None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Source the library under `set -euo pipefail` and call it, exactly as up.sh does.
 
@@ -117,7 +142,8 @@ def run_preflight(stub: str | None, env: dict[str, str] | None = None) -> subpro
             (toolbin / tool).symlink_to(real)
 
         e = dict(os.environ)
-        e.pop("PROJECT_ID", None)
+        for name in _lib_env_knobs():
+            e.pop(name, None)
         e["PATH"] = f"{bindir}:{toolbin}"
         e.update(env or {})
         # The sanitization, asserted rather than assumed. It was an assumption for the life of this

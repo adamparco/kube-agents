@@ -443,13 +443,28 @@ def check_closed_lessons_are_executable() -> list[str]:
                 f"all describe who should enforce; none of them execute."
             )
             continue
-        resolved = []
+        # EVERY named artifact must exist, not merely one of them. "One of them" is what this
+        # check asked for until 2026-07-26, and it let LSN-027 name `lib/substrate-capacity.sh`
+        # -- a path that has never existed, the file is at `dev/lib/` -- for as long as the row
+        # also named `invariants-gate.py`, which resolves. A row that half-resolves reads as a
+        # working citation and is checked as one, which is the [[lsn-023]] shape one level up:
+        # the text that describes the mechanization satisfied the check instead of the
+        # mechanization. Tightening, not relaxing (invariant 10 permits it).
+        missing = []
         for a in artifacts:
             hits = list(REPO.rglob(a)) if "/" not in a else ([REPO / a] if (REPO / a).exists() else [])
-            resolved += [h for h in hits if h.exists()]
-        if not resolved:
+            if not [h for h in hits if h.exists()]:
+                missing.append(a)
+        if len(missing) == len(artifacts):
             failures.append(
                 f"{lid} is `closed` naming {artifacts}, none of which exists on disk."
+            )
+            continue
+        if missing:
+            failures.append(
+                f"{lid} is `closed` and names {missing}, which do not exist on disk. The row's "
+                f"other citations resolve, so this reads as a working reference and is not one — "
+                f"fix the path or drop the claim."
             )
             continue
         if not any(_invoked_by(a, chain) for a in artifacts):
@@ -1583,16 +1598,30 @@ def check_platform_idioms_are_gnu_first() -> list[str]:
     )
     WINDOW = 12  # code lines; wide enough for a case/esac fallthrough, narrow enough to mean pairing
 
-    scripts = sorted(
-        p
-        for d in ("dev", "hack", "k8s-operator/scripts")
-        if (REPO / d).is_dir()
-        for p in (REPO / d).rglob("*.sh")
-    )
-    if len(scripts) < 20:
+    # Every TRACKED `*.sh`, not a directory list. A directory list was the first draft and it left
+    # eight scripts unscanned, `deploy/shared/*.sh` among them -- and those run ONLY on Linux,
+    # inside the containers, where a BSD-first idiom gets no second chance. A lint whose scope is
+    # enumerated goes quietly partial the first time a script lands somewhere new.
+    #
+    # `git ls-files` rather than rglob, for one specific reason: `k8s-operator/scripts/vars.sh` is
+    # gitignored and holds live secrets in plaintext. This check prints the offending LINE in its
+    # failure message, so a bare rglob would put a lint one bad line away from printing a token
+    # into CI logs. Tracked-only means the corpus and the publishable set are the same set.
+    try:
+        listing = subprocess.run(
+            ["git", "ls-files", "-z", "*.sh"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return [f"VACUOUS: could not enumerate tracked shell scripts ({exc}); nothing was scanned."]
+    scripts = sorted(REPO / p for p in listing.split("\0") if p and (REPO / p).is_file())
+    if len(scripts) < 60:
         return [
-            f"VACUOUS: found {len(scripts)} shell scripts to scan; this tree had 60+ when the "
-            f"check was written. The directories moved and the lint stopped linting."
+            f"VACUOUS: found {len(scripts)} tracked shell scripts to scan; this tree had 73 when "
+            f"the check was written. Either the corpus moved or the enumeration broke."
         ]
 
     failures = []

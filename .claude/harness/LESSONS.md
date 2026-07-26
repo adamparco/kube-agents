@@ -55,7 +55,7 @@ will start selecting.
 | **LSN-024** | checks, timing | A check reports a property absent; the object was correct and the read was simply early | closed | `invariants-gate.py` `check_l2_status_reads_are_polled` (P9, L0-CHAIN) |
 | **LSN-025** | checks, identity | A label selector names a role, not an object, and still matches the generation you deleted | closed | `invariants-gate.py` `check_p3_pods_resolved_by_ownership` (P3, L0-CHAIN) |
 | **LSN-026** | checks, infrastructure | Several unrelated security properties all "fail" at once, and the cluster is what is broken | closed | `invariants-gate.py` `check_l2_scripts_assert_cluster_health` (P10, L0-CHAIN) · `preconditions.sh` |
-| **LSN-027** | infrastructure, preflight | A preflight reports the host is fine, and the cluster still refuses to start | closed | `invariants-gate.py` `check_cluster_creating_scripts_assert_capacity` · `lib/substrate-capacity.sh` |
+| **LSN-027** | infrastructure, preflight | A preflight reports the host is fine, and the cluster still refuses to start | closed | `invariants-gate.py` `check_cluster_creating_scripts_assert_capacity` · `dev/lib/substrate-capacity.sh` |
 | **LSN-028** | netpol, substrate | An allowlist denies the destination it lists, and the over-block reads as a fixture bug | closed | `egress-enforcement.sh` §3/§4 (run by `verify-phase7.sh` → phase5, L2-CHAIN) |
 | **LSN-029** | portability, substrate | A portability fallback runs the wrong tool first, and the failure arrives on stdout | closed | `invariants-gate.py` `check_platform_idioms_are_gnu_first` (L0-CHAIN) · `test_build_under_test_precondition.py` |
 
