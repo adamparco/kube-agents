@@ -25,15 +25,43 @@ AGENTS := $(notdir $(patsubst %/,%,$(wildcard agents/*/)))
 
 default: docker-build
 
+# `docker build` with no --platform builds for the HOST architecture. On Apple silicon that is
+# arm64, and every node this repo deploys to is amd64: the image builds, pushes, and pulls, and
+# then the container dies with `exec format error`. Nothing upstream of the pod catches it -- the
+# tag exists, the digest resolves, `kubectl get deploy` just never reaches Ready. These targets
+# push into the same Artifact Registry a real install pulls from, so the damage outlives the build.
+#
+# Refuse rather than quietly emulate. `--platform linux/amd64` under QEMU is the slowness this
+# branch exists to delete: `make cloud-build-push` builds all seven amd64 images in parallel,
+# off-host. Set ALLOW_HOST_ARCH_BUILD=1 to build for THIS machine anyway (not for the cluster).
+HOST_ARCH := $(shell uname -m)
+
+.PHONY: assert-amd64-host
+assert-amd64-host:
+	@case "$(HOST_ARCH)" in \
+	  x86_64 | amd64) ;; \
+	  *) \
+	    if [ -z "$(ALLOW_HOST_ARCH_BUILD)" ]; then \
+	      echo "refusing: this host is $(HOST_ARCH); a plain 'docker build' here produces a" >&2; \
+	      echo "$(HOST_ARCH) image, and the nodes it would be deployed to are amd64. It would" >&2; \
+	      echo "push and pull cleanly and then die with 'exec format error'." >&2; \
+	      echo "" >&2; \
+	      echo "  make cloud-build-push      # all seven images, amd64, in parallel, off-host" >&2; \
+	      echo "  make <target> ALLOW_HOST_ARCH_BUILD=1   # build for this machine anyway" >&2; \
+	      exit 2; \
+	    fi; \
+	    echo "warning: building an $(HOST_ARCH) image (ALLOW_HOST_ARCH_BUILD is set). Do not deploy it." >&2 ;; \
+	esac
+
 # Docker builds
 docker-build: docker-build-agents docker-build-credential-proxy
 docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent))
 
 .PHONY: $(foreach agent,$(AGENTS),docker-build-$(agent))
-$(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
+$(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%: assert-amd64-host
 	docker build --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:$(TAG) -f deploy/docker/Dockerfile .
 
-docker-build-credential-proxy:
+docker-build-credential-proxy: assert-amd64-host
 	docker build --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:$(TAG) -f deploy/docker/Dockerfile .
 
 # Docker pushes
