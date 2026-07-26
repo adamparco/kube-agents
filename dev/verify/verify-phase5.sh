@@ -5,8 +5,8 @@
 # 03 §11 is the load-bearing regression) and the prior-phase regressions. Phase 5 is the merge-time
 # review gate, egress lockdown, pod hardening, and mutation attribution — so its acceptance splits into
 # a HERMETIC core (stdlib python scorer + go goldens + router audit test, all cluster-free and the
-# authoritative signal) and a LIVE core on the Kind cluster (VAP admission dry-run — GA on k8s >= 1.30 —
-# plus egress ENFORCEMENT, which kindnet cannot do and is PROVEN separately on Calico).
+# authoritative signal) and a LIVE core on the L2 cluster (VAP admission dry-run — GA on k8s >= 1.30 —
+# plus egress ENFORCEMENT, which needs a dataplane that actually enforces NetworkPolicy).
 #
 #   P5-A (a)  A PR with an unmitigated high finding is BLOCKED; a matching non-expired waiver mitigates.
 #             HERMETIC: score_findings.py — an unmitigated high exits 1 (BLOCK), a clean set exits 0
@@ -17,8 +17,8 @@
 #             STRUCTURAL: all THREE tier egress netpols are pure allowlists — policyTypes:[Egress] with a
 #             tier podSelector (default-deny) and NO 0.0.0.0/0 escape (the cloud-metadata / off-allowlist
 #             negative). LIVE: egress-enforcement.sh proves a same-shaped policy actually BLOCKS an
-#             off-allowlist dest on an enforcing CNI; rc 3 (DEFERRED on kindnet) is non-fatal here because
-#             enforcement is PROVEN on the Calico cluster (P5-T6); rc 1 (FAILED) is a halt.
+#             off-allowlist dest. Both rc 1 (FAILED) and rc 3 (no enforcing dataplane) are halts here —
+#             see the note at the call site for why rc 3 stopped being tolerated on 2026-07-26.
 #   P5-C (c)  Every agent pod runs under the hardened security context.
 #             HERMETIC: go TestAgentsGolden (full render byte-lock) + TestClusterAdminRender_LoadBearing
 #             (asserts readOnlyRootFilesystem:true on EVERY rendered container, so a golden regen can't
@@ -36,14 +36,11 @@
 #             Phase 6 (not yet built) → N-A, flagged not skipped.
 #
 # NOT covered here — deferred, NOT faked (same discipline as verify-phase2/3/4):
-#   - Egress ENFORCEMENT on Calico is a SEPARATE run (egress-enforcement.sh against the Calico cluster,
-#     P5-T6 PROVEN); on the default kindnet dev cluster it DEFERs (rc 3), which this gate treats as
-#     non-fatal and says so. The tier-netpol SHAPE is proven structurally here.
 #   - The live review-gate CI workflow (review-gate.yml) runs in GitHub Actions; its scoring core is the
-#     hermetic scorer proven above. LIVE end-to-end webhook delivery is scratch-GKE / CI, not Kind.
+#     hermetic scorer proven above. LIVE end-to-end webhook delivery is CI, not the L2 cluster.
 #   - 05 §8 chaos (failure-isolation) — Phase 6, NOT YET BUILT → N-A this phase (not a silent skip).
 #
-# DESTRUCTIVE-TEST GUARD: the live checks only run against a Kind context. The hermetic suite runs
+# DESTRUCTIVE-TEST GUARD: the live checks only run against a scratch-GKE context. The hermetic suite runs
 # anywhere (it never touches a cluster), so this gate is CI-runnable even with no cluster reachable.
 # Usage: dev/verify/verify-phase5.sh [kube-context]
 #
@@ -72,7 +69,7 @@
 #      with a rendered ConfigMap at runtime (LSN-003).
 set -uo pipefail  # -e omitted: exit codes are inspected manually.
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 K="kubectl --context $CTX"
 
@@ -85,8 +82,8 @@ VAP_READONLY=examples/gitops-repo/policy/vap-agent-readonly.yaml
 NS_PSS=examples/gitops-repo/clusters/cluster-a/namespaces/team-x/00-namespace.yaml
 
 case "$CTX" in
-  kind-*) : ;;
-  *) echo "REFUSING: context '$CTX' is not a Kind cluster (destructive-test guard)." >&2; exit 2 ;;
+  gke-scratch-*) : ;;
+  *) echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2; exit 2 ;;
 esac
 
 fail=0
@@ -188,9 +185,9 @@ pytest_ok "submit-suggestion stamps Requested-by:/Trace-Id: trailers (flag>env>a
   && pass "router audit: a delivered turn ties Sender to TraceID and carries it to dispatch (T-A)" \
   || { bad "router attribution audit test FAILED (Acc d / T-A)"; tail -20 /tmp/p5-audit.log; }
 
-# ============================ LIVE ACCEPTANCE (Kind) ============================
-# VAP admission is GA on k8s >= 1.30 (dev cluster is v1.31.x); egress enforcement needs Calico.
-echo; echo "== LIVE (Kind $CTX): VAP admission dry-run (c) + egress enforcement (b) =="
+# ============================ LIVE ACCEPTANCE (L2) ============================
+# VAP admission is GA on k8s >= 1.30; egress enforcement needs a dataplane that enforces NetworkPolicy.
+echo; echo "== LIVE ($CTX): VAP admission dry-run (c) + egress enforcement (b) =="
 if $K version >/dev/null 2>&1; then
   # P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
   # three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
@@ -265,17 +262,28 @@ EOF
     bad "could not apply pod-hardening VAP to $CTX (Acc c live)"; tail -10 /tmp/p5-vapapply.log
   fi
 
-  # (b) LIVE: egress ENFORCEMENT. kindnet does not enforce NetworkPolicy → DEFER (rc 3), non-fatal here
-  #     because P5-T6 PROVED it on the Calico cluster. rc 1 (FAILED) is a halt condition.
+  # (b) LIVE: egress ENFORCEMENT.
+  #
+  # rc 3 USED TO BE NON-FATAL and it was the right call at the time: the default inner-loop cluster ran
+  # kindnet, which accepts a NetworkPolicy and enforces nothing (LSN-006), so a deferral here was the
+  # substrate answering and enforcement was proven on a second, Calico cluster. Since 2026-07-26 the
+  # only accepted target is `gke-scratch-*`, `dev/cluster/up.sh` builds it with Dataplane V2, and P4's
+  # allow-list recognizes anetd — so there is no longer a target this script legitimately defers on.
+  # Leaving the tolerance in place would mean a cluster that silently lost its enforcing dataplane
+  # reported the same thing as one that never had one, on a BLOCKING-ALWAYS security property. rc 3 is
+  # now a failure, which is a strengthening (invariant 10 permits that direction).
   bash dev/tests/egress-enforcement.sh "$CTX" >/tmp/p5-egress.log 2>&1; erc=$?
   case "$erc" in
     0) pass "egress enforcement PROVEN live on $CTX (off-allowlist dest DENIED, on-allowlist ALLOWED)";;
-    3) note "egress enforcement DEFERRED on $CTX (kindnet does not enforce NetworkPolicy) — PROVEN separately on Calico (P5-T6). Non-fatal.";;
+    3) bad "egress enforcement could not run on $CTX — no NetworkPolicy-ENFORCING dataplane (P4). The"
+       echo "       L2 target is built with Dataplane V2, so this is a broken cluster or an allow-list that"
+       echo "       has not learned its dataplane, not an expected deferral. Acc b is unproven either way."
+       tail -20 /tmp/p5-egress.log;;
     *) bad "egress enforcement FAILED on $CTX (rc=$erc — HALT, Acc b)"; tail -20 /tmp/p5-egress.log;;
   esac
 else
   note "context '$CTX' unreachable — LIVE VAP + egress SKIPPED (hermetic acceptance above still authoritative)."
-  note "Re-run against a deployed Kind stack (INSTALL 'Phase 2 — Kind inner loop') to exercise live admission."
+  note "Re-run against a deployed L2 stack (dev/cluster/up.sh) to exercise live admission."
 fi
 
 # ============================ REGRESSION (load-bearing) ============================
@@ -304,8 +312,8 @@ done
   || { bad "go test ./... FAILED (regress)"; tail -25 /tmp/p5-gotest.log; }
 
 echo
-echo "  DEFERRED (not faked): egress ENFORCEMENT on kindnet → Calico run (P5-T6 PROVEN); live review-gate"
-echo "  webhook → GitHub Actions / scratch-GKE.  05 §8 chaos → Phase 6 (not yet built, N-A)."
+echo "  DEFERRED (not faked): live review-gate webhook → GitHub Actions.  05 §8 chaos → Phase 6"
+echo "  (not yet built, N-A).  Egress enforcement is no longer on this list: it asserts above."
 echo
 echo "===================================================================="
 if [ "$fail" -eq 0 ]; then echo " Phase 5 verification: ALL CHECKS PASSED"; else echo " Phase 5 verification: FAILURES ABOVE (see HALT conditions)"; fi

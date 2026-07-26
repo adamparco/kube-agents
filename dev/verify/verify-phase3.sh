@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 3 (Developer Team Agent + isolation proof) — consolidated Kind verification harness.
+# Phase 3 (Developer Team Agent + isolation proof) — consolidated L2 verification harness.
 #
 # Re-runnable gate for the load-bearing inner-loop suites (07 §2 Phase 3 Accept + 03 §3/§11):
 #   P3-K1  placement clause (A1)      — matching metadata.namespace==scope.namespace ADMITTED;
@@ -16,19 +16,22 @@
 #   P3-K7  cascade render -> VAP      — render_developer_team.py identity ADMITTED (dry-run);
 #                                        write-verb tamper DENIED
 #
-# NOT covered here (need infra beyond a single kindnet node — run separately):
-#   Calico EGRESS ENFORCEMENT — kindnet does NOT enforce NetworkPolicy, so P3-K6 proves the policy is
-#         STRUCTURALLY correct (shape, tier selector, zero 0.0.0.0/0, server-dry-run valid) only.
-#         Enforcement (agent pod cannot reach 169.254.169.254 / the open internet) is proven on a
-#         throwaway Calico cluster; see docs/build/LEDGER.md §Verification log. Do NOT read a green
-#         P3-K6 as "egress is enforced on this cluster".
+# NOT covered here (run separately):
+#   EGRESS ENFORCEMENT — P3-K6 proves the policy is STRUCTURALLY correct (shape, tier selector, zero
+#         0.0.0.0/0, server-dry-run valid) and nothing more. Enforcement — the agent pod actually
+#         cannot reach 169.254.169.254 or the open internet — is a different claim needing traffic,
+#         and it is `dev/verify/egress-enforcement-l2.sh`, one line up the same L2 chain. The split is
+#         not an artifact of the substrate: it was one until 2026-07-26 (kindnet accepted these
+#         policies and enforced none of them, LSN-006), but the L2 cluster now runs GKE Dataplane V2
+#         and enforces for real. Two scripts because they are two claims. Do NOT read a green P3-K6 as
+#         "egress is enforced on this cluster" — read egress-enforcement-l2.sh's exit code for that.
 #   Router go-test suites — deterministic: `cd k8s-operator && go test ./...`.
-#   V-G* — scratch-GKE cloud identity / cross-cluster / live chat.
+#   V-G* — cloud identity / cross-cluster / live chat.
 #
-# PREREQUISITE: the full stack is deployed to the target Kind cluster
-#   (cert-manager + `make deploy` + the VAP). See INSTALL.md "Phase 2 — Kind inner loop".
+# PREREQUISITE: the full stack is deployed to the target cluster (cert-manager + `make deploy` + the
+#   VAP). `dev/cluster/up.sh` produces exactly that; see INSTALL.md "Method 3 — Remote Development".
 #
-# DESTRUCTIVE-TEST GUARD: only runs against a Kind context.
+# DESTRUCTIVE-TEST GUARD: only runs against a scratch-GKE context.
 # Usage: dev/verify/verify-phase3.sh [kube-context]
 #
 # PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
@@ -53,11 +56,11 @@
 #      applied object, and that is deliberate and stated: 30-netpol-*.yaml carries REPLACE_WITH_* CIDR
 #      placeholders and is therefore NEVER applied live here, so the tree file is the only artifact
 #      that exists to judge — which is also why P3-K6 is a SHAPE claim and not an enforcement one
-#      (kindnet enforces nothing; see the deferral above). No claim here reads the image-baked config
+#      (a file is not traffic; see the pointer above). No claim here reads the image-baked config
 #      file that the operator shadows with a rendered ConfigMap at runtime (LSN-003).
 set -uo pipefail  # -e omitted: kubectl exit codes are inspected manually.
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 K="kubectl --context $CTX"
 NS=kubeagents-system
@@ -68,8 +71,8 @@ CR="$TEAMX/60-developer-team-agent.yaml"
 IDENTITY="$TEAMX/50-developer-team-identity.yaml"
 
 case "$CTX" in
-  kind-*) : ;;
-  *) echo "REFUSING: context '$CTX' is not a Kind cluster (destructive-test guard)." >&2; exit 2 ;;
+  gke-scratch-*) : ;;
+  *) echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2; exit 2 ;;
 esac
 
 fail=0
@@ -84,7 +87,7 @@ cd "$REPO_ROOT"
 p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
 
 echo "===================================================================="
-echo " Phase 3 Kind verification — context: $CTX"
+echo " Phase 3 verification — context: $CTX"
 echo "===================================================================="
 
 # --- Preconditions: CRD present, VAP enforcing, K8s >= 1.30 ------------------------------------
@@ -141,8 +144,12 @@ p3_force_recreate "$K" "$NSX" deploy/developer-team-team-x-gateway 90 \
 # cannot return a pod belonging to the generation P3 just deleted, and the three assertions below all
 # read the same pinned object (LSN-024).
 pod="$(p3_pod_of_deploy "$K" "$NSX" developer-team-team-x-gateway 120)"
-# Existence, not Ready: the pod stays Pending on a single-node dev Kind (prod-correct ~2Gi+ requests),
-# and every field read below lives in the spec, which a Pending pod already has.
+# Existence, not Ready: this reads spec fields only, and a Pending pod already has all of them. Kept
+# deliberately weak. It was written weak because the pod stayed Pending on the old single-node host,
+# and it stays weak because Ready is not what P3-K2 claims — the claim is what the operator RENDERED
+# (serviceAccountName, image, tier label), which is decided at admission. Requiring Ready here would
+# couple three renderer assertions to image pulls and scheduling, and fail them for reasons that have
+# nothing to do with the renderer.
 [ -n "$pod" ] \
   && pass "controller re-rendered the dev-team pod after the forced recreate (fresh admission, current renderer): $pod" \
   || bad "no pod owned by the current dev-team Deployment within 120s of the forced recreate — the assertions below would read nothing (HALT cond 4)"
@@ -189,7 +196,7 @@ if [ $rc -ne 0 ] && echo "$out" | grep -qiE 'immutable'; then pass "tier PATCH R
 echo; echo "== P3-K5: VAP attenuation (negative-attenuation.sh) =="
 if bash dev/tests/negative-attenuation.sh "$CTX"; then pass "VAP attenuation suite green"; else bad "VAP attenuation suite FAILED (HALT cond 1)"; fi
 
-# --- P3-K6: namespace isolation shape (structural; Calico enforcement deferred) ----------------
+# --- P3-K6: namespace isolation shape (structural; enforcement is egress-enforcement-l2.sh) ----
 echo; echo "== P3-K6: namespace isolation netpol shape + ExternalName aliases =="
 DD="$TEAMX/20-netpol-default-deny.yaml"
 EG="$TEAMX/30-netpol-developer-team-egress.yaml"
@@ -209,7 +216,7 @@ printf '%s' "$sub" | $K apply --dry-run=server -f - >/dev/null 2>&1 && pass "egr
 if grep -q 'type: ExternalName' "$AL" && grep -q 'name: litellm' "$AL" && grep -q 'name: github-token-minter' "$AL"; then
   pass "ExternalName aliases present (litellm, github-token-minter)"
 else bad "ExternalName service aliases missing (litellm / github-token-minter)"; fi
-echo "  NOTE: kindnet does not enforce NetworkPolicy — egress ENFORCEMENT is proven on Calico separately."
+echo "  NOTE: every check above judges YAML. ENFORCEMENT is dev/verify/egress-enforcement-l2.sh."
 
 # --- P3-K7: cascade render -> VAP dry-run (rendered admit; write-verb tamper deny) -------------
 echo; echo "== P3-K7: cascade render -> VAP dry-run =="
@@ -237,6 +244,6 @@ else echo "  (skip P3-K7 — python3 not found)"; fi
 
 echo
 echo "===================================================================="
-if [ "$fail" -eq 0 ]; then echo " Phase 3 Kind verification: ALL CHECKS PASSED"; else echo " Phase 3 Kind verification: FAILURES ABOVE (see HALT conditions)"; fi
+if [ "$fail" -eq 0 ]; then echo " Phase 3 verification: ALL CHECKS PASSED"; else echo " Phase 3 verification: FAILURES ABOVE (see HALT conditions)"; fi
 echo "===================================================================="
 exit "$fail"

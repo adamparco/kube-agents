@@ -4,7 +4,8 @@
 # Proves the design's central resilience claim — NO CASCADE FAILURE (04 §6) — by killing things and
 # asserting that (1) running state and the other tiers survive, and (2) the controller relaunches what it
 # owns. This is the load-bearing 05 §8 "failure isolation (chaos)" bullet, deferred N-A through Phases 4-5
-# and now live. It adds no new agent behaviour and no write path; every op is reversible and Kind-guarded.
+# and now live. It adds no new agent behaviour and no write path; every op is reversible and the target
+# is guarded to a scratch cluster.
 #
 #   C1  Controller DOWN -> running pods CONTINUE + NO new reconciles + reconcile RESUMES on restart.
 #         Scale kubeagents-controller-manager -> 0. A Running stand-in pod stays UID-stable + Ready
@@ -33,13 +34,13 @@
 #
 # DEFERRED, NOT FAKED (04 §6 honest scoping, D3): the LITERAL "spoke agent pauses because it cannot reach
 # real hub-hosted inference/Minty over private networking" needs a real hub + inference across two clusters
-# (scratch-GKE) — C4 proves the load-bearing half (cluster state + workloads survive hub loss) on Kind and
-# defers the agent-reasoning-pause. Never asserted green here.
+# — C4 proves the load-bearing half (cluster state + workloads survive hub loss) on the one L2 cluster
+# and defers the agent-reasoning-pause. Never asserted green here.
 #
 # FIXTURES (D1): controller *reconcile-behaviour* (C1 no-reconcile/resume, C2 Deployment relaunch) uses the
 # REAL Agent CR + REAL controller — observed on the Deployment object, faithful even though the real agent
-# pod stays Pending on the single-node dev Kind (the controller bakes prod-correct ~2Gi+ requests across a
-# 4-container pod). *Pod-continuity / no-cascade* (C1/C3/C4 running-pod claims) uses lightweight stand-in
+# pod may stay Pending if the node pool is small (the controller bakes prod-correct ~2Gi+ requests across
+# a 4-container pod, and `up.sh` sizes for two of them, not many). *Pod-continuity / no-cascade* (C1/C3/C4 running-pod claims) uses lightweight stand-in
 # Deployments labeled kube-agents/tier with the FULL hardened securityContext (so they are admitted under
 # the same PSS-restricted + pod-hardening-VAP ceiling a real agent faces), running registry.k8s.io/pause
 # with tiny requests so they schedule. A stand-in is a faithful proxy for the K8s-level "independent
@@ -49,7 +50,7 @@
 # polling that X's exact pod stays present + Ready across the ENTIRE disruption window (not one snapshot);
 # "Z is relaunched/reconciled" waits for the new object with a bounded timeout that FAILS loudly if absent.
 #
-# DESTRUCTIVE-TEST GUARD (D2): only runs against a Kind context; every op is reversible + single-object; a
+# DESTRUCTIVE-TEST GUARD (D2): only runs against a scratch-GKE context; every op is reversible + single-object; a
 # cleanup trap restores the controller replica count and removes kube-agents-chaos on any exit.
 # Usage: dev/verify/chaos-suite.sh [kube-context]
 #
@@ -77,7 +78,7 @@
 #      ConfigMap (LSN-003) is out of scope by construction.
 set -uo pipefail  # -e omitted: exit codes are inspected manually.
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 K="kubectl --context $CTX"
 
@@ -90,8 +91,8 @@ REAL_CR=cluster-admin-cluster-a
 PAUSE=registry.k8s.io/pause:3.9
 
 case "$CTX" in
-  kind-*) : ;;
-  *) echo "REFUSING: context '$CTX' is not a Kind cluster (destructive-test guard)." >&2; exit 2 ;;
+  gke-scratch-*) : ;;
+  *) echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2; exit 2 ;;
 esac
 
 fail=0
@@ -389,8 +390,8 @@ fi
 
 # ---- restore pre-chaos steady state (regression-safety, D2) -----------------------------------------
 # C1/C2 delete the real agent Deployment and let the controller recreate it; wait for its POD object to
-# exist again (Pending is expected on single-node dev Kind — the controller bakes prod-correct ~2Gi+
-# requests) so the post-chaos regression (e.g. verify-phase2 V-K9, which reads that pod) sees steady state.
+# exist again (Pending is tolerated — the controller bakes prod-correct ~2Gi+ requests and this waits for
+# the OBJECT, not for Ready) so the post-chaos regression (e.g. verify-phase2 V-K9, which reads that pod) sees steady state.
 echo; echo "== restore pre-chaos steady state: real agent pod recreated =="
 settle_ok=0
 for _ in $(seq 1 40); do
@@ -406,8 +407,8 @@ fi
 
 echo
 echo "  DEFERRED (not faked, D3): the LITERAL spoke agent-reasoning-pause under real hub loss (no real"
-echo "  inference/Minty over private networking) → two-cluster / scratch-GKE. C4 proves the load-bearing"
-echo "  half (cluster state + workloads survive hub loss) on Kind."
+echo "  inference/Minty over private networking) → needs a second cluster. C4 proves the load-bearing"
+echo "  half (cluster state + workloads survive hub loss) here."
 echo
 echo "===================================================================="
 if [ "$fail" -eq 0 ]; then echo " Phase 6 chaos suite: ALL CHECKS PASSED"; else echo " Phase 6 chaos suite: FAILURES ABOVE (see HALT conditions)"; fi

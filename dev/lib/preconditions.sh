@@ -6,7 +6,7 @@
 # install), LSN-002 once, and both were recorded closed against a precondition ID that nothing
 # executes. The scripts that "honour P1" honoured it by printing a reminder:
 #
-#     echo "  NOTE (P1): rebuild + kind load + rollout restart before trusting a green run here."
+#     echo "  NOTE (P1): rebuild + push + rollout restart before trusting a green run here."
 #
 # A note is addressed to whoever already knows. The failure mode of both lessons is a run that looks
 # green, so the only useful form is one that turns the run red.

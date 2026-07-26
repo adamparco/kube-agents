@@ -500,12 +500,17 @@ def check_l0_chain_is_runnable() -> list[str]:
 # LSN-005 — the destructive-test guard stays anchored
 # ---------------------------------------------------------------------------------------------
 
-# A script whose context comes from the caller: `CTX="${1:-kind-...}"`. Those are the ones that can
-# be pointed anywhere. up.sh builds `kind-$CLUSTER` itself and is not in scope -- there is no
-# argument to aim at the live cluster.
+# A script whose context comes from the caller: `CTX="${1:-gke-scratch-...}"`. Those are the ones
+# that can be pointed anywhere. up.sh derives its context from the cluster it just created and is
+# not in scope -- there is no argument to aim at the live cluster.
 CALLER_CTX = re.compile(r'^\s*CTX="?\$\{\d+:-', re.MULTILINE)
 CASE_ON_CTX = re.compile(r'case\s+"?\$(?:\{)?CTX(?:\})?"?\s+in(.*?)^\s*esac', re.MULTILINE | re.DOTALL)
-ANCHORED_ARM = re.compile(r"^(?:kind|gke-scratch)-[A-Za-z0-9*_.-]*\*?$")
+# One anchor, since 2026-07-26. `kind-` was the second accepted prefix until the inner loop moved
+# off the host; dropping it NARROWS what these scripts will run against, which invariant 10 permits
+# in the strengthening direction only -- and this is that direction. A stale `kind-*` arm left here
+# would be worse than cosmetic: it is an accepted prefix with nothing behind it, so the first script
+# to acquire one would be accepted by a guard nobody is maintaining.
+ANCHORED_ARM = re.compile(r"^gke-scratch-[A-Za-z0-9*_.-]*\*?$")
 
 
 def _case_arms(body: str) -> tuple[list[str], str | None]:
@@ -540,9 +545,9 @@ def check_destructive_guards_are_anchored() -> list[str]:
     §Targets classifies the live cluster `platform-agent-host` as install verification only, and
     `kubectl config current-context` may well be pointing at it right now.
 
-    The assertion is specifically about ANCHORING, not about the guard existing. `*kind*)` and
-    `[[ $CTX == *kind* ]]` both look like guards and both accept `platform-agent-host-kind-backup`;
-    an anchored `kind-*` cannot. LSN-005 is the substring-match lesson, so a check that only
+    The assertion is specifically about ANCHORING, not about the guard existing. `*scratch*)` and
+    `[[ $CTX == *scratch* ]]` both look like guards and both accept `my-gke-scratch-of-prod`; an
+    anchored `gke-scratch-*` cannot. LSN-005 is the substring-match lesson, so a check that only
     asserted "there is a case statement" would pass the exact code the lesson is about.
     """
     scripts = sorted((REPO / "dev").rglob("*.sh"))
@@ -572,7 +577,7 @@ def check_destructive_guards_are_anchored() -> list[str]:
         for pat in arms:
             if not ANCHORED_ARM.match(pat):
                 failures.append(
-                    f"{rel}: guard arm {pat!r} is not anchored to `kind-` or `gke-scratch-`. "
+                    f"{rel}: guard arm {pat!r} is not anchored to `gke-scratch-`. "
                     f"A leading or interior `*` makes this a substring match, which is LSN-005 "
                     f"verbatim — the live cluster is one character away from matching."
                 )

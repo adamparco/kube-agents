@@ -3,10 +3,10 @@
 #
 # Phase 7 is the FINAL roadmap phase (07 §2 "Phase 7 — Cloud-agnostic seams (later)"). It adds NO new
 # persona, NO new agent capability, and NO new write path — it turns three already-unopinionated seams
-# into real, tested artifacts and proves the cloud-neutral core on a vanilla, non-GKE target while
-# HONESTLY DEFERRING the pieces that need a real second cloud. This script proves the phase Accept
-# criteria (a–c) and re-runs every prior gate so the cloud-agnostic refactor did not weaken the
-# read-only ceiling, isolation, or resilience.
+# into real, tested artifacts and proves as much of the cloud-neutral core as the provisioned targets
+# can carry, while HONESTLY DEFERRING the pieces that need a target this build does not have. This
+# script proves the phase Accept criteria (a–c) and re-runs every prior gate so the cloud-agnostic
+# refactor did not weaken the read-only ceiling, isolation, or resilience.
 #
 #   A. NET-NEW seam artifacts (hermetic — structural + semantic; no cluster needed) ---------------
 #        P7-T1  iac-parity.py        — real Terraform HCL exemplar (cluster-b, iac.format: terraform)
@@ -22,20 +22,31 @@
 #                                      zero-config default (unset ⇒ byte-for-byte no regression) and a
 #                                      documented non-GCP path.                              (Accept c)
 #
-#   B. P7-T4 — VANILLA (Kind, non-GKE) CORE-CONCEPT ACCEPTANCE (Accept c) -------------------------
-#      Kind is a vanilla, non-GKE Kubernetes distribution (kindnet CNI, no GKE/GCP API). On it the
-#      Phase-1–3 CLOUD-NEUTRAL core concepts hold with NO GKE dependency:
+#   B. P7-T4 — CORE-CONCEPT ACCEPTANCE (Accept c) --------------------------------------------------
+#      The Phase-1–3 CLOUD-NEUTRAL core concepts must hold with NO GKE dependency:
+#        B0  the target is a VANILLA, non-GKE distribution — DEFERRED as of 2026-07-26. Until then the
+#            inner loop ran on Kind (kindnet CNI, no GKE/GCP API), and this criterion was PROVEN by
+#            asserting the node kubeletVersion carried no `-gke` suffix. The inner loop is now the
+#            remote GKE dev cluster and no non-GKE Kubernetes target is provisioned, so the criterion
+#            has nothing to run against. It is recorded as a deferral (D4, below; LEDGER §Deferrals)
+#            rather than deleted, because the criterion is still the right one and the blocker is
+#            purely which clusters exist. B1 and B2 do not depend on it at all, and B3 loses only its
+#            PORTABILITY reading — see there.
 #        B1  deterministic ChatOps routing — go-test TestGateway_ThreadAffinity: a bound thread's bare
 #            follow-up sticks with inference_calls==0 (the router core is deterministic, no model call).
 #        B2  no-GKE-dependency assertion (static) — the core RBAC / webhook / VAP / router MECHANISM
-#            path references no *.googleapis.com host and no GKE-only API group. (The cloud-COUPLED
+#            path references no *.googleapis.com host and no GKE-only API group. This is the
+#            load-bearing cloud-neutrality assertion, it is hermetic, and B0's deferral does not touch
+#            it: it reads the mechanism source, not the cluster under it. (The cloud-COUPLED
 #            identity — the iam.gke.io/gcp-service-account WI annotation on the read-only identities —
 #            is the one GKE-specific seam a 2nd cloud swaps for IRSA / AAD Workload Identity; it is
 #            DEFERRED-NOT-FAKED per D1, never asserted clean here.)
-#        B3  live core concepts on this vanilla target — verify-phase2.sh + verify-phase3.sh:
-#            read-only per-tier SAR (get/list/watch only; no writes; no priv-esc), GitOps-PR-only
-#            mutation (VAP attenuation ceiling), namespace isolation, the (tier,scope) cardinality
-#            webhook + tier immutability — all pure-Kubernetes, no GKE API.
+#        B3  live core concepts — verify-phase2.sh + verify-phase3.sh: read-only per-tier SAR
+#            (get/list/watch only; no writes; no priv-esc), GitOps-PR-only mutation (VAP attenuation
+#            ceiling), namespace isolation, the (tier,scope) cardinality webhook + tier immutability —
+#            all pure-Kubernetes, no GKE API. These still RUN and are still load-bearing; what they no
+#            longer are, while B0 is deferred, is evidence of PORTABILITY, because the target they run
+#            on is the same distribution as the live install.
 #
 #   C. P7-T5 — FULL REGRESSION (must stay green — HALT on failure) --------------------------------
 #        verify-phase6.sh → 05 §8 chaos C1–C4 (no cascade) + verify-phase{2,3,4,5}.sh (prior Accept,
@@ -45,14 +56,19 @@
 #
 # DEFERRED, NOT FAKED (recorded, never asserted green):
 #   D1  a real SECOND CLOUD — EKS/AKS cluster + cloud identity (IRSA / AAD WI) + a live second-cloud
-#       apply. Kind proves the cloud-NEUTRAL core; the cloud-COUPLED identity binding is deferred.
+#       apply. B2 proves the cloud-NEUTRAL core statically; the cloud-COUPLED identity binding is deferred.
 #   D2  CLI-level IaC validation — `terraform validate`/`fmt`/`apply` (no terraform binary; structural
-#       + semantic parity proven hermetically instead — same pattern as Calico for kindnet's NetworkPolicy).
+#       + semantic parity proven hermetically instead).
 #   D2b `circleci config validate` (no circleci binary — structural + dispatch parity proven hermetically).
 #   D3  a live NON-GCP observability backend queried end-to-end (query translation is backend-specific).
-#   (Also still carried: the scratch-GKE V-G cloud checks, and the 08 §5 deferred hardening.)
+#   D4  a vanilla, non-GKE Kubernetes TARGET (B0) — new 2026-07-26, weaker than D1 and separately
+#       promotable: D1 wants a second CLOUD with its own identity system, D4 wants only a second
+#       DISTRIBUTION (a k3s VM would discharge it). Blocker: no non-GKE target is provisioned.
+#   (Also still carried: the V-G cloud checks — the ephemeral Autopilot cluster they named was retired
+#   on 2026-07-26 and the L2 dev cluster has Workload Identity of its own, so the BLOCKER changed from
+#   "no GKE target" to "nobody has written them"; and the 08 §5 deferred hardening.)
 #
-# DESTRUCTIVE-TEST GUARD: only runs against a Kind context (verify-phase6 → chaos-suite scales/deletes
+# DESTRUCTIVE-TEST GUARD: only runs against a scratch-GKE context (verify-phase6 → chaos-suite scales/deletes
 # reversible, single-object, self-cleaning fixtures; guarded the same way in every prior phase).
 # Usage: dev/verify/verify-phase7.sh [kube-context]
 #
@@ -74,12 +90,12 @@
 #      /opt/data/config.yaml that it is mounted over (LSN-003).
 set -uo pipefail
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 case "$CTX" in
-  kind-*) : ;;
-  *) echo "REFUSING: context '$CTX' is not a Kind cluster (destructive-test guard)." >&2; exit 2 ;;
+  gke-scratch-*) : ;;
+  *) echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2; exit 2 ;;
 esac
 
 fail=0
@@ -140,17 +156,46 @@ else
 fi
 run_hermetic "otel-endpoint" bash dev/tests/otel-endpoint.sh "$REPO_ROOT"                # T3 (Accept c)
 
-# ==== B. P7-T4 — vanilla (Kind, non-GKE) core-concept acceptance (Accept c) ==========================
-echo; echo "== B. P7-T4 vanilla core-concept acceptance — the cloud-neutral core holds on a non-GKE target =="
+# ==== B. P7-T4 — core-concept acceptance (Accept c) ==================================================
+echo; echo "== B. P7-T4 core-concept acceptance — the cloud-neutral core, and what proves it =="
 
-# Confirm the target really is a vanilla, non-GKE distribution (so 'passes on a 2nd target' is honest).
-# Read the SERVER-side node kubeletVersion (authoritative) — NOT `kubectl version`'s first gitVersion,
-# which is the client build (this host's kubectl is gcloud's `-gke` kubectl and would mis-flag Kind).
+# --- B0: is the target a vanilla, non-GKE distribution? — DEFERRED (D4) ------------------------------
+# This used to be an ASSERTION, and it passed: the inner loop was Kind, so `bad` on a `-gke` suffix was
+# a criterion with a target behind it. On 2026-07-26 the loop moved to a remote GKE dev cluster and no
+# non-GKE Kubernetes target is provisioned anywhere in this build, so the assertion has nothing left to
+# be true about.
+#
+# The three ways to handle that, and why this is the third. (1) Delete the criterion: that is
+# weakening a phase Accept criterion because it became inconvenient, and it leaves 07 §5 Accept (c)
+# claiming coverage that does not exist. (2) Keep asserting: on the only reachable target it would
+# fail every run, so it would be muted or ignored within a week, which is worse than either honest
+# answer. (3) Defer it, with a named blocker and a promotion condition, and keep printing it every
+# run so the gap stays visible — 09 §6, and the same shape as D1/D2/D3 below.
+#
+# The kubeletVersion is still READ and REPORTED. A deferral that stops looking cannot tell you the day
+# the blocker lifts; this one prints what it found, so pointing the suite at a k3s VM shows up in the
+# output before anyone edits a file.
 if [ "$reachable" -eq 1 ]; then
   gv="$(kubectl --context "$CTX" get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null)"
-  cni="$(kubectl --context "$CTX" -n kube-system get pods -o name 2>/dev/null | grep -m1 -iE 'kindnet|calico' || true)"
-  case "$gv" in *gke*|*-gke.*) bad "target node kubeletVersion '$gv' is a GKE build — not a vanilla 2nd target";; *) pass "target is vanilla upstream Kubernetes (node kubeletVersion $gv, no GKE suffix)";; esac
-  [ -n "$cni" ] && note "CNI is ${cni##*/} (a generic CNI, not a GKE-managed dataplane)"
+  case "$gv" in
+    *gke*|*-gke.*)
+      defer "B0 vanilla non-GKE target (Accept c) — node kubeletVersion '$gv' is a GKE build. No"
+      echo "           non-GKE Kubernetes target is provisioned (D4; LEDGER §Deferrals). B1/B2 below are"
+      echo "           cluster-independent and still assert; B3 still runs, but on this target it is"
+      echo "           evidence the core WORKS, not evidence that it PORTS."
+      ;;
+    "")
+      defer "B0 vanilla non-GKE target (Accept c) — could not read the node kubeletVersion from '$CTX'."
+      ;;
+    *)
+      # The blocker lifted. Not a silent upgrade to `pass`: promoting a deferral is a ledger edit
+      # (invariant 12) and this says so, loudly, on the run that first makes it possible.
+      pass "target is vanilla upstream Kubernetes (node kubeletVersion $gv, no GKE suffix)"
+      note "D4's blocker no longer holds on this target. PROMOTE the deferral: restore B0 as an"
+      note "  assertion, close the LEDGER §Deferrals row for the vanilla target, and point 07 §5"
+      note "  Accept (c) back at this line."
+      ;;
+  esac
 else
   note "context '$CTX' unreachable — B1/B2 (hermetic/static) still run; B3 (live) will be skipped"
 fi
@@ -201,19 +246,19 @@ fi
 defer "cloud-COUPLED identity — the iam.gke.io/gcp-service-account WI annotation on the read-only"
 echo "           identities is the one GKE-specific binding a 2nd cloud swaps for IRSA / AAD WI (D1)."
 
-# --- B3: live core concepts on this vanilla target — verify-phase{2,3}.sh ----------------------------
-echo; echo "-- B3: live core concepts on vanilla Kind — read-only SAR, isolation, cardinality webhook, VAP --"
+# --- B3: live core concepts — verify-phase{2,3}.sh ---------------------------------------------------
+echo; echo "-- B3: live core concepts — read-only SAR, isolation, cardinality webhook, VAP --"
 if [ "$reachable" -eq 1 ] && [ "$live_ok" -eq 1 ]; then
   if bash dev/verify/verify-phase2.sh "$CTX" >/tmp/p7-phase2.log 2>&1; then
-    pass "verify-phase2.sh green on vanilla Kind (cluster-admin read-only SAR + cardinality webhook + VAP attenuation)"
+    pass "verify-phase2.sh green (cluster-admin read-only SAR + cardinality webhook + VAP attenuation)"
   else
-    bad "verify-phase2.sh FAILED on vanilla Kind — a core concept does not hold on the 2nd target (HALT)"
+    bad "verify-phase2.sh FAILED — a core concept does not hold on the L2 target (HALT)"
     tail -25 /tmp/p7-phase2.log
   fi
   if bash dev/verify/verify-phase3.sh "$CTX" >/tmp/p7-phase3.log 2>&1; then
-    pass "verify-phase3.sh green on vanilla Kind (dev-team namespace isolation + read-only SAR + placement)"
+    pass "verify-phase3.sh green (dev-team namespace isolation + read-only SAR + placement)"
   else
-    bad "verify-phase3.sh FAILED on vanilla Kind — namespace isolation / SAR does not hold on the 2nd target (HALT)"
+    bad "verify-phase3.sh FAILED — namespace isolation / SAR does not hold on the L2 target (HALT)"
     tail -25 /tmp/p7-phase3.log
   fi
 elif [ "$live_ok" -eq 3 ]; then
@@ -237,7 +282,7 @@ if [ "$reachable" -eq 1 ] && [ "$live_ok" -eq 1 ]; then
 elif [ "$live_ok" -eq 3 ]; then
   defer "the full regression — P1 unverifiable. This is a deferral and NOT a pass: the suite is"
   echo "           load-bearing, so a run that cannot establish which code it exercised does not"
-  echo "           discharge it. Rebuild, kind load, rollout restart, and run this again."
+  echo "           discharge it. Run dev/cluster/reload-images.sh operator $CTX, then run this again."
   fail=1
 else
   bad "context '$CTX' unreachable or not running the build under test — the full regression (chaos + prior gates) is load-bearing and cannot be skipped"
@@ -245,6 +290,7 @@ fi
 
 # ==== D. Deferrals (printed, never asserted green) ==================================================
 echo; echo "== D. Deferred-not-faked (recorded; never asserted green) =="
+defer "a vanilla NON-GKE Kubernetes target — Accept (c) B0 above. Blocker: none provisioned (D4)."
 defer "a real SECOND CLOUD — EKS/AKS cluster + cloud identity (IRSA / AAD WI) + a live second-cloud apply (D1)."
 defer "CLI-level IaC validation — terraform validate/fmt/apply (no terraform binary; parity proven hermetically) (D2)."
 defer "circleci config validate (no circleci binary; structural + dispatch parity proven hermetically) (D2b)."

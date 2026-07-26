@@ -21,15 +21,20 @@
 #     ones for each dataplane                       is the single easiest mistake in the policy and
 #                                                   it surfaces as an auth timeout with no mention of
 #                                                   the network.
-#   * A live GKE pod actually mints a WI token .... NOT PROVABLE HERE and NOT FAKED. Kind has no
-#     under the policy                              metadata server. Carried as an L3 deferral with a
-#                                                   named blocker (LEDGER Deferrals: no Dataplane V2
-#                                                   on the live cluster, no scratch GKE).
+#   * A live pod actually mints a WI token ........ NOT PROVEN HERE and NOT FAKED. The blocker CHANGED
+#     under the policy                              on 2026-07-26 and shrank: it used to be "the
+#                                                   substrate has no metadata server at all", and the
+#                                                   L2 cluster is now GKE with a workload pool, so it
+#                                                   has one. What is missing is the binding — a GSA,
+#                                                   an IAM policy on it, and the annotation tying the
+#                                                   agent KSA to it. That is provisioning nobody has
+#                                                   done on the dev cluster, not a property of the
+#                                                   substrate. Still a deferral, still never faked.
 #
 # Every negative is preceded by a baseline probe with NO policy in place, so a later failure to reach
 # a destination can only be the policy — never a missing listener, a slow pull, or broken DNS.
 #
-# DESTRUCTIVE-TEST GUARD: Kind / scratch-GKE contexts only, anchored (never a substring glob).
+# DESTRUCTIVE-TEST GUARD: scratch-GKE contexts only, anchored (never a substring glob).
 # Exit: 0 = V-CTN-020 (L2 half) PROVEN · 1 = FAILED (halt) · 2 = refused target · 3 = DEFERRED.
 # Usage: dev/verify/egress-enforcement-l2.sh [kube-context]
 #
@@ -47,7 +52,7 @@
 #      artifact and can drift from the renderer without either side noticing.
 set -uo pipefail # -e omitted deliberately: probe exit codes are inspected, not fatal.
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 K="kubectl --context $CTX"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPTS="$REPO/k8s-operator/scripts"
@@ -61,9 +66,9 @@ SERVER_IMG="python:3.12-alpine"
 CLIENT_IMG="curlimages/curl:8.10.1"
 
 case "$CTX" in
-  kind-* | gke-scratch-*) : ;;
+  gke-scratch-*) : ;;
   *)
-    echo "REFUSING: context '$CTX' is not a Kind/scratch cluster (destructive-test guard)." >&2
+    echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2
     exit 2
     ;;
 esac
@@ -256,7 +261,7 @@ fi
 
 # --- 5) apply the SHIPPED policy and re-probe --------------------------------------------------------
 echo
-echo "== 5) applying the shipped policy (WI off — the Kind posture) =="
+echo "== 5) applying the shipped policy (rendered with WI OFF) =="
 printf '%s\n' "$POLICY_NOWI" | $K apply -f - >/dev/null || {
   bad "the shipped policy was REJECTED by the API server — it is not applicable as rendered"
   exit 1

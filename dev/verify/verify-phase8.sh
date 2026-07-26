@@ -8,17 +8,19 @@
 # (a)–(f) and re-runs every prior gate.
 #
 # ONE TARGET, NOT DEFAULTED. This used to demand TWO contexts and refuse if they were equal, because
-# the operator lived on a kindnet cluster and Calico lived on a second, operator-less one. Those two
-# clusters differed in exactly two create-time knobs — CNI and node count — which are orthogonal, so
-# they were merged: `dev/cluster/up.sh` now builds one 2-node Calico cluster that hosts the
-# operator, and 4 Kind nodes became 2. Carrying two control planes was not free; LSN-026 is three
-# false security failures caused by nothing but the memory pressure of doing it.
+# the operator lived on a cluster whose CNI enforced no NetworkPolicy and the enforcing dataplane
+# lived on a second, operator-less one. Those two clusters differed in exactly two create-time knobs
+# — CNI and node count — which are orthogonal, so they were merged: `dev/cluster/up.sh` builds one
+# 2-node cluster with an enforcing dataplane that also hosts the operator. Carrying two control
+# planes was not free; LSN-026 is three false security failures caused by nothing but the memory
+# pressure of doing it, and it is one reason the whole inner loop is remote now.
 #
 # The old "the two contexts must differ" refusal was a PROXY for the thing that matters — that an
 # egress claim is not being made on a dataplane which enforces nothing (LSN-006, binding.md P4).
 # Comparing two strings never tested that; it only tested that someone had typed two names. On one
-# cluster the proxy is worthless, so it is replaced below by the capability itself: assert
-# `calico-node` is present, and refuse rather than let section D go green on kindnet.
+# cluster the proxy is worthless, so it is replaced below by the capability itself: P4 asks the
+# cluster what its dataplane is, and section D defers rather than passing on one that does not
+# enforce.
 #
 # The target is still required positionally and still has no default. On 2026-07-25 `L2-CHAIN.txt`
 # appended one target to every line; followed literally it sent two operator-dependent checks at the
@@ -33,8 +35,8 @@
 #      definition site for "what L0 means" and would drift (V-MET-013). This section runs the file.
 #                                                                        (Accept a, c, e — L0 halves)
 #   B. Accept (a)/(b) — install and multi-tier, live ----------------------------------------------
-#      tenant-isolation-l2.sh (quota + default-deny applied FROM THE INSTALL PATH, enforced on
-#      Calico), gitops-tree-applies-l2.sh (the shipped GitOps tree applies cleanly), and
+#      tenant-isolation-l2.sh (quota + default-deny applied FROM THE INSTALL PATH, and enforced),
+#      gitops-tree-applies-l2.sh (the shipped GitOps tree applies cleanly), and
 #      multi-agent-namespace-l2.sh (two agents, one namespace, distinct per-agent claims).
 #   C. Accept (c) — the allowlist closes at admission ---------------------------------------------
 #      closed-allowlist-l2.sh on the operator cluster: a blank/empty allowlist is REJECTED by the
@@ -45,8 +47,8 @@
 #      no claim on the exemption. Naming it here cost nothing and would have spread a retired
 #      identifier to a seventh file; the lint caught it on this script's first run.
 #   D. Accept (d) — egress enforced while WI still works ------------------------------------------
-#      egress-enforcement-l2.sh on Calico. P4 is not taken on trust: this script reads the CNI off
-#      the egress target and DEFERS rather than passes if it is not Calico.
+#      egress-enforcement-l2.sh. P4 is not taken on trust: this script asks the egress target which
+#      dataplane it runs and DEFERS rather than passes on one not KNOWN to enforce NetworkPolicy.
 #   E. Accept (c)/(e) completeness — the phase's own unfinished work, detected mechanically --------
 #      V-CTR-002 is BLOCKING-PHASE and P8-T1 left it `partial`; V-MET-011 is BLOCKING-ALWAYS and may
 #      not be deferred at all. Rather than a comment saying "T9/T10 pending", this section looks for
@@ -60,19 +62,21 @@
 #   D1  V-CTN-020 at L3 — the live-WI half. `platform-agent-host` has no Dataplane V2 and enabling it
 #       is a cluster recreation on a non-destructive-test target (binding.md §Targets). The
 #       BLOCKING-ALWAYS L2 instance is NOT deferred and runs in section D.
-#   D3  V-CMP-003's Config Connector slice — the CRDs are absent from Kind (21/22).
+#   D3  V-CMP-003's Config Connector slice — no target in this build has the Config Connector CRDs
+#       (21/22). On the L2 GKE cluster that is now an addon nobody has enabled rather than a
+#       distribution that can never have it, so the blocker got closer without clearing.
 #   D4  the live-target checklist in docs/build/phase-8-live-checklist.md — every L3 step that needs a
 #       human on a real GKE cluster. Listed there so it is visible, never asserted here.
 #
 #   D2 IS GONE, and the way it went is the point. It read: "LSN-015 CLAIM 2 needs 2 schedulable nodes
-#   and ~6Gi allocatable; the dev Kind is single-node." That is a deferral whose blocker was a line in
-#   a YAML file we own — an environmental fact right up until someone reads it as one. `up.sh` now
-#   builds the two-node cluster, so the claim runs. A deferral that names OUR OWN configuration as the
+#   and ~6Gi allocatable; the dev cluster is single-node." That is a deferral whose blocker was a line
+#   in a config file we own — an environmental fact right up until someone reads it as one. `up.sh`
+#   builds a two-node cluster, so the claim runs. A deferral that names OUR OWN configuration as the
 #   external obstacle is the shape to be suspicious of; V-MET-006 asks for a blocker, and this one
 #   answered with a default.
 #
-# DESTRUCTIVE-TEST GUARD: the context must be Kind or a scratch GKE. `platform-agent-host` is
-# outer-loop install verification only and is NOT a destructive-test target (binding.md §Targets).
+# DESTRUCTIVE-TEST GUARD: the context must be a scratch GKE (`gke-scratch-*`). `platform-agent-host`
+# is outer-loop install verification only and is NOT a destructive-test target (binding.md §Targets).
 # Usage: dev/verify/verify-phase8.sh <context>
 #
 # PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
@@ -91,8 +95,9 @@
 #      Where a sub-script asserts on a pod it just recreated it must reach that pod by ownership
 #      (`p3_pod_of_deploy`), never by a label selector, which still matches the generation the
 #      recreate deleted (LSN-025).
-#   P4 dataplane:         section D is green only on Calico/Dataplane V2. Read off the egress target
-#      at run time rather than inferred from its name, and DEFERRED — never passed — if absent.
+#   P4 dataplane:         section D is green only on a dataplane KNOWN to enforce NetworkPolicy.
+#      Asked of the egress target at run time via p4_assert_enforcing_dataplane rather than inferred
+#      from its name, and DEFERRED — never passed — on anything the allow-list does not recognise.
 #   P6 runtime-authoritative: the live objects each sub-script reads back from the API server, and,
 #      where a config claim is made, the operator-rendered ConfigMap — never the image-baked
 #      /opt/data/config.yaml it is mounted over (LSN-003).
@@ -108,7 +113,7 @@ if [ -z "$DEV_CTX" ]; then
 REFUSING: verify-phase8.sh will not pick a target for you.
 
   usage: dev/verify/verify-phase8.sh <context>
-  e.g.   dev/verify/verify-phase8.sh kind-kube-agents-dev
+  e.g.   dev/verify/verify-phase8.sh gke-scratch-kube-agents-dev
 
   Stand it up first: dev/cluster/up.sh
 
@@ -128,8 +133,8 @@ EGR_CTX="$DEV_CTX"
 # named a context after it.
 for c in "$DEV_CTX" "$EGR_CTX"; do
   case "$c" in
-    kind-*|gke-scratch-*) : ;;
-    *) echo "REFUSING: context '$c' is neither kind-* nor gke-scratch-* (destructive-test guard)." >&2; exit 2 ;;
+    gke-scratch-*) : ;;
+    *) echo "REFUSING: context '$c' is not gke-scratch-* (destructive-test guard)." >&2; exit 2 ;;
   esac
 done
 
@@ -172,7 +177,7 @@ for _t in "$DEV_CTX:$dev_up" "$EGR_CTX:$egr_up"; do
     echo >&2
     echo "REFUSING to render a Phase 8 verdict: ${_t%:*} cannot run the experiment (P10)." >&2
     echo "  This is NOT a claim that Phase 8 regressed. Repair or recreate the cluster and re-run:" >&2
-    echo "    kind delete cluster --name \"\${CLUSTER}\" && bash dev/cluster/up.sh" >&2
+    echo "    bash dev/cluster/down.sh && bash dev/cluster/up.sh" >&2
     exit 2
   fi
 done
@@ -195,16 +200,20 @@ fi
 
 # P4 read off the cluster, not inferred from the context name. A name is a claim about a dataplane;
 # the dataplane is a fact about it, and only one of those can be wrong without anyone noticing.
-calico=0
+#
+# This was a local `grep -qi calico` over kube-system pod names until 2026-07-26 — a second, worse
+# copy of the library's P4. Worse in the specific direction that matters: it hard-coded ONE product,
+# so it would have deferred section D on a GKE Dataplane V2 cluster that enforces perfectly, and the
+# gate's whole point is that the deferral means something. Now it asks the library, which keeps an
+# allow-list of dataplanes known to enforce (calico-node · anetd · cilium) and defers on anything
+# else. One definition site, per V-MET-013.
+enforcing=0
 if [ "$egr_up" -eq 1 ]; then
-  if kubectl --context "$EGR_CTX" -n kube-system get pods -o name 2>/dev/null | grep -qi 'calico'; then
-    calico=1
-    pass "P4: $EGR_CTX runs Calico — an egress claim may be green here"
+  if p4_assert_enforcing_dataplane "kubectl --context $EGR_CTX"; then
+    enforcing=1
+    pass "P4: $EGR_CTX runs $P4_DATAPLANE, which enforces NetworkPolicy — an egress claim may be green here"
   else
-    cni="$(kubectl --context "$EGR_CTX" -n kube-system get pods -o name 2>/dev/null | grep -m1 -iE 'kindnet|cilium|calico' || echo 'unknown')"
-    note "P4: $EGR_CTX runs ${cni##*/}, not Calico — section D will be DEFERRED, never passed (LSN-006)"
-    note "    up.sh builds this cluster with Calico, so a kindnet cluster here predates that and"
-    note "    cannot be upgraded in place: kind delete cluster --name kube-agents-dev && up.sh"
+    note "P4: section D will be DEFERRED, never passed (LSN-006). The library printed what it found."
   fi
 else
   note "egress target '$EGR_CTX' is unreachable — section D will be DEFERRED, never passed"
@@ -280,12 +289,12 @@ fi
 
 # ==== D. Accept (d) — egress enforced, on a dataplane that enforces =================================
 echo; echo "== D. Accept (d) — off-allowlist egress blocked while Workload Identity still works =="
-if [ "$calico" -eq 1 ]; then
+if [ "$enforcing" -eq 1 ]; then
   run_l2 egress-enforcement dev/verify/egress-enforcement-l2.sh "$EGR_CTX" \
     "default-deny holds, port narrowing is enforced, and the metadata allow is absent without WI"
 else
-  defer "V-CTN-020's L2 instance — $EGR_CTX does not run an enforcing dataplane. On kindnet a"
-  echo "           NetworkPolicy is accepted and ignored, so every negative here would pass for the"
+  defer "V-CTN-020's L2 instance — $EGR_CTX does not run a dataplane known to enforce. A CNI that"
+  echo "           ignores NetworkPolicy still ACCEPTS one, so every negative here would pass for the"
   echo "           wrong reason (LSN-006). BLOCKING-ALWAYS: this is a failure of the RUN, not of the"
   echo "           claim — stand the cluster up with dev/cluster/up.sh and re-run."
   fail=1
@@ -339,15 +348,15 @@ if [ "$dev_ok" -eq 1 ]; then
 elif [ "$dev_ok" -eq 3 ]; then
   defer "the full regression — P1 unverifiable. This is a deferral and NOT a pass: the suite is"
   echo "           load-bearing, so a run that cannot establish which code it exercised does not"
-  echo "           discharge it. Rebuild, kind load, rollout restart, and run this again."
+  echo "           discharge it. Run dev/cluster/reload-images.sh operator $DEV_CTX, then run this again."
   fail=1
 fi
 
 # ==== G. Deferrals and the live-target checklist ====================================================
 echo; echo "== G. Deferred-not-faked (recorded; never asserted green) =="
-defer "LSN-015 CLAIM 2 — both agent pods Ready in one namespace needs 2 schedulable nodes and ~6Gi"
-echo "           allocatable; the dev Kind is single-node. The per-agent isolation claims are NOT deferred (D2)."
-defer "V-CMP-003's Config Connector slice — those CRDs are absent from Kind (21/22) (D3)."
+defer "V-CMP-003's Config Connector slice — no target in this build has the Config Connector CRDs"
+echo "           (21/22). On the L2 GKE cluster that is an addon nobody enabled, not a distribution"
+echo "           that can never have it — a closer blocker, not a cleared one (D3)."
 defer "every L3 step needing a human on a real GKE cluster — enumerated in"
 echo "           docs/build/phase-8-live-checklist.md, with the command and the expected observation"
 echo "           for each. Listed so it is visible; nothing there is asserted by this script (D4)."

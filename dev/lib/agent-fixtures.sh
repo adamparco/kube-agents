@@ -10,7 +10,7 @@
 #   k8s-operator/internal/controller — checked, not assumed). On a real install both arrive from
 #   the GitOps tree: examples/gitops-repo/.../50-developer-team-identity.yaml ships the SA, and
 #   provision_07_gcp_k8s_secrets.sh writes the Secret. dev applies NEITHER of those paths,
-#   so on Kind the objects simply never exist.
+#   so on a scratch cluster the objects simply never exist.
 #
 #   The failure that follows is misleading in a specific way. A missing SA blocks pod CREATION
 #   (the ServiceAccount admission plugin rejects it), so the Deployment reports no pods at all;
@@ -22,10 +22,10 @@
 #
 # WHAT IT DELIBERATELY DOES NOT DO
 #   The API key it mints is `openssl rand`, generated locally, never echoed, and only ever written
-#   to a Kind cluster. It is NOT a credential for anything — the gateway checks it against itself.
+#   to a scratch cluster. It is NOT a credential for anything — the gateway checks it against itself.
 #   No model-provider key, Slack token or GCP credential is created here, and none should be: those
 #   live only in the gitignored vars.sh and the real platform-agent-secrets (phase-8-live-checklist).
-#   Callers are guarded to kind-*/gke-scratch-* contexts; this file does not relax that.
+#   Callers are guarded to gke-scratch-* contexts; this file does not relax that.
 #
 # Usage (source it):
 #   . "$(dirname "$0")/../lib/agent-fixtures.sh"

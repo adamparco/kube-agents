@@ -22,7 +22,7 @@
 # NOTE ON SCOPE: this is completeness, not correctness. It proves the tree can land, not that landing it
 # produces a working fleet — that is the per-phase verify scripts' job.
 #
-# DESTRUCTIVE-TEST GUARD: Kind / scratch-GKE contexts only, anchored. Nothing here writes to the
+# DESTRUCTIVE-TEST GUARD: scratch-GKE contexts only, anchored. Nothing here writes to the
 # cluster, but --dry-run=server against a live production API server is still a request I will not send
 # without an explicit scratch target.
 # Exit: 0 = V-CMP-003 PROVEN · 1 = FAILED · 2 = refused target · 3 = DEFERRED.
@@ -40,15 +40,15 @@
 #      under test here; there is no rendered layer above it.
 set -uo pipefail
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 K="kubectl --context $CTX"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TREE="$REPO/examples/gitops-repo"
 
 case "$CTX" in
-  kind-* | gke-scratch-*) : ;;
+  gke-scratch-*) : ;;
   *)
-    echo "REFUSING: context '$CTX' is not a Kind/scratch cluster (destructive-test guard)." >&2
+    echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2
     exit 2
     ;;
 esac
@@ -128,13 +128,14 @@ for m in "${MANIFESTS[@]}"; do
   fi
 
   # A missing CRD is a missing PREREQUISITE, not a defect in the manifest. The Config Connector
-  # types (ContainerCluster/ContainerNodePool) are never installed on Kind, so this file is simply
-  # not judgeable here — record it as deferred with the blocker named, never as a pass. The
-  # discriminator is the API server's own error text, not my opinion about which files matter.
+  # types (ContainerCluster/ContainerNodePool) need the ConfigConnector addon, which no target in
+  # this build has enabled, so those files are simply not judgeable here — record them as deferred
+  # with the blocker named, never as a pass. The discriminator is the API server's own error text,
+  # not my opinion about which files matter.
   if printf '%s' "$out" | grep -q 'no matches for kind\|ensure CRDs are installed first'; then
     echo "DEFER: $rel — $(printf '%s' "$out" | grep -o 'no matches for kind [^ ]* in version [^ ]*' | head -1)"
     echo "        blocker: that CRD is not installed on this cluster. Not a pass. Needs a target"
-    echo "        that has it (Config Connector types => L3, an actual GKE/KCC cluster)."
+    echo "        that has it (Config Connector types => the ConfigConnector addon, enabled)."
     deferred=$((deferred + 1))
     continue
   fi
@@ -199,7 +200,7 @@ fi
 if [ "$deferred" -gt 0 ]; then
   echo "V-CMP-003 (L2): PROVEN for $applied of $((applied + deferred)) judgeable manifests, plus all six"
   echo "  rendered egress policies, with the negative control firing. $deferred manifest(s) DEFERRED on a"
-  echo "  named blocker (CRDs absent from a Kind cluster) — record this as PARTIAL, not pass, and close"
+  echo "  named blocker (those CRDs are on no target here) — record this as PARTIAL, not pass, and close"
   echo "  it on a target that has those CRDs."
 else
   echo "V-CMP-003 (L2): PROVEN — every shipped manifest and every rendered egress policy is appliable,"

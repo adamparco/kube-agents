@@ -27,7 +27,7 @@
 # script. Every negative case runs with --dry-run=server: admission (CEL + webhook) executes in full,
 # and nothing is persisted.
 #
-# DESTRUCTIVE-TEST GUARD: Kind / scratch-GKE contexts only.
+# DESTRUCTIVE-TEST GUARD: scratch-GKE contexts only.
 # Usage: dev/verify/closed-allowlist-l2.sh [kube-context]
 #
 # PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
@@ -43,12 +43,12 @@
 #      is an input. L2-4 reads the running Deployment's env, which is what the router actually sees.
 set -uo pipefail
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 case "$CTX" in
-  kind-*|gke-scratch-*) : ;;
-  *) echo "REFUSING: context '$CTX' is not a Kind cluster (destructive-test guard)." >&2; exit 2 ;;
+  gke-scratch-*) : ;;
+  *) echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2; exit 2 ;;
 esac
 
 K="kubectl --context $CTX"

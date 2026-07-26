@@ -7,7 +7,7 @@
 #   - a read-only agent Role                              -> ADMITTED
 # Adversarially distinguishes a real policy denial from a malformed-object error.
 #
-# DESTRUCTIVE-TEST GUARD: only runs against a Kind or scratch-GKE context.
+# DESTRUCTIVE-TEST GUARD: only runs against a scratch-GKE context.
 # Usage: dev/tests/negative-attenuation.sh [kube-context]
 #
 # PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
@@ -29,16 +29,16 @@
 #      cannot be read as the attenuation working.
 set -uo pipefail  # -e omitted deliberately: kubectl exit codes are inspected manually below.
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VAP="$REPO_ROOT/examples/gitops-repo/policy/vap-agent-readonly.yaml"
 K="kubectl --context $CTX"
 
-# Anchored allow-list: kind-* (up.sh) and gke-scratch-* (create.sh rename) ONLY. Substring globs like
+# Anchored allow-list: gke-scratch-* (dev/cluster/up.sh) ONLY. Substring globs like
 # *scratch* would let a prod context (e.g. gke_prod_..._kube-agents-dev-prod) slip through — never do that.
 case "$CTX" in
-  kind-* | gke-scratch-*) : ;;
-  *) echo "REFUSING: context '$CTX' is not a Kind/scratch cluster (destructive-test guard)." >&2; exit 2 ;;
+  gke-scratch-*) : ;;
+  *) echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2; exit 2 ;;
 esac
 
 fail=0

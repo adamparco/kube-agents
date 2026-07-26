@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# seed-agent-fixtures.sh — give every Agent CR on a Kind cluster the Secret and ServiceAccount it
+# seed-agent-fixtures.sh — give every Agent CR on a scratch cluster the Secret and ServiceAccount it
 # references but does not own, so its pods can actually start.
 #
 # WHY THIS EXISTS
 #   `up.sh` creates a cluster and `make deploy` installs the operator, but nothing in dev ever
 #   applies the GitOps identity manifests or runs provision_07 — so the two objects every Agent CR
-#   names (see lib/agent-fixtures.sh) are simply absent on Kind. The agent Deployments then sit in
+#   names (see lib/agent-fixtures.sh) are simply absent on a scratch cluster. The Deployments then sit in
 #   CreateContainerConfigError forever, and the message names a missing Secret rather than a missing
 #   INSTALL STEP, which is why this went unnoticed until a gate needed a running agent pod.
 #
@@ -16,19 +16,19 @@
 #   key, Slack token or cloud credential is created or read here — those belong to the live install
 #   path only (docs/build/phase-8-live-checklist.md).
 #
-# DESTRUCTIVE-TEST GUARD: Kind / scratch-GKE contexts only, anchored. This writes Secrets and
+# DESTRUCTIVE-TEST GUARD: scratch-GKE contexts only, anchored. This writes Secrets and
 # ServiceAccounts, so the guard is load-bearing — it must never run against the live cluster.
 # Exit: 0 = fixtures present · 2 = refused target · 3 = DEFERRED (unreachable / no CRD).
 # Usage: dev/verify/seed-agent-fixtures.sh [kube-context]
 set -uo pipefail
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 K="kubectl --context $CTX"
 
 case "$CTX" in
-  kind-* | gke-scratch-*) : ;;
+  gke-scratch-*) : ;;
   *)
-    echo "REFUSING: context '$CTX' is not a Kind/scratch cluster (destructive-test guard)." >&2
+    echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2
     exit 2
     ;;
 esac

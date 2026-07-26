@@ -32,7 +32,9 @@ SHELL = /usr/bin/env bash -o pipefail
 #
 # `kubectl config current-context` on this host may be the live cluster `platform-agent-host`,
 # which `.claude/harness/binding.md` §Targets classifies as install-verification only. So an
-# UNSET context is only accepted when the ambient one is anchored `kind-*` / `gke-scratch-*`;
+# UNSET context is only accepted when the ambient one is anchored `gke-scratch-*` (one anchor since
+# 2026-07-26 — `kind-*` was accepted while the inner loop ran on the host, and an accepted prefix
+# with nothing behind it is a guard nobody maintains);
 # anything else must be named on the command line. Naming it is always allowed -- deliberately
 # deploying to the live cluster is a real operation, forgetting which cluster you are on is not.
 KUBE_CONTEXT ?=
@@ -62,8 +64,8 @@ ctx-guard:
 	fi; \
 	if [ "$$explicit" = no ]; then \
 	  case "$$ctx" in \
-	    kind-* | gke-scratch-*) : ;; \
-	    *) echo "REFUSING: ambient context '$$ctx' is not kind-*/gke-scratch-*, and no" >&2; \
+	    gke-scratch-*) : ;; \
+	    *) echo "REFUSING: ambient context '$$ctx' is not gke-scratch-*, and no" >&2; \
 	       echo "  KUBE_CONTEXT= was given. If you mean it, name it:" >&2; \
 	       echo "      make <target> KUBE_CONTEXT=$$ctx" >&2; \
 	       exit 2 ;; \
@@ -140,7 +142,7 @@ ifndef ignore-not-found
 endif
 
 .PHONY: install
-install: ctx-guard manifests kustomize ## Install CRDs into $(KUBE_CONTEXT), or the ambient context if it is kind-*/gke-scratch-*.
+install: ctx-guard manifests kustomize ## Install CRDs into $(KUBE_CONTEXT), or the ambient context if it is gke-scratch-*.
 	@out="$$( $(KUSTOMIZE) build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | $(KUBECTL) apply -f -; else echo "No CRDs to install; skipping."; fi
 
@@ -150,7 +152,7 @@ uninstall: ctx-guard manifests kustomize ## Uninstall CRDs from $(KUBE_CONTEXT).
 	if [ -n "$$out" ]; then echo "$$out" | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
 .PHONY: deploy
-deploy: ctx-guard manifests kustomize ## Deploy controller to $(KUBE_CONTEXT), or the ambient context if it is kind-*/gke-scratch-*.
+deploy: ctx-guard manifests kustomize ## Deploy controller to $(KUBE_CONTEXT), or the ambient context if it is gke-scratch-*.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
 

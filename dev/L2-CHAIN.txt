@@ -8,17 +8,20 @@
 #
 # Each line takes a --context argument. Every one of these is a DESTRUCTIVE test target: they apply
 # deliberately-bad RBAC, delete pods, and exercise denial paths. The guard in each script is an
-# anchored `case` on kind-* / gke-scratch-* and invariants-gate.py asserts it stays anchored —
-# a substring match is LSN-005, and the live GKE cluster is one `*` away.
+# anchored `case` on gke-scratch-* and invariants-gate.py asserts it stays anchored — a substring
+# match is LSN-005, and the live GKE cluster is one `*` away. That the accepted set is now a single
+# anchor and not two is a STRENGTHENING: the guards accept strictly fewer contexts than they did.
 #
 # Every line CARRIES its own context, still, even though every line now carries the SAME one.
 #
-# There used to be two Kind targets: `kind-kube-agents-dev` ran kindnet and hosted the operator,
-# `kind-kube-agents-egress` ran Calico and hosted none, and precondition P4 meant neither could serve
-# the whole file. They differed in two create-time knobs, CNI and node count, which are orthogonal —
-# so `up.sh` now builds their union (2 nodes, Calico, operator) and there is one target. Three
-# control planes on one laptop VM is also what LSN-026 cost us: three FALSE security failures from
-# memory pressure alone.
+# The single target is the end of a two-step consolidation. There used to be two clusters, because
+# precondition P4 meant neither could serve the whole file: one hosted the operator on a dataplane
+# that accepted NetworkPolicy and enforced none of it, the other enforced but hosted no operator.
+# They differed in two create-time knobs, dataplane and node count, which are orthogonal — so up.sh
+# built their union and there was one. On 2026-07-26 that union moved off the laptop to a remote GKE
+# cluster (dev/cluster/up.sh — Dataplane V2, 2 nodes, Workload Identity), which changes where it runs
+# and not what it is. Running several control planes on one laptop VM is also what LSN-026 cost us:
+# three FALSE security failures from memory pressure alone, on a substrate no longer in the loop.
 #
 # The per-line context is NOT collapsed back into the run loop now that the values agree. It was a
 # run-loop default once. That was a single-definition-site violation dressed as a convenience: the
@@ -32,23 +35,25 @@
 #
 # Run:  while read -r c; do case "$c" in ''|\#*) continue ;; esac; eval "$c"; done < dev/L2-CHAIN.txt
 #
-# Precondition P1 applies to every line: rebuild -> `kind load` -> `rollout restart` -> assert the
-# running imageID digest equals the build under test. A green here against a stale image is
-# LSN-001, and no line of this file can detect that on its own.
+# Precondition P1 applies to every line: `bash dev/cluster/reload-images.sh <what> <ctx>` builds,
+# pushes, and deploys BY DIGEST, then P1 asserts the running imageID digest equals the build under
+# test. A green here against a stale image is LSN-001, and no line of this file can detect that on
+# its own — deploying by digest is what makes that trap unrepresentable rather than merely detected.
 
 # --- the standing regression suite ----------------------------------------------------------
 # verify-phase7.sh is the whole prior build in one command: it runs verify-phase{2,3,4,5,6}.sh,
 # chaos C1-C4, 03 §11 negative attenuation, the goldens and `go test ./...`. It is listed FIRST
 # because a phase's new L2 evidence is worth nothing if it was gathered on a cluster where the
 # previous phases had already broken.
-bash dev/verify/verify-phase7.sh kind-kube-agents-dev
+bash dev/verify/verify-phase7.sh gke-scratch-kube-agents-dev
 
 # --- Phase 8 L2 checks ------------------------------------------------------------------------
 # Two kinds of claim, one cluster that can host both: the first three need a dataplane that actually
-# enforces NetworkPolicy (P4 — Calico, never kindnet), the last two need the operator and its
-# webhook. The target below satisfies both, which is the whole reason it was merged.
-bash dev/verify/egress-enforcement-l2.sh kind-kube-agents-dev
-bash dev/verify/tenant-isolation-l2.sh kind-kube-agents-dev
-bash dev/verify/closed-allowlist-l2.sh kind-kube-agents-dev
-bash dev/verify/gitops-tree-applies-l2.sh kind-kube-agents-dev
-bash dev/verify/multi-agent-namespace-l2.sh kind-kube-agents-dev
+# enforces NetworkPolicy (P4's allow-list of known-enforcing dataplanes — this target runs anetd,
+# GKE's Dataplane V2), the last two need the operator and its webhook. The target below satisfies
+# both, which is the whole reason it was merged.
+bash dev/verify/egress-enforcement-l2.sh gke-scratch-kube-agents-dev
+bash dev/verify/tenant-isolation-l2.sh gke-scratch-kube-agents-dev
+bash dev/verify/closed-allowlist-l2.sh gke-scratch-kube-agents-dev
+bash dev/verify/gitops-tree-applies-l2.sh gke-scratch-kube-agents-dev
+bash dev/verify/multi-agent-namespace-l2.sh gke-scratch-kube-agents-dev

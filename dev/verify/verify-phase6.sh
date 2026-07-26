@@ -26,9 +26,9 @@
 #
 # DEFERRED (not faked, 04 §6 honest scoping): the LITERAL spoke agent-reasoning-pause under real hub loss
 # (real inference/Minty over private networking) needs two clusters -> scratch-GKE. C4 proves the
-# load-bearing half (cluster state + workloads survive hub loss) on Kind and never asserts the rest green.
+# load-bearing half (cluster state + workloads survive hub loss) and never asserts the rest green.
 #
-# Destructive-test guard: Kind context only; chaos-suite.sh is reversible + single-object + self-cleaning.
+# Destructive-test guard: scratch-GKE context only; chaos-suite.sh is reversible, single-object, self-cleaning.
 # Usage: dev/verify/verify-phase6.sh [kube-context]
 #
 # PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
@@ -48,12 +48,12 @@
 #      config file, so the image-baked-versus-rendered-ConfigMap distinction (LSN-003) does not arise.
 set -uo pipefail
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 case "$CTX" in
-  kind-*) : ;;
-  *) echo "REFUSING: context '$CTX' is not a Kind cluster (destructive-test guard)." >&2; exit 2 ;;
+  gke-scratch-*) : ;;
+  *) echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2; exit 2 ;;
 esac
 
 fail=0
@@ -108,7 +108,7 @@ fi
 echo
 echo "  DEFERRED (not faked, 04 §6): the LITERAL spoke agent-reasoning-pause under real hub loss (real"
 echo "  inference/Minty over private networking) -> two-cluster / scratch-GKE. C4 proves the load-bearing"
-echo "  half (cluster state + workloads survive hub loss) on Kind."
+echo "  half (cluster state + workloads survive hub loss) here."
 echo
 echo "===================================================================="
 if [ "$fail" -eq 0 ]; then echo " Phase 6 verification: ALL CHECKS PASSED"; else echo " Phase 6 verification: FAILURES ABOVE (see HALT conditions)"; fi

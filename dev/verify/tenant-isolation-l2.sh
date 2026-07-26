@@ -15,8 +15,9 @@
 #   (must be admitted), one exceeding the ceiling (must be refused), and it checks the quota's own
 #   accounting moves.
 #
-#   NETWORK — enforcement is a property of the CNI (LSN-006). kindnet accepts a NetworkPolicy and
-#   enforces nothing, so on kindnet this half is DEFERRED, never passed (binding.md P4). Section 4
+#   NETWORK — enforcement is a property of the dataplane, not of the API server (LSN-006). A CNI that
+#   ignores NetworkPolicy still accepts one, so on a dataplane P4 does not recognise as enforcing this
+#   half is DEFERRED, never passed (binding.md P4). Section 4
 #   baselines every probe with no policy in force, then applies the allowlist, then the floor — in
 #   the order the install path applies them — and re-probes at each stage. A deny that was never
 #   first shown to be an allow is not evidence.
@@ -27,7 +28,7 @@
 # actually invoke those steps is a separate, cheaper claim, proven at L0 by
 # dev/tests/install-path-wired.py. Neither check is sufficient alone and both are required.
 #
-# DESTRUCTIVE-TEST GUARD: Kind / scratch-GKE contexts only, anchored. This one creates namespaces,
+# DESTRUCTIVE-TEST GUARD: scratch-GKE contexts only, anchored. This one creates namespaces,
 # pods and policies, so the guard is load-bearing rather than a formality.
 # Exit: 0 = PROVEN · 1 = FAILED · 2 = refused target · 3 = DEFERRED.
 # Usage: dev/verify/tenant-isolation-l2.sh [kube-context]
@@ -36,13 +37,13 @@
 # check_l2_scripts_declare_preconditions). Declared, not assumed: LSN-001 and LSN-002 each
 # recurred against scripts whose authors believed the preconditions held.
 #   P1 image-under-test:  none — the ResourceQuota and default-deny under test are rendered by this script from
-#      `common.sh`, and enforced by the API server and Calico. No operator code path is involved.
+#      `common.sh`, and enforced by the API server and the dataplane. No operator code path is involved.
 #   P3 admission-recreate: every probe pod and every fixture pod. Section 2 submits pods AFTER the quota is in force, which
 #      is the only way to observe a quota refusal; a pod admitted before it would keep running.
 #   P6 runtime-authoritative: the rendered manifests from `common.sh` and the live objects read back from the API server.
 set -uo pipefail
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 K="kubectl --context $CTX"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPTS="$REPO/k8s-operator/scripts"
@@ -61,9 +62,9 @@ SERVER_IMG="python:3.12-alpine"
 CLIENT_IMG="curlimages/curl:8.10.1"
 
 case "$CTX" in
-  kind-* | gke-scratch-*) : ;;
+  gke-scratch-*) : ;;
   *)
-    echo "REFUSING: context '$CTX' is not a Kind/scratch cluster (destructive-test guard)." >&2
+    echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2
     exit 2
     ;;
 esac

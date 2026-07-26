@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 2 (Cluster Admin Agent + cascade) — consolidated Kind verification harness.
+# Phase 2 (Cluster Admin Agent + cascade) — consolidated L2 verification harness.
 #
 # Re-runnable gate for the load-bearing inner-loop suites (07 §2 Accept a–e + 03 §11 negatives):
 #   V-K1  post-rename webhook serving   — duplicate (tier,scope) REJECTED; tier PATCH REJECTED
@@ -9,16 +9,16 @@
 #   V-K9  bootstrap ordering (partial)  — Agent CR before CRD FAILS; in-order reconciles pod bound to pre-created SA
 #   V-K10 no-break-glass                — controller/router ClusterRoles grant no write on rbac resources
 #
-# NOT covered here (need infra beyond a single Kind node — run separately):
-#   V-K11 egress enforcement — needs a NetworkPolicy-enforcing CNI (kindnet does NOT enforce).
-#         Proven on a throwaway Calico cluster; see docs/build/LEDGER.md §Verification log.
+# NOT covered here (run separately):
+#   V-K11 egress enforcement — a different claim, needing traffic rather than YAML. It is
+#         `dev/verify/egress-enforcement-l2.sh`, one line up the same L2 chain.
 #   V-K4/K5/K6/K7 — deterministic go-test suites: `cd k8s-operator && go test ./...`.
 #   V-G1..V-G4 — scratch-GKE cloud identity / cross-cluster / live chat / live cascade.
 #
-# PREREQUISITE: the full stack is deployed to the target Kind cluster
-#   (cert-manager + `make deploy` + the VAP). See INSTALL.md "Phase 2 — Kind inner loop".
+# PREREQUISITE: the full stack is deployed to the target cluster (cert-manager + `make deploy` + the
+#   VAP). `dev/cluster/up.sh` produces exactly that; see INSTALL.md "Method 3 — Remote Development".
 #
-# DESTRUCTIVE-TEST GUARD: only runs against a Kind context.
+# DESTRUCTIVE-TEST GUARD: only runs against a scratch-GKE context.
 # Usage: dev/verify/verify-phase2.sh [kube-context]
 #
 # PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
@@ -47,7 +47,7 @@
 #      installation, not about what one cluster happens to have applied.
 set -uo pipefail  # -e omitted: kubectl exit codes are inspected manually.
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 K="kubectl --context $CTX"
 NS=kubeagents-system
@@ -56,8 +56,8 @@ IDENTITY=examples/gitops-repo/clusters/cluster-a/agents/identity/cluster-admin-i
 VAP=examples/gitops-repo/policy/vap-agent-readonly.yaml
 
 case "$CTX" in
-  kind-*) : ;;
-  *) echo "REFUSING: context '$CTX' is not a Kind cluster (destructive-test guard)." >&2; exit 2 ;;
+  gke-scratch-*) : ;;
+  *) echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2; exit 2 ;;
 esac
 
 fail=0
@@ -73,7 +73,7 @@ cd "$REPO_ROOT"
 p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
 
 echo "===================================================================="
-echo " Phase 2 Kind verification — context: $CTX"
+echo " Phase 2 verification — context: $CTX"
 echo "===================================================================="
 
 # --- Preconditions: CRD present, stale CRD gone, VAP enforcing, K8s >= 1.30 -------------------
@@ -114,8 +114,9 @@ p3_force_recreate "$K" "$NS" deploy/cluster-admin-cluster-a-gateway 90 \
 # was not passing because it was correct, it was passing because GC happened to be quick enough here
 # — the defect and the luck are both invisible from inside the run (LSN-024).
 pod="$(p3_pod_of_deploy "$K" "$NS" cluster-admin-cluster-a-gateway 120)"
-# The pod stays Pending on a single-node dev Kind (the controller bakes prod-correct ~2Gi+ requests
-# across a 4-container pod), so existence — not Ready — is the right bar for reading its spec.
+# Existence, not Ready, is the right bar: every field read below lives in the spec, which a Pending pod
+# already has. The claim is what the operator RENDERED, which is decided at admission — requiring Ready
+# would couple it to image pulls and scheduling and fail it for reasons the renderer did not cause.
 [ -n "$pod" ] \
   && pass "controller re-rendered the agent pod after the forced recreate (fresh admission, current renderer): $pod" \
   || bad "no pod owned by the current agent Deployment within 120s of the forced recreate — the three assertions below would read nothing (HALT cond 4)"
@@ -182,6 +183,6 @@ else pass "controller RBAC grants no write on rbac resources"; fi
 
 echo
 echo "===================================================================="
-if [ "$fail" -eq 0 ]; then echo " Phase 2 Kind verification: ALL CHECKS PASSED"; else echo " Phase 2 Kind verification: FAILURES ABOVE (see HALT conditions)"; fi
+if [ "$fail" -eq 0 ]; then echo " Phase 2 verification: ALL CHECKS PASSED"; else echo " Phase 2 verification: FAILURES ABOVE (see HALT conditions)"; fi
 echo "===================================================================="
 exit "$fail"

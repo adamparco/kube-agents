@@ -23,8 +23,9 @@
 #   pods on the SAME node mount an RWO claim quite happily, so a single-node cluster cannot exhibit a
 #   multi-attach at all, and "both pods came up" there is not evidence of anything. That is LSN-015
 #   applied to itself one level up — the fixture needs N=2 nodes for the same reason it needs N=2
-#   agents. It also needs enough memory for two agent pods (~2.7Gi each as rendered), the agent image
-#   on EVERY node, and the ServiceAccount + API-key Secret the CRs reference but nothing creates.
+#   agents. It also needs enough memory for two agent pods (~2.7Gi each as rendered), an agent image
+#   this commit's build actually put in the registry, and the ServiceAccount + API-key Secret the
+#   CRs reference but nothing creates.
 #   `dev/cluster/up.sh` produces exactly that cluster; section 3 checks each condition and
 #   defers on the one that is missing rather than failing the claim for an environmental reason.
 #
@@ -32,7 +33,7 @@
 # conflict. A deferral naming an external blocker is honest; a pass on a cluster that is physically
 # incapable of showing the failure is not (09 §6, V-MET-014).
 #
-# DESTRUCTIVE-TEST GUARD: Kind / scratch-GKE contexts only, anchored. This creates a namespace and
+# DESTRUCTIVE-TEST GUARD: scratch-GKE contexts only, anchored. This creates a namespace and
 # two Agent CRs, so the guard is load-bearing.
 # Exit: 0 = PROVEN · 1 = FAILED · 2 = refused target · 3 = DEFERRED.
 # Usage: dev/verify/multi-agent-namespace-l2.sh [kube-context]
@@ -50,24 +51,29 @@
 #      naming function — that is asserted separately at L1, and the two are the point of the pair.
 set -uo pipefail
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 K="kubectl --context $CTX"
 NS="multi-agent-l2"
 A1="alpha-agent"
 A2="beta-agent"
 
 # The agent image these CRs run. This USED to be hard-coded to ghcr.io/gke-labs/...:v0.1.0, which no
-# inner-loop host has ever had — so even on a cluster that could host CLAIM 2, both pods would have
-# gone ImagePullBackOff and the claim would have failed for a reason unrelated to RWO. Defaults to
-# the local build that up.sh / reload-images.sh put on every node, and section 3 checks it is
-# really there before asserting anything (P8 also wants zero ghcr.io/gke-labs containers).
-AGENT_IMAGE_REPO="${AGENT_IMAGE_REPO:-kube-agents}"
-AGENT_IMAGE_TAG="${AGENT_IMAGE_TAG:-dev}"
+# inner-loop cluster has ever had — so even on a cluster that could host CLAIM 2, both pods would
+# have gone ImagePullBackOff and the claim would have failed for a reason unrelated to RWO. It now
+# names the tag `reload-images.sh agents` pushes for THIS commit, and section 3 resolves that tag to
+# a digest in Artifact Registry before asserting anything (P8 also wants zero ghcr.io/gke-labs
+# containers). The dirty-tree variant carries an epoch that cannot be re-derived here, so a dirty
+# tree resolves the clean-commit tag; that is visible in the deferral message when it is absent.
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get core/project 2>/dev/null)}"
+REGION="${REGION:-us-east4}"
+AR_REPO="${AR_REPO:-kube-agents}"
+AGENT_IMAGE_REPO="${AGENT_IMAGE_REPO:-$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO}"
+AGENT_IMAGE_TAG="${AGENT_IMAGE_TAG:-dev-$(git -C "$(dirname "$0")/../.." rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 
 case "$CTX" in
-  kind-* | gke-scratch-*) : ;;
+  gke-scratch-*) : ;;
   *)
-    echo "REFUSING: context '$CTX' is not a Kind/scratch cluster (destructive-test guard)." >&2
+    echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2
     exit 2
     ;;
 esac
@@ -243,36 +249,47 @@ if [ "$NODES" -lt 2 ]; then
   echo "  it would need to exhibit for 'both pods came up' to mean anything. CLAIM 1 above still"
   echo "  stands on its own; CLAIM 2 is not evidence here and is NOT being recorded as a pass."
   echo "  Unblock: dev/cluster/up.sh — it builds a 2-node cluster (control-plane + worker) with"
-  echo "  the full stack and the agent images on both nodes. A 1-node cluster here means this"
-  echo "  cluster predates that change; delete it and re-run up.sh."
+  echo "  the full stack. A 1-node cluster here means the node pool was resized down; bring it"
+  echo "  back with dev/cluster/resume.sh, or re-run up.sh."
   [ "$fail" -eq 0 ] && exit 3 || exit 1
 fi
 if [ "$ALLOC_GI" -lt "$NEED_GI" ]; then
   echo "DEFERRED: ${ALLOC_GI}Gi allocatable, need ~${NEED_GI}Gi. An agent pod requests ~2.7Gi"
   echo "  (agent 2Gi + dashboard 512Mi + fluent-bit 128Mi + event-watcher 64Mi) and two will not fit,"
   echo "  so a Pending pod here would mean 'the node is small', not 'the claim multi-attached'."
-  echo "  Unblock: raise the Docker VM's memory, then re-run."
+  echo "  Unblock: the node pool is too small for this claim. Re-create with a larger machine"
+  echo "  type (dev/cluster/up.sh sets e2-standard-4), then re-run."
   [ "$fail" -eq 0 ] && exit 3 || exit 1
 fi
 
-# The image must be on EVERY node, and this is checked rather than hoped for. This cluster exists so
-# the two pods land on DIFFERENT nodes; an image present on only one of them converts the very
-# outcome we want into an ImagePullBackOff, which would then be recorded as "the agents cannot
-# coexist" — a false failure with the right shape to be believed.
+# The image must be PULLABLE, and this is checked rather than hoped for. This cluster exists so the
+# two pods land on DIFFERENT nodes; an image that does not resolve converts the very outcome we want
+# into an ImagePullBackOff, which would then be recorded as "the agents cannot coexist" — a false
+# failure with the right shape to be believed.
+#
+# WHAT REPLACED `docker exec <node> crictl images`. The old form asked each node's image store
+# whether a side-loaded tag was present, which was the right question for `kind load` and has no
+# analogue on a managed cluster — there is no docker socket to the nodes, and the kubelet pulls
+# rather than being handed a copy. The question is now asked of the registry the kubelet pulls
+# FROM, and answered with a digest rather than a tag. That is strictly stronger than the grep it
+# replaces: a tag present in a node's store says nothing about WHICH build it is, and same-tag
+# staleness is LSN-001 exactly. Presence on the node that actually ran the pod is then asserted
+# after the fact, from the pod's own resolved imageID, which is the only authoritative answer.
 image_missing=""
-for node in $($K get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
-  for tier in cluster-admin developer-team; do
-    repo="$AGENT_IMAGE_REPO/${tier}-agent"
-    if ! docker exec "$node" crictl images 2>/dev/null |
-      awk -v r="$repo" -v t="$AGENT_IMAGE_TAG" '$1 ~ r"$" && $2 == t {f=1} END {exit !f}'; then
-      image_missing="$image_missing\n    $node is missing $repo:$AGENT_IMAGE_TAG"
-    fi
-  done
+for tier in cluster-admin developer-team; do
+  uri="$AGENT_IMAGE_REPO/${tier}-agent:$AGENT_IMAGE_TAG"
+  digest="$(gcloud artifacts docker images describe "$uri" --project "$PROJECT_ID" \
+    --format='value(image_summary.digest)' 2>/dev/null)"
+  if [ -z "$digest" ]; then
+    image_missing="$image_missing\n    $uri does not resolve in Artifact Registry"
+  else
+    echo "  $tier-agent -> ${digest:0:19}..."
+  fi
 done
 if [ -n "$image_missing" ]; then
-  echo "DEFERRED: the agent image is not on every node, so a cross-node placement — the exact result"
-  echo "  this cluster exists to produce — would fail to pull and be indistinguishable from the RWO"
-  echo "  conflict this claim is looking for:"
+  echo "DEFERRED: the agent image for this commit is not in the registry the cluster pulls from, so"
+  echo "  a cross-node placement — the exact result this cluster exists to produce — would fail to"
+  echo "  pull and be indistinguishable from the RWO conflict this claim is looking for:"
   printf '%b\n' "$image_missing"
   echo "  Unblock: dev/cluster/reload-images.sh agents $CTX"
   [ "$fail" -eq 0 ] && exit 3 || exit 1
@@ -298,6 +315,26 @@ for name in "$A1" "$A2"; do
     waiting="$($K -n "$NS" get pods -l "kube-agents/agent=$name" -o jsonpath='{range .items[0].status.containerStatuses[*]}{.name}={.state.waiting.reason}:{.state.waiting.message}{" "}{end}' 2>/dev/null)"
     bad "$name never became Available with a second agent in the namespace: ${sched:-no scheduling message} | containers: ${waiting:-none reported}"
   fi
+done
+
+# The other half of what the crictl grep used to claim, asked where the answer is authoritative:
+# the image is on the node that ran the pod. `.status.containerStatuses[].imageID` is written by the
+# kubelet AFTER it has the layers, so a resolved digest here is proof of local presence in a way the
+# node's image list never was — that list can hold a tag pointing at a different build. An empty
+# imageID on a Running pod means the runtime reported no manifest digest, which is worth saying out
+# loud rather than passing over: every downstream claim about "the build under test" rests on it.
+# `platform-agent` is the container name for every tier, not just the platform one — the operator
+# hard-codes it in agent_manifests.go. Named explicitly rather than taken as `[0]`, because the pod
+# also carries a dashboard, fluent-bit and event-watcher, and an index would silently start
+# describing whichever of those the renderer happens to emit first.
+for name in "$A1" "$A2"; do
+  iid="$($K -n "$NS" get pods -l "kube-agents/agent=$name" \
+    -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="platform-agent")].imageID}' 2>/dev/null)"
+  case "$iid" in
+    *@sha256:*) pass "$name's agent container resolved to a digest on its node (${iid##*@})" ;;
+    "") bad "$name's agent container reports no imageID — the node that ran it cannot be shown to hold the image under test" ;;
+    *) bad "$name's agent container resolved to '$iid', which names no digest (LSN-001: a tag is not a build)" ;;
+  esac
 done
 
 # Same node => the RWO conflict was never actually put to the test, even with two nodes present.

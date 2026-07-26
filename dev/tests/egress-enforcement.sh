@@ -3,7 +3,7 @@
 #
 # Proves that on a NetworkPolicy-ENFORCING dataplane, a tier-shaped default-deny + pure-allowlist
 # egress policy actually BLOCKS an off-allowlist destination while ALLOWING an on-allowlist one — the
-# thing kindnet cannot do (verify-phase3 P3-K6 + the P5 shape checks are structural-only). It uses a
+# thing a shape check cannot do (verify-phase3 P3-K6 + the P5 checks judge YAML only). It uses a
 # representative in-cluster policy of the SAME shape as the production tier netpols (podSelector by tier
 # label, policyTypes:[Egress], DNS + a single ipBlock allow) so it proves the ENFORCEMENT MECHANISM,
 # not a specific production CIDR.
@@ -12,7 +12,7 @@
 # reachable with no policy (baseline), so a later failure to reach the off-allowlist target can only be
 # the policy — not broken networking.
 #
-# DESTRUCTIVE-TEST GUARD: only runs against a Kind or scratch-GKE context.
+# DESTRUCTIVE-TEST GUARD: only runs against a scratch-GKE context.
 # Exit codes: 0 = enforcement PROVEN; 1 = enforcement FAILED (halt condition); 3 = DEFERRED (no
 # NetworkPolicy-enforcing dataplane reachable — not faked green; stand one up with dev/cluster/up.sh).
 # Usage: dev/tests/egress-enforcement.sh [kube-context]
@@ -36,7 +36,7 @@
 #      absent an enforcing dataplane this exits 3 (DEFERRED), never 0.
 set -uo pipefail # -e omitted deliberately: kubectl/exec exit codes are inspected manually.
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 K="kubectl --context $CTX"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=dev/lib/preconditions.sh
@@ -46,11 +46,11 @@ TIER="egress-probe"
 ALLOWED_IMG="nginx:1.27-alpine"
 CLIENT_IMG="curlimages/curl:8.10.1"
 
-# Anchored allow-list: kind-* and gke-scratch-* ONLY. Substring globs like *scratch* would let a prod
+# Anchored allow-list: gke-scratch-* ONLY. Substring globs like *scratch* would let a prod
 # context slip through — never do that.
 case "$CTX" in
-  kind-* | gke-scratch-*) : ;;
-  *) echo "REFUSING: context '$CTX' is not a Kind/scratch cluster (destructive-test guard)." >&2; exit 2 ;;
+  gke-scratch-*) : ;;
+  *) echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2; exit 2 ;;
 esac
 
 fail=0

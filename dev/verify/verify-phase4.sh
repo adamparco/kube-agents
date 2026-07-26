@@ -4,7 +4,7 @@
 # Re-runnable gate for 07 §2 Phase 4 Accept (a–e) + the touched suites (04 §9, 06 §10, 03 §11) and the
 # load-bearing regressions. Phase 4 is push-first proactivity + indirect (GitOps/OKF) coordination, so
 # MOST of its acceptance is HERMETIC by design (go golden + dependency-free python + the OKF validator) —
-# the live Kind cluster is used only for the REGRESSION subset that the existing Phase-3 stack can prove
+# the live L2 cluster is used only for the REGRESSION subset that the existing Phase-3 stack can prove
 # without the Phase-4 image (03 §11 attenuation + read-only per-tier SAR under a trigger).
 #
 #   P4-K1 (a)  A K8s watch fires a reaction, scoped to the tier, WITHOUT a heartbeat poll.
@@ -29,20 +29,22 @@
 #              HERMETIC: test_detect_drift (desired-authoritative, server-default-tolerant read-only diff;
 #              drifted live object still present — detect-and-propose, never fix) + test_submit_suggestion
 #              (--dry-run halts after the local branch+commit, before git push / gh pr create).
-#   REGRESS    LIVE on the deployed Phase-3 Kind stack: negative-attenuation.sh (03 §11 — write / impersonate
+#   REGRESS    LIVE on the deployed Phase-3 stack: negative-attenuation.sh (03 §11 — write / impersonate
 #              / wrong-scope DENIED) + read-only per-tier SAR still holds (invariant 1 under a push trigger);
 #              08 §7 controller-mints-no-RBAC (go golden — controller ClusterRole has no rbac apiGroup).
 #
 # NOT covered here — deferred, NOT faked (same discipline as verify-phase2/3):
-#   - LIVE Event→session spawn and the cloud transport legs (alert Pub/Sub delivery, GitHub webhook HMAC)
-#     need the Phase-4 watcher/eventingress image REBUILT + `kind load` + `rollout restart` (the stale-image
-#     caveat: a same-tag image reads green while running Phase-3 code) or scratch-GKE. D1 is Kind-provable
-#     only at the IN-POD terminus (synthetic POST) which requires that rebuilt image; the transport is
-#     scratch-GKE-deferred. This gate proves the terminus/render/scoping logic hermetically instead.
+#   - LIVE Event→session spawn and the cloud transport legs (alert Pub/Sub delivery, GitHub webhook HMAC).
+#     The IN-POD terminus (synthetic POST) needs the Phase-4 watcher/eventingress image actually deployed;
+#     `dev/cluster/reload-images.sh` builds it and deploys it BY DIGEST, so the stale-image caveat that
+#     made this expensive — a same-tag image reads green while running Phase-3 code — is now structurally
+#     impossible rather than merely warned about. What is still genuinely deferred is the TRANSPORT: real
+#     Pub/Sub delivery and a real GitHub webhook signature, neither of which any target here originates.
+#     This gate proves the terminus/render/scoping logic hermetically instead.
 #   - 05 §8 chaos (failure-isolation) — Phase 6, NOT YET BUILT → N-A this phase (not a silent skip).
-#   - Calico egress ENFORCEMENT + V-G scratch-GKE cloud identity — as documented in verify-phase3.sh.
+#   - Egress ENFORCEMENT + the V-G cloud-identity checks — as documented in verify-phase3.sh.
 #
-# DESTRUCTIVE-TEST GUARD: the live regression only runs against a Kind context. The hermetic suite runs
+# DESTRUCTIVE-TEST GUARD: the live regression only runs against a scratch-GKE context. The hermetic suite runs
 # anywhere (it never touches a cluster), so this gate is CI-runnable even with no cluster reachable.
 # Usage: dev/verify/verify-phase4.sh [kube-context]
 #
@@ -71,7 +73,7 @@
 #      rendered ConfigMap at runtime (LSN-003).
 set -uo pipefail  # -e omitted: exit codes are inspected manually.
 
-CTX="${1:-kind-kube-agents-dev}"
+CTX="${1:-gke-scratch-kube-agents-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 K="kubectl --context $CTX"
 NSX=team-x
@@ -80,8 +82,8 @@ DEVEG="$TEAMX/30-netpol-developer-team-egress.yaml"
 CADMEG="examples/gitops-repo/clusters/cluster-a/agents/netpol-cluster-admin-egress.yaml"
 
 case "$CTX" in
-  kind-*) : ;;
-  *) echo "REFUSING: context '$CTX' is not a Kind cluster (destructive-test guard)." >&2; exit 2 ;;
+  gke-scratch-*) : ;;
+  *) echo "REFUSING: context '$CTX' is not a scratch cluster (destructive-test guard)." >&2; exit 2 ;;
 esac
 
 fail=0
@@ -122,7 +124,7 @@ for tier in platform cluster-admin developer-team; do
 done
 [ "$seam_auth" -eq 0 ]   && pass "S1 seam auth enforced across all 3 tiers (bearer/owner; no/invalid → 401/403)" || { bad "S1 seam-auth test FAILED (invariant 5 wake-vector gap)"; tail -12 /tmp/p4-auth.log; }
 [ "$seam_render" -eq 0 ] && pass "S2 inject kind-discriminator across all 3 tiers (alert/github/escalation; unknown → 400)" || { bad "S2 inject-render test FAILED"; tail -12 /tmp/p4-render.log; }
-note "LIVE Event→session spawn needs the Phase-4 watcher image (rebuild + kind load + rollout) — deferred; logic proven above."
+note "LIVE Event→session spawn needs the Phase-4 watcher image deployed (dev/cluster/reload-images.sh) — deferred; logic proven above."
 
 # --- P4-K2 (b): escalation round-trip is indirect (GitOps/OKF only, invariant 3) ---------------
 echo; echo "== P4-K2 (b): escalation written by a child, picked up by parent — never a direct call =="
@@ -164,7 +166,7 @@ pytest_ok "detect-drift: desired-authoritative server-default-tolerant read-only
 pytest_ok "submit-suggestion --dry-run halts after local branch+commit — no git push, no gh pr create" \
           "dev/test_submit_suggestion.py"
 
-# ============================ LIVE REGRESSION (Kind, load-bearing) ============================
+# ============================ LIVE REGRESSION (L2, load-bearing) ============================
 # Runs against the already-deployed Phase-3 stack (no Phase-4 image needed). Skips (flagged, non-fatal to
 # the hermetic gate) if the cluster is unreachable so CI can run the hermetic suite standalone.
 echo; echo "== REGRESSION (03 §11 + read-only SAR under trigger + 08 §7) — live on $CTX =="
@@ -198,7 +200,7 @@ if $K version >/dev/null 2>&1; then
   fi
 else
   note "context '$CTX' unreachable — LIVE regression SKIPPED (hermetic acceptance above still authoritative)."
-  note "Re-run against a deployed Kind stack (INSTALL 'Phase 2 — Kind inner loop') to exercise 03 §11 + SAR."
+  note "Re-run against a deployed L2 stack (dev/cluster/up.sh) to exercise 03 §11 + SAR."
 fi
 # 08 §7 — controller mints no RBAC/SA (go golden; deterministic, no cluster).
 ( cd k8s-operator && go test ./internal/controller/ >/tmp/p4-ctrl.log 2>&1 ) \
@@ -206,9 +208,9 @@ fi
   || { bad "08 §7 controller golden FAILED (regress)"; tail -15 /tmp/p4-ctrl.log; }
 
 echo
-echo "  DEFERRED (not faked): live Event→session spawn + cloud transport (Pub/Sub/GitHub HMAC) → Phase-4"
-echo "  image rebuild / scratch-GKE.  05 §8 chaos → Phase 6 (not yet built, N-A).  Calico egress"
-echo "  ENFORCEMENT + V-G cloud identity → separate Calico / scratch-GKE runs (see verify-phase3.sh)."
+echo "  DEFERRED (not faked): the cloud TRANSPORT legs (real Pub/Sub delivery, real GitHub webhook HMAC)"
+echo "  — no target here originates either.  05 §8 chaos → Phase 6 (not yet built, N-A).  Egress"
+echo "  ENFORCEMENT + V-G cloud identity → separate runs (see verify-phase3.sh)."
 echo
 echo "===================================================================="
 if [ "$fail" -eq 0 ]; then echo " Phase 4 verification: ALL CHECKS PASSED"; else echo " Phase 4 verification: FAILURES ABOVE (see HALT conditions)"; fi
