@@ -40,7 +40,7 @@
 #      under test here; there is no rendered layer above it.
 set -uo pipefail
 
-CTX="${1:-kind-kube-agents-egress}"
+CTX="${1:-kind-kube-agents-dev}"
 K="kubectl --context $CTX"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TREE="$REPO/examples/gitops-repo"

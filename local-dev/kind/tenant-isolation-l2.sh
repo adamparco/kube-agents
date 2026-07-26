@@ -42,7 +42,7 @@
 #   P6 runtime-authoritative: the rendered manifests from `common.sh` and the live objects read back from the API server.
 set -uo pipefail
 
-CTX="${1:-kind-kube-agents-egress}"
+CTX="${1:-kind-kube-agents-dev}"
 K="kubectl --context $CTX"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPTS="$REPO/k8s-operator/scripts"
@@ -223,7 +223,7 @@ if [ "$ENFORCING" != "calico" ] && [ "$ENFORCING" != "dataplane-v2" ]; then
   echo
   echo "DEFERRED (network half): dataplane is '$ENFORCING', which ACCEPTS NetworkPolicy and ENFORCES"
   echo "  NOTHING. Any deny observed here would be a false green. Re-run on Calico:"
-  echo "    local-dev/kind/up-egress.sh && $0 kind-kube-agents-egress"
+  echo "    local-dev/kind/up.sh && $0 kind-kube-agents-dev"
   echo
   if [ "$fail" -ne 0 ]; then
     echo "V-CMP-001 (L2, quota half): FAILURES ABOVE"

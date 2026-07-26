@@ -23,7 +23,10 @@
 #   pods on the SAME node mount an RWO claim quite happily, so a single-node cluster cannot exhibit a
 #   multi-attach at all, and "both pods came up" there is not evidence of anything. That is LSN-015
 #   applied to itself one level up — the fixture needs N=2 nodes for the same reason it needs N=2
-#   agents. It also needs enough memory for two agent pods (~2.7Gi each as rendered).
+#   agents. It also needs enough memory for two agent pods (~2.7Gi each as rendered), the agent image
+#   on EVERY node, and the ServiceAccount + API-key Secret the CRs reference but nothing creates.
+#   `local-dev/kind/up.sh` produces exactly that cluster; section 3 checks each condition and
+#   defers on the one that is missing rather than failing the claim for an environmental reason.
 #
 # So section 3 DEFERS, loudly and with the measured numbers, unless the cluster can actually host the
 # conflict. A deferral naming an external blocker is honest; a pass on a cluster that is physically
@@ -52,6 +55,14 @@ K="kubectl --context $CTX"
 NS="multi-agent-l2"
 A1="alpha-agent"
 A2="beta-agent"
+
+# The agent image these CRs run. This USED to be hard-coded to ghcr.io/gke-labs/...:v0.1.0, which no
+# inner-loop host has ever had — so even on a cluster that could host CLAIM 2, both pods would have
+# gone ImagePullBackOff and the claim would have failed for a reason unrelated to RWO. Defaults to
+# the local build that up.sh / reload-images.sh put on every node, and section 3 checks it is
+# really there before asserting anything (P8 also wants zero ghcr.io/gke-labs containers).
+AGENT_IMAGE_REPO="${AGENT_IMAGE_REPO:-kube-agents}"
+AGENT_IMAGE_TAG="${AGENT_IMAGE_TAG:-dev}"
 
 case "$CTX" in
   kind-* | gke-scratch-*) : ;;
@@ -111,9 +122,11 @@ create_agent() { # create_agent <name> <tier> <extra-scope-yaml> <extra-spec-yam
   local name="$1" tier="$2" scope_extra="$3" spec_extra="$4"
   # A tier-appropriate spec: the developer-team tier carries the A1 placement clause
   # (metadata.namespace == spec.scope.namespace); the cluster-admin tier is cluster-scoped, must NOT
-  # set it, and requires a parentRef. Both reference a ServiceAccount nothing has created —
-  # deliberately. The pods cannot start without it, and CLAIM 1 does not need them to: the PVCs are
-  # reconciled from the CR, so the naming property is decided before any pod is scheduled.
+  # set it, and requires a parentRef. Both reference a ServiceAccount and a Secret that do not exist
+  # yet, and CLAIM 1 runs anyway — deliberately, and it is worth being precise about why. The PVC
+  # names are reconciled from the CR, so the naming property is decided before any pod is scheduled;
+  # CLAIM 1 is therefore strictly cheaper than CLAIM 2 and must not acquire CLAIM 2's dependencies.
+  # Section 3 seeds both fixtures (lib/agent-fixtures.sh) at the point it actually needs pods.
   cat <<YAML | $K apply -f - >/dev/null || bad "could not create Agent $name"
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: Agent
@@ -136,8 +149,9 @@ ${scope_extra}
         name: ${name}-secrets
         key: API_SERVER_KEY
   deployment:
-    image: ghcr.io/gke-labs/kube-agents/${tier}-agent
-    tag: v0.1.0
+    image: ${AGENT_IMAGE_REPO}/${tier}-agent
+    tag: ${AGENT_IMAGE_TAG}
+    imagePullPolicy: IfNotPresent
   security:
     serviceAccountName: ${name}-sa
 ${spec_extra}
@@ -225,7 +239,9 @@ if [ "$NODES" -lt 2 ]; then
   echo "  node share an RWO claim without complaint — this cluster cannot exhibit the multi-attach"
   echo "  it would need to exhibit for 'both pods came up' to mean anything. CLAIM 1 above still"
   echo "  stands on its own; CLAIM 2 is not evidence here and is NOT being recorded as a pass."
-  echo "  Unblock: a 2-node Kind cluster (control-plane + worker) with >= ${NEED_GI}Gi allocatable."
+  echo "  Unblock: local-dev/kind/up.sh — it builds a 2-node cluster (control-plane + worker) with"
+  echo "  the full stack and the agent images on both nodes. A 1-node cluster here means this"
+  echo "  cluster predates that change; delete it and re-run up.sh."
   [ "$fail" -eq 0 ] && exit 3 || exit 1
 fi
 if [ "$ALLOC_GI" -lt "$NEED_GI" ]; then
@@ -236,12 +252,48 @@ if [ "$ALLOC_GI" -lt "$NEED_GI" ]; then
   [ "$fail" -eq 0 ] && exit 3 || exit 1
 fi
 
+# The image must be on EVERY node, and this is checked rather than hoped for. This cluster exists so
+# the two pods land on DIFFERENT nodes; an image present on only one of them converts the very
+# outcome we want into an ImagePullBackOff, which would then be recorded as "the agents cannot
+# coexist" — a false failure with the right shape to be believed.
+image_missing=""
+for node in $($K get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+  for tier in cluster-admin developer-team; do
+    repo="$AGENT_IMAGE_REPO/${tier}-agent"
+    if ! docker exec "$node" crictl images 2>/dev/null |
+      awk -v r="$repo" -v t="$AGENT_IMAGE_TAG" '$1 ~ r"$" && $2 == t {f=1} END {exit !f}'; then
+      image_missing="$image_missing\n    $node is missing $repo:$AGENT_IMAGE_TAG"
+    fi
+  done
+done
+if [ -n "$image_missing" ]; then
+  echo "DEFERRED: the agent image is not on every node, so a cross-node placement — the exact result"
+  echo "  this cluster exists to produce — would fail to pull and be indistinguishable from the RWO"
+  echo "  conflict this claim is looking for:"
+  printf '%b\n' "$image_missing"
+  echo "  Unblock: local-dev/kind/reload-images.sh agents $CTX"
+  [ "$fail" -eq 0 ] && exit 3 || exit 1
+fi
+
+# Only now: the pods need a ServiceAccount and an API-key Secret that nothing else creates. Seeded
+# HERE, after CLAIM 1, so CLAIM 1 keeps holding without them (see create_agent) and this stays the
+# only section that needs a startable pod.
+echo "  seeding the fixtures the pods need to start:"
+. "$(dirname "$0")/lib/agent-fixtures.sh"
+seed_agent_fixtures "$K" "$NS" "$A1"
+seed_agent_fixtures "$K" "$NS" "$A2"
+
 for name in "$A1" "$A2"; do
-  if $K -n "$NS" wait --for=condition=Available "deployment/${name}-gateway" --timeout=180s >/dev/null 2>&1; then
+  if $K -n "$NS" wait --for=condition=Available "deployment/${name}-gateway" --timeout=240s >/dev/null 2>&1; then
     pass "$name's Deployment became Available alongside the other agent"
   else
-    reason="$($K -n "$NS" get pods -l "kube-agents/agent=$name" -o jsonpath='{.items[0].status.conditions[?(@.type=="PodScheduled")].message}' 2>/dev/null)"
-    bad "$name never became Available with a second agent in the namespace: ${reason:-no message}"
+    # Report what the CONTAINER is stuck on, not only PodScheduled. A multi-attach shows up as an
+    # unschedulable/attach message, but a missing fixture or image shows up in the container's
+    # waiting reason and the old message rendered it as "no message" — a failure with no cause
+    # attached is the one most likely to be blamed on whatever this script is nominally testing.
+    sched="$($K -n "$NS" get pods -l "kube-agents/agent=$name" -o jsonpath='{.items[0].status.conditions[?(@.type=="PodScheduled")].message}' 2>/dev/null)"
+    waiting="$($K -n "$NS" get pods -l "kube-agents/agent=$name" -o jsonpath='{range .items[0].status.containerStatuses[*]}{.name}={.state.waiting.reason}:{.state.waiting.message}{" "}{end}' 2>/dev/null)"
+    bad "$name never became Available with a second agent in the namespace: ${sched:-no scheduling message} | containers: ${waiting:-none reported}"
   fi
 done
 

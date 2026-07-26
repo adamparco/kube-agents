@@ -1,7 +1,39 @@
-# Kind cluster for kube-agents negative/isolation tests (07 Phase 0).
+# local-dev/kind/kind-config.yaml — THE inner-loop cluster. There is one, and this is its shape.
 # K8s >= 1.30 is required for ValidatingAdmissionPolicy GA — set the node image via up.sh.
+#
+# This file used to have two siblings, `kind-calico.yaml` and `kind-2node.yaml`, and the repo ran
+# three Kind clusters at once. They differed in exactly two create-time knobs — CNI and node count —
+# which are orthogonal, so the union of all three is ONE cluster and every claim any of them served
+# is served here. Three control planes on a 6-CPU laptop VM was not a design; it was three separate
+# decisions to avoid rebuilding a working install, never revisited. See LSN-026 for what the host
+# pressure then cost: kube-scheduler crash-looping on two clusters at once and three FALSE security
+# failures in one run.
+#
+# Both knobs below are load-bearing. Neither is a preference, and dropping either does not give a
+# weaker cluster — it gives a cluster on which specific claims go VACUOUS while still printing
+# green, which is the failure mode this repository keeps paying for.
+#
+#   disableDefaultCNI: kindnet accepts a NetworkPolicy and silently enforces NOTHING. A suite that
+#     applies default-deny and then asserts "the pod is contained" passes while containing nothing.
+#     That is LSN-006, and it is why precondition P4 (binding.md) says an egress claim is `deferred`
+#     and never `pass` on kindnet. Calico is installed by up.sh; nodes stay NotReady until it lands,
+#     which is expected here and not a failure.
+#
+#   the worker node: ReadWriteOnce excludes per NODE, not per pod. Two pods co-located on one node
+#     mount an RWO claim quite happily, so a single-node cluster is PHYSICALLY INCAPABLE of showing
+#     the multi-attach that LSN-015 is about — "both pods came up" there is evidence of nothing, and
+#     V-CMP-004's CLAIM 2 stayed deferred for as long as this file said one node. The control-plane
+#     node is left schedulable (Kind does not taint it), so the scheduler has two placement targets
+#     and is free to spread the two agents across them.
+#
+# The worker costs ~400MiB and is the only thing here that cannot be collapsed further.
+#
+# Usage: local-dev/kind/up.sh   (creates the cluster AND installs the whole stack)
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: kube-agents-dev
+networking:
+  disableDefaultCNI: true # remove kindnet; Calico enforces NetworkPolicy (P4)
 nodes:
   - role: control-plane
+  - role: worker

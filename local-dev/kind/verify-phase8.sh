@@ -7,15 +7,23 @@
 # actually published, and the invariants gate is actually a mechanism. This script proves Accept
 # (a)–(f) and re-runs every prior gate.
 #
-# TWO TARGETS, NEITHER DEFAULTED. Phase 8's claims do not all live on one cluster:
-#   * `kind-kube-agents-dev`    runs kindnet and hosts the operator — the only place a webhook,
-#                               renderer or admission claim can be made.
-#   * `kind-kube-agents-egress` runs Calico and hosts NO operator — the only Kind target where an
-#                               egress claim may be green (LSN-006, binding.md P4).
-# So both are required positionally and neither has a default. On 2026-07-25 `L2-CHAIN.txt` appended
-# one target to every line; followed literally it sent two operator-dependent checks at the
-# operator-less cluster, where both correctly returned P1-UNVERIFIABLE — two of six lines silently not
-# run, visible only because P1 refuses to guess. A default target here would rebuild that defect in a
+# ONE TARGET, NOT DEFAULTED. This used to demand TWO contexts and refuse if they were equal, because
+# the operator lived on a kindnet cluster and Calico lived on a second, operator-less one. Those two
+# clusters differed in exactly two create-time knobs — CNI and node count — which are orthogonal, so
+# they were merged: `local-dev/kind/up.sh` now builds one 2-node Calico cluster that hosts the
+# operator, and 4 Kind nodes became 2. Carrying two control planes was not free; LSN-026 is three
+# false security failures caused by nothing but the memory pressure of doing it.
+#
+# The old "the two contexts must differ" refusal was a PROXY for the thing that matters — that an
+# egress claim is not being made on a dataplane which enforces nothing (LSN-006, binding.md P4).
+# Comparing two strings never tested that; it only tested that someone had typed two names. On one
+# cluster the proxy is worthless, so it is replaced below by the capability itself: assert
+# `calico-node` is present, and refuse rather than let section D go green on kindnet.
+#
+# The target is still required positionally and still has no default. On 2026-07-25 `L2-CHAIN.txt`
+# appended one target to every line; followed literally it sent two operator-dependent checks at the
+# operator-less cluster, where both correctly returned P1-UNVERIFIABLE — two of six lines silently
+# not run, visible only because P1 refuses to guess. A default here would rebuild that defect in the
 # script whose whole job is to be the phase's single verdict.
 #
 #   A. L0 — the hermetic layer, run as `L0-CHAIN.txt`, not as a list copied out of it -------------
@@ -52,25 +60,31 @@
 #   D1  V-CTN-020 at L3 — the live-WI half. `platform-agent-host` has no Dataplane V2 and enabling it
 #       is a cluster recreation on a non-destructive-test target (binding.md §Targets). The
 #       BLOCKING-ALWAYS L2 instance is NOT deferred and runs in section D.
-#   D2  LSN-015 CLAIM 2 (both agent pods Ready in one namespace) — needs 2 schedulable nodes and
-#       ~6Gi allocatable; the dev Kind is single-node. The per-agent isolation claims are not deferred.
 #   D3  V-CMP-003's Config Connector slice — the CRDs are absent from Kind (21/22).
 #   D4  the live-target checklist in docs/build/phase-8-live-checklist.md — every L3 step that needs a
 #       human on a real GKE cluster. Listed there so it is visible, never asserted here.
 #
-# DESTRUCTIVE-TEST GUARD: both contexts must be Kind or a scratch GKE. `platform-agent-host` is
+#   D2 IS GONE, and the way it went is the point. It read: "LSN-015 CLAIM 2 needs 2 schedulable nodes
+#   and ~6Gi allocatable; the dev Kind is single-node." That is a deferral whose blocker was a line in
+#   a YAML file we own — an environmental fact right up until someone reads it as one. `up.sh` now
+#   builds the two-node cluster, so the claim runs. A deferral that names OUR OWN configuration as the
+#   external obstacle is the shape to be suspicious of; V-MET-006 asks for a blocker, and this one
+#   answered with a default.
+#
+# DESTRUCTIVE-TEST GUARD: the context must be Kind or a scratch GKE. `platform-agent-host` is
 # outer-loop install verification only and is NOT a destructive-test target (binding.md §Targets).
-# Usage: local-dev/kind/verify-phase8.sh <dev-context> <egress-context>
+# Usage: local-dev/kind/verify-phase8.sh <context>
 #
 # PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
 # check_l2_scripts_declare_preconditions). Declared, not assumed: LSN-001 and LSN-002 each recurred
 # against scripts whose authors believed the preconditions held.
-#   P1 image-under-test:  kubeagents-system/control-plane=controller-manager on the DEV context only,
-#      asserted here via p1_assert_build_under_test. Sections B (multi-agent), C and F all rest on the
-#      operator's webhook and renderer, so a stale operator makes them statements about code that is
-#      not in the tree. The EGRESS context deliberately runs no operator: its claims are about what
-#      Calico enforces against manifests applied from the install path, and asserting P1 there would
-#      assert something known to be false. Section A is hermetic and is unaffected.
+#   P1 image-under-test:  kubeagents-system/control-plane=controller-manager, asserted here via
+#      p1_assert_build_under_test. Sections B (multi-agent), C and F all rest on the operator's
+#      webhook and renderer, so a stale operator makes them statements about code that is not in the
+#      tree. This used to be qualified "on the DEV context only", because the egress cluster ran no
+#      operator and asserting P1 there would have asserted something known to be false. There is one
+#      cluster now and it runs the operator, so the qualification is gone rather than carried
+#      forward as a distinction the reader has to resolve. Section A is hermetic and is unaffected.
 #   P3 admission-recreate: none of this script's own — it creates no object. Each sub-script owns the
 #      fixtures for the admission property it claims and answers P3 in its own block, which is the
 #      only place that answer can be given without guessing about code this script does not read.
@@ -87,23 +101,27 @@
 set -uo pipefail
 
 DEV_CTX="${1:-}"
-EGR_CTX="${2:-}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-if [ -z "$DEV_CTX" ] || [ -z "$EGR_CTX" ]; then
+if [ -z "$DEV_CTX" ]; then
   cat >&2 <<'USAGE'
-REFUSING: verify-phase8.sh needs BOTH targets, and will not pick either for you.
+REFUSING: verify-phase8.sh will not pick a target for you.
 
-  usage: local-dev/kind/verify-phase8.sh <dev-context> <egress-context>
-  e.g.   local-dev/kind/verify-phase8.sh kind-kube-agents-dev kind-kube-agents-egress
+  usage: local-dev/kind/verify-phase8.sh <context>
+  e.g.   local-dev/kind/verify-phase8.sh kind-kube-agents-dev
 
-Phase 8's claims live on two clusters. The operator, its webhook and its renderer exist only on the
-dev target; an egress claim may be green only on the Calico target (binding.md P4). A default would
-send half the phase gate at the wrong cluster and report the other half as the whole — which is
-exactly what L2-CHAIN.txt's single-target run loop did on 2026-07-25.
+  Stand it up first: local-dev/kind/up.sh
+
+This script deletes pods, applies deliberately-bad RBAC and exercises denial paths. A default target
+is a guess about which cluster you meant, and the guess would be read from `kubectl config
+current-context`, which on this machine may well be the live GKE cluster.
 USAGE
   exit 2
 fi
+# EGR_CTX remains a distinct variable rather than being search-replaced away: the sections below make
+# genuinely different KINDS of claim (operator-backed vs dataplane-enforced), and keeping the two
+# names is what lets them be pointed at different clusters again without re-deriving which is which.
+EGR_CTX="$DEV_CTX"
 
 # Anchored `case`, both ends, on both contexts (LSN-005). Not a substring match: `gke-scratch-` as a
 # prefix is the whole point, and `*gke-scratch*` would happily admit the live cluster if someone ever
@@ -114,12 +132,11 @@ for c in "$DEV_CTX" "$EGR_CTX"; do
     *) echo "REFUSING: context '$c' is neither kind-* nor gke-scratch-* (destructive-test guard)." >&2; exit 2 ;;
   esac
 done
-if [ "$DEV_CTX" = "$EGR_CTX" ]; then
-  echo "REFUSING: both targets are '$DEV_CTX'. One cluster cannot host both an operator-backed" >&2
-  echo "  admission claim and a Calico-enforced egress claim; passing the same context twice would" >&2
-  echo "  make one of the two sections quietly meaningless." >&2
-  exit 2
-fi
+
+# The "the two contexts must differ" refusal that used to sit here is gone with the second cluster.
+# Worth naming what it actually was: a proxy. It compared two STRINGS, which tested nothing about
+# either cluster's dataplane — it only tested that someone had typed two names. The property it stood
+# in for is asserted for real further down, as P4, by reading the CNI off the cluster at run time.
 
 fail=0
 pass()  { echo "PASS: $1"; }
@@ -130,8 +147,7 @@ cd "$REPO_ROOT"
 
 echo "===================================================================="
 echo " Phase 8 verification (make it real)"
-echo "   operator target: $DEV_CTX"
-echo "   egress target:   $EGR_CTX"
+echo "   target: $DEV_CTX  (operator + enforcing dataplane, one cluster)"
 echo "===================================================================="
 
 dev_up=1; kubectl --context "$DEV_CTX" version >/dev/null 2>&1 || dev_up=0
@@ -156,7 +172,7 @@ for _t in "$DEV_CTX:$dev_up" "$EGR_CTX:$egr_up"; do
     echo >&2
     echo "REFUSING to render a Phase 8 verdict: ${_t%:*} cannot run the experiment (P10)." >&2
     echo "  This is NOT a claim that Phase 8 regressed. Repair or recreate the cluster and re-run:" >&2
-    echo "    kind delete cluster --name \"\${CLUSTER}\" && bash local-dev/kind/up-egress.sh   # or up.sh" >&2
+    echo "    kind delete cluster --name \"\${CLUSTER}\" && bash local-dev/kind/up.sh" >&2
     exit 2
   fi
 done
@@ -187,6 +203,8 @@ if [ "$egr_up" -eq 1 ]; then
   else
     cni="$(kubectl --context "$EGR_CTX" -n kube-system get pods -o name 2>/dev/null | grep -m1 -iE 'kindnet|cilium|calico' || echo 'unknown')"
     note "P4: $EGR_CTX runs ${cni##*/}, not Calico — section D will be DEFERRED, never passed (LSN-006)"
+    note "    up.sh builds this cluster with Calico, so a kindnet cluster here predates that and"
+    note "    cannot be upgraded in place: kind delete cluster --name kube-agents-dev && up.sh"
   fi
 else
   note "egress target '$EGR_CTX' is unreachable — section D will be DEFERRED, never passed"
@@ -269,7 +287,7 @@ else
   defer "V-CTN-020's L2 instance — $EGR_CTX does not run an enforcing dataplane. On kindnet a"
   echo "           NetworkPolicy is accepted and ignored, so every negative here would pass for the"
   echo "           wrong reason (LSN-006). BLOCKING-ALWAYS: this is a failure of the RUN, not of the"
-  echo "           claim — stand up the Calico target with local-dev/kind/up-egress.sh and re-run."
+  echo "           claim — stand the cluster up with local-dev/kind/up.sh and re-run."
   fail=1
 fi
 defer "V-CTN-020's live-WI half at L3 — platform-agent-host has no Dataplane V2 and is not a"

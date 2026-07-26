@@ -337,20 +337,21 @@ narrows a **claim**, never a check: no assertion is removed, and the total rises
 
 Every bullet binds to at least one check ID. No bullet is unbound.
 
-| Accept                                                                                  | Check IDs                                                        | Level      | Target                               |
-| --------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------- | ------------------------------------ |
-| **(a)** clean-clone install brings all three tiers Ready, published images              | V-CMP-001, V-CMP-002, V-CMP-004, V-CMP-005                       | L0, L2, L3 | kind + live (L3 partly deferred)     |
-| **(b)** every tier completes an inference call and mints a token from its own namespace | V-CMP-001 (C5, C6 Wired+Exercised probes)                        | L2, L3     | kind + live (L3 deferred)            |
-| **(c)** empty **or blank** allowlist rejected at admission; no `*_ALLOW_ALL_USERS` env  | V-CTR-002 (V-7 slice in P8-T1; V-1…V-10 in P8-T9), **V-CTR-014** | L0, L2     | kind                                 |
-| **(d)** off-allowlist egress blocked while Workload Identity still works                | V-CTN-020                                                        | L2\*, L3   | **kind-kube-agents-egress** (Calico) |
-| **(e)** the invariants gate reflects the imperative model                               | V-MET-003, V-MET-004, V-MET-006, V-MET-007                       | L0         | none                                 |
-| **(f)** `verify-phase7.sh` regression green                                             | the full prior ratchet (03 §11, 05 §8, phases 2–7)               | L1, L2     | kind-kube-agents-dev                 |
+| Accept                                                                                  | Check IDs                                                        | Level      | Target                            |
+| --------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------- | --------------------------------- |
+| **(a)** clean-clone install brings all three tiers Ready, published images              | V-CMP-001, V-CMP-002, V-CMP-004, V-CMP-005                       | L0, L2, L3 | kind + live (L3 partly deferred)  |
+| **(b)** every tier completes an inference call and mints a token from its own namespace | V-CMP-001 (C5, C6 Wired+Exercised probes)                        | L2, L3     | kind + live (L3 deferred)         |
+| **(c)** empty **or blank** allowlist rejected at admission; no `*_ALLOW_ALL_USERS` env  | V-CTR-002 (V-7 slice in P8-T1; V-1…V-10 in P8-T9), **V-CTR-014** | L0, L2     | kind                              |
+| **(d)** off-allowlist egress blocked while Workload Identity still works                | V-CTN-020                                                        | L2\*, L3   | **kind-kube-agents-dev** (Calico) |
+| **(e)** the invariants gate reflects the imperative model                               | V-MET-003, V-MET-004, V-MET-006, V-MET-007                       | L0         | none                              |
+| **(f)** `verify-phase7.sh` regression green                                             | the full prior ratchet (03 §11, 05 §8, phases 2–7)               | L1, L2     | kind-kube-agents-dev              |
 
-\* **V-CTN-020 is BLOCKING-ALWAYS and may never be deferred** (09 §9.6). Its L2 instance runs on
-`kind-kube-agents-egress` (Calico v3.28.0) — the **only** Kind target where an egress claim may be
-green (LSN-006, `binding.md` P4). That cluster does **not currently exist** and P8-T2 must create it
-from `local-dev/kind/kind-calico.yaml`. Its L3 instance on live GKE is a separately-recorded
-carried deferral (see Deferrals below), consistent with how the scratch-GKE V-G checks are carried.
+\* **V-CTN-020 is BLOCKING-ALWAYS and may never be deferred** (09 §9.6). Its L2 instance needs a
+dataplane that actually enforces NetworkPolicy (Calico v3.28.0; LSN-006, `binding.md` P4). P8-T2
+created a dedicated `kind-kube-agents-egress` cluster for that; on 2026-07-26 the three inner-loop
+clusters were merged, and Calico now ships on the single `kind-kube-agents-dev` built by
+`local-dev/kind/up.sh`. Its L3 instance on live GKE is a separately-recorded carried deferral (see
+Deferrals below), consistent with how the scratch-GKE V-G checks are carried.
 
 ---
 

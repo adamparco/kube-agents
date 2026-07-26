@@ -496,8 +496,8 @@ def check_l0_chain_is_runnable() -> list[str]:
 # ---------------------------------------------------------------------------------------------
 
 # A script whose context comes from the caller: `CTX="${1:-kind-...}"`. Those are the ones that can
-# be pointed anywhere. up.sh / up-egress.sh build `kind-$CLUSTER` themselves and are not in scope --
-# there is no argument to aim at the live cluster.
+# be pointed anywhere. up.sh builds `kind-$CLUSTER` itself and is not in scope -- there is no
+# argument to aim at the live cluster.
 CALLER_CTX = re.compile(r'^\s*CTX="?\$\{\d+:-', re.MULTILINE)
 CASE_ON_CTX = re.compile(r'case\s+"?\$(?:\{)?CTX(?:\})?"?\s+in(.*?)^\s*esac', re.MULTILINE | re.DOTALL)
 ANCHORED_ARM = re.compile(r"^(?:kind|gke-scratch)-[A-Za-z0-9*_.-]*\*?$")
@@ -882,8 +882,9 @@ L2_SCOPE_FLOOR = 16
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:
-# up.sh and up-egress.sh provision clusters, lib/preconditions.sh is sourced for its helpers, and none
-# of the three renders a verdict that a stale image or a grandfathered object could falsify.
+# up.sh provisions the cluster, lib/preconditions.sh and lib/host-capacity.sh are sourced for their
+# helpers, and none of the three renders a verdict a stale image or grandfathered object could
+# falsify.
 VERDICT_FUNCS = (
     re.compile(r"^\s*(?:function\s+)?pass\s*\(\)", re.MULTILINE),
     re.compile(r"^\s*(?:function\s+)?bad\s*\(\)", re.MULTILINE),
@@ -962,8 +963,8 @@ def _l2_scripts_in_scope() -> list[Path]:
 
     Chain lines are kept even when they do not exist, so a typo'd chain line still reaches the
     floor and the existence check below. Transitive entries are traversed through regardless of
-    whether they render verdicts — up-egress.sh renders none but reaches two scripts that do — and
-    filtered out of the result at the end.
+    whether they render verdicts — up.sh renders none but reaches reload-images.sh, and
+    verify-phase7.sh reaches five scripts that do — and filtered out of the result at the end.
     """
     chain = _l2_chain_scripts()
     chain_set = set(chain)
@@ -1314,6 +1315,55 @@ def check_p3_pods_resolved_by_ownership() -> list[str]:
 
 # ---------------------------------------------------------------------------------------------
 
+def check_cluster_creating_scripts_assert_host_capacity() -> list[str]:
+    """LSN-027. Anything that creates a Kind cluster measures the host first, from one definition site.
+
+    Both resources `lib/host-capacity.sh` measures were found the hard way, and each was then
+    written into whichever script happened to be in hand -- which is how the memory floor briefly
+    existed in two files with two different values. The deeper problem is that a preflight grown one
+    incident at a time only ever measures the PREVIOUS incident: the memory check was written after
+    LSN-026, and the very next new cluster died on inotify while that check printed 5.7Gi of
+    headroom. A green preflight is not neutral there; it actively points at the wrong resource.
+
+    So the rule is not "have a preflight", it is "call THE preflight" -- one place to fix a floor,
+    one place to add the next resource, and a new `up-*.sh` cannot be written without it.
+
+    Scanned on code lines only (LSN-023): a comment mentioning assert_host_capacity is not a call.
+    An `echo` containing `kind create cluster` DOES trip this, and deliberately -- it caught one on
+    its first run. A remediation string telling the reader to hand-roll a cluster is itself the
+    defect: `kind create cluster --config kind-config.yaml` now yields a cluster with the default
+    CNI disabled and no Calico, so every node stays NotReady. up.sh is the only path that produces
+    a working cluster, so it is the only thing a message may name.
+    """
+    creators = sorted(
+        p for p in (REPO / "local-dev").rglob("*.sh")
+        if "kind create cluster" in _code_lines(p.read_text())
+    )
+    if not creators:
+        return [
+            "VACUOUS: no script under local-dev/ runs `kind create cluster`, so this check has "
+            "nothing to enforce. Either the clusters are created somewhere this does not look or "
+            "the pattern changed -- fix the search, not the finding."
+        ]
+    failures = []
+    for p in creators:
+        code = _code_lines(p.read_text())
+        rel = p.relative_to(REPO)
+        if "assert_host_capacity" not in code:
+            failures.append(
+                f"{rel} runs `kind create cluster` without calling assert_host_capacity "
+                f"(lib/host-capacity.sh). Source it and call it before the create, or the next "
+                f"host-capacity outage is diagnosed from scratch (LSN-026, LSN-027)."
+            )
+        elif "lib/host-capacity.sh" not in code:
+            failures.append(
+                f"{rel} calls assert_host_capacity but never sources lib/host-capacity.sh, so it "
+                f"is either relying on a caller's environment or has its own copy. One definition "
+                f"site (V-MET-013) is the whole point of the check."
+            )
+    return failures
+
+
 CHECKS = [
     ("invariant 7 — authority never precedes machinery", check_write_verbs_have_machinery),
     ("invariant 8 / V-MET-003 — assertion ratchet", check_assertion_ratchet),
@@ -1328,6 +1378,10 @@ CHECKS = [
     ("invariant 13 / LSN-019 — closed lessons are executable", check_closed_lessons_are_executable),
     ("P9 — `.status` reads are polled, not slept on", check_l2_status_reads_are_polled),
     ("P3 — recreated pods are resolved by ownership", check_p3_pods_resolved_by_ownership),
+    (
+        "LSN-027 — cluster-creating scripts measure the host first",
+        check_cluster_creating_scripts_assert_host_capacity,
+    ),
     ("L0 chain is runnable and wired to CI", check_l0_chain_is_runnable),
 ]
 

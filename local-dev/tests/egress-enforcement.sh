@@ -14,7 +14,7 @@
 #
 # DESTRUCTIVE-TEST GUARD: only runs against a Kind or scratch-GKE context.
 # Exit codes: 0 = enforcement PROVEN; 1 = enforcement FAILED (halt condition); 3 = DEFERRED (no
-# NetworkPolicy-enforcing CNI reachable — not faked green; stand up local-dev/kind/kind-calico.yaml).
+# NetworkPolicy-enforcing CNI reachable — not faked green; stand up local-dev/kind/kind-config.yaml).
 # Usage: local-dev/tests/egress-enforcement.sh [kube-context]
 #
 # PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
@@ -36,7 +36,7 @@
 #      absent calico-node this exits 3 (DEFERRED), never 0.
 set -uo pipefail # -e omitted deliberately: kubectl/exec exit codes are inspected manually.
 
-CTX="${1:-kind-kube-agents-egress}"
+CTX="${1:-kind-kube-agents-dev}"
 K="kubectl --context $CTX"
 NS="egress-test"
 TIER="egress-probe"
@@ -60,12 +60,12 @@ trap cleanup EXIT
 echo "== 0) checking for a NetworkPolicy-enforcing CNI (Calico) =="
 if ! $K version >/dev/null 2>&1; then
   echo "DEFERRED: context '$CTX' is not reachable — no enforcing cluster to test against."
-  echo "  Stand one up: kind create cluster --name kube-agents-egress --config local-dev/kind/kind-calico.yaml"
+  echo "  Stand one up: local-dev/kind/up.sh"
   exit 3
 fi
 if ! $K -n kube-system get daemonset calico-node >/dev/null 2>&1; then
   echo "DEFERRED: no calico-node found — kindnet does NOT enforce NetworkPolicy, so egress deny cannot be"
-  echo "  proven here. This is deferred-not-faked (E-A). Use local-dev/kind/kind-calico.yaml + install Calico."
+  echo "  proven here. This is deferred-not-faked (E-A). Use local-dev/kind/kind-config.yaml + install Calico."
   exit 3
 fi
 pass "Calico (NetworkPolicy-enforcing CNI) present"

@@ -11,18 +11,24 @@
 # anchored `case` on kind-* / gke-scratch-* and invariants-gate.py asserts it stays anchored —
 # a substring match is LSN-005, and the live GKE cluster is one `*` away.
 #
-# Every line CARRIES its own context, and not every line carries the same one. There are two Kind
-# targets on purpose: `kind-kube-agents-dev` runs kindnet and hosts the operator, while
-# `kind-kube-agents-egress` runs Calico and hosts no operator — and precondition P4 says an egress
-# claim is `deferred` and never `pass` on kindnet, so neither target can serve the whole file.
+# Every line CARRIES its own context, still, even though every line now carries the SAME one.
 #
-# The context used to be appended by the runner, and the run line below said "Calico target". That
-# was a single-definition-site violation dressed as a convenience: the paragraph here explained
-# that the targets differ and then handed the reader one loop that gave every line the same one.
-# Followed literally on 2026-07-25, it sent `closed-allowlist-l2.sh` and `multi-agent-namespace-l2.sh`
-# at the operator-less cluster, where both correctly returned P1-UNVERIFIABLE (rc 3) — two of six
-# lines silently not run, and only visibly so because P1 refuses to guess. A default target is a
-# guess about which cluster a check needs; the check knows, so the line says.
+# There used to be two Kind targets: `kind-kube-agents-dev` ran kindnet and hosted the operator,
+# `kind-kube-agents-egress` ran Calico and hosted none, and precondition P4 meant neither could serve
+# the whole file. They differed in two create-time knobs, CNI and node count, which are orthogonal —
+# so `up.sh` now builds their union (2 nodes, Calico, operator) and there is one target. Three
+# control planes on one laptop VM is also what LSN-026 cost us: three FALSE security failures from
+# memory pressure alone.
+#
+# The per-line context is NOT collapsed back into the run loop now that the values agree. It was a
+# run-loop default once. That was a single-definition-site violation dressed as a convenience: the
+# paragraph here explained that the targets differ and then handed the reader one loop that gave
+# every line the same one. Followed literally on 2026-07-25 it sent `closed-allowlist-l2.sh` and
+# `multi-agent-namespace-l2.sh` at the operator-less cluster, where both correctly returned
+# P1-UNVERIFIABLE (rc 3) — two of six lines silently not run, and only visibly so because P1 refuses
+# to guess. A default target is a guess about which cluster a check needs; the check knows, so the
+# line says. That the guess would currently be RIGHT is exactly why re-introducing it would be hard
+# to notice, and the next time the targets diverge is the run nobody would check.
 #
 # Run:  while read -r c; do case "$c" in ''|\#*) continue ;; esac; eval "$c"; done < local-dev/L2-CHAIN.txt
 #
@@ -38,11 +44,11 @@
 bash local-dev/kind/verify-phase7.sh kind-kube-agents-dev
 
 # --- Phase 8 L2 checks ------------------------------------------------------------------------
-# Target column, and why each one: `-egress` where the claim is about a dataplane enforcing
-# something (P4), `-dev` where the claim is about the operator or its webhook, which only that
-# cluster runs.
-bash local-dev/kind/egress-enforcement-l2.sh kind-kube-agents-egress
-bash local-dev/kind/tenant-isolation-l2.sh kind-kube-agents-egress
+# Two kinds of claim, one cluster that can host both: the first three need a dataplane that actually
+# enforces NetworkPolicy (P4 — Calico, never kindnet), the last two need the operator and its
+# webhook. The target below satisfies both, which is the whole reason it was merged.
+bash local-dev/kind/egress-enforcement-l2.sh kind-kube-agents-dev
+bash local-dev/kind/tenant-isolation-l2.sh kind-kube-agents-dev
 bash local-dev/kind/closed-allowlist-l2.sh kind-kube-agents-dev
-bash local-dev/kind/gitops-tree-applies-l2.sh kind-kube-agents-egress
+bash local-dev/kind/gitops-tree-applies-l2.sh kind-kube-agents-dev
 bash local-dev/kind/multi-agent-namespace-l2.sh kind-kube-agents-dev

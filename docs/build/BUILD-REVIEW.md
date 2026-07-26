@@ -196,7 +196,7 @@ Caveat: the endpoint is provider-neutral but **auth is not** — scripts always 
 
 | Script                                                                             | Cluster-bound?                                                                 | Rating                      |
 | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | --------------------------- |
-| `up.sh` / `down.sh` / `kind-config.yaml` / `kind-calico.yaml`                      | lifecycle                                                                      | real-runnable / real-static |
+| `up.sh` / `down.sh` / `kind-config.yaml`                                           | lifecycle                                                                      | real-runnable / real-static |
 | `verify-phase2.sh`, `verify-phase3.sh`                                             | hard cluster-bound                                                             | real-runnable               |
 | `verify-phase4.sh`, `verify-phase5.sh`                                             | **partially hermetic** (core runs cluster-free; live regression needs cluster) | real-runnable               |
 | `verify-phase6.sh`, `verify-phase7.sh`                                             | hard cluster-bound (unreachable = FAIL)                                        | real-runnable               |
@@ -336,13 +336,11 @@ for p in 2 3 4 5 6 7; do local-dev/kind/verify-phase$p.sh kind-kube-agents-dev; 
 
 **Stale-image rule (load-bearing).** Local images reuse a fixed tag (`:dev`, `:latest`) with `imagePullPolicy: IfNotPresent`, so a same-tag image is **not** auto-refreshed. A Kind gate can read green against a stale build that under-enforces an admission invariant. **Always rebuild → `kind load` → `rollout restart`/`set image` before trusting a gate** — `reload-images.sh` does exactly this. This matters most before Phase 6.
 
-**Calico caveat for egress.** kindnet does **not** enforce NetworkPolicy, so `egress-enforcement.sh` self-defers (exit 3, non-fatal). To actually prove egress enforcement:
+**Calico caveat for egress.** kindnet does **not** enforce NetworkPolicy, so on a kindnet cluster `egress-enforcement.sh` self-defers (exit 3, non-fatal). This used to require standing up a second, Calico-only cluster. It no longer does — `up.sh` builds the one inner-loop cluster with Calico already, so:
 
 ```bash
-kind create cluster --name kube-agents-egress --config local-dev/kind/kind-calico.yaml
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
-kubectl -n kube-system rollout status ds/calico-node
-local-dev/tests/egress-enforcement.sh kind-kube-agents-egress   # exit 0 = proven; exit 3 = deferred
+local-dev/kind/up.sh                                         # 2 nodes, Calico, operator, VAP, agent images
+local-dev/tests/egress-enforcement.sh kind-kube-agents-dev   # exit 0 = proven; exit 3 = deferred
 ```
 
 No `calico`/`calicoctl` binary is needed — install is pure `kubectl apply`.

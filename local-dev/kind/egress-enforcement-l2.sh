@@ -46,7 +46,7 @@
 #      artifact and can drift from the renderer without either side noticing.
 set -uo pipefail # -e omitted deliberately: probe exit codes are inspected, not fatal.
 
-CTX="${1:-kind-kube-agents-egress}"
+CTX="${1:-kind-kube-agents-dev}"
 K="kubectl --context $CTX"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPTS="$REPO/k8s-operator/scripts"
@@ -84,12 +84,12 @@ trap cleanup EXIT
 # --- 0) preconditions: reachable cluster + an ENFORCING dataplane ------------------------------------
 echo "== 0) preconditions =="
 if ! $K version >/dev/null 2>&1; then
-  echo "DEFERRED: context '$CTX' is not reachable. Stand it up: local-dev/kind/up-egress.sh"
+  echo "DEFERRED: context '$CTX' is not reachable. Stand it up: local-dev/kind/up.sh"
   exit 3
 fi
 if ! $K -n kube-system get daemonset calico-node >/dev/null 2>&1; then
   echo "DEFERRED: no enforcing CNI (calico-node absent). kindnet accepts NetworkPolicy and enforces"
-  echo "  nothing, so an egress claim here would be false. Run: local-dev/kind/up-egress.sh"
+  echo "  nothing, so an egress claim here would be false. Run: local-dev/kind/up.sh"
   exit 3
 fi
 pass "enforcing dataplane present (calico-node)"
