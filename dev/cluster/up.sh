@@ -40,12 +40,15 @@ for tool in kind kubectl docker; do
 done
 
 # --- host preflight ------------------------------------------------------------------------------
-# assert_host_capacity is the single definition site for "can this host hold a Kind cluster", and
-# invariants-gate.py `check_cluster_creating_scripts_assert_host_capacity` fails any script that
-# runs `kind create cluster` without calling it. Two resources, two separate incidents, and the
-# reason both live there rather than one: a preflight grown one outage at a time only ever measures
-# the PREVIOUS outage (LSN-027). Override with ALLOW_TIGHT_MEMORY=1 if you know better.
-. "$HERE/../lib/host-capacity.sh"
+# lib/substrate-capacity.sh is the single definition site for "can this substrate hold the cluster",
+# one function per substrate, each annotated with the create command it covers. invariants-gate.py
+# `check_cluster_creating_scripts_assert_capacity` parses those annotations and fails any script
+# that runs a covered create command without calling its preflight. Two resources here, two separate
+# incidents, and the reason both live there rather than one: a preflight grown one outage at a time
+# only ever measures the PREVIOUS outage (LSN-027). Override with ALLOW_TIGHT_MEMORY=1 if you know
+# better.
+# shellcheck source=dev/lib/substrate-capacity.sh
+. "$HERE/../lib/substrate-capacity.sh"
 assert_host_capacity
 
 # --- cluster ---------------------------------------------------------------------------------------

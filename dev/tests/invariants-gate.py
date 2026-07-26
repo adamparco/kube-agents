@@ -887,7 +887,7 @@ L2_SCOPE_FLOOR = 16
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:
-# up.sh provisions the cluster, lib/preconditions.sh and lib/host-capacity.sh are sourced for their
+# up.sh provisions the cluster, lib/preconditions.sh and lib/substrate-capacity.sh are sourced for their
 # helpers, and none of the three renders a verdict a stale image or grandfathered object could
 # falsify.
 VERDICT_FUNCS = (
@@ -1379,10 +1379,19 @@ def check_l2_scripts_assert_cluster_health() -> list[str]:
 
 # ---------------------------------------------------------------------------------------------
 
-def check_cluster_creating_scripts_assert_host_capacity() -> list[str]:
-    """LSN-027. Anything that creates a Kind cluster measures the host first, from one definition site.
+CAPACITY_LIB = REPO / "dev" / "lib" / "substrate-capacity.sh"
+# `# @covers: <command>` on the line above `assert_<name>_capacity() {`. Parsed, not hardcoded --
+# see the docstring for why the map has to live in the library and not here.
+COVERS = re.compile(
+    r"^#\s*@covers:\s*(?P<cmd>.+?)\s*$\n(?P<fn>assert_\w*capacity)\s*\(\)\s*\{",
+    re.MULTILINE,
+)
 
-    Both resources `lib/host-capacity.sh` measures were found the hard way, and each was then
+
+def check_cluster_creating_scripts_assert_capacity() -> list[str]:
+    """LSN-027. Anything that creates a cluster measures its substrate first, from one definition site.
+
+    Every resource `lib/substrate-capacity.sh` measures was found the hard way, and each was then
     written into whichever script happened to be in hand -- which is how the memory floor briefly
     existed in two files with two different values. The deeper problem is that a preflight grown one
     incident at a time only ever measures the PREVIOUS incident: the memory check was written after
@@ -1392,39 +1401,65 @@ def check_cluster_creating_scripts_assert_host_capacity() -> list[str]:
     So the rule is not "have a preflight", it is "call THE preflight" -- one place to fix a floor,
     one place to add the next resource, and a new `up-*.sh` cannot be written without it.
 
-    Scanned on code lines only (LSN-023): a comment mentioning assert_host_capacity is not a call.
-    An `echo` containing `kind create cluster` DOES trip this, and deliberately -- it caught one on
-    its first run. A remediation string telling the reader to hand-roll a cluster is itself the
-    defect: `kind create cluster --config kind-config.yaml` now yields a cluster with the default
-    CNI disabled and no Calico, so every node stays NotReady. up.sh is the only path that produces
-    a working cluster, so it is the only thing a message may name.
+    SUBSTRATE-NEUTRAL BY CONSTRUCTION. The lesson is about preflights, not about Colima, and the
+    check has to outlive the host that taught it -- otherwise deleting Kind silently retires it.
+    So the command -> preflight map is PARSED out of the library's `@covers:` lines rather than
+    written here. Adding a substrate is one function plus one comment in one file; retiring one is
+    a deletion, after which no script matches that command and the map shrinks on its own. A table
+    here would instead go quietly green about a pattern nothing uses any more.
+
+    Scanned on code lines only (LSN-023): a comment mentioning the assertion is not a call. An
+    `echo` containing a create command DOES trip this, and deliberately -- it caught one on its
+    first run. A remediation string telling the reader to hand-roll a cluster is itself the defect,
+    because a hand-rolled cluster is missing whatever up.sh does after the create; up.sh is the
+    only path that produces a working cluster, so it is the only thing a message may name.
     """
-    creators = sorted(
-        p for p in (REPO / "dev").rglob("*.sh")
-        if "kind create cluster" in _code_lines(p.read_text())
-    )
+    if not CAPACITY_LIB.exists():
+        return [
+            f"VACUOUS: {CAPACITY_LIB.relative_to(REPO)} does not exist, so there is no preflight to "
+            f"require. If the library moved, move this constant with it -- in the same commit."
+        ]
+    covers = {m.group("cmd"): m.group("fn") for m in COVERS.finditer(CAPACITY_LIB.read_text())}
+    if not covers:
+        return [
+            f"VACUOUS: {CAPACITY_LIB.relative_to(REPO)} declares no `# @covers: <command>` line "
+            f"above any assert_*_capacity function, so this check knows of no cluster-creating "
+            f"command to police and passes everything. Either the annotation was dropped or the "
+            f"function naming changed -- fix the parser, not the finding."
+        ]
+
+    creators: dict[Path, list[str]] = {}
+    for p in sorted((REPO / "dev").rglob("*.sh")):
+        code = _code_lines(p.read_text())
+        matched = [cmd for cmd in covers if cmd in code]
+        if matched:
+            creators[p] = matched
     if not creators:
         return [
-            "VACUOUS: no script under dev/ runs `kind create cluster`, so this check has "
-            "nothing to enforce. Either the clusters are created somewhere this does not look or "
-            "the pattern changed -- fix the search, not the finding."
+            f"VACUOUS: no script under dev/ runs any of the cluster-creating commands the library "
+            f"claims to cover ({', '.join(sorted(covers))}), so this check has nothing to enforce. "
+            f"Either clusters are now created somewhere this does not look, or a substrate was "
+            f"retired without retiring its @covers line -- fix the search, not the finding."
         ]
+
     failures = []
-    for p in creators:
+    for p, cmds in creators.items():
         code = _code_lines(p.read_text())
         rel = p.relative_to(REPO)
-        if "assert_host_capacity" not in code:
-            failures.append(
-                f"{rel} runs `kind create cluster` without calling assert_host_capacity "
-                f"(lib/host-capacity.sh). Source it and call it before the create, or the next "
-                f"host-capacity outage is diagnosed from scratch (LSN-026, LSN-027)."
-            )
-        elif "lib/host-capacity.sh" not in code:
-            failures.append(
-                f"{rel} calls assert_host_capacity but never sources lib/host-capacity.sh, so it "
-                f"is either relying on a caller's environment or has its own copy. One definition "
-                f"site (V-MET-013) is the whole point of the check."
-            )
+        for cmd in cmds:
+            fn = covers[cmd]
+            if fn not in code:
+                failures.append(
+                    f"{rel} runs `{cmd}` without calling {fn} (lib/substrate-capacity.sh). Source "
+                    f"it and call it before the create, or the next capacity outage is diagnosed "
+                    f"from scratch (LSN-026, LSN-027)."
+                )
+            elif "lib/substrate-capacity.sh" not in code:
+                failures.append(
+                    f"{rel} calls {fn} but never sources lib/substrate-capacity.sh, so it is "
+                    f"either relying on a caller's environment or has its own copy. One definition "
+                    f"site (V-MET-013) is the whole point of the check."
+                )
     return failures
 
 
@@ -1447,8 +1482,8 @@ CHECKS = [
         check_l2_scripts_assert_cluster_health,
     ),
     (
-        "LSN-027 — cluster-creating scripts measure the host first",
-        check_cluster_creating_scripts_assert_host_capacity,
+        "LSN-027 — cluster-creating scripts measure their substrate first",
+        check_cluster_creating_scripts_assert_capacity,
     ),
     ("L0 chain is runnable and wired to CI", check_l0_chain_is_runnable),
 ]

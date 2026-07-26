@@ -375,7 +375,7 @@ The one trap to avoid: following the old INSTALL.md literally (`make deploy IMG=
 
 These need a real cluster/cloud and are **not** part of the Kind loop (all disclosed, none asserted green):
 
-- `dev/gke-scratch/create.sh` — `gcloud container clusters create-auto` (billable); needs `gcloud` auth + a GCP project.
+- ~~`dev/gke-scratch/create.sh`~~ — retired 2026-07-26. The ephemeral Autopilot cluster it stood up is replaced by the L2 dev cluster (`dev/cluster/up.sh`), which carries Workload Identity and Dataplane V2, so these stop being a separate target to provision.
 - **V-G1..V-G4**: cluster-admin viewer GSA + Workload Identity, second spoke + private hub inference/Minty, live Google Chat app, live CI/CD apply.
 - `tests/e2e/gchat_agent_test.py` — real end-to-end pytest against a deployed Chat agent; needs WIF provisioning (`provision_ci_iam.sh`) + a Chat space (run via `.github/workflows/e2e-gchat-test.yml`).
 - Second cloud (EKS IRSA / AKS AAD) + live `terraform apply` (D1/D2).
