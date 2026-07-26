@@ -260,9 +260,11 @@ Tear down:    dev/cluster/down.sh
 
 THE ROUTER CRASHLOOPS HERE, AND THAT IS THE CORRECT OUTCOME, not a broken bring-up. It runs the
 image built from this tree — that part is now proven rather than assumed — and exits on
-\`missing required --project-id\`, because config/router/deployment.yaml ships the literal
-REPLACE_WITH_PROJECT_ID / REPLACE_WITH_INBOUND_SUBSCRIPTION and its ServiceAccount carries no
-Workload Identity annotation. Wiring those needs a real Pub/Sub subscription and a bound GSA, which
+\`missing required --project-id\`, because config/router/deployment.yaml ships KAGE_PROJECT_ID and
+KAGE_INBOUND_SUBSCRIPTION as EMPTY strings — deliberately, per V-CMP-003, so the failure names the
+variable to set instead of a placeholder flowing into the Pub/Sub client and surfacing as a missing
+credentials file — and its ServiceAccount carries no Workload Identity annotation. provision_03
+step 5 is what sets them on a real install. Wiring them needs a Pub/Sub subscription and a GSA, which
 is L3 work on a live install, not something an inner-loop cluster can or should invent. The router's
 routing logic is proven hermetically against the pstest fake (go test ./internal/router/), so
 nothing in dev/L2-CHAIN.txt depends on this pod. Confirm the reason, do not assume it:

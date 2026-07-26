@@ -122,14 +122,57 @@ build_and_resolve() {
   echo "$REGISTRY/$name@$digest"
 }
 
-reload_operator() {
-  echo "== operator =="
-  local ref
-  ref="$(build_and_resolve k8s-operator "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile")" || return 4
+# build_concurrently <name>:<subs> [<name>:<subs> ...] -> writes $BUILD_REFS/<name>.ref per image
+#
+# Cloud Build gives every submission its own worker, so these were never competing for anything --
+# the serial version simply blocked this laptop on `Waiting for build to complete` once per image.
+# Measured 2026-07-26: ~5 min each, so `all` was ~25 min of wall clock to do ~5 min of work.
+#
+# Every PID is waited on INDIVIDUALLY. A bare `wait` yields 0 no matter what the jobs did, which
+# here would mean reporting a green reload for images that never reached the registry -- the exact
+# "the command ran and left nothing behind" shape build_and_resolve's two-step exists to catch.
+# Substitutions may not contain a colon; none do, and the `%%`/`#` split below assumes it.
+BUILD_REFS=""
+trap '[ -n "$BUILD_REFS" ] && rm -rf "$BUILD_REFS"' EXIT
+build_concurrently() {
+  local spec name pids='' rc=0
+  # Removed on EXIT by the trap above. Left in place while the script runs because the refs are read
+  # back after the deploy steps, and a ref file deleted early reads as "that image was never built".
+  BUILD_REFS="$(mktemp -d)" || return 4
+  for spec in "$@"; do
+    name="${spec%%:*}"
+    build_and_resolve "$name" "${spec#*:}" >"$BUILD_REFS/$name.ref" &
+    pids="$pids $!:$name"
+  done
+  echo "-- $# image(s) building concurrently on Cloud Build --" >&2
+  for spec in $pids; do
+    wait "${spec%%:*}" || { rc=4; echo "ERROR: build failed for ${spec##*:}." >&2; }
+  done
+  return $rc
+}
+
+# ref_for <name> -> the digest reference build_concurrently resolved, or empty
+ref_for() { tr -d '\n' <"$BUILD_REFS/$1.ref" 2>/dev/null; }
+
+# The build half and the deploy half are separate functions ONLY so that `all` can put all five
+# builds on Cloud Build at once and then deploy them. Each `reload_*` still reads as build-then-deploy.
+OPERATOR_SPEC='k8s-operator:_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile'
+ROUTER_SPEC='kage-router:_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile.router'
+agent_spec() { echo "$1-agent:_TARGET=$1,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG"; }
+
+deploy_operator() {
+  local ref="$1"
+  [ -n "$ref" ] || return 4
   echo "-> repointing the controller at $ref"
   $K -n "$NS" set image deploy/kubeagents-controller-manager "manager=$ref" || return 4
   $K -n "$NS" rollout status deploy/kubeagents-controller-manager --timeout=180s || return 4
   echo "OK: controller now running $ref"
+}
+
+reload_operator() {
+  echo "== operator =="
+  build_concurrently "$OPERATOR_SPEC" || return 4
+  deploy_operator "$(ref_for k8s-operator)"
 }
 
 # The router is a separate image from the same tree (Dockerfile.router), not a variant of the
@@ -137,8 +180,10 @@ reload_operator() {
 #
 # THE ONE PLACE THIS SCRIPT SPLITS "no image" FROM "image, no Ready pod", AND WHY.
 #   Everywhere else the two are the same failure. Here they are not, because the router is KNOWN not
-#   to start on an unwired cluster: config/router/deployment.yaml ships REPLACE_WITH_PROJECT_ID and
-#   REPLACE_WITH_INBOUND_SUBSCRIPTION, and its SA carries no Workload Identity annotation, so it
+#   to start on an unwired cluster: config/router/deployment.yaml ships KAGE_PROJECT_ID and
+#   KAGE_INBOUND_SUBSCRIPTION as empty strings (deliberately -- V-CMP-003, and an empty value makes
+#   the process name the variable instead of failing later inside the Pub/Sub client), and its SA
+#   carries no Workload Identity annotation, so it
 #   exits on `missing required --project-id` before it can reach Pub/Sub. That is a disclosed gap in
 #   the CONFIG, and it is not evidence about the image -- which is the thing this script exists to
 #   put on the cluster. Collapsing them would make every inner-loop bring-up fail on a condition
@@ -146,10 +191,9 @@ reload_operator() {
 #   which is how an image goes back to being never built. So: rc 4 if the registry has nothing
 #   (fatal anywhere), rc 5 if the digest is deployed and the pod will not come up (the caller
 #   decides, and up.sh discloses it).
-reload_router() {
-  echo "== router =="
-  local ref
-  ref="$(build_and_resolve kage-router "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile.router")" || return 4
+deploy_router() {
+  local ref="$1"
+  [ -n "$ref" ] || return 4
   echo "-> repointing the router at $ref"
   $K -n "$NS" set image deploy/kubeagents-router "router=$ref" || return 4
   if ! $K -n "$NS" rollout status deploy/kubeagents-router --timeout=180s; then
@@ -161,36 +205,55 @@ reload_router() {
   echo "OK: router now running $ref"
 }
 
+reload_router() {
+  echo "== router =="
+  build_concurrently "$ROUTER_SPEC" || return 4
+  deploy_router "$(ref_for kage-router)"
+}
+
+# patch_agent_crs — repoint every Agent CR at the digest built for ITS tier.
+#
+# Runs once, after all three images exist, rather than once per tier inside the build loop. The CR
+# list is a property of the cluster and does not change between builds, so re-listing it three times
+# was three answers to the same question.
+patch_agent_crs() {
+  local patched=0 crs ns name crtier ref
+  # An empty spec.deployment.image does NOT fall back to anything local -- the controller resolves
+  # ghcr.io/gke-labs/kube-agents/<tier>-agent:v0.1.0, which is the upstream build. So the CRs are
+  # patched, not merely reported on. resolveAgentImage() already treats a reference containing '@'
+  # as complete and passes it through untouched, so a digest needs no `tag:`.
+  crs="$($K get agents -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}/{.spec.tier}{"\n"}{end}' 2>/dev/null)"
+  while IFS=/ read -r ns name crtier; do
+    [ -n "$name" ] || continue
+    # An absent spec.tier IS platform (agentindex.EffectiveTier), so the default has to be applied
+    # here too, or platform agents written without the field silently keep the upstream image
+    # while this script reports three tiers rebuilt.
+    [ -n "$crtier" ] || crtier=platform
+    ref="$(ref_for "$crtier-agent")"
+    # A CR naming a tier nobody built is not a no-op to pass over: it would keep the upstream image
+    # while this script reported every CR repointed.
+    [ -n "$ref" ] || { echo "ERROR: agent $ns/$name has tier '$crtier', which was not built." >&2; return 4; }
+    $K -n "$ns" patch agent "$name" --type=merge \
+      -p "{\"spec\":{\"deployment\":{\"image\":\"$ref\"}}}" >/dev/null || return 4
+    echo "   patched agent $ns/$name -> $crtier digest"
+    patched=$((patched + 1))
+  done <<<"$crs"
+  AGENT_CRS_PATCHED="$patched"
+}
+
 reload_agents() {
   echo "== agents =="
-  local built=0 patched=0 tier ref crs ns name crtier
+  local tier built=0 patched=0
+  build_concurrently "$(agent_spec platform)" "$(agent_spec cluster-admin)" "$(agent_spec developer-team)" || return 4
   for tier in platform cluster-admin developer-team; do
-    ref="$(build_and_resolve "$tier-agent" "_TARGET=$tier,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG")" || return 4
-    built=$((built + 1))
-
-    # An empty spec.deployment.image does NOT fall back to anything local -- the controller
-    # resolves ghcr.io/gke-labs/kube-agents/<tier>-agent:v0.1.0, which is the upstream build. So
-    # the CRs are patched, not merely reported on. resolveAgentImage() already treats a reference
-    # containing '@' as complete and passes it through untouched, so a digest needs no `tag:`.
-    crs="$($K get agents -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}/{.spec.tier}{"\n"}{end}' 2>/dev/null)"
-    while IFS=/ read -r ns name crtier; do
-      [ -n "$name" ] || continue
-      # An absent spec.tier IS platform (agentindex.EffectiveTier), so the default has to be applied
-      # here too, or platform agents written without the field silently keep the upstream image
-      # while this script reports three tiers rebuilt.
-      [ -n "$crtier" ] || crtier=platform
-      [ "$crtier" = "$tier" ] || continue
-      $K -n "$ns" patch agent "$name" --type=merge \
-        -p "{\"spec\":{\"deployment\":{\"image\":\"$ref\"}}}" >/dev/null || return 4
-      echo "   patched agent $ns/$name -> $tier digest"
-      patched=$((patched + 1))
-    done <<<"$crs"
+    [ -n "$(ref_for "$tier-agent")" ] && built=$((built + 1))
   done
-
   if [ "$built" -ne 3 ]; then
     echo "ERROR: $built of 3 agent images built — refusing to report success." >&2
     return 4
   fi
+  patch_agent_crs || return 4
+  patched="$AGENT_CRS_PATCHED"
   # Zero CRs is legitimate: up.sh runs this on a cluster that has no fixtures yet. It is reported as
   # a count rather than passed over in silence, because "built and deployed nothing" and "built and
   # deployed everything" must not print the same thing.
@@ -200,11 +263,32 @@ reload_agents() {
   fi
 }
 
+# `all` is not `operator && router && agents`: that chain is five Cloud Build submissions one after
+# another, and the deploy step of each is seconds of work gating the next five-minute build. One
+# concurrent build of everything, then the deploys, is the same work in the time of the slowest image.
+#
+# The router's rc 5 -- deployed at the right digest, will not start for want of config -- is carried
+# through rather than allowed to short-circuit the agents, because it is a disclosed CONFIG gap and
+# `&&` would have made it silently skip the rest of the reload.
+reload_all() {
+  local rc=0 router_rc=0
+  build_concurrently "$OPERATOR_SPEC" "$ROUTER_SPEC" \
+    "$(agent_spec platform)" "$(agent_spec cluster-admin)" "$(agent_spec developer-team)" || return 4
+  echo "== operator =="; deploy_operator "$(ref_for k8s-operator)" || return 4
+  echo "== router ==";   deploy_router   "$(ref_for kage-router)" || router_rc=$?
+  [ "$router_rc" -eq 4 ] && return 4
+  echo "== agents =="
+  patch_agent_crs || return 4
+  echo "OK: 3 agent images built and pushed at $TAG; $AGENT_CRS_PATCHED Agent CR(s) repointed at their digest."
+  [ "$rc" -eq 0 ] && rc=$router_rc
+  return $rc
+}
+
 case "$TARGET" in
   operator) reload_operator ;;
   router)   reload_router ;;
   agents)   reload_agents ;;
-  all)      reload_operator && reload_router && reload_agents ;;
+  all)      reload_all ;;
   # The guard above still ran, and deliberately, even though this arm touches no cluster. A guard
   # that applies to some subcommands and not others is a guard someone has to remember the shape
   # of; this one is uniform and costs nothing here.
