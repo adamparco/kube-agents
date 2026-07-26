@@ -343,7 +343,31 @@ p3_pod_of_deploy() {
 # rc 0 healthy · rc 2 could-not-run (never rc 1: an unhealthy cluster is not a failed property, and
 # a caller that maps this to FAIL reintroduces the exact confusion it exists to remove).
 p10_assert_control_plane_healthy() {
-  local K="$1" label="${2:-cluster}" ns="p10-health-$$" i sa=""
+  local K="$1" label="${2:-cluster}" ns="" i sa=""
+  # 0. Memoize per target, for the life of the process tree.
+  #
+  # The L2 scripts invoke each other: verify-phase7 reaches phases 2-6, and phase 5 reaches 2-4 and
+  # chaos-suite, all as CHILD PROCESSES. Unmemoized, one chain would create and delete a probe
+  # namespace a dozen times to re-answer a question whose answer cannot have changed — and the
+  # per-probe cost is not the real objection. A check that is expensive to call gets called
+  # defensively, in one place, at the top, which is precisely the "declared once by a caller on
+  # everyone else's behalf" shape that L2_SCOPE_FLOOR exists to reject.
+  #
+  # Memoizing a POSITIVE only. A failure is never cached: the caller is expected to exit on it, and
+  # if some future caller chooses to retry instead, it must get a live answer. Exported so children
+  # inherit it; keyed by the kubectl invocation, so a script that probes two clusters (verify-phase8
+  # probes both) still asks about each one separately.
+  #
+  # A caller that PIPES this function runs it in a subshell, where the export lands on a copy and is
+  # lost — such a caller simply re-probes, which is a second of wasted time and never a wrong answer.
+  # Left as-is deliberately: the alternative is a temp file, i.e. real shared state and a cleanup
+  # obligation, bought to save a second on a path no L2 script currently takes.
+  local _key
+  _key="P10_OK_$(printf '%s' "$K" | tr -c 'A-Za-z0-9' '_')"
+  if [ "${!_key:-}" = "1" ]; then
+    echo "P10 ok: $label — asserted healthy earlier in this run (memoized)"
+    return 0
+  fi
   # 1. The API server answers at all, within a bound. `kubectl version` alone is served from cache in
   #    some clients, so ask for something the server must actually look up.
   if ! $K get --raw='/readyz' >/dev/null 2>&1; then
@@ -354,8 +378,22 @@ p10_assert_control_plane_healthy() {
   # 2. kube-controller-manager converges. The `default` ServiceAccount in a fresh namespace is written
   #    by its ServiceAccount controller and by nothing else, so its appearance is proof of liveness
   #    rather than evidence about it. Cleaned up regardless of outcome.
-  if ! $K create namespace "$ns" >/dev/null 2>&1; then
-    echo "P10-UNHEALTHY: $label — could not create a probe namespace." >&2
+  #
+  # The NAME comes from the server, via generateName, rather than from anything assembled here.
+  # Step 2 deletes with --wait=false, so any client-side scheme has to be unique per CALL or a
+  # second probe collides with its own still-Terminating namespace and reports "could not create a
+  # probe namespace" — an infrastructure complaint standing exactly where the real verdict belongs,
+  # and reached precisely on RETRY after a failure, which is the one path memoization leaves live.
+  # `$$` alone collides immediately; `$$` plus a shell counter looks right and still collides,
+  # because a caller that pipes this function's output (`| tee run.log`, `| head`) runs it in a
+  # SUBSHELL, where the increment happens to a copy and is discarded. Rather than keep guessing at
+  # client-side uniqueness, ask the API server — which is authoritative, cannot collide, and makes
+  # the create itself a second piece of evidence that the server accepts writes.
+  ns="$(printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  generateName: p10-health-\n' \
+    | $K create -f - -o jsonpath='{.metadata.name}' 2>/dev/null)"
+  if [ -z "$ns" ]; then
+    echo "P10-UNHEALTHY: $label — could not create a probe namespace, so the API server is not" >&2
+    echo "  accepting writes. Every fixture an L2 claim needs would fail the same way." >&2
     return 2
   fi
   for i in $(seq 1 30); do
@@ -376,11 +414,13 @@ p10_assert_control_plane_healthy() {
   local sched
   sched="$($K -n kube-system get pods -l component=kube-scheduler \
     -o jsonpath='{range .items[*]}{.metadata.name}={range @.status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{end}' 2>/dev/null)"
+  local sched_note=""
   if [ -z "$sched" ]; then
-    echo "P10 ok: $label — control plane converges (managed/unobservable scheduler; not asserted)"
-    return 0
-  fi
-  if ! printf '%s' "$sched" | grep -q '=True'; then
+    # Fall through rather than return: step 4 reads `tier=control-plane` pods, which a managed
+    # provider also hides, so the loop is a no-op here — but if some provider DOES expose them with
+    # a restart history, an early return would have thrown that evidence away to save nothing.
+    sched_note=" (managed/unobservable scheduler; not asserted)"
+  elif ! printf '%s' "$sched" | grep -q '=True'; then
     echo "P10-UNHEALTHY: $label — kube-scheduler is not Ready ($sched). Fixture pods will sit Pending" >&2
     echo "  until the timeout and every claim that needs a running pod would report ABSENT." >&2
     return 2
@@ -427,6 +467,7 @@ EOT
     echo "  reported would be a claim about scheduler uptime wearing the costume of a security result." >&2
     return 2
   fi
-  echo "P10 ok: $label — API server ready, controller-manager converging, scheduler Ready, no recent restarts"
+  echo "P10 ok: $label — API server ready, controller-manager converging, scheduler Ready, no recent restarts${sched_note}"
+  export "$_key=1"
   return 0
 }

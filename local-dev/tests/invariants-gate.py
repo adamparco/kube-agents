@@ -878,7 +878,7 @@ L2_CHAIN_FLOOR = 6
 # leaving L2-CHAIN.txt, this one notices a claim-making script leaving the closure — including one
 # that leaves by being un-called, or by renaming its verdict functions, neither of which touches the
 # chain file at all.
-L2_SCOPE_FLOOR = 15
+L2_SCOPE_FLOOR = 16
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:
