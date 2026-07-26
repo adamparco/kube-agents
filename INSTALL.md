@@ -18,9 +18,11 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Step 4: Deploy the Operator & CRDs](#step-4-deploy-the-operator--crds)
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
-5. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-   - [Phase 2 — Kind inner loop (Cluster Admin Agent + cascade)](#phase-2--kind-inner-loop-cluster-admin-agent--cascade)
-   - [Phase 3 — Kind inner loop (Developer Team Agent + namespace isolation)](#phase-3--kind-inner-loop-developer-team-agent--namespace-isolation)
+5. [Method 3: Remote Development & Fast Iteration](#method-3-remote-development--fast-iteration)
+   - [Bring the cluster up](#bring-the-cluster-up)
+   - [Build your working tree onto the cluster](#build-your-working-tree-onto-the-cluster-read-this-before-any-phase)
+   - [Phase 2 — inner loop (Cluster Admin Agent + cascade)](#phase-2--inner-loop-cluster-admin-agent--cascade)
+   - [Phase 3 — inner loop (Developer Team Agent + namespace isolation)](#phase-3--inner-loop-developer-team-agent--namespace-isolation)
    - [Phase 4 — Coordination & knowledge (push-first proactivity + OKF)](#phase-4--coordination--knowledge-push-first-proactivity--okf)
    - [Phase 5 — Security gate & hardening (review-gate CI, egress, pod hardening, attribution)](#phase-5--security-gate--hardening-review-gate-ci-egress-pod-hardening-attribution)
    - [Phase 6 — Failure-isolation & resilience (chaos: no cascade)](#phase-6--failure-isolation--resilience-chaos-no-cascade)
@@ -245,7 +247,7 @@ make deploy IMG=$IMG
 
 > **`KUBE_CONTEXT` is how these targets choose a cluster.** Every target under `##@ Deployment`
 > passes `--context` explicitly. Leave `KUBE_CONTEXT` unset and the target reads your ambient
-> context, but **refuses** to proceed unless it looks like a throwaway (`kind-*`, `gke-scratch-*`)
+> context, but **refuses** to proceed unless that context matches the anchored `gke-scratch-*` arm
 > — it prints the command that would name it deliberately and exits 2. Passing a whole command
 > line (`KUBECTL="kubectl --context …"`) is rejected outright: `make` accepts any assignment
 > whether or not the Makefile reads one, and that override used to be silently discarded, which
@@ -293,109 +295,193 @@ kubectl get agents -A
 
 ---
 
-## Method 3: Local Development & Fast Iteration
+## Method 3: Remote Development & Fast Iteration
 
-For developer testing on a workstation against a local cluster (e.g., Kind) or remote GKE cluster without building container images:
+The inner development loop runs against one remote cluster: GKE **`kube-agents-dev`** in project
+`adamparco-kage`, zone `us-east4-a` — zonal, two `e2-standard-4` nodes, **Dataplane V2**, **Workload
+Identity**, image streaming. Every verification entry point below targets it, and `dev/cluster/up.sh`
+builds exactly the stack they expect.
 
-1. **Set your active Kubernetes context**:
-   ```bash
-   kubectl config current-context
-   ```
-2. **Install CRDs**: (`KUBE_CONTEXT` is required unless the context above is `kind-*` /
-   `gke-scratch-*` — see the note in Step 4)
-   ```bash
-   cd k8s-operator
-   make install KUBE_CONTEXT=$(kubectl config current-context)
-   ```
-3. **Run the controller locally with webhooks disabled**:
-   ```bash
-   ENABLE_WEBHOOKS=false make run
-   ```
-4. **Fast Remote Rebuild & Update**:
-   To rebuild and push an updated container image and trigger immediate deployment rollout in GKE:
-   ```bash
-   make dev-rebuild-agent ARGS="platform"
-   ```
+Its kube context is **`gke-scratch-kube-agents-dev`**, and the `gke-scratch-` prefix is a security
+control rather than a label. The suites below apply deliberately-bad RBAC, delete pods and exercise
+denial paths, so each one guards itself with an anchored `case "$CTX" in gke-scratch-*)` and refuses
+every other context. gcloud's own generated name for this cluster —
+`gke_adamparco-kage_us-east4-a_kube-agents-dev` — matches no guard, which is why `up.sh` renames it:
+the rename is what makes the cluster addressable by the suite at all, and nothing renames
+`platform-agent-host`, which is how the live install in the same project stays un-addressable by it.
 
-### Kind inner loop — build & load your **local** images first (read this before any phase)
+### Bring the cluster up
 
-The Kind phases below all assume the cluster is running **your working-tree code**, not the
-upstream published image. Two things make this non-obvious, and both have bitten this repo:
+You need `gcloud` authenticated (`gcloud auth login` plus `gcloud auth application-default login`),
+`kubectl`, and a GCP project with the `container`, `cloudbuild`, `artifactregistry` and `compute`
+APIs enabled. `up.sh` assumes none of it: a project preflight (`dev/lib/substrate-capacity.sh`) runs
+before anything is created and checks that a project is set, that those four APIs are enabled, that
+the regional CPUS quota has room for the 8 vCPU this cluster needs, and that Artifact Registry
+answers — refusing with exit 2 and the exact `gcloud services enable …` line to run. It also closes
+by naming what it did **not** measure, because a preflight grown one incident at a time only ever
+measures the previous incident, and a disabled `container.googleapis.com` fails `clusters create`
+with an access error that reads like an IAM problem and sends you to permissions, where everything
+is already correct.
+
+```bash
+bash dev/cluster/up.sh      # create + cert-manager + operator + VAP + agent images (5-8 min cold)
+bash dev/cluster/pause.sh   # every node pool -> 0
+bash dev/cluster/resume.sh  # nodes back, ~2 min
+bash dev/cluster/down.sh    # delete the cluster and its kube context
+```
+
+`up.sh` is idempotent, and re-running it is the supported way to pick up a source change. It asserts
+two properties at bring-up instead of assuming them, because both fail quietly downstream: at least
+**two Ready nodes** (`ReadWriteOnce` excludes per _node_, so the multi-attach conflict a co-existence
+claim rests on cannot be exhibited at all on one) and a dataplane precondition P4 recognises. Either
+one missing is exit 4 here, rather than a deferral discovered forty minutes into a gate.
+
+**`pause.sh` is the normal between-session action.** It resizes the node pools to zero, which leaves
+the control-plane fee as the whole bill and keeps every API object exactly as you left it — etcd
+lives in the control plane, so the CRDs, the Agent CRs, the VAP and the namespaces all survive a
+pause. What does not survive is the running pods; `resume.sh` restores two nodes in about two
+minutes and the controllers reconcile. `down.sh` is rarely what you want: deleting costs 3-5 minutes
+plus a full cert-manager + operator + agent-image reinstall to undo, and it is for a cluster that is
+the wrong _shape_ — most often a dataplane P4 does not recognise, which GKE cannot enable in place.
+It refuses any cluster name but `kube-agents-dev`, compared with `=` and not a glob, because it
+addresses the cluster through the GCP API by name and never uses a context at all, so the name is
+the only guard available to it.
+
+Running, this costs roughly **$0.35-0.45/hr**; paused, about **$0.10/hr** for the control plane.
+
+For a tight edit-run loop that needs no image build, the controller still runs from your host
+against the cluster with the webhook off:
+
+```bash
+kubectl config use-context gke-scratch-kube-agents-dev
+cd k8s-operator
+make install KUBE_CONTEXT=gke-scratch-kube-agents-dev
+ENABLE_WEBHOOKS=false make run
+```
+
+Two things that mode is not. The in-cluster controller keeps running and a host-run one does not
+join its leader election (`--leader-elect` defaults to false off-cluster), so scale
+`deploy/kubeagents-controller-manager` to 0 first unless you want two reconcilers writing the same
+objects. And nothing under `dev/verify/` is meaningful with `ENABLE_WEBHOOKS=false`: the cardinality,
+placement and tier-immutability claims are admission claims, so a green would be a statement about a
+webhook that is not serving.
+
+To rebuild and roll out a **platform** agent image on the Method 1 install (the cluster named in
+`k8s-operator/scripts/vars.sh`, not the inner-loop cluster), use `make dev-rebuild-agent ARGS="platform"`.
+
+### Build your working tree onto the cluster (read this before any phase)
+
+The phases below all assume the cluster is running **your working-tree code**, not the upstream
+published image. Two things make this non-obvious, and both have bitten this repo:
 
 - **`make deploy` does _not_ build.** It only runs `kustomize set image` + `kubectl apply`. So
   `make deploy IMG=ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0` deploys the **upstream**
-  binary and compiles nothing of yours. To test your changes you must build a **local** image,
-  `kind load` it, and point the workload at it.
-- **There are two image families**, built by two different Makefiles:
-  - **operator image** (the controller + webhook) — `k8s-operator/Makefile`, target `docker-build`
-  - **agent images** (`platform` / `cluster-admin` / `developer-team`) — the **root** `Makefile`,
-    target `docker-build-agents`
+  binary and compiles nothing of yours.
+- **There are three image families**: the **operator image** (the controller + webhook), the
+  **router image** (`kage-router`, built from `k8s-operator/Dockerfile.router` — the same tree, a
+  different binary), and the three **agent images** (`platform` / `cluster-admin` /
+  `developer-team`). A change under `k8s-operator/internal/router/` needs the second, other changes
+  under `k8s-operator/` the first, a change under `agents/<tier>/` the third, and none of them is
+  rebuilt by deploying. The router is the one to watch: `make deploy` does not rewrite its image at
+  all — it is pinned in `config/router/kustomization.yaml` — and the pinned default
+  `ghcr.io/gke-labs/kube-agents/kage-router:v0.1.0` answers an anonymous pull with `403`, so a
+  cluster that never builds it gets a router in `ErrImagePull` rather than one running upstream code.
 
-Use the helper — it does build → `kind load` → repoint the running workload, and is guarded to
-Kind/scratch-GKE contexts so it can never touch a real cluster:
+One helper builds either or both. It is guarded to `gke-scratch-*` contexts, so it can never repoint
+a workload on a cluster that matters:
 
 ```bash
-# operator (controller + webhook): build kube-agents/k8s-operator:dev, load it, restart the controller
-dev/cluster/reload-images.sh operator kind-kube-agents-dev
+# operator (controller + webhook): build, push, repoint the controller at the new digest
+bash dev/cluster/reload-images.sh operator gke-scratch-kube-agents-dev
 
-# agent images: build kube-agents/<tier>-agent:latest and load them
-dev/cluster/reload-images.sh agents   kind-kube-agents-dev
+# the kage-router (the read-only ChatOps front door — a separate image from the same tree)
+bash dev/cluster/reload-images.sh router   gke-scratch-kube-agents-dev
 
-# both
-dev/cluster/reload-images.sh all      kind-kube-agents-dev
+# the three tier agent images, plus a patch of every Agent CR of the matching tier
+bash dev/cluster/reload-images.sh agents   gke-scratch-kube-agents-dev
+
+# all three
+bash dev/cluster/reload-images.sh all      gke-scratch-kube-agents-dev
 ```
 
-Two rules the helper encodes so you don't get silently-stale results:
+**It builds on Cloud Build, and that is not one option among several.** This host is arm64 and every
+image target is amd64: a local `docker build` produces images no node can execute, and the failure
+does not arrive at build time — it arrives minutes later as a CrashLoopBackOff with
+`exec format error` in some other component. The agent tiers are `FROM nousresearch/hermes-agent`, a
+whole userspace rather than one static binary, so the `$PREBUILT_BINARY` cross-compile hatch that
+serves the Go images does not rescue them either.
 
-- **`imagePullPolicy` trap.** The controller renders agent pods with `imagePullPolicy: PullAlways`
-  by **default**, which makes the kubelet ignore your `kind load`ed image and re-pull from the
-  registry (i.e. run the **upstream** image). For local Kind testing, the Agent CR must set
-  `spec.deployment.imagePullPolicy: IfNotPresent` (the example CRs already do). The operator
-  Deployment itself already uses `IfNotPresent`.
-- **Stale-image rule.** Local images reuse a fixed tag (`:dev`, `:latest`). Same tag +
-  `IfNotPresent` means the kubelet will **not** refresh a copy it already has — so after **any**
-  source change you must rebuild **and** reload **and** restart. The helper always does all three.
+`gcloud builds submit` reporting success tells you a build ran; it does not tell you what is in the
+registry under that tag. So the helper reads the digest back out of Artifact Registry
+(`us-east4-docker.pkg.dev/adamparco-kage/kube-agents`) and **deploys by digest** — `kubectl set image`
+with `manager=…@sha256:…` for the controller, a merge patch of `spec.deployment.image` for each Agent
+CR. A tag that built and does not resolve is exit 4, not a warning: every result downstream of it
+would describe whatever was there before.
+
+Two consequences worth stating outright, because each replaces an instruction that used to be
+load-bearing:
+
+- **There is no `kind load` and no `rollout restart`.** A changed digest changes the Deployment spec,
+  which _is_ a rollout; an unchanged digest is genuinely the same image, and restarting it would
+  prove nothing.
+- **The stale-image trap is closed structurally, not merely detected.** The old loop reused a fixed
+  tag (`:dev`, `:latest`), and same tag + `imagePullPolicy: IfNotPresent` means the kubelet keeps a
+  copy it already has — so a rebuilt image silently did not take effect and the gate reported on the
+  previous build. That is LSN-001, which recurred three times. A digest names one immutable manifest,
+  so the outcome is now unrepresentable rather than warned about, and the pull policy is irrelevant
+  instead of load-bearing. Precondition **P1** still asserts it, because "unrepresentable through
+  this path" and "true on this cluster right now" are different claims: each gate reads the running
+  pod's `imageID`, resolves that digest in Artifact Registry, and requires the tags it carries to
+  name the commit this tree is on (`dev-<sha>`, or `dev-<sha>-dirty-<epoch>` for an uncommitted edit,
+  whose epoch is compared against the mtime of the dirty files). A cluster running the upstream image
+  or a build of a different commit fails the gate instead of passing it.
 
 > If you only want the upstream published image (a quick smoke test, not testing your code), you
-> can `cd k8s-operator && make deploy IMG=ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0` — but
-> understand that this tests **upstream**, not your working tree.
+> can `cd k8s-operator && make deploy IMG=ghcr.io/gke-labs/kube-agents/k8s-operator:v0.1.0 KUBE_CONTEXT=gke-scratch-kube-agents-dev`
+> — but understand that this tests **upstream**, not your working tree, and P1 will say so.
 
-### Phase 2 — Kind inner loop (Cluster Admin Agent + cascade)
+### Phase 2 — inner loop (Cluster Admin Agent + cascade)
 
 Phase 2 adds the tier-discriminated `Agent` CRD, the read-only
 **Cluster Admin Agent** persona, the standalone **kage-router** ChatOps front door, the **F4
 provisioning cascade** (the Platform Agent proposes a subordinate cluster-admin bundle as a GitOps PR),
-and the **spoke bootstrap** ordered apply waves. Verify the whole inner loop on a local Kind cluster:
+and the **spoke bootstrap** ordered apply waves. Verify the whole inner loop on the dev cluster:
 
-1. **Create a Kind cluster** (K8s ≥ 1.30 — the VAP requires `ValidatingAdmissionPolicy` GA):
+1. **Bring up the stack** — cluster → cert-manager → the operator you just built, deployed at its
+   digest → the read-only VAP → the three tier agent images. `up.sh` does all of it, in that order,
+   and is idempotent, so this is also how you re-run it after a source change:
    ```bash
-   kind create cluster --name kube-agents-dev --image kindest/node:v1.31.2
+   bash dev/cluster/up.sh
    ```
-2. **Deploy the stack** (cert-manager → controller/CRD/webhooks/router → VAP). Build & load your
-   **local** operator image first (see "Kind inner loop" above), then deploy that tag — do **not**
-   deploy the upstream `ghcr.io/...:v0.1.0` tag if you want to test your working tree:
+   The VAP needs `ValidatingAdmissionPolicy` GA (K8s ≥ 1.30). The regular release channel is well
+   past that, and `verify-phase2.sh` asserts the server version rather than trusting the channel.
+2. **Run the consolidated verification gate** (destructive; guarded to `gke-scratch-*` contexts only):
    ```bash
-   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.7/cert-manager.yaml
-   kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=180s
-   make -C k8s-operator docker-build IMG=kube-agents/k8s-operator:dev
-   kind load docker-image kube-agents/k8s-operator:dev --name kube-agents-dev
-   cd k8s-operator && make deploy IMG=kube-agents/k8s-operator:dev && cd ..
-   kubectl apply -f examples/gitops-repo/policy/vap-agent-readonly.yaml
-   ```
-3. **Run the consolidated verification gate** (destructive; guarded to Kind contexts only):
-   ```bash
-   dev/verify/verify-phase2.sh kind-kube-agents-dev
+   dev/verify/verify-phase2.sh gke-scratch-kube-agents-dev
    ```
    It exercises the load-bearing suites: live webhook serving (duplicate `(tier,scope)` + tier
    immutability rejected), VAP attenuation (write/impersonate/wrong-scope denied), read-only per-tier
    SAR, the cascade render → VAP dry-run, bootstrap ordering (pod binds the pre-created SA), and the
    no-break-glass check. The deterministic router/index suites run under `cd k8s-operator && go test ./...`.
-4. **Egress enforcement (V-K11)** needs a NetworkPolicy-enforcing CNI — kindnet does **not** enforce it.
-   Create a throwaway cluster with `disableDefaultCNI: true` and install Calico to verify the per-tier
-   default-deny egress (including the metadata-server `169.254.169.254` block). See
-   [docs/build/LEDGER.md](docs/build/LEDGER.md) §Verification log for the exact steps.
+3. **Egress enforcement (V-K11) is a separate script, and it now passes.** It is a different claim
+   from everything above — it needs traffic, not YAML — so it lives one line up the same L2 chain:
+   ```bash
+   dev/verify/egress-enforcement-l2.sh gke-scratch-kube-agents-dev
+   ```
+   This was a standing deferral for six phases: kindnet, the CNI it was measured on, accepts a
+   NetworkPolicy, returns 201, stores it and enforces nothing, so every green from a network check
+   there was a statement about the API server's willingness to persist YAML (LSN-006). Dataplane V2
+   enforces, so the **shipped rendered policy** is now proven to deny for real: an off-allowlist
+   destination blocked, an off-allowlist port blocked on an allowlisted namespace, the metadata
+   address absent, and a no-policy baseline first so a deny cannot be a DNS failure in disguise.
+   **The rule that produced the deferral survives untouched:** enforcement is a property of the
+   dataplane, not of the API server, and a cluster accepts a NetworkPolicy whether or not it will
+   ever enforce one. `p4_assert_enforcing_dataplane` in `dev/lib/preconditions.sh` is therefore an
+   **allow-list** of dataplanes known to enforce — `calico-node`, `anetd` (Dataplane V2), `cilium` —
+   and anything it does not recognise is `deferred`, never `pass`. A deny-list would get today's case
+   right and the next unrecognised dataplane wrong, in the one direction that produces a false green.
 
-### Phase 3 — Kind inner loop (Developer Team Agent + namespace isolation)
+### Phase 3 — inner loop (Developer Team Agent + namespace isolation)
 
 Phase 3 adds the read-only **Developer Team Agent** (one per namespace), the load-bearing **A1
 placement clause** (a developer-team `Agent` must be created in the namespace it scopes —
@@ -403,34 +489,38 @@ placement clause** (a developer-team `Agent` must be created in the namespace it
 (default-deny NetworkPolicy + a per-tier egress allowlist, `ResourceQuota`, and in-namespace
 `ExternalName` aliases for the shared hub services), the **`propose-developer-team`** cascade on the
 Cluster Admin Agent, and the router completion (NL confidence/clarify, candidate validity, thread
-affinity, audit attribution). It reuses the Phase 2 stack on the same Kind cluster.
+affinity, audit attribution). It reuses the Phase 2 stack on the same cluster.
 
-> **Image refresh (important).** The webhook/controller run inside the operator image. After **any**
-> change to `k8s-operator/internal/webhook` or `.../controller`, refresh the running image before
-> verifying — a same-tag image with `imagePullPolicy: IfNotPresent` will otherwise keep serving the
-> stale build and can **silently under-enforce** an admission invariant (this is exactly how a
-> Phase 3 placement escape first slipped through). The helper does build → `kind load` → restart in
-> one guarded step:
+> **Image refresh (important).** The webhook and the controller run inside the operator image, so
+> after **any** change to `k8s-operator/internal/webhook` or `.../controller` the cluster is still
+> serving the previous build until you push a new one:
 >
 > ```bash
-> dev/cluster/reload-images.sh operator kind-kube-agents-dev
+> bash dev/cluster/reload-images.sh operator gke-scratch-kube-agents-dev
 > ```
+>
+> What changed is the cost of forgetting. A same-tag image with `imagePullPolicy: IfNotPresent` used
+> to keep serving the stale build and **silently under-enforce** an admission invariant — which is
+> exactly how a Phase 3 placement escape first slipped through. Deploying by digest ends that
+> particular silence: the gate's P1 assertion resolves the running digest in Artifact Registry and
+> halts with "the cluster runs a build of a DIFFERENT COMMIT" rather than reporting green about code
+> you are not testing.
 >
 > Equivalent longhand, if you prefer to see each step:
 >
 > ```bash
-> make -C k8s-operator docker-build IMG=kube-agents/k8s-operator:dev
-> kind load docker-image kube-agents/k8s-operator:dev --name kube-agents-dev
-> kubectl -n kubeagents-system set image deploy/kubeagents-controller-manager manager=kube-agents/k8s-operator:dev
-> kubectl -n kubeagents-system rollout restart deploy/kubeagents-controller-manager
-> kubectl -n kubeagents-system rollout status  deploy/kubeagents-controller-manager --timeout=120s
+> gcloud builds submit --config deploy/docker/cloudbuild.yaml \
+>   --substitutions=_IMAGE_URI=us-east4-docker.pkg.dev/adamparco-kage/kube-agents/k8s-operator:dev-$(git rev-parse --short HEAD),_CACHE_URI=us-east4-docker.pkg.dev/adamparco-kage/kube-agents/k8s-operator:buildcache,_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile .
+> D=$(gcloud artifacts docker images describe us-east4-docker.pkg.dev/adamparco-kage/kube-agents/k8s-operator:dev-$(git rev-parse --short HEAD) --format='value(image_summary.digest)')
+> kubectl -n kubeagents-system set image deploy/kubeagents-controller-manager manager=us-east4-docker.pkg.dev/adamparco-kage/kube-agents/k8s-operator@$D
+> kubectl -n kubeagents-system rollout status deploy/kubeagents-controller-manager --timeout=180s
 > ```
 
-1. **Run the consolidated Phase 3 gate** (destructive; guarded to Kind contexts only). It applies the
+1. **Run the consolidated Phase 3 gate** (destructive; guarded to `gke-scratch-*` contexts only). It applies the
    `team-x` tenant bundle (`namespaces/team-x/` `00`→`60`, in numeric order) and the dev-team `Agent`
    CR, then asserts the whole isolation proof:
    ```bash
-   dev/verify/verify-phase3.sh kind-kube-agents-dev
+   dev/verify/verify-phase3.sh gke-scratch-kube-agents-dev
    ```
    It exercises: the **placement clause** (matching namespace admitted, foreign `metadata.namespace`
    rejected), the **reconciled dev-team pod** (bound to the pre-created `developer-team-agent` SA, the
@@ -442,9 +532,13 @@ affinity, audit attribution). It reuses the Phase 2 stack on the same Kind clust
      `ExternalName` aliases, and the **cascade** `render_developer_team.py` → VAP dry-run (identity
      admitted, write-verb tamper denied). The deterministic router suites run under
      `cd k8s-operator && go test ./...`.
-2. **Egress enforcement** carries the same kindnet caveat as Phase 2 — `verify-phase3.sh` validates
-   the egress policy **structurally** (shape, tier selector, zero `0.0.0.0/0`) and defers real
-   enforcement (agent pod cannot reach `169.254.169.254` or the open internet) to a Calico cluster.
+2. **Egress enforcement is proven here too, and the two-script split is no longer a substrate
+   artifact.** `verify-phase3.sh` judges the egress policy **structurally** — shape, tier selector,
+   a pure allowlist with zero `0.0.0.0/0`, server-dry-run valid — and asserts nothing about traffic;
+   enforcement is `egress-enforcement-l2.sh`, exactly as in Phase 2, and it passes on this cluster.
+   Keep reading them as two claims rather than one: a green P3-K6 says the shipped policy is well
+   formed, and only the enforcement script's exit code says an agent pod cannot in fact reach
+   `169.254.169.254` or the open internet. A file is not traffic even on a dataplane that enforces.
 
 ### Phase 4 — Coordination & knowledge (push-first proactivity + OKF)
 
@@ -462,17 +556,20 @@ opens a corrective PR unprompted (SC4, 01 §7), and per-tier **heartbeat SOPs** 
 trigger changes only _when_ an agent wakes, never _what_ it may do — every resulting change still flows
 through a reviewed `submit-suggestion` PR.
 
-> **Same image-refresh caveat as Phase 3.** The watcher sidecar, the controller's per-tier watcher-arg
-> rendering, and the seam hardening all ship inside the operator/agent images at the shared `v0.1.0` tag.
-> The **live** Event→session spawn and the cloud transport legs therefore require a rebuild +
-> `kind load` + `rollout restart` before they can be trusted on Kind (a stale same-tag image reads green
-> while running Phase-3 code). The gate below proves the Phase-4 **logic** hermetically so it is
-> trustworthy without a rebuild; the live spawn/transport is explicitly deferred.
+> **The image half of this caveat is gone; the transport half is not.** The watcher sidecar, the
+> controller's per-tier watcher-arg rendering and the seam hardening all ship inside the
+> operator/agent images, which used to share the `v0.1.0` tag — so a stale same-tag image read green
+> while running Phase-3 code, and the live Event→session spawn could not be trusted without a rebuild
+> nobody could verify had happened. `reload-images.sh` builds those images and deploys them **by
+> digest**, so the **in-pod terminus** is now reachable evidence rather than a blocked claim. What no
+> target in this build can originate is the **transport**: real alert Pub/Sub delivery and a real
+> GitHub webhook HMAC. The gate below proves the terminus, the render and the per-tier scoping
+> hermetically, which is why it is trustworthy with or without a cluster.
 
-1. **Run the consolidated Phase 4 gate** (the live regression is destructive and guarded to Kind
-   contexts; the hermetic acceptance runs anywhere, so this is CI-safe with no cluster):
+1. **Run the consolidated Phase 4 gate** (the live regression is destructive and guarded to
+   `gke-scratch-*` contexts; the hermetic acceptance runs anywhere, so this is CI-safe with no cluster):
    ```bash
-   dev/verify/verify-phase4.sh kind-kube-agents-dev
+   dev/verify/verify-phase4.sh gke-scratch-kube-agents-dev
    ```
    It proves 07 §2 Phase 4 Accept **(a)–(e)** hermetically — **(a)** per-tier scoped watcher +
    fail-closed `validate()` + controller `--owner`/`--scope-namespace` rendering + the hardened
@@ -483,13 +580,13 @@ through a reviewed `submit-suggestion` PR.
    never push) with `okf-validate` green; **(d)** per-tier heartbeats run **scoped** audits
    (cluster-admin over its cluster, developer-team over its namespace only) and route any change to a
    PR; **(e)** injected drift yields a **corrective-PR artifact** while the drifted live object stays
-   present (detect-and-propose, never fix) — then re-runs the load-bearing **regression** live on Kind
-   (03 §11 `negative-attenuation.sh`, the dev-team read-only SAR under a trigger, and the 08 §7
-   controller-mints-no-RBAC golden).
-2. **Deferred, not faked:** the live Event→session spawn and the cloud transport (alert Pub/Sub
-   delivery, GitHub webhook HMAC) need the rebuilt Phase-4 image / scratch-GKE — the gate proves the
-   in-pod terminus and all rendering/scoping logic instead. **05 §8 chaos** (failure-isolation) is
-   Phase 6 and is marked N-A here rather than silently skipped.
+   present (detect-and-propose, never fix) — then re-runs the load-bearing **regression** live on the
+   dev cluster (03 §11 `negative-attenuation.sh`, the dev-team read-only SAR under a trigger, and the
+   08 §7 controller-mints-no-RBAC golden).
+2. **Deferred, not faked:** the cloud transport legs — alert Pub/Sub delivery and GitHub webhook HMAC
+   — have no originator in this build, so the gate proves the in-pod terminus and all
+   rendering/scoping logic instead. **05 §8 chaos** (failure-isolation) is Phase 6 and is marked N-A
+   here rather than silently skipped.
 
 ### Phase 5 — Security gate & hardening (review-gate CI, egress, pod hardening, attribution)
 
@@ -500,7 +597,7 @@ heartbeat re-run) via a **headless detector**, emit findings tagged with a **sev
 **hermetic Python scorer** turns "any unmitigated high/critical" into a **merge block**; a finding is
 mitigated only by a matching, non-expired entry in `security-review-waivers.yaml` (fingerprint =
 `sha256(agent\nfile\nnormalize(message))[:16]`). (2) A **per-tier egress allowlist** for all three tiers
-(platform is net-new) plus a **real enforcement proof** on Calico. (3) The **hardened pod-security
+(platform is net-new) plus a **real enforcement proof** on the dev cluster. (3) The **hardened pod-security
 context on every agent pod** made continuously enforced — PSS `enforce: restricted` on the namespace
 plus a focused `vap-agent-pod-hardening` VAP that requires `readOnlyRootFilesystem: true` on every
 `kube-agents/tier` pod (restricted-PSS does not cover it), composing with — never colliding with — the
@@ -508,47 +605,57 @@ RBAC-governing `vap-agent-readonly`. (4) **End-to-end attribution** — the auth
 per-turn trace id flow router → inject seam → session → PR, stamped as durable `Requested-by:` /
 `Trace-Id:` trailers on the mutation PR (which squash-merge lands in `main`'s history).
 
-> **Enforcement needs the right substrate.** Two Accept criteria can only be _proven_ on capable
-> infrastructure: egress **enforcement** (b) needs a NetworkPolicy-enforcing CNI — the default `kindnet`
-> dev cluster does **not** enforce, so the shape is checked structurally on Kind and actual deny/allow is
-> proven on a **Calico** cluster (`dev/verify/kind-calico.yaml` + `dev/tests/egress-enforcement.sh`),
-> deferred-not-faked where Calico is unreachable; the pod-hardening **VAP** (c) needs K8s ≥ 1.30 (VAP GA —
-> the dev cluster is v1.31.x). A freshly-applied VAP binding also has a short activation delay, so the
-> gate polls the admission dry-run until the binding is live before judging.
+> **Both criteria that needed capable infrastructure now have it.** Egress **enforcement** (b) needs a
+> NetworkPolicy-enforcing CNI, and Dataplane V2 is one, so `dev/tests/egress-enforcement.sh` proves an
+> off-allowlist destination is actually blocked on the same cluster the rest of the gate runs on,
+> rather than the shape being checked here and the deny/allow answered somewhere else.
+> That moved the gate as well as the result: an `rc 3` (no enforcing dataplane) was a tolerated,
+> non-fatal deferral and is now a **failure**, because the only accepted target is built with
+> Dataplane V2, so rc 3 there means a broken cluster or an allow-list that has not learned its
+> dataplane — not an expected outcome. On a BLOCKING-ALWAYS security property, "nobody could measure
+> it" and "there is nothing to measure it with" must not print the same thing. The pod-hardening
+> **VAP** (c) needs K8s ≥ 1.30 (VAP GA), which the regular release channel satisfies; a
+> freshly-applied VAP binding still has a short activation delay, so the gate polls the admission
+> dry-run until the binding is live before judging.
 
-1. **Run the consolidated Phase 5 gate** (the live checks are destructive and guarded to Kind contexts;
-   the hermetic acceptance runs anywhere, so this is CI-safe with no cluster):
+1. **Run the consolidated Phase 5 gate** (the live checks are destructive and guarded to `gke-scratch-*`
+   contexts; the hermetic acceptance runs anywhere, so this is CI-safe with no cluster):
    ```bash
-   dev/verify/verify-phase5.sh kind-kube-agents-dev
+   dev/verify/verify-phase5.sh gke-scratch-kube-agents-dev
    ```
    It proves 07 §2 Phase 5 Accept **(a)–(d)** — **(a)** `score_findings.py` BLOCKS an unmitigated `high`
    (exit 1), PASSES a clean set (exit 0), lets a matching non-expired waiver mitigate, and still BLOCKS on
    an **expired** waiver (negative control), backed by the scorer + extractor unit suites; **(b)** all
    three tier egress netpols are pure allowlists (`policyTypes:[Egress]`, tier `podSelector`, **no
-   `0.0.0.0/0`**), and live egress enforcement is exercised (DEFERRED, non-fatal, on kindnet — PROVEN
-   separately on Calico); **(c)** the go goldens carry `readOnlyRootFilesystem: true` on every rendered
-   container, the namespace carries the PSS `restricted` label, both VAPs are present, and — live on Kind
-   — the pod-hardening VAP **rejects** an un-hardened `kube-agents/tier` pod (the error names
+   `0.0.0.0/0`**), and live egress enforcement is **PROVEN** on this cluster — a no-policy baseline
+   first, so that an off-allowlist destination going dark afterwards can only be the policy and not a
+   DNS or scheduling failure wearing its costume; **(c)** the go goldens carry
+   `readOnlyRootFilesystem: true` on every rendered container, the namespace carries the PSS
+   `restricted` label, both VAPs are present, and — live —
+   the pod-hardening VAP **rejects** an un-hardened `kube-agents/tier` pod (the error names
    `readOnlyRootFilesystem`), **admits** a hardened one, and leaves a non-agent pod **untouched** (scope
    proof); **(d)** `submit-suggestion` stamps the `Requested-by:` / `Trace-Id:` trailers (flag > env >
    autonomous fallback, single-line, idempotent, reaching the dry-run artifact) and the router audit ties
    `Sender` to the `TraceID` carried through to dispatch. It then re-runs the load-bearing **regression**
-   live on Kind (03 §11 `negative-attenuation.sh`) plus the full prior-phase gates
+   live on the dev cluster (03 §11 `negative-attenuation.sh`) plus the full prior-phase gates
    (`verify-phase{2,3,4}.sh`) and `go test ./...`.
-2. **Deferred, not faked:** egress **enforcement** on kindnet defers to the Calico run; the **live
-   headless detector** in `review-gate.yml` needs the `ANTHROPIC_API_KEY` secret + live creds and skips
-   gracefully on fork PRs (like `auto_request_review`) — the scorer, which is the authoritative gate,
-   always runs and is proven hermetically; the **hostname-precise L7 egress proxy**, **cross-object
-   webhook**, **gVisor execution sandbox**, and **per-request user down-scoping** remain deferred
-   hardening (08 §5). **05 §8 chaos** (failure-isolation) is Phase 6 and is marked N-A here rather than
-   silently skipped.
+2. **Deferred, not faked:** the **live headless detector** in `review-gate.yml` needs the
+   `ANTHROPIC_API_KEY` secret + live creds and skips gracefully on fork PRs (like
+   `auto_request_review`) — the scorer, which is the authoritative gate, always runs and is proven
+   hermetically; the **hostname-precise L7 egress proxy**, **cross-object webhook**, **gVisor
+   execution sandbox**, and **per-request user down-scoping** remain deferred hardening (08 §5). The
+   gVisor node pool is deliberately absent from the dev cluster — 08 §5's sandbox checks are
+   unwritten, so a pool would be an extra node running nothing, and `up.sh` prints the single
+   `gcloud container node-pools create … --sandbox type=gvisor` command that adds it the day they
+   land. **05 §8 chaos** (failure-isolation) is Phase 6 and is marked N-A here rather than silently
+   skipped.
 
 ### Phase 6 — Failure-isolation & resilience (chaos: no cascade)
 
 Phase 6 is a **validation phase** — it adds no new persona and no new write path. It graduates the
 05 §8 **failure-isolation (chaos)** suite from deferred to a live, load-bearing gate, proving the
 design's central resilience claim: **no cascade failure** (04 §6). Four experiments run against the
-existing Kind cluster (`dev/verify/chaos-suite.sh`):
+dev cluster (`dev/verify/chaos-suite.sh`):
 
 - **C1 — controller down.** Scale `kubeagents-controller-manager` → 0. A running pod stays Ready
   (running pods continue), the deleted agent Deployment is **not** recreated (no reconciles without the
@@ -566,33 +673,34 @@ existing Kind cluster (`dev/verify/chaos-suite.sh`):
   actuation, 05 §8 bullet 4). — Accept **(a)**.
 
 Run the consolidated Phase 6 gate — the NET-NEW chaos suite plus the full prior-phase regression
-(the live ops are destructive and **guarded to Kind contexts**; every op is reversible, single-object,
-and self-cleaning):
+(the live ops are destructive and **guarded to `gke-scratch-*` contexts**; every op is reversible,
+single-object, and self-cleaning):
 
 ```bash
-dev/verify/verify-phase6.sh kind-kube-agents-dev
+dev/verify/verify-phase6.sh gke-scratch-kube-agents-dev
 ```
 
-> **The dev cluster must run the locally-built controller.** The published `k8s-operator:v0.1.0` image
-> predates the Phase 5 pod hardening — it renders agent pods **without** `readOnlyRootFilesystem`, which
-> the `vap-agent-pod-hardening` VAP (correctly) rejects at admission, so a recreated pod never appears.
-> Before Phase 6, build and load the current controller so its live rendering matches source:
+> **The cluster must run the controller you built — and now it does by construction.** The published
+> `k8s-operator:v0.1.0` image predates the Phase 5 pod hardening: it renders agent pods **without**
+> `readOnlyRootFilesystem`, which the `vap-agent-pod-hardening` VAP (correctly) rejects at admission,
+> so a recreated pod never appears and C2 reads as a controller that failed to relaunch. `up.sh`
+> deploys the operator it just built, at its digest, so a cluster brought up by it is already right;
+> after a source change, one command restores that:
 >
 > ```bash
-> cd k8s-operator && make docker-build IMG=kube-agents/k8s-operator:dev
-> kind load docker-image kube-agents/k8s-operator:dev --name kube-agents-dev
-> kubectl -n kubeagents-system set image deploy/kubeagents-controller-manager manager=kube-agents/k8s-operator:dev
+> bash dev/cluster/reload-images.sh operator gke-scratch-kube-agents-dev
 > ```
 >
-> With the hardened controller deployed, a recreated agent pod is **admitted** (it stays `Pending` on a
-> single-node dev cluster because the controller bakes prod-correct ~2Gi+ requests across a 4-container
-> pod — faithful, not a failure). This is the first point where the **live controller-rendered** agent
-> pod is observed carrying `readOnlyRootFilesystem: true` and passing the hardening VAP end-to-end.
+> With the hardened controller deployed, a recreated agent pod is **admitted**. The suite tolerates a
+> replacement that is still `Pending` — the controller bakes prod-correct ~2Gi+ requests across a
+> 4-container pod, and C2's claim is that the controller recreates the object, not that a node had
+> room for it. This is the point where the **live controller-rendered** agent pod is observed carrying
+> `readOnlyRootFilesystem: true` and passing the hardening VAP end-to-end.
 
 > **Deferred, not faked (04 §6 honest scoping).** The **literal** spoke agent-reasoning-pause under a
 > real hub outage — the spoke agent blocking because it cannot reach real hub-hosted inference/Minty
-> over private networking — needs two clusters and is deferred to a **scratch-GKE** run. C4 proves the
-> load-bearing half on Kind (cluster state + workloads survive hub loss) and never asserts the rest
+> over private networking — needs **two** clusters, and the inner loop provisions one. C4 proves the
+> load-bearing half here (cluster state + workloads survive hub loss) and never asserts the rest
 > green. Parent → child is an **authority/lifecycle** edge, not a runtime dependency; the hub is
 > shared-fate for agent **reasoning**, not for the cluster's **running state**.
 
@@ -618,12 +726,11 @@ unset ⇒ current behavior, byte-for-byte). Three seams land:
   `KUBEAGENTS_OBS_BACKEND` / `OBS_*_BASE_URL` (**defaulting to `gcp`**), with a documented Prometheus/OTLP
   path for a non-GCP target.
 
-Run the consolidated Phase 7 gate — the net-new seam validators, the vanilla (non-GKE) core-concept
-acceptance, and the full prior-phase regression (the live ops are destructive and **guarded to Kind
-contexts**):
+Run the consolidated Phase 7 gate — the net-new seam validators, the core-concept acceptance, and the
+full prior-phase regression (the live ops are destructive and **guarded to `gke-scratch-*` contexts**):
 
 ```bash
-dev/verify/verify-phase7.sh kind-kube-agents-dev
+dev/verify/verify-phase7.sh gke-scratch-kube-agents-dev
 ```
 
 It proves 07 §2 Phase 7 Accept **(a)–(c)**:
@@ -639,26 +746,39 @@ It proves 07 §2 Phase 7 Accept **(a)–(c)**:
   (an env override changes the resolved endpoint/backend to a non-`googleapis.com` target; **unset ⇒ the
   exact current GKE default**, no regression; a non-GCP profile with a required URL unset **fails loudly**
   rather than silently falling back to Google).
-- **Section B — vanilla (Kind, non-GKE) core-concept acceptance** → Accept **(c)**. On a vanilla upstream
-  Kubernetes node (asserted from the node `kubeletVersion` carrying **no `-gke` suffix**), the Phase 1–3
-  cloud-neutral core concepts hold with **no GKE dependency**: read-only agent SAR, GitOps-PR-only
-  mutation, namespace isolation, the `(tier,scope)` cardinality webhook, VAP attenuation, and
-  deterministic ChatOps routing (`inference_calls == 0`, proven hermetically by
-  `go test -run TestGateway_ThreadAffinity`). An explicit **no-GKE-dependency** static assertion scans the
-  cloud-neutral **mechanism** path (VAP, webhook, controller RBAC, router Go) for any `*.googleapis.com` /
-  GKE-only API reference; the cloud-**coupled** Workload-Identity→GSA annotation is flagged
-  deferred-not-faked (D1), not scanned or faked green.
+- **Section B — core-concept acceptance** → Accept **(c)**. The Phase 1–3 cloud-neutral core concepts
+  hold with **no GKE dependency**: read-only agent SAR, GitOps-PR-only mutation, namespace isolation,
+  the `(tier,scope)` cardinality webhook, VAP attenuation, and deterministic ChatOps routing
+  (`inference_calls == 0`, proven hermetically by `go test -run TestGateway_ThreadAffinity`). An explicit
+  **no-GKE-dependency** static assertion scans the cloud-neutral **mechanism** path (VAP, webhook,
+  controller RBAC, router Go) for any `*.googleapis.com` / GKE-only API reference; it reads the mechanism
+  source and not the cluster under it, which is what makes it the load-bearing cloud-neutrality claim and
+  keeps it hermetic. The cloud-**coupled** Workload-Identity→GSA annotation is flagged deferred-not-faked
+  (D1), not scanned or faked green.
+
+  **B0 — the target itself being a vanilla, non-GKE distribution — is the one criterion here that moved
+  backwards.** It used to be asserted directly, by reading the node `kubeletVersion` and requiring **no
+  `-gke` suffix**; the inner loop is a GKE cluster, so the assertion now has nothing to run against and
+  is recorded as a deferral (**D4**) rather than deleted — the criterion is still the right one and the
+  blocker is purely which clusters exist. The script still reads and prints the `kubeletVersion`, because
+  a deferral that stops looking cannot tell you the day it stopped being true. The live half
+  (`verify-phase2.sh` + `verify-phase3.sh`) still runs and is still load-bearing; what it no longer is,
+  while B0 is deferred, is evidence of **portability**, since the distribution under it is the same one
+  the live install runs on.
+
 - **Section C — full regression.** `verify-phase6.sh` → transitively chaos C1–C4 + `verify-phase{2,3,4,5}.sh`
   - 03 §11 `negative-attenuation.sh` + goldens + `go test ./...`, all still green (the seam changes are
     additive and default-preserving, so nothing prior moves).
 
-> **Deferred, not faked.** A **real second cloud** — an EKS/AKS cluster with its cloud identity (IRSA /
-> AAD Workload Identity) and a live `terraform apply` / cross-cloud pipeline run (D1/D2). **CLI-level
-> artifact validation** — `terraform validate`/`fmt`/`apply` and `circleci config validate`: the
-> `terraform` and `circleci` binaries are absent on the build host, so structural + semantic parity is
-> proven **hermetically** (via `go`/`python3`) instead, exactly as Calico stood in for kindnet's missing
-> NetworkPolicy enforcement in earlier phases. A **live non-GCP observability backend** queried
-> end-to-end (D3). None of these are asserted green.
+> **Deferred, not faked.** A **vanilla, non-GKE Kubernetes target** (D4) — B0 above; the blocker is that
+> none is provisioned. D4 is weaker than D1 and separately promotable: D1 wants a second **cloud** with
+> its own identity system, D4 wants only a second **distribution**, and a k3s VM would discharge it. A
+> **real second cloud** — an EKS/AKS cluster with its cloud identity (IRSA / AAD Workload Identity) and a
+> live `terraform apply` / cross-cloud pipeline run (D1/D2). **CLI-level artifact validation** —
+> `terraform validate`/`fmt`/`apply` and `circleci config validate`: the `terraform` and `circleci`
+> binaries are absent on the build host, so structural + semantic parity is proven **hermetically** (via
+> `go`/`python3`) instead. A **live non-GCP observability backend** queried end-to-end (D3). None of
+> these are asserted green.
 
 ## Teardown & Cleanup
 
@@ -689,16 +809,23 @@ You can also run step-specific teardowns:
 - `make gcp-teardown-02-gvisor`: Delete gVisor node pool
 - `make gcp-teardown-01-cluster`: Decommission GKE Standard cluster
 
-### Manual Local Uninstall
+### Manual Uninstall
 
-To uninstall the operator controller and CRDs manually:
+To uninstall the operator controller and CRDs manually, naming the cluster you mean:
 
 ```bash
 cd k8s-operator
-export KUBE_CONTEXT=$(kubectl config current-context)
-make undeploy
-make uninstall
+make undeploy  KUBE_CONTEXT=gke_<project>_<region>_<cluster>
+make uninstall KUBE_CONTEXT=gke_<project>_<region>_<cluster>
 ```
+
+Type the context rather than `KUBE_CONTEXT=$(kubectl config current-context)`. That form reads as a
+safety measure and is the opposite of one: it launders whatever context happens to be selected past
+the check that exists to make you say which cluster you are deleting a CRD from, and deleting a CRD
+deletes every custom resource of that kind. `make uninstall` has no undo and no confirmation.
+
+For the inner-loop cluster there is nothing to uninstall — `bash dev/cluster/down.sh` deletes the
+whole cluster, and `bash dev/cluster/pause.sh` is what you want between sessions.
 
 ---
 

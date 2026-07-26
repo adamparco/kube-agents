@@ -10,6 +10,11 @@ A Helm chart at `deploy/helm/platform-agent/` and a local development flow at `d
 - [PR #353 — README overhaul + Helm + Kind](https://github.com/gke-labs/kube-agents/pull/353) — the umbrella change adding the chart and the Kind script.
 - Watch [`deploy/`](https://github.com/gke-labs/kube-agents/tree/main/deploy) and [`dev/`](https://github.com/gke-labs/kube-agents/tree/main/dev) for the artifacts once they land.
 
+This is upstream's proposal for a Kind-based install, and it is a different thing from this
+repository's own inner loop, which stopped using Kind on 2026-07-26 and now runs on a remote GKE
+cluster ([Operator development](/kube-agents/operator/development/)). `dev/` here is the
+verification harness, not the `dev/setup-kind.sh` the PR adds.
+
 ## Install today
 
 Until those merge, use:

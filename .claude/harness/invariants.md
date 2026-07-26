@@ -124,26 +124,35 @@ Each maps to a named hack in `SELF-IMPROVEMENT.md` §4.
   `docker build` the relevant Dockerfile target if the image changed.
 - Use `.github/PULL_REQUEST_TEMPLATE.md`; do **not** use `gh pr create --fill`.
 - Push PR branches to a fork, not upstream. Stage only targeted files.
-- **Rebuild → load/push → restart before trusting any live gate.** A stale same-tag image with
+- **Deploy by digest before trusting any live gate.** A stale same-tag image with
   `imagePullPolicy: IfNotPresent` silently under-enforces admission and reads as green.
+  `dev/cluster/reload-images.sh` builds on Cloud Build, reads the digest back out of Artifact
+  Registry, and sets `…@sha256:…` on the Deployment — which makes that trap unrepresentable rather
+  than merely detected, and means no `rollout restart` is needed: a changed digest IS a rollout.
 - **Every cluster-addressing `make` target names its cluster.**
   [gated: `check_make_targets_are_context_explicit`, LSN-018] Recipes go through `$(KUBECTL)`, never
   a bare `kubectl`; the context comes from `KUBE_CONTEXT=`, and `KUBECTL=` is rejected outright
   because it was once accepted and silently ignored. With `KUBE_CONTEXT` unset, `ctx-guard` accepts
-  the ambient context only if it is anchored `kind-*` / `gke-scratch-*` and refuses otherwise with
-  the command that would name it. Deliberately deploying to a live cluster is a real operation;
+  the ambient context only if it is anchored `gke-scratch-*` and refuses otherwise with the command
+  that would name it. Deliberately deploying to a live cluster is a real operation;
   forgetting which cluster you are on is not.
 
 ## Destructive-test guard
 
 Before any test that deletes/kills resources, applies deliberately-bad RBAC, or exercises a
-destructive **action** through the broker, confirm the target context is **Kind** or an **ephemeral
-scratch GKE** cluster. If it is anything else (esp. a prod context), **halt and surface** — do not
-run.
+destructive **action** through the broker, confirm the target context is a **scratch cluster** —
+`gke-scratch-*`, recreatable from `dev/cluster/up.sh` and holding no data anyone will miss. If it is
+anything else (esp. a prod context), **halt and surface** — do not run.
 
 [gated: `check_destructive_guards_are_anchored`, LSN-005] The guard is a shell `case` on the caller's
-`$CTX` whose accepting arms are **anchored** — `kind-*`, `gke-scratch-*` — and whose `*)` arm exits
-non-zero. A substring test (`*kind*`) is the LSN-005 failure and passes for a cluster merely named
-`my-kind-of-prod`; the gate rejects any arm that does not start at the left edge, and any default arm
-that does not exit. The live GKE cluster `platform-agent-host` is one `*` away from every one of
-these scripts.
+`$CTX` whose accepting arms are **anchored** — `gke-scratch-*` — and whose `*)` arm exits non-zero. A
+substring test (`*scratch*`) is the LSN-005 failure and passes for a cluster merely named
+`prod-scratchpad`; the gate rejects any arm that does not start at the left edge, and any default arm
+that does not exit. The list of accepted anchors was `kind-*`, `gke-scratch-*` until 2026-07-26;
+dropping one is a strengthening, and adding one back is the direction that needs review.
+
+Two scripts cannot use this guard and are not exceptions to it. `dev/cluster/down.sh` and
+`dev/cluster/scale.sh` address the cluster by **name through the GCP API** and never touch a kube
+context at all, so they compare `$CLUSTER` to the one name they are for with `=`, not a glob. Same
+rule, different identifier: `platform-agent-host` lives in the same project and is one variable
+away from `clusters delete` and from `resize --num-nodes 0`.

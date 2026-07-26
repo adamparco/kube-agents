@@ -1,8 +1,16 @@
 # Phase 8 — live-target checklist (L3)
 
-Everything Phase 8 claims that **a Kind cluster cannot prove**, with the exact command and the exact
+Everything Phase 8 claims that **the inner loop cannot prove**, with the exact command and the exact
 observation that would discharge it. `verify-phase8.sh` prints a pointer to this file and asserts
 nothing in it.
+
+That list got shorter on 2026-07-26 and the reason is worth stating, because it changes what several
+of these steps are for. The inner loop moved from Kind to a remote GKE cluster with **Dataplane V2**
+and a **workload pool** (`dev/cluster/up.sh`). Two of the six steps below existed because Kind had no
+metadata server and a different NetworkPolicy implementation than the live cluster. Neither is true
+of the new inner loop, so those steps stop being _"the substrate cannot do this"_ and become _"this
+particular cluster, with its real service accounts and its real policy set, has not been asked"_ —
+still a live-only claim, and a much narrower one. Each step's **Why** paragraph says which it is.
 
 This is not a deferrals table. The [deferrals table](LEDGER.md#deferrals) records claims that are
 **blocked** on something external and names the blocker. This file records claims that are blocked on
@@ -27,10 +35,14 @@ do not paste them into a log you intend to attach, and do not commit `vars.sh`.
 
 ## L3-1 — Workload Identity still mints a token with the egress policy applied
 
-**Why Kind cannot do it.** This is the second half of Accept (d), and it is a conjunction on purpose:
-_off-allowlist egress blocked **while Workload Identity still works**_. Either half alone is easy and
-wrong. Kind proves the blocking half on Calico; the minting half needs a real metadata server, which
-Kind does not have, backed by a real Google service account.
+**Why the inner loop cannot do it.** This is the second half of Accept (d), and it is a conjunction
+on purpose: _off-allowlist egress blocked **while Workload Identity still works**_. Either half alone
+is easy and wrong. The inner loop proves the blocking half. For the minting half the blocker
+**changed and shrank** on 2026-07-26: it used to be that Kind had no metadata server at all, and the
+inner-loop cluster is now GKE with a workload pool, so it has one. What is missing is the binding — a
+GSA, an IAM policy on it, and the annotation tying the agent KSA to it. That is provisioning nobody
+has done on the dev cluster, not a property of the substrate, and doing it would discharge this step
+without touching the live install.
 
 This is also the step most likely to fail quietly. A broken metadata allow surfaces as a **timeout
 inside the auth client library** — an authentication error that never mentions the network — which is
@@ -72,8 +84,11 @@ not the service account.
 
 ## L3-2 — Off-allowlist egress is actually blocked on the live dataplane
 
-**Why Kind cannot do it.** Kind proves this on Calico. GKE's Dataplane V2 is a different
-implementation, and "the policy is accepted" is not "the packet is dropped" on either.
+**Why the inner loop cannot do it.** It largely can, now: the dev cluster runs Dataplane V2, the
+same implementation as the live one, so `egress-enforcement-l2.sh` is no longer standing in for a
+different dataplane. What is left here is not the mechanism but this cluster's own policy set —
+`platform-agent-host` carries the rendered production allow-list, and "the policy is accepted" is
+still not "the packet is dropped".
 
 ```sh
 CTX=gke_adamparco-kage_us-east4_platform-agent-host
@@ -97,9 +112,9 @@ metadata allow meaningfully narrower than a whole-host one.
 
 ## L3-3 — A clean-clone install brings all three tiers Ready
 
-**Why Kind cannot do it.** Accept (a) says _clean clone → all three tiers Ready, from published
-images_. The dev Kind runs a locally-built operator side-loaded with `kind load`; that is the correct
-inner loop and it is the opposite of this claim. This step is the only thing that exercises the
+**Why the inner loop cannot do it.** Accept (a) says _clean clone → all three tiers Ready, from
+published images_. The dev cluster runs the operator at a `dev-<sha>` digest built from the working
+tree; that is the correct inner loop and it is the opposite of this claim. This step is the only thing that exercises the
 published images, the real registry pull path, and the provisioning scripts in the order a new user
 meets them.
 
@@ -131,8 +146,8 @@ something was side-loaded and the claim is not proven.
 
 ## L3-4 — Every tier completes an inference call and mints a token from its own namespace
 
-**Why Kind cannot do it.** Accept (b). Needs a real model endpoint and real per-namespace Workload
-Identity bindings. The Kind runs prove the wiring (C5/C6 Wired probes); this proves the call.
+**Why the inner loop cannot do it.** Accept (b). Needs a real model endpoint and real per-namespace
+Workload Identity bindings. The L2 runs prove the wiring (C5/C6 Wired probes); this proves the call.
 
 Per tier — platform, cluster-admin, developer-team — from a pod **in that tier's own namespace**:
 
@@ -151,7 +166,7 @@ developer-team pod must **not** be able to mint the cluster-admin tier's token.
 
 ## L3-5 — The published image tags are immutable and match `tags.env`
 
-**Why Kind cannot do it.** P8-T5 made `:v0.1.0` real via an immutable scheme (`main` → `:${sha}`;
+**Why the inner loop cannot do it.** P8-T5 made `:v0.1.0` real via an immutable scheme (`main` → `:${sha}`;
 `v*` git tag → the release tag, with the tag build failing if the git tag disagrees with
 `KAGE_IMAGE_VERSION`). The build-side half is gated at L0. The registry-side half — that the tag
 exists, resolves to one digest, and has not moved — can only be asked of the registry.
@@ -174,17 +189,20 @@ done
 ## L3-6 — Destructive resilience, on a scratch cluster only
 
 **Not on `platform-agent-host`.** The chaos suite scales and deletes. It is guarded by an anchored
-`case` on `kind-*` / `gke-scratch-*` and will refuse the live context — which is the guard working,
-not an obstacle to route around.
+`case` on `gke-scratch-*` and will refuse the live context — which is the guard working, not an
+obstacle to route around.
+
+Since 2026-07-26 this needs no special cluster: the inner loop **is** a `gke-scratch-*` Dataplane V2
+cluster, so the step is the ordinary L2 run.
 
 ```sh
-gcloud container clusters create gke-scratch-kage-chaos --region us-east4 --enable-dataplane-v2 ...
-# then, with the context renamed to gke-scratch-kage-chaos:
-bash dev/verify/verify-phase8.sh gke-scratch-kage-chaos gke-scratch-kage-chaos-egress
+bash dev/cluster/up.sh                                          # idempotent; resume.sh if paused
+bash dev/verify/verify-phase8.sh gke-scratch-kube-agents-dev
 ```
 
-Dataplane V2 on the scratch cluster is also what would discharge **L3-1** and **L3-2** without
-touching the live cluster, which is the cheaper path to closing that deferral.
+The same cluster is what would discharge **L3-1** and **L3-2** without touching the live install,
+which is the cheaper path to closing that deferral — L3-1 needs the GSA/KSA binding described above,
+L3-2 needs the production allow-list rendered against it.
 
 **Records.** the scratch-GKE V-G cloud checks; V-CTN-020 at L3.
 

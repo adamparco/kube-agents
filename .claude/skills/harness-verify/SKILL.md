@@ -43,8 +43,11 @@ first; a result gathered before they hold is discarded, not adjusted.
    admission property.
 3. **No grandfathered objects** (09 §11.2). Admission does not evict existing pods. Force recreation
    before judging; a running object's state is not evidence the policy works.
-4. **An enforcing network substrate** (09 §11.6). kindnet ignores NetworkPolicy entirely. Egress
-   checks require Calico / Dataplane V2 — otherwise record `deferred`, never `pass`.
+4. **An enforcing network substrate** (09 §11.6). A cluster accepts a NetworkPolicy whether or not
+   anything enforces it, so a green egress check on a non-enforcing dataplane is evidence about the
+   API server. `p4_assert_enforcing_dataplane` holds an **allow-list** of dataplanes known to
+   enforce — `calico-node`, `anetd` (Dataplane V2), `cilium`. Anything unrecognised → `deferred`,
+   never `pass`.
 5. **Anchored destructive-test guard** (09 §11.5). Before any test that deletes, kills, applies
    deliberately-bad RBAC, or drives a destructive action through the broker: confirm the context
    matches the sanctioned ephemeral pattern with an **anchored** match. Substring matching would
@@ -76,7 +79,7 @@ Independent suites may be dispatched in parallel; each returns its own evidence.
 ## 4. Record evidence — one row per check (09 §9.4)
 
 ```
-check_id, suite, level, target(kind|gke|none), result(pass|fail|deferred|skipped|quarantined),
+check_id, suite, level, target(gke|none), result(pass|fail|deferred|skipped|quarantined),
 requirement_ids[], evidence_ref, duration_s, started_at, image_digests[], notes
 ```
 

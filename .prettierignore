@@ -1,0 +1,14 @@
+# Files whose formatting is owned by a generator, not by a human editing them.
+#
+# Prettier and the generator each have a fixed opinion, and when they differ the file oscillates:
+# `prettier --write` reformats it, the next generator run puts it back, and every run of either one
+# shows up as a diff nobody wrote. Listing the file here settles the question by naming the owner.
+#
+# This is not a licence to add anything inconvenient. The bar is that a MACHINE writes the file and
+# a human does not hand-edit it, so prettier's output would be discarded on the next regeneration
+# anyway.
+
+# Written by `python3 dev/tests/invariants-gate.py --update-baseline` (json.dumps indent=2).
+# Prettier collapses single-element arrays onto one line; json.dumps never does. Nothing else about
+# the file is contested, and the ratchet reads it with `json.load`, which does not care either way.
+dev/assertion-baseline.json

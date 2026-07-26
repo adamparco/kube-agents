@@ -100,9 +100,10 @@ guardrails:
   same rule — it opens PRs, it does not push to protected branches or force past checks.
 
 - **Destructive tests are geofenced.** Negative-security and chaos tests (deleting agents, killing
-  the hub, applying deliberately-bad RBAC) run **only on Kind or an ephemeral scratch cluster** — a
-  destructive-test guard confirms the kube context matches `kind-*` / `gke-scratch-*` before any
-  delete/kill/bad-apply, and **halts** otherwise. Prod is never a target.
+  the hub, applying deliberately-bad RBAC) run **only on the ephemeral scratch cluster** — a
+  destructive-test guard confirms the kube context matches an anchored `gke-scratch-*` before any
+  delete/kill/bad-apply, and **halts** otherwise. One accepted anchor, not two: a prefix that no
+  cluster in the loop uses any more is a guard nobody maintains. Prod is never a target.
 
 - **Load-bearing halts.** The harness stops and surfaces — rather than auto-advancing — when a
   security negative test (03 §11) or a chaos test (05 §8) fails, when a change would break an
@@ -171,9 +172,17 @@ re-runnable gate script (`dev/verify/verify-phase<N>.sh`) so any phase can be re
 
 Recurring lessons the ledger captured and later phases relied on:
 
-- **Stale-image trap (inner loop):** after any webhook/controller change, rebuild → `kind load` →
-  `rollout restart` before verifying, or a stale image silently under-enforces admission. This bit
-  three times before it became a standing rule.
+- **Stale-image trap (inner loop):** a fixed tag plus `imagePullPolicy: IfNotPresent` means the
+  kubelet keeps the copy it already has, so a rebuilt controller silently under-enforces admission
+  and the gate reads green anyway. This bit three times before it became a standing rule, and a
+  standing rule is addressed to whoever already remembers. The inner loop now deploys **by digest**
+  — `dev/cluster/reload-images.sh` builds, pushes, reads the digest back out of the registry the
+  kubelet pulls from, and sets `…@sha256:…` on the Deployment. A digest names one immutable
+  manifest, so the trap stops being something a check has to detect and becomes unrepresentable;
+  `rollout restart` goes with it, since a changed digest changes the spec, which _is_ a rollout.
+  Precondition **P1** still runs, and still asserts the running pod's `imageID` digest is the build
+  under test — the mechanism is what is now trusted, so the check that would catch it being
+  bypassed is exactly the one to keep.
 - **Prettier on the full changed set:** CI checks every changed `.md`/`.yaml` against the base branch,
   not just files touched this session — pre-check the whole diff before opening the PR.
 - **Base-remote gotcha:** diff against the fork's `main`, not the upstream remote, or the diff looks

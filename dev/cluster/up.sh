@@ -173,6 +173,10 @@ $K -n cert-manager wait --for=condition=Available deploy --all --timeout=300s
 # afterwards would mean rolling out somebody else's binary in the middle of a script whose whole job
 # is to put YOUR code on the cluster.
 echo "== building the operator image under test on Cloud Build =="
+# Asked BEFORE the deploy that dirties it, because afterwards the two cases are indistinguishable.
+MANAGER_KUSTOMIZATION="k8s-operator/config/manager/kustomization.yaml"
+KUSTOMIZATION_WAS_DIRTY="$(git -C "$REPO_ROOT" status --porcelain -- "$MANAGER_KUSTOMIZATION" 2>/dev/null)" ||
+  KUSTOMIZATION_WAS_DIRTY=""
 OP_REF="$(bash "$HERE/reload-images.sh" digest "$CTX")" || {
   echo "ERROR: could not build and resolve the operator image (see above)." >&2; exit 4; }
 
@@ -180,6 +184,18 @@ OP_REF="$(bash "$HERE/reload-images.sh" digest "$CTX")" || {
 # because accepting one it does not read is what let a CRD land on the wrong cluster (LSN-018).
 echo "== deploying the controller, CRD and webhooks to $CTX ($OP_REF) =="
 make -C "$REPO_ROOT/k8s-operator" deploy IMG="$OP_REF" KUBE_CONTEXT="$CTX"
+
+# `make deploy` runs `kustomize edit set image`, which WRITES config/manager/kustomization.yaml in
+# the working tree. Restoring it is not tidiness. That path is inside P1's build-input scope for the
+# operator image (`_p1_build_inputs` maps k8s-operator/* to `k8s-operator`), so a deploy leaves a
+# dirty file whose mtime is NEWER than the image that was just built -- and P1's freshness half then
+# reports "built from a dirty tree BEFORE the newest edit", failing every gate run after a clean
+# bring-up. The check is right; the bring-up was manufacturing the condition it detects. Restore
+# only if the file was clean going in, so an edit somebody is actually working on is never discarded.
+if [ -z "$KUSTOMIZATION_WAS_DIRTY" ]; then
+  git -C "$REPO_ROOT" checkout -- "$MANAGER_KUSTOMIZATION" 2>/dev/null || true
+fi
+
 $K -n kubeagents-system rollout status deploy/kubeagents-controller-manager --timeout=300s
 
 # No `rollout restart` here, and its absence is the point. The Kind version needed one because
@@ -187,6 +203,27 @@ $K -n kubeagents-system rollout status deploy/kubeagents-controller-manager --ti
 # it already had and P1 failed with "older than the source" — the LSN-001 stale-image trap in
 # script form. IMG is a digest now. A changed digest changes the spec, which IS a rollout; an
 # unchanged digest is genuinely the same image, and restarting it would prove nothing.
+
+# --- router -------------------------------------------------------------------------------------
+# The router ships in the same `make deploy` bundle as the controller but NOT under the same image
+# knob: `make deploy` only rewrites `controller`, and kage-router is pinned separately in
+# config/router/kustomization.yaml. Left alone it resolves to the published
+# ghcr.io/gke-labs/kube-agents/kage-router:v0.1.0, which answers an anonymous pull with 403 -- so
+# every bring-up ended with a router in ImagePullBackOff. That is 09 §11.9 ("built, never wired")
+# happening inside the harness's own installer, and it was not a regression from Kind: the Kind loop
+# never built the router either, it just failed later and less visibly. Built and repointed here so
+# `up.sh` finishes with a cluster whose every workload is running code from this tree.
+echo "== building the router image under test on Cloud Build =="
+router_rc=0
+bash "$HERE/reload-images.sh" router "$CTX" || router_rc=$?
+case "$router_rc" in
+  0) ROUTER_STATE="Running" ;;
+  # 5 is "the digest is deployed, the pod will not start". Named here rather than swallowed, and
+  # repeated in the closing banner, because a CrashLoopBackOff nobody warned you about is the most
+  # expensive line on a fresh cluster: it looks exactly like the bring-up broke.
+  5) ROUTER_STATE="CrashLoopBackOff — EXPECTED, see below" ;;
+  *) echo "ERROR: could not build the router image (see above)." >&2; exit 4 ;;
+esac
 
 echo "== applying the read-only VAP =="
 $K apply -f "$REPO_ROOT/examples/gitops-repo/policy/vap-agent-readonly.yaml"
@@ -211,6 +248,7 @@ cat <<EOF
  '$CLUSTER' is ready.  Context: $CTX
    $nodes nodes · $P4_DATAPLANE (NetworkPolicy ENFORCED) · Workload Identity
    CRD + controller + webhooks at a digest · read-only VAP
+   kage-router at a digest · $ROUTER_STATE
 ====================================================================
 Every line of dev/L2-CHAIN.txt targets this one cluster:
     while read -r c; do case "\$c" in ''|\#*) continue ;; esac; eval "\$c"; done < dev/L2-CHAIN.txt
@@ -219,6 +257,16 @@ Phase gate:   dev/verify/verify-phase8.sh $CTX
 Pick up code: dev/cluster/reload-images.sh all $CTX
 Stop paying:  dev/cluster/pause.sh      (nodes -> 0; resume.sh restores them in ~2 min)
 Tear down:    dev/cluster/down.sh
+
+THE ROUTER CRASHLOOPS HERE, AND THAT IS THE CORRECT OUTCOME, not a broken bring-up. It runs the
+image built from this tree — that part is now proven rather than assumed — and exits on
+\`missing required --project-id\`, because config/router/deployment.yaml ships the literal
+REPLACE_WITH_PROJECT_ID / REPLACE_WITH_INBOUND_SUBSCRIPTION and its ServiceAccount carries no
+Workload Identity annotation. Wiring those needs a real Pub/Sub subscription and a bound GSA, which
+is L3 work on a live install, not something an inner-loop cluster can or should invent. The router's
+routing logic is proven hermetically against the pstest fake (go test ./internal/router/), so
+nothing in dev/L2-CHAIN.txt depends on this pod. Confirm the reason, do not assume it:
+    kubectl --context $CTX -n kubeagents-system logs deploy/kubeagents-router
 
 NOT installed, deliberately: the gVisor sandbox pool. 08 §5's sandbox checks are unwritten
 (verify-phase7.sh §D carries that deferral), so a pool would be an extra node running nothing —

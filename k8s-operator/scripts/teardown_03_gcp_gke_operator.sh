@@ -21,6 +21,12 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 # ─── Configuration State Restoration ──────────────────────────────────────────
 ensure_teardown_state
 
+# The cluster the `make` targets below delete from, named rather than inherited (LSN-018: a context
+# override the Makefile did not read was accepted and ignored, and the CRD went to whatever
+# `kubectl config current-context` was). Both `connect_cluster` and CI's get-gke-credentials write
+# exactly this context name; set KUBE_CONTEXT to point the run somewhere else.
+KUBE_CONTEXT="${KUBE_CONTEXT:-gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}}"
+
 # ─── Confirmation Prompt ──────────────────────────────────────────────────────
 confirm_action "This will permanently undeploy the Kubernetes Operator and remove its CRDs from the GKE cluster." \
   "GCP Project:$PROJECT_ID" \
@@ -63,7 +69,7 @@ if [ "${DRY_RUN:-0}" -eq 1 ] || [ -n "$OPERATOR_DEPLOYED" ]; then
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     echo -e "  ${C_GREEN}[DRY-RUN] Would undeploy Operator Controller Manager.${C_RESET}"
   else
-    make -C "$OPERATOR_DIR" undeploy ignore-not-found=true
+    make -C "$OPERATOR_DIR" undeploy KUBE_CONTEXT="$KUBE_CONTEXT" ignore-not-found=true
     echo -e "  ${C_GREEN}✓ Operator Controller Manager undeployed successfully.${C_RESET}"
   fi
 else
@@ -81,7 +87,7 @@ if [ "${DRY_RUN:-0}" -eq 1 ] || [ -n "$CRDS_INSTALLED" ]; then
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     echo -e "  ${C_GREEN}[DRY-RUN] Would uninstall Custom Resource Definitions (CRDs).${C_RESET}"
   else
-    make -C "$OPERATOR_DIR" uninstall ignore-not-found=true
+    make -C "$OPERATOR_DIR" uninstall KUBE_CONTEXT="$KUBE_CONTEXT" ignore-not-found=true
     echo -e "  ${C_GREEN}✓ CRDs uninstalled successfully.${C_RESET}"
   fi
 else

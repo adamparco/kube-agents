@@ -56,7 +56,7 @@ last; they are the one thing the inversion does not touch.
 - The Kubernetes event watcher, `eventingress`, and the drift detector: **the entire detection half
   of proactivity is built and working.** It currently ends in a PR; it needs to end in an action.
 - The ChatOps router, the per-tier personas and skills, OKF, session state, attribution plumbing,
-  the chaos suite, and the whole Kind verification harness.
+  the chaos suite, and the whole verification harness.
 
 ## 2. Phases
 
@@ -345,27 +345,31 @@ checks pass.
 - **Authority never precedes machinery.** A pre-merge check must fail any change that grants an
   agent identity a write verb before the broker, classifier, journal, and undo path are present and
   tested (P8-T6).
-- **Refresh the image before trusting a live gate.** A stale same-tag image with `imagePullPolicy:
+- **Deploy by digest before trusting a live gate.** A stale same-tag image with `imagePullPolicy:
 IfNotPresent` silently under-enforces admission and reads as green — it has already masked a
-  namespace-isolation escape, missing pod hardening, and a wrong controller entirely. Rebuild →
-  load/push → restart is a gate step, not a note. This matters more now: a stale admission policy
-  under an imperative agent under-enforces **writes**.
-- **Three rungs, in order: hermetic → Kind → live target.** Kind remains the fast inner loop; the
-  live target is where cloud IAM, egress, and the SLIs are actually proven.
+  namespace-isolation escape, missing pod hardening, and a wrong controller entirely. Since
+  2026-07-26 the Deployment references `…@sha256:…` resolved from the registry, which makes that
+  trap unrepresentable rather than merely detected; precondition P1 still asserts it, because a
+  control that has become structurally impossible is exactly the one that quietly stops being
+  checked. This matters more now: a stale admission policy under an imperative agent
+  under-enforces **writes**.
+- **Three rungs, in order: hermetic → remote dev cluster → live install.** The inner loop is a
+  scratch GKE cluster, recreatable by script; the live install is where cloud IAM, multi-cluster
+  topology, and the audit-log SLIs are actually proven.
 - **Deferred, never faked.** If a check cannot run, record it as deferred with the blocker named —
   never assert it green.
 
 ## 6. Standing deferrals (not scheduled)
 
-| Deferred                                            | Why deferred                                                                                                                                | Promote when                                                                                      |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| Per-request user down-scoping (confused deputy)     | v1 bounds it with trusted-human access, the scope ceiling, and the gated class. The broker is now its natural host, so the cost has dropped | Access extends beyond fully trusted humans, or an audit demands per-user attribution of authority |
-| gVisor execution sandbox + untrusted code execution | Ship together; v1 agents run no untrusted code. `RuntimeClassName` plumbing already exists                                                  | An agent gains a code-execution capability                                                        |
-| L7 hostname-precise egress proxy                    | L3/L4 policy cannot express hostnames; CIDR allowlists are the v1 approximation                                                             | The CIDR allowlist proves too coarse                                                              |
-| Co-located multi-tenant broker                      | **Explicitly rejected for v1** — it would reintroduce a fleet-wide writer and undo the one-scope blast radius                               | Per-agent broker cost becomes prohibitive **and** a per-scope credential isolation story exists   |
-| Semantic recall / mem0 + Qdrant                     | The journal and OKF cover recall adequately; a stateful vector store was the cost concern                                                   | Evidence that recall over the journal and OKF is insufficient                                     |
-| Scion launch primitive                              | Blocked upstream; the seam is built and parity-tested, native is default                                                                    | Scion's K8s mode supports long-lived supervision                                                  |
-| Second cloud (EKS / AKS)                            | No account or cluster; the cloud-neutral core already passes on vanilla Kubernetes                                                          | A real second-cloud target exists                                                                 |
+| Deferred                                            | Why deferred                                                                                                                                                                                                                                                                                                                                                                                         | Promote when                                                                                      |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Per-request user down-scoping (confused deputy)     | v1 bounds it with trusted-human access, the scope ceiling, and the gated class. The broker is now its natural host, so the cost has dropped                                                                                                                                                                                                                                                          | Access extends beyond fully trusted humans, or an audit demands per-user attribution of authority |
+| gVisor execution sandbox + untrusted code execution | Ship together; v1 agents run no untrusted code. `RuntimeClassName` plumbing already exists                                                                                                                                                                                                                                                                                                           | An agent gains a code-execution capability                                                        |
+| L7 hostname-precise egress proxy                    | L3/L4 policy cannot express hostnames; CIDR allowlists are the v1 approximation                                                                                                                                                                                                                                                                                                                      | The CIDR allowlist proves too coarse                                                              |
+| Co-located multi-tenant broker                      | **Explicitly rejected for v1** — it would reintroduce a fleet-wide writer and undo the one-scope blast radius                                                                                                                                                                                                                                                                                        | Per-agent broker cost becomes prohibitive **and** a per-scope credential isolation story exists   |
+| Semantic recall / mem0 + Qdrant                     | The journal and OKF cover recall adequately; a stateful vector store was the cost concern                                                                                                                                                                                                                                                                                                            | Evidence that recall over the journal and OKF is insufficient                                     |
+| Scion launch primitive                              | Blocked upstream; the seam is built and parity-tested, native is default                                                                                                                                                                                                                                                                                                                             | Scion's K8s mode supports long-lived supervision                                                  |
+| Second cloud (EKS / AKS), and any non-GKE target    | No account or cluster. The cloud-neutral core was shown on vanilla Kubernetes for phases 7–8, when the inner loop was Kind; moving that loop to a remote GKE cluster on 2026-07-26 removed the last non-GKE target, so Phase 7 Accept (c) is now carried as a deferral rather than an assertion — see the D4 row in `docs/build/LEDGER.md` §Deferrals. The criterion stands; nothing runs against it | A real second-distro or second-cloud target exists                                                |
 
 **Promoted out of deferral by the inversion:** the **cross-object child ⊆ parent admission webhook**
 was deferred hardening in the read-only design and is a **v1 requirement** here (P11-T2) — when a

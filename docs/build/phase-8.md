@@ -337,19 +337,24 @@ narrows a **claim**, never a check: no assertion is removed, and the total rises
 
 Every bullet binds to at least one check ID. No bullet is unbound.
 
-| Accept                                                                                  | Check IDs                                                        | Level      | Target                            |
-| --------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------- | --------------------------------- |
-| **(a)** clean-clone install brings all three tiers Ready, published images              | V-CMP-001, V-CMP-002, V-CMP-004, V-CMP-005                       | L0, L2, L3 | kind + live (L3 partly deferred)  |
-| **(b)** every tier completes an inference call and mints a token from its own namespace | V-CMP-001 (C5, C6 Wired+Exercised probes)                        | L2, L3     | kind + live (L3 deferred)         |
-| **(c)** empty **or blank** allowlist rejected at admission; no `*_ALLOW_ALL_USERS` env  | V-CTR-002 (V-7 slice in P8-T1; V-1…V-10 in P8-T9), **V-CTR-014** | L0, L2     | kind                              |
-| **(d)** off-allowlist egress blocked while Workload Identity still works                | V-CTN-020                                                        | L2\*, L3   | **kind-kube-agents-dev** (Calico) |
-| **(e)** the invariants gate reflects the imperative model                               | V-MET-003, V-MET-004, V-MET-006, V-MET-007                       | L0         | none                              |
-| **(f)** `verify-phase7.sh` regression green                                             | the full prior ratchet (03 §11, 05 §8, phases 2–7)               | L1, L2     | kind-kube-agents-dev              |
+| Accept                                                                                  | Check IDs                                                        | Level      | Target                          |
+| --------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------- | ------------------------------- |
+| **(a)** clean-clone install brings all three tiers Ready, published images              | V-CMP-001, V-CMP-002, V-CMP-004, V-CMP-005                       | L0, L2, L3 | dev + live (L3 partly deferred) |
+| **(b)** every tier completes an inference call and mints a token from its own namespace | V-CMP-001 (C5, C6 Wired+Exercised probes)                        | L2, L3     | dev + live (L3 deferred)        |
+| **(c)** empty **or blank** allowlist rejected at admission; no `*_ALLOW_ALL_USERS` env  | V-CTR-002 (V-7 slice in P8-T1; V-1…V-10 in P8-T9), **V-CTR-014** | L0, L2     | dev                             |
+| **(d)** off-allowlist egress blocked while Workload Identity still works                | V-CTN-020                                                        | L2\*, L3   | **dev** (Dataplane V2)          |
+| **(e)** the invariants gate reflects the imperative model                               | V-MET-003, V-MET-004, V-MET-006, V-MET-007                       | L0         | none                            |
+| **(f)** `verify-phase7.sh` regression green                                             | the full prior ratchet (03 §11, 05 §8, phases 2–7)               | L1, L2     | dev                             |
+
+"dev" above is the one inner-loop cluster, `gke-scratch-kube-agents-dev` — the L2 target since
+2026-07-26. It was three separate Kind clusters when these rows were written; the merge and the move
+are recorded in the footnote below, and no row's LEVEL changed, only the substrate it runs on.
 
 \* **V-CTN-020 is BLOCKING-ALWAYS and may never be deferred** (09 §9.6). Its L2 instance needs a
 dataplane that actually enforces NetworkPolicy (Calico v3.28.0; LSN-006, `binding.md` P4). P8-T2
 created a dedicated `kind-kube-agents-egress` cluster for that; on 2026-07-26 the three inner-loop
-clusters were merged, and Calico now ships on the single `kind-kube-agents-dev` built by
+clusters were merged into one, and that one then moved off the laptop entirely — the L2 target is now
+the remote GKE cluster `gke-scratch-kube-agents-dev`, on **Dataplane V2**, built by
 `dev/cluster/up.sh`. Its L3 instance on live GKE is a separately-recorded carried deferral (see
 Deferrals below), consistent with how the scratch-GKE V-G checks are carried.
 
@@ -401,13 +406,18 @@ None is a BLOCKING-ALWAYS check being hidden; V-CTN-020's blocking L2 instance *
 
 ## Notes carried into IMPLEMENT
 
-- **Precondition P1 is mandatory before any L2 judgement**: rebuild → `kind load` → `rollout
-restart` → **assert the running `imageID` digest matches the build under test**. LSN-001 recurred
-  three times; a same-tag image is not evidence.
+- **Precondition P1 is mandatory before any L2 judgement**: `dev/cluster/reload-images.sh` builds on
+  Cloud Build, reads the digest back out of Artifact Registry, and **deploys by digest** — then P1
+  asserts the running `imageID` digest matches the build under test, and that the deployed tag's
+  short sha matches HEAD. LSN-001 recurred three times; a same-tag image is not evidence. Deploying
+  by digest makes that trap unrepresentable, which is exactly why P1 still asserts it: a control that
+  has become structurally impossible is the one that quietly stops being checked.
 - **P3**: admission policies do not evict what already exists. Force-recreate the pods the property
   is about, or the check is testing the past.
-- **P4**: an egress claim is green only on Calico/Dataplane V2. On kindnet it is `deferred`, never
-  `pass`.
+- **P4**: an egress claim is green only on a dataplane in the allow-list of known-enforcing ones
+  (`calico-node`, `anetd`/Dataplane V2, `cilium`). On anything unrecognised it is `deferred`, never
+  `pass` — an allow-list and not a deny-list, because a deny-list gets the _next_ unrecognised
+  dataplane wrong in the only direction that matters.
 - **P6 / LSN-003 (open)**: assert against the **operator-rendered ConfigMap**, not the image-baked
   `config.yaml` it shadows, and name which one the check reads.
 - **LSN-015 (open)**: any per-agent resource is exercised with **≥2 agents in one namespace**.

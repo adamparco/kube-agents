@@ -144,7 +144,7 @@ make dev-rebuild-agent ARGS="platform"
 - **[dev/dev_rebuild_agent.sh](scripts/dev/dev_rebuild_agent.sh)**:
   - Prompts for or accepts an agent target (`platform`).
   - Ensures the GCP Artifact Registry repository exists.
-  - Builds and pushes the updated container image via Google Cloud Build (or locally with `--local`).
+  - Builds and pushes the updated container image via Google Cloud Build. That is the only build path: the `--local` docker-build flag was removed and now exits non-zero, because it produced an arm64 image for amd64 nodes and the mismatch only surfaced later as an `exec format error` CrashLoopBackOff.
   - Automatically updates any running Custom Resources and rolling-restarts Kubernetes Deployments in GKE with the new image.
 
 ---

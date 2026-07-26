@@ -82,13 +82,13 @@ nothing worth knowing.
 
 ## 3. Verification levels
 
-| Level  | Environment              | Typical runtime | What belongs here                                                                                                                     | What must **never** be proven only here                                                        |
-| ------ | ------------------------ | --------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| **L0** | None — static analysis   | seconds         | Schema/CRD validation, RBAC manifest parsing, CEL policy unit evaluation, template↔policy agreement, structural greps, doc lints      | Any runtime enforcement property. A file's contents are not evidence that a control is active. |
-| **L1** | Process-local unit tests | seconds         | Classifier decisions, undo-plan generation, envelope validation, `ActionRecord` state machine, mesh loop prevention, scope resolution | Anything involving the API server's actual admission or RBAC evaluation.                       |
-| **L2** | Kind cluster             | minutes         | Admission policies, controller reconcile, broker pipeline end to end, `auth can-i` sweeps, gating, undo round-trips, chaos            | Cloud IAM, Workload Identity, real egress enforcement, audit-log-derived SLIs.                 |
-| **L3** | Live cloud target (GKE)  | tens of minutes | Cloud IAM conditions, WI bindings, egress on an enforcing dataplane, audit-log SLIs, managed-service integration, multi-cluster       | Nothing — but L3 is slow and scarce, so only properties that genuinely need a cloud go here.   |
-| **L4** | Soak / chaos / load      | hours           | NFR measurement under load, flap and budget behaviour over time, adversarial campaigns, long-horizon journal/undo integrity           | Fast-feedback properties that belong at L0–L2.                                                 |
+| Level  | Environment              | Typical runtime | What belongs here                                                                                                                     | What must **never** be proven only here                                                                                                                                                                                                  |
+| ------ | ------------------------ | --------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **L0** | None — static analysis   | seconds         | Schema/CRD validation, RBAC manifest parsing, CEL policy unit evaluation, template↔policy agreement, structural greps, doc lints      | Any runtime enforcement property. A file's contents are not evidence that a control is active.                                                                                                                                           |
+| **L1** | Process-local unit tests | seconds         | Classifier decisions, undo-plan generation, envelope validation, `ActionRecord` state machine, mesh loop prevention, scope resolution | Anything involving the API server's actual admission or RBAC evaluation.                                                                                                                                                                 |
+| **L2** | Remote dev cluster (GKE) | minutes         | Admission policies, controller reconcile, broker pipeline end to end, `auth can-i` sweeps, gating, undo round-trips, chaos            | Cloud IAM, Workload Identity, audit-log-derived SLIs. Egress **enforcement** is provable here once the dataplane enforces (§9.3.4), but the L3 network is the one production traffic actually crosses, so V-CTN-020 is required at both. |
+| **L3** | Live cloud target (GKE)  | tens of minutes | Cloud IAM conditions, WI bindings, egress on an enforcing dataplane, audit-log SLIs, managed-service integration, multi-cluster       | Nothing — but L3 is slow and scarce, so only properties that genuinely need a cloud go here.                                                                                                                                             |
+| **L4** | Soak / chaos / load      | hours           | NFR measurement under load, flap and budget behaviour over time, adversarial campaigns, long-horizon journal/undo integrity           | Fast-feedback properties that belong at L0–L2.                                                                                                                                                                                           |
 
 **The level-selection rule.** Choose the **lowest level that can actually prove the property**.
 Pushing a check down a level to make CI fast is only legitimate when the lower level proves the same
@@ -274,8 +274,10 @@ happy path is not evidence for a security or safety property.
 | V-CTN-019 | Cloud negative: a tier's actor GSA cannot read/write another cluster or project ¬                                            | 03 §3.2       | L3       | 11    |
 | V-CTN-020 | Egress default-deny holds while Workload Identity still functions ¬                                                          | 03 §9         | L2\*, L3 | 8     |
 
-\* L2 requires an enforcing CNI (Calico or Dataplane V2); kindnet silently ignores NetworkPolicy —
-see §11.6.
+\* L2 requires a dataplane on P4's known-enforcing allow-list. A cluster accepts a NetworkPolicy
+whether or not anything enforces it, so on an unrecognised dataplane the result is `deferred`, never
+`pass` — see §11.6. The L2 target has run Dataplane V2 since 2026-07-26, which is what turned this
+row from a standing liability into evidence.
 
 ### 6.2 V-BRK — The broker is the only writer (BLOCKING-ALWAYS)
 
@@ -698,16 +700,19 @@ Before any L2/L3 result is trusted the harness asserts:
 2. **Policies are live** — a freshly-created `ValidatingAdmissionPolicyBinding` has an activation
    delay; poll a dry-run until it actually rejects before judging.
 3. **No grandfathered objects** — pods that predate a policy are not evidence it works (§11.2).
-4. **The CNI enforces NetworkPolicy** — otherwise egress checks are meaningless (§11.6).
-5. **The destructive-test guard** — the context is Kind or an ephemeral scratch cluster, matched by
-   an **anchored** pattern (§11.5).
+4. **The dataplane enforces NetworkPolicy** — checked against an **allow-list** of dataplanes
+   known to enforce, not a deny-list of known-broken ones: a deny-list gets the next
+   unrecognised dataplane wrong in the only direction that matters (§11.6).
+5. **The destructive-test guard** — the context is a scratch cluster, matched by an **anchored**
+   pattern and with a default arm that exits non-zero (§11.5). Scripts that address a cluster by
+   name through a cloud API instead of a kube context guard on the name, with `=` and not a glob.
 
 ### 9.4 Evidence and reporting
 
 Every run emits a machine-readable manifest, one record per check:
 
 ```
-check_id, suite, level, target(kind|gke|none), result(pass|fail|deferred|skipped|quarantined),
+check_id, suite, level, target(gke|none), result(pass|fail|deferred|skipped|quarantined),
 requirement_ids[], evidence_ref, duration_s, started_at, image_digests[], notes
 ```
 

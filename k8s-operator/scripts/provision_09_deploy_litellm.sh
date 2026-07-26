@@ -34,6 +34,12 @@ init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var_model_provider
 
+# The cluster the `make` targets below write to, named rather than inherited (LSN-018: a context
+# override the Makefile did not read was accepted and ignored, and the CRD went to whatever
+# `kubectl config current-context` was). Both `connect_cluster` and CI's get-gke-credentials write
+# exactly this context name; set KUBE_CONTEXT to point the run somewhere else.
+KUBE_CONTEXT="${KUBE_CONTEXT:-gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}}"
+
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -56,7 +62,7 @@ verify_litellm() {
 execute_litellm() {
   print_info "Deploying LiteLLM Gateway into GKE..."
   export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME
-  make -C "${OPERATOR_DIR}" deploy-litellm || return 1
+  make -C "${OPERATOR_DIR}" deploy-litellm KUBE_CONTEXT="${KUBE_CONTEXT}" || return 1
 }
 
 

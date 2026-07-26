@@ -4,6 +4,10 @@
 # ==============================================================================
 # Script to build, push, and redeploy the platform agent image
 # for fast local iteration and testing.
+#
+# The build always runs on Google Cloud Build. The `--local` docker-build flag was removed and now
+# exits non-zero: it produced an arm64 image for amd64 nodes, and that only surfaced as an
+# `exec format error` CrashLoopBackOff minutes later, in a different component.
 # ==============================================================================
 
 set -e
@@ -28,11 +32,21 @@ VARS_FILE="${SCRIPTS_DIR}/vars.sh"
 source "${SCRIPTS_DIR}/common.sh" "$@"
 
 # ─── Argument Parsing ─────────────────────────────────────────────────────────
-USE_LOCAL_BUILD=0
 SELECTED_AGENT=""
 for arg in "$@"; do
   case $arg in
-    --local) USE_LOCAL_BUILD=1 ;;
+    # --local ran `docker build` on this machine. Every image target here is linux/amd64 and the
+    # machines that ran it are arm64, so it produced an image no GKE node can execute — and the
+    # bill came due minutes later, in a different component, as a CrashLoopBackOff whose only
+    # symptom was `exec format error`. Refusing loudly beats ignoring the flag: a silently-ignored
+    # --local looks exactly like a --local that worked (LSN-018 is the same shape).
+    --local)
+      print_error "--local was removed. It built the image on THIS machine; these are arm64 and"
+      print_error "every image target is amd64, so the result CrashLoopBackOffs on GKE with"
+      print_error "'exec format error' minutes later, in another component. Cloud Build is now the"
+      print_error "only path — drop the flag and re-run."
+      exit 1
+      ;;
     platform) SELECTED_AGENT="$arg" ;;
     *) ;;
   esac
@@ -65,11 +79,7 @@ esac
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
-if [ "$USE_LOCAL_BUILD" -eq 1 ]; then
-  check_prereqs "gcloud" "kubectl" "docker"
-else
-  check_prereqs "gcloud" "kubectl"
-fi
+check_prereqs "gcloud" "kubectl"
 
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for Dev Rebuild"
@@ -96,10 +106,9 @@ fi
 DEV_TAG="dev-$(date +%Y%m%d-%H%M%S)"
 IMAGE_BASE="$REGION-docker.pkg.dev/$PROJECT_ID/$GCP_ARTIFACT_REGISTRY_REPO_NAME/$IMAGE_NAME"
 IMAGE_URI="$IMAGE_BASE:$DEV_TAG"
-IMAGE_URI_LATEST="$IMAGE_BASE:latest"
-# The Cloud Build path caches against :buildcache, not :latest. deploy/docker/cloudbuild.yaml
-# deliberately retired :latest as a cache tag because it was mutable AND looked deployable AND was
-# listed in `images:`, so a cache write republished something a cluster could pull.
+# Cloud Build caches against :buildcache, not :latest. deploy/docker/cloudbuild.yaml deliberately
+# retired :latest as a cache tag because it was mutable AND looked deployable AND was listed in
+# `images:`, so a cache write republished something a cluster could pull.
 IMAGE_URI_CACHE="$IMAGE_BASE:buildcache"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
@@ -123,25 +132,16 @@ verify_image_build() {
   return 1
 }
 execute_image_build() {
-  if [ "$USE_LOCAL_BUILD" -eq 1 ]; then
-    print_info "Building '$AGENT_TARGET' agent locally using Docker..."
-    docker pull "$IMAGE_URI_LATEST" 2>/dev/null || true
-    DOCKER_BUILDKIT=1 docker build --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
-    print_info "Pushing images to Artifact Registry ($IMAGE_BASE)..."
-    docker push "$IMAGE_URI" || return 1
-    docker push "$IMAGE_URI_LATEST" || return 1
-  else
-    print_info "Submitting build for '$AGENT_TARGET' agent to Google Cloud Build..."
-    print_info "Target image: $IMAGE_URI (cache: $IMAGE_URI_CACHE)"
-    (
-      cd "${REPO_ROOT}"
-      gcloud builds submit \
-          --config="deploy/docker/cloudbuild.yaml" \
-          --substitutions="_IMAGE_URI=${IMAGE_URI},_CACHE_URI=${IMAGE_URI_CACHE},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
-          --project="${PROJECT_ID}" \
-          .
-    ) || return 1
-  fi
+  print_info "Submitting build for '$AGENT_TARGET' agent to Google Cloud Build..."
+  print_info "Target image: $IMAGE_URI (cache: $IMAGE_URI_CACHE)"
+  (
+    cd "${REPO_ROOT}"
+    gcloud builds submit \
+        --config="deploy/docker/cloudbuild.yaml" \
+        --substitutions="_IMAGE_URI=${IMAGE_URI},_CACHE_URI=${IMAGE_URI_CACHE},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
+        --project="${PROJECT_ID}" \
+        .
+  ) || return 1
 }
 
 # Step 3: Connect to Host GKE Cluster

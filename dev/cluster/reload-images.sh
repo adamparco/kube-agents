@@ -25,19 +25,26 @@
 #   deployment mechanism makes unrepresentable. It also makes the pull policy irrelevant rather
 #   than load-bearing.
 #
-# Usage: dev/cluster/reload-images.sh [operator|agents|all|digest] [kube-context]
+# Usage: dev/cluster/reload-images.sh [operator|router|agents|all|digest|digest-router] [kube-context]
 #   operator (default)  build+push the controller image, repoint + restart the controller
+#   router              build+push the kage-router image, repoint + restart the router
 #   agents              build+push the three tier agent images, repoint every Agent CR of each tier
-#   all                 both
+#   all                 all three
 #   digest              build+push the controller image and print its DIGEST reference on stdout,
-#                       touching no cluster. This is for up.sh on a cluster that has no Deployment
-#                       to repoint yet: `make deploy` needs an IMG, and the alternative — deploy
-#                       the upstream tag as a placeholder, then repoint — means rolling out
-#                       somebody else's binary inside a script whose job is to install YOURS.
-#                       Progress goes to stderr so `$(...)` captures the reference alone.
+#   digest-router       same for the router. Both touch no cluster. They are for up.sh on a cluster
+#                       that has no Deployment to repoint yet: `make deploy` needs an IMG and a
+#                       ROUTER_IMG, and the alternative — deploy the upstream tag as a placeholder,
+#                       then repoint — means rolling out somebody else's binary inside a script
+#                       whose job is to install YOURS. It is also not available: the published
+#                       `ghcr.io/gke-labs/kube-agents/kage-router:v0.1.0` answers an anonymous pull
+#                       with 403, so a cluster brought up on the default ROUTER_IMG gets a router
+#                       stuck in ImagePullBackOff — which is 09 §11.9 ("built, never wired") sitting
+#                       in the inner loop's own bring-up. Progress goes to stderr so `$(...)`
+#                       captures the reference alone.
 #
 # Exit codes (contract shared with up.sh, and relied on by the L2 suites):
 #   0 ok · 1 usage · 2 refused (guard) · 3 required tool missing · 4 an image did not materialise
+#   5 the digest IS deployed but the workload did not become Ready — `router` only; see reload_router
 set -uo pipefail
 
 TARGET="${1:-operator}"
@@ -125,6 +132,35 @@ reload_operator() {
   echo "OK: controller now running $ref"
 }
 
+# The router is a separate image from the same tree (Dockerfile.router), not a variant of the
+# operator: 05 C15 makes it the read-only ChatOps front door, with its own SA and its own role.
+#
+# THE ONE PLACE THIS SCRIPT SPLITS "no image" FROM "image, no Ready pod", AND WHY.
+#   Everywhere else the two are the same failure. Here they are not, because the router is KNOWN not
+#   to start on an unwired cluster: config/router/deployment.yaml ships REPLACE_WITH_PROJECT_ID and
+#   REPLACE_WITH_INBOUND_SUBSCRIPTION, and its SA carries no Workload Identity annotation, so it
+#   exits on `missing required --project-id` before it can reach Pub/Sub. That is a disclosed gap in
+#   the CONFIG, and it is not evidence about the image -- which is the thing this script exists to
+#   put on the cluster. Collapsing them would make every inner-loop bring-up fail on a condition
+#   nobody in the inner loop can fix, and the usual response to that is to stop running the step,
+#   which is how an image goes back to being never built. So: rc 4 if the registry has nothing
+#   (fatal anywhere), rc 5 if the digest is deployed and the pod will not come up (the caller
+#   decides, and up.sh discloses it).
+reload_router() {
+  echo "== router =="
+  local ref
+  ref="$(build_and_resolve kage-router "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile.router")" || return 4
+  echo "-> repointing the router at $ref"
+  $K -n "$NS" set image deploy/kubeagents-router "router=$ref" || return 4
+  if ! $K -n "$NS" rollout status deploy/kubeagents-router --timeout=180s; then
+    echo "NOTE: the router is deployed at $ref but did not become Ready." >&2
+    echo "  The image is the one under test; the pod's CONFIG is not wired. Read the reason:" >&2
+    echo "    kubectl --context $CTX -n $NS logs deploy/kubeagents-router" >&2
+    return 5
+  fi
+  echo "OK: router now running $ref"
+}
+
 reload_agents() {
   echo "== agents =="
   local built=0 patched=0 tier ref crs ns name crtier
@@ -166,11 +202,13 @@ reload_agents() {
 
 case "$TARGET" in
   operator) reload_operator ;;
+  router)   reload_router ;;
   agents)   reload_agents ;;
-  all)      reload_operator && reload_agents ;;
+  all)      reload_operator && reload_router && reload_agents ;;
   # The guard above still ran, and deliberately, even though this arm touches no cluster. A guard
   # that applies to some subcommands and not others is a guard someone has to remember the shape
   # of; this one is uniform and costs nothing here.
-  digest)   build_and_resolve k8s-operator "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile" ;;
-  *) echo "usage: $0 [operator|agents|all|digest] [kube-context]" >&2; exit 1 ;;
+  digest)        build_and_resolve k8s-operator "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile" ;;
+  digest-router) build_and_resolve kage-router "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile.router" ;;
+  *) echo "usage: $0 [operator|router|agents|all|digest|digest-router] [kube-context]" >&2; exit 1 ;;
 esac
