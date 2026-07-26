@@ -96,6 +96,37 @@ case "$?" in
   *) bad "P1: the cluster is NOT running the build under test (LSN-001 — V-K1/V-K9 describe other code)" ;;
 esac
 
+# This script OWNS the Agent CR it applies, and takes it away again. On the disposable Kind clusters
+# this suite was written against, ownership was free: the cluster went in the bin after the campaign,
+# so "leave it behind" and "clean it up" were the same thing. One long-lived cluster makes them
+# different, and the difference had two costs.
+#
+# The visible one: the shipped example pins ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0,
+# which answers an anonymous pull with 403, so every run left a gateway wedged in ImagePullBackOff.
+# That red was never evidence of anything -- nothing read it and nothing failed on it -- and it was
+# equally consistent with a reverted digest patch, a full node, or a missing SA. An ambient red that
+# no check owns is how the NEXT real failure gets misattributed (LSN-026). The publication gap it
+# gestured at is now a ledger deferral with a blocker and a promote-when, which is a claim something
+# actually checks.
+#
+# The invisible one, and the reason this is a fix rather than tidying: chaos-suite.sh was reading this
+# leftover CR as a fixture it never created. It passed only because phase 2 happened to run first on a
+# cluster nobody reset. It now applies its own.
+#
+# Deleting the CR is enough -- the Deployment, ReplicaSet and pod are ownerReferenced to it, and the
+# Agent CRD carries no finalizer, so the CR goes immediately and its children follow via GC. The
+# identity ClusterRole/SA and the VAP are deliberately NOT deleted: they are cluster fixtures other
+# suites depend on, and unlike the CR they are not a rendering of the operator under test.
+#
+# Placed after P1 and before the first apply, so it is armed for every exit path below, including a
+# `bad` that halts mid-suite. No assertion is weakened: the trap runs strictly after the last read,
+# and :127 still asserts the ghcr tag string on the rendered pod exactly as before.
+cleanup() {
+  $K -n "$NS" delete agent cluster-admin-cluster-a cluster-admin-cluster-a-dup \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 # --- V-K9 (out-of-order half): Agent CR before CRD would fail (proved on fresh cluster). --------
 # Here the CRD exists, so instead prove identity-before-pod: apply identity + CR in order.
 echo; echo "== V-K9: in-order identity -> Agent CR; pod binds pre-created SA =="
@@ -105,6 +136,11 @@ $K apply -f "$AGENT" >/dev/null 2>&1 && pass "Agent CR admitted by webhook" || b
 # read whatever pod the previous build left behind (`sleep 6` cannot tell a fresh pod from an old one).
 # Delete the Deployment and let the controller re-render it: that is what makes them assertions about
 # the renderer in this tree rather than about the past (LSN-002).
+# Since the EXIT trap above took ownership of the CR, `p3_force_recreate`'s "the Deployment does not
+# exist; the next apply is a genuine admission" branch (rc 0, preconditions.sh) is now the EXPECTED
+# steady state rather than a rare one -- the previous run deleted it. Do not read that as dead code
+# and delete the call: it is what keeps this assertion honest on a cluster where the CR DID survive,
+# which is exactly the case the trap cannot cover (a SIGKILL, or a run that never reached the trap).
 p3_force_recreate "$K" "$NS" deploy/cluster-admin-cluster-a-gateway 90 \
   || bad "P3: could not force-recreate the agent Deployment — V-K9 below would be about the past (LSN-002)"
 # Resolve the pod by OWNERSHIP and pin it by name — see `p3_pod_of_deploy`. This block was the twin

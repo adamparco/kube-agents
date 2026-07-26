@@ -250,26 +250,67 @@ fi
 
 # Every Agent already in the cluster must satisfy the same property.
 echo; echo "== L2-4b: no EXISTING rendered Deployment carries the retired hatch =="
+#
+# NON-VACUITY. This block asserts a universal -- "no rendered Deployment carries the hatch" -- and a
+# universal over an empty set is true for free. Two separate things used to hide that:
+#
+#   1. The selector was `app.kubernetes.io/managed-by=kube-agents-operator`, which NO operator code
+#      path has ever written. LEDGER.md:243 already recorded this ("an exact match this value cannot
+#      satisfy") and ruled the manifest side unfixable, because the label lives at 29 byte-locked
+#      sites with three different real managers. It is fixable from THIS end for free: select on
+#      `kube-agents/tier`, which agent_manifests.go:531 writes onto every rendered Deployment, as an
+#      EXISTENCE selector so it keeps matching whatever the tier value happens to be. The old loop
+#      matched zero objects on every run since this file was written; the whole-cluster fallback
+#      below has been carrying the entire check alone, and its own comment -- "so a renaming of that
+#      label cannot turn this check into a silent no-op" -- was describing a no-op that had already
+#      happened.
+#
+#   2. verify-phase2.sh used to leave cluster-admin-cluster-a behind, so a rendered Deployment was
+#      always lying around for this loop to walk regardless. Phase 2 now deletes its own CR on exit,
+#      so on a clean cluster the only rendered Deployment is the probe THIS script applied twenty
+#      lines up -- which is the right dependency (a suite should supply its own subject), but it
+#      makes the population small enough that losing it stops being obvious.
+#
+# So count the population and assert the counts. A green line from this block now means "N objects
+# were examined and none carried the hatch", not "nothing was examined". That distinction is the
+# whole of LSN-021.
 found_hatch=0
+rendered_seen=0
+all_seen=0
 while read -r ns name; do
   [ -z "$name" ] && continue
+  rendered_seen=$((rendered_seen + 1))
   names="$($K -n "$ns" get deploy "$name" -o jsonpath='{.spec.template.spec.containers[*].env[*].name}' 2>/dev/null)"
   if printf '%s' "$names" | grep -q "ALLOW_ALL_USERS"; then
     bad "$ns/$name carries a *_ALLOW_ALL_USERS env var (V-CTR-014)"
     found_hatch=1
   fi
-done < <($K get deploy -A -l app.kubernetes.io/managed-by=kube-agents-operator --no-headers 2>/dev/null | awk '{print $1, $2}')
-# The label selector above is the operator's own; fall back to a whole-cluster sweep so a renaming of
-# that label cannot turn this check into a silent no-op.
+done < <($K get deploy -A -l kube-agents/tier --no-headers 2>/dev/null | awk '{print $1, $2}')
+# The selector above is the operator's own; keep the whole-cluster sweep as well, so a renaming of
+# that label cannot turn this check into a silent no-op. It is the wider net, not the narrower one:
+# an operand that escaped the label still has to pass here.
 while read -r ns name; do
   [ -z "$name" ] && continue
+  all_seen=$((all_seen + 1))
   names="$($K -n "$ns" get deploy "$name" -o jsonpath='{.spec.template.spec.containers[*].env[*].name}' 2>/dev/null)"
   if printf '%s' "$names" | grep -q "ALLOW_ALL_USERS"; then
     bad "$ns/$name carries a *_ALLOW_ALL_USERS env var (V-CTR-014, cluster-wide sweep)"
     found_hatch=1
   fi
 done < <($K get deploy -A --no-headers 2>/dev/null | awk '{print $1, $2}')
-[ "$found_hatch" -eq 0 ] && pass "no Deployment in the cluster carries a *_ALLOW_ALL_USERS env var"
+
+if [ "$all_seen" -eq 0 ]; then
+  # Not "the cluster is clean" -- a cluster running this script has at least the operator itself.
+  bad "the cluster-wide sweep matched 0 Deployments of any kind: kubectl returned nothing, so neither sweep above proves anything"
+elif [ "$rendered_seen" -eq 0 ]; then
+  if [ -n "${dep:-}" ]; then
+    bad "the operator-rendered sweep matched 0 Deployments while ${dep#deployment.apps/} is live in $NS — the kube-agents/tier selector has stopped selecting what the operator writes (agent_manifests.go:531), and this check is asserting a universal over an empty set"
+  else
+    bad "the operator-rendered sweep matched 0 Deployments and the probe rendered none either — V-CTR-014 has no live operand at all here"
+  fi
+elif [ "$found_hatch" -eq 0 ]; then
+  pass "no *_ALLOW_ALL_USERS env var on any of $rendered_seen operator-rendered Deployment(s), nor on any of $all_seen Deployment(s) cluster-wide"
+fi
 
 echo
 echo "===================================================================="

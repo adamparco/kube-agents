@@ -38,7 +38,9 @@
 # and defers the agent-reasoning-pause. Never asserted green here.
 #
 # FIXTURES (D1): controller *reconcile-behaviour* (C1 no-reconcile/resume, C2 Deployment relaunch) uses the
-# REAL Agent CR + REAL controller — observed on the Deployment object, faithful even though the real agent
+# REAL Agent CR + REAL controller — applied by THIS script and removed on exit, so the suite runs
+# standalone against a clean cluster instead of inheriting another suite's leftovers —
+# observed on the Deployment object, faithful even though the real agent
 # pod may stay Pending if the node pool is small (the controller bakes prod-correct ~2Gi+ requests across
 # a 4-container pod, and `up.sh` sizes for two of them, not many). *Pod-continuity / no-cascade* (C1/C3/C4 running-pod claims) uses lightweight stand-in
 # Deployments labeled kube-agents/tier with the FULL hardened securityContext (so they are admitted under
@@ -88,6 +90,19 @@ CM=kubeagents-controller-manager
 REAL_NS=kubeagents-system
 REAL_DEPLOY=cluster-admin-cluster-a-gateway   # owned by Agent CR cluster-admin-cluster-a
 REAL_CR=cluster-admin-cluster-a
+# This suite APPLIES the two manifests below (see the block after P1) and deletes the CR on exit. It
+# is a fixture, and it is NOT the subject under test: C1/C2 claim things about how the CONTROLLER
+# reconciles when it is killed, and the CR is only the object it reconciles. Its image never has to
+# pull for any assertion here to hold -- what is read is the Deployment object and, at the end, the
+# existence of a pod OBJECT.
+#
+# It is applied rather than assumed because until now this script read whatever CR verify-phase2.sh
+# left on the cluster. That worked on disposable Kind clusters, where phase 2 always ran first into a
+# fresh cluster and the whole thing was binned afterwards. It is not a dependency anyone declared, it
+# is not one L2-CHAIN.txt enforces, and it fails outright the first time chaos-suite.sh is run on its
+# own against a clean cluster -- which is now the normal state, because phase 2 cleans up after itself.
+REAL_AGENT=examples/gitops-repo/clusters/cluster-a/agents/agent.yaml
+REAL_IDENTITY=examples/gitops-repo/clusters/cluster-a/agents/identity/cluster-admin-identity.yaml
 PAUSE=registry.k8s.io/pause:3.9
 
 case "$CTX" in
@@ -111,6 +126,10 @@ cleanup() {
     $K -n "$CM_NS" scale deploy "$CM" --replicas="$CM_ORIG_REPLICAS" >/dev/null 2>&1 || true
   fi
   $K delete ns "$CHAOS_NS" --wait=false --ignore-not-found >/dev/null 2>&1 || true
+  # The Agent CR this suite applies. Its Deployment/ReplicaSet/pod are ownerReferenced to it and the
+  # Agent CRD carries no finalizer, so deleting the CR is enough and is prompt. The identity SA and
+  # ClusterRole are left in place: they are cluster fixtures other suites read, not this run's state.
+  $K -n "$REAL_NS" delete agent "$REAL_CR" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -235,6 +254,22 @@ case "$?" in
   3) echo "  DEFERRED (not faked): P1 unverifiable — reason above; C1/C2 below describe an unidentified controller." ;;
   *) bad "P1: the cluster is NOT running the build under test (LSN-001 — C1/C2 would describe other code)" ;;
 esac
+
+# Apply this suite's own Agent fixture. Identity FIRST and not merely for tidiness: the gateway pod
+# binds a pre-created ServiceAccount, so without it the ReplicaSet cannot create a pod at all, and the
+# post-chaos settle block near the end of this file -- which waits for a pod OBJECT -- would time out
+# and downgrade to a note. That is a soft skip dressed as a pass (LSN-021), and it would be blamed on
+# chaos rather than on a missing SA.
+#
+# Verdicts are pass/bad, not `|| true`. A swallowed apply surfaces three assertions later as C1/C2
+# failing about the controller, which is the wrong subject and the expensive kind of wrong.
+echo; echo "== fixture: this suite's own Agent CR (identity, then CR) =="
+$K apply -f "$REAL_IDENTITY" >/dev/null 2>&1 \
+  && pass "fixture identity applied (SA + read-only ClusterRole the gateway pod binds)" \
+  || bad "fixture identity apply failed — the gateway pod cannot be created, so C1/C2 would test nothing"
+$K apply -f "$REAL_AGENT" >/dev/null 2>&1 \
+  && pass "fixture Agent CR $REAL_CR applied (the object C1/C2 watch the controller reconcile)" \
+  || bad "fixture Agent CR apply failed — C1/C2 below have no Deployment to observe"
 
 # Fresh chaos namespace (PSS restricted so stand-ins face the same ceiling a real agent pod does).
 $K delete ns "$CHAOS_NS" --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
@@ -391,7 +426,18 @@ fi
 # ---- restore pre-chaos steady state (regression-safety, D2) -----------------------------------------
 # C1/C2 delete the real agent Deployment and let the controller recreate it; wait for its POD object to
 # exist again (Pending is tolerated — the controller bakes prod-correct ~2Gi+ requests and this waits for
-# the OBJECT, not for Ready) so the post-chaos regression (e.g. verify-phase2 V-K9, which reads that pod) sees steady state.
+# the OBJECT, not for Ready).
+#
+# What this restores is now THIS SUITE'S OWN steady state, not the next suite's starting state. The
+# older rationale here said the wait existed so the post-chaos regression -- verify-phase2's V-K9 --
+# would find that pod; that is no longer true and was the visible face of the undeclared dependency
+# this script used to have. Phase 2 applies and owns its own CR, and the EXIT trap removes this one a
+# few lines from now regardless of what is found here.
+#
+# The check stays because it still asserts something real, and something this suite is uniquely placed
+# to assert: that after C1 scaled the controller down and C2 deleted the Deployment underneath it, the
+# controller came back and reconciled the object rather than leaving it deleted. Dropping the wait
+# because "nothing downstream needs it" would discard that.
 echo; echo "== restore pre-chaos steady state: real agent pod recreated =="
 settle_ok=0
 for _ in $(seq 1 40); do

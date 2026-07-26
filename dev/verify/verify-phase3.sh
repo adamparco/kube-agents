@@ -108,6 +108,29 @@ case "$?" in
   *) bad "P1: the cluster is NOT running the build under test (LSN-001 — P3-K1/K2/K4 describe other code)" ;;
 esac
 
+# This script OWNS the Agent CRs it applies. Same reasoning as the trap in verify-phase2.sh: on the
+# disposable Kind clusters these suites were written against, "leave it" and "clean it" were the same
+# act; on one long-lived cluster they are not, and the leftover gateway sat in ImagePullBackOff on the
+# unpublished ghcr example tag from one run to the next, owned by no check.
+#
+# THREE CRs, because two of them are supposed to be rejected and a trap must not assume the thing the
+# suite is testing: `-dup` (P3-K4's cardinality probe) and the foreign-placement copy in `default`
+# (P3-K1's isolation-escape probe). If the webhook regresses and admits either, the assertion fails
+# loudly AND the object is cleaned up -- a failing run must not also poison the next one.
+#
+# NAMESPACE team-x AND ITS SA, RESOURCEQUOTA AND NETWORKPOLICY ARE DELIBERATELY KEPT. verify-phase4.sh
+# reads the developer-team ServiceAccount for its SubjectAccessReview regression; delete it here and
+# that check degrades to a note instead of failing, which is the silent-skip shape LSN-021 is about.
+# The CR is a rendering of the operator under test and belongs to this run; the namespace scaffolding
+# is a cluster fixture and does not.
+cleanup() {
+  $K -n "$NSX" delete agent developer-team-team-x developer-team-team-x-dup \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  $K -n default delete agent developer-team-team-x \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 # --- P3-K1: placement clause (A1) — apply namespace prereqs + identity, then CR ----------------
 # The egress netpol (30-) carries REPLACE_WITH_* CIDR placeholders (invalid CIDRs) so it is NOT
 # applied live here — it is substituted + dry-run validated in P3-K6. Everything else applies clean.

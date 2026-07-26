@@ -257,6 +257,16 @@ Phase gate:   dev/verify/verify-phase8.sh $CTX
 Pick up code: dev/cluster/reload-images.sh all $CTX
 Stop paying:  dev/cluster/pause.sh      (nodes -> 0; resume.sh restores them in ~2 min)
 Tear down:    dev/cluster/down.sh
+EOF
+
+# The router paragraph is printed under the condition it describes, not unconditionally. Told every
+# time, it is a prediction: it reads as true on the run where the router is fine, and a disclosure
+# that survives its own falsification has stopped disclosing anything. Told only on rc 5, it is a
+# report -- and the `else` arm means the interesting case, a router that unexpectedly came up, is no
+# longer the one outcome this banner is silent about. Nothing in the repo reads the router's state,
+# so silence there would last until someone happened to look.
+if [ "$router_rc" -eq 5 ]; then
+  cat <<EOF
 
 THE ROUTER CRASHLOOPS HERE, AND THAT IS THE CORRECT OUTCOME, not a broken bring-up. It runs the
 image built from this tree — that part is now proven rather than assumed — and exits on
@@ -269,6 +279,21 @@ is L3 work on a live install, not something an inner-loop cluster can or should 
 routing logic is proven hermetically against the pstest fake (go test ./internal/router/), so
 nothing in dev/L2-CHAIN.txt depends on this pod. Confirm the reason, do not assume it:
     kubectl --context $CTX -n kubeagents-system logs deploy/kubeagents-router
+EOF
+else
+  cat <<EOF
+
+THE ROUTER CAME UP, WHICH THIS TREE DOES NOT EXPECT. config/router/deployment.yaml ships
+KAGE_PROJECT_ID and KAGE_INBOUND_SUBSCRIPTION empty (V-CMP-003) and the ServiceAccount carries no
+Workload Identity annotation, so \`missing required --project-id\` is the documented outcome and rc 5
+is the documented return. Something wired this cluster out of band, or the config changed and the
+disclosure did not. Either way a recorded gap is now false, which is a ledger edit and not a nicety:
+    docs/build/LEDGER.md   -- Deferrals, the router row
+    dev/cluster/reload-images.sh   -- the rc 4 / rc 5 split and the contract above it
+EOF
+fi
+
+cat <<EOF
 
 NOT installed, deliberately: the gVisor sandbox pool. 08 §5's sandbox checks are unwritten
 (verify-phase7.sh §D carries that deferral), so a pool would be an extra node running nothing —
