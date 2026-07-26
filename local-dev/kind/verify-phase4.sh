@@ -45,6 +45,30 @@
 # DESTRUCTIVE-TEST GUARD: the live regression only runs against a Kind context. The hermetic suite runs
 # anywhere (it never touches a cluster), so this gate is CI-runnable even with no cluster reachable.
 # Usage: local-dev/kind/verify-phase4.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). Three waivers, which is the honest answer for a gate whose
+# acceptance is hermetic by design — and the reason each waiver states WHY rather than "n/a" is that
+# an unargued waiver is indistinguishable from an unexamined one.
+#   P1 image-under-test:  none — no first-party image participates in any claim here. P4-K1..K5 run go
+#      tests and dependency-free python against the WORKING TREE, so their subject is the source, not a
+#      container. The live regression's subjects are the read-only VAP and the agent ServiceAccounts'
+#      RBAC, and 08 §7 is the standing proof that the controller mints neither: both come from the
+#      GitOps tree via the installer, so a stale operator image cannot change either answer. The one
+#      Phase-4 claim that WOULD depend on an image — live Event→session spawn through the watcher — is
+#      the deferral this script already refuses to fake.
+#   P3 admission-recreate: none — this script judges no admission decision of its own. `auth can-i` is
+#      an authorization query against RBAC as it stands, evaluated fresh on every call, with no object
+#      created and nothing to grandfather. The admission negatives it cares about belong to
+#      negative-attenuation.sh, which creates each object it judges inside its own run and declares
+#      that in its own block, where the answer can be checked against the code that implements it.
+#   P6 runtime-authoritative: split, and named rather than blurred. The live half reads the API server
+#      (SAR answers, SA existence). The structural half — invariant 3, no parent-tier destination in a
+#      child's egress allowlist — reads the GitOps tree files, which are DESIRED state, not the applied
+#      NetworkPolicy. That is the correct artifact for this particular claim, because the claim is that
+#      the shipped allowlist contains no agent→agent path for anyone who applies it, not that one
+#      cluster is currently free of one. Nothing here reads the config file the operator shadows with a
+#      rendered ConfigMap at runtime (LSN-003).
 set -uo pipefail  # -e omitted: exit codes are inspected manually.
 
 CTX="${1:-kind-kube-agents-dev}"

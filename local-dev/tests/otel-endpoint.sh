@@ -18,6 +18,23 @@
 #
 # Usage: local-dev/tests/otel-endpoint.sh [REPO_ROOT]
 # Exit 0 = seam holds; non-zero on any failure.
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). All three are waived, and the single reason is worth stating
+# plainly rather than three times: this script never contacts a cluster. It is reached from an L2 gate
+# (verify-phase7.sh section A) and therefore falls inside the lint's scope, but it is hermetic, and a
+# declaration block that pretended otherwise would be the exact failure the block exists to prevent.
+#   P1 image-under-test:  none — nothing runs. The Dockerfile and the entrypoint are read as TEXT from
+#      the tree; no image is built, pulled or executed, so there is no digest to compare and no way for
+#      a stale container to change the answer.
+#   P3 admission-recreate: none — no Kubernetes object is created, applied or dry-run, so there is no
+#      admission decision here for a pre-existing object to have escaped (LSN-002 cannot arise).
+#   P6 runtime-authoritative: none, in the sense the precondition means — but the reason it does not
+#      apply is the same reason LSN-003 exists. The endpoint is resolved at container start by
+#      docker-entrypoint.sh, so the runtime-authoritative artifact would be a running container's
+#      environment. This script deliberately does not claim to have read that; it proves the RESOLUTION
+#      CONTRACT by replaying the entrypoint's own default-expansion, and D3 above keeps the live
+#      collector deferred rather than asserting it green.
 set -euo pipefail
 
 ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"

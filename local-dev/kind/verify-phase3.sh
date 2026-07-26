@@ -30,6 +30,31 @@
 #
 # DESTRUCTIVE-TEST GUARD: only runs against a Kind context.
 # Usage: local-dev/kind/verify-phase3.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). Written from a reading of THIS script, not inferred by the
+# gates that reach it (verify-phase5/6/7.sh all do).
+#   P1 image-under-test:  kubeagents-system/control-plane=controller-manager — P3-K1 asks whether the
+#      webhook enforces the placement clause, P3-K4 asks whether it enforces cardinality and tier
+#      immutability, and P3-K2 asks what the operator rendered into the dev-team pod. All three are
+#      answered by the operator image, and the operator runs in kubeagents-system even though the
+#      objects it renders here live in team-x. Asserted via p1_assert_build_under_test. P3-K3 (SAR),
+#      P3-K6 (netpol shape) and P3-K7 (renderer + VAP) do not depend on that image.
+#   P3 admission-recreate: deploy/developer-team-team-x-gateway in team-x — P3-K2 reads a pod's
+#      serviceAccountName, image and tier label, and re-applying an Agent CR that already exists is a
+#      no-op, so the pod it read was whatever the last build left behind. This was `sleep 6` then read
+#      until 2026-07-25, the same LSN-002 shape as verify-phase2 V-K9 and found the same way.
+#      p3_force_recreate now deletes the Deployment so the controller re-renders it. P3-K1's
+#      foreign-placement CR, P3-K4's duplicate and P3-K6/K7's dry-runs are fresh admissions already:
+#      the first two are objects that do not exist until this run creates them, and a server-side dry
+#      run admits in full and persists nothing.
+#   P6 runtime-authoritative: the live API server for every admission verdict, pod spec and SAR answer.
+#      The netpol clauses in P3-K6 are the one place this script judges working-tree YAML instead of an
+#      applied object, and that is deliberate and stated: 30-netpol-*.yaml carries REPLACE_WITH_* CIDR
+#      placeholders and is therefore NEVER applied live here, so the tree file is the only artifact
+#      that exists to judge — which is also why P3-K6 is a SHAPE claim and not an enforcement one
+#      (kindnet enforces nothing; see the deferral above). No claim here reads the image-baked config
+#      file that the operator shadows with a rendered ConfigMap at runtime (LSN-003).
 set -uo pipefail  # -e omitted: kubectl exit codes are inspected manually.
 
 CTX="${1:-kind-kube-agents-dev}"
@@ -51,6 +76,8 @@ fail=0
 pass() { echo "PASS: $1"; }
 bad()  { echo "FAIL: $1"; fail=1; }
 cd "$REPO_ROOT"
+# P1 and P3 are executed here, not described — the block above is only honest because of these calls.
+. "$REPO_ROOT/local-dev/kind/lib/preconditions.sh"
 
 echo "===================================================================="
 echo " Phase 3 Kind verification — context: $CTX"
@@ -64,6 +91,15 @@ fp="$($K get validatingadmissionpolicy kube-agents-agent-readonly -o jsonpath='{
 [ "$fp" = "Fail" ] && pass "VAP failurePolicy=Fail" || bad "VAP failurePolicy is '$fp' (must be Fail — HALT cond 3)"
 minor="$($K version -o json 2>/dev/null | grep -m1 '"minor"' | grep -oE '[0-9]+' | head -1)"
 [ -n "$minor" ] && [ "$minor" -ge 30 ] && pass "K8s >= 1.30 (minor=$minor, VAP GA)" || bad "K8s minor=$minor < 30 (VAP not GA — HALT cond 3)"
+
+# P1 — the webhook that decides P3-K1 and P3-K4, and the renderer that produces the pod P3-K2 reads,
+# are the same operator image. Ask before claiming anything about them (LSN-001).
+p1_assert_build_under_test "$K" "$NS" control-plane=controller-manager
+case "$?" in
+  0) pass "P1: the running operator is the build under test" ;;
+  3) echo "  DEFERRED (not faked): P1 unverifiable — reason printed above; the webhook/render claims below are about an unknown build." ;;
+  *) bad "P1: the cluster is NOT running the build under test (LSN-001 — P3-K1/K2/K4 describe other code)" ;;
+esac
 
 # --- P3-K1: placement clause (A1) — apply namespace prereqs + identity, then CR ----------------
 # The egress netpol (30-) carries REPLACE_WITH_* CIDR placeholders (invalid CIDRs) so it is NOT
@@ -87,11 +123,28 @@ fi
 
 # --- P3-K2: reconciled dev-team pod — pre-created SA + dev-team image + tier label --------------
 echo; echo "== P3-K2: reconciled dev-team pod (SA / image / tier label) =="
-sleep 6
-sel="app=developer-team-team-x-gateway"
-sa="$($K -n $NSX get pod -l "$sel" -o jsonpath='{.items[0].spec.serviceAccountName}' 2>/dev/null)"
-img="$($K -n $NSX get pod -l "$sel" -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null)"
-tier="$($K -n $NSX get pod -l "$sel" -o jsonpath='{.items[0].metadata.labels.kube-agents/tier}' 2>/dev/null)"
+# P3 — the CR applied above already existed, so its apply was a no-op and the pod below is whatever the
+# previous build left in team-x. `sleep 6` cannot tell those apart. Delete the Deployment and let the
+# controller re-render it, so the three assertions describe the renderer in this tree (LSN-002).
+p3_force_recreate "$K" "$NSX" deploy/developer-team-team-x-gateway 90 \
+  || bad "P3: could not force-recreate the dev-team Deployment — P3-K2 below would be about the past (LSN-002)"
+# Resolve the pod by OWNERSHIP and pin it by name. The selector-based poll this replaces was flaky at
+# 2-in-3 and both halves of it were wrong: `-o name | head -1` matched the PREVIOUS run's pod, which
+# the recreate had orphaned but which GC had not reached yet, and then three separate `.items[0]`
+# reads each re-listed a set that was changing underneath them. The symptom was always EMPTY, never a
+# wrong value — one run read the SA fine and got '' for the image and the tier one call later, as GC
+# removed the pod mid-sequence. `p3_pod_of_deploy` walks Deployment uid -> ReplicaSet -> Pod, so it
+# cannot return a pod belonging to the generation P3 just deleted, and the three assertions below all
+# read the same pinned object (LSN-024).
+pod="$(p3_pod_of_deploy "$K" "$NSX" developer-team-team-x-gateway 120)"
+# Existence, not Ready: the pod stays Pending on a single-node dev Kind (prod-correct ~2Gi+ requests),
+# and every field read below lives in the spec, which a Pending pod already has.
+[ -n "$pod" ] \
+  && pass "controller re-rendered the dev-team pod after the forced recreate (fresh admission, current renderer): $pod" \
+  || bad "no pod owned by the current dev-team Deployment within 120s of the forced recreate — the assertions below would read nothing (HALT cond 4)"
+sa="$($K -n "$NSX" get pod "$pod" -o jsonpath='{.spec.serviceAccountName}' 2>/dev/null)"
+img="$($K -n "$NSX" get pod "$pod" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null)"
+tier="$($K -n "$NSX" get pod "$pod" -o jsonpath='{.metadata.labels.kube-agents/tier}' 2>/dev/null)"
 [ "$sa" = "developer-team-agent" ] && pass "pod bound to pre-created SA developer-team-agent" || bad "pod SA is '$sa' (HALT cond 4)"
 case "$img" in *developer-team-agent:*) pass "pod image is developer-team-agent:<tag> ($img)";; *) bad "pod image '$img' not developer-team-agent:<tag> (HALT cond 4)";; esac
 [ "$tier" = "developer-team" ] && pass "pod carries kube-agents/tier=developer-team" || bad "pod tier label is '$tier'"

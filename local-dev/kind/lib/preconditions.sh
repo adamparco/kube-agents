@@ -20,8 +20,94 @@
 #   1 = verified DIFFERENT: it is not. This is the finding; it is never a skip.
 #   3 = could not verify. Defer, and say what was missing.
 #
+# "The build under test" is TWO claims, and P1 makes both: the cluster runs the image this host
+# built (digest), and that image was built from the source as it stands now (freshness). The first
+# without the second passed green over a six-hour-stale operator on 2026-07-25.
+#
 # Usage:  . "$(dirname "$0")/lib/preconditions.sh"
 #         p1_assert_build_under_test "$K" kubeagents-system control-plane=controller-manager
+
+# --- P1, the freshness half ------------------------------------------------------------------------
+# THE HOLE THIS CLOSES, found 2026-07-25 by running P1 for the first time on kind-kube-agents-dev.
+# The digest comparison below answers "is the cluster running MY LOCAL IMAGE of this tag" — and it
+# answered yes about an image built six hours and twenty-five minutes BEFORE the last commit that
+# touched the operator source. That is not a corner case: "ran the gate, forgot to rebuild" is
+# LSN-001's actual recurrence mode, and the check written to mechanize LSN-001 could not fail in it.
+# V-MET-014, on the very check that exists to stop the thing it could not see.
+#
+# Freshness is decided against the newest of (a) the commit time of the last commit touching the
+# image's build inputs and (b) the mtime of any DIRTY file among them. Commit time rather than mtime
+# for tracked files, because a fresh clone or a branch switch rewrites every mtime and would report
+# a perfectly current image as stale — a check that cries wolf is the other way to make one
+# decorative. Dirty files have no commit time, so mtime is the only answer for them, and it is the
+# right one: an uncommitted edit to the controller is exactly the code a local L2 run is about.
+
+# Build inputs per image, keyed by the repository's last path segment. Deliberately small and
+# deliberately NOT defaulted to the repo root: a docs commit would then mark every image stale, and
+# a check that fires on unrelated changes gets ignored on the day it is right. An image with no
+# mapping returns 3 (could not verify) and says so, so a new one announces itself instead of
+# silently losing the freshness half.
+_p1_build_inputs() {
+  # Strip the digest, then the tag — and the tag only from the LAST path segment, because a
+  # registry host may legitimately carry a port (localhost:5000/kube-agents/...).
+  local last="${1%%@*}"
+  last="${last##*/}"
+  case "${last%%:*}" in
+    k8s-operator | kage-router) echo "k8s-operator" ;; # docker build context is k8s-operator/
+    *) return 1 ;;
+  esac
+}
+
+_p1_mtime() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+}
+
+# _p1_newest_source_epoch <path> -> epoch on stdout; empty if git cannot answer.
+_p1_newest_source_epoch() {
+  local path="$1" newest t f
+  newest="$(git log -1 --format=%ct -- "$path" 2>/dev/null)"
+  [ -n "$newest" ] || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    t="$(_p1_mtime "$f")"
+    [ -n "$t" ] && [ "$t" -gt "$newest" ] && newest="$t"
+  done <<EOF
+$(git status --porcelain --untracked-files=all -- "$path" 2>/dev/null | cut -c4-)
+EOF
+  echo "$newest"
+}
+
+# _p1_assert_image_is_current <image> -> 0 fresh, 1 stale, 3 undecidable (all print their reason).
+_p1_assert_image_is_current() {
+  local image="$1" inputs created img_epoch src_epoch
+  if ! inputs="$(_p1_build_inputs "$image")"; then
+    echo "  P1 freshness UNVERIFIED: no build-input mapping for '$image'. The digest matched, so the"
+    echo "    cluster runs your local copy — but nothing here can tell whether that copy predates the"
+    echo "    source. Add the image to _p1_build_inputs in $(basename "${BASH_SOURCE[0]}")."
+    return 3
+  fi
+  created="$(docker image inspect "$image" --format '{{.Created}}' 2>/dev/null)"
+  img_epoch="$(python3 -c 'import sys,re,datetime
+s=re.sub(r"\.\d+","",sys.argv[1])
+print(int(datetime.datetime.fromisoformat(s).timestamp()))' "$created" 2>/dev/null)"
+  src_epoch="$(_p1_newest_source_epoch "$inputs")"
+  if [ -z "$img_epoch" ] || [ -z "$src_epoch" ]; then
+    echo "  P1 freshness UNVERIFIED: could not read the image's creation time or git's newest change"
+    echo "    to $inputs (image='$created' src='$src_epoch'). Not a pass."
+    return 3
+  fi
+  if [ "$img_epoch" -ge "$src_epoch" ]; then
+    return 0
+  fi
+  echo "P1 FAILED: the image is the one the cluster runs, and it is OLDER THAN THE SOURCE."
+  echo "    image built:  $(date -r "$img_epoch" 2>/dev/null || echo "$img_epoch")  ($image)"
+  echo "    $inputs last changed: $(date -r "$src_epoch" 2>/dev/null || echo "$src_epoch")"
+  echo "  The digest matches because you are running your own build; it is a build of code that is"
+  echo "  no longer in the tree. This is LSN-001 in its actual recurrence mode — the gate was run,"
+  echo "  the rebuild was not. Fix, do not skip:"
+  echo "      local-dev/kind/reload-images.sh operator <kube-context>"
+  return 1
+}
 
 # --- P1 ------------------------------------------------------------------------------------------
 # p1_assert_build_under_test <kubectl-cmd> <namespace> <label-selector> [container-index]
@@ -35,12 +121,25 @@
 # falls back to RepoDigests, and to state 3 if the host has never seen the image at all.
 p1_assert_build_under_test() {
   local K="$1" ns="$2" sel="$3" idx="${4:-0}"
-  local running spec_image local_id
+  local running spec_image local_id pod
 
-  running="$($K -n "$ns" get pods -l "$sel" \
-    -o jsonpath="{.items[0].status.containerStatuses[$idx].imageID}" 2>/dev/null)"
-  spec_image="$($K -n "$ns" get pods -l "$sel" \
-    -o jsonpath="{.items[0].spec.containers[$idx].image}" 2>/dev/null)"
+  # The NEWEST Running pod, not `.items[0]`. Measured 2026-07-25: immediately after a `rollout
+  # status` reported success, items[0] was the previous revision's pod, still Terminating and still
+  # listed — so P1 read the image of the build that was being replaced and called the restore a
+  # failure. It fails safe in that direction and unsafe in the other one (a lingering pod that
+  # happens to be current), and either way an arbitrary pick is not evidence about a named artifact.
+  pod="$($K -n "$ns" get pods -l "$sel" --field-selector=status.phase=Running \
+    --sort-by=.status.startTime -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)"
+  if [ -z "$pod" ]; then
+    echo "P1 UNVERIFIABLE: no RUNNING pod matched -l $sel in $ns."
+    echo "  Not a pass. A digest that cannot be read is not a digest that matches."
+    return 3
+  fi
+
+  running="$($K -n "$ns" get pod "$pod" \
+    -o jsonpath="{.status.containerStatuses[$idx].imageID}" 2>/dev/null)"
+  spec_image="$($K -n "$ns" get pod "$pod" \
+    -o jsonpath="{.spec.containers[$idx].image}" 2>/dev/null)"
 
   if [ -z "$running" ]; then
     echo "P1 UNVERIFIABLE: no running pod matched -l $sel in $ns, or it reports no imageID."
@@ -73,7 +172,14 @@ p1_assert_build_under_test() {
   fi
 
   if [ "$running_digest" = "$local_id" ]; then
-    echo "P1 ok: running ${running_digest:0:12} == local build of $spec_image"
+    # The digest half is satisfied. It is only half: see _p1_assert_image_is_current above.
+    _p1_assert_image_is_current "$spec_image"
+    local fresh=$?
+    [ "$fresh" -eq 1 ] && return 1
+    echo "P1 ok: running ${running_digest:0:12} == local build of $spec_image$(
+      [ "$fresh" -eq 0 ] && echo ", built from the current source"
+    )"
+    [ "$fresh" -eq 3 ] && return 3
     return 0
   fi
 
@@ -84,7 +190,11 @@ p1_assert_build_under_test() {
   repo_digests="$(docker image inspect "$spec_image" --format '{{join .RepoDigests " "}}' 2>/dev/null)"
   case " $repo_digests " in
     *"@sha256:$running_digest"*)
+      _p1_assert_image_is_current "$spec_image"
+      local fresh=$?
+      [ "$fresh" -eq 1 ] && return 1
       echo "P1 ok: running ${running_digest:0:12} matches a RepoDigest of $spec_image"
+      [ "$fresh" -eq 3 ] && return 3
       return 0
       ;;
   esac
@@ -108,21 +218,99 @@ p1_assert_build_under_test() {
 # `enforce: restricted`, the bundled pods had no securityContext, and everything stayed Ready. The
 # gap appeared only when a clean cluster refused to schedule them.
 #
-# This deletes and waits for the object to be gone, so the caller's next apply goes through
-# admission for real. It deliberately does NOT recreate: the caller owns what the replacement looks
-# like, and a helper that guesses would hide the shape being tested.
+# This deletes and waits until the object the caller is about to inspect is a DIFFERENT object, so
+# the next read is about a fresh admission. It deliberately does not recreate anything itself: the
+# caller owns what the replacement looks like, and a helper that guesses would hide the shape under
+# test.
+#
+# WHY THE TEST IS "NEW UID" AND NOT "GONE", measured on kind-kube-agents-dev 2026-07-25. The first
+# version asserted the resource had disappeared. For `deploy/developer-team-team-x-gateway` that is
+# never true for longer than a few milliseconds: the Agent CR still exists, so the controller
+# reconciles the Deployment straight back. The helper spent its full 90-second budget watching the
+# name it had just deleted keep existing, then reported a P3 FAILURE about a recreate that had in
+# fact happened perfectly — the very next assertion in verify-phase3.sh read the freshly rendered
+# pod and passed. A controller-owned object is exactly the kind this precondition is for, so "gone"
+# was the wrong question. What LSN-002 actually requires is that the object being judged went
+# through admission under the rules in force NOW, and a changed metadata.uid is precisely that,
+# whether the replacement came from the caller's next apply or from the controller's reconcile.
 p3_force_recreate() {
   local K="$1" ns="$2" res="$3" timeout="${4:-60}"
-  if ! $K -n "$ns" get "$res" >/dev/null 2>&1; then
+  local old_uid new_uid i
+  old_uid="$($K -n "$ns" get "$res" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
+  if [ -z "$old_uid" ]; then
     echo "P3 ok: $res does not exist in $ns; the next apply is a genuine admission."
     return 0
   fi
-  $K -n "$ns" delete "$res" --wait=true --timeout="${timeout}s" >/dev/null 2>&1
-  if $K -n "$ns" get "$res" >/dev/null 2>&1; then
-    echo "P3 FAILED: $res still exists in $ns after a $timeout s delete."
-    echo "  Asserting an admission property against it would be testing the past (LSN-002)."
-    return 1
-  fi
-  echo "P3 ok: $res deleted; the next apply passes through admission under the current rules."
-  return 0
+
+  # --wait=false, then poll for the identity change ourselves. `--wait=true` blocks on the NAME
+  # disappearing, which a controller-owned resource may never do, and burning the timeout before
+  # asking the real question is how the first version got the wrong answer.
+  $K -n "$ns" delete "$res" --wait=false >/dev/null 2>&1
+  for i in $(seq 1 "$timeout"); do
+    new_uid="$($K -n "$ns" get "$res" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
+    if [ -z "$new_uid" ]; then
+      echo "P3 ok: $res deleted after ${i}s; the next apply passes through admission under the"
+      echo "  current rules."
+      return 0
+    fi
+    if [ "$new_uid" != "$old_uid" ]; then
+      echo "P3 ok: $res was replaced after ${i}s (uid ${old_uid:0:8} -> ${new_uid:0:8}); its owner"
+      echo "  recreated it, so what follows is a fresh admission and not the object that was there."
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "P3 FAILED: $res in $ns is still the SAME object after ${timeout}s (uid ${old_uid:0:8})."
+  echo "  The delete did not take effect, so asserting an admission property against it would be"
+  echo "  testing the rules in force when it was created (LSN-002)."
+  return 1
+}
+
+# -----------------------------------------------------------------------------------------------
+# P3, second half — the pod the CURRENT Deployment owns, by name
+# -----------------------------------------------------------------------------------------------
+#
+# `p3_force_recreate` returns the instant the DEPLOYMENT has a new uid. The old Deployment's pods are
+# garbage-collected after that, asynchronously, so at the moment it returns the pre-recreate pod is
+# still listed and does not yet carry a deletionTimestamp. A caller that then polls for "a pod
+# matching the selector" is handed the OLD one — precisely the object P3 exists to keep it away from
+# — and reads its spec until GC removes it out from under the sequence.
+#
+# Measured on 2026-07-25 in verify-phase3.sh. One run pinned the pod its PREVIOUS run had created,
+# read `.spec.serviceAccountName` successfully, and got empty strings for the image and the tier
+# label one kubectl call later. Two runs in three failed, always with EMPTY reads and never with
+# wrong values (LSN-024's signature). No amount of extra waiting fixes it: the thing being waited for
+# was the wrong object, and a deletionTimestamp filter cannot see a pod that is merely about to be
+# deleted. verify-phase2.sh carried the identical block and was passing on GC timing alone.
+#
+# So resolve by OWNERSHIP, not by time or by label: Deployment uid -> ReplicaSets whose ownerReference
+# is that uid -> a Pod whose ownerReference is one of those ReplicaSets. No clock, no assumption about
+# GC latency, no selector that both generations answer to. Emits one pod NAME on stdout — keep every
+# other message off stdout — so the caller's assertions read a single pinned object instead of
+# re-listing a moving set once per field.
+p3_pod_of_deploy() {
+  local K="$1" ns="$2" deploy="$3" timeout="${4:-120}"
+  local duid rsuids name i
+  for i in $(seq 1 "$timeout"); do
+    duid="$($K -n "$ns" get "deploy/$deploy" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
+    if [ -n "$duid" ]; then
+      rsuids="$($K -n "$ns" get rs \
+        -o go-template='{{range .items}}{{$u := .metadata.uid}}{{range .metadata.ownerReferences}}{{$u}} {{.uid}}{{"\n"}}{{end}}{{end}}' \
+        2>/dev/null | awk -v d="$duid" '$2 == d {print $1}')"
+      if [ -n "$rsuids" ]; then
+        name="$($K -n "$ns" get pods \
+          -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{$n := .metadata.name}}{{range .metadata.ownerReferences}}{{$n}} {{.uid}}{{"\n"}}{{end}}{{end}}{{end}}' \
+          2>/dev/null | awk -v r="$(echo "$rsuids" | tr '\n' ' ')" \
+            'BEGIN { n = split(r, a, " "); for (k = 1; k <= n; k++) if (a[k] != "") s[a[k]] = 1 }
+             ($2 in s) { print $1; exit }')"
+        if [ -n "$name" ]; then
+          echo "$name"
+          return 0
+        fi
+      fi
+    fi
+    sleep 1
+  done
+  return 1
 }

@@ -20,6 +20,31 @@
 #
 # DESTRUCTIVE-TEST GUARD: only runs against a Kind context.
 # Usage: local-dev/kind/verify-phase2.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). Written from a reading of THIS script. verify-phase7.sh
+# reaches it transitively and deliberately declined to declare one on its behalf, because a
+# precondition written by a caller is a guess wearing the costume of a fact.
+#   P1 image-under-test:  kubeagents-system/control-plane=controller-manager — V-K1 asks whether the
+#      webhook rejects a duplicate (tier,scope) and a tier PATCH, and V-K9 asks what the operator
+#      rendered into the agent pod. Both answers are produced BY the operator image, so a stale
+#      operator turns them into statements about code that is not in the tree (LSN-001, three
+#      recurrences). Asserted via p1_assert_build_under_test. V-K3 (SAR) and V-K10 (a static grep of
+#      the shipped role.yaml) do not depend on it and stay meaningful either way.
+#   P3 admission-recreate: deploy/cluster-admin-cluster-a-gateway in kubeagents-system — V-K9 reads a
+#      pod's serviceAccountName, image and tier label, and `apply` on an Agent CR that already exists
+#      changes nothing, so the pod under inspection could predate this build entirely. Until 2026-07-25
+#      this section was `apply` then `sleep 6` then read, which is LSN-002 exactly: it described the
+#      past whenever the CR was already there, which is every re-run. p3_force_recreate now deletes the
+#      Deployment and the controller re-renders it. V-K1's duplicate and its tier PATCH are fresh
+#      admissions by construction; V-K8's tamper is a server-side dry run, which admits in full and
+#      persists nothing, so nothing there can be grandfathered.
+#   P6 runtime-authoritative: the live API server — the pod spec read back after reconcile, the VAP
+#      failurePolicy read from the cluster, and the admission verdicts themselves. No config claim is
+#      made here, so the file the operator shadows with a rendered ConfigMap at runtime (LSN-003) is
+#      never read. The one file this script does judge, k8s-operator/config/rbac/role.yaml in V-K10, is
+#      deliberately the SOURCE artifact: the claim is about what the shipped chart grants to every
+#      installation, not about what one cluster happens to have applied.
 set -uo pipefail  # -e omitted: kubectl exit codes are inspected manually.
 
 CTX="${1:-kind-kube-agents-dev}"
@@ -39,6 +64,9 @@ fail=0
 pass() { echo "PASS: $1"; }
 bad()  { echo "FAIL: $1"; fail=1; }
 cd "$REPO_ROOT"
+# P1 and P3 are executed here, not described. Both were prose in binding.md for four phases and both
+# recurred anyway; the declaration block above is only honest because these two calls exist.
+. "$REPO_ROOT/local-dev/kind/lib/preconditions.sh"
 
 echo "===================================================================="
 echo " Phase 2 Kind verification — context: $CTX"
@@ -54,15 +82,42 @@ fp="$($K get validatingadmissionpolicy kube-agents-agent-readonly -o jsonpath='{
 minor="$($K version -o json 2>/dev/null | grep -m1 '"minor"' | grep -oE '[0-9]+' | head -1)"
 [ -n "$minor" ] && [ "$minor" -ge 30 ] && pass "K8s >= 1.30 (minor=$minor, VAP GA)" || bad "K8s minor=$minor < 30 (VAP not GA — HALT cond 3)"
 
+# P1 — is the operator serving this webhook and rendering this pod the build under test? Everything
+# V-K1 and V-K9 claim below is produced by that image. This runs first so the answer arrives as a
+# failure rather than as a footnote under a green run (LSN-001).
+p1_assert_build_under_test "$K" "$NS" control-plane=controller-manager
+case "$?" in
+  0) pass "P1: the running operator is the build under test" ;;
+  3) echo "  DEFERRED (not faked): P1 unverifiable — reason printed above; V-K1/V-K9 below are about an unknown build." ;;
+  *) bad "P1: the cluster is NOT running the build under test (LSN-001 — V-K1/V-K9 describe other code)" ;;
+esac
+
 # --- V-K9 (out-of-order half): Agent CR before CRD would fail (proved on fresh cluster). --------
 # Here the CRD exists, so instead prove identity-before-pod: apply identity + CR in order.
 echo; echo "== V-K9: in-order identity -> Agent CR; pod binds pre-created SA =="
 $K apply -f "$IDENTITY" >/dev/null 2>&1 && pass "identity applied (VAP-clean read-only ClusterRole admitted)" || bad "identity apply failed"
 $K apply -f "$AGENT" >/dev/null 2>&1 && pass "Agent CR admitted by webhook" || bad "Agent CR rejected (unexpected)"
-sleep 6
-sa="$($K -n $NS get pod -l app=cluster-admin-cluster-a-gateway -o jsonpath='{.items[0].spec.serviceAccountName}' 2>/dev/null)"
-img="$($K -n $NS get pod -l app=cluster-admin-cluster-a-gateway -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null)"
-tier="$($K -n $NS get pod -l app=cluster-admin-cluster-a-gateway -o jsonpath='{.items[0].metadata.labels.kube-agents/tier}' 2>/dev/null)"
+# P3 — applying an Agent CR that already exists changes nothing, so the three assertions below used to
+# read whatever pod the previous build left behind (`sleep 6` cannot tell a fresh pod from an old one).
+# Delete the Deployment and let the controller re-render it: that is what makes them assertions about
+# the renderer in this tree rather than about the past (LSN-002).
+p3_force_recreate "$K" "$NS" deploy/cluster-admin-cluster-a-gateway 90 \
+  || bad "P3: could not force-recreate the agent Deployment — V-K9 below would be about the past (LSN-002)"
+# Resolve the pod by OWNERSHIP and pin it by name — see `p3_pod_of_deploy`. This block was the twin
+# of the one in verify-phase3.sh, which failed 2 runs in 3 on 2026-07-25: a selector poll matches the
+# pod of the generation P3 just deleted (orphaned, not yet GC'd, so no deletionTimestamp to filter
+# on), and three separate `.items[0]` reads re-list a set that is changing between them. This copy
+# was not passing because it was correct, it was passing because GC happened to be quick enough here
+# — the defect and the luck are both invisible from inside the run (LSN-024).
+pod="$(p3_pod_of_deploy "$K" "$NS" cluster-admin-cluster-a-gateway 120)"
+# The pod stays Pending on a single-node dev Kind (the controller bakes prod-correct ~2Gi+ requests
+# across a 4-container pod), so existence — not Ready — is the right bar for reading its spec.
+[ -n "$pod" ] \
+  && pass "controller re-rendered the agent pod after the forced recreate (fresh admission, current renderer): $pod" \
+  || bad "no pod owned by the current agent Deployment within 120s of the forced recreate — the three assertions below would read nothing (HALT cond 4)"
+sa="$($K -n $NS get pod "$pod" -o jsonpath='{.spec.serviceAccountName}' 2>/dev/null)"
+img="$($K -n $NS get pod "$pod" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null)"
+tier="$($K -n $NS get pod "$pod" -o jsonpath='{.metadata.labels.kube-agents/tier}' 2>/dev/null)"
 [ "$sa" = "cluster-admin-agent" ] && pass "pod bound to pre-created SA cluster-admin-agent" || bad "pod SA is '$sa' (HALT cond 4)"
 case "$img" in *cluster-admin-agent:*) pass "pod image is cluster-admin-agent:<tag> ($img)";; *) bad "pod image '$img' not cluster-admin-agent:<tag> (HALT cond 4)";; esac
 [ "$tier" = "cluster-admin" ] && pass "pod carries kube-agents/tier=cluster-admin" || bad "pod tier label is '$tier'"
