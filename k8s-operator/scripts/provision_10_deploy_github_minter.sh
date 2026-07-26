@@ -37,6 +37,12 @@ init_var "KMS_KEY" "github-token-minter-key" "Enter Cloud KMS Key Name"
 
 export GOOGLE_CLOUD_QUOTA_PROJECT="${PROJECT_ID}"
 
+# The cluster the `make` targets below write to, named rather than inherited (LSN-018: a context
+# override the Makefile did not read was accepted and ignored, and the CRD went to whatever
+# `kubectl config current-context` was). Both `connect_cluster` and CI's get-gke-credentials write
+# exactly this context name; set KUBE_CONTEXT to point the run somewhere else.
+KUBE_CONTEXT="${KUBE_CONTEXT:-gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}}"
+
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
 # Step 1: Connect kubectl
@@ -198,7 +204,7 @@ execute_github_minter() {
   if [ -d "$GITHUB_INTEGRATION_DIR" ]; then
     # Ensure all variables are exported for envsubst
     export PROJECT_ID REGION CLUSTER_NAME NAMESPACE GITHUB_MINTER_KSA_NAME GITHUB_MINTER_GSA_NAME KMS_KEYRING KMS_KEY KMS_KEY_VERSION GITHUB_ORG GITHUB_REPO KSA_NAME PLATFORM_AGENT_GSA_NAME
-    make -C "${OPERATOR_DIR}" deploy-github || return 1
+    make -C "${OPERATOR_DIR}" deploy-github KUBE_CONTEXT="${KUBE_CONTEXT}" || return 1
   else
     print_error "GitHub integration directory not found at ${GITHUB_INTEGRATION_DIR}"
     return 1

@@ -9,7 +9,7 @@
 # (ADMIT) from wrong-scope cluster-scoped RBAC (DENY) for the namespace tier, not just read vs write.
 #
 # Namespace: team-x (the canonical developer-team namespace). The verify harness ensures team-x exists
-# before applying (see local-dev/tests/negative-attenuation.sh, which creates it). Expect apply to
+# before applying (see dev/tests/negative-attenuation.sh, which creates it). Expect apply to
 # SUCCEED; a failure to admit this legitimate read-only Role is a too-strict-policy regression.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

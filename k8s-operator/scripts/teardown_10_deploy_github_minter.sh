@@ -21,6 +21,12 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 # ─── Configuration State Restoration ──────────────────────────────────────────
 ensure_teardown_state
 
+# The cluster the `make` targets below delete from, named rather than inherited (LSN-018: a context
+# override the Makefile did not read was accepted and ignored, and the CRD went to whatever
+# `kubectl config current-context` was). Both `connect_cluster` and CI's get-gke-credentials write
+# exactly this context name; set KUBE_CONTEXT to point the run somewhere else.
+KUBE_CONTEXT="${KUBE_CONTEXT:-gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}}"
+
 # ─── Confirmation Prompt ──────────────────────────────────────────────────────
 confirm_action "This will permanently delete the GitHub Token Minter and destroy the KMS key versions." \
   "GCP Project:$PROJECT_ID" \
@@ -52,7 +58,7 @@ else
     active_version=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" --filter="state=ENABLED" --format="value(name)" --quiet 2>/dev/null | awk -F'/' '{print $NF}' | sort -n | tail -n 1)
     export KMS_KEY_VERSION="${active_version:-1}"
     
-    make -C "${OPERATOR_DIR}" undeploy-github || true
+    make -C "${OPERATOR_DIR}" undeploy-github KUBE_CONTEXT="${KUBE_CONTEXT}" || true
   else
     # Fallback: raw kubectl deletion if manifests are missing
     kubectl delete deployment/github-token-minter -n "${NAMESPACE}" --ignore-not-found=true || true

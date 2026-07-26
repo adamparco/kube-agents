@@ -46,8 +46,14 @@ init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 # Pinned to the release tag, not :latest — the publish workflows no longer produce a :latest, so
 # this default used to name an image that could not be pulled. Keep in step with KAGE_IMAGE_VERSION
-# in tags.env; V-CMP-002 (local-dev/test_image_provenance.py) fails if it drifts.
+# in tags.env; V-CMP-002 (dev/test_image_provenance.py) fails if it drifts.
 init_var "REPLAY_IMAGE" "ghcr.io/gke-labs/kube-agents/replay-proxy:v0.1.0" "Enter Replay Proxy container image"
+
+# The cluster the `make` targets below write to, named rather than inherited (LSN-018: a context
+# override the Makefile did not read was accepted and ignored, and the CRD went to whatever
+# `kubectl config current-context` was). Both `connect_cluster` and CI's get-gke-credentials write
+# exactly this context name; set KUBE_CONTEXT to point the run somewhere else.
+KUBE_CONTEXT="${KUBE_CONTEXT:-gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}}"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -70,7 +76,7 @@ verify_inference_replay() {
 execute_inference_replay() {
   print_info "Deploying Inference Replay proxy into GKE (image=${REPLAY_IMAGE})..."
   export NAMESPACE REPLAY_IMAGE
-  make -C "${OPERATOR_DIR}" deploy-inference-replay || return 1
+  make -C "${OPERATOR_DIR}" deploy-inference-replay KUBE_CONTEXT="${KUBE_CONTEXT}" || return 1
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────

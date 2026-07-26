@@ -11,6 +11,22 @@ spec:
   # Single replica: the inbound puller relies on Pub/Sub at-least-once delivery, not leader election, so
   # the router needs no lease RBAC. Scaling out would require leader election to keep one active puller.
   replicas: 1
+  # Recreate, because "one active puller" is a claim about ROLLOUTS too, not only about steady state.
+  # The default RollingUpdate resolves maxSurge 25% of 1 UP to 1, so every rollout briefly runs the old
+  # and new routers together — two pullers on one at-least-once subscription, with nothing to arbitrate
+  # them, which is the precise thing the comment above says this design has no mechanism for. Recreate
+  # is already the answer to this shape in litellm and github-token-minter.
+  #
+  # It also retires a decoy on the inner-loop cluster. maxUnavailable 25% of 1 resolves DOWN to 0, so the
+  # old ReplicaSet may not scale down until the new pod reports available -- and this pod never does (see
+  # the env comment below). Both ReplicaSets then sit at DESIRED 1 forever, so the console shows two dead
+  # routers, one of them on a stale image, and the next reader has to work out which one is the subject.
+  #
+  # WHAT THIS DOES NOT DO: it does not make the router start. It still exits on the missing project ID,
+  # `rollout status` still times out, and `dev/cluster/reload-images.sh` still returns rc 5. One dead pod
+  # instead of two is the whole of the change -- the disclosed gap stays disclosed.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: kube-agents-operator

@@ -22,6 +22,12 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 # ─── Configuration State Restoration ──────────────────────────────────────────
 ensure_teardown_state
 
+# The cluster the `make` targets below delete from, named rather than inherited (LSN-018: a context
+# override the Makefile did not read was accepted and ignored, and the CRD went to whatever
+# `kubectl config current-context` was). Both `connect_cluster` and CI's get-gke-credentials write
+# exactly this context name; set KUBE_CONTEXT to point the run somewhere else.
+KUBE_CONTEXT="${KUBE_CONTEXT:-gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}}"
+
 # Default value used only for envsubst expansion during delete; its concrete
 # value does not affect which resources are removed.
 export REPLAY_IMAGE="${REPLAY_IMAGE:-placeholder}"
@@ -49,7 +55,7 @@ if [ "${DRY_RUN:-0}" -eq 1 ]; then
   echo -e "  ${C_GREEN}[DRY-RUN] Would undeploy Inference Replay Proxy in namespace '${NAMESPACE}'.${C_RESET}"
 else
   export NAMESPACE REPLAY_IMAGE
-  make -C "${OPERATOR_DIR}" undeploy-inference-replay ignore-not-found=true || true
+  make -C "${OPERATOR_DIR}" undeploy-inference-replay KUBE_CONTEXT="${KUBE_CONTEXT}" ignore-not-found=true || true
   echo -e "  ${C_GREEN}✓ Inference Replay Proxy undeploy command completed.${C_RESET}"
 fi
 

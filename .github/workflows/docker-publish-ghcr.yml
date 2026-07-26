@@ -6,7 +6,7 @@ name: Publish to GHCR
 # There is deliberately no :latest. Every manifest in this repo pins an exact tag and says so
 # ("pinned to an immutable version tag (not :latest)"); a moving tag in a shared registry would
 # make each of those comments false and make a rollback un-addressable. V-CMP-002
-# (local-dev/test_image_provenance.py) fails the build if a publish step reintroduces one, or if
+# (dev/test_image_provenance.py) fails the build if a publish step reintroduces one, or if
 # any manifest pins a tag no workflow here produces.
 on:
   push:
@@ -30,7 +30,7 @@ jobs:
         # comment line outright ("Invalid format"), so `cat` worked only while tags.env was a single
         # bare assignment. It has three consumers with three different grammars -- this one, `include
         # tags.env` in the Makefile, and `. ./tags.env` in shell -- and the file must satisfy all
-        # three. local-dev/test_image_provenance.py asserts exactly that.
+        # three. dev/test_image_provenance.py asserts exactly that.
         run: grep -E '^[A-Z][A-Z0-9_]*=' tags.env >> "$GITHUB_ENV"
 
       - name: Resolve image tag

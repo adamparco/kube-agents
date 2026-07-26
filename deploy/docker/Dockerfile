@@ -116,10 +116,10 @@ COPY --from=watcher-builder /workspace/eventingress /usr/local/bin/eventingress
 RUN chmod 755 /usr/local/bin/eventingress
 
 # Shared OKF frontmatter parser (Phase 4 D4). Baked in the shared base so EVERY tier's read-knowledge
-# skill imports the SAME file local-dev/okf-validate.py uses — no schema drift between "what CI
+# skill imports the SAME file dev/okf-validate.py uses — no schema drift between "what CI
 # validates" and "what an agent reads". The per-tier `COPY agents/<tier>/scripts/` below merges on top
 # of this, so this file survives in all three tier images.
-COPY --chmod=0644 local-dev/okf_frontmatter.py /opt/defaults/scripts/okf_frontmatter.py
+COPY --chmod=0644 dev/okf_frontmatter.py /opt/defaults/scripts/okf_frontmatter.py
 
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642

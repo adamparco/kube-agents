@@ -66,12 +66,14 @@ The exposed ports:
 Deploy these via `make deploy-*` from `k8s-operator/`:
 
 ```bash
-export KUBE_CONTEXT=kind-kube-agents-dev   # required unless your current context is kind-*/gke-scratch-*
+export KUBE_CONTEXT=gke-scratch-kube-agents-dev   # required unless your current context is gke-scratch-*
 make deploy                     # operator
 make deploy-litellm             # inference gateway
 make deploy-github              # Minty
 make deploy-inference-replay    # replay proxy
 ```
+
+Naming the context is always allowed — deploying to a production cluster is a real operation. Leaving `KUBE_CONTEXT` unset is what the guard restricts: the target falls back to your ambient context only when that context is anchored `gke-scratch-*`, so forgetting which cluster you are on cannot put the operator somewhere you did not choose. Anything else is refused, with the command that would name it deliberately.
 
 ## What's coming (not merged)
 

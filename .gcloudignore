@@ -1,3 +1,17 @@
+# What `gcloud builds submit` uploads as the build context.
+#
+# This file is a cost, not a formality: every `make cloud-build-push` uploads this tree seven times,
+# once per image. Excluding the prose corpora takes the upload from ~4 MB to well under one.
+#
+# The two `!` re-includes below are load-bearing. `deploy/docker/Dockerfile` COPYs `docs/glossary.md`
+# (line 92) and `dev/okf_frontmatter.py` (line 122) into the agent images, so a blanket
+# `docs/` or `dev/` exclusion does not make the build smaller -- it makes it fail, at the COPY,
+# with a message about a missing file rather than a missing ignore rule. The `dir/*` + `!dir/file`
+# shape is deliberate: gitignore semantics cannot re-include a file whose parent directory is
+# excluded, so `docs/` followed by `!docs/glossary.md` would silently not work.
+#
+# Verify any change here with:  gcloud meta list-files-for-upload
+
 # Version control
 .git
 .github
@@ -19,8 +33,22 @@ node_modules/
 .venv/
 venv/
 k8s-operator/bin/
+# Gitignored, but .gitignore is not consulted once this file exists -- so without this line the
+# 125 KB coverage profile rides along in all seven uploads.
+k8s-operator/cover.out
 
 # Local configuration files (except tracked default .env)
 .env
 .env.*
 !agents/shared/defaults/.env
+
+# Prose and harness corpora. None of this is in any image; docs/ alone is 2.2 MB and the build
+# ledger under docs/build/ is most of it.
+docs/*
+!docs/glossary.md
+.claude/
+dev/*
+!dev/okf_frontmatter.py
+# The 09 §9.4 evidence record. Grew out of docs/build/LEDGER.md on 2026-07-26 and would otherwise
+# ride along in all seven uploads for the same reason the ledger used to.
+verification/

@@ -305,7 +305,7 @@ shape:
 - **Terraform** (`iac.format: terraform`) —
   `examples/gitops-repo/clusters/cluster-b/provisioning/{cluster.tf,variables.tf}`
 
-The two are asserted **semantically equivalent** by `local-dev/tests/iac-parity.py` (same location,
+The two are asserted **semantically equivalent** by `dev/tests/iac-parity.py` (same location,
 release channel, node machine type/count, VPC-native / Workload-Identity / Shielded / private shape).
 Keep each format in its **own** cluster dir: the actuation pipeline dispatches per directory (`*.tf` →
 `terraform apply`, else `*.y*ml` → `kubectl apply`), so `.tf` and `.yaml` in one provisioning dir would

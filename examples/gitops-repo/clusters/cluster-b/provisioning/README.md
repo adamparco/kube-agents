@@ -26,7 +26,7 @@ cluster dir — `cluster-a` = KCC, `cluster-b` = Terraform — and never collide
 - [`variables.tf`](variables.tf) — `project_id` (required, supplied by CI/CD) and `region` (defaults
   to the KCC twin's location).
 
-`local-dev/tests/iac-parity.py` asserts the HCL is **structurally valid** and **semantically
+`dev/tests/iac-parity.py` asserts the HCL is **structurally valid** and **semantically
 equivalent** to the KCC twin, and that `apply.yml` routes each format correctly.
 
 ## Trust boundary (unchanged)

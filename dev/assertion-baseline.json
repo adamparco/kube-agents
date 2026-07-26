@@ -1,0 +1,268 @@
+{
+  "_comment": "Baseline for the assertion ratchet (V-MET-003, invariants.md 8). Regenerate with `python3 dev/tests/invariants-gate.py --update-baseline` ONLY when adding tests. Removing a name here to make the gate pass is invariant 9 (no weakening to pass) and invariant 10 if the check is load-bearing.",
+  "inventory": {
+    "dev/test_applied_manifests.py": [
+      "test_applied_manifests_carry_no_placeholder_value",
+      "test_the_router_env_is_empty_not_fake",
+      "test_the_scanner_distinguishes_a_value_from_a_comment"
+    ],
+    "dev/test_build_under_test_precondition.py": [
+      "test_a_build_of_a_different_commit_is_a_failure_not_a_deferral",
+      "test_a_clean_build_with_uncommitted_operator_changes_is_stale",
+      "test_a_digest_with_no_commit_carrying_tag_is_undecidable",
+      "test_a_dirty_build_newer_than_the_edit_is_fresh",
+      "test_a_dirty_build_older_than_the_edit_is_stale",
+      "test_abbreviated_shas_compare_as_prefixes_in_both_directions",
+      "test_an_unmapped_image_is_undecidable_and_says_so",
+      "test_dirt_outside_the_build_inputs_does_not_make_the_image_stale",
+      "test_repo_path_strips_tag_and_digest_but_keeps_a_registry_port",
+      "test_tag_naming_head_on_a_clean_tree_is_fresh",
+      "test_the_makefile_src_prefix_counts_as_provenance_too",
+      "test_the_right_tag_among_several_is_the_one_that_decides"
+    ],
+    "dev/test_capacity_preflight.py": [
+      "test_api_list_unreadable",
+      "test_every_probe_unreadable_at_once",
+      "test_gcloud_absent_refuses_rather_than_dying_at_127",
+      "test_missing_api_refuses_and_names_the_enable_command",
+      "test_no_bare_command_substitution_assignment",
+      "test_no_project_refuses_with_remediation",
+      "test_quota_exhausted_refuses_and_does_not_offer_the_live_cluster",
+      "test_quota_probe_rejects_its_arguments",
+      "test_registry_unreachable_refuses"
+    ],
+    "dev/test_dataplane_precondition.py": [
+      "test_only_known_enforcing_dataplanes_are_accepted",
+      "test_p4_never_returns_one",
+      "test_rejection_says_what_it_found"
+    ],
+    "dev/test_detect_drift.py": [
+      "test_detects_real_field_change",
+      "test_emit_corrective_artifact_without_push",
+      "test_no_false_positive_on_server_defaults"
+    ],
+    "dev/test_heartbeat_sops.py": [
+      "test_both_cron_files_still_valid_json",
+      "test_both_sops_exist",
+      "test_cluster_admin_cron_wires_heartbeat",
+      "test_cluster_admin_is_cluster_scoped",
+      "test_common_backstop_properties",
+      "test_developer_team_cron_wires_heartbeat",
+      "test_developer_team_is_namespace_scoped"
+    ],
+    "dev/test_image_provenance.py": [
+      "test_every_ghcr_publish_step_uses_the_release_tag_scheme",
+      "test_every_published_image_is_built_on_pull_requests",
+      "test_every_published_image_is_signed",
+      "test_every_referenced_image_has_a_publish_step",
+      "test_every_referenced_tag_is_a_tag_ci_produces",
+      "test_no_publish_step_pushes_a_mutable_release_tag",
+      "test_tags_env_parses_under_all_three_of_its_grammars",
+      "test_the_gar_mirror_publishes_the_same_images_as_ghcr",
+      "test_the_go_defaults_pin_the_release_tag",
+      "test_the_join_is_not_vacuous"
+    ],
+    "dev/test_mcp_bridge.py": [
+      "test_bridge_contains_no_interactive_flow",
+      "test_malformed_stdin_does_not_kill_the_session",
+      "test_metadata_token_is_presented_as_a_bearer",
+      "test_no_config_or_renderer_references_mcp_remote",
+      "test_no_endpoint_argument_is_a_usage_error",
+      "test_no_metadata_server_exits_nonzero_within_seconds",
+      "test_notification_gets_no_reply",
+      "test_remote_error_becomes_a_jsonrpc_error",
+      "test_rendered_goldens_use_the_bridge",
+      "test_request_is_relayed_and_answered",
+      "test_session_id_is_echoed_on_later_requests",
+      "test_slow_remote_times_out_rather_than_blocking",
+      "test_sse_response_is_unwrapped",
+      "test_the_scanner_still_catches_a_real_rewiring",
+      "test_unreachable_remote_becomes_a_jsonrpc_error"
+    ],
+    "dev/test_mutate.py": [
+      "test_missing_file_is_exit_2_and_command_never_runs",
+      "test_no_command_is_usage",
+      "test_one_missing_among_several_refuses_all",
+      "test_preserves_mode",
+      "test_propagates_exit_code",
+      "test_restores_after_failing_command",
+      "test_restores_after_successful_command",
+      "test_restores_every_file",
+      "test_restores_on_signal_and_the_command_cannot_write_afterwards",
+      "test_restores_unstaged_working_tree_content"
+    ],
+    "dev/test_raise_escalation.py": [
+      "test_dry_run_writes_valid_entry_and_artifact_without_push",
+      "test_helper_and_skill_identical_across_lower_tiers",
+      "test_refuses_platform_tier",
+      "test_round_trip_parent_reads_via_read_knowledge"
+    ],
+    "dev/test_read_knowledge.py": [
+      "test_git_wrapper_refuses_non_readonly_subcommand",
+      "test_no_match_returns_4",
+      "test_okf_validate_uses_shared_parser",
+      "test_read_knowledge_uses_shared_parser",
+      "test_refuses_push_intent",
+      "test_run_lists_runbook_by_type",
+      "test_run_reads_entry_by_link",
+      "test_sparse_checkout_materializes_only_knowledge"
+    ],
+    "dev/test_skill_templates.py": [
+      "test_asset_tokens_and_renderer_tokens_are_the_same_set",
+      "test_default_bundle_matches_the_install_path",
+      "test_no_corrupted_placeholder",
+      "test_no_placeholder_cidr_in_a_rendered_manifest",
+      "test_rendered_bundle_has_no_unsubstituted_token",
+      "test_the_corruption_detector_fires",
+      "test_the_widened_render_actually_widens",
+      "test_widened_bundle_matches_the_install_path"
+    ],
+    "dev/test_submit_suggestion.py": [
+      "test_all_three_submit_suggestion_identical",
+      "test_dry_run_artifact_autonomous_fallback",
+      "test_dry_run_artifact_carries_trailers_from_env",
+      "test_dry_run_emits_diff_and_artifact_without_push_or_pr",
+      "test_dry_run_refuses_protected_branch",
+      "test_dry_run_refuses_wrong_tier_prefix",
+      "test_dry_run_requires_existing_local_branch",
+      "test_dry_run_via_main_exits_zero_and_prints_diff",
+      "test_resolution_precedence",
+      "test_trailer_shape_and_idempotence",
+      "test_trailer_value_is_single_line"
+    ],
+    "dev/verify/egress-enforcement-l2.sh": [
+      "169.254.169.252/32",
+      "169.254.169.254/32"
+    ],
+    "k8s-operator/internal/agentindex/identity_test.go": [
+      "TestEffectiveTier_DefaultsToPlatform",
+      "TestIdentity_MatchesScopeIdentity",
+      "TestScopeIdentity_DifferentClustersDoNotCollide",
+      "TestScopeIdentity_PerTierKey"
+    ],
+    "k8s-operator/internal/controller/agent_controller_test.go": [
+      "TestAgentReconciler_Reconcile",
+      "TestAgentReconciler_Reconcile_ExistingRuntimeClass",
+      "TestAgentReconciler_Reconcile_MissingRuntimeClass",
+      "TestAgentReconciler_Reconcile_PodUnschedulable"
+    ],
+    "k8s-operator/internal/controller/agent_manifests_test.go": [
+      "TestBuildConfigMap",
+      "TestBuildConfigMapSlackEnabled",
+      "TestBuildConfigMap_MemoryConfig",
+      "TestBuildDeployment",
+      "TestBuildDeploymentAllowedUsersDropsBlankEntries",
+      "TestBuildDeploymentGoogleChatAllowedUsersDegenerate",
+      "TestBuildDeploymentSlackDegenerateAllowlistFailsClosed",
+      "TestBuildDeploymentSlackIntegration",
+      "TestBuildDeployment_DashboardDisabled",
+      "TestBuildDeployment_DashboardEnabled",
+      "TestBuildFluentBitConfigMap",
+      "TestBuildPVC",
+      "TestBuildPlatformService",
+      "TestBuildSettingsConfigMap",
+      "TestBuildSettingsConfigMapEmptyGitRepo",
+      "TestBuildSettingsConfigMapNilGitHub",
+      "TestBuildSettingsConfigMapNilIntegration",
+      "TestBuildSystemPVC",
+      "TestDisplayMode",
+      "TestGetConfigMapHash",
+      "TestWatcherArgsPerTierScoping"
+    ],
+    "k8s-operator/internal/controller/manifest_helpers_test.go": [
+      "TestBuildDeploymentTierAwareImage",
+      "TestDefaultImageForTier",
+      "TestMergeAnnotations",
+      "TestMergeEnvVars",
+      "TestResolveAgentImage",
+      "TestResolveDeploymentReplicasAndStrategy"
+    ],
+    "k8s-operator/internal/controller/pod_launcher_test.go": [
+      "TestLaunchSpecFor",
+      "TestScionLauncherParityWithNative",
+      "TestSelectPodLauncher_DefaultsToNative",
+      "TestSelectPodLauncher_FallsBackWhenScionUnavailable"
+    ],
+    "k8s-operator/internal/controller/telemetry_test.go": [
+      "TestBuildDeploymentAllowsOTelEnvOverrides",
+      "TestBuildDeploymentHasOTelEnv",
+      "TestBuildDeploymentOTelReflectsTier",
+      "TestOTelTelemetryEnvVars"
+    ],
+    "k8s-operator/internal/eventingress/normalize_test.go": [
+      "TestNormalizeAlertCloudMonitoring",
+      "TestNormalizeAlertThinPayloadDegrades",
+      "TestNormalizeGitHubIssue",
+      "TestNormalizeGitHubPullRequestFallback",
+      "TestParseSyntheticEventRejectsBadKind",
+      "TestParseSyntheticEventRoundTrip",
+      "TestValidateKnownKinds"
+    ],
+    "k8s-operator/internal/eventingress/pubsubsource/source_test.go": [
+      "TestNew_Validates",
+      "TestSource_DrainsAlertsToRelay"
+    ],
+    "k8s-operator/internal/eventingress/relay_test.go": [
+      "TestNewRelayValidatesConfig",
+      "TestRelayDeliverSendsAuthAndEnvelope",
+      "TestRelayInjectPropagatesSeamError",
+      "TestRelayInjectRejectsUnknownKind"
+    ],
+    "k8s-operator/internal/router/affinity_test.go": [
+      "TestGateway_ThreadAffinity",
+      "TestMemAffinityStore"
+    ],
+    "k8s-operator/internal/router/audit_test.go": [
+      "TestGateway_AuditAttributionSurface"
+    ],
+    "k8s-operator/internal/router/chatevent_test.go": [
+      "TestIsDeterministicRefusal",
+      "TestParseChatEvent"
+    ],
+    "k8s-operator/internal/router/gateway_test.go": [
+      "TestGateway_ClosedAllowlistFailsClosed",
+      "TestGateway_DeterministicRefusalsNeverDispatch",
+      "TestGateway_DeveloperTeamRouting",
+      "TestGateway_HandleAuthorizesBeforeDispatch",
+      "TestGateway_InferenceCandidateValidity",
+      "TestGateway_NoSuchTarget",
+      "TestIndex_LookupHandle",
+      "TestIndex_UpsertLookupRemove",
+      "TestInferredHandleStaleMenuRefusedBySpine"
+    ],
+    "k8s-operator/internal/router/integration_test.go": [
+      "TestGateway_PubSubDispatch_Emulator"
+    ],
+    "k8s-operator/internal/router/pubsubinbound/receiver_test.go": [
+      "TestReceiver_RoutesInboundEvents"
+    ],
+    "k8s-operator/internal/router/reconciler_envtest_test.go": [
+      "TestReconciler_SyncsIndexFromAPIServer"
+    ],
+    "k8s-operator/internal/router/resolve_test.go": [
+      "TestAuthorize_EmptyAllowlistRefusesEveryone",
+      "TestAuthorize_FailClosed",
+      "TestHandleForAgent_And_Canonical",
+      "TestHandle_RouteKey",
+      "TestInfer_RouteClarifyAndAccounting",
+      "TestInfer_ThresholdFlipByConfigOnly",
+      "TestResolve_DeterministicRefusals",
+      "TestResolve_InferenceBoundary",
+      "TestResolve_SlashAndHandleModes"
+    ],
+    "k8s-operator/internal/testing/cluster_admin_render_test.go": [
+      "TestClusterAdminRender_LoadBearing"
+    ],
+    "k8s-operator/internal/testing/golden_test.go": [
+      "TestAgentsGolden"
+    ],
+    "k8s-operator/internal/webhook/agent_webhook_test.go": [
+      "TestAgentCardinality",
+      "TestAgentClosedAllowlist",
+      "TestAgentScopeAndParent",
+      "TestAgentTierImmutable",
+      "TestAgentValidation"
+    ]
+  },
+  "retired": {}
+}

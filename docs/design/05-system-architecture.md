@@ -1316,7 +1316,7 @@ These are **defaults for a builder**, not commitments; revisit under load testin
 > section states what to check and why; 09 states how it is run, gated, and proved complete.
 
 The failure-isolation / chaos suite. Scenarios are labelled **CH1–CH9**; **CH1–CH4 are the
-scenarios `local-dev/kind/verify-phase6.sh` labels `C1`–`C4`** (renamed here so scenario labels do
+scenarios `dev/verify/verify-phase6.sh` labels `C1`–`C4`** (renamed here so scenario labels do
 not collide with the component IDs of §1). CH5–CH9 are created by the imperative model. Each is a
 runnable check; a build is not done until all are green ([README](README.md) building note 8).
 

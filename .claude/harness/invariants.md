@@ -12,13 +12,13 @@ Detailed in `docs/design/03-security-model.md`.
 
 Answer each as PASS / FAIL / N-A with one line of evidence (a file, a test name, a command output).
 
-> **Six of these now fail a build instead of asking you.** `local-dev/tests/invariants-gate.py`
+> **Six of these now fail a build instead of asking you.** `dev/tests/invariants-gate.py`
 > (P8-T6) runs in the L0 chain on every PR and mechanizes **7**, **8**, **12** and **13**, plus the
 > destructive-test guard below and the build targets' `--context` discipline. The rest are
 > judgements about intent that a script cannot make and stay answered per PR — mechanizing four of
 > thirteen is not "the gate is done", it is four fewer places where being tired is the same as
 > being dishonest. Each mechanized item is marked **[gated]** below with the function that enforces
-> it. Before recording any lint result as evidence, run `local-dev/toolchain-preflight.sh`
+> it. Before recording any lint result as evidence, run `dev/toolchain-preflight.sh`
 > (LSN-020): a green from a tool is evidence only for the rules that tool actually ran.
 
 1. **Agents act.** The change does not make an agent file a proposal, open a ticket, or ask a human
@@ -71,7 +71,7 @@ Answer each as PASS / FAIL / N-A with one line of evidence (a file, a test name,
    asserting read-only-ness is removed only in the same commit that adds its imperative counterpart.
    - Check: the PR names the pair. A change that reduces the total number of security assertions is
      wrong.
-   - The ratchet counts assertions against `local-dev/assertion-baseline.json`. Lowering it needs
+   - The ratchet counts assertions against `dev/assertion-baseline.json`. Lowering it needs
      `--update-baseline` and a diff a reviewer sees, which is the point: the count may fall, but not
      quietly. Paired with `check_retirements_name_replacements` (V-MET-004) so a retired check ID
      keeps a pointer to what replaced it instead of evaporating.
@@ -124,26 +124,35 @@ Each maps to a named hack in `SELF-IMPROVEMENT.md` §4.
   `docker build` the relevant Dockerfile target if the image changed.
 - Use `.github/PULL_REQUEST_TEMPLATE.md`; do **not** use `gh pr create --fill`.
 - Push PR branches to a fork, not upstream. Stage only targeted files.
-- **Rebuild → load/push → restart before trusting any live gate.** A stale same-tag image with
+- **Deploy by digest before trusting any live gate.** A stale same-tag image with
   `imagePullPolicy: IfNotPresent` silently under-enforces admission and reads as green.
+  `dev/cluster/reload-images.sh` builds on Cloud Build, reads the digest back out of Artifact
+  Registry, and sets `…@sha256:…` on the Deployment — which makes that trap unrepresentable rather
+  than merely detected, and means no `rollout restart` is needed: a changed digest IS a rollout.
 - **Every cluster-addressing `make` target names its cluster.**
   [gated: `check_make_targets_are_context_explicit`, LSN-018] Recipes go through `$(KUBECTL)`, never
   a bare `kubectl`; the context comes from `KUBE_CONTEXT=`, and `KUBECTL=` is rejected outright
   because it was once accepted and silently ignored. With `KUBE_CONTEXT` unset, `ctx-guard` accepts
-  the ambient context only if it is anchored `kind-*` / `gke-scratch-*` and refuses otherwise with
-  the command that would name it. Deliberately deploying to a live cluster is a real operation;
+  the ambient context only if it is anchored `gke-scratch-*` and refuses otherwise with the command
+  that would name it. Deliberately deploying to a live cluster is a real operation;
   forgetting which cluster you are on is not.
 
 ## Destructive-test guard
 
 Before any test that deletes/kills resources, applies deliberately-bad RBAC, or exercises a
-destructive **action** through the broker, confirm the target context is **Kind** or an **ephemeral
-scratch GKE** cluster. If it is anything else (esp. a prod context), **halt and surface** — do not
-run.
+destructive **action** through the broker, confirm the target context is a **scratch cluster** —
+`gke-scratch-*`, recreatable from `dev/cluster/up.sh` and holding no data anyone will miss. If it is
+anything else (esp. a prod context), **halt and surface** — do not run.
 
 [gated: `check_destructive_guards_are_anchored`, LSN-005] The guard is a shell `case` on the caller's
-`$CTX` whose accepting arms are **anchored** — `kind-*`, `gke-scratch-*` — and whose `*)` arm exits
-non-zero. A substring test (`*kind*`) is the LSN-005 failure and passes for a cluster merely named
-`my-kind-of-prod`; the gate rejects any arm that does not start at the left edge, and any default arm
-that does not exit. The live GKE cluster `platform-agent-host` is one `*` away from every one of
-these scripts.
+`$CTX` whose accepting arms are **anchored** — `gke-scratch-*` — and whose `*)` arm exits non-zero. A
+substring test (`*scratch*`) is the LSN-005 failure and passes for a cluster merely named
+`prod-scratchpad`; the gate rejects any arm that does not start at the left edge, and any default arm
+that does not exit. The list of accepted anchors was `kind-*`, `gke-scratch-*` until 2026-07-26;
+dropping one is a strengthening, and adding one back is the direction that needs review.
+
+Two scripts cannot use this guard and are not exceptions to it. `dev/cluster/down.sh` and
+`dev/cluster/scale.sh` address the cluster by **name through the GCP API** and never touch a kube
+context at all, so they compare `$CLUSTER` to the one name they are for with `=`, not a glob. Same
+rule, different identifier: `platform-agent-host` lives in the same project and is one variable
+away from `clusters delete` and from `resize --num-nodes 0`.

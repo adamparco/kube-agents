@@ -90,7 +90,7 @@ Prefer to supply real values you already know (project, cluster, namespace, loca
 Chat ID). The script prints exactly which files it wrote — stage **only** those.
 
 The four isolation manifests it emits (`10`/`20`/`30`/`40`) are the **same bytes** the installer applies
-from `k8s-operator/scripts/*.template`; `local-dev/test_skill_templates.py` fails if they ever differ.
+from `k8s-operator/scripts/*.template`; `dev/test_skill_templates.py` fails if they ever differ.
 Do not hand-edit the assets — edit the installer template and regenerate.
 
 ### Step 2: Verify before proposing

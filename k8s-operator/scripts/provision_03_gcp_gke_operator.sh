@@ -32,6 +32,12 @@ init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 
+# The cluster the `make` targets below write to, named rather than inherited (LSN-018: a context
+# override the Makefile did not read was accepted and ignored, and the CRD went to whatever
+# `kubectl config current-context` was). Both `connect_cluster` and CI's get-gke-credentials write
+# exactly this context name; set KUBE_CONTEXT to point the run somewhere else.
+KUBE_CONTEXT="${KUBE_CONTEXT:-gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}}"
+
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
 # Step 1: Connect kubectl
@@ -86,7 +92,7 @@ verify_operator() {
 }
 execute_operator() {
   print_info "Installing Custom Resource Definitions (CRDs)..."
-  make -C "$OPERATOR_DIR" install || return 1
+  make -C "$OPERATOR_DIR" install KUBE_CONTEXT="$KUBE_CONTEXT" || return 1
 
   # Honour OPERATOR_IMAGE / ROUTER_IMAGE from vars.sh. Without this, `make deploy` falls back to
   # the Makefile defaults (ghcr.io/gke-labs/...:v0.1.0) and silently ships the PUBLISHED images
@@ -104,7 +110,7 @@ execute_operator() {
   fi
 
   print_info "Deploying Operator Controller Manager to the GKE cluster..."
-  make -C "$OPERATOR_DIR" deploy "${deploy_args[@]}" || return 1
+  make -C "$OPERATOR_DIR" deploy KUBE_CONTEXT="$KUBE_CONTEXT" "${deploy_args[@]}" || return 1
   wait_for_k8s_resource "deployment/kubeagents-controller-manager" "${NAMESPACE:-kubeagents-system}" "Available" "180s" || return 1
 }
 

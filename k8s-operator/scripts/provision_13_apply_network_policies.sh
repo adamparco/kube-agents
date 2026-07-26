@@ -82,7 +82,7 @@ case "${ENFORCING}" in
   kindnet)
     print_warning "kindnet detected. It ACCEPTS NetworkPolicy objects and ENFORCES NOTHING."
     print_warning "The policies below will be created and will contain no traffic. Do not read their"
-    print_warning "presence as containment; use local-dev/kind/up-egress.sh (Calico) to prove egress."
+    print_warning "presence as containment; use dev/cluster/up.sh (Calico) to prove egress."
     ;;
   *)
     print_warning "Could not identify the CNI. Whether these policies are enforced is UNVERIFIED."

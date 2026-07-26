@@ -19,7 +19,7 @@
 # KEYLESS: auth is OIDC (CIRCLE_OIDC_TOKEN → Workload Identity Federation); there are NO long-lived
 # JSON service-account keys. `circleci config validate` is the schema check; it is deferred-not-faked
 # here (CLI absent on the build host) — structure + dispatch parity is proven by
-# local-dev/tests/circleci-parity.py instead (same pattern as Calico standing in for kindnet).
+# dev/tests/circleci-parity.py instead (same pattern as Calico standing in for kindnet).
 
 version: 2.1
 

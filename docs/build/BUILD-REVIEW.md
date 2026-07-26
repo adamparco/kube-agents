@@ -14,6 +14,19 @@ _A grounded, reality-checked assessment of what was built, what genuinely works,
 
 Repository root: `/Users/adamparco/github/kube-agents` · Branch reviewed: `docs/design-end-state-specs` · All Phases 0–7 merged to `main`.
 
+> **Substrate note, 2026-07-26 — read this before acting on any command below.** Every live result
+> in this review was produced on a local Kind cluster (`kind-kube-agents-dev`, K8s v1.31.2,
+> kindnet). That was the inner loop on 2026-07-24, and the Kind references throughout this document
+> describe it as it was; they are the record of what was run, not instructions. On **2026-07-26 the
+> inner loop moved to a remote GKE cluster**: `kube-agents-dev` in `us-east4-a`, 2 × `e2-standard-4`,
+> **Dataplane V2** (which enforces NetworkPolicy, where kindnet enforced nothing), **Workload
+> Identity**, context `gke-scratch-kube-agents-dev`. Kind is out of the loop entirely.
+>
+> Only §6 was rewritten for the new substrate, because §6 is the one section addressed to a reader
+> who is about to type something. The findings and ratings above and below it were **not** re-run,
+> so they are left exactly as the audit produced them rather than restated as though they still
+> held. Three §7 caveats are superseded outright by the move and are marked there.
+
 ---
 
 ## 1. Executive summary
@@ -192,18 +205,18 @@ Caveat: the endpoint is provider-neutral but **auth is not** — scripts always 
 
 ### 3.8 Local-dev harness
 
-**Purpose.** The "how to run and test" surface: `local-dev/kind/` per-phase gates + chaos suite; `local-dev/tests/` adversarial cluster tests + hermetic parity validators. **Every cluster-touching script is Kind-guarded** (destructive ops refuse a non-`kind-*`/`gke-scratch-*` context).
+**Purpose.** The "how to run and test" surface: `dev/verify/` per-phase gates + chaos suite; `dev/tests/` adversarial cluster tests + hermetic parity validators. **Every cluster-touching script is context-guarded** (destructive ops refuse a context outside the accepted anchor set — `kind-*`/`gke-scratch-*` when this review ran, narrowed to `gke-scratch-*` alone on 2026-07-26; the accepted set is corrected here rather than left as history, because a reader who takes it at face value concludes a `kind-*` context is still accepted by a security control that no longer accepts one).
 
-| Script                                                                             | Cluster-bound?                                                                 | Rating                      |
-| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | --------------------------- |
-| `up.sh` / `down.sh` / `kind-config.yaml` / `kind-calico.yaml`                      | lifecycle                                                                      | real-runnable / real-static |
-| `verify-phase2.sh`, `verify-phase3.sh`                                             | hard cluster-bound                                                             | real-runnable               |
-| `verify-phase4.sh`, `verify-phase5.sh`                                             | **partially hermetic** (core runs cluster-free; live regression needs cluster) | real-runnable               |
-| `verify-phase6.sh`, `verify-phase7.sh`                                             | hard cluster-bound (unreachable = FAIL)                                        | real-runnable               |
-| `chaos-suite.sh`                                                                   | hard cluster-bound + destructive                                               | real-runnable               |
-| `negative-attenuation.sh`                                                          | cluster-bound (applies VAP + RBAC)                                             | real-runnable               |
-| `egress-enforcement.sh`                                                            | needs **Calico** CNI; on kindnet exits 3 (deferred)                            | real-runnable               |
-| `iac-parity.py`, `circleci-parity.py`, `observability-seam.py`, `otel-endpoint.sh` | **fully host-hermetic**                                                        | real-runnable               |
+| Script                                                                             | Cluster-bound?                                                                 | Rating        |
+| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------- |
+| `up.sh` / `down.sh` / `pause.sh` / `resume.sh` / `reload-images.sh`                | lifecycle                                                                      | real-runnable |
+| `verify-phase2.sh`, `verify-phase3.sh`                                             | hard cluster-bound                                                             | real-runnable |
+| `verify-phase4.sh`, `verify-phase5.sh`                                             | **partially hermetic** (core runs cluster-free; live regression needs cluster) | real-runnable |
+| `verify-phase6.sh`, `verify-phase7.sh`                                             | hard cluster-bound (unreachable = FAIL)                                        | real-runnable |
+| `chaos-suite.sh`                                                                   | hard cluster-bound + destructive                                               | real-runnable |
+| `negative-attenuation.sh`                                                          | cluster-bound (applies VAP + RBAC)                                             | real-runnable |
+| `egress-enforcement.sh`                                                            | needs **Calico** CNI; on kindnet exits 3 (deferred)                            | real-runnable |
+| `iac-parity.py`, `circleci-parity.py`, `observability-seam.py`, `otel-endpoint.sh` | **fully host-hermetic**                                                        | real-runnable |
 
 ---
 
@@ -216,10 +229,10 @@ Caveat: the endpoint is provider-neutral but **auth is not** — scripts always 
 | Operator builds          | `cd k8s-operator && go build ./...`                                                                                                   | **exit 0**, no output                                                                                                             |
 | Operator vets            | `go vet ./...`                                                                                                                        | **exit 0**, zero diagnostics                                                                                                      |
 | Operator tests           | `go test ./...` and `make test` (fresh, envtest)                                                                                      | **exit 0**, no FAIL; `internal/controller` **88.6% coverage** (agentindex 93.3%, router 94.8%, webhook 80.6%, eventingress 85.3%) |
-| IaC KCC↔Terraform parity | `python3 local-dev/tests/iac-parity.py`                                                                                               | **exit 0** — 5 PASS incl. "equivalent across 14 facts"                                                                            |
-| CircleCI parity          | `python3 local-dev/tests/circleci-parity.py`                                                                                          | **exit 0** — 8 PASS incl. dispatch parity + keyless-no-static-key                                                                 |
-| Observability seam       | `python3 local-dev/tests/observability-seam.py`                                                                                       | **exit 0** — 6 PASS incl. loud-fail on missing non-GCP URL                                                                        |
-| OTLP endpoint seam       | `bash local-dev/tests/otel-endpoint.sh`                                                                                               | **exit 0** — 6/6 PASS                                                                                                             |
+| IaC KCC↔Terraform parity | `python3 dev/tests/iac-parity.py`                                                                                                     | **exit 0** — 5 PASS incl. "equivalent across 14 facts"                                                                            |
+| CircleCI parity          | `python3 dev/tests/circleci-parity.py`                                                                                                | **exit 0** — 8 PASS incl. dispatch parity + keyless-no-static-key                                                                 |
+| Observability seam       | `python3 dev/tests/observability-seam.py`                                                                                             | **exit 0** — 6 PASS incl. loud-fail on missing non-GCP URL                                                                        |
+| OTLP endpoint seam       | `bash dev/tests/otel-endpoint.sh`                                                                                                     | **exit 0** — 6/6 PASS                                                                                                             |
 | Review-gate scorer       | `python3 -m unittest test_score_findings test_extract_findings`                                                                       | **40 tests OK**                                                                                                                   |
 | Local-dev skill tests    | `test_submit_suggestion` (11), `test_detect_drift` (3), `test_raise_escalation` (4), `test_heartbeat_sops` (7), `test_read_knowledge` | all **OK**                                                                                                                        |
 
@@ -278,17 +291,17 @@ cd k8s-operator && go build ./... && go vet ./... && go test ./...
 cd ..
 
 # 2) Phase-7 hermetic parity + seam validators (all exit 0)
-python3 local-dev/tests/iac-parity.py .
-python3 local-dev/tests/circleci-parity.py .
-python3 local-dev/tests/observability-seam.py .
-bash   local-dev/tests/otel-endpoint.sh .
+python3 dev/tests/iac-parity.py .
+python3 dev/tests/circleci-parity.py .
+python3 dev/tests/observability-seam.py .
+bash   dev/tests/otel-endpoint.sh .
 
 # 3) Review-gate scorer + extractor unit tests (40 tests OK)
 python3 -m unittest scripts/review-gate/test_score_findings.py \
                     scripts/review-gate/test_extract_findings.py
 
 # 4) Mutation-path invariant tests (hermetic, real local git repos)
-cd local-dev && python3 -m unittest test_submit_suggestion test_detect_drift \
+cd dev && python3 -m unittest test_submit_suggestion test_detect_drift \
    test_read_knowledge test_raise_escalation test_heartbeat_sops
 cd ..
 
@@ -303,56 +316,50 @@ cd k8s-operator && go test ./internal/router/ -run 'TestResolve|Inference|Thread
 
 > `make test` runs `go fmt ./...` which will rewrite the 4 gofmt-dirty files listed in §4.1. If you want a clean tree, use `go test ./...` directly (no rewrite) or `git checkout` afterward.
 
-### (b) Full inner loop on Kind
+### (b) Full inner loop
 
-**Prerequisites — the ONLY genuinely missing binary is `kind`.** Everything else the suite truly needs (`go`, `docker`, `kubectl`, `python3`, `make`, `jq`, `bash`, `envsubst`) is present. `kustomize` is auto-bootstrapped by the operator Makefile via `go install`; `helm` is NOT used by the Kind loop (cert-manager is applied with `kubectl apply -f`); `terraform`/`circleci`/`yq` are never needed (parity is hermetic).
+> These commands are current as of 2026-07-26 and target the remote GKE inner loop — see the
+> substrate note at the top of this document for what changed and what was not re-run.
 
-```bash
-# 0) Install kind (the one blocker)
-go install sigs.k8s.io/kind@latest        # or: brew install kind
-
-# 1) Bring up the cluster (K8s v1.31.2, ctx kind-kube-agents-dev)
-local-dev/kind/up.sh
-
-# 2) cert-manager (webhook TLS)
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
-kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=180s
-
-# 3) Deploy YOUR LOCAL operator image — never the published v0.1.0.
-#    `make deploy` does NOT build; it only sets the image + applies. So you must build +
-#    kind-load a LOCAL tag first, then deploy THAT tag. (The published v0.1.0 is upstream's
-#    binary, not your working tree; and it renders pods without readOnlyRootFilesystem, which
-#    the hardening VAP rejects.) The helper does build → kind load → repoint in one step:
-local-dev/kind/reload-images.sh operator kind-kube-agents-dev
-#    ...or longhand, if the controller Deployment doesn't exist yet:
-#      make -C k8s-operator docker-build IMG=kube-agents/k8s-operator:dev
-#      kind load docker-image kube-agents/k8s-operator:dev --name kube-agents-dev
-#      cd k8s-operator && make deploy IMG=kube-agents/k8s-operator:dev && cd ..
-kubectl apply -f examples/gitops-repo/policy/vap-agent-readonly.yaml
-
-# 4) Run the per-phase gates
-for p in 2 3 4 5 6 7; do local-dev/kind/verify-phase$p.sh kind-kube-agents-dev; done
-```
-
-**Stale-image rule (load-bearing).** Local images reuse a fixed tag (`:dev`, `:latest`) with `imagePullPolicy: IfNotPresent`, so a same-tag image is **not** auto-refreshed. A Kind gate can read green against a stale build that under-enforces an admission invariant. **Always rebuild → `kind load` → `rollout restart`/`set image` before trusting a gate** — `reload-images.sh` does exactly this. This matters most before Phase 6.
-
-**Calico caveat for egress.** kindnet does **not** enforce NetworkPolicy, so `egress-enforcement.sh` self-defers (exit 3, non-fatal). To actually prove egress enforcement:
+**Prerequisites.** `gcloud` (authenticated, with a project set), `kubectl`, `go`, `python3`, `make`, `jq`, `bash`, `git`, `envsubst`. `kustomize` is auto-bootstrapped by the operator Makefile via `go install`; cert-manager is installed by `up.sh` with `kubectl apply -f`, so `helm` is still unused; `terraform`/`circleci`/`yq` are still never needed (parity is hermetic). Neither `kind` nor a local Docker daemon is one of these any more: images are built on Cloud Build because the nodes are amd64 and the developer host is arm64, and a local build produces images the cluster cannot execute — surfacing minutes later as `CrashLoopBackOff` with `exec format error`, in some other component.
 
 ```bash
-kind create cluster --name kube-agents-egress --config local-dev/kind/kind-calico.yaml
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
-kubectl -n kube-system rollout status ds/calico-node
-local-dev/tests/egress-enforcement.sh kind-kube-agents-egress   # exit 0 = proven; exit 3 = deferred
+# 1) Bring up the whole inner loop, one command: cluster (2 nodes, Dataplane V2, Workload
+#    Identity) → cert-manager → the operator built FROM YOUR WORKING TREE on Cloud Build and
+#    deployed BY DIGEST → the read-only VAP → the three tier agent images. 5-8 min on a first
+#    create; idempotent, and re-running it is the supported way to pick up a source change.
+dev/cluster/up.sh
+#    It renames gcloud's generated context to gke-scratch-kube-agents-dev. That prefix is the
+#    only arm every destructive-test guard in dev/ accepts; a cluster nobody renames is one
+#    the suite cannot touch.
+
+# 2) Pick up a later source change without a full up.sh
+dev/cluster/reload-images.sh all gke-scratch-kube-agents-dev
+
+# 3) Run the per-phase gates
+for p in 2 3 4 5 6 7 8; do dev/verify/verify-phase$p.sh gke-scratch-kube-agents-dev; done
+
+# 4) Between sessions: nodes → 0. etcd is in the control plane, so every object survives.
+dev/cluster/pause.sh      # resume.sh restores 2 nodes in ~2 min; down.sh deletes the cluster
 ```
 
-No `calico`/`calicoctl` binary is needed — install is pure `kubectl apply`.
+**Stale-image rule (load-bearing) — now carried by the deploy mechanism, not by discipline.** The trap was a fixed tag (`:dev`, `:latest`) plus `imagePullPolicy: IfNotPresent`: the kubelet keeps a copy it already has, so a gate reads green against a stale build that under-enforces an admission invariant. `reload-images.sh` deploys by **digest** — build, push to Artifact Registry, read the digest back out of the registry the kubelet pulls from, then `set image …@sha256:…`. A digest names one immutable manifest, so the trap is unrepresentable rather than something a reminder has to catch, and `rollout restart` is gone with it: a changed digest changes the Deployment spec, which _is_ a rollout. Precondition P1 still asserts the running pod's `imageID` digest is the build under test — that is the check that fires if the mechanism is bypassed.
+
+**Egress enforcement.** kindnet accepted every NetworkPolicy and enforced none of them, which is why the egress claims in §4.3 and §7 were proven on a separate Calico cluster or self-deferred. Dataplane V2 enforces, so the inner-loop cluster is now the target for both suites:
+
+```bash
+dev/verify/egress-enforcement-l2.sh gke-scratch-kube-agents-dev  # the SHIPPED policy
+dev/tests/egress-enforcement.sh gke-scratch-kube-agents-dev      # the mechanism, synthetic policy
+```
+
+Exit 0 = enforcement proven, 3 = deferred (no dataplane the check knows to enforce) — never faked green. No CNI binary is needed on the host in either case.
 
 **Did this review test the _right_ image?** Yes for everything it actually asserted:
 
 - **Controller + webhook + admission** — the live cluster's controller was a **local** build (`kube-agents/k8s-operator:dev`, rebuilt and re-verified this pass), so the webhook/reconciler/admission checks tested the **working tree**, not upstream's `ghcr.io/...:v0.1.0`.
 - **VAPs (read-only RBAC, pod hardening)** — image-independent: they validate the real policy YAML at admission regardless of which operator image runs.
 - **Go/envtest + hermetic Python/shell suites** — always compile and run the local source; no container image involved.
-- **Agent _runtime content_** — **not exercised live** at all (needs inference creds; deferred). The running agent pods still carried the upstream `:v0.1.0` image, but pod hardening (`readOnlyRootFilesystem`, etc.) is rendered by the **local controller**, not baked into the agent image — so no wrong-image result was masked. To run agents from your working tree, `reload-images.sh agents …` and set `spec.deployment.imagePullPolicy: IfNotPresent`.
+- **Agent _runtime content_** — **not exercised live** at all (needs inference creds; deferred). The running agent pods still carried the upstream `:v0.1.0` image, but pod hardening (`readOnlyRootFilesystem`, etc.) is rendered by the **local controller**, not baked into the agent image — so no wrong-image result was masked. To run agents from your working tree today, `dev/cluster/reload-images.sh agents gke-scratch-kube-agents-dev`, which patches every Agent CR of each tier to that tier's image digest; the pull policy stopped being load-bearing when the reference stopped being a tag.
 
 The one trap to avoid: following the old INSTALL.md literally (`make deploy IMG=ghcr.io/...:v0.1.0` and stop) would have tested the **upstream** controller, not yours. That step is now fixed to build + load a local tag first.
 
@@ -377,7 +384,7 @@ The one trap to avoid: following the old INSTALL.md literally (`make deploy IMG=
 
 These need a real cluster/cloud and are **not** part of the Kind loop (all disclosed, none asserted green):
 
-- `local-dev/gke-scratch/create.sh` — `gcloud container clusters create-auto` (billable); needs `gcloud` auth + a GCP project.
+- ~~`dev/gke-scratch/create.sh`~~ — retired 2026-07-26. The ephemeral Autopilot cluster it stood up is replaced by the L2 dev cluster (`dev/cluster/up.sh`), which carries Workload Identity and Dataplane V2, so these stop being a separate target to provision.
 - **V-G1..V-G4**: cluster-admin viewer GSA + Workload Identity, second spoke + private hub inference/Minty, live Google Chat app, live CI/CD apply.
 - `tests/e2e/gchat_agent_test.py` — real end-to-end pytest against a deployed Chat agent; needs WIF provisioning (`provision_ci_iam.sh`) + a Chat space (run via `.github/workflows/e2e-gchat-test.yml`).
 - Second cloud (EKS IRSA / AKS AAD) + live `terraform apply` (D1/D2).
@@ -387,10 +394,25 @@ These need a real cluster/cloud and are **not** part of the Kind loop (all discl
 ## 7. Caveats, gotchas & known limitations
 
 - **Stale-image rule** (most important): same `v0.1.0` tag + `IfNotPresent` means Kind will serve a stale build and can silently under-enforce. The published `v0.1.0` operator renders pods **without** `readOnlyRootFilesystem` — you must build+load a local image or Phase 6 fails. Always rebuild → `kind load` → restart before a gate.
+  **Superseded 2026-07-26.** Not by discipline but by construction: `reload-images.sh` deploys by
+  **digest**, and a digest cannot name two different builds, so there is no stale-image state left
+  to remember to avoid. The published `v0.1.0` finding stands — it is still the wrong binary to
+  certify — but the way you avoid it is now "run `up.sh`", not "remember to reload".
 - **`kubectl` `-gke` version gotcha**: the host `kubectl` is gcloud's `-gke` build, whose client `gitVersion` carries a `-gke` suffix. `verify-phase7.sh` correctly reads the **server-side** node `kubeletVersion` (not client version) to confirm a vanilla target — a robustness detail, not a gap.
 - **kindnet vs Calico**: kindnet does not enforce NetworkPolicy; egress enforcement is proven only on a separate Calico cluster. On kindnet the netpol **shape** is validated structurally and enforcement self-defers (rc 3).
+  **Superseded 2026-07-26.** The inner loop runs Dataplane V2, which enforces, so `V-CTN-020` is
+  expected to **pass** there rather than defer — the one correctness gap the substrate move closes,
+  not merely a speed-up. The self-deferral mechanism stays: precondition P4 now allow-lists the
+  dataplanes known to enforce (`calico-node`, `anetd`, `cilium`) and defers on anything it does not
+  recognise, so an unenforcing CNI still cannot be mistaken for a pass.
 - **Missing CLIs → hermetic parity**: `terraform`, `circleci` (and `kind`/`calicoctl`) are absent; the Phase-7 IaC/pipeline claims are proven by stdlib-Python parity validators, with CLI-level validation explicitly deferred (D2/D4) — same honest pattern as Calico-for-kindnet.
 - **Router in Kind is benign-CrashLoop**: `config/router/deployment.yaml` ships env placeholders (`REPLACE_WITH_PROJECT_ID`, `REPLACE_WITH_INBOUND_SUBSCRIPTION`) and the router SA has **no Workload-Identity annotation**, so `kage-router` cannot authenticate to real Pub/Sub in Kind and will crashloop — expected/benign until those are wired for a real project. The router's logic is proven hermetically against the pstest fake.
+  **Amended 2026-07-26.** On the GKE inner loop the router does not reach the crashloop: it stops
+  one step earlier, at `ErrImagePull`, because the default `ghcr.io/gke-labs/kube-agents/kage-router:v0.1.0`
+  answers an anonymous pull with `403`. That is not a regression from Kind — the Kind loop never
+  built the router either, it just failed later and more quietly. `reload-images.sh router` builds
+  it from the working tree into the project's own registry, and `up.sh` now calls it, so the
+  placeholder-env crashloop above is once again the _first_ thing that stops it.
 - **gofmt not clean**: 4 files fail `gofmt -l`; `make` masks it via `go fmt ./...`.
 - **Image tag mismatch**: root `Makefile` tags agent images `:latest`; operator defaults + verify expect `:v0.1.0` — build/tag `:v0.1.0` explicitly.
 - **`spec.iac.format` has zero Go consumers** — stored + schema-validated, not yet acted upon (rated `partial`, correctly).

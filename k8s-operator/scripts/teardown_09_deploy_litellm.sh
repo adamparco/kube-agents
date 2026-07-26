@@ -21,6 +21,12 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 # ─── Configuration State Restoration ──────────────────────────────────────────
 ensure_teardown_state
 
+# The cluster the `make` targets below delete from, named rather than inherited (LSN-018: a context
+# override the Makefile did not read was accepted and ignored, and the CRD went to whatever
+# `kubectl config current-context` was). Both `connect_cluster` and CI's get-gke-credentials write
+# exactly this context name; set KUBE_CONTEXT to point the run somewhere else.
+KUBE_CONTEXT="${KUBE_CONTEXT:-gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}}"
+
 # ─── Confirmation Prompt ──────────────────────────────────────────────────────
 confirm_action "This will permanently undeploy the LiteLLM Gateway." \
   "GCP Project:$PROJECT_ID" \
@@ -45,7 +51,7 @@ if [ "${DRY_RUN:-0}" -eq 1 ]; then
   echo -e "  ${C_GREEN}[DRY-RUN] Would undeploy LiteLLM Gateway in namespace '${NAMESPACE}'.${C_RESET}"
 else
   export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME
-  make -C "${OPERATOR_DIR}" undeploy-litellm || true
+  make -C "${OPERATOR_DIR}" undeploy-litellm KUBE_CONTEXT="${KUBE_CONTEXT}" || true
   echo -e "  ${C_GREEN}✓ LiteLLM Gateway undeploy command completed.${C_RESET}"
 fi
 

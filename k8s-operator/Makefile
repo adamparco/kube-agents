@@ -32,7 +32,9 @@ SHELL = /usr/bin/env bash -o pipefail
 #
 # `kubectl config current-context` on this host may be the live cluster `platform-agent-host`,
 # which `.claude/harness/binding.md` §Targets classifies as install-verification only. So an
-# UNSET context is only accepted when the ambient one is anchored `kind-*` / `gke-scratch-*`;
+# UNSET context is only accepted when the ambient one is anchored `gke-scratch-*` (one anchor since
+# 2026-07-26 — `kind-*` was accepted while the inner loop ran on the host, and an accepted prefix
+# with nothing behind it is a guard nobody maintains);
 # anything else must be named on the command line. Naming it is always allowed -- deliberately
 # deploying to the live cluster is a real operation, forgetting which cluster you are on is not.
 KUBE_CONTEXT ?=
@@ -62,8 +64,8 @@ ctx-guard:
 	fi; \
 	if [ "$$explicit" = no ]; then \
 	  case "$$ctx" in \
-	    kind-* | gke-scratch-*) : ;; \
-	    *) echo "REFUSING: ambient context '$$ctx' is not kind-*/gke-scratch-*, and no" >&2; \
+	    gke-scratch-*) : ;; \
+	    *) echo "REFUSING: ambient context '$$ctx' is not gke-scratch-*, and no" >&2; \
 	       echo "  KUBE_CONTEXT= was given. If you mean it, name it:" >&2; \
 	       echo "      make <target> KUBE_CONTEXT=$$ctx" >&2; \
 	       exit 2 ;; \
@@ -113,8 +115,29 @@ build: manifests generate fmt vet ## Build manager binary.
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go
 
+# See the root Makefile's assert-amd64-host for the full reasoning. Short version: a plain
+# `docker build` on Apple silicon produces an arm64 image, the nodes are amd64, and the failure
+# does not surface until the container execs. `make -C .. cloud-build-push` builds amd64 off-host.
+HOST_ARCH := $(shell uname -m)
+
+.PHONY: assert-amd64-host
+assert-amd64-host:
+	@case "$(HOST_ARCH)" in \
+	  x86_64 | amd64) ;; \
+	  *) \
+	    if [ -z "$(ALLOW_HOST_ARCH_BUILD)" ]; then \
+	      echo "refusing: this host is $(HOST_ARCH) and the nodes are amd64. The image would" >&2; \
+	      echo "build, push, and pull, then die with 'exec format error'." >&2; \
+	      echo "" >&2; \
+	      echo "  make -C .. cloud-build-push               # amd64, off-host, all images" >&2; \
+	      echo "  make <target> ALLOW_HOST_ARCH_BUILD=1     # build for this machine anyway" >&2; \
+	      exit 2; \
+	    fi; \
+	    echo "warning: building an $(HOST_ARCH) image (ALLOW_HOST_ARCH_BUILD is set). Do not deploy it." >&2 ;; \
+	esac
+
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager.
+docker-build: assert-amd64-host ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build -t ${IMG} .
 
 .PHONY: docker-push
@@ -126,7 +149,7 @@ build-router: manifests generate fmt vet ## Build kage-router binary.
 	go build -o bin/router cmd/router/main.go
 
 .PHONY: docker-build-router
-docker-build-router: ## Build docker image with the kage-router.
+docker-build-router: assert-amd64-host ## Build docker image with the kage-router.
 	$(CONTAINER_TOOL) build -f Dockerfile.router -t ${ROUTER_IMG} .
 
 .PHONY: docker-push-router
@@ -140,7 +163,7 @@ ifndef ignore-not-found
 endif
 
 .PHONY: install
-install: ctx-guard manifests kustomize ## Install CRDs into $(KUBE_CONTEXT), or the ambient context if it is kind-*/gke-scratch-*.
+install: ctx-guard manifests kustomize ## Install CRDs into $(KUBE_CONTEXT), or the ambient context if it is gke-scratch-*.
 	@out="$$( $(KUSTOMIZE) build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | $(KUBECTL) apply -f -; else echo "No CRDs to install; skipping."; fi
 
@@ -150,7 +173,7 @@ uninstall: ctx-guard manifests kustomize ## Uninstall CRDs from $(KUBE_CONTEXT).
 	if [ -n "$$out" ]; then echo "$$out" | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
 .PHONY: deploy
-deploy: ctx-guard manifests kustomize ## Deploy controller to $(KUBE_CONTEXT), or the ambient context if it is kind-*/gke-scratch-*.
+deploy: ctx-guard manifests kustomize ## Deploy controller to $(KUBE_CONTEXT), or the ambient context if it is gke-scratch-*.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
 

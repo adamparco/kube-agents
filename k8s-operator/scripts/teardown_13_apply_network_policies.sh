@@ -12,7 +12,7 @@
 # workloads this platform does not own"), so everything provision_13 created in that namespace
 # survives every teardown. On the next provision those stale policies are silently re-adopted — a
 # NetworkPolicy left behind from an older allowlist would quietly govern the new install. P8-T2
-# shipped provision_13 with no teardown at all; `local-dev/tests/install-path-wired.py` is what
+# shipped provision_13 with no teardown at all; `dev/tests/install-path-wired.py` is what
 # noticed.
 #
 # Order is the reverse of provision_13: floor first, then the per-tier allowlists, so no pod is ever

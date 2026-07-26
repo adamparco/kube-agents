@@ -35,7 +35,7 @@ This skill **cannot** write. Two properties are enforced by the helper script, n
 
 It uses a **contents:read**-scoped token (`GITHUB_READ_TOKEN`), not the `submit-suggestion` write token.
 
-The frontmatter parser is the **same shared module** `local-dev/okf-validate.py` uses, so what you read
+The frontmatter parser is the **same shared module** `dev/okf-validate.py` uses, so what you read
 is exactly what CI validates — no schema drift.
 
 ## Execution Instructions

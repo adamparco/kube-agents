@@ -1,0 +1,35 @@
+# Files where prettier is not the right owner of the formatting.
+#
+# Two distinct reasons appear below, and each entry states its own. This is not a general licence to
+# silence the formatter: a file belongs here only when prettier's output is either DISCARDED by
+# something else or actively COSTLY, and the cost is measurable. Everything else stays formatted --
+# `make prettier-check` is the whole point, and CI runs prettier over changed files on every PR.
+
+# --- Reason 1: a generator writes it, so prettier's opinion is overwritten anyway. ---
+
+# Written by `python3 dev/tests/invariants-gate.py --update-baseline` (json.dumps indent=2).
+# Prettier collapses single-element arrays onto one line; json.dumps never does, so the two
+# reformat each other forever and every run of either shows up as a diff nobody wrote. Nothing else
+# about the file is contested, and the ratchet reads it with `json.load`, which does not care.
+dev/assertion-baseline.json
+
+# --- Reason 2: table padding is 50-64% of a file the harness reads on EVERY invocation. ---
+#
+# Prettier pads each table cell out to the widest cell in its column. On a table whose widest cell
+# is a 3 KB paragraph, every other row in that column is padded to 3 KB of trailing spaces. These
+# two files are mandated reading at ORIENT, and the padding alone had made LEDGER.md too large for a
+# single `Read`: 446 KB in 414 lines, of which 287 KB was whitespace. LESSONS.md was 160 KB, 53%
+# padding.
+#
+# The fix is not "run prettier less often" -- it is that these two files pay a real per-invocation
+# context cost for an alignment nobody reads, so the formatter does not get a vote. Write table rows
+# with single spaces around the pipes; nothing will re-pad them. LESSONS.md went further and turned
+# its per-lesson tables into bold-label prose, which prettier could not have padded either way.
+#
+# Both files were ALREADY failing `make prettier-check` on main before this, so listing them here
+# fixes that target rather than papering over it.
+docs/build/LEDGER.md
+.claude/harness/LESSONS.md
+# The archive is the moved half of LEDGER.md and was de-padded in the same pass. Left out, prettier
+# would re-pad it on the next run and hand back the 290 KB the move just removed.
+docs/build/archive/LEDGER-phases-0-7.md

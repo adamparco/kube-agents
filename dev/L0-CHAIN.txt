@@ -1,0 +1,55 @@
+# The L0 regression chain — every check that runs with no cluster and no network.
+#
+# THIS FILE IS THE SINGLE DEFINITION SITE (V-MET-013). Three consumers read it and there is no
+# second list to drift from:
+#
+#   1. .github/workflows/l0-checks.yml   — runs every line on every PR. Until 2026-07-25 CI ran
+#                                          NONE of these, so every mechanization the harness built
+#                                          across phases 2-8 was enforced only when a human
+#                                          remembered to run it. That is LSN-007 ("built, tested,
+#                                          and unreachable") pointed at the verification machinery
+#                                          itself, and it is the reason this file exists.
+#   2. dev/tests/invariants-gate.py — asserts every LESSONS.md entry marked `closed` names an
+#                                          artifact that appears HERE. A lesson closed against a
+#                                          command nobody runs is not closed (LSN-019).
+#   3. the harness REGRESS step           — runs the chain before any CHECKPOINT.
+#
+# Format: one shell command per line, run from the repository root, expected to exit 0.
+# Blank lines and #-comments ignored. Keep one command per line: the gate matches artifacts by
+# substring, and a compound line hides what it runs.
+
+# --- unittest modules (dev/test_*.py) -------------------------------------------------
+# Discovered as one command; 69 tests at time of writing. Individually re-runnable with
+# `python3 -m unittest dev.test_<name>`.
+python3 -m unittest discover dev
+
+# --- standalone L0 checks (dev/tests/*.py) --------------------------------------------
+python3 dev/tests/install-path-wired.py
+python3 dev/tests/closed-allowlist.py
+python3 dev/tests/reference-render.py
+python3 dev/tests/circleci-parity.py
+python3 dev/tests/iac-parity.py
+python3 dev/tests/observability-seam.py
+python3 dev/okf-validate.py
+# Callers vs parsers. P8-T4 removed `--github-cidrs` from the developer-team renderer and left
+# verify-phase3.sh passing it: argparse exited 2, stderr went to /dev/null, and P3-K7 verified
+# nothing for a day (LSN-021). Nothing in L0 looked at a CLI's callers until this line existed.
+python3 dev/tests/cli-contract.py
+# 09 §14's own lints (V-MET-010/012/013-for-check-IDs). They were written `L0` and never built, so
+# 09 §5.1 lost two load-bearing components and 09 §5.2 five contracts with nothing to notice (LSN-014).
+python3 dev/tests/spec-ids.py
+# Documentation a reader ACTS on, checked against the build (P8-T7). Three of the 74 falsehoods it
+# first found were created by earlier units of phase 8 itself: P8-T1 deleted the allow-all escape
+# hatch and left two documents still promising it, and P8-T3 shipped provisioning step 13 with no
+# `make` target while every step list stopped at 11. Docs drift on the same schedule as code.
+python3 dev/tests/docs-truth.py
+
+# --- repository mechanics (LSN-012) ---------------------------------------------------------
+# Which remote carries the work, and does `main` point at it? Local main tracked `upstream/main`
+# (gke-labs) for the whole of phases 2-8: a bare `git pull` would have fetched a tree with none of
+# this build in it. Resolved by CONTENT, never by remote name -- the name has already changed once.
+bash dev/git-preflight.sh
+
+# --- the invariants gate itself (P8-T6) -----------------------------------------------------
+# Runs last: it reads this file, and several of its checks are about the chain above.
+python3 dev/tests/invariants-gate.py

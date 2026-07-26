@@ -5,7 +5,7 @@
 # platform agent authors via PR when the proposing agent's iac.format is `kcc` (the default), per
 # agents/platform/skills/gke-cluster-creator/SKILL.md. Its parity twin is the Terraform HCL exemplar
 # at ../../cluster-b/provisioning/ (iac.format: terraform) — the two describe the SAME cluster shape
-# in the two supported formats, and local-dev/tests/iac-parity.py asserts they stay equivalent.
+# in the two supported formats, and dev/tests/iac-parity.py asserts they stay equivalent.
 #
 # The reference actuation pipeline applies this dir with `kubectl apply --server-side --recursive`
 # because it holds *.yaml and no *.tf (apply.yml apply_path(): *.tf → terraform, else *.y*ml →

@@ -45,7 +45,7 @@ pins a first-party image pins that value. Cutting a release is therefore two ste
 whose git tag disagrees with `tags.env`, so the version a user pins and the version actually
 published cannot drift apart.
 
-This is enforced offline, on every PR, by `local-dev/test_image_provenance.py` (check **V-CMP-002**):
+This is enforced offline, on every PR, by `dev/test_image_provenance.py` (check **V-CMP-002**):
 it joins the set of `(image, tag)` pairs referenced anywhere in the tree against the set the
 workflows produce, and fails on any reference to an image no workflow builds or a tag no workflow
 publishes. It exists because both halves of that join were broken at once — three images had
@@ -105,6 +105,12 @@ builds and pushes to a dev Artifact Registry repo and restarts the Deployment. S
 
 `make docker-build` / `make docker-push` from the repo root build into your own Artifact Registry,
 tagged `src-<sha>` from the working-tree commit. Override with `make docker-push TAG=...`.
+
+On a host that is not amd64 these targets **refuse** (exit 2), as do `make -C k8s-operator
+docker-build` and `docker-build-router`. A plain `docker build` there produces an image for the
+host architecture, which pushes and pulls cleanly and then dies with `exec format error` on an
+amd64 node — nothing between the build and the exec reports a problem. Use `make cloud-build-push`,
+or set `ALLOW_HOST_ARCH_BUILD=1` to build an image for your own machine and not for the cluster.
 
 ## CI
 

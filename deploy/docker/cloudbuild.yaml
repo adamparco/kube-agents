@@ -26,9 +26,15 @@ steps:
       - "-c"
       - |
         set -eu
-        # $_FOO is a Cloud Build substitution, expanded before bash ever runs. $$foo is escaped
+        # $$_FOO is a Cloud Build substitution, expanded before bash ever runs. $$foo is escaped
         # through to bash as $foo -- Cloud Build rejects a bare ${...} it does not recognise, so a
         # shell variable has to be written $$foo or the build fails to even start.
+        #
+        # That applies inside this comment too, which is why it says $$_FOO and not the bare form.
+        # A YAML block scalar is a string value, not a YAML comment: Cloud Build substitutes into it
+        # before bash sees it, so an unescaped example token here failed the *whole build* with
+        # "key in the template _FOO is not matched in the substitution data" -- at submit time,
+        # before a single step ran.
         target_arg=""
         if [ -n "$_TARGET" ]; then target_arg="--target $_TARGET"; fi
         hermes_arg=""

@@ -33,7 +33,7 @@ jobs:
       # difference an error instead of a quieter run -- in both directions: if a future runner image
       # drops shellcheck, this job would silently stop checking shell and keep reporting green.
       - name: Toolchain preflight (LSN-020)
-        run: bash local-dev/toolchain-preflight.sh
+        run: bash dev/toolchain-preflight.sh
 
       - name: Run actionlint
         run: actionlint -color
