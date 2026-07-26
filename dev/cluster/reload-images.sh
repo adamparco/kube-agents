@@ -25,10 +25,16 @@
 #   deployment mechanism makes unrepresentable. It also makes the pull policy irrelevant rather
 #   than load-bearing.
 #
-# Usage: dev/cluster/reload-images.sh [operator|agents|all] [kube-context]
+# Usage: dev/cluster/reload-images.sh [operator|agents|all|digest] [kube-context]
 #   operator (default)  build+push the controller image, repoint + restart the controller
 #   agents              build+push the three tier agent images, repoint every Agent CR of each tier
 #   all                 both
+#   digest              build+push the controller image and print its DIGEST reference on stdout,
+#                       touching no cluster. This is for up.sh on a cluster that has no Deployment
+#                       to repoint yet: `make deploy` needs an IMG, and the alternative — deploy
+#                       the upstream tag as a placeholder, then repoint — means rolling out
+#                       somebody else's binary inside a script whose job is to install YOURS.
+#                       Progress goes to stderr so `$(...)` captures the reference alone.
 #
 # Exit codes (contract shared with up.sh, and relied on by the L2 suites):
 #   0 ok · 1 usage · 2 refused (guard) · 3 required tool missing · 4 an image did not materialise
@@ -162,5 +168,9 @@ case "$TARGET" in
   operator) reload_operator ;;
   agents)   reload_agents ;;
   all)      reload_operator && reload_agents ;;
-  *) echo "usage: $0 [operator|agents|all] [kube-context]" >&2; exit 1 ;;
+  # The guard above still ran, and deliberately, even though this arm touches no cluster. A guard
+  # that applies to some subcommands and not others is a guard someone has to remember the shape
+  # of; this one is uniform and costs nothing here.
+  digest)   build_and_resolve k8s-operator "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile" ;;
+  *) echo "usage: $0 [operator|agents|all|digest] [kube-context]" >&2; exit 1 ;;
 esac
