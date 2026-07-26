@@ -75,11 +75,19 @@ DEFAULT_LIMIT = 500
 # name why, and the reason must be true of the check itself -- "it is always red" is not a reason,
 # it is the thing that needs one. Adding an entry here is a deliberate narrowing of a merge gate:
 # under invariant 10 it is a human-review change, and the ledger row is not optional.
+#
+# HISTORICAL ONLY, since 2026-07-26. The workflow that produced the one entry below was DELETED
+# (`.github/workflows/auto_request_review.yml`), so no PR opened after that date can produce this
+# red at all. The entry stays because the audit walks backwards: the check runs recorded against
+# every head SHA merged before the deletion are still red on the forge, and dropping the waiver
+# would turn a settled history into findings. Deleting the check was the better fix than waiving
+# it, which is the direction this dict should always move.
 BENIGN: dict[str, str] = {
     "Auto Request Review": (
-        "a bot that requests reviewers from a CODEOWNERS file; on a fork PR it has no permission "
-        "to request a review on the upstream's behalf and fails for that reason alone. It asserts "
-        "nothing about the code and has never been green on this fork."
+        "a bot that requested reviewers from a roster of upstream `gke-labs` owners; on a fork PR "
+        "it had no permission to request a review on their behalf and failed for that reason "
+        "alone. It asserted nothing about the code and was never green on this fork. The workflow "
+        "was removed on 2026-07-26; this entry covers merges that predate the removal."
     ),
 }
 

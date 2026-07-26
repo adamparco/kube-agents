@@ -640,8 +640,7 @@ per-turn trace id flow router → inject seam → session → PR, stamped as dur
    live on the dev cluster (03 §11 `negative-attenuation.sh`) plus the full prior-phase gates
    (`verify-phase{2,3,4}.sh`) and `go test ./...`.
 2. **Deferred, not faked:** the **live headless detector** in `review-gate.yml` needs the
-   `ANTHROPIC_API_KEY` secret + live creds and skips gracefully on fork PRs (like
-   `auto_request_review`) — the scorer, which is the authoritative gate, always runs and is proven
+   `ANTHROPIC_API_KEY` secret + live creds and skips gracefully on fork PRs — the scorer, which is the authoritative gate, always runs and is proven
    hermetically; the **hostname-precise L7 egress proxy**, **cross-object webhook**, **gVisor
    execution sandbox**, and **per-request user down-scoping** remain deferred hardening (08 §5). The
    gVisor node pool is deliberately absent from the dev cluster — 08 §5's sandbox checks are
