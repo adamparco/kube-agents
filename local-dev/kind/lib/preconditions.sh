@@ -314,3 +314,119 @@ p3_pod_of_deploy() {
   done
   return 1
 }
+
+# --- P10 -------------------------------------------------------------------------------------------
+#
+# The cluster can still DO the things an L2 claim needs done, before any L2 claim is believed.
+#
+# Written on 2026-07-25, after verify-phase8.sh's first end-to-end run reported that tenant isolation
+# did not hold, that the egress default-deny did not hold, and that chaos C2 failed to replace a
+# deleted pod. All three were false. `kube-scheduler` and `kube-controller-manager` on the egress Kind
+# were both in CrashLoopBackOff — 41 and 37 restarts against a 9h-old cluster — losing their leader
+# leases because API-server calls were timing out at 5s under host memory pressure (the Docker VM has
+# ~1.9GiB total and was carrying two Kind control planes). With no scheduler, fixture pods stay
+# Pending forever and every enforcement claim downstream of them reports the property ABSENT. With no
+# controller-manager, new namespaces never get a `default` ServiceAccount and `kubectl run` fails
+# with a Forbidden that a suppressed exit status swallows.
+#
+# That is the LSN-024 shape aimed at infrastructure rather than at timing: the check reported a
+# security property missing when the property was fine and the cluster could not run the experiment.
+# It is the worst possible direction for this failure to point, because "tenant isolation does not
+# hold" is exactly the sentence someone acts on. A suite that cannot tell a dead scheduler from a
+# broken NetworkPolicy is not measuring the NetworkPolicy.
+#
+# Probes the CAPABILITY, not a proxy for it. Reading `.status.phase` of the static pods would have
+# caught this particular outage, but it answers a question about pods when the question is whether
+# the control plane still converges. Creating a namespace and waiting for the ServiceAccount its
+# controller must write is the same claim stated as an experiment, and it costs about a second.
+#
+# rc 0 healthy · rc 2 could-not-run (never rc 1: an unhealthy cluster is not a failed property, and
+# a caller that maps this to FAIL reintroduces the exact confusion it exists to remove).
+p10_assert_control_plane_healthy() {
+  local K="$1" label="${2:-cluster}" ns="p10-health-$$" i sa=""
+  # 1. The API server answers at all, within a bound. `kubectl version` alone is served from cache in
+  #    some clients, so ask for something the server must actually look up.
+  if ! $K get --raw='/readyz' >/dev/null 2>&1; then
+    echo "P10-UNHEALTHY: $label — the API server did not answer /readyz. Nothing below this line" >&2
+    echo "  could be measured, and an L2 verdict taken now would describe the cluster, not the code." >&2
+    return 2
+  fi
+  # 2. kube-controller-manager converges. The `default` ServiceAccount in a fresh namespace is written
+  #    by its ServiceAccount controller and by nothing else, so its appearance is proof of liveness
+  #    rather than evidence about it. Cleaned up regardless of outcome.
+  if ! $K create namespace "$ns" >/dev/null 2>&1; then
+    echo "P10-UNHEALTHY: $label — could not create a probe namespace." >&2
+    return 2
+  fi
+  for i in $(seq 1 30); do
+    sa="$($K -n "$ns" get sa default -o name 2>/dev/null)"
+    [ -n "$sa" ] && break
+    sleep 1
+  done
+  $K delete namespace "$ns" --wait=false >/dev/null 2>&1
+  if [ -z "$sa" ]; then
+    echo "P10-UNHEALTHY: $label — a fresh namespace got no 'default' ServiceAccount within 30s, so" >&2
+    echo "  kube-controller-manager is not converging. Pods will fail to create with a Forbidden and" >&2
+    echo "  every enforcement claim downstream would report its property ABSENT for the wrong reason." >&2
+    return 2
+  fi
+  # 3. kube-scheduler is up. Self-hosted (Kind, kubeadm) exposes it as a static pod; a managed control
+  #    plane (GKE) does not, and absence there is the provider hiding it, not a fault. Say which case
+  #    this was — an unobservable component reported as healthy is a green with nothing behind it.
+  local sched
+  sched="$($K -n kube-system get pods -l component=kube-scheduler \
+    -o jsonpath='{range .items[*]}{.metadata.name}={range @.status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{end}' 2>/dev/null)"
+  if [ -z "$sched" ]; then
+    echo "P10 ok: $label — control plane converges (managed/unobservable scheduler; not asserted)"
+    return 0
+  fi
+  if ! printf '%s' "$sched" | grep -q '=True'; then
+    echo "P10-UNHEALTHY: $label — kube-scheduler is not Ready ($sched). Fixture pods will sit Pending" >&2
+    echo "  until the timeout and every claim that needs a running pod would report ABSENT." >&2
+    return 2
+  fi
+  # 4. And it has been up for a while, not merely up at this instant.
+  #
+  # Steps 1-3 all passed against the very cluster whose kube-scheduler had restarted 41 times in 9
+  # hours, because a CrashLoopBackOff is a cycle: probe it during an up-swing and every liveness
+  # question answers yes. An L2 suite runs for half an hour. "Healthy now" is not the property it
+  # needs — "healthy for the next thirty minutes" is, and a recent restart is the available evidence
+  # against it. Without this the precondition would have certified the cluster that produced three
+  # false security failures, which is a check reporting green about the thing it was written for.
+  local finished when now flap=""
+  now="$(date +%s)"
+  while read -r when; do
+    [ -n "$when" ] || continue
+    # GNU date first, BSD second — this runs on whatever host the developer has. BOTH need to be told
+    # the input is UTC: the API server emits RFC3339 with a trailing `Z`, and BSD `date -j -f` parses
+    # the fields as LOCAL time and ignores the Z outright. The first version of this omitted `-u` and
+    # every delta came out negative on a UTC-4 host — and since every negative is less than the
+    # window, it flagged as "just restarted" every restart that had ever happened. A check that
+    # always fires is no more evidence than one that never does (V-MET-014); it just fails safe
+    # enough to look deliberate.
+    finished="$(date -u -d "$when" +%s 2>/dev/null || date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$when" +%s 2>/dev/null)"
+    [ -n "$finished" ] || continue
+    if [ $((now - finished)) -lt 0 ]; then
+      # Future-dated: the parse is wrong, or the cluster's clock is. Either way this cannot be
+      # reasoned about, and guessing "recent" would resurrect the bug above.
+      echo "P10: $label — cannot compare restart time '$when' (parsed in the future); treating as" >&2
+      echo "  unknown rather than recent. Fix the parse before trusting a green from this probe." >&2
+      continue
+    fi
+    if [ $((now - finished)) -lt "${P10_FLAP_WINDOW:-900}" ]; then
+      flap="$flap $((now - finished))s-ago"
+    fi
+  done <<EOT
+$($K -n kube-system get pods -l tier=control-plane \
+  -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.lastState.terminated.finishedAt}{"\n"}{end}{end}' 2>/dev/null)
+EOT
+  if [ -n "$flap" ]; then
+    echo "P10-UNHEALTHY: $label — a control-plane component restarted in the last" >&2
+    echo "  ${P10_FLAP_WINDOW:-900}s (${flap# }). It answers probes now, but a CrashLoopBackOff answers" >&2
+    echo "  probes during its up-swing too, and an L2 suite runs for half an hour. Anything it" >&2
+    echo "  reported would be a claim about scheduler uptime wearing the costume of a security result." >&2
+    return 2
+  fi
+  echo "P10 ok: $label — API server ready, controller-manager converging, scheduler Ready, no recent restarts"
+  return 0
+}
