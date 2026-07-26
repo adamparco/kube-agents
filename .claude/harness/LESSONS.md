@@ -56,6 +56,7 @@ will start selecting.
 | **LSN-025** | checks, identity | A label selector names a role, not an object, and still matches the generation you deleted | closed | `invariants-gate.py` `check_p3_pods_resolved_by_ownership` (P3, L0-CHAIN) |
 | **LSN-026** | checks, infrastructure | Several unrelated security properties all "fail" at once, and the cluster is what is broken | closed | `invariants-gate.py` `check_l2_scripts_assert_cluster_health` (P10, L0-CHAIN) · `preconditions.sh` |
 | **LSN-027** | infrastructure, preflight | A preflight reports the host is fine, and the cluster still refuses to start | closed | `invariants-gate.py` `check_cluster_creating_scripts_assert_capacity` · `lib/substrate-capacity.sh` |
+| **LSN-028** | netpol, substrate | An allowlist denies the destination it lists, and the over-block reads as a fixture bug | closed | `egress-enforcement.sh` §3/§4 (run by `verify-phase7.sh` → phase5, L2-CHAIN) |
 
 **Open: 0 of 27.**
 
@@ -1122,3 +1123,66 @@ node produced the containerd line naming the resource, which is the only reason 
 inotify instead of "probably memory again". Note for whoever hits this next: **the sysctl does not
 survive a Colima restart**, so a host that passed yesterday can refuse today; that is the check
 working, and the `provision:` block in the refusal text is the fix.
+
+---
+
+## LSN-028 — An allowlist denies the destination it lists, and the over-block reads as a fixture bug
+
+`netpol, substrate` · **closed** 2026-07-26 (P8-T8c)
+
+**Trigger.** First run of `dev/tests/egress-enforcement.sh` on the remote dev cluster. Baseline green
+— both server pods reachable with no policy — then, with a default-deny plus a one-entry allowlist
+applied, BOTH probes denied, including the one the allowlist explicitly names. Same script, same
+fixture pods, same policy text had been green for weeks on Kind + Calico. The verdict line read
+`egress enforcement FAILED … (HALT, Acc b)`, which is the loudest thing a security suite can print,
+and the assertion that produced it was the ALLOW.
+
+**Root cause.** The allow rule was `ipBlock: <allowed-server podIP>/32`. GKE Dataplane V2 is Cilium,
+and Cilium resolves pod-to-pod traffic by **endpoint identity**: a CIDR selector names no identity,
+so the rule selected nothing and the destination fell through to the default deny. Calico honours the
+same rule, which is why the fixture had never been wrong before. `ipBlock` is neither broken nor
+deprecated — it is the governing mechanism for addresses that have no endpoint identity, i.e.
+everything **outside** the cluster (the metadata server at 169.254.169.254, the hub CIDR). The
+production tier netpols this fixture calls itself "the same shape as" already split the two: selector
+for in-cluster, ipBlock for external. The fixture had collapsed both onto ipBlock, and exactly one
+dataplane in the world was ever going to complain about that.
+
+**Generalize.** **An over-blocking allowlist fails SAFE, so the red line it produces points at the
+fixture rather than at the policy — and the cheapest way to clear it is to stop asserting the thing
+that broke.** Relaxing that ALLOW would have left a suite that only ever proves denial, on a suite
+whose entire purpose is that a pure allowlist admits exactly what it lists: green, smaller, and
+worthless. That is [[lsn-009]] arriving through a security failure instead of through a refactor.
+Two rules follow. **(a)** A policy fixture must exercise each rule KIND against the destination CLASS
+that rule kind governs. A fixture that uses one selector for every destination is testing whichever
+dataplane interprets that selector most permissively, and it passes wherever it happens to run.
+**(b)** When a check that has been green for weeks turns red on a new substrate, the substrate is the
+first hypothesis and the fixture the second — and neither is a conclusion until it has been measured.
+This is [[lsn-006]] inverted: there, every NetworkPolicy assertion was green on a dataplane that
+enforced nothing. Here the dataplane enforces more literally than the fixture assumed. Both are one
+error — believing a policy result without knowing which dataplane produced it.
+
+**Mechanization.** **`dev/tests/egress-enforcement.sh`** §3/§4, run by `verify-phase5.sh` under
+`verify-phase7.sh`, which is line 1 of `dev/L2-CHAIN.txt`. The allowlist now carries three rules and
+each is asserted against what it actually governs: kube-system:53 for DNS, `podSelector:
+role=allowed-server` on TCP 80 for the in-cluster pair, `ipBlock: 1.1.1.1/32` on TCP 443 for the
+external pair — four assertions, two allow and two deny. The fix is portable, not conditional:
+podSelector is honoured by Calico and Cilium alike, so there is no `if dataplane` branch here to go
+stale (P4's allow-list of enforcing dataplanes is still what decides whether the suite may run at
+all). The external arm is gated on both external hosts being reachable BEFORE the policy is applied
+and is **SKIPPED, never passed** when they are not — an ipBlock deny on a cluster with no internet
+egress is not evidence, it is the ambient state. The measured numbers live in the comment block above
+the policy, because the next person to meet that red line will be looking for permission to delete
+the assertion, and the comment is what is in front of them when they do.
+
+**Verify.** Established by controlled experiment rather than by inference, on
+`gke-scratch-kube-agents-dev` (anetd / Dataplane V2), same two pods throughout: no policy =>
+REACHABLE; policy with `ipBlock: <podIP>/32` => BLOCKED; policy differing in that one rule,
+`podSelector: role=allowed-server` => REACHABLE. The first attempt at that experiment ran under zsh
+and reported all three as BLOCKED: `K="kubectl --context $C"` is not word-split there, so every probe
+was a `command not found` and every result was a false negative that happened to agree with the
+hypothesis. Re-run under `bash`, which is what produced the three lines above — a wrong shell is the
+[[lsn-021]] shape, a command that "runs" and does nothing. Post-fix the suite is 4/4 with the
+external arm live: on-allowlist in-cluster (10.68.0.53) ALLOWED, off-allowlist in-cluster
+(10.68.0.54) DENIED, on-allowlist EXTERNAL (1.1.1.1:443) ALLOWED by ipBlock, off-allowlist EXTERNAL
+(8.8.8.8:443) DENIED — `EGRESS ENFORCEMENT: PROVEN`. See also [[lsn-026]] and [[lsn-027]], the other
+two entries whose trigger was a change of substrate.
