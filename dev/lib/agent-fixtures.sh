@@ -30,6 +30,7 @@
 # Usage (source it):
 #   . "$(dirname "$0")/../lib/agent-fixtures.sh"
 #   seed_agent_fixtures "$K" <namespace> <agent-name>
+#   run_tier_fixture_pod "$K" <namespace> <pod-name> <image> <tier>
 
 # seed_agent_fixtures <kubectl-cmd> <namespace> <agent-name>
 #   Reads the object NAMES off the CR itself rather than reconstructing them, so a CR that names its
@@ -78,4 +79,47 @@ seed_agent_fixtures() {
   fi
 
   return 0
+}
+
+# run_tier_fixture_pod <kubectl-cmd> <namespace> <pod-name> <image> <tier>
+#   Creates the long-lived client pod the NetworkPolicy suites probe from. It has to carry
+#   `kube-agents/tier=<tier>` — that label is precisely what the per-tier egress policy selects on, so
+#   a fixture without it proves nothing about the policy under test.
+#
+#   Which means the fixture is ALSO in scope for `kube-agents-agent-pod-hardening`, the VAP that Denies
+#   any tier-labelled pod whose containers do not set `readOnlyRootFilesystem: true`. So the pod is
+#   rendered hardened, the same way the operator renders a real agent container. This is not a
+#   concession to the policy: a fixture standing in for an agent pod that could not itself be admitted
+#   as an agent pod was never representative of one.
+#
+#   On a disposable per-campaign cluster this never came up — nothing had applied the hardening VAP
+#   yet when the netpol suites ran. On one long-lived cluster the suites share admission state with
+#   whatever ran before them, and `verify-phase7.sh` applies that VAP and leaves it applied.
+#
+#   The refusal is REPORTED, not swallowed. The call sites used to send `kubectl run` to /dev/null and
+#   discover the outcome 180s later as "fixture never became Ready" — LSN-021's shape exactly, a
+#   command that quietly did nothing and handed its symptom to the next step. An admission denial is
+#   an answer; it belongs on stderr the moment it arrives.
+#
+#   rc 0 = the pod exists · rc 1 = the API server refused it (message on stderr).
+run_tier_fixture_pod() {
+  local K="$1" ns="$2" name="$3" img="$4" tier="$5" out
+
+  # The suites' cleanup traps delete with --wait=false, so a fast re-run can still find the previous
+  # pod Terminating. Settle that here rather than surfacing it as an AlreadyExists "refusal".
+  $K -n "$ns" delete pod "$name" --ignore-not-found --timeout=60s >/dev/null 2>&1 || true
+
+  # --override-type=strategic so the containers list merges on its `name` key: a plain JSON merge
+  # patch replaces the whole list, which would drop the image and command kubectl just generated.
+  if out="$($K -n "$ns" run "$name" --image="$img" --restart=Never \
+    --labels="kube-agents/tier=$tier" \
+    --override-type=strategic \
+    --overrides="{\"spec\":{\"containers\":[{\"name\":\"$name\",\"securityContext\":{\"readOnlyRootFilesystem\":true}}]}}" \
+    --command -- sleep 3600 2>&1)"; then
+    return 0
+  fi
+
+  echo "  fixtures: the API server REFUSED tier fixture $ns/$name — it was never created:" >&2
+  printf '    %s\n' "$out" >&2
+  return 1
 }

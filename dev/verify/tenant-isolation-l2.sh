@@ -247,8 +247,11 @@ echo
 echo "== 3) network fixtures =="
 $K -n "$NNS" run svc-intra --image="$SERVER_IMG" --restart=Never \
   --command -- python3 -m http.server 80 >/dev/null 2>&1
-$K -n "$NNS" run tier-client --image="$CLIENT_IMG" --restart=Never \
-  --labels="kube-agents/tier=$TIER" --command -- sleep 3600 >/dev/null 2>&1
+. "$(dirname "$0")/../lib/agent-fixtures.sh"
+if ! run_tier_fixture_pod "$K" "$NNS" tier-client "$CLIENT_IMG" "$TIER"; then
+  bad "the tier-labelled client fixture was refused at admission — cannot prove enforcement"
+  exit 1
+fi
 # An ordinary tenant workload, NOT tier-labelled. The allowlist does not select it; the floor does.
 # This pod is what distinguishes "the agent is contained" from "the namespace is contained".
 $K -n "$NNS" run plain-client --image="$CLIENT_IMG" --restart=Never \

@@ -212,8 +212,11 @@ serve "$CTRL_NS" svc-denied-port 9999
 # A foreign namespace — never admitted by any rule.
 serve "$TENANT_NS" svc-tenant 80
 
-$K -n "$CTRL_NS" run egress-client --image="$CLIENT_IMG" --restart=Never \
-  --labels="kube-agents/tier=$TIER" --command -- sleep 3600 >/dev/null 2>&1
+. "$(dirname "$0")/../lib/agent-fixtures.sh"
+if ! run_tier_fixture_pod "$K" "$CTRL_NS" egress-client "$CLIENT_IMG" "$TIER"; then
+  bad "the tier-labelled client fixture was refused at admission — cannot prove enforcement"
+  exit 1
+fi
 
 for spec in "$CTRL_NS/svc-allowed-port" "$CTRL_NS/svc-denied-port" "$TENANT_NS/svc-tenant" "$CTRL_NS/egress-client"; do
   if ! $K -n "${spec%%/*}" wait --for=condition=Ready "pod/${spec##*/}" --timeout=180s >/dev/null 2>&1; then

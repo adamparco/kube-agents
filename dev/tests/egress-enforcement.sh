@@ -5,8 +5,10 @@
 # egress policy actually BLOCKS an off-allowlist destination while ALLOWING an on-allowlist one — the
 # thing a shape check cannot do (verify-phase3 P3-K6 + the P5 checks judge YAML only). It uses a
 # representative in-cluster policy of the SAME shape as the production tier netpols (podSelector by tier
-# label, policyTypes:[Egress], DNS + a single ipBlock allow) so it proves the ENFORCEMENT MECHANISM,
-# not a specific production CIDR.
+# label, policyTypes:[Egress], DNS + one in-cluster allow + one external ipBlock allow) so it proves the
+# ENFORCEMENT MECHANISM, not a specific production CIDR. Why the allowlist carries both an endpoint
+# selector and an ipBlock — and why substituting one for the other silently stops proving anything on
+# Dataplane V2 — is at section 3.
 #
 # Adversarially distinguishes a REAL deny from a setup/DNS error: it first proves BOTH destinations are
 # reachable with no policy (baseline), so a later failure to reach the off-allowlist target can only be
@@ -45,6 +47,11 @@ NS="egress-test"
 TIER="egress-probe"
 ALLOWED_IMG="nginx:1.27-alpine"
 CLIENT_IMG="curlimages/curl:8.10.1"
+# Two well-known anycast resolvers, used only as TCP:443 endpoints outside the cluster. Nothing is
+# sent to them and no name is resolved through them — they are the cheapest stable pair of external
+# addresses that a pure-allowlist policy can put one of on the list and leave the other off.
+EXT_ALLOWED="1.1.1.1"
+EXT_DENIED="8.8.8.8"
 
 # Anchored allow-list: gke-scratch-* ONLY. Substring globs like *scratch* would let a prod
 # context slip through — never do that.
@@ -84,8 +91,11 @@ $K -n "$NS" run allowed-server --image="$ALLOWED_IMG" --labels="role=allowed-ser
   --port=80 >/dev/null 2>&1 || true
 $K -n "$NS" run denied-server --image="$ALLOWED_IMG" --labels="role=denied-server" \
   --port=80 >/dev/null 2>&1 || true
-$K -n "$NS" run client --image="$CLIENT_IMG" --labels="kube-agents/tier=$TIER" \
-  --command -- sleep 3600 >/dev/null 2>&1 || true
+. "$(dirname "$0")/../lib/agent-fixtures.sh"
+if ! run_tier_fixture_pod "$K" "$NS" client "$CLIENT_IMG" "$TIER"; then
+  bad "the tier-labelled client fixture was refused at admission — cannot prove enforcement"
+  exit 1
+fi
 
 for p in allowed-server denied-server client; do
   if ! $K -n "$NS" wait --for=condition=Ready "pod/$p" --timeout=120s >/dev/null 2>&1; then
@@ -100,19 +110,49 @@ if [ -z "$ALLOWED_IP" ] || [ -z "$DENIED_IP" ] || [ "$ALLOWED_IP" = "$DENIED_IP"
   bad "could not resolve two distinct server pod IPs — setup error, not a policy result"; exit 1
 fi
 
-probe() { # probe <ip> -> 0 if HTTP reachable within 4s, non-zero otherwise
-  $K -n "$NS" exec client -- curl -s -o /dev/null --max-time 4 "http://$1/" >/dev/null 2>&1
+probe() { # probe <url> -> 0 if reachable within 4s, non-zero otherwise
+  $K -n "$NS" exec client -- curl -s -o /dev/null --max-time 4 "$1" >/dev/null 2>&1
 }
 
-# --- 2) baseline (no policy): BOTH reachable -> proves networking works (real-vs-setup) ---------------
-echo "== 2) baseline with NO egress policy (both must be reachable) =="
-if probe "$ALLOWED_IP"; then pass "baseline: allowed-server reachable"; else
+# --- 2) baseline (no policy): everything reachable -> proves networking works (real-vs-setup) ---------
+echo "== 2) baseline with NO egress policy (every destination must be reachable) =="
+if probe "http://$ALLOWED_IP/"; then pass "baseline: allowed-server reachable"; else
   bad "baseline: allowed-server UNREACHABLE with no policy — setup/networking error, not a real deny"; exit 1; fi
-if probe "$DENIED_IP"; then pass "baseline: denied-server reachable"; else
+if probe "http://$DENIED_IP/"; then pass "baseline: denied-server reachable"; else
   bad "baseline: denied-server UNREACHABLE with no policy — setup/networking error, not a real deny"; exit 1; fi
 
-# --- 3) apply a tier-shaped default-deny + single-ipBlock allowlist -----------------------------------
-echo "== 3) applying default-deny + pure-allowlist egress (allow ONLY $ALLOWED_IP/32 + DNS) =="
+# The external pair is what makes the ipBlock arm below evidence rather than decoration: an ipBlock
+# deny proves nothing on a cluster with no internet egress, where every external probe fails anyway.
+# Both must be reachable first, or the whole arm is SKIPPED — never counted as a pass (09 §6).
+EXT_BASELINE=0
+if probe "https://$EXT_ALLOWED/" && probe "https://$EXT_DENIED/"; then
+  EXT_BASELINE=1
+  pass "baseline: both external hosts ($EXT_ALLOWED, $EXT_DENIED) reachable on :443"
+else
+  echo "  NOTE: no internet egress from this cluster — the ipBlock arm will be SKIPPED, not passed."
+fi
+
+# --- 3) apply a tier-shaped default-deny + pure allowlist ---------------------------------------------
+# The allowlist has two kinds of rule because the production tier netpols have two kinds, and on a
+# Cilium-family dataplane they are NOT interchangeable:
+#
+#   in-cluster destination  -> podSelector / namespaceSelector   (DNS, the control namespace)
+#   out-of-cluster address  -> ipBlock                           (metadata server, hub CIDR)
+#
+# That split is load-bearing on Dataplane V2 and was learned the hard way. This policy used to allow
+# its in-cluster destination with `ipBlock: <podIP>/32`, which Calico honours and DPv2 does not:
+# Cilium resolves pod-to-pod traffic by ENDPOINT IDENTITY, and a CIDR selector does not name an
+# identity, so the rule matched nothing and the on-allowlist probe was denied along with everything
+# else. Measured on gke-scratch-kube-agents-dev 2026-07-26: same two pods, same policy otherwise —
+# ipBlock <podIP>/32 => BLOCKED, podSelector => REACHABLE.
+#
+# The failure mode is the dangerous direction. An over-blocking allowlist fails SAFE, so the tempting
+# read of that red line is "the fixture is wrong, relax the assertion" — and relaxing it would have
+# left a check that only ever proves denial, on a suite whose entire point is that the allowlist
+# admits what it lists. Both rule kinds are therefore exercised here, each against the destination
+# class it actually governs.
+echo "== 3) applying default-deny + pure-allowlist egress (in-cluster: allowed-server by podSelector;"
+echo "      external: $EXT_ALLOWED/32 by ipBlock; plus DNS) =="
 $K apply -f - >/dev/null 2>&1 <<EOF
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -135,20 +175,36 @@ spec:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
     - to:
-        - ipBlock:
-            cidr: $ALLOWED_IP/32
+        - podSelector:
+            matchLabels:
+              role: allowed-server
       ports:
         - { protocol: TCP, port: 80 }
+    - to:
+        - ipBlock:
+            cidr: $EXT_ALLOWED/32
+      ports:
+        - { protocol: TCP, port: 443 }
 EOF
 sleep 5 # let the dataplane program the policy
 
 # --- 4) the load-bearing assertions: on-allowlist ALLOWED, off-allowlist DENIED ----------------------
 echo "== 4) enforcement assertions =="
-if probe "$ALLOWED_IP"; then pass "on-allowlist destination ($ALLOWED_IP) is ALLOWED"; else
-  bad "on-allowlist destination is BLOCKED — policy over-blocks (or the dataplane is not ready)"; fi
-if probe "$DENIED_IP"; then
+if probe "http://$ALLOWED_IP/"; then pass "on-allowlist in-cluster destination ($ALLOWED_IP) is ALLOWED"; else
+  bad "on-allowlist in-cluster destination is BLOCKED — the allowlist over-blocks: it denies what it lists"; fi
+if probe "http://$DENIED_IP/"; then
   bad "off-allowlist destination ($DENIED_IP) is REACHABLE — egress is NOT enforced (HALT: Accept b fails)"; else
-  pass "off-allowlist destination ($DENIED_IP) is DENIED (egress enforced)"; fi
+  pass "off-allowlist in-cluster destination ($DENIED_IP) is DENIED (egress enforced)"; fi
+
+if [ "$EXT_BASELINE" -eq 1 ]; then
+  if probe "https://$EXT_ALLOWED/"; then pass "on-allowlist EXTERNAL destination ($EXT_ALLOWED:443) is ALLOWED by ipBlock"; else
+    bad "on-allowlist EXTERNAL destination ($EXT_ALLOWED:443) is BLOCKED — the ipBlock allow does not admit what it names"; fi
+  if probe "https://$EXT_DENIED/"; then
+    bad "off-allowlist EXTERNAL destination ($EXT_DENIED:443) is REACHABLE — the allowlist does not bound outbound egress (HALT: Accept b fails)"; else
+    pass "off-allowlist EXTERNAL destination ($EXT_DENIED:443) is DENIED"; fi
+else
+  echo "SKIP: the ipBlock arm — no internet egress at baseline, so neither result would be evidence."
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then echo "EGRESS ENFORCEMENT: PROVEN (on-allowlist allowed, off-allowlist denied)"; else

@@ -108,6 +108,7 @@ echo "  ...: ${#MANIFESTS[@]} YAML files under examples/gitops-repo/"
 skipped=0
 deferred=0
 applied=0
+refused=0
 
 for m in "${MANIFESTS[@]}"; do
   rel="${m#"$REPO"/}"
@@ -118,6 +119,39 @@ for m in "${MANIFESTS[@]}"; do
   if ! grep -qE '^apiVersion:' "$m"; then
     echo "SKIP: $rel (no top-level apiVersion — not a Kubernetes manifest)"
     skipped=$((skipped + 1))
+    continue
+  fi
+
+  # Not every manifest in the tree is meant to APPLY. `policy/tests/*_negatives.yaml` exists to be
+  # REFUSED — it is the fixture that proves the read-only VAP still bites — so "it applied" is the
+  # failing outcome for it, not the passing one. Which question to ask is declared by the file, in a
+  # `# kube-agents/expect-denied-by: <policy>` line, for the same reason the apiVersion test above is
+  # structural: a list of excused paths maintained HERE is a list I could quietly extend the next time
+  # this goes red. The declaration is two-sided and cannot be used as an escape hatch — marking a real
+  # manifest expect-denied makes it fail the moment the API server admits it.
+  #
+  # This never fired on the old two-cluster Kind loop: the egress cluster this ran against had no VAP
+  # installed, so the negatives fixture applied cleanly and was counted as evidence of appliability.
+  # One long-lived cluster that carries the policy tree is what turned the question the right way up.
+  expect_denied_by="$(sed -n 's|^# *kube-agents/expect-denied-by: *||p' "$m" | head -1 | tr -d ' \r')"
+  if [ -n "$expect_denied_by" ]; then
+    if ! $K get validatingadmissionpolicybinding "$expect_denied_by" >/dev/null 2>&1; then
+      echo "DEFER: $rel — declares it must be refused by '$expect_denied_by', which is not bound on"
+      echo "        this cluster. Its contract is unjudgeable here. Not a pass. Needs a target with"
+      echo "        the policy tree applied (dev/cluster/up.sh applies it)."
+      deferred=$((deferred + 1))
+      continue
+    fi
+    if out="$($K apply --dry-run=server -f "$m" 2>&1)"; then
+      bad "$rel was ADMITTED — it declares it must be REFUSED by '$expect_denied_by', and that policy"
+      printf '        %s\n' "IS bound on this cluster. The policy did not fire: this is exactly the defect the fixture exists to catch."
+    elif printf '%s' "$out" | grep -q "$expect_denied_by"; then
+      pass "$rel REFUSED by '$expect_denied_by', as it declares it must be"
+      refused=$((refused + 1))
+    else
+      bad "$rel was refused, but NOT by '$expect_denied_by' — a schema or RBAC error is not evidence"
+      printf '        %s\n' "$(printf '%s' "$out" | head -4)"
+    fi
     continue
   fi
 
@@ -145,7 +179,7 @@ for m in "${MANIFESTS[@]}"; do
 done
 
 echo
-echo "  tree: $applied appliable · $deferred deferred (missing CRD) · $skipped not-a-manifest"
+echo "  tree: $applied appliable · $refused refused-as-declared · $deferred deferred · $skipped not-a-manifest"
 
 # --- 3) the installer's own rendered output ---------------------------------------------------------
 # The tree is what a human copies; render_egress_policy is what the installer actually applies. Both
@@ -198,12 +232,14 @@ if [ "$fail" -ne 0 ]; then
 fi
 
 if [ "$deferred" -gt 0 ]; then
-  echo "V-CMP-003 (L2): PROVEN for $applied of $((applied + deferred)) judgeable manifests, plus all six"
-  echo "  rendered egress policies, with the negative control firing. $deferred manifest(s) DEFERRED on a"
-  echo "  named blocker (those CRDs are on no target here) — record this as PARTIAL, not pass, and close"
-  echo "  it on a target that has those CRDs."
+  echo "V-CMP-003 (L2): PROVEN for $((applied + refused)) of $((applied + refused + deferred)) judgeable manifests"
+  echo "  ($applied appliable, $refused refused by the policy each declares), plus all six rendered egress"
+  echo "  policies, with the negative control firing. $deferred manifest(s) DEFERRED on a named blocker"
+  echo "  (those CRDs are on no target here) — record this as PARTIAL, not pass, and close it on a"
+  echo "  target that has those CRDs."
 else
-  echo "V-CMP-003 (L2): PROVEN — every shipped manifest and every rendered egress policy is appliable,"
-  echo "  and the check demonstrably rejects the un-appliable placeholder it was written for."
+  echo "V-CMP-003 (L2): PROVEN — every shipped manifest lands the way it declares it should ($applied"
+  echo "  appliable, $refused refused by the policy named in the file), every rendered egress policy is"
+  echo "  appliable, and the check demonstrably rejects the un-appliable placeholder it was written for."
 fi
 exit 0

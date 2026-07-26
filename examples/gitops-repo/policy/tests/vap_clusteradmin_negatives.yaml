@@ -2,9 +2,17 @@
 #
 # These objects MUST be REJECTED at apply time by `kube-agents-agent-readonly`
 # (examples/gitops-repo/policy/vap-agent-readonly.yaml) even if a bad RBAC PR is merged past human
-# review. They are consumed by the Kind verify harness (dev + tests/e2e/vap_negative_test.sh):
+# review. They are consumed by the dev verify harness (dev/ + tests/e2e/vap_negative_test.sh):
 # each doc is applied and the apply is expected to FAIL with the quoted VAP message — a plain apply
 # error (schema/RBAC) does NOT count, the denial must provably come from the policy.
+#
+# The line below states that contract in a form a script can read. `gitops-tree-applies-l2.sh`
+# dry-run-applies every manifest in this tree and, by default, requires it to APPLY — which is the
+# wrong question for a fixture whose entire purpose is to be refused. It asks the declared question
+# instead: refused by this exact policy => pass; admitted => FAIL, because the policy is bound and
+# did not fire; the policy absent from the target => deferred, never a pass. Declaring it here rather
+# than hard-coding a path in the checker keeps the checker from acquiring a list of excused files.
+# kube-agents/expect-denied-by: kube-agents-agent-readonly
 #
 # DO NOT let CI/CD apply this file to a real cluster's policy tree — it lives under policy/tests/ and
 # is excluded from the actuation pipeline's apply paths; it is fixture input for the negative suite.

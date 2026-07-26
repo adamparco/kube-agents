@@ -311,8 +311,8 @@ for name in "$A1" "$A2"; do
     # unschedulable/attach message, but a missing fixture or image shows up in the container's
     # waiting reason and the old message rendered it as "no message" — a failure with no cause
     # attached is the one most likely to be blamed on whatever this script is nominally testing.
-    sched="$($K -n "$NS" get pods -l "kube-agents/agent=$name" -o jsonpath='{.items[0].status.conditions[?(@.type=="PodScheduled")].message}' 2>/dev/null)"
-    waiting="$($K -n "$NS" get pods -l "kube-agents/agent=$name" -o jsonpath='{range .items[0].status.containerStatuses[*]}{.name}={.state.waiting.reason}:{.state.waiting.message}{" "}{end}' 2>/dev/null)"
+    sched="$($K -n "$NS" get pods -l "app=${name}-gateway" -o jsonpath='{.items[0].status.conditions[?(@.type=="PodScheduled")].message}' 2>/dev/null)"
+    waiting="$($K -n "$NS" get pods -l "app=${name}-gateway" -o jsonpath='{range .items[0].status.containerStatuses[*]}{.name}={.state.waiting.reason}:{.state.waiting.message}{" "}{end}' 2>/dev/null)"
     bad "$name never became Available with a second agent in the namespace: ${sched:-no scheduling message} | containers: ${waiting:-none reported}"
   fi
 done
@@ -327,8 +327,16 @@ done
 # hard-codes it in agent_manifests.go. Named explicitly rather than taken as `[0]`, because the pod
 # also carries a dashboard, fluent-bit and event-watcher, and an index would silently start
 # describing whichever of those the renderer happens to emit first.
+#
+# `app=<agent>-gateway` is the selector because it is the one the operator actually stamps —
+# agent_manifests.go sets `app` and `kube-agents/tier` on the pod template and nothing else. An
+# earlier draft of this block selected on `kube-agents/agent=<name>`, a label that exists nowhere in
+# the operator: every query returned an empty list, and the two assertions below read that as "no
+# imageID" and "two different node names" respectively. One of them failed loudly. The other PASSED,
+# because two empty strings are not equal — a check that reported the cross-node case exercised on
+# the strength of having found no pods at all.
 for name in "$A1" "$A2"; do
-  iid="$($K -n "$NS" get pods -l "kube-agents/agent=$name" \
+  iid="$($K -n "$NS" get pods -l "app=${name}-gateway" \
     -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="platform-agent")].imageID}' 2>/dev/null)"
   case "$iid" in
     *@sha256:*) pass "$name's agent container resolved to a digest on its node (${iid##*@})" ;;
@@ -338,9 +346,12 @@ for name in "$A1" "$A2"; do
 done
 
 # Same node => the RWO conflict was never actually put to the test, even with two nodes present.
-N1="$($K -n "$NS" get pods -l "kube-agents/agent=$A1" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)"
-N2="$($K -n "$NS" get pods -l "kube-agents/agent=$A2" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)"
-if [ -n "$N1" ] && [ "$N1" = "$N2" ]; then
+# Unreadable node => nothing was put to the test at all, and that is a failure, not a placement.
+N1="$($K -n "$NS" get pods -l "app=${A1}-gateway" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)"
+N2="$($K -n "$NS" get pods -l "app=${A2}-gateway" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)"
+if [ -z "$N1" ] || [ -z "$N2" ]; then
+  bad "could not read the node for one or both agent pods (A1='${N1:-none}' A2='${N2:-none}') — placement is unjudgeable, so neither the co-located NOTE nor the cross-node pass would be evidence"
+elif [ "$N1" = "$N2" ]; then
   echo "NOTE: both pods landed on '$N1'. Co-located pods share an RWO claim without error, so this"
   echo "  run did not exercise the cross-node case even though the cluster could have."
 else
