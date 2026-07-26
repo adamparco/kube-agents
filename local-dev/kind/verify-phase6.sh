@@ -30,6 +30,22 @@
 #
 # Destructive-test guard: Kind context only; chaos-suite.sh is reversible + single-object + self-cleaning.
 # Usage: local-dev/kind/verify-phase6.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). This script is an orchestrator: it runs two sub-scripts and
+# reports their exit codes. All three waivers say the same thing from three angles — it creates
+# nothing, reads nothing and judges nothing directly — and each names the script that DOES.
+#   P1 image-under-test:  none — this gate asserts nothing of its own about a running image. Its A
+#      block is chaos-suite.sh, whose C1/C2 claims are about the controller's reconcile behaviour and
+#      which asserts P1 itself; its B block is verify-phase5.sh, which delegates in turn to
+#      verify-phase{2,3}.sh, and those assert it too. The digest check belongs beside the assertion it
+#      protects, not one or two call frames above it.
+#   P3 admission-recreate: none — this script creates no object, so there is nothing here that could
+#      have been admitted under older rules. chaos-suite.sh deletes and recreates every object whose
+#      recovery it claims, and says so in its own block.
+#   P6 runtime-authoritative: none — the only artifacts this script reads are the exit codes and stdout
+#      of two sub-scripts, which it greps to surface their summary lines. It makes no claim about a
+#      config file, so the image-baked-versus-rendered-ConfigMap distinction (LSN-003) does not arise.
 set -uo pipefail
 
 CTX="${1:-kind-kube-agents-dev}"

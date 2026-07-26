@@ -52,6 +52,29 @@
 # DESTRUCTIVE-TEST GUARD (D2): only runs against a Kind context; every op is reversible + single-object; a
 # cleanup trap restores the controller replica count and removes kube-agents-chaos on any exit.
 # Usage: local-dev/kind/chaos-suite.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions).
+#   P1 image-under-test:  kubeagents-system/control-plane=controller-manager — C1 and C2 are claims
+#      ABOUT THE CONTROLLER: that it stops reconciling when it is down, resumes when it comes back, and
+#      recreates an agent Deployment it owns. There is no way to make those statements about the build
+#      in this tree without checking that the pod being scaled to zero and back is running that build.
+#      This is also the script most exposed to LSN-001, because a stale controller passes C1 and C2
+#      exactly as convincingly as a current one — the behaviour under test is old in both cases, and
+#      only the digest can tell them apart. Asserted via p1_assert_build_under_test before C1 starts.
+#      C3 and C4 use stand-ins running upstream pause and do not depend on it.
+#   P3 admission-recreate: the stand-in Deployments in kube-agents-chaos, and the real agent Deployment
+#      in kubeagents-system. The namespace is deleted and recreated at the top of every run, and the
+#      scaffold self-check asserts that a hardened tier-labeled stand-in is ADMITTED under PSS
+#      restricted plus the pod-hardening VAP — an admission claim that is only worth anything because
+#      the object is created fresh, after the labels are applied, on every run. C1/C2 then delete the
+#      real agent Deployment outright and require the controller to recreate it, so the recovery
+#      claims are about a genuinely new admission rather than a survivor (LSN-002).
+#   P6 runtime-authoritative: the live API server throughout — pod presence and Ready conditions polled
+#      across each disruption window, ownerReferences on the recreated Deployment and on the spoke pod,
+#      the installed CRD list, and the recreated agent pod's securityContext read back at the end. This
+#      script reads no file at all, so the image-baked config the operator shadows with a rendered
+#      ConfigMap (LSN-003) is out of scope by construction.
 set -uo pipefail  # -e omitted: exit codes are inspected manually.
 
 CTX="${1:-kind-kube-agents-dev}"
@@ -76,6 +99,7 @@ pass() { echo "PASS: $1"; }
 bad()  { echo "FAIL: $1"; fail=1; }
 note() { echo "  NOTE: $1"; }
 cd "$REPO_ROOT"
+. "$REPO_ROOT/local-dev/kind/lib/preconditions.sh"
 
 # ---- helpers -----------------------------------------------------------------------------------------
 CM_ORIG_REPLICAS=""
@@ -193,6 +217,16 @@ if ! $K version >/dev/null 2>&1; then
   echo "REFUSING: context '$CTX' is not reachable — the chaos suite needs a live Kind cluster." >&2
   exit 2
 fi
+
+# P1 — C1 and C2 are claims about how THIS controller behaves when it is killed and restarted. A
+# controller from three phases ago fails and recovers just as convincingly, so without the digest the
+# whole A block is a statement about unknown code (LSN-001).
+p1_assert_build_under_test "$K" "$CM_NS" control-plane=controller-manager
+case "$?" in
+  0) pass "P1: the controller about to be killed and restarted is the build under test" ;;
+  3) echo "  DEFERRED (not faked): P1 unverifiable — reason above; C1/C2 below describe an unidentified controller." ;;
+  *) bad "P1: the cluster is NOT running the build under test (LSN-001 — C1/C2 would describe other code)" ;;
+esac
 
 # Fresh chaos namespace (PSS restricted so stand-ins face the same ceiling a real agent pod does).
 $K delete ns "$CHAOS_NS" --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true

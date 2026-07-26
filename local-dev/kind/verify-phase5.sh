@@ -46,6 +46,30 @@
 # DESTRUCTIVE-TEST GUARD: the live checks only run against a Kind context. The hermetic suite runs
 # anywhere (it never touches a cluster), so this gate is CI-runnable even with no cluster reachable.
 # Usage: local-dev/kind/verify-phase5.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions).
+#   P1 image-under-test:  none for anything this script claims itself. P5-A is a stdlib scorer, P5-B
+#      and P5-C read tree YAML and go goldens, P5-D is a python suite plus a go test, and the live half
+#      exercises a ValidatingAdmissionPolicy and the CNI — the API server and the dataplane decide
+#      those, not a first-party image. The operator-image-dependent claims in a Phase-5 run all live in
+#      the REGRESSION block, inside verify-phase{2,3}.sh, and each of those asserts P1 itself against
+#      kubeagents-system/control-plane=controller-manager. Asserting it a third time here would put the
+#      check somewhere other than next to the evidence it protects, which is how it became decorative
+#      the first time. If a claim of this script's OWN ever starts depending on the operator image,
+#      this waiver stops being true and the assertion belongs here.
+#   P3 admission-recreate: the three P5-C admission probes, via `apply --dry-run=server`. A server-side
+#      dry run runs the full admission chain and persists nothing, so each of the three — unhardened
+#      agent pod rejected, hardened one admitted, non-agent pod untouched — is decided under the rules
+#      in force right now and cannot be answered by an object that was admitted under older ones
+#      (LSN-002). The VAP itself is re-applied immediately before them, and the probe then POLLS for up
+#      to ~40s so binding-activation latency reads as latency rather than as an enforcement gap.
+#   P6 runtime-authoritative: the API server for the live admission verdicts, and the CNI dataplane for
+#      the egress result. The structural checks read tree YAML deliberately: the claim in P5-B and P5-C
+#      is that every shipped tier netpol is a pure allowlist and every rendered container carries
+#      readOnlyRootFilesystem, which is a property of the artifacts kube-agents ships rather than of one
+#      cluster's current contents. No claim reads the image-baked config file that the operator shadows
+#      with a rendered ConfigMap at runtime (LSN-003).
 set -uo pipefail  # -e omitted: exit codes are inspected manually.
 
 CTX="${1:-kind-kube-agents-dev}"

@@ -720,6 +720,43 @@ def _deferral_rows() -> list[list[str]]:
     return rows
 
 
+def _closed_deferral_failures(
+    subject: str, blocker: str, promote: str, chain: str
+) -> list[str]:
+    """The LSN-019 bar, applied to a deferral that says it is over.
+
+    Deliberately the same three questions LSN-019 asks a closed lesson, in the same order, because
+    the two closures make the same claim: that a thing which used to be unverifiable is now
+    verified by something that runs. A closure backed by a paragraph is the shape LSN-007 had, and
+    that defect returned twice.
+    """
+    if not re.search(r"\d{4}-\d{2}-\d{2}", blocker):
+        return [
+            f"deferral {subject!r} is CLOSED without a closure date. When it stopped being true "
+            f"is half of what the register is for."
+        ]
+    artifacts = PATHISH.findall(promote)
+    if not artifacts:
+        return [
+            f"deferral {subject!r} is CLOSED and its promote-when column names no runnable "
+            f"artifact (only: {promote.strip() or '—'}). The column asks what would end the "
+            f"deferral; a closed row answers with the thing that did, and prose does not run."
+        ]
+    resolved = [a for a in artifacts if (REPO / a).exists()]
+    if not resolved:
+        return [
+            f"deferral {subject!r} is CLOSED naming {artifacts}, none of which exists on disk."
+        ]
+    if not any(_invoked_by(a, chain) for a in resolved):
+        return [
+            f"deferral {subject!r} is CLOSED naming {resolved}, which exist but are run by "
+            f"nothing: no line of L0-CHAIN.txt or L2-CHAIN.txt, no step of any workflow. The "
+            f"deferral was that nothing checked this; an artifact nothing invokes has not "
+            f"changed that."
+        ]
+    return []
+
+
 def check_deferrals_name_blockers() -> list[str]:
     """V-MET-006. "Deferred" is only honest when it names what it is waiting for.
 
@@ -728,6 +765,15 @@ def check_deferrals_name_blockers() -> list[str]:
     §9.6: a BLOCKING-ALWAYS check may not be deferred at all. A *level* of one may (V-CTN-020 has
     no Dataplane V2 at L3), but only when the check is green at some other level; otherwise the
     suite is unverified and the build is not shippable, whatever the row says.
+
+    A row that declares **CLOSED** is asked a different question, not excused from being asked.
+    The tempting shortcut -- skip struck-through rows -- rebuilds the exact bug `_deferral_rows`
+    was written to kill: it hands every deferral an exit that consists of typing a word. So a
+    closed row must instead clear the LSN-019 bar, which is *higher* than the one it leaves: name
+    a runnable artifact, on disk, invoked by a chain or a workflow. "Deferred" means nothing can
+    check this yet; "closed" therefore means something now does, and it has to be nameable. The
+    promote-when column is where that name goes -- the column asks what would end the deferral,
+    and for a closed row the answer is what did.
     """
     if not LEDGER.exists():
         return [f"{LEDGER.relative_to(REPO)} not found"]
@@ -740,15 +786,27 @@ def check_deferrals_name_blockers() -> list[str]:
         ]
 
     ledger_text = LEDGER.read_text()
+    chain = regress_chain_text()
     failures = []
     for cells in rows:
         _date, subject, blocker, owner, promote = cells[:5]
-        for label, value in (("blocker", blocker), ("owner", owner), ("promote-when", promote)):
+        closed = "CLOSED" in blocker.upper()
+        # Only the promote-when question changes shape when a row closes. The first draft skipped
+        # the whole loop for a closed row, and a mutation that blanked the owner of a CLOSED row
+        # went straight through: typing one word had quietly dropped two of the three questions,
+        # in a check whose own docstring promised the opposite. Who carried a deferral does not
+        # stop being a fact when it ends -- that is the half of the register history lives in.
+        asked = (("blocker", blocker), ("owner", owner))
+        if not closed:
+            asked += (("promote-when", promote),)
+        for label, value in asked:
             if not value or value in {"-", "—", "TBD", "tbd", "?"}:
                 failures.append(
                     f"deferral {subject!r} names no {label}. V-MET-006: a deferral without one "
                     f"is a failure that has been renamed rather than recorded."
                 )
+        if closed:
+            failures += _closed_deferral_failures(subject, blocker, promote, chain)
         for cid in CHECK_ID.findall(subject):
             if not cid.startswith(BLOCKING_ALWAYS):
                 continue
@@ -801,6 +859,12 @@ MIN_WAIVER_REASON = 30
 # What counts as actually re-running admission on a fresh object: the helper, an explicit delete, or
 # a server-side dry run (which admits in full and persists nothing, so nothing can be grandfathered).
 P3_BACKING = ("p3_force_recreate", " delete ", "dry-run=server")
+# The two members of P3_BACKING that are CODE IDENTIFIERS rather than English. A declaration can only
+# contain one of these on purpose, so when it does, that specific mechanism must be in the code — see
+# check_l2_scripts_declare_preconditions for why the disjunction above is not enough on its own.
+# " delete " is deliberately excluded: "deletes the Deployment" is ordinary prose, and treating the
+# word as a reference to the token would make the check fire on how a sentence is phrased.
+P3_NAMED_MECHANISMS = ("p3_force_recreate", "dry-run=server")
 # ConfigMap data keys the operator emits at runtime. A file of the same basename in the image is
 # SHADOWED by this at runtime, so reading the file is reading an input, not the artifact.
 CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
@@ -809,6 +873,27 @@ CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
 # chain left the check green over the remaining five. A floor below the real count is a check that
 # tolerates exactly the change it exists to notice.
 L2_CHAIN_FLOOR = 6
+# How many scripts the TRANSITIVE scope held when it was widened (2026-07-25, P8-T8). A separate
+# ratchet from the one above because the two guard different things: L2_CHAIN_FLOOR notices a line
+# leaving L2-CHAIN.txt, this one notices a claim-making script leaving the closure — including one
+# that leaves by being un-called, or by renaming its verdict functions, neither of which touches the
+# chain file at all.
+L2_SCOPE_FLOOR = 15
+# A script whose output is read as a verdict defines both of these. Derived rather than listed,
+# because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
+# gap this widening closed existed for five phases precisely because nobody did. Both are required:
+# up.sh and up-egress.sh provision clusters, lib/preconditions.sh is sourced for its helpers, and none
+# of the three renders a verdict that a stale image or a grandfathered object could falsify.
+VERDICT_FUNCS = (
+    re.compile(r"^\s*(?:function\s+)?pass\s*\(\)", re.MULTILINE),
+    re.compile(r"^\s*(?:function\s+)?bad\s*\(\)", re.MULTILINE),
+)
+# A reference to another shell script as it appears in code: bare, $REPO_ROOT-prefixed, or assembled
+# from a loop variable — verify-phase5.sh reaches phases 2-4 as `verify-phase$p.sh`, and a resolver
+# that only understood literals would have missed verify-phase4.sh entirely. Variables are resolved by
+# GLOB, which over-approximates; that is the safe direction for a check that fails on an ABSENT
+# declaration, since the worst case is asking a script to explain itself that did not have to.
+SCRIPT_REF = re.compile(r"(local-dev/[A-Za-z0-9_./${}-]*\.sh)")
 
 
 def _declared_preconditions(text: str) -> dict[str, str]:
@@ -848,6 +933,57 @@ def _l2_chain_scripts() -> list[Path]:
             if token.endswith(".sh"):
                 out.append(REPO / token)
     return out
+
+
+def _script_refs(text: str) -> list[Path]:
+    """Every local-dev/*.sh path this script's CODE names, with shell variables glob-expanded.
+
+    Comments are stripped first for the same reason the P1/P3 backing checks strip them: a header
+    that MENTIONS chaos-suite.sh in prose is not a script that runs it, and treating the two alike
+    would pull every script named in a "NOT covered here" paragraph into scope.
+    """
+    out: list[Path] = []
+    for ref in SCRIPT_REF.findall(_code_lines(text)):
+        if "$" in ref:
+            out.extend(sorted(REPO.glob(re.sub(r"\$\{?\w+\}?", "*", ref))))
+        else:
+            out.append(REPO / ref)
+    return out
+
+
+def _l2_scripts_in_scope() -> list[Path]:
+    """L2-CHAIN.txt's own lines, plus every claim-making script an L2 run transitively reaches.
+
+    The chain's six lines reach nine more through delegation — verify-phase7.sh runs phases 2, 3 and
+    6; phase 6 runs the chaos suite and phase 5; phase 5 runs phases 2-4; four of them run
+    negative-attenuation.sh. Those nine made L2 claims for five phases without declaring what artifact
+    they were judging, which is how verify-phase2.sh could read a pod that predated the build under
+    test and report it as evidence (LSN-002, found by this widening).
+
+    Chain lines are kept even when they do not exist, so a typo'd chain line still reaches the
+    floor and the existence check below. Transitive entries are traversed through regardless of
+    whether they render verdicts — up-egress.sh renders none but reaches two scripts that do — and
+    filtered out of the result at the end.
+    """
+    chain = _l2_chain_scripts()
+    chain_set = set(chain)
+    seen: set[Path] = set()
+    order: list[Path] = []
+    frontier = list(chain)
+    while frontier:
+        path = frontier.pop(0)
+        if path in seen:
+            continue
+        seen.add(path)
+        order.append(path)
+        if path.exists():
+            frontier.extend(_script_refs(path.read_text()))
+    return [
+        p
+        for p in order
+        if p in chain_set
+        or (p.exists() and all(r.search(p.read_text()) for r in VERDICT_FUNCS))
+    ]
 
 
 def _shadowed_basenames() -> set[str]:
@@ -897,20 +1033,29 @@ def _code_lines(text: str) -> str:
 def check_l2_scripts_declare_preconditions() -> list[str]:
     """LSN-001/002/003. Every L2 script says which artifact it is judging, and proves it.
 
-    Scoped to the lines of L2-CHAIN.txt, NOT to their transitive callees. verify-phase{2..6}.sh and
-    chaos-suite.sh are reached through verify-phase7.sh and are not covered here — determining their
-    real preconditions means reading each one, and a declaration written on a script's behalf by its
-    caller is a guess wearing the costume of a fact. That gap is a recorded deferral in
-    docs/build/LEDGER.md with an owner and a promotion condition; it is not a silent cap.
+    Scoped to the TRANSITIVE closure of L2-CHAIN.txt, not just its lines. It was chain-only until
+    2026-07-25, on the argument that a declaration written on a script's behalf by its caller is a
+    guess wearing the costume of a fact — which is true, and was an argument for reading the nine
+    delegated scripts, not for leaving them unasked. P8-T8 read them. Two turned out to be reporting
+    a pod that could predate the build under test as though it were evidence about it.
     """
-    scripts = _l2_chain_scripts()
-    if len(scripts) < L2_CHAIN_FLOOR:
+    chain = _l2_chain_scripts()
+    scripts = _l2_scripts_in_scope()
+    if len(chain) < L2_CHAIN_FLOOR:
         return [
-            f"VACUOUS: resolved {len(scripts)} scripts from {L2_CHAIN.relative_to(REPO)}; there "
+            f"VACUOUS: resolved {len(chain)} scripts from {L2_CHAIN.relative_to(REPO)}; there "
             f"were {L2_CHAIN_FLOOR} when this was written. A line left the chain, or the chain "
             f"format changed and this check went quiet over the scripts it stopped seeing. "
             f"Retiring an L2 check is a deliberate act (V-MET-004) — raise or lower this floor "
             f"in the same commit that changes the chain, never afterwards."
+        ]
+    if len(scripts) < L2_SCOPE_FLOOR:
+        return [
+            f"VACUOUS: the L2 closure resolved to {len(scripts)} claim-making scripts; there were "
+            f"{L2_SCOPE_FLOOR} when the scope was widened. Something stopped being reachable, "
+            f"stopped existing, or stopped looking like a verdict-renderer (pass()/bad()) — and "
+            f"each of those is a script whose preconditions this check quietly stopped asking "
+            f"about. Move this floor in the same commit that removes the script, never afterwards."
         ]
 
     shadowed = _shadowed_basenames()
@@ -976,6 +1121,21 @@ def check_l2_scripts_declare_preconditions() -> list[str]:
                 f"exists, so the claim would be about the rules in force when the object was "
                 f"created (LSN-002)."
             )
+        # LSN-023, one level deeper than the P1 rule above. The disjunction is satisfied by ANY
+        # delete in the file, including a cleanup that runs only after an assertion has already
+        # failed — measured 2026-07-25 by deleting verify-phase3.sh's p3_force_recreate call, which
+        # the gate did not notice because line 85 tears down a rejected fixture. So: whatever
+        # mechanism the declaration NAMES, the code must contain that one. A block saying
+        # "p3_force_recreate deletes the Deployment" is a claim about a specific call, and a check
+        # that reads the claim should be able to tell whether the call is there.
+        for mech in P3_NAMED_MECHANISMS:
+            if mech in p3 and mech not in code:
+                failures.append(
+                    f"{rel} declares P3 by naming {mech!r}, which appears nowhere in its code. "
+                    f"Some other delete in the file satisfies the general backing test, so this "
+                    f"would otherwise read as green while the mechanism the declaration promised "
+                    f"is absent (LSN-002/LSN-023)."
+                )
 
         p6 = declared["P6"]
         for base in shadowed:
@@ -987,6 +1147,168 @@ def check_l2_scripts_declare_preconditions() -> list[str]:
                     f"into a ConfigMap and mounts OVER the image-baked copy. The file is an input; "
                     f"the ConfigMap is the artifact that runs (LSN-003). Name the rendered one."
                 )
+    return failures
+
+
+# ---------------------------------------------------------------------------------------------
+# P9 — an assertion on controller-written state is reached by polling, never by waiting a while
+# ---------------------------------------------------------------------------------------------
+
+# A `.status` subtree is written by a controller, asynchronously, after the object is accepted. Any
+# read of one is therefore a race unless something synchronises it, and the two primitives that do
+# are a bounded poll and `kubectl wait --for=`. A `sleep` is neither: it encodes a guess about a
+# controller's latency, and the guess is re-made every time the cluster is slower than the day the
+# number was chosen.
+#
+# Written after two live instances on 2026-07-25, both in tenant-isolation-l2.sh. `.status.hard`
+# was read with no wait at all, so on the Calico cluster -- where the quota controller took 21s and
+# five polls -- the check reported the quota as capping NOTHING on all five axes while the very
+# next section of the same run proved it binds. Five lines below, `.status.used` was read after a
+# flat `sleep 3` against that same 21s controller, and had been passing on luck.
+#
+# The rule is deliberately about the READ and not about `sleep`. A ban on bare sleeps would flag
+# the seven "let Calico program the policy" waits in this corpus, where no readiness field exists
+# to poll and the sleep is the honest primitive -- a lint whose findings are mostly legitimate is
+# one that teaches people to write exemptions.
+STATUS_READ = re.compile(r"jsonpath=.\{\.status\.")
+LOOP_OPEN = re.compile(r"(^|\s)(for|while|until)\b.*;\s*do\s*$|(^|\s)do\s*$")
+LOOP_CLOSE = re.compile(r"^\s*done\b")
+KUBECTL_WAIT = re.compile(r"\bwait\s+--for=")
+FUNC_OPEN = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w-]*)\s*\(\)\s*\{")
+# Below this the regex has stopped matching and the check has stopped checking. A floor rather than
+# an exact ratchet, unlike the assertion count: how MANY status reads the corpus makes is not
+# itself a property worth defending -- that none of them is unsynchronised is.
+L2_STATUS_READ_FLOOR = 6
+
+
+def _lines_inside_loops(lines: list[str]) -> tuple[list[bool], dict[str, bool]]:
+    """For each line: is it inside a loop body? And: which functions are CALLED from inside one?
+
+    The second half exists for `chaos-suite.sh`'s `is_ready()`, which reads a pod's Ready condition
+    and is correct precisely because both of its call sites are poll loops. Judging the read by the
+    function it sits in would flag it; judging it by how the function is used is the real question.
+    """
+    in_loop, depth = [], 0
+    for line in lines:
+        code = "" if line.strip().startswith("#") else line.split(" #")[0]
+        if LOOP_CLOSE.search(code):
+            depth = max(0, depth - 1)
+        in_loop.append(depth > 0)
+        if LOOP_OPEN.search(code):
+            depth += 1
+    called_in_loop: dict[str, bool] = {}
+    for i, line in enumerate(lines):
+        code = "" if line.strip().startswith("#") else line.split(" #")[0]
+        m = FUNC_OPEN.match(code)
+        if m:
+            called_in_loop.setdefault(m.group(1), False)
+    for name in called_in_loop:
+        for i, line in enumerate(lines):
+            code = "" if line.strip().startswith("#") else line.split(" #")[0]
+            if FUNC_OPEN.match(code):
+                continue
+            if re.search(rf"\b{re.escape(name)}\b", code) and in_loop[i]:
+                called_in_loop[name] = True
+                break
+    return in_loop, called_in_loop
+
+
+def check_l2_status_reads_are_polled() -> list[str]:
+    """Precondition P9. Controller-written state is polled for, not slept on."""
+    scripts = [p for p in _l2_scripts_in_scope() if p.exists()]
+    failures, total = [], 0
+    for p in scripts:
+        lines = p.read_text().splitlines()
+        in_loop, called_in_loop = _lines_inside_loops(lines)
+        enclosing = None
+        for i, line in enumerate(lines):
+            code = "" if line.strip().startswith("#") else line.split(" #")[0]
+            m = FUNC_OPEN.match(code)
+            if m:
+                enclosing = m.group(1)
+            elif code.strip() == "}":
+                enclosing = None
+            if not STATUS_READ.search(code):
+                continue
+            total += 1
+            if in_loop[i] or called_in_loop.get(enclosing or "", False):
+                continue
+            if KUBECTL_WAIT.search("\n".join(lines[max(0, i - 20) : i])):
+                continue
+            failures.append(
+                f"{p.relative_to(REPO)}:{i + 1} reads a `.status` field with nothing "
+                f"synchronising it — no enclosing poll, no `kubectl wait --for=` above it. A "
+                f"controller writes that subtree after admission, so an unsynchronised read "
+                f"returns whatever has landed so far, and an empty one is indistinguishable from "
+                f"the property genuinely being absent."
+            )
+    if total < L2_STATUS_READ_FLOOR:
+        return [
+            f"VACUOUS: found {total} `.status` reads across {len(scripts)} L2 scripts; there were "
+            f"10 when this was written. The pattern stopped matching, so every read now looks "
+            f"synchronised by virtue of being invisible."
+        ]
+    return failures
+
+
+# ---------------------------------------------------------------------------------------------
+# P3, second half — a pod under an admission assertion is reached by ownership, not by selector
+# ---------------------------------------------------------------------------------------------
+
+# `p3_force_recreate` returns the moment the DEPLOYMENT's uid changes. Its pods are garbage-collected
+# after that, asynchronously, so the pod belonging to the generation P3 has just deleted is still
+# listed -- and still carries no deletionTimestamp to filter on -- at the instant the caller starts
+# looking. A selector poll therefore hands back the OLD pod, which is the exact object P3 exists to
+# keep the assertion away from, and an `.items[N]` read re-resolves that changing list once per field.
+#
+# Written after verify-phase3.sh failed 2 runs in 3 on 2026-07-25. Every failure was an EMPTY read
+# (`pod SA is ''`, `pod image ''`), never a wrong value; one run read the SA successfully and then got
+# '' for the image and the tier one kubectl call later, as GC removed the pod mid-sequence.
+# verify-phase2.sh carried a byte-identical block and was green purely because GC happened to be
+# quicker there -- the defect and the luck are indistinguishable from inside a passing run. That was
+# the third instance in one day of `.items[0]`-after-a-selector being a guess, the first having been
+# in P1's own pod read, which is the point at which this harness stops fixing instances.
+#
+# The rule is scoped to scripts that call `p3_force_recreate`, and deliberately not to every
+# `.items[` in the corpus. Reading `.items[0]` off `get nodes` on a single-node Kind is a different
+# and much weaker claim, and a lint whose findings are mostly legitimate is one that teaches people to
+# write exemptions. Where the script has just deleted one generation of a workload and is about to
+# assert on the next, the index is never defensible.
+P3_RECREATE_CALL = re.compile(r"(?<![\w-])p3_force_recreate\s+\S")
+ITEMS_INDEX_READ = re.compile(r"jsonpath=.\{\.items\[")
+# Two callers today. A floor rather than a ratchet: how many suites force-recreate is not itself a
+# property worth defending, but a rule that applies to nothing has stopped being evidence (V-MET-014).
+P3_RECREATE_CALLER_FLOOR = 2
+
+
+def check_p3_pods_resolved_by_ownership() -> list[str]:
+    """Precondition P3. A script that force-recreates resolves pods by ownership, not by list index."""
+    callers, failures = [], []
+    for p in sorted(_l2_scripts_in_scope()):
+        if not p.exists():
+            continue
+        lines = p.read_text().splitlines()
+        code = ["" if ln.strip().startswith("#") else ln.split(" #")[0] for ln in lines]
+        if not any(P3_RECREATE_CALL.search(c) for c in code):
+            continue
+        callers.append(p)
+        for i, c in enumerate(code):
+            if ITEMS_INDEX_READ.search(c):
+                failures.append(
+                    f"{p.relative_to(REPO)}:{i + 1} indexes into `.items[]` in a script that calls "
+                    f"`p3_force_recreate`. The recreate returns when the Deployment's uid changes, "
+                    f"not when its old pods are gone, so that list still contains the generation P3 "
+                    f"just deleted — and re-resolving it per field lets GC empty it mid-sequence. "
+                    f"Resolve the pod once with `p3_pod_of_deploy` and read every field from that "
+                    f"name (LSN-024)."
+                )
+    if len(callers) < P3_RECREATE_CALLER_FLOOR:
+        return [
+            f"VACUOUS: only {len(callers)} script(s) in the L2 scope call `p3_force_recreate`; there "
+            f"were {P3_RECREATE_CALLER_FLOOR} when this was written. Either the precondition stopped "
+            f"being used or the call pattern stopped matching, and in both cases this check is now "
+            f"reporting green about nothing."
+        ]
     return failures
 
 
@@ -1004,6 +1326,8 @@ CHECKS = [
         check_l2_scripts_declare_preconditions,
     ),
     ("invariant 13 / LSN-019 — closed lessons are executable", check_closed_lessons_are_executable),
+    ("P9 — `.status` reads are polled, not slept on", check_l2_status_reads_are_polled),
+    ("P3 — recreated pods are resolved by ownership", check_p3_pods_resolved_by_ownership),
     ("L0 chain is runnable and wired to CI", check_l0_chain_is_runnable),
 ]
 

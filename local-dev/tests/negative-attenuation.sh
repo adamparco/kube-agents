@@ -9,6 +9,24 @@
 #
 # DESTRUCTIVE-TEST GUARD: only runs against a Kind or scratch-GKE context.
 # Usage: local-dev/tests/negative-attenuation.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions). This script is the read-only ceiling's load-bearing
+# negative, and four different gates delegate to it (verify-phase2 V-K2, verify-phase3 P3-K5,
+# verify-phase4 and verify-phase5 regressions), so each of them can only waive P3 by pointing here.
+#   P1 image-under-test:  none — no first-party image is on the path of any claim. The policy under
+#      test is a ValidatingAdmissionPolicy applied from the working tree by this script, and the
+#      component that enforces it is the API server's own CEL evaluator. Neither the operator nor an
+#      agent container participates, so a stale image cannot make a denial look like an admission.
+#   P3 admission-recreate: the four Roles/ClusterRoles below. Each is applied INSIDE the run and after
+#      the VAP, so every verdict is rendered by the policy as it exists in this tree; each is deleted
+#      again on the way out, including on the unexpected-admit path, so a leaked object from a previous
+#      run cannot turn a later run's create into an update against stale bytes. This is what lets the
+#      gates above declare their own P3 as "none — owned by negative-attenuation.sh" honestly.
+#   P6 runtime-authoritative: the API server's admission response itself, not a rendered manifest — and
+#      the check is adversarial about which one it got: a non-zero exit is only accepted as a denial
+#      when the message matches the policy's own text, so a malformed object or an unrelated webhook
+#      cannot be read as the attenuation working.
 set -uo pipefail  # -e omitted deliberately: kubectl exit codes are inspected manually below.
 
 CTX="${1:-kind-kube-agents-dev}"

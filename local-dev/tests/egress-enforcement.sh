@@ -16,6 +16,24 @@
 # Exit codes: 0 = enforcement PROVEN; 1 = enforcement FAILED (halt condition); 3 = DEFERRED (no
 # NetworkPolicy-enforcing CNI reachable — not faked green; stand up local-dev/kind/kind-calico.yaml).
 # Usage: local-dev/tests/egress-enforcement.sh [kube-context]
+#
+# PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
+# check_l2_scripts_declare_preconditions).
+#   P1 image-under-test:  none — the two fixture servers are upstream nginx and the client is upstream
+#      curl, chosen precisely so that nothing about kube-agents' own build can influence the result.
+#      The subject of the claim is the CNI's NetworkPolicy implementation, and it is asserted through a
+#      packet, not through a rendered manifest, so no first-party digest is on the path.
+#   P3 admission-recreate: none, and the reason is a real distinction rather than a convenience.
+#      NetworkPolicy is not an admission control: the CNI evaluates it per-connection for as long as
+#      the policy exists, so a policy applied AFTER a pod is already running still governs that pod.
+#      That is exactly why the baseline-then-apply-then-reprobe ordering here is valid, and it is the
+#      same ordering that would be invalid for an admission claim (LSN-002). The namespace is deleted
+#      and recreated each run anyway, so no fixture survives to be grandfathered.
+#   P6 runtime-authoritative: the dataplane result — an HTTP probe from inside the client pod to two
+#      live pod IPs — plus the baseline that proves both were reachable before the policy existed. That
+#      baseline is what makes the artifact authoritative rather than merely live: without it, a DNS or
+#      scheduling failure would present as a successful deny. P4 also applies and is enforced in code:
+#      absent calico-node this exits 3 (DEFERRED), never 0.
 set -uo pipefail # -e omitted deliberately: kubectl/exec exit codes are inspected manually.
 
 CTX="${1:-kind-kube-agents-egress}"

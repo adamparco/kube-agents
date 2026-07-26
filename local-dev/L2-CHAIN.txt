@@ -11,12 +11,20 @@
 # anchored `case` on kind-* / gke-scratch-* and invariants-gate.py asserts it stays anchored —
 # a substring match is LSN-005, and the live GKE cluster is one `*` away.
 #
-# Every line takes the context as its one argument, and NOT every line takes the same one. There
-# are two Kind targets on purpose: `kind-kube-agents-dev` runs kindnet, `kind-kube-agents-egress`
-# runs Calico, and precondition P4 says an egress claim is `deferred` and never `pass` on kindnet.
-# So the egress and gitops/tenant lines want the Calico cluster; the rest are happy on either.
+# Every line CARRIES its own context, and not every line carries the same one. There are two Kind
+# targets on purpose: `kind-kube-agents-dev` runs kindnet and hosts the operator, while
+# `kind-kube-agents-egress` runs Calico and hosts no operator — and precondition P4 says an egress
+# claim is `deferred` and never `pass` on kindnet, so neither target can serve the whole file.
 #
-# Run (Calico target):  while read -r c; do eval "$c kind-kube-agents-egress"; done < local-dev/L2-CHAIN.txt
+# The context used to be appended by the runner, and the run line below said "Calico target". That
+# was a single-definition-site violation dressed as a convenience: the paragraph here explained
+# that the targets differ and then handed the reader one loop that gave every line the same one.
+# Followed literally on 2026-07-25, it sent `closed-allowlist-l2.sh` and `multi-agent-namespace-l2.sh`
+# at the operator-less cluster, where both correctly returned P1-UNVERIFIABLE (rc 3) — two of six
+# lines silently not run, and only visibly so because P1 refuses to guess. A default target is a
+# guess about which cluster a check needs; the check knows, so the line says.
+#
+# Run:  while read -r c; do case "$c" in ''|\#*) continue ;; esac; eval "$c"; done < local-dev/L2-CHAIN.txt
 #
 # Precondition P1 applies to every line: rebuild -> `kind load` -> `rollout restart` -> assert the
 # running imageID digest equals the build under test. A green here against a stale image is
@@ -27,11 +35,14 @@
 # chaos C1-C4, 03 §11 negative attenuation, the goldens and `go test ./...`. It is listed FIRST
 # because a phase's new L2 evidence is worth nothing if it was gathered on a cluster where the
 # previous phases had already broken.
-bash local-dev/kind/verify-phase7.sh
+bash local-dev/kind/verify-phase7.sh kind-kube-agents-dev
 
 # --- Phase 8 L2 checks ------------------------------------------------------------------------
-bash local-dev/kind/egress-enforcement-l2.sh
-bash local-dev/kind/tenant-isolation-l2.sh
-bash local-dev/kind/closed-allowlist-l2.sh
-bash local-dev/kind/gitops-tree-applies-l2.sh
-bash local-dev/kind/multi-agent-namespace-l2.sh
+# Target column, and why each one: `-egress` where the claim is about a dataplane enforcing
+# something (P4), `-dev` where the claim is about the operator or its webhook, which only that
+# cluster runs.
+bash local-dev/kind/egress-enforcement-l2.sh kind-kube-agents-egress
+bash local-dev/kind/tenant-isolation-l2.sh kind-kube-agents-egress
+bash local-dev/kind/closed-allowlist-l2.sh kind-kube-agents-dev
+bash local-dev/kind/gitops-tree-applies-l2.sh kind-kube-agents-egress
+bash local-dev/kind/multi-agent-namespace-l2.sh kind-kube-agents-dev

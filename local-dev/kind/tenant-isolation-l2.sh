@@ -131,7 +131,25 @@ else
   exit 1
 fi
 
-HARD="$($K -n "$QNS" get resourcequota "${QNS}-quota" -o jsonpath='{.status.hard}' 2>/dev/null)"
+# `.status.hard` and not `.spec.hard`, because P6 wants the artifact the runtime acknowledged
+# rather than the one we asked for -- but status is written by the quota controller, so it is
+# EMPTY for a while after the apply and this read had no wait at all. On 2026-07-25 that raced:
+# the same quota that section 2 proves binds (a 200-CPU pod refused, `used.requests.cpu=500m`
+# accounted) was reported here as capping NOTHING on all five axes. Measured on the Calico
+# cluster, status took 21s and five polls to appear; on the faster dev cluster the unwaited read
+# won often enough to look green. A check that reports "caps nothing" about a working quota is
+# worse than one that is simply slow -- and it fails in the safe direction only by luck, since
+# the identical empty read is what a genuinely empty quota returns.
+HARD=""
+for _i in $(seq 1 60); do
+  HARD="$($K -n "$QNS" get resourcequota "${QNS}-quota" -o jsonpath='{.status.hard}' 2>/dev/null)"
+  [ -n "$HARD" ] && break
+  sleep 1
+done
+if [ -z "$HARD" ]; then
+  bad "the quota controller never populated .status.hard in 60s — the quota object exists but"
+  bad "  nothing has acknowledged it, so it caps nothing yet. Not a slow read; an unenforced quota."
+fi
 note "hard: $HARD"
 for k in '"requests.cpu"' '"requests.memory"' '"limits.cpu"' '"limits.memory"' '"pods"'; do
   if printf '%s' "$HARD" | grep -q "$k"; then
@@ -184,8 +202,16 @@ fi
 $K -n "$QNS" run q-real --image="$SERVER_IMG" --restart=Never \
   --overrides="{\"spec\":{\"containers\":[{\"name\":\"c\",\"image\":\"$SERVER_IMG\",\"command\":[\"sleep\",\"3600\"],\"resources\":$FITS}]}}" \
   >/dev/null 2>&1
-sleep 3
-USED_CPU="$($K -n "$QNS" get resourcequota "${QNS}-quota" -o jsonpath='{.status.used.requests\.cpu}' 2>/dev/null)"
+# Poll rather than `sleep 3`. `used` is quota-controller output like `hard` above, and the same
+# 21 s that field took on this cluster would have blown straight through a three-second sleep. It
+# has been passing on luck: a fixed sleep encodes a guess about a controller's latency, and the
+# guess is re-made every time the cluster is slower than the day the number was chosen.
+USED_CPU=""
+for _i in $(seq 1 60); do
+  USED_CPU="$($K -n "$QNS" get resourcequota "${QNS}-quota" -o jsonpath='{.status.used.requests\.cpu}' 2>/dev/null)"
+  [ "$USED_CPU" = "500m" ] && break
+  sleep 1
+done
 if [ "$USED_CPU" = "500m" ]; then
   pass "quota accounting tracks the admitted pod (used.requests.cpu=$USED_CPU)"
 else
