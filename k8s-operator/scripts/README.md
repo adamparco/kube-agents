@@ -168,11 +168,12 @@ Cloud Build (`make cloud-build-push` from the repo root), which builds natively 
 pushes straight to Artifact Registry.
 
 **Images push to a registry the cluster never pulls from.** The root `Makefile` defaults to
-`LOCATION ?= us-central1`. If your cluster and Artifact Registry live elsewhere you must pass it
-explicitly, or the push silently succeeds into the wrong region:
+`LOCATION ?= us-east4`, where this project's Artifact Registry repo lives. If your cluster and
+Artifact Registry live elsewhere you must pass it explicitly, or the push silently succeeds into
+the wrong region:
 
 ```bash
-make docker-push LOCATION=us-east4
+make docker-push LOCATION=us-central1
 ```
 
 **The deploy runs published images even though you built from source.** `make deploy` falls back

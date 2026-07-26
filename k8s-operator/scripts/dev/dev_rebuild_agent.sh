@@ -97,6 +97,10 @@ DEV_TAG="dev-$(date +%Y%m%d-%H%M%S)"
 IMAGE_BASE="$REGION-docker.pkg.dev/$PROJECT_ID/$GCP_ARTIFACT_REGISTRY_REPO_NAME/$IMAGE_NAME"
 IMAGE_URI="$IMAGE_BASE:$DEV_TAG"
 IMAGE_URI_LATEST="$IMAGE_BASE:latest"
+# The Cloud Build path caches against :buildcache, not :latest. deploy/docker/cloudbuild.yaml
+# deliberately retired :latest as a cache tag because it was mutable AND looked deployable AND was
+# listed in `images:`, so a cache write republished something a cluster could pull.
+IMAGE_URI_CACHE="$IMAGE_BASE:buildcache"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -128,12 +132,12 @@ execute_image_build() {
     docker push "$IMAGE_URI_LATEST" || return 1
   else
     print_info "Submitting build for '$AGENT_TARGET' agent to Google Cloud Build..."
-    print_info "Target Images: $IMAGE_URI and $IMAGE_URI_LATEST"
+    print_info "Target image: $IMAGE_URI (cache: $IMAGE_URI_CACHE)"
     (
       cd "${REPO_ROOT}"
       gcloud builds submit \
           --config="deploy/docker/cloudbuild.yaml" \
-          --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
+          --substitutions="_IMAGE_URI=${IMAGE_URI},_CACHE_URI=${IMAGE_URI_CACHE},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
           --project="${PROJECT_ID}" \
           .
     ) || return 1

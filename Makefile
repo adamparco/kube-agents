@@ -1,6 +1,10 @@
 include tags.env
 
-LOCATION ?= us-central1
+# The Artifact Registry region. This is not a free choice: it must match where the `kube-agents`
+# repo actually exists, or every push here lands somewhere the cluster never pulls from. For
+# adamparco-kage that is us-east4 -- `gcloud artifacts repositories describe kube-agents
+# --location=us-central1` returns NOT_FOUND, which is what made `cloud-build-push` a no-op path.
+LOCATION ?= us-east4
 REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core/project)/kube-agents)$(REPO)
 
 BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
