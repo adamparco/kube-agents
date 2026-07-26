@@ -3,9 +3,9 @@
 # The per-tier DEFAULT-DENY egress NetworkPolicy for an agent pod (03 §9/§10), rendered by
 # `provision_13_apply_network_policies.sh` and applied by it. THIS FILE IS THE SOURCE. Two sets of
 # copies are DERIVED from it and must never be hand-edited: the committed exemplars under
-# examples/gitops-repo/ (checked byte-for-byte by local-dev/tests/reference-render.py) and, where one
+# examples/gitops-repo/ (checked byte-for-byte by dev/tests/reference-render.py) and, where one
 # exists, the matching propose-developer-team skill asset with the tenant namespace parameterised
-# (checked by local-dev/test_skill_templates.py). Edit this template, then regenerate both.
+# (checked by dev/test_skill_templates.py). Edit this template, then regenerate both.
 #
 # SHAPE = PURE ALLOWLIST. `policyTypes: [Egress]` plus a podSelector makes egress default-deny for the
 # selected pods; only what is listed is reachable. There is deliberately NO 0.0.0.0/0 rule: a broad

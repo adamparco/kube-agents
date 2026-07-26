@@ -159,7 +159,7 @@ phases (0–7) delivered and merged to `main`**, each as its own PR with green C
 
 Verification ran on a live Kind cluster (inner loop) with scratch-cloud checks flagged and deferred
 where infra wasn't provisioned — **deferred, never faked.** Each phase left a consolidated,
-re-runnable gate script (`local-dev/kind/verify-phase<N>.sh`) so any phase can be re-verified later.
+re-runnable gate script (`dev/verify/verify-phase<N>.sh`) so any phase can be re-verified later.
 
 **The autonomy caught real bugs.** A pre-PR adversarial review gate on Phase 0 (22 agents, 17 findings
 → 5 confirmed → 4 fixed and re-verified) found two genuine security defects before they shipped:

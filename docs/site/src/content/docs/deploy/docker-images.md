@@ -45,7 +45,7 @@ pins a first-party image pins that value. Cutting a release is therefore two ste
 whose git tag disagrees with `tags.env`, so the version a user pins and the version actually
 published cannot drift apart.
 
-This is enforced offline, on every PR, by `local-dev/test_image_provenance.py` (check **V-CMP-002**):
+This is enforced offline, on every PR, by `dev/test_image_provenance.py` (check **V-CMP-002**):
 it joins the set of `(image, tag)` pairs referenced anywhere in the tree against the set the
 workflows produce, and fails on any reference to an image no workflow builds or a tag no workflow
 publishes. It exists because both halves of that join were broken at once — three images had

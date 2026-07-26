@@ -22,7 +22,7 @@ target using the customer's pipeline of choice._
   privileged writer (03 §4); adding it introduces no new write path from any agent
   ([`docs/build/phase-7.md`](../../../docs/build/phase-7.md) D4).
 
-`local-dev/tests/circleci-parity.py` asserts all of the above against `apply.yml` (dispatch parity +
+`dev/tests/circleci-parity.py` asserts all of the above against `apply.yml` (dispatch parity +
 main-only trigger + per-target contexts + no static key), plus a malformed-config negative control.
 
 ## Deferred-not-faked

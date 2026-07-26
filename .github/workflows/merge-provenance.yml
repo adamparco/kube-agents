@@ -7,7 +7,7 @@ name: Merge Provenance
 # record of the check runs against the merged PR's head SHA. So this runs AFTER a merge lands, and
 # on a schedule so that a merge made while Actions was degraded still gets looked at.
 #
-# It is not in local-dev/L0-CHAIN.txt on purpose: L0 means no cluster and no network, and the
+# It is not in dev/L0-CHAIN.txt on purpose: L0 means no cluster and no network, and the
 # evidence for this check is only reachable over the API. Putting it there would make every offline
 # L0 run report a failure it cannot fix, and the chain would stop being run.
 on:
@@ -46,7 +46,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
-          python3 local-dev/tests/merge-provenance.py
+          python3 dev/tests/merge-provenance.py
           status=$?
           case "$status" in
             0) echo "merge provenance green" ;;

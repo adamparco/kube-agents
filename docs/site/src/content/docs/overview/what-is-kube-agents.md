@@ -50,7 +50,7 @@ Once the [provisioning script](/kube-agents/install/quickstart-gke/) finishes, y
 ## What is _not_ included
 
 - **No Helm chart yet** — [PR #353](https://github.com/gke-labs/kube-agents/pull/353) is proposing one. Today, install is via `./provision.sh` + Kustomize.
-- **No local Kind path yet** — same PR proposes `local-dev/setup-kind.sh`. Today you need a real cluster.
+- **No local Kind path yet** — same PR proposes `dev/setup-kind.sh`. Today you need a real cluster.
 - **No web UI or CLI beyond `kubectl` port-forward + the Hermes API** — chat is the primary user interface.
 - **No cross-cloud abstractions** — the shipping MCP toolset, IAM assumptions, and provisioning scripts all target GKE. The runtime and persona are cluster-agnostic; the skill catalog is not.
 

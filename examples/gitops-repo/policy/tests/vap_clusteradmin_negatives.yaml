@@ -2,7 +2,7 @@
 #
 # These objects MUST be REJECTED at apply time by `kube-agents-agent-readonly`
 # (examples/gitops-repo/policy/vap-agent-readonly.yaml) even if a bad RBAC PR is merged past human
-# review. They are consumed by the Kind verify harness (local-dev + tests/e2e/vap_negative_test.sh):
+# review. They are consumed by the Kind verify harness (dev + tests/e2e/vap_negative_test.sh):
 # each doc is applied and the apply is expected to FAIL with the quoted VAP message — a plain apply
 # error (schema/RBAC) does NOT count, the denial must provably come from the policy.
 #

@@ -9,7 +9,7 @@ name: L0 Checks
 # LSN-007 ("built, tested, and unreachable") aimed at the verification machinery itself: the checks
 # existed, passed, and could not fail a pull request.
 #
-# The command list lives in local-dev/L0-CHAIN.txt, not here. One definition site (V-MET-013), read
+# The command list lives in dev/L0-CHAIN.txt, not here. One definition site (V-MET-013), read
 # by this workflow, by the harness REGRESS step, and by invariants-gate.py -- which fails if a
 # lesson marked `closed` names an artifact that appears in no line of it.
 on:
@@ -58,7 +58,7 @@ jobs:
               failed=$((failed + 1))
             fi
             echo "::endgroup::"
-          done < local-dev/L0-CHAIN.txt
+          done < dev/L0-CHAIN.txt
 
           echo
           if [ "$failed" -ne 0 ]; then

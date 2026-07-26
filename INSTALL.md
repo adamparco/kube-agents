@@ -336,13 +336,13 @@ Kind/scratch-GKE contexts so it can never touch a real cluster:
 
 ```bash
 # operator (controller + webhook): build kube-agents/k8s-operator:dev, load it, restart the controller
-local-dev/kind/reload-images.sh operator kind-kube-agents-dev
+dev/cluster/reload-images.sh operator kind-kube-agents-dev
 
 # agent images: build kube-agents/<tier>-agent:latest and load them
-local-dev/kind/reload-images.sh agents   kind-kube-agents-dev
+dev/cluster/reload-images.sh agents   kind-kube-agents-dev
 
 # both
-local-dev/kind/reload-images.sh all      kind-kube-agents-dev
+dev/cluster/reload-images.sh all      kind-kube-agents-dev
 ```
 
 Two rules the helper encodes so you don't get silently-stale results:
@@ -384,7 +384,7 @@ and the **spoke bootstrap** ordered apply waves. Verify the whole inner loop on 
    ```
 3. **Run the consolidated verification gate** (destructive; guarded to Kind contexts only):
    ```bash
-   local-dev/kind/verify-phase2.sh kind-kube-agents-dev
+   dev/verify/verify-phase2.sh kind-kube-agents-dev
    ```
    It exercises the load-bearing suites: live webhook serving (duplicate `(tier,scope)` + tier
    immutability rejected), VAP attenuation (write/impersonate/wrong-scope denied), read-only per-tier
@@ -413,7 +413,7 @@ affinity, audit attribution). It reuses the Phase 2 stack on the same Kind clust
 > one guarded step:
 >
 > ```bash
-> local-dev/kind/reload-images.sh operator kind-kube-agents-dev
+> dev/cluster/reload-images.sh operator kind-kube-agents-dev
 > ```
 >
 > Equivalent longhand, if you prefer to see each step:
@@ -430,7 +430,7 @@ affinity, audit attribution). It reuses the Phase 2 stack on the same Kind clust
    `team-x` tenant bundle (`namespaces/team-x/` `00`→`60`, in numeric order) and the dev-team `Agent`
    CR, then asserts the whole isolation proof:
    ```bash
-   local-dev/kind/verify-phase3.sh kind-kube-agents-dev
+   dev/verify/verify-phase3.sh kind-kube-agents-dev
    ```
    It exercises: the **placement clause** (matching namespace admitted, foreign `metadata.namespace`
    rejected), the **reconciled dev-team pod** (bound to the pre-created `developer-team-agent` SA, the
@@ -472,7 +472,7 @@ through a reviewed `submit-suggestion` PR.
 1. **Run the consolidated Phase 4 gate** (the live regression is destructive and guarded to Kind
    contexts; the hermetic acceptance runs anywhere, so this is CI-safe with no cluster):
    ```bash
-   local-dev/kind/verify-phase4.sh kind-kube-agents-dev
+   dev/verify/verify-phase4.sh kind-kube-agents-dev
    ```
    It proves 07 §2 Phase 4 Accept **(a)–(e)** hermetically — **(a)** per-tier scoped watcher +
    fail-closed `validate()` + controller `--owner`/`--scope-namespace` rendering + the hardened
@@ -511,7 +511,7 @@ per-turn trace id flow router → inject seam → session → PR, stamped as dur
 > **Enforcement needs the right substrate.** Two Accept criteria can only be _proven_ on capable
 > infrastructure: egress **enforcement** (b) needs a NetworkPolicy-enforcing CNI — the default `kindnet`
 > dev cluster does **not** enforce, so the shape is checked structurally on Kind and actual deny/allow is
-> proven on a **Calico** cluster (`local-dev/kind/kind-calico.yaml` + `local-dev/tests/egress-enforcement.sh`),
+> proven on a **Calico** cluster (`dev/verify/kind-calico.yaml` + `dev/tests/egress-enforcement.sh`),
 > deferred-not-faked where Calico is unreachable; the pod-hardening **VAP** (c) needs K8s ≥ 1.30 (VAP GA —
 > the dev cluster is v1.31.x). A freshly-applied VAP binding also has a short activation delay, so the
 > gate polls the admission dry-run until the binding is live before judging.
@@ -519,7 +519,7 @@ per-turn trace id flow router → inject seam → session → PR, stamped as dur
 1. **Run the consolidated Phase 5 gate** (the live checks are destructive and guarded to Kind contexts;
    the hermetic acceptance runs anywhere, so this is CI-safe with no cluster):
    ```bash
-   local-dev/kind/verify-phase5.sh kind-kube-agents-dev
+   dev/verify/verify-phase5.sh kind-kube-agents-dev
    ```
    It proves 07 §2 Phase 5 Accept **(a)–(d)** — **(a)** `score_findings.py` BLOCKS an unmitigated `high`
    (exit 1), PASSES a clean set (exit 0), lets a matching non-expired waiver mitigate, and still BLOCKS on
@@ -548,7 +548,7 @@ per-turn trace id flow router → inject seam → session → PR, stamped as dur
 Phase 6 is a **validation phase** — it adds no new persona and no new write path. It graduates the
 05 §8 **failure-isolation (chaos)** suite from deferred to a live, load-bearing gate, proving the
 design's central resilience claim: **no cascade failure** (04 §6). Four experiments run against the
-existing Kind cluster (`local-dev/kind/chaos-suite.sh`):
+existing Kind cluster (`dev/verify/chaos-suite.sh`):
 
 - **C1 — controller down.** Scale `kubeagents-controller-manager` → 0. A running pod stays Ready
   (running pods continue), the deleted agent Deployment is **not** recreated (no reconciles without the
@@ -570,7 +570,7 @@ Run the consolidated Phase 6 gate — the NET-NEW chaos suite plus the full prio
 and self-cleaning):
 
 ```bash
-local-dev/kind/verify-phase6.sh kind-kube-agents-dev
+dev/verify/verify-phase6.sh kind-kube-agents-dev
 ```
 
 > **The dev cluster must run the locally-built controller.** The published `k8s-operator:v0.1.0` image
@@ -623,7 +623,7 @@ acceptance, and the full prior-phase regression (the live ops are destructive an
 contexts**):
 
 ```bash
-local-dev/kind/verify-phase7.sh kind-kube-agents-dev
+dev/verify/verify-phase7.sh kind-kube-agents-dev
 ```
 
 It proves 07 §2 Phase 7 Accept **(a)–(c)**:

@@ -127,7 +127,7 @@ then deploy the no-mint controller, then assert the agent still reads and mints 
    → `list pods` yes, `create/delete` no, cross-tier read no.
 5. **Cardinality webhook (T8):** two CRs with the same `(tier,scope)` → 2nd rejected; changing `tier` on
    an existing CR → rejected; a different `(tier,scope)` → admitted.
-6. **VAP still green (03 §11, load-bearing):** re-run `local-dev/tests/negative-attenuation.sh` — Phase 0
+6. **VAP still green (03 §11, load-bearing):** re-run `dev/tests/negative-attenuation.sh` — Phase 0
    backstop must stay passing; the pre-created identity manifests (T6) must be VAP-clean.
 7. **GitOps loop (A1/A3):** dry-run `submit_suggestion.py` on an authored KCC artifact → opens a PR
    (branch `platform-agent/...`, targeted files only, Conventional Commit); the PR is the audit record.

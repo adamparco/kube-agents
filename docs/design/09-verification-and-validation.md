@@ -198,20 +198,20 @@ check that proves they left the critical path.
 
 Every schema in 06 must exist as a real type whose shape matches the spec.
 
-| Contract                                         | Source  | Completeness check                                                                         |
-| ------------------------------------------------ | ------- | ------------------------------------------------------------------------------------------ |
-| `Agent` CRD                                      | 06 §1   | Generated CRD ⊇ every specified field, with specified types, defaults, and enums           |
-| Reader/actor RBAC templates (×6)                 | 06 §2   | Six rendered manifests exist and match the spec's rule sets exactly                        |
-| Action Envelope                                  | 06 §4.1 | Type exists; every specified field present; refused-key list enforced                      |
-| `ChangePolicy`                                   | 06 §4.2 | CRD exists; stricter-only enforced                                                         |
-| `ActionRecord`                                   | 06 §4.3 | CRD exists; full status lifecycle representable                                            |
-| `FleetFreeze` / `UndoRequest` / `ApprovalRoster` | 06 §4.4 | CRDs exist and are honoured by the broker                                                  |
-| Mesh request/response                            | 06 §7   | Type exists; authn and loop-prevention fields present                                      |
-| `ChatOpsConfig` (cluster-scoped singleton)       | 06 §1.1 | CRD exists; exactly one instance named `default`; holds the fleet-level Slack app config   |
-| Audit/attribution record                         | 06 §8   | Trace fields present end to end                                                            |
-| ChatOps addressing & routing                     | 06 §2b  | Every addressing form and operational verb resolves to a route; V-CMP-023 pairs surfaces   |
-| OKF knowledge entry                              | 06 §5   | Every shipped entry validates against the frontmatter schema (`local-dev/okf-validate.py`) |
-| IaC mirror layout                                | 06 §3.1 | The rendered mirror tree matches the specified paths — for C13, an **optional** component  |
+| Contract                                         | Source  | Completeness check                                                                        |
+| ------------------------------------------------ | ------- | ----------------------------------------------------------------------------------------- |
+| `Agent` CRD                                      | 06 §1   | Generated CRD ⊇ every specified field, with specified types, defaults, and enums          |
+| Reader/actor RBAC templates (×6)                 | 06 §2   | Six rendered manifests exist and match the spec's rule sets exactly                       |
+| Action Envelope                                  | 06 §4.1 | Type exists; every specified field present; refused-key list enforced                     |
+| `ChangePolicy`                                   | 06 §4.2 | CRD exists; stricter-only enforced                                                        |
+| `ActionRecord`                                   | 06 §4.3 | CRD exists; full status lifecycle representable                                           |
+| `FleetFreeze` / `UndoRequest` / `ApprovalRoster` | 06 §4.4 | CRDs exist and are honoured by the broker                                                 |
+| Mesh request/response                            | 06 §7   | Type exists; authn and loop-prevention fields present                                     |
+| `ChatOpsConfig` (cluster-scoped singleton)       | 06 §1.1 | CRD exists; exactly one instance named `default`; holds the fleet-level Slack app config  |
+| Audit/attribution record                         | 06 §8   | Trace fields present end to end                                                           |
+| ChatOps addressing & routing                     | 06 §2b  | Every addressing form and operational verb resolves to a route; V-CMP-023 pairs surfaces  |
+| OKF knowledge entry                              | 06 §5   | Every shipped entry validates against the frontmatter schema (`dev/okf-validate.py`)      |
+| IaC mirror layout                                | 06 §3.1 | The rendered mirror tree matches the specified paths — for C13, an **optional** component |
 
 Deferred by design and asserted **absent**, exactly as in §5.1: the user-authorization down-scoping
 contract (06 §2a) and the session-state contract's mem0 backing (06 §6). Absent means the harness
@@ -620,7 +620,7 @@ The mapping is a generated artifact, not prose:
 
 The meta suite is self-referential: its `Source` is a section of **this** document, because what it
 verifies is this document's own machinery. Every other suite sources a spec — a check whose Source
-cell is empty has no stated rationale anywhere, which `local-dev/tests/spec-ids.py` now rejects.
+cell is empty has no stated rationale anywhere, which `dev/tests/spec-ids.py` now rejects.
 
 | ID        | Meta-check                                                                                                                                                                                              | Source        | Lvl |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | --- |
@@ -920,7 +920,7 @@ than absorbed, because an unowned requirement is exactly what §12.2 existed to 
 
 - **V-MET-010** — every check ID referenced anywhere in specs 01–08 exists in §6 of this document,
   and every §6 ID is referenced by or traceable to a spec section. `L0` — **implemented**:
-  `local-dev/tests/spec-ids.py`, in `local-dev/L0-CHAIN.txt`. A check's source is read from its
+  `dev/tests/spec-ids.py`, in `dev/L0-CHAIN.txt`. A check's source is read from its
   `Source` cell, or from its section preamble where the table has no such column; the target must
   resolve to a real heading (or, for `05 C15`, a real component).
 - **V-MET-011** — every bullet in every spec Verification section (02 §10, 03 §11, 04 §9, 05 §8,

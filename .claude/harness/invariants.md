@@ -12,13 +12,13 @@ Detailed in `docs/design/03-security-model.md`.
 
 Answer each as PASS / FAIL / N-A with one line of evidence (a file, a test name, a command output).
 
-> **Six of these now fail a build instead of asking you.** `local-dev/tests/invariants-gate.py`
+> **Six of these now fail a build instead of asking you.** `dev/tests/invariants-gate.py`
 > (P8-T6) runs in the L0 chain on every PR and mechanizes **7**, **8**, **12** and **13**, plus the
 > destructive-test guard below and the build targets' `--context` discipline. The rest are
 > judgements about intent that a script cannot make and stay answered per PR — mechanizing four of
 > thirteen is not "the gate is done", it is four fewer places where being tired is the same as
 > being dishonest. Each mechanized item is marked **[gated]** below with the function that enforces
-> it. Before recording any lint result as evidence, run `local-dev/toolchain-preflight.sh`
+> it. Before recording any lint result as evidence, run `dev/toolchain-preflight.sh`
 > (LSN-020): a green from a tool is evidence only for the rules that tool actually ran.
 
 1. **Agents act.** The change does not make an agent file a proposal, open a ticket, or ask a human
@@ -71,7 +71,7 @@ Answer each as PASS / FAIL / N-A with one line of evidence (a file, a test name,
    asserting read-only-ness is removed only in the same commit that adds its imperative counterpart.
    - Check: the PR names the pair. A change that reduces the total number of security assertions is
      wrong.
-   - The ratchet counts assertions against `local-dev/assertion-baseline.json`. Lowering it needs
+   - The ratchet counts assertions against `dev/assertion-baseline.json`. Lowering it needs
      `--update-baseline` and a diff a reviewer sees, which is the point: the count may fall, but not
      quietly. Paired with `check_retirements_name_replacements` (V-MET-004) so a retired check ID
      keeps a pointer to what replaced it instead of evaporating.

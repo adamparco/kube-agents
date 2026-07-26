@@ -16,7 +16,7 @@ Two invariant-preserving properties, enforced structurally (not just by conventi
      BEFORE touching the repo. There is deliberately no code path that pushes or commits.
 
 The frontmatter parser is imported from the SHARED module (`okf_frontmatter`, shipped at
-/opt/defaults/scripts) — the very file `local-dev/okf-validate.py` uses — so an agent reads exactly the
+/opt/defaults/scripts) — the very file `dev/okf-validate.py` uses — so an agent reads exactly the
 schema CI validates.
 
 Auth: a **contents:read**-scoped token (default env GITHUB_READ_TOKEN), NOT the submit-suggestion write
@@ -38,10 +38,10 @@ import tempfile
 from pathlib import Path
 
 # Import the shared OKF parser. In-pod it lives at /opt/defaults/scripts; in the repo (verify/tests) it
-# lives at <repo>/local-dev. Try both so read and CI provably share one parser.
+# lives at <repo>/dev. Try both so read and CI provably share one parser.
 _CANDIDATES = [
     "/opt/defaults/scripts",
-    str(Path(__file__).resolve().parents[5] / "local-dev"),
+    str(Path(__file__).resolve().parents[5] / "dev"),
 ]
 for _p in _CANDIDATES:
     if _p not in sys.path and os.path.isdir(_p):

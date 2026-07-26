@@ -14,7 +14,7 @@ here via PR only.
   - Shielded nodes, e2-standard-4 / 100 GB, node autoscaling 1–4). It is **semantically equivalent**
     to the Terraform twin at
     [`../../cluster-b/provisioning/cluster.tf`](../../cluster-b/provisioning/cluster.tf);
-    `local-dev/tests/iac-parity.py` asserts the two stay in parity. Other resources that live here in
+    `dev/tests/iac-parity.py` asserts the two stay in parity. Other resources that live here in
     a real target: additional node pools, project IAM (`IAMPolicyMember`), etc.
 
 `PROJECT_ID` is substituted per project by CI/CD (same convention as the identity manifests in

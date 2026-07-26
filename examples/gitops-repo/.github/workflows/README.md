@@ -20,4 +20,4 @@ GitHub Actions is the reference; CircleCI/Jenkins/Argo/Flux/Atlantis are equally
 **second, equivalent** pipeline ships as [`../../.circleci/config.yml`](../../.circleci/config.yml)
 (CircleCI) — same KCC/HCL dispatch, same per-target least-privilege creds, same merge-to-`main`
 trigger — demonstrating actuation is genuinely pipeline-agnostic (Phase 7, 07 §2 Accept (b)). The two
-are kept in parity by `local-dev/tests/circleci-parity.py`.
+are kept in parity by `dev/tests/circleci-parity.py`.

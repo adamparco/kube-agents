@@ -41,7 +41,7 @@ absent unless asked for, because a REPLACE_WITH_* in a `cidr:` field is rejected
 and made the entire bundle un-appliable (V-CMP-003).
 
 The four isolation manifests (10/20/30/40) are the SAME BYTES the installer applies from
-k8s-operator/scripts/*.template — that is asserted, not aspired to: local-dev/test_skill_templates.py
+k8s-operator/scripts/*.template — that is asserted, not aspired to: dev/test_skill_templates.py
 renders both and compares them. Edit the installer template, then regenerate the asset here.
 """
 from __future__ import annotations
@@ -127,7 +127,7 @@ def _cidr_rule(comment: str, csv: str | None, port: int) -> list[str]:
     Byte-for-byte the same emission as `_emit_cidr_rule` in
     k8s-operator/scripts/common.sh. The two must not diverge: the manifests this
     script proposes and the ones the installer applies are the same manifests,
-    and local-dev/test_skill_templates.py compares them exactly.
+    and dev/test_skill_templates.py compares them exactly.
     """
     cidrs = [c.strip() for c in (csv or "").split(",") if c.strip()]
     if not cidrs:

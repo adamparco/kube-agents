@@ -10,7 +10,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `platform/`: Configuration for the Platform Agent.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Helm charts, manifests).
 - `docs/`: Documentation, guides, and walkthroughs.
-- `local-dev/`: Tooling for local offline testing (Kind setup).
+- `dev/`: Tooling for local offline testing (Kind setup).
 - `INSTALL.md`: Installation guide.
 - `README.md`: Project overview.
 

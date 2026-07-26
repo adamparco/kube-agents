@@ -192,7 +192,7 @@ Caveat: the endpoint is provider-neutral but **auth is not** — scripts always 
 
 ### 3.8 Local-dev harness
 
-**Purpose.** The "how to run and test" surface: `local-dev/kind/` per-phase gates + chaos suite; `local-dev/tests/` adversarial cluster tests + hermetic parity validators. **Every cluster-touching script is Kind-guarded** (destructive ops refuse a non-`kind-*`/`gke-scratch-*` context).
+**Purpose.** The "how to run and test" surface: `dev/verify/` per-phase gates + chaos suite; `dev/tests/` adversarial cluster tests + hermetic parity validators. **Every cluster-touching script is Kind-guarded** (destructive ops refuse a non-`kind-*`/`gke-scratch-*` context).
 
 | Script                                                                             | Cluster-bound?                                                                 | Rating                      |
 | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | --------------------------- |
@@ -216,10 +216,10 @@ Caveat: the endpoint is provider-neutral but **auth is not** — scripts always 
 | Operator builds          | `cd k8s-operator && go build ./...`                                                                                                   | **exit 0**, no output                                                                                                             |
 | Operator vets            | `go vet ./...`                                                                                                                        | **exit 0**, zero diagnostics                                                                                                      |
 | Operator tests           | `go test ./...` and `make test` (fresh, envtest)                                                                                      | **exit 0**, no FAIL; `internal/controller` **88.6% coverage** (agentindex 93.3%, router 94.8%, webhook 80.6%, eventingress 85.3%) |
-| IaC KCC↔Terraform parity | `python3 local-dev/tests/iac-parity.py`                                                                                               | **exit 0** — 5 PASS incl. "equivalent across 14 facts"                                                                            |
-| CircleCI parity          | `python3 local-dev/tests/circleci-parity.py`                                                                                          | **exit 0** — 8 PASS incl. dispatch parity + keyless-no-static-key                                                                 |
-| Observability seam       | `python3 local-dev/tests/observability-seam.py`                                                                                       | **exit 0** — 6 PASS incl. loud-fail on missing non-GCP URL                                                                        |
-| OTLP endpoint seam       | `bash local-dev/tests/otel-endpoint.sh`                                                                                               | **exit 0** — 6/6 PASS                                                                                                             |
+| IaC KCC↔Terraform parity | `python3 dev/tests/iac-parity.py`                                                                                                     | **exit 0** — 5 PASS incl. "equivalent across 14 facts"                                                                            |
+| CircleCI parity          | `python3 dev/tests/circleci-parity.py`                                                                                                | **exit 0** — 8 PASS incl. dispatch parity + keyless-no-static-key                                                                 |
+| Observability seam       | `python3 dev/tests/observability-seam.py`                                                                                             | **exit 0** — 6 PASS incl. loud-fail on missing non-GCP URL                                                                        |
+| OTLP endpoint seam       | `bash dev/tests/otel-endpoint.sh`                                                                                                     | **exit 0** — 6/6 PASS                                                                                                             |
 | Review-gate scorer       | `python3 -m unittest test_score_findings test_extract_findings`                                                                       | **40 tests OK**                                                                                                                   |
 | Local-dev skill tests    | `test_submit_suggestion` (11), `test_detect_drift` (3), `test_raise_escalation` (4), `test_heartbeat_sops` (7), `test_read_knowledge` | all **OK**                                                                                                                        |
 
@@ -278,17 +278,17 @@ cd k8s-operator && go build ./... && go vet ./... && go test ./...
 cd ..
 
 # 2) Phase-7 hermetic parity + seam validators (all exit 0)
-python3 local-dev/tests/iac-parity.py .
-python3 local-dev/tests/circleci-parity.py .
-python3 local-dev/tests/observability-seam.py .
-bash   local-dev/tests/otel-endpoint.sh .
+python3 dev/tests/iac-parity.py .
+python3 dev/tests/circleci-parity.py .
+python3 dev/tests/observability-seam.py .
+bash   dev/tests/otel-endpoint.sh .
 
 # 3) Review-gate scorer + extractor unit tests (40 tests OK)
 python3 -m unittest scripts/review-gate/test_score_findings.py \
                     scripts/review-gate/test_extract_findings.py
 
 # 4) Mutation-path invariant tests (hermetic, real local git repos)
-cd local-dev && python3 -m unittest test_submit_suggestion test_detect_drift \
+cd dev && python3 -m unittest test_submit_suggestion test_detect_drift \
    test_read_knowledge test_raise_escalation test_heartbeat_sops
 cd ..
 
@@ -312,7 +312,7 @@ cd k8s-operator && go test ./internal/router/ -run 'TestResolve|Inference|Thread
 go install sigs.k8s.io/kind@latest        # or: brew install kind
 
 # 1) Bring up the cluster (K8s v1.31.2, ctx kind-kube-agents-dev)
-local-dev/kind/up.sh
+dev/cluster/up.sh
 
 # 2) cert-manager (webhook TLS)
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
@@ -323,7 +323,7 @@ kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=18
 #    kind-load a LOCAL tag first, then deploy THAT tag. (The published v0.1.0 is upstream's
 #    binary, not your working tree; and it renders pods without readOnlyRootFilesystem, which
 #    the hardening VAP rejects.) The helper does build → kind load → repoint in one step:
-local-dev/kind/reload-images.sh operator kind-kube-agents-dev
+dev/cluster/reload-images.sh operator kind-kube-agents-dev
 #    ...or longhand, if the controller Deployment doesn't exist yet:
 #      make -C k8s-operator docker-build IMG=kube-agents/k8s-operator:dev
 #      kind load docker-image kube-agents/k8s-operator:dev --name kube-agents-dev
@@ -331,7 +331,7 @@ local-dev/kind/reload-images.sh operator kind-kube-agents-dev
 kubectl apply -f examples/gitops-repo/policy/vap-agent-readonly.yaml
 
 # 4) Run the per-phase gates
-for p in 2 3 4 5 6 7; do local-dev/kind/verify-phase$p.sh kind-kube-agents-dev; done
+for p in 2 3 4 5 6 7; do dev/verify/verify-phase$p.sh kind-kube-agents-dev; done
 ```
 
 **Stale-image rule (load-bearing).** Local images reuse a fixed tag (`:dev`, `:latest`) with `imagePullPolicy: IfNotPresent`, so a same-tag image is **not** auto-refreshed. A Kind gate can read green against a stale build that under-enforces an admission invariant. **Always rebuild → `kind load` → `rollout restart`/`set image` before trusting a gate** — `reload-images.sh` does exactly this. This matters most before Phase 6.
@@ -339,8 +339,8 @@ for p in 2 3 4 5 6 7; do local-dev/kind/verify-phase$p.sh kind-kube-agents-dev; 
 **Calico caveat for egress.** kindnet does **not** enforce NetworkPolicy, so on a kindnet cluster `egress-enforcement.sh` self-defers (exit 3, non-fatal). This used to require standing up a second, Calico-only cluster. It no longer does — `up.sh` builds the one inner-loop cluster with Calico already, so:
 
 ```bash
-local-dev/kind/up.sh                                         # 2 nodes, Calico, operator, VAP, agent images
-local-dev/tests/egress-enforcement.sh kind-kube-agents-dev   # exit 0 = proven; exit 3 = deferred
+dev/cluster/up.sh                                         # 2 nodes, Calico, operator, VAP, agent images
+dev/tests/egress-enforcement.sh kind-kube-agents-dev   # exit 0 = proven; exit 3 = deferred
 ```
 
 No `calico`/`calicoctl` binary is needed — install is pure `kubectl apply`.
@@ -375,7 +375,7 @@ The one trap to avoid: following the old INSTALL.md literally (`make deploy IMG=
 
 These need a real cluster/cloud and are **not** part of the Kind loop (all disclosed, none asserted green):
 
-- `local-dev/gke-scratch/create.sh` — `gcloud container clusters create-auto` (billable); needs `gcloud` auth + a GCP project.
+- `dev/gke-scratch/create.sh` — `gcloud container clusters create-auto` (billable); needs `gcloud` auth + a GCP project.
 - **V-G1..V-G4**: cluster-admin viewer GSA + Workload Identity, second spoke + private hub inference/Minty, live Google Chat app, live CI/CD apply.
 - `tests/e2e/gchat_agent_test.py` — real end-to-end pytest against a deployed Chat agent; needs WIF provisioning (`provision_ci_iam.sh`) + a Chat space (run via `.github/workflows/e2e-gchat-test.yml`).
 - Second cloud (EKS IRSA / AKS AAD) + live `terraform apply` (D1/D2).

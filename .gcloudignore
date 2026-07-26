@@ -4,8 +4,8 @@
 # once per image. Excluding the prose corpora takes the upload from ~4 MB to well under one.
 #
 # The two `!` re-includes below are load-bearing. `deploy/docker/Dockerfile` COPYs `docs/glossary.md`
-# (line 92) and `local-dev/okf_frontmatter.py` (line 122) into the agent images, so a blanket
-# `docs/` or `local-dev/` exclusion does not make the build smaller -- it makes it fail, at the COPY,
+# (line 92) and `dev/okf_frontmatter.py` (line 122) into the agent images, so a blanket
+# `docs/` or `dev/` exclusion does not make the build smaller -- it makes it fail, at the COPY,
 # with a message about a missing file rather than a missing ignore rule. The `dir/*` + `!dir/file`
 # shape is deliberate: gitignore semantics cannot re-include a file whose parent directory is
 # excluded, so `docs/` followed by `!docs/glossary.md` would silently not work.
@@ -47,5 +47,5 @@ k8s-operator/cover.out
 docs/*
 !docs/glossary.md
 .claude/
-local-dev/*
-!local-dev/okf_frontmatter.py
+dev/*
+!dev/okf_frontmatter.py

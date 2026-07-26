@@ -5,7 +5,7 @@
 # authors via PR when the proposing agent's spec.iac.format is `terraform`, per
 # agents/platform/skills/gke-cluster-creator/SKILL.md. Its parity twin is the KCC YAML exemplar at
 # ../../cluster-a/provisioning/cluster-a.yaml (iac.format: kcc) — the two describe the SAME cluster
-# shape in the two supported formats, and local-dev/tests/iac-parity.py asserts they stay equivalent
+# shape in the two supported formats, and dev/tests/iac-parity.py asserts they stay equivalent
 # (location, release channel, node machine type/count, networking / WI / shielded / private shape).
 #
 # The reference actuation pipeline applies this dir with `terraform init && terraform apply` because

@@ -180,7 +180,7 @@ not an obstacle to route around.
 ```sh
 gcloud container clusters create gke-scratch-kage-chaos --region us-east4 --enable-dataplane-v2 ...
 # then, with the context renamed to gke-scratch-kage-chaos:
-bash local-dev/kind/verify-phase8.sh gke-scratch-kage-chaos gke-scratch-kage-chaos-egress
+bash dev/verify/verify-phase8.sh gke-scratch-kage-chaos gke-scratch-kage-chaos-egress
 ```
 
 Dataplane V2 on the scratch cluster is also what would discharge **L3-1** and **L3-2** without
@@ -192,14 +192,14 @@ touching the live cluster, which is the cheaper path to closing that deferral.
 
 ## Status
 
-| Step | Claim                                | Records                       | Run? |
-| ---- | ------------------------------------ | ----------------------------- | ---- |
-| L3-1 | WI mints a token with egress applied | V-CTN-020 (L3)                | ☐    |
-| L3-2 | Off-allowlist egress blocked, live   | V-CTN-020 (L3)                | ☐    |
-| L3-3 | Clean-clone install, three tiers     | V-CMP-001/004/005             | ☐    |
-| L3-4 | Inference + per-namespace token      | V-CMP-001 (C5/C6)             | ☐    |
-| L3-5 | Published tags immutable             | V-CMP-002 (L3)                | ☐    |
-| L3-6 | Destructive resilience               | V-G scratch checks            | ☐    |
+| Step | Claim                                | Records            | Run? |
+| ---- | ------------------------------------ | ------------------ | ---- |
+| L3-1 | WI mints a token with egress applied | V-CTN-020 (L3)     | ☐    |
+| L3-2 | Off-allowlist egress blocked, live   | V-CTN-020 (L3)     | ☐    |
+| L3-3 | Clean-clone install, three tiers     | V-CMP-001/004/005  | ☐    |
+| L3-4 | Inference + per-namespace token      | V-CMP-001 (C5/C6)  | ☐    |
+| L3-5 | Published tags immutable             | V-CMP-002 (L3)     | ☐    |
+| L3-6 | Destructive resilience               | V-G scratch checks | ☐    |
 
 Nothing is ticked. Ticking a box here is a claim, and a claim needs the output pasted into a ledger
 row with the date and the cluster — a tick on its own is the shape of evidence without the substance.
