@@ -1,118 +1,166 @@
 #!/usr/bin/env bash
-# reload-images.sh — build kube-agents images FROM YOUR WORKING TREE and load them
-# into a Kind cluster, so the inner-loop gates test YOUR code, never the upstream
-# published image (ghcr.io/gke-labs/...:v0.1.0).
+# reload-images.sh — build kube-agents images FROM YOUR WORKING TREE on Cloud Build, push them to
+# Artifact Registry, and point the running workloads at the resulting DIGEST, so the inner-loop
+# gates test YOUR code and can prove they are doing so.
 #
 # WHY THIS EXISTS
-#   `make deploy` does NOT build — it only runs `kustomize set image` + `kubectl apply`.
-#   Deploying the published tag therefore tests the UPSTREAM binary, not your changes.
-#   And a Kind cluster only sees an image after `kind load docker-image ...`.
-#   This script does build -> kind load -> point the running workload at the local image,
-#   which is the whole "test my local changes on Kind" loop in one command.
+#   `make deploy` does NOT build — it only runs `kustomize set image` + `kubectl apply`. Deploying
+#   the published tag therefore tests the UPSTREAM binary (ghcr.io/gke-labs/...), not your changes.
+#   This script does build -> push -> repoint -> restart, which is the whole "test my changes"
+#   loop in one command.
 #
-# THE imagePullPolicy TRAP (important)
-#   The controller renders agent pods with imagePullPolicy: PullAlways by DEFAULT
-#   (k8s-operator/internal/controller/agent_manifests.go). With PullAlways the kubelet
-#   IGNORES the kind-loaded image and re-pulls from the registry — silently running the
-#   upstream image. For local Kind testing your Agent CR MUST set:
-#       spec.deployment.imagePullPolicy: IfNotPresent   # (or Never)
-#   The example CRs already do this. The operator Deployment already uses IfNotPresent.
+# WHY CLOUD BUILD AND NOT `docker build`
+#   The nodes are amd64 and the developer host is arm64. A local build produces images the cluster
+#   cannot execute, and the failure surfaces as CrashLoopBackOff with `exec format error` several
+#   minutes later, in a different component. Cloud Build is not the slow option here; it is the
+#   only correct one for the agent tiers, which are FROM nousresearch/hermes-agent — a whole
+#   userspace, not one static binary, so the $PREBUILT_BINARY cross-compile hatch does not apply.
 #
-# THE stale-image rule
-#   Local images reuse a fixed tag (e.g. :dev). Same tag + IfNotPresent = the kubelet will
-#   NOT refresh a copy it already has. This script always rebuilds AND reloads, so a
-#   `set image`/`rollout restart` afterward genuinely picks up your latest source.
+# WHAT REPLACED THE imagePullPolicy TRAP
+#   The Kind version of this script side-loaded a fixed `:dev` tag and depended on
+#   `imagePullPolicy: IfNotPresent`, which is the LSN-001 stale-image trap in script form: same tag
+#   + IfNotPresent means the kubelet keeps a copy it already has, so a rebuilt image silently does
+#   not take effect. This deploys by DIGEST. A digest cannot be stale — it names one immutable
+#   manifest — so the trap stops being something P1 has to detect and becomes something the
+#   deployment mechanism makes unrepresentable. It also makes the pull policy irrelevant rather
+#   than load-bearing.
 #
 # Usage: dev/cluster/reload-images.sh [operator|agents|all] [kube-context]
-#   operator (default)  build+load the controller image, repoint + restart the controller
-#   agents              build+load the three tier agent images (you then restart the agent
-#                       Deployments; their CRs must use imagePullPolicy IfNotPresent)
+#   operator (default)  build+push the controller image, repoint + restart the controller
+#   agents              build+push the three tier agent images, repoint every Agent CR of each tier
 #   all                 both
+#
+# Exit codes (contract shared with up.sh, and relied on by the L2 suites):
+#   0 ok · 1 usage · 2 refused (guard) · 3 required tool missing · 4 an image did not materialise
 set -uo pipefail
 
 TARGET="${1:-operator}"
-CTX="${2:-kind-kube-agents-dev}"
-CLUSTER="${CTX#kind-}"                       # kind context is kind-<clustername>
+CTX="${2:-gke-scratch-kube-agents-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-OP_IMG="kube-agents/k8s-operator:dev"        # local tag — deliberately NOT the ghcr name
-AGENT_REPO="kube-agents"                      # -> kube-agents/<tier>-agent:$AGENT_TAG
-# ONE definition site for the agent tag, passed to `make` and used to find what `make` produced.
-#
-# This used to be two: the loop below looked for `:latest` while the build took whatever the root
-# Makefile's `TAG ?=` happened to be. P8-T5 changed that default to `src-<sha>` to stop publishing
-# `:latest`, and this script kept looking for a tag nothing produced any more — so every tier missed,
-# each printed "(skip … not built for this REPO)", and the script exited 0 having loaded NOTHING.
-# That is LSN-021 (a command is "run" and does nothing) and V-MET-013 (two definition sites that
-# drifted). It is also the whole reason the agent gateways sat in ImagePullBackOff: the one script
-# whose job is to put those images on the host had been quietly declining to.
-AGENT_TAG="${AGENT_TAG:-dev}"
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get core/project 2>/dev/null)}"
+REGION="${REGION:-us-east4}"
+AR_REPO="${AR_REPO:-kube-agents}"
+REGISTRY="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO"
 NS=kubeagents-system
 
-# --- DESTRUCTIVE-TEST GUARD: only touch a Kind (or scratch-GKE) context ---------------------
+# --- DESTRUCTIVE-TEST GUARD: only touch an ephemeral scratch cluster -----------------------------
+# Anchored, never a substring (LSN-005). `*gke-scratch*` would accept `my-gke-scratch-of-prod`, and
+# the live install `platform-agent-host` is one `*` away from every script in this directory. The
+# default arm exits non-zero; that is the half that makes the rest of it a guard.
 case "$CTX" in
-  kind-*|gke-scratch-*) : ;;
-  *) echo "REFUSING: context '$CTX' is not a Kind cluster (image-reload guard)." >&2; exit 2 ;;
+  gke-scratch-*) : ;;
+  *) echo "REFUSING: context '$CTX' is not an ephemeral scratch cluster (image-reload guard)." >&2
+     echo "  This script repoints running workloads. Name the dev cluster explicitly:" >&2
+     echo "    $0 $TARGET gke-scratch-kube-agents-dev" >&2
+     exit 2 ;;
 esac
 
-command -v kind >/dev/null 2>&1 || { echo "ERROR: kind is not installed (brew install kind)." >&2; exit 3; }
-command -v docker >/dev/null 2>&1 || { echo "ERROR: docker is not available." >&2; exit 3; }
-cd "$REPO_ROOT"
+for tool in gcloud kubectl git; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: $tool is not installed." >&2; exit 3; }
+done
+[ -n "$PROJECT_ID" ] || { echo "ERROR: no GCP project set (gcloud config set project ...)." >&2; exit 3; }
+cd "$REPO_ROOT" || { echo "ERROR: cannot enter $REPO_ROOT." >&2; exit 3; }
 
 K="kubectl --context $CTX"
 
+# The tag is derived, never chosen. P1 reads the short sha back out of the deployed reference to
+# answer "is the cluster running the current source", so the tag has to CARRY that answer -- and a
+# dirty tree has to be visibly not a commit, or P1 would certify uncommitted work as `dev-abc1234`.
+SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  TAG="dev-$SHA-dirty-$(date +%s)"
+else
+  TAG="dev-$SHA"
+fi
+# shellcheck disable=SC1091
+. "$REPO_ROOT/tags.env"
+
+# build_and_resolve <image-name> <extra-substitutions> -> echoes repo/name@sha256:...
+#
+# Two steps that must not be collapsed into one. `gcloud builds submit` succeeding tells you a
+# build ran; it does not tell you what is now in the registry under that tag, and the difference is
+# exactly LSN-021 -- a command that "ran" and left nothing behind. Reading the digest back is a
+# question asked of the registry the cluster pulls from, not of the builder.
+build_and_resolve() {
+  local name="$1" subs="$2"
+  local uri="$REGISTRY/$name:$TAG"
+  local cache="$REGISTRY/$name:buildcache"
+  echo "-> building $name:$TAG on Cloud Build" >&2
+  if ! gcloud builds submit \
+      --config deploy/docker/cloudbuild.yaml \
+      --project "$PROJECT_ID" \
+      --substitutions="_IMAGE_URI=$uri,_CACHE_URI=$cache,$subs" \
+      . >&2; then
+    echo "ERROR: Cloud Build failed for $name." >&2
+    return 4
+  fi
+  local digest
+  digest="$(gcloud artifacts docker images describe "$uri" \
+    --project "$PROJECT_ID" --format='value(image_summary.digest)' 2>/dev/null)"
+  if [ -z "$digest" ]; then
+    # Not a warning. The build reported success, so an absent digest means the tag does not resolve
+    # in the registry the cluster pulls from -- and every result downstream would describe whatever
+    # was there before.
+    echo "ERROR: $uri built but does not resolve in Artifact Registry; nothing to deploy." >&2
+    return 4
+  fi
+  echo "   $name -> ${digest:0:19}..." >&2
+  echo "$REGISTRY/$name@$digest"
+}
+
 reload_operator() {
   echo "== operator =="
-  echo "-> building $OP_IMG from local source"
-  make -C k8s-operator docker-build IMG="$OP_IMG"
-  echo "-> loading $OP_IMG into kind cluster '$CLUSTER'"
-  kind load docker-image "$OP_IMG" --name "$CLUSTER"
-  echo "-> repointing the controller at the local image and restarting"
-  $K -n "$NS" set image deploy/kubeagents-controller-manager manager="$OP_IMG"
-  $K -n "$NS" rollout restart deploy/kubeagents-controller-manager
-  $K -n "$NS" rollout status  deploy/kubeagents-controller-manager --timeout=120s
-  echo "OK: controller now running $OP_IMG"
-  echo "   verify: $K -n $NS get deploy kubeagents-controller-manager -o jsonpath='{.spec.template.spec.containers[0].image}'"
+  local ref
+  ref="$(build_and_resolve k8s-operator "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile")" || return 4
+  echo "-> repointing the controller at $ref"
+  $K -n "$NS" set image deploy/kubeagents-controller-manager "manager=$ref" || return 4
+  $K -n "$NS" rollout status deploy/kubeagents-controller-manager --timeout=180s || return 4
+  echo "OK: controller now running $ref"
 }
 
 reload_agents() {
   echo "== agents =="
-  echo "-> building agent images ($AGENT_REPO/<tier>-agent:$AGENT_TAG) from local source"
-  make docker-build-agents REPO="$AGENT_REPO" TAG="$AGENT_TAG"
-  local missing=0
+  local built=0 patched=0 tier ref crs ns name crtier
   for tier in platform cluster-admin developer-team; do
-    img="$AGENT_REPO/${tier}-agent:$AGENT_TAG"
-    if docker image inspect "$img" >/dev/null 2>&1; then
-      echo "-> loading $img into kind cluster '$CLUSTER'"
-      kind load docker-image "$img" --name "$CLUSTER"
-    else
-      # HARD failure, not a skip. The soft "(skip …)" this replaces is what let the tag drift go
-      # unnoticed: `make` had just been told to build this exact name, so it being absent means the
-      # build did not do what this script asked. Reporting that as a skip and exiting 0 turns a
-      # broken reload into a silent no-op, and the only symptom is an ImagePullBackOff somewhere
-      # else, minutes later, that looks like a cluster problem.
-      echo "ERROR: $img is absent after 'make docker-build-agents' was told to build it." >&2
-      missing=$((missing + 1))
-    fi
+    ref="$(build_and_resolve "$tier-agent" "_TARGET=$tier,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG")" || return 4
+    built=$((built + 1))
+
+    # An empty spec.deployment.image does NOT fall back to anything local -- the controller
+    # resolves ghcr.io/gke-labs/kube-agents/<tier>-agent:v0.1.0, which is the upstream build. So
+    # the CRs are patched, not merely reported on. resolveAgentImage() already treats a reference
+    # containing '@' as complete and passes it through untouched, so a digest needs no `tag:`.
+    crs="$($K get agents -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}/{.spec.tier}{"\n"}{end}' 2>/dev/null)"
+    while IFS=/ read -r ns name crtier; do
+      [ -n "$name" ] || continue
+      # An absent spec.tier IS platform (agentindex.EffectiveTier), so the default has to be applied
+      # here too, or platform agents written without the field silently keep the upstream image
+      # while this script reports three tiers rebuilt.
+      [ -n "$crtier" ] || crtier=platform
+      [ "$crtier" = "$tier" ] || continue
+      $K -n "$ns" patch agent "$name" --type=merge \
+        -p "{\"spec\":{\"deployment\":{\"image\":\"$ref\"}}}" >/dev/null || return 4
+      echo "   patched agent $ns/$name -> $tier digest"
+      patched=$((patched + 1))
+    done <<<"$crs"
   done
-  if [ "$missing" -gt 0 ]; then
-    echo "ERROR: $missing of 3 agent images missing — refusing to report success." >&2
+
+  if [ "$built" -ne 3 ]; then
+    echo "ERROR: $built of 3 agent images built — refusing to report success." >&2
     return 4
   fi
-  cat <<EOF
-OK: all 3 agent images built and loaded at tag '$AGENT_TAG'. To make the cluster USE them, each
-Agent CR must set BOTH — an empty spec.deployment.image does NOT fall back to the local build, it
-defaults to ghcr.io/gke-labs/kube-agents/<tier>-agent:v0.1.0, which this host has never had:
-    spec.deployment.image:           $AGENT_REPO/<tier>-agent:$AGENT_TAG
-    spec.deployment.imagePullPolicy: IfNotPresent   # default PullAlways ignores kind-loaded images
-  then restart the agent workload, e.g.:
-    $K -n <namespace> rollout restart deploy/<agent-name>-gateway
-EOF
+  # Zero CRs is legitimate: up.sh runs this on a cluster that has no fixtures yet. It is reported as
+  # a count rather than passed over in silence, because "built and deployed nothing" and "built and
+  # deployed everything" must not print the same thing.
+  echo "OK: 3 agent images built and pushed at $TAG; $patched Agent CR(s) repointed at their digest."
+  if [ "$patched" -eq 0 ]; then
+    echo "   (no Agent CRs exist on $CTX yet — seed fixtures, then re-run to repoint them)"
+  fi
 }
 
 case "$TARGET" in
   operator) reload_operator ;;
   agents)   reload_agents ;;
-  all)      reload_operator; reload_agents ;;
+  all)      reload_operator && reload_agents ;;
   *) echo "usage: $0 [operator|agents|all] [kube-context]" >&2; exit 1 ;;
 esac
