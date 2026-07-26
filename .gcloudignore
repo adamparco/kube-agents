@@ -49,3 +49,6 @@ docs/*
 .claude/
 dev/*
 !dev/okf_frontmatter.py
+# The 09 §9.4 evidence record. Grew out of docs/build/LEDGER.md on 2026-07-26 and would otherwise
+# ride along in all seven uploads for the same reason the ledger used to.
+verification/

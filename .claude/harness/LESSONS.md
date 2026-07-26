@@ -12,39 +12,50 @@ before it became something that fails the build.
 about to touch. Lessons are written symptom-first, because you will meet the symptom before you know
 the cause.
 
+**Format, and why it is what it is.** Each lesson's fields were a two-column table until 2026-07-26,
+when prettier's column padding turned out to be **53% of this file** — 160 KB, all of it read at
+every orientation. They are bold-label paragraphs now, which prettier cannot pad, and the file is in
+`.prettierignore` so the index table stays unpadded too. Write new lessons the same way.
+
+**Nothing has been archived, and the criterion is why.** The prune that shrank the ledger was to
+move out the bodies of closed lessons whose mechanization had held **three phases or more**. Applied
+honestly that set is **empty**: every lesson here was seeded or opened inside Phase 8, so not one has
+had three phases to hold for. The bodies all stay. Revisit at the next milestone, when the criterion
+will start selecting.
+
 ---
 
 ## Index
 
-| ID          | Tag                       | You will notice…                                                                            | Status | Closed by                                                                                           |
-| ----------- | ------------------------- | ------------------------------------------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------- |
-| **LSN-001** | images, live-verify       | A live check passes that the source says must fail (or vice versa); unit tests are fine     | closed | `invariants-gate.py` `check_l2_scripts_declare_preconditions` (P1) · `preconditions.sh`             |
-| **LSN-002** | admission, live-verify    | A policy is applied, the offending object still runs, and nothing complains                 | closed | `invariants-gate.py` same check, P3 arm · `preconditions.sh` `p3_force_recreate`                    |
-| **LSN-003** | config, checks            | The check reads the value you wrote; the pod behaves as if you never wrote it               | closed | `invariants-gate.py` same check, P6 arm (shadowed-basename rule)                                    |
-| **LSN-004** | rbac, policy-design       | A policy "blocks all writes" and the escape uses a verb that is not a write                 | closed | `invariants-gate.py` check 1 (read-verb ALLOW-list)                                                 |
-| **LSN-005** | destructive-tests         | A guard "only runs on test clusters" and the context name merely _contains_ a keyword       | closed | `invariants-gate.py` `check_destructive_guards_are_anchored`                                        |
-| **LSN-006** | netpol, levels            | Every NetworkPolicy assertion is green and traffic flows anyway                             | closed | `egress-enforcement-l2.sh` (L2-CHAIN, Calico)                                                       |
-| **LSN-007** | completeness, wiring      | Every unit test passes and the feature does nothing in a real install                       | closed | `install-path-wired.py` · `test_image_provenance.py` · 09 §5.1                                      |
-| **LSN-008** | deferrals                 | A phase report is all green and a whole class of checks never ran                           | closed | `invariants-gate.py` `check_deferrals_name_blockers` (V-MET-006)                                    |
-| **LSN-009** | ratchets, refactors       | A refactor lands, the suite is green, and the suite is smaller                              | closed | `invariants-gate.py` ratchet + `check_retirements_name_replacements`                                |
-| **LSN-010** | ci, formatting            | Prettier is clean locally and the Prettier Check is red on the PR                           | closed | `.github/workflows/prettier.yml` · `toolchain-preflight.sh`                                         |
-| **LSN-011** | merge                     | One required check is red and one flag would merge it anyway                                | closed | `merge-provenance.py` (in `merge-provenance.yml`: push to main + daily)                             |
-| **LSN-012** | git, remotes              | The diff is enormous, or empty, or the PR shows none of the work                            | closed | `git-preflight.sh` (L0-CHAIN)                                                                       |
-| **LSN-013** | version-assertions        | A vanilla cluster is reported as GKE (or the reverse)                                       | closed | `verify-phase7.sh` B0 (server-side node `kubeletVersion`)                                           |
-| **LSN-014** | specs, audits             | Two specs each look correct and the thing they describe cannot be built                     | closed | `spec-ids.py` (V-MET-010/012/013-for-check-IDs, L0-CHAIN)                                           |
-| **LSN-015** | fixtures, topology        | Everything works with one of a thing and deadlocks with two                                 | closed | `multi-agent-namespace-l2.sh` CLAIM 1 · `agent_manifests_test.go:185`                               |
-| **LSN-016** | codegen, levels           | Every gate is green and the artifact they describe will not install                         | closed | `closed-allowlist.py` check 3b · `closed-allowlist-l2.sh` L2-1                                      |
-| **LSN-017** | checks, corpus            | A check is green before the commit and red after it, with nothing changed in between        | closed | `closed-allowlist.py` `tracked_files()`                                                             |
-| **LSN-018** | targets, tooling          | A `make` target applies to the wrong cluster and the context override is ignored            | closed | `invariants-gate.py` `check_make_targets_are_context_explicit`                                      |
-| **LSN-019** | lessons, mechanization    | A lesson says `closed`, the mechanization field is populated, and the defect recurs         | closed | `invariants-gate.py` `check_closed_lessons_are_executable`                                          |
-| **LSN-020** | ci, tooling               | A linter is green locally and red in CI, and the local run never ran the rule               | closed | `toolchain-preflight.sh` (in `actionlint.yml`)                                                      |
-| **LSN-021** | clis, callers             | A command is "run" and does nothing; the only symptom is a downstream file not existing     | closed | `cli-contract.py` (L0-CHAIN)                                                                        |
-| **LSN-022** | reverts, mutation         | Work you finished an hour ago is simply gone, and there is no stash and no reflog entry     | closed | `mutate.sh` · `test_mutate.py` (`unittest discover dev`)                                            |
-| **LSN-023** | checks, corpus            | A check that requires code to call X is satisfied by the comment saying it calls X          | closed | `invariants-gate.py` `_code_lines()`                                                                |
-| **LSN-024** | checks, timing            | A check reports a property absent; the object was correct and the read was simply early     | closed | `invariants-gate.py` `check_l2_status_reads_are_polled` (P9, L0-CHAIN)                              |
-| **LSN-025** | checks, identity          | A label selector names a role, not an object, and still matches the generation you deleted  | closed | `invariants-gate.py` `check_p3_pods_resolved_by_ownership` (P3, L0-CHAIN)                           |
-| **LSN-026** | checks, infrastructure    | Several unrelated security properties all "fail" at once, and the cluster is what is broken | closed | `invariants-gate.py` `check_l2_scripts_assert_cluster_health` (P10, L0-CHAIN) · `preconditions.sh`  |
-| **LSN-027** | infrastructure, preflight | A preflight reports the host is fine, and the cluster still refuses to start                | closed | `invariants-gate.py` `check_cluster_creating_scripts_assert_capacity` · `lib/substrate-capacity.sh` |
+| ID | Tag | You will notice… | Status | Closed by |
+| --- | --- | --- | --- | --- |
+| **LSN-001** | images, live-verify | A live check passes that the source says must fail (or vice versa); unit tests are fine | closed | `invariants-gate.py` `check_l2_scripts_declare_preconditions` (P1) · `preconditions.sh` |
+| **LSN-002** | admission, live-verify | A policy is applied, the offending object still runs, and nothing complains | closed | `invariants-gate.py` same check, P3 arm · `preconditions.sh` `p3_force_recreate` |
+| **LSN-003** | config, checks | The check reads the value you wrote; the pod behaves as if you never wrote it | closed | `invariants-gate.py` same check, P6 arm (shadowed-basename rule) |
+| **LSN-004** | rbac, policy-design | A policy "blocks all writes" and the escape uses a verb that is not a write | closed | `invariants-gate.py` check 1 (read-verb ALLOW-list) |
+| **LSN-005** | destructive-tests | A guard "only runs on test clusters" and the context name merely _contains_ a keyword | closed | `invariants-gate.py` `check_destructive_guards_are_anchored` |
+| **LSN-006** | netpol, levels | Every NetworkPolicy assertion is green and traffic flows anyway | closed | `egress-enforcement-l2.sh` (L2-CHAIN, Dataplane V2) · `test_dataplane_precondition.py` |
+| **LSN-007** | completeness, wiring | Every unit test passes and the feature does nothing in a real install | closed | `install-path-wired.py` · `test_image_provenance.py` · 09 §5.1 |
+| **LSN-008** | deferrals | A phase report is all green and a whole class of checks never ran | closed | `invariants-gate.py` `check_deferrals_name_blockers` (V-MET-006) |
+| **LSN-009** | ratchets, refactors | A refactor lands, the suite is green, and the suite is smaller | closed | `invariants-gate.py` ratchet + `check_retirements_name_replacements` |
+| **LSN-010** | ci, formatting | Prettier is clean locally and the Prettier Check is red on the PR | closed | `.github/workflows/prettier.yml` · `toolchain-preflight.sh` |
+| **LSN-011** | merge | One required check is red and one flag would merge it anyway | closed | `merge-provenance.py` (in `merge-provenance.yml`: push to main + daily) |
+| **LSN-012** | git, remotes | The diff is enormous, or empty, or the PR shows none of the work | closed | `git-preflight.sh` (L0-CHAIN) |
+| **LSN-013** | version-assertions | A vanilla cluster is reported as GKE (or the reverse) | closed | `verify-phase7.sh` B0 (server-side node `kubeletVersion`) |
+| **LSN-014** | specs, audits | Two specs each look correct and the thing they describe cannot be built | closed | `spec-ids.py` (V-MET-010/012/013-for-check-IDs, L0-CHAIN) |
+| **LSN-015** | fixtures, topology | Everything works with one of a thing and deadlocks with two | closed | `multi-agent-namespace-l2.sh` CLAIM 1 · `agent_manifests_test.go:185` |
+| **LSN-016** | codegen, levels | Every gate is green and the artifact they describe will not install | closed | `closed-allowlist.py` check 3b · `closed-allowlist-l2.sh` L2-1 |
+| **LSN-017** | checks, corpus | A check is green before the commit and red after it, with nothing changed in between | closed | `closed-allowlist.py` `tracked_files()` |
+| **LSN-018** | targets, tooling | A `make` target applies to the wrong cluster and the context override is ignored | closed | `invariants-gate.py` `check_make_targets_are_context_explicit` |
+| **LSN-019** | lessons, mechanization | A lesson says `closed`, the mechanization field is populated, and the defect recurs | closed | `invariants-gate.py` `check_closed_lessons_are_executable` |
+| **LSN-020** | ci, tooling | A linter is green locally and red in CI, and the local run never ran the rule | closed | `toolchain-preflight.sh` (in `actionlint.yml`) |
+| **LSN-021** | clis, callers | A command is "run" and does nothing; the only symptom is a downstream file not existing | closed | `cli-contract.py` (L0-CHAIN) |
+| **LSN-022** | reverts, mutation | Work you finished an hour ago is simply gone, and there is no stash and no reflog entry | closed | `mutate.sh` · `test_mutate.py` (`unittest discover dev`) |
+| **LSN-023** | checks, corpus | A check that requires code to call X is satisfied by the comment saying it calls X | closed | `invariants-gate.py` `_code_lines()` |
+| **LSN-024** | checks, timing | A check reports a property absent; the object was correct and the read was simply early | closed | `invariants-gate.py` `check_l2_status_reads_are_polled` (P9, L0-CHAIN) |
+| **LSN-025** | checks, identity | A label selector names a role, not an object, and still matches the generation you deleted | closed | `invariants-gate.py` `check_p3_pods_resolved_by_ownership` (P3, L0-CHAIN) |
+| **LSN-026** | checks, infrastructure | Several unrelated security properties all "fail" at once, and the cluster is what is broken | closed | `invariants-gate.py` `check_l2_scripts_assert_cluster_health` (P10, L0-CHAIN) · `preconditions.sh` |
+| **LSN-027** | infrastructure, preflight | A preflight reports the host is fine, and the cluster still refuses to start | closed | `invariants-gate.py` `check_cluster_creating_scripts_assert_capacity` · `lib/substrate-capacity.sh` |
 
 **Open: 0 of 27.**
 
@@ -76,13 +87,40 @@ first question this pass asks of anything still open.
 
 `images, live-verify` · **closed** 2026-07-25 (improvement pass) · recurred **three times** (Phase 3, Phase 6, first live install)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | A namespace-isolation escape was **admitted** on a live cluster while the source and every unit test were correct. Later: chaos-recreated pods never appeared, because a controller predating the Phase-5 hardening rendered pods the hardening VAP correctly rejected. Later still: a live install silently ran the published `ghcr.io/gke-labs` controller even though the operator had been built from local source.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| **Root cause**    | The deployed image was `:v0.1.0`/`:latest` with `imagePullPolicy: IfNotPresent`. A same-tag image is **not** re-pulled, and the node keeps the old layer until a pod is recreated against a freshly loaded one. In the third instance, `provision_03` called `make deploy` without `IMG`, so `OPERATOR_IMAGE` was ignored outright.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| **Generalize**    | **A deployed artifact is not evidence of the build under test unless its identity is verified.** Applies to every image, policy, CRD, and rendered manifest — not just this operator. The failure is silent by construction: the old logic under-enforces, so the run reads green.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| **Mechanization** | Two artifacts, because the lesson has two halves. **`dev/lib/preconditions.sh`** `p1_assert_build_under_test` reads the pod's running `status.containerStatuses[].imageID` and compares it against the local build's config digest — returning **three** states, not two, since "could not look" is exactly how P1 became decorative (it maps to the caller's DEFERRED exit, never to a pass). **`dev/tests/invariants-gate.py`** `check_l2_scripts_declare_preconditions` is what makes it non-optional: every script in `L2-CHAIN.txt` must declare a `P1:` line naming the artifact it is judging, and a script that declares one without calling `p1_assert_build_under_test` fails with "the declaration is ahead of the code". Previously closed against `binding.md` **P1**/**P8**, 09 §9.3.1 and **V-CMP-002** — a precondition, two spec sections and a check ID, none of which execute. V-CMP-002 (`test_image_provenance.py`) is real but proves the **publish** side; the defect landed on the **running** side all three times. |
-| **Verify**        | Seven mutations run through `dev/mutate.sh` against `verify-phase7.sh` and `tenant-isolation-l2.sh`, all caught, plus an unmutated control that stays green: delete the `P1:` declaration · declare P1 as `yes` (names no artifact) · delete the `p1_assert_build_under_test` call and keep the sentence describing it · delete the `P3:` declaration · waive P3 with a bare `none` · waive P1 with a bare `none` · point P6 at `/opt/data/config.yaml`. **Limit, stated:** a waiver with a well-written but false argument passes — the lint measures that an argument was made, not that it is true.                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+**Trigger.** A namespace-isolation escape was **admitted** on a live cluster while the source and
+every unit test were correct. Later: chaos-recreated pods never appeared, because a controller
+predating the Phase-5 hardening rendered pods the hardening VAP correctly rejected. Later still: a
+live install silently ran the published `ghcr.io/gke-labs` controller even though the operator had
+been built from local source.
+
+**Root cause.** The deployed image was `:v0.1.0`/`:latest` with `imagePullPolicy: IfNotPresent`. A
+same-tag image is **not** re-pulled, and the node keeps the old layer until a pod is recreated
+against a freshly loaded one. In the third instance, `provision_03` called `make deploy` without
+`IMG`, so `OPERATOR_IMAGE` was ignored outright.
+
+**Generalize.** **A deployed artifact is not evidence of the build under test unless its identity is
+verified.** Applies to every image, policy, CRD, and rendered manifest — not just this operator. The
+failure is silent by construction: the old logic under-enforces, so the run reads green.
+
+**Mechanization.** Two artifacts, because the lesson has two halves. **`dev/lib/preconditions.sh`**
+`p1_assert_build_under_test` reads the pod's running `status.containerStatuses[].imageID` and
+compares it against the local build's config digest — returning **three** states, not two, since
+"could not look" is exactly how P1 became decorative (it maps to the caller's DEFERRED exit, never
+to a pass). **`dev/tests/invariants-gate.py`** `check_l2_scripts_declare_preconditions` is what
+makes it non-optional: every script in `L2-CHAIN.txt` must declare a `P1:` line naming the artifact
+it is judging, and a script that declares one without calling `p1_assert_build_under_test` fails
+with "the declaration is ahead of the code". Previously closed against `binding.md` **P1**/**P8**,
+09 §9.3.1 and **V-CMP-002** — a precondition, two spec sections and a check ID, none of which
+execute. V-CMP-002 (`test_image_provenance.py`) is real but proves the **publish** side; the defect
+landed on the **running** side all three times.
+
+**Verify.** Seven mutations run through `dev/mutate.sh` against `verify-phase7.sh` and
+`tenant-isolation-l2.sh`, all caught, plus an unmutated control that stays green: delete the `P1:`
+declaration · declare P1 as `yes` (names no artifact) · delete the `p1_assert_build_under_test` call
+and keep the sentence describing it · delete the `P3:` declaration · waive P3 with a bare `none` ·
+waive P1 with a bare `none` · point P6 at `/opt/data/config.yaml`. **Limit, stated:** a waiver with
+a well-written but false argument passes — the lint measures that an argument was made, not that it
+is true.
 
 > It did **not** close as "remember to rebuild the image". That sentence had already been written
 > down twice and forgotten twice.
@@ -93,13 +131,28 @@ first question this pass asks of anything still open.
 
 `admission, live-verify` · **closed** 2026-07-25 (improvement pass)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | `kubeagents-system` was labelled Pod Security `enforce: restricted`, the bundled LiteLLM and inference-replay pods had no `securityContext` — and everything stayed Ready. The gap only appeared when a clean cluster refused to schedule them.                                                                                                                                                                                                                                                                                                                                                                                                               |
-| **Root cause**    | Admission policies (PSA, VAP) evaluate **admission**. They do not evict, re-admit, or re-evaluate objects that already exist. A pre-policy pod grandfathers itself and masks a renderer that emits non-conforming objects.                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| **Generalize**    | Never infer enforcement from the state of a running object. An admission property is only observable at the moment of admission — force the recreation, or you are testing the past.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| **Mechanization** | **`dev/tests/invariants-gate.py`** `check_l2_scripts_declare_preconditions`, P3 arm: a script that declares `P3 admission-recreate:` against a live object must contain, **in code and not in a comment**, one of `p3_force_recreate` (in `dev/lib/preconditions.sh`), an explicit `delete`, or `--dry-run=server` — the last because a server-side dry run admits in full and persists nothing, so there is nothing to grandfather. A script that cannot honour P3 must waive it in writing with an argument; "none" alone fails. Previously closed against `binding.md` **P3** and 09 §9.3.3/§11.2 — a precondition and two spec sections, none executable. |
-| **Verify**        | Deleting the `P3:` declaration and waiving it with a bare `none` both fail the gate (mutations M4 and M5 above). The runtime half: `egress-enforcement-l2.sh` deletes its fixtures before each negative and `closed-allowlist-l2.sh` re-applies server-side.                                                                                                                                                                                                                                                                                                                                                                                                  |
+**Trigger.** `kubeagents-system` was labelled Pod Security `enforce: restricted`, the bundled
+LiteLLM and inference-replay pods had no `securityContext` — and everything stayed Ready. The gap
+only appeared when a clean cluster refused to schedule them.
+
+**Root cause.** Admission policies (PSA, VAP) evaluate **admission**. They do not evict, re-admit,
+or re-evaluate objects that already exist. A pre-policy pod grandfathers itself and masks a renderer
+that emits non-conforming objects.
+
+**Generalize.** Never infer enforcement from the state of a running object. An admission property is
+only observable at the moment of admission — force the recreation, or you are testing the past.
+
+**Mechanization.** **`dev/tests/invariants-gate.py`** `check_l2_scripts_declare_preconditions`, P3
+arm: a script that declares `P3 admission-recreate:` against a live object must contain, **in code
+and not in a comment**, one of `p3_force_recreate` (in `dev/lib/preconditions.sh`), an explicit
+`delete`, or `--dry-run=server` — the last because a server-side dry run admits in full and persists
+nothing, so there is nothing to grandfather. A script that cannot honour P3 must waive it in writing
+with an argument; "none" alone fails. Previously closed against `binding.md` **P3** and 09
+§9.3.3/§11.2 — a precondition and two spec sections, none executable.
+
+**Verify.** Deleting the `P3:` declaration and waiving it with a bare `none` both fail the gate
+(mutations M4 and M5 above). The runtime half: `egress-enforcement-l2.sh` deletes its fixtures
+before each negative and `closed-allowlist-l2.sh` re-applies server-side.
 
 ---
 
@@ -107,13 +160,28 @@ first question this pass asks of anything still open.
 
 `config, checks` · **closed** 2026-07-25 (improvement pass)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | Checks asserted against the `config.yaml` baked into the image and passed. The runtime was reading the operator-rendered ConfigMap, which **shadows** it, and which said something different.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| **Root cause**    | Two artifacts hold the same setting and only one is authoritative at runtime. The cheaper one to read is the wrong one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| **Generalize**    | A check must name the **runtime-authoritative** artifact and read that. Where a value is rendered, the rendered copy is the truth and the source is an input.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| **Mechanization** | **`dev/tests/invariants-gate.py`** `check_l2_scripts_declare_preconditions`, P6 arm — the lint proposed at the last pass, built at this one. Every L2 script declares `P6 runtime-authoritative:` naming the artifact it reads, and the declaration fails if it names a **path** whose basename the operator also renders into a ConfigMap, unless it says `configmap` too. The shadowed basenames are **derived, not listed**: `_shadowed_basenames()` reads the ConfigMap `data` keys out of `k8s-operator/internal/**/*.go`, so a renderer that starts emitting a second key is covered the day it lands. A hardcoded `{"config.yaml"}` would have been a memorial to this lesson rather than a guard against it. |
-| **Verify**        | Rewriting `tenant-isolation-l2.sh`'s P6 to `/opt/data/config.yaml` fails the gate with "the file is an input; the ConfigMap is the artifact that runs" (mutation M6 above). Adding a key to a renderer's ConfigMap `data` map extends the check with no edit here.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+**Trigger.** Checks asserted against the `config.yaml` baked into the image and passed. The runtime
+was reading the operator-rendered ConfigMap, which **shadows** it, and which said something
+different.
+
+**Root cause.** Two artifacts hold the same setting and only one is authoritative at runtime. The
+cheaper one to read is the wrong one.
+
+**Generalize.** A check must name the **runtime-authoritative** artifact and read that. Where a
+value is rendered, the rendered copy is the truth and the source is an input.
+
+**Mechanization.** **`dev/tests/invariants-gate.py`** `check_l2_scripts_declare_preconditions`, P6
+arm — the lint proposed at the last pass, built at this one. Every L2 script declares `P6
+runtime-authoritative:` naming the artifact it reads, and the declaration fails if it names a
+**path** whose basename the operator also renders into a ConfigMap, unless it says `configmap` too.
+The shadowed basenames are **derived, not listed**: `_shadowed_basenames()` reads the ConfigMap
+`data` keys out of `k8s-operator/internal/**/*.go`, so a renderer that starts emitting a second key
+is covered the day it lands. A hardcoded `{"config.yaml"}` would have been a memorial to this lesson
+rather than a guard against it.
+
+**Verify.** Rewriting `tenant-isolation-l2.sh`'s P6 to `/opt/data/config.yaml` fails the gate with
+"the file is an input; the ConfigMap is the artifact that runs" (mutation M6 above). Adding a key to
+a renderer's ConfigMap `data` map extends the check with no edit here.
 
 ---
 
@@ -121,13 +189,27 @@ first question this pass asks of anything still open.
 
 `rbac, policy-design` · **closed**
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | The VAP read-only ceiling was expressed as a **write-verb deny-list**. It admitted `impersonate` — which is equivalent to cluster-admin. Found by the Phase-0 pre-PR adversarial review, not by the suite.                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| **Root cause**    | A deny-list is a claim about the complete set of dangerous verbs. That set is open-ended and grows with the API.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| **Generalize**    | **Security policies are allow-lists.** Enumerate what is permitted (`verbs ⊆ get/list/watch`) and deny by default. A deny-list on a boundary is wrong even when it currently happens to be complete.                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| **Mechanization** | **`dev/tests/invariants-gate.py` check 1** (`check_write_verbs_have_machinery`). Every Role/ClusterRole carrying the `kube-agents/tier` label is scanned against an **allow-list** of `get`/`list`/`watch`, copied verbatim from the `is-agent-rbac` CEL in `vap-agent-readonly.yaml` rather than re-derived — so gate and runtime agree by construction. Anything else, including `escalate`/`bind`/`impersonate`, fails unless the broker machinery exists. A deny-list of "write verbs" is the shape of the original defect and cannot be reintroduced here without deleting the comment that says so. Backed by **V-CTN-012**/**V-CTR-004** and 09 §11.4. |
-| **Verify**        | `dev/tests/negative-attenuation.sh` includes the `impersonate` ClusterRole as a standing negative.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+**Trigger.** The VAP read-only ceiling was expressed as a **write-verb deny-list**. It admitted
+`impersonate` — which is equivalent to cluster-admin. Found by the Phase-0 pre-PR adversarial
+review, not by the suite.
+
+**Root cause.** A deny-list is a claim about the complete set of dangerous verbs. That set is
+open-ended and grows with the API.
+
+**Generalize.** **Security policies are allow-lists.** Enumerate what is permitted (`verbs ⊆
+get/list/watch`) and deny by default. A deny-list on a boundary is wrong even when it currently
+happens to be complete.
+
+**Mechanization.** **`dev/tests/invariants-gate.py` check 1** (`check_write_verbs_have_machinery`).
+Every Role/ClusterRole carrying the `kube-agents/tier` label is scanned against an **allow-list** of
+`get`/`list`/`watch`, copied verbatim from the `is-agent-rbac` CEL in `vap-agent-readonly.yaml`
+rather than re-derived — so gate and runtime agree by construction. Anything else, including
+`escalate`/`bind`/`impersonate`, fails unless the broker machinery exists. A deny-list of "write
+verbs" is the shape of the original defect and cannot be reintroduced here without deleting the
+comment that says so. Backed by **V-CTN-012**/**V-CTR-004** and 09 §11.4.
+
+**Verify.** `dev/tests/negative-attenuation.sh` includes the `impersonate` ClusterRole as a standing
+negative.
 
 ---
 
@@ -135,13 +217,22 @@ first question this pass asks of anything still open.
 
 `destructive-tests` · **closed**
 
-| Field             |                                                                                                                                                                                                                                         |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | The destructive-test guard matched contexts by substring (`*scratch*`, `*kind*`). A production context named `gke_prod_…_kube-agents-dev-prod` would have satisfied it and been treated as a disposable test cluster.                   |
-| **Root cause**    | Glob substring matching on a name that an attacker — or an ordinary naming convention — controls.                                                                                                                                       |
-| **Generalize**    | A guard that decides whether destruction is permitted is a security control. Anchor it (`kind-*`, `gke-scratch-*` in a shell `case`), and give the guard **its own negative test**.                                                     |
-| **Mechanization** | **`dev/tests/invariants-gate.py`** `check_destructive_guards_are_anchored`. Every script under `dev/` that takes its context from the caller (`CTX="${1:-…}"`, 14 of them) must have a `case "$CTX"` whose accepting arms match `^(kind | gke-scratch)-`with no leading or interior`_`, and whose `_)`arm exits non-zero. Mutation-tested both ways: rewriting one arm to`_kind_`fails the gate, and so does replacing a refusal's`exit 2`with a bare`;;`. Previously closed against `binding.md`P5 and 09 §9.3.5, which state the rule and enforce nothing. The same check covers the`ctx-guard` target added for LSN-018. |
-| **Verify**        | The guard is exercised against three prod-lookalike contexts and refuses all three (LEDGER, Phase 0).                                                                                                                                   |
+**Trigger.** The destructive-test guard matched contexts by substring (`*scratch*`, `*kind*`). A
+production context named `gke_prod_…_kube-agents-dev-prod` would have satisfied it and been treated
+as a disposable test cluster.
+
+**Root cause.** Glob substring matching on a name that an attacker — or an ordinary naming
+convention — controls.
+
+**Generalize.** A guard that decides whether destruction is permitted is a security control. Anchor
+it (`kind-*`, `gke-scratch-*` in a shell `case`), and give the guard **its own negative test**.
+
+**Mechanization.** **`dev/tests/invariants-gate.py`** `check_destructive_guards_are_anchored`. Every
+script under `dev/` that takes its context from the caller (`CTX="${1:-…}"`, 14 of them) must have a
+`case "$CTX"` whose accepting arms match `^(kind
+
+**Verify.** The guard is exercised against three prod-lookalike contexts and refuses all three
+(LEDGER, Phase 0).
 
 ---
 
@@ -149,13 +240,40 @@ first question this pass asks of anything still open.
 
 `netpol, levels` · **closed**
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | Per-tier NetworkPolicies were asserted structurally correct and the suite was green. The cluster ran **kindnet**, which ignores NetworkPolicy entirely — nothing was ever blocked.                                                                                                                                                                                                                                                                                                                                                                          |
-| **Root cause**    | The property is runtime enforcement; the check was a file grep. The level was chosen for speed, not for what it could prove.                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| **Generalize**    | **An enforcement property is proven on an enforcing substrate, or recorded `deferred` — never green from a structural check.** A check's substrate is part of its definition (SELF-IMPROVEMENT §4, "stub the dependency").                                                                                                                                                                                                                                                                                                                                  |
-| **Mechanization** | **`dev/verify/egress-enforcement-l2.sh`**, in `dev/L2-CHAIN.txt`, run on the dedicated Calico target `kind-kube-agents-egress`: 18/18, each negative preceded by a no-policy baseline that reaches the endpoint, against the **shipped rendered policy** rather than a synthetic one. That last distinction is the lesson — `dev/tests/egress-enforcement.sh` builds its own policy and so stays green whatever ships. Precondition **P4** (never `pass` on kindnet) and 09 §3/§9.3.4/§11.6 remain the statement of the rule; this is the thing that fails. |
-| **Verify**        | Run the egress suite on the kindnet cluster and confirm it reports `DEFERRED`, not `PASS`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+**Trigger.** Per-tier NetworkPolicies were asserted structurally correct and the suite was green.
+The cluster ran **kindnet**, which ignores NetworkPolicy entirely — nothing was ever blocked.
+
+**Root cause.** The property is runtime enforcement; the check was a file grep. The level was chosen
+for speed, not for what it could prove.
+
+**Generalize.** **An enforcement property is proven on an enforcing substrate, or recorded
+`deferred` — never green from a structural check.** A check's substrate is part of its definition
+(SELF-IMPROVEMENT §4, "stub the dependency").
+
+**Mechanization.** **`dev/verify/egress-enforcement-l2.sh`**, in `dev/L2-CHAIN.txt`: 18/18, each
+negative preceded by a no-policy baseline that reaches the endpoint, against the **shipped rendered
+policy** rather than a synthetic one. That last distinction is the lesson —
+`dev/tests/egress-enforcement.sh` builds its own policy and so stays green whatever ships.
+Precondition **P4**, `p4_assert_enforcing_dataplane` in `dev/lib/preconditions.sh`, is the half that
+refuses to be fooled twice: it is an **allow-list of known-enforcing dataplanes** (`calico-node`,
+`anetd`, `cilium`), so an unrecognised dataplane returns `deferred` rather than `pass`. A deny-list
+(`if kindnet then defer`) gets this case right and the next one wrong, which is the same mistake one
+substrate later. 09 §3/§9.3.4/§11.6 remain the statement of the rule; these are the things that
+fail.
+
+**Verify.** `dev/test_dataplane_precondition.py`, in `dev/L0-CHAIN.txt`, feeds the detector
+fabricated `kubectl get ds` output for calico · anetd · kindnet · nothing and asserts only the first
+two are accepted. Hermetic on purpose: the substrate it needs to prove the lesson against is the one
+the loop no longer has.
+
+**Substrate note (2026-07-26).** The kindnet cluster this lesson was learned on, and the dedicated
+Calico target `kind-kube-agents-egress` that closed it, are both gone — L2 is one remote GKE cluster
+on **Dataplane V2**, which enforces. The lesson does not weaken with them: it is why `V-CTN-020` was
+a known liability for eight phases rather than a genuine pass, and it is the reason the dev cluster
+had to be created with DPv2 (GKE cannot enable it on an existing cluster, so it is a create-time
+choice or nothing). What changed is that the enforcing substrate is now the default one instead of a
+second cluster stood up beside it. See also [[lsn-026]] and [[lsn-027]], the two other lessons whose
+host left the loop that day.
 
 ---
 
@@ -163,14 +281,38 @@ first question this pass asks of anything still open.
 
 `completeness, wiring` · **closed**
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | `kage-router`, the event ingress, and the NetworkPolicies all had passing tests. In a live install the router was at 0 replicas, no install path applied the policies, and the ingress had no caller.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| **Root cause**    | Completeness was measured as "the component exists and its tests pass". Nothing asserted it was reachable from the system it belongs to.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| **Generalize**    | **Completeness = exists AND wired AND exercised.** Three probes, all recorded, or the component is not done.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| **Mechanization** | `dev/tests/install-path-wired.py` — every numbered step script is invoked by its driver, every driver reference resolves, provision/teardown are symmetric, teardown descends. Plus **V-CMP-004** (`replicas > 0` in the default install) and **V-CMP-003** (no `REPLACE_WITH_*` in a shipped manifest); 09 §5.1, §11.9. **P8-T5 adds `dev/test_image_provenance.py`** (**V-CMP-002**) for a third form of unreachable this lesson's other two probes cannot see: wired correctly in-tree, but pinning an image or tag no workflow publishes. `kage-router` — this lesson's own trigger — was in that state for two further phases after it was first closed.                                                    |
-| **Recurrence**    | **2026-07-25, P8-T3.** This lesson was marked closed with mechanization "**V-CMP-001**" — a check ID in 09 §6 that **no script implemented**. The closure asserted coverage that did not exist, so the defect recurred: P8-T2 shipped `provision_13_apply_network_policies.sh`, a correct step that renders and applies the three per-tier egress policies, and added it to no driver. It also had no teardown. The unit's ledger row states the policies are "applied from an install path"; for one commit they were not. Re-closed with a runnable check, which found both defects on its first execution. The generalization — that a populated Mechanization field is not a mechanization — is **LSN-019**. |
-| **Verify**        | Park a required Deployment at 0 replicas and confirm V-CMP-004 fails. For the wiring half: comment out a `provision_NN` line in `provision.sh` and confirm `install-path-wired.py` exits non-zero (this is one of its seven self-test controls). For the registry half: delete a publish step, or retag any manifest to a tag no workflow produces, and confirm `python3 -m unittest dev.test_image_provenance` exits non-zero (11 such mutations were run; all 11 fail).                                                                                                                                                                                                                                        |
+**Trigger.** `kage-router`, the event ingress, and the NetworkPolicies all had passing tests. In a
+live install the router was at 0 replicas, no install path applied the policies, and the ingress had
+no caller.
+
+**Root cause.** Completeness was measured as "the component exists and its tests pass". Nothing
+asserted it was reachable from the system it belongs to.
+
+**Generalize.** **Completeness = exists AND wired AND exercised.** Three probes, all recorded, or
+the component is not done.
+
+**Mechanization.** `dev/tests/install-path-wired.py` — every numbered step script is invoked by its
+driver, every driver reference resolves, provision/teardown are symmetric, teardown descends. Plus
+**V-CMP-004** (`replicas > 0` in the default install) and **V-CMP-003** (no `REPLACE_WITH_*` in a
+shipped manifest); 09 §5.1, §11.9. **P8-T5 adds `dev/test_image_provenance.py`** (**V-CMP-002**) for
+a third form of unreachable this lesson's other two probes cannot see: wired correctly in-tree, but
+pinning an image or tag no workflow publishes. `kage-router` — this lesson's own trigger — was in
+that state for two further phases after it was first closed.
+
+**Recurrence.** **2026-07-25, P8-T3.** This lesson was marked closed with mechanization
+"**V-CMP-001**" — a check ID in 09 §6 that **no script implemented**. The closure asserted coverage
+that did not exist, so the defect recurred: P8-T2 shipped `provision_13_apply_network_policies.sh`,
+a correct step that renders and applies the three per-tier egress policies, and added it to no
+driver. It also had no teardown. The unit's ledger row states the policies are "applied from an
+install path"; for one commit they were not. Re-closed with a runnable check, which found both
+defects on its first execution. The generalization — that a populated Mechanization field is not a
+mechanization — is **LSN-019**.
+
+**Verify.** Park a required Deployment at 0 replicas and confirm V-CMP-004 fails. For the wiring
+half: comment out a `provision_NN` line in `provision.sh` and confirm `install-path-wired.py` exits
+non-zero (this is one of its seven self-test controls). For the registry half: delete a publish
+step, or retag any manifest to a tag no workflow produces, and confirm `python3 -m unittest
+dev.test_image_provenance` exits non-zero (11 such mutations were run; all 11 fail).
 
 ---
 
@@ -178,13 +320,25 @@ first question this pass asks of anything still open.
 
 `deferrals` · **closed**
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | The scratch-GKE V-G checks were "pending" for five consecutive phases. Only the explicit ⏸ label in the ledger kept them from reading as part of a green phase.                                                                                                                                                                                                                                                                                                                                    |
-| **Root cause**    | A phase summary reports what ran. A check that never ran contributes nothing to the summary — so absence looks like success.                                                                                                                                                                                                                                                                                                                                                                       |
-| **Generalize**    | **Deferred is a first-class result**, with a named external blocker, an owner, and a promotion condition. A deferral without an external blocker is a failure wearing a different label, and reclassifying a failure as a deferral is a named reward hack. **A BLOCKING-ALWAYS check may never be deferred** — if it cannot run, the build is not verifiable, and that is the finding.                                                                                                             |
-| **Mechanization** | **`dev/tests/invariants-gate.py`** `check_deferrals_name_blockers`, over the ledger's **Deferrals** table: every row must name a blocker, an owner and a promotion condition, and no row may defer a **BLOCKING-ALWAYS** suite unless the verification log records that check passing at some other level. Mutation-tested by blanking one owner cell. Previously closed against **V-MET-006** and 09 §9.6 — the check ID that describes this rule, which is exactly the closure LSN-019 is about. |
-| **Verify**        | A deferral with no blocker fails V-MET-006.                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+**Trigger.** The scratch-GKE V-G checks were "pending" for five consecutive phases. Only the
+explicit ⏸ label in the ledger kept them from reading as part of a green phase.
+
+**Root cause.** A phase summary reports what ran. A check that never ran contributes nothing to the
+summary — so absence looks like success.
+
+**Generalize.** **Deferred is a first-class result**, with a named external blocker, an owner, and a
+promotion condition. A deferral without an external blocker is a failure wearing a different label,
+and reclassifying a failure as a deferral is a named reward hack. **A BLOCKING-ALWAYS check may
+never be deferred** — if it cannot run, the build is not verifiable, and that is the finding.
+
+**Mechanization.** **`dev/tests/invariants-gate.py`** `check_deferrals_name_blockers`, over the
+ledger's **Deferrals** table: every row must name a blocker, an owner and a promotion condition, and
+no row may defer a **BLOCKING-ALWAYS** suite unless the verification log records that check passing
+at some other level. Mutation-tested by blanking one owner cell. Previously closed against
+**V-MET-006** and 09 §9.6 — the check ID that describes this rule, which is exactly the closure
+LSN-019 is about.
+
+**Verify.** A deferral with no blocker fails V-MET-006.
 
 ---
 
@@ -192,13 +346,28 @@ first question this pass asks of anything still open.
 
 `ratchets, refactors` · **closed** _(P8-T6: the pre-merge script now exists and runs)_
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Trigger**       | The read-only → imperative conversion makes many read-only assertions genuinely obsolete. Deleting one and gaining no replacement leaves the suite green and smaller, and nobody notices.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| **Root cause**    | Green is a property of the checks that ran, not of the checks that should exist. Removal is invisible to every signal except a count.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| **Generalize**    | **Tests are replaced, never deleted.** A retirement must name its replacement, the replacement must exist first, and the total must not fall. Retired IDs are kept with a pointer, never reused.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| **Mechanization** | **`dev/tests/invariants-gate.py`** — `check_assertion_ratchet` (**V-MET-003**) diffs the named-test inventory against `dev/assertion-baseline.json` across the whole corpus (Python `test_*`, Go `Test*`, shell `check_*`/`assert_*`), and `check_retirements_name_replacements` (**V-MET-004**) requires every retired entry to point at something that exists. The unit is the **named test**, not the `assert` statement: "tests are replaced, never deleted" is a statement about tests, and a raw-assert count fires on honest refactors — a gate that fires on honest work gets disabled. Scope is deliberately **wider** than V-MET-003's letter (V-CTN/V-BRK/V-REV/V-ADV), because only V-CTN-020 of those has an implementation today and the literal scope would guard one check and read green forever. |
-| **Verify**        | Delete a security assertion with no replacement and confirm the ratchet fails the diff.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+**Trigger.** The read-only → imperative conversion makes many read-only assertions genuinely
+obsolete. Deleting one and gaining no replacement leaves the suite green and smaller, and nobody
+notices.
+
+**Root cause.** Green is a property of the checks that ran, not of the checks that should exist.
+Removal is invisible to every signal except a count.
+
+**Generalize.** **Tests are replaced, never deleted.** A retirement must name its replacement, the
+replacement must exist first, and the total must not fall. Retired IDs are kept with a pointer,
+never reused.
+
+**Mechanization.** **`dev/tests/invariants-gate.py`** — `check_assertion_ratchet` (**V-MET-003**)
+diffs the named-test inventory against `dev/assertion-baseline.json` across the whole corpus (Python
+`test_*`, Go `Test*`, shell `check_*`/`assert_*`), and `check_retirements_name_replacements`
+(**V-MET-004**) requires every retired entry to point at something that exists. The unit is the
+**named test**, not the `assert` statement: "tests are replaced, never deleted" is a statement about
+tests, and a raw-assert count fires on honest refactors — a gate that fires on honest work gets
+disabled. Scope is deliberately **wider** than V-MET-003's letter (V-CTN/V-BRK/V-REV/V-ADV), because
+only V-CTN-020 of those has an implementation today and the literal scope would guard one check and
+read green forever.
+
+**Verify.** Delete a security assertion with no replacement and confirm the ratchet fails the diff.
 
 ---
 
@@ -206,13 +375,22 @@ first question this pass asks of anything still open.
 
 `ci, formatting` · **closed** · broke CI **twice**
 
-| Field             |                                                                                                                                                                                                                                                                                           |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | PR #3 went red on a golden fixture the session had never opened. PR #4 needed a follow-up `style(phase2)` commit for skill docs and fixtures formatted in earlier commits.                                                                                                                |
-| **Root cause**    | The session formatted the files it edited. CI runs `git diff --name-only origin/<base_ref>...HEAD` and checks **every** changed `.md`/`.yaml`/`.yml` on the branch, including files from earlier units.                                                                                   |
-| **Generalize**    | Run the project's formatter over the **full changed set relative to the base branch**, computed the same way CI computes it — not over the files you happen to remember touching.                                                                                                         |
-| **Mechanization** | `.github/workflows/prettier.yml` is the binding verdict and runs on every PR; `dev/toolchain-preflight.sh` records the local formatter's version so a skew is visible before the PR rather than after it. `binding.md` §Build still carries the exact command with `origin/main` as base. |
-| **Verify**        | `npx prettier --check` over the base-branch diff set is clean before every PR.                                                                                                                                                                                                            |
+**Trigger.** PR #3 went red on a golden fixture the session had never opened. PR #4 needed a
+follow-up `style(phase2)` commit for skill docs and fixtures formatted in earlier commits.
+
+**Root cause.** The session formatted the files it edited. CI runs `git diff --name-only
+origin/<base_ref>...HEAD` and checks **every** changed `.md`/`.yaml`/`.yml` on the branch, including
+files from earlier units.
+
+**Generalize.** Run the project's formatter over the **full changed set relative to the base
+branch**, computed the same way CI computes it — not over the files you happen to remember touching.
+
+**Mechanization.** `.github/workflows/prettier.yml` is the binding verdict and runs on every PR;
+`dev/toolchain-preflight.sh` records the local formatter's version so a skew is visible before the
+PR rather than after it. `binding.md` §Build still carries the exact command with `origin/main` as
+base.
+
+**Verify.** `npx prettier --check` over the base-branch diff set is clean before every PR.
 
 ---
 
@@ -220,15 +398,45 @@ first question this pass asks of anything still open.
 
 `merge` · **closed** 2026-07-25 (improvement pass)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | A milestone PR sits with the gate green except one red check, and `gh pr merge --admin` is one flag away. Auto-merge makes this a standing temptation rather than an occasional one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| **Root cause**    | The objective is "the phase is merged". Bypassing the check achieves the objective without achieving the property.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| **Generalize**    | A red required check means the milestone is **not done**. Forcing it converts a slow build into an untrustworthy one — every later green rests on an unverified base.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| **Mechanization** | **`dev/tests/merge-provenance.py`**, run by **`.github/workflows/merge-provenance.yml`** on every push to `main` and daily at 06:17 UTC. For each squash commit on `main` it asserts: the subject names a PR, that PR's merge commit **is** this commit (a `(#N)` in free text proves nothing), and every check run against the PR's head SHA concluded green. The reopening note said the forbidden flags "leave no trace a later check could find **in the tree**" — true, and the wrong place to look. The forge keeps the check-run conclusions for the head SHA forever, so "was anything merged over a red check" is answerable exactly, after the fact, without trusting anyone's memory. **Exit 2 = could not run** (no `gh`, no credential, no network) and the workflow converts it to a failure, because "the audit could not run" and "the audit found nothing" are the same output only in builds that turn out to have been lying to themselves. |
-| **Scope**         | The audit starts at the fork point (`INHERITED_FLOOR`) — the 187 commits authored upstream resolve `(#N)` in **gke-labs**'s PR namespace and produced 187 false accusations on the first run. The floor is itself checked: it must be an ancestor of a remote that does **not** carry `docs/build/LEDGER.md`, so it cannot be walked forward past this build's own merges. What it still cannot see, stated: a check that was never required and never ran leaves no red run to find (V-MET-007 owns that), `--no-verify` skips local hooks that never produce a check run at all, and a red re-run green **after** the merge reads as green.                                                                                                                                                                                                                                                                                                                  |
-| **Escape found**  | Its first correct run found one. **PR #10**, 2026-07-24, `docs: correct Kind test flow to build & load local images`, merged with **prettier red** on `docs/build/HARNESS.md`. The formatting defect is long since resolved; the merge is the LSN-011 instance and stays on the record as a **carried** escape rather than being cleared, because clearing it would leave a check that has never found anything. It predates every phase PR in this build (#11–#16), all of which are clean.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| **Verify**        | `python3 dev/tests/merge-provenance.py` → 15 merged PRs audited since the fork point, no **new** red merge, 1 carried escape, exit 0. The one recurring benign failure — `Auto Request Review`, a CODEOWNERS bot with no permission on a fork — is named and argued in the script rather than filtered silently; a documented exception a reader can dispute is the difference between a scope and an exemption.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+**Trigger.** A milestone PR sits with the gate green except one red check, and `gh pr merge --admin`
+is one flag away. Auto-merge makes this a standing temptation rather than an occasional one.
+
+**Root cause.** The objective is "the phase is merged". Bypassing the check achieves the objective
+without achieving the property.
+
+**Generalize.** A red required check means the milestone is **not done**. Forcing it converts a slow
+build into an untrustworthy one — every later green rests on an unverified base.
+
+**Mechanization.** **`dev/tests/merge-provenance.py`**, run by
+**`.github/workflows/merge-provenance.yml`** on every push to `main` and daily at 06:17 UTC. For
+each squash commit on `main` it asserts: the subject names a PR, that PR's merge commit **is** this
+commit (a `(#N)` in free text proves nothing), and every check run against the PR's head SHA
+concluded green. The reopening note said the forbidden flags "leave no trace a later check could
+find **in the tree**" — true, and the wrong place to look. The forge keeps the check-run conclusions
+for the head SHA forever, so "was anything merged over a red check" is answerable exactly, after the
+fact, without trusting anyone's memory. **Exit 2 = could not run** (no `gh`, no credential, no
+network) and the workflow converts it to a failure, because "the audit could not run" and "the audit
+found nothing" are the same output only in builds that turn out to have been lying to themselves.
+
+**Scope.** The audit starts at the fork point (`INHERITED_FLOOR`) — the 187 commits authored
+upstream resolve `(#N)` in **gke-labs**'s PR namespace and produced 187 false accusations on the
+first run. The floor is itself checked: it must be an ancestor of a remote that does **not** carry
+`docs/build/LEDGER.md`, so it cannot be walked forward past this build's own merges. What it still
+cannot see, stated: a check that was never required and never ran leaves no red run to find
+(V-MET-007 owns that), `--no-verify` skips local hooks that never produce a check run at all, and a
+red re-run green **after** the merge reads as green.
+
+**Escape found.** Its first correct run found one. **PR #10**, 2026-07-24, `docs: correct Kind test
+flow to build & load local images`, merged with **prettier red** on `docs/build/HARNESS.md`. The
+formatting defect is long since resolved; the merge is the LSN-011 instance and stays on the record
+as a **carried** escape rather than being cleared, because clearing it would leave a check that has
+never found anything. It predates every phase PR in this build (#11–#16), all of which are clean.
+
+**Verify.** `python3 dev/tests/merge-provenance.py` → 15 merged PRs audited since the fork point, no
+**new** red merge, 1 carried escape, exit 0. The one recurring benign failure — `Auto Request
+Review`, a CODEOWNERS bot with no permission on a fork — is named and argued in the script rather
+than filtered silently; a documented exception a reader can dispute is the difference between a
+scope and an exemption.
 
 ---
 
@@ -236,13 +444,33 @@ first question this pass asks of anything still open.
 
 `git, remotes` · **closed** 2026-07-25 (improvement pass)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | A diff against `main` shows tens of unrelated commits, or nothing at all, and a PR opened against the wrong base contains none of the phase work.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| **Root cause**    | Local `main` tracks **`upstream/main`** (`gke-labs/kube-agents`), which has none of the build; the work lives on the fork, currently **`origin`** (`adamparco/kube-agents`). Remote names have changed across the build — `fork` then, `origin` now — so the name is not a reliable handle.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| **Generalize**    | Resolve the work-carrying remote from `git remote -v` at run start and use it explicitly for diff base, push, and PR base. Never rely on the branch's tracking ref for a base.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| **Mechanization** | **`dev/git-preflight.sh`**, in `dev/L0-CHAIN.txt` and therefore in `l0-checks.yml` on every PR. It identifies the work-carrying remote **by content** — the remote whose `main` contains `docs/build/LEDGER.md` — then asserts local `main` tracks that remote and that no branch tracks a different one. Resolving by content and not by name is the point: the name has already changed once in this build (`fork`, then `origin`), so a check pinned to `origin` would be checking a spelling. What it deliberately does **not** assert: that `origin` has any particular URL (the upstream is a legitimate remote to have, and pinning a URL fails every other contributor's clone — LSN-020's mistake), or fetch freshness (a check that needs the network is a check that fails on a plane). CI has no local tracking refs, so assertions 2 and 3 say so out loud instead of passing silently; assertion 1 is real there given `fetch-depth: 0`, which the same unit added to `l0-checks.yml`. |
-| **Verify**        | On this clone at the time of writing, assertion 2 **failed** — local `main` tracked `upstream/main` (gke-labs), exactly the state the lesson describes, undetected for six phases. Fixed with `git branch -u origin/main main`; the check now exits 0 and would go red again the moment it recurs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+**Trigger.** A diff against `main` shows tens of unrelated commits, or nothing at all, and a PR
+opened against the wrong base contains none of the phase work.
+
+**Root cause.** Local `main` tracks **`upstream/main`** (`gke-labs/kube-agents`), which has none of
+the build; the work lives on the fork, currently **`origin`** (`adamparco/kube-agents`). Remote
+names have changed across the build — `fork` then, `origin` now — so the name is not a reliable
+handle.
+
+**Generalize.** Resolve the work-carrying remote from `git remote -v` at run start and use it
+explicitly for diff base, push, and PR base. Never rely on the branch's tracking ref for a base.
+
+**Mechanization.** **`dev/git-preflight.sh`**, in `dev/L0-CHAIN.txt` and therefore in
+`l0-checks.yml` on every PR. It identifies the work-carrying remote **by content** — the remote
+whose `main` contains `docs/build/LEDGER.md` — then asserts local `main` tracks that remote and that
+no branch tracks a different one. Resolving by content and not by name is the point: the name has
+already changed once in this build (`fork`, then `origin`), so a check pinned to `origin` would be
+checking a spelling. What it deliberately does **not** assert: that `origin` has any particular URL
+(the upstream is a legitimate remote to have, and pinning a URL fails every other contributor's
+clone — LSN-020's mistake), or fetch freshness (a check that needs the network is a check that fails
+on a plane). CI has no local tracking refs, so assertions 2 and 3 say so out loud instead of passing
+silently; assertion 1 is real there given `fetch-depth: 0`, which the same unit added to
+`l0-checks.yml`.
+
+**Verify.** On this clone at the time of writing, assertion 2 **failed** — local `main` tracked
+`upstream/main` (gke-labs), exactly the state the lesson describes, undetected for six phases. Fixed
+with `git branch -u origin/main main`; the check now exits 0 and would go red again the moment it
+recurs.
 
 ---
 
@@ -250,13 +478,25 @@ first question this pass asks of anything still open.
 
 `version-assertions` · **closed**
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | The Phase-7 "this is a vanilla, non-GKE target" assertion false-failed on a Kind cluster.                                                                                                                                                                                                                                                                                                                                                                   |
-| **Root cause**    | It read the first `gitVersion` from `kubectl version`, which is the **client** build. The host's `kubectl` is gcloud's, whose version string carries `-gke`, so a Kind cluster was flagged as GKE.                                                                                                                                                                                                                                                          |
-| **Generalize**    | An assertion about the target must read a property **of the target**: `.items[0].status.nodeInfo.kubeletVersion` from a node, not anything the local toolchain reports about itself.                                                                                                                                                                                                                                                                        |
-| **Mechanization** | **`dev/verify/verify-phase7.sh`** B0, now listed in `dev/L2-CHAIN.txt`: it reads `nodes[0].status.nodeInfo.kubeletVersion` from the **server** and fails when a target claimed to be vanilla carries a `-gke` build string. The commented reason is the lesson itself — this host's `kubectl` is gcloud's `-gke` client, so `kubectl version`'s first line would mis-flag every Kind cluster as GKE. `binding.md` **P7** states the rule; this fails on it. |
-| **Verify**        | The Phase-7 gate passes on `kind-kube-agents-dev` with kubeletVersion `v1.31.2` and would fail on a `-gke` node.                                                                                                                                                                                                                                                                                                                                            |
+**Trigger.** The Phase-7 "this is a vanilla, non-GKE target" assertion false-failed on a Kind
+cluster.
+
+**Root cause.** It read the first `gitVersion` from `kubectl version`, which is the **client**
+build. The host's `kubectl` is gcloud's, whose version string carries `-gke`, so a Kind cluster was
+flagged as GKE.
+
+**Generalize.** An assertion about the target must read a property **of the target**:
+`.items[0].status.nodeInfo.kubeletVersion` from a node, not anything the local toolchain reports
+about itself.
+
+**Mechanization.** **`dev/verify/verify-phase7.sh`** B0, now listed in `dev/L2-CHAIN.txt`: it reads
+`nodes[0].status.nodeInfo.kubeletVersion` from the **server** and fails when a target claimed to be
+vanilla carries a `-gke` build string. The commented reason is the lesson itself — this host's
+`kubectl` is gcloud's `-gke` client, so `kubectl version`'s first line would mis-flag every Kind
+cluster as GKE. `binding.md` **P7** states the rule; this fails on it.
+
+**Verify.** The Phase-7 gate passes on `kind-kube-agents-dev` with kubeletVersion `v1.31.2` and
+would fail on a `-gke` node.
 
 ---
 
@@ -264,14 +504,49 @@ first question this pass asks of anything still open.
 
 `specs, audits` · **closed** 2026-07-25 (improvement pass)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | A systematic requirement-coverage audit found **eighteen** cross-document conflicts and **ten** load-bearing mechanisms no component owned. The worst was invisible from either side: the actor templates granted an agent what it acts on, and **nothing granted the broker permission to write the `ActionRecord` journal it is required to write** — so invariant 3 could not be satisfied by any implementation of the design as written. Others: broker port `8443` vs `8643`, `batchWindow: 5m` widening exactly the race the workflow spec claimed to close, an audit filter scoped to one namespace that left three of four SLIs blind to the largest tier.                                                                                                                                                                                                                                        |
-| **Root cause**    | Each document was internally consistent. Contradictions live in the **space between** documents, where no single author is reading both statements at once, and a harness cannot verify an implementation against a contradiction.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| **Generalize**    | Conflicts are found by a systematic cross-document audit, not by reading carefully. Resolve them **in the source documents** — a resolution recorded only in the verification doc is a fifth place for the truth to live. Keep the register, because a future edit can silently undo a resolution.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| **Mechanization** | **`dev/tests/spec-ids.py`**, in `dev/L0-CHAIN.txt` — the §14 lints that had been written down as `L0` and never built. **V-MET-010**: every `V-XXX-NNN` cited anywhere in `docs/design/**` resolves to a definition in 09, and every ID defined in 09 is cited by the doc it says it verifies — both directions, because a check nobody cites is as broken as a citation with no check. **V-MET-012**: every component in 05 §1 has a row in 09 §5.1 and every contract section in 06 has one in §5.2, so a spec cannot grow a load-bearing thing that no probe covers. **V-MET-013 for check IDs**: one definition site, no duplicate rows. **V-MET-011** (the traceability matrix) is **deferred** with a named blocker and a promotion condition in 09 §14 — deferring one lint in the same edit that implements the other three is the honest form, and V-MET-006 enforces the shape of that deferral. |
-| **Escapes found** | Its first run found real drift, which is what a lint written weeks after the audit is for. **`C-JR`** (journal reconciler) and **`C-AD`** (anomaly detector) — both "New (v1, load-bearing)" in 05 §1 — had **no row anywhere in 09 §5.1**: two load-bearing components with no Exists/Wired/Exercised probe, not listed as deferred or optional either, so their absence read as coverage. Five 06 contracts (§2a, §2b, §3.1, §5, §6) were likewise absent from the §5.2 inventory. All fixed in the specs in the same unit; the two that are genuinely deferred (§2a user-authorization down-scoping, §6 mem0 backing) are now asserted **absent** rather than simply being missing.                                                                                                                                                                                                                     |
-| **Verify**        | Five mutations against the real specs, each caught by the intended group: delete the `C-JR` row (V-MET-012a) · add a `## 11. Telemetry contract` section to 06 (V-MET-012b) · cite `V-CTN-099` from 03 (V-MET-010 forward) · retarget a citation to a section that does not exist (V-MET-010 reverse) · duplicate the `V-CTN-001` catalog row (V-MET-013). Plus 10 in-file self-test controls. The §12 registers remain the record of the audit itself; §12.3's three self-created gaps (N-1 policy generator, N-2 broker-digest allowlist, N-3 anomaly-baseline checkpoint) are tracked as deferrals, not lessons.                                                                                                                                                                                                                                                                                        |
+**Trigger.** A systematic requirement-coverage audit found **eighteen** cross-document conflicts and
+**ten** load-bearing mechanisms no component owned. The worst was invisible from either side: the
+actor templates granted an agent what it acts on, and **nothing granted the broker permission to
+write the `ActionRecord` journal it is required to write** — so invariant 3 could not be satisfied
+by any implementation of the design as written. Others: broker port `8443` vs `8643`, `batchWindow:
+5m` widening exactly the race the workflow spec claimed to close, an audit filter scoped to one
+namespace that left three of four SLIs blind to the largest tier.
+
+**Root cause.** Each document was internally consistent. Contradictions live in the **space
+between** documents, where no single author is reading both statements at once, and a harness cannot
+verify an implementation against a contradiction.
+
+**Generalize.** Conflicts are found by a systematic cross-document audit, not by reading carefully.
+Resolve them **in the source documents** — a resolution recorded only in the verification doc is a
+fifth place for the truth to live. Keep the register, because a future edit can silently undo a
+resolution.
+
+**Mechanization.** **`dev/tests/spec-ids.py`**, in `dev/L0-CHAIN.txt` — the §14 lints that had been
+written down as `L0` and never built. **V-MET-010**: every `V-XXX-NNN` cited anywhere in
+`docs/design/**` resolves to a definition in 09, and every ID defined in 09 is cited by the doc it
+says it verifies — both directions, because a check nobody cites is as broken as a citation with no
+check. **V-MET-012**: every component in 05 §1 has a row in 09 §5.1 and every contract section in 06
+has one in §5.2, so a spec cannot grow a load-bearing thing that no probe covers. **V-MET-013 for
+check IDs**: one definition site, no duplicate rows. **V-MET-011** (the traceability matrix) is
+**deferred** with a named blocker and a promotion condition in 09 §14 — deferring one lint in the
+same edit that implements the other three is the honest form, and V-MET-006 enforces the shape of
+that deferral.
+
+**Escapes found.** Its first run found real drift, which is what a lint written weeks after the
+audit is for. **`C-JR`** (journal reconciler) and **`C-AD`** (anomaly detector) — both "New (v1,
+load-bearing)" in 05 §1 — had **no row anywhere in 09 §5.1**: two load-bearing components with no
+Exists/Wired/Exercised probe, not listed as deferred or optional either, so their absence read as
+coverage. Five 06 contracts (§2a, §2b, §3.1, §5, §6) were likewise absent from the §5.2 inventory.
+All fixed in the specs in the same unit; the two that are genuinely deferred (§2a user-authorization
+down-scoping, §6 mem0 backing) are now asserted **absent** rather than simply being missing.
+
+**Verify.** Five mutations against the real specs, each caught by the intended group: delete the
+`C-JR` row (V-MET-012a) · add a `## 11. Telemetry contract` section to 06 (V-MET-012b) · cite
+`V-CTN-099` from 03 (V-MET-010 forward) · retarget a citation to a section that does not exist
+(V-MET-010 reverse) · duplicate the `V-CTN-001` catalog row (V-MET-013). Plus 10 in-file self-test
+controls. The §12 registers remain the record of the audit itself; §12.3's three self-created gaps
+(N-1 policy generator, N-2 broker-digest allowlist, N-3 anomaly-baseline checkpoint) are tracked as
+deferrals, not lessons.
 
 ---
 
@@ -279,14 +554,36 @@ first question this pass asks of anything still open.
 
 `fixtures, topology` · **closed** (Phase 8, P8-T4)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | On the first real multi-tier install, the **second** agent in a namespace hung in `ContainerCreating` with a multi-attach error. Every prior test had run exactly one agent per namespace.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| **Root cause**    | The `system-metadata` PVC was a fixed namespace-scoped name with `ReadWriteOnce`, while the data PVC was already per-agent. The designed topology co-locates tiers; the fixture never did.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| **Generalize**    | A fixture that instantiates one of something cannot observe conflicts between two. Where the design says N, the fixture must be N — cardinality is part of the property, not a test-setup detail.                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| **Mechanization** | **`dev/verify/multi-agent-namespace-l2.sh`** (L2) creates **two Agent CRs of different tiers in one namespace** and asserts each gets its own `<name>-system-metadata` claim, that no bare namespace-scoped `system-metadata` claim exists, and that no PVC is referenced by both Deployments. Backed at L0 by `agent_manifests_test.go:185`. Both exit non-zero if the naming regresses — demonstrated by planting the old bare claim, which turned the run from exit 3 to exit 1 (2026-07-25).                                                                                                                                                                 |
-| **Residual**      | The script's **CLAIM 2** — both pods actually Ready side by side — is **deferred, not passed**, and says so with measured numbers. `ReadWriteOnce` excludes per **node**, so two pods co-located on one node share an RWO claim without complaint: a single-node cluster cannot exhibit the multi-attach, and "both pods came up" there would be evidence of nothing. This is LSN-015 applied to itself one level up — the fixture needs N=2 **nodes** for the same reason it needs N=2 agents. Unblocks on a 2-node Kind cluster with ≥6Gi allocatable (this host's Docker VM has 1.9Gi; one agent pod requests ~2.7Gi). Carried to **P8-T8**'s live checklist. |
-| **Closed by**     | The defect itself is closed by construction: a multi-attach requires two pods referencing one RWO claim, and the fixture proves no claim is shared. CLAIM 2 would only add that nothing _else_ prevents coexistence — a multi-tier-install property, not this lesson's.                                                                                                                                                                                                                                                                                                                                                                                          |
+**Trigger.** On the first real multi-tier install, the **second** agent in a namespace hung in
+`ContainerCreating` with a multi-attach error. Every prior test had run exactly one agent per
+namespace.
+
+**Root cause.** The `system-metadata` PVC was a fixed namespace-scoped name with `ReadWriteOnce`,
+while the data PVC was already per-agent. The designed topology co-locates tiers; the fixture never
+did.
+
+**Generalize.** A fixture that instantiates one of something cannot observe conflicts between two.
+Where the design says N, the fixture must be N — cardinality is part of the property, not a
+test-setup detail.
+
+**Mechanization.** **`dev/verify/multi-agent-namespace-l2.sh`** (L2) creates **two Agent CRs of
+different tiers in one namespace** and asserts each gets its own `<name>-system-metadata` claim,
+that no bare namespace-scoped `system-metadata` claim exists, and that no PVC is referenced by both
+Deployments. Backed at L0 by `agent_manifests_test.go:185`. Both exit non-zero if the naming
+regresses — demonstrated by planting the old bare claim, which turned the run from exit 3 to exit 1
+(2026-07-25).
+
+**Residual.** The script's **CLAIM 2** — both pods actually Ready side by side — is **deferred, not
+passed**, and says so with measured numbers. `ReadWriteOnce` excludes per **node**, so two pods
+co-located on one node share an RWO claim without complaint: a single-node cluster cannot exhibit
+the multi-attach, and "both pods came up" there would be evidence of nothing. This is LSN-015
+applied to itself one level up — the fixture needs N=2 **nodes** for the same reason it needs N=2
+agents. Unblocks on a 2-node Kind cluster with ≥6Gi allocatable (this host's Docker VM has 1.9Gi;
+one agent pod requests ~2.7Gi). Carried to **P8-T8**'s live checklist.
+
+**Closed by.** The defect itself is closed by construction: a multi-attach requires two pods
+referencing one RWO claim, and the fixture proves no claim is shared. CLAIM 2 would only add that
+nothing _else_ prevents coexistence — a multi-tier-install property, not this lesson's.
 
 ---
 
@@ -294,13 +591,37 @@ first question this pass asks of anything still open.
 
 `codegen, levels` · **closed**
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | P8-T1 rewrote the `allowedUsers` CEL rule to inspect entry content. `go build`, `go vet`, `go test ./...`, `make manifests` and the new L0 validator were all green. The rule was not valid CEL, and separately would not have installed even if it were.                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| **Root cause**    | Two independent failures, both invisible below L2. (1) **`gofmt` edits markers.** A kubebuilder marker is a line comment, and gofmt applies its legacy prose-quoting substitution to comments: the adjacent-apostrophe pair in the CEL empty-string literal `''` became a single U+201D. `make build` runs controller-gen _before_ `go fmt`, so the CRD generated in that same command was correct and the corruption only reached the CRD on the _next_ generation. (2) **The API server cost-bounds CEL.** A per-entry rule over a list with no `maxItems`, of strings with no `maxLength`, is estimated as unbounded and the CRD is refused outright. Neither failure is reachable from anything Go compiles. |
-| **Generalize**    | A generated artifact is not verified by the generator succeeding. When the toolchain that _produces_ an expression is not the toolchain that _evaluates_ it, only the evaluator is evidence — and for a CRD the evaluator is a live API server at install time. This is LSN-006 ("well-formed is not enforced") one layer earlier: here the artifact was not even well-formed, and five gates said it was.                                                                                                                                                                                                                                                                                                       |
-| **Mechanization** | Two layers, deliberately. **L0**: `dev/tests/closed-allowlist.py` check 3b rejects any `+kubebuilder:` marker containing a typographic quote — the specific corruption, caught in the tree. **L2**: `dev/verify/closed-allowlist-l2.sh` **L2-1** applies the CRD to a live API server before asserting anything about its rules, which catches the general class (bad syntax, cost overrun, unknown function) rather than one instance of it. The rule itself is now written quote-free (`u.trim().size() > 0`) so the formatter has nothing to rewrite, and `allowedUsers` carries `MaxItems=256` / `items:MaxLength=253`.                                                                                      |
-| **Verify**        | `make build && make manifests` twice in a row leaves the marker byte-identical, and `closed-allowlist-l2.sh` L2-1 fails loudly if the CRD stops installing. Negative control: reintroducing the quote pair trips check 3b (`--self-test`, control "gofmt-mangled marker rejected").                                                                                                                                                                                                                                                                                                                                                                                                                              |
+**Trigger.** P8-T1 rewrote the `allowedUsers` CEL rule to inspect entry content. `go build`, `go
+vet`, `go test ./...`, `make manifests` and the new L0 validator were all green. The rule was not
+valid CEL, and separately would not have installed even if it were.
+
+**Root cause.** Two independent failures, both invisible below L2. (1) **`gofmt` edits markers.** A
+kubebuilder marker is a line comment, and gofmt applies its legacy prose-quoting substitution to
+comments: the adjacent-apostrophe pair in the CEL empty-string literal `''` became a single U+201D.
+`make build` runs controller-gen _before_ `go fmt`, so the CRD generated in that same command was
+correct and the corruption only reached the CRD on the _next_ generation. (2) **The API server
+cost-bounds CEL.** A per-entry rule over a list with no `maxItems`, of strings with no `maxLength`,
+is estimated as unbounded and the CRD is refused outright. Neither failure is reachable from
+anything Go compiles.
+
+**Generalize.** A generated artifact is not verified by the generator succeeding. When the toolchain
+that _produces_ an expression is not the toolchain that _evaluates_ it, only the evaluator is
+evidence — and for a CRD the evaluator is a live API server at install time. This is LSN-006
+("well-formed is not enforced") one layer earlier: here the artifact was not even well-formed, and
+five gates said it was.
+
+**Mechanization.** Two layers, deliberately. **L0**: `dev/tests/closed-allowlist.py` check 3b
+rejects any `+kubebuilder:` marker containing a typographic quote — the specific corruption, caught
+in the tree. **L2**: `dev/verify/closed-allowlist-l2.sh` **L2-1** applies the CRD to a live API
+server before asserting anything about its rules, which catches the general class (bad syntax, cost
+overrun, unknown function) rather than one instance of it. The rule itself is now written quote-free
+(`u.trim().size() > 0`) so the formatter has nothing to rewrite, and `allowedUsers` carries
+`MaxItems=256` / `items:MaxLength=253`.
+
+**Verify.** `make build && make manifests` twice in a row leaves the marker byte-identical, and
+`closed-allowlist-l2.sh` L2-1 fails loudly if the CRD stops installing. Negative control:
+reintroducing the quote pair trips check 3b (`--self-test`, control "gofmt-mangled marker
+rejected").
 
 ---
 
@@ -308,13 +629,32 @@ first question this pass asks of anything still open.
 
 `checks, corpus` · **closed**
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Trigger**       | P8-T2's regression run failed `closed-allowlist.py` on `dev/verify/closed-allowlist-l2.sh:23`. That file was written by P8-T1, committed unchanged in `fa99f82`, and the same validator had reported exit 0 during P8-T1 — a green the ledger recorded as evidence for **V-CTR-014 L0**.                                                                                                                                                                                                         |
-| **Root cause**    | The corpus came from `git ls-files`, which lists **tracked** files. The unit's own new file was still untracked when the check ran, so it was never scanned. The ordering that produces this — write, check, record the green, then `git add` — is the normal ordering, which is what makes it dangerous: the check is blind in exactly the window where the unit's new work lives, and it reports that blindness as a pass.                                                                     |
-| **Generalize**    | A check's corpus is part of the check. "Green" means nothing without knowing what was scanned, and a corpus derived from git index state is a corpus that excludes new work by construction. The corpus must be the tree **as it will exist after the commit**. Any other validator enumerating via `git ls-files` inherits this — and here it is compounded by `.git/info/exclude`, which hides the four force-added harness roots from `--others --exclude-standard` too.                      |
-| **Mechanization** | `closed-allowlist.py` `tracked_files()` now unions three sources: `git ls-files` (tracked), `git ls-files --others --exclude-standard` (new and not ignored), and a direct `rglob` of the four force-added roots (`.claude/harness`, `.claude/skills`, `docs/build`, `dev`) filtered to source suffixes. The offending file was also classified correctly — `closed-allowlist-l2.sh` is an **assertion file**, permitted to name the retired identifier but still subject to the emission guard. |
-| **Verify**        | Planted `SLACK_ALLOW_ALL_USERS` in an untracked scratch YAML; the check failed on it and named the file. Before the fix it passed. The `--self-test` controls (9/9) still fire.                                                                                                                                                                                                                                                                                                                  |
+**Trigger.** P8-T2's regression run failed `closed-allowlist.py` on
+`dev/verify/closed-allowlist-l2.sh:23`. That file was written by P8-T1, committed unchanged in
+`fa99f82`, and the same validator had reported exit 0 during P8-T1 — a green the ledger recorded as
+evidence for **V-CTR-014 L0**.
+
+**Root cause.** The corpus came from `git ls-files`, which lists **tracked** files. The unit's own
+new file was still untracked when the check ran, so it was never scanned. The ordering that produces
+this — write, check, record the green, then `git add` — is the normal ordering, which is what makes
+it dangerous: the check is blind in exactly the window where the unit's new work lives, and it
+reports that blindness as a pass.
+
+**Generalize.** A check's corpus is part of the check. "Green" means nothing without knowing what
+was scanned, and a corpus derived from git index state is a corpus that excludes new work by
+construction. The corpus must be the tree **as it will exist after the commit**. Any other validator
+enumerating via `git ls-files` inherits this — and here it is compounded by `.git/info/exclude`,
+which hides the four force-added harness roots from `--others --exclude-standard` too.
+
+**Mechanization.** `closed-allowlist.py` `tracked_files()` now unions three sources: `git ls-files`
+(tracked), `git ls-files --others --exclude-standard` (new and not ignored), and a direct `rglob` of
+the four force-added roots (`.claude/harness`, `.claude/skills`, `docs/build`, `dev`) filtered to
+source suffixes. The offending file was also classified correctly — `closed-allowlist-l2.sh` is an
+**assertion file**, permitted to name the retired identifier but still subject to the emission
+guard.
+
+**Verify.** Planted `SLACK_ALLOW_ALL_USERS` in an untracked scratch YAML; the check failed on it and
+named the file. Before the fix it passed. The `--self-test` controls (9/9) still fire.
 
 ---
 
@@ -322,13 +662,35 @@ first question this pass asks of anything still open.
 
 `targets, tooling` · **closed** (Phase 8, P8-T6)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | P8-T2 needed the Agent CRD on the new Calico cluster and ran `make -C k8s-operator install KUBECTL="kubectl --context kind-kube-agents-egress"`. The override was silently ignored — the Makefile pipes to bare `kubectl` — and the CRD landed on whatever `kubectl config current-context` pointed at. It was the right cluster, by luck.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| **Root cause**    | The Makefile has no context parameter, so `install`/`deploy` are implicitly addressed to ambient state. Passing `KUBECTL=` looks like it works because `make` accepts any variable assignment, whether or not the Makefile reads it. A no-op override is worse than no override: it produces a false sense of having been explicit.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| **Generalize**    | `binding.md` §Targets requires an explicit `--context` on every cluster command because current-context may be the live GKE cluster `platform-agent-host`, which is **install-verification only and not a destructive-test target**. A rule that shell commands follow and build targets ignore is not enforced. Any command that reads ambient cluster state needs the guard, not just the ones the harness happens to type by hand.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| **Mechanization** | **`dev/tests/invariants-gate.py`** `check_make_targets_are_context_explicit`, plus the `ctx-guard` target it enforces. `k8s-operator/Makefile` now derives `$(KUBECTL)` from **`KUBE_CONTEXT`**, every one of the ten cluster-addressing targets depends on `ctx-guard`, no deployment recipe may name a bare `kubectl`, and a command-line `KUBECTL=` — the exact no-op override that triggered this — is a hard `$(error)` telling the caller which variable to use instead. With `KUBE_CONTEXT` unset the guard reads the ambient context and **refuses** anything outside anchored `kind-*`/`gke-scratch-*`, printing the command that would name it deliberately; naming it explicitly is always allowed, because deploying to the live cluster on purpose is a real operation and forgetting which cluster you are on is not. Verified: `KUBECTL=` refused, `KUBE_CONTEXT=platform-agent-host` accepted, an ambient `platform-agent-host` refused with exit 2. |
-| **Interim**       | Verify placement after any `make install`/`deploy`: read back the object's `creationTimestamp` with an explicit `--context`. That is how this was caught rather than assumed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+**Trigger.** P8-T2 needed the Agent CRD on the new Calico cluster and ran `make -C k8s-operator
+install KUBECTL="kubectl --context kind-kube-agents-egress"`. The override was silently ignored —
+the Makefile pipes to bare `kubectl` — and the CRD landed on whatever `kubectl config
+current-context` pointed at. It was the right cluster, by luck.
+
+**Root cause.** The Makefile has no context parameter, so `install`/`deploy` are implicitly
+addressed to ambient state. Passing `KUBECTL=` looks like it works because `make` accepts any
+variable assignment, whether or not the Makefile reads it. A no-op override is worse than no
+override: it produces a false sense of having been explicit.
+
+**Generalize.** `binding.md` §Targets requires an explicit `--context` on every cluster command
+because current-context may be the live GKE cluster `platform-agent-host`, which is
+**install-verification only and not a destructive-test target**. A rule that shell commands follow
+and build targets ignore is not enforced. Any command that reads ambient cluster state needs the
+guard, not just the ones the harness happens to type by hand.
+
+**Mechanization.** **`dev/tests/invariants-gate.py`** `check_make_targets_are_context_explicit`,
+plus the `ctx-guard` target it enforces. `k8s-operator/Makefile` now derives `$(KUBECTL)` from
+**`KUBE_CONTEXT`**, every one of the ten cluster-addressing targets depends on `ctx-guard`, no
+deployment recipe may name a bare `kubectl`, and a command-line `KUBECTL=` — the exact no-op
+override that triggered this — is a hard `$(error)` telling the caller which variable to use
+instead. With `KUBE_CONTEXT` unset the guard reads the ambient context and **refuses** anything
+outside anchored `kind-*`/`gke-scratch-*`, printing the command that would name it deliberately;
+naming it explicitly is always allowed, because deploying to the live cluster on purpose is a real
+operation and forgetting which cluster you are on is not. Verified: `KUBECTL=` refused,
+`KUBE_CONTEXT=platform-agent-host` accepted, an ambient `platform-agent-host` refused with exit 2.
+
+**Interim.** Verify placement after any `make install`/`deploy`: read back the object's
+`creationTimestamp` with an explicit `--context`. That is how this was caught rather than assumed.
 
 ---
 
@@ -336,13 +698,36 @@ first question this pass asks of anything still open.
 
 `lessons, mechanization` · **closed** (Phase 8, P8-T6)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | P8-T3 found `provision_13` invoked by no driver — the exact shape of **LSN-007**, which the index recorded as `closed`. Its Mechanization field read "**V-CMP-001** (all three probes per component ID in 05 §1)". V-CMP-001 is a check ID in a specification. No script implemented it. The lesson had been closed against an intention.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| **Root cause**    | `SELF-IMPROVEMENT.md` §2–§3 requires a lesson to end in a mechanization rather than prose, and the closure ritual is to populate the Mechanization field. A check ID satisfies the ritual perfectly while enforcing nothing, because 09 is a specification and specifications do not execute. The gap is invisible **because** the field is populated — a blank field would have been noticed at the next ORIENT; a plausible one reads as done.                                                                                                                                                                                                                                                                                                                                          |
-| **Generalize**    | **Closed means a command exits non-zero when the defect returns.** Not a check ID, not a `binding.md` clause, not a precondition — those describe who should enforce, and describing enforcement is what this repository keeps mistaking for enforcement (LSN-006: well-formed is not enforced; LSN-016: five gates over uncompiled CEL; this one is the same error applied to the harness's own memory). The status field must name an artifact and the artifact must be executable.                                                                                                                                                                                                                                                                                                     |
-| **Mechanization** | **`dev/tests/invariants-gate.py`** `check_closed_lessons_are_executable`. Every index row marked `closed` must name at least one artifact that exists on disk **and** is invoked by `dev/L0-CHAIN.txt`, `dev/L2-CHAIN.txt`, or a CI workflow with a real trigger. A `workflow_dispatch`-only file does not count: nothing runs it unless a human presses a button, which is the standing of a script nobody types. Its first run reopened **13 of 17** closed lessons; after correcting the citations where a running artifact genuinely existed, **five** stayed reopened — LSN-001, LSN-002, LSN-011, LSN-012, LSN-014. That is the outcome this lesson predicted, and the open count crossing `binding.md`'s threshold of 5 is the designed response, not a reason to weaken the rule. |
-| **Interim**       | When closing a lesson, paste the command and its non-zero exit on a reintroduced defect into the ledger row. LSN-016 and LSN-017 were closed this way and neither has recurred; LSN-007 was not, and did.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+**Trigger.** P8-T3 found `provision_13` invoked by no driver — the exact shape of **LSN-007**, which
+the index recorded as `closed`. Its Mechanization field read "**V-CMP-001** (all three probes per
+component ID in 05 §1)". V-CMP-001 is a check ID in a specification. No script implemented it. The
+lesson had been closed against an intention.
+
+**Root cause.** `SELF-IMPROVEMENT.md` §2–§3 requires a lesson to end in a mechanization rather than
+prose, and the closure ritual is to populate the Mechanization field. A check ID satisfies the
+ritual perfectly while enforcing nothing, because 09 is a specification and specifications do not
+execute. The gap is invisible **because** the field is populated — a blank field would have been
+noticed at the next ORIENT; a plausible one reads as done.
+
+**Generalize.** **Closed means a command exits non-zero when the defect returns.** Not a check ID,
+not a `binding.md` clause, not a precondition — those describe who should enforce, and describing
+enforcement is what this repository keeps mistaking for enforcement (LSN-006: well-formed is not
+enforced; LSN-016: five gates over uncompiled CEL; this one is the same error applied to the
+harness's own memory). The status field must name an artifact and the artifact must be executable.
+
+**Mechanization.** **`dev/tests/invariants-gate.py`** `check_closed_lessons_are_executable`. Every
+index row marked `closed` must name at least one artifact that exists on disk **and** is invoked by
+`dev/L0-CHAIN.txt`, `dev/L2-CHAIN.txt`, or a CI workflow with a real trigger. A
+`workflow_dispatch`-only file does not count: nothing runs it unless a human presses a button, which
+is the standing of a script nobody types. Its first run reopened **13 of 17** closed lessons; after
+correcting the citations where a running artifact genuinely existed, **five** stayed reopened —
+LSN-001, LSN-002, LSN-011, LSN-012, LSN-014. That is the outcome this lesson predicted, and the open
+count crossing `binding.md`'s threshold of 5 is the designed response, not a reason to weaken the
+rule.
+
+**Interim.** When closing a lesson, paste the command and its non-zero exit on a reintroduced defect
+into the ledger row. LSN-016 and LSN-017 were closed this way and neither has recurred; LSN-007 was
+not, and did.
 
 ---
 
@@ -350,13 +735,41 @@ first question this pass asks of anything still open.
 
 `ci, tooling` · **closed** (Phase 8, P8-T6)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Trigger**       | P8-T5 recorded "`actionlint` on all 22 workflows → **exit 0**" in the ledger as evidence, then went red on the PR with four `SC2140` findings. `actionlint` shells out to `shellcheck` for `run:` blocks and **silently reports nothing when the binary is absent**. It was not installed. The local run and the CI run were different checks wearing the same name and the same exit code.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| **Root cause**    | The evidence recorded was the exit code of a command, and an exit code cannot distinguish "the rule held" from "the rule never ran". Optional-dependency degradation is the normal design of lint tooling — it is a convenience for the many contributors who lack the plugin — so nothing was misconfigured and nothing warned. The failure mode is specific to graceful degradation: a **missing** linter is loud, a **partial** one is silent.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| **Generalize**    | **A green from a tool is evidence only for the rules that tool actually ran.** This is V-MET-014 ("a check that cannot fail is not evidence") turned on the toolchain instead of the assertions: the harness has been careful that its _checks_ cannot be vacuous while trusting that its _linters_ are whole. Before recording a lint pass as evidence, establish that the local tool has the same rule set as the one whose verdict is binding — for actionlint that means `shellcheck` on `PATH`, and the same question is open for every plugin-extensible linter in the chain.                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| **Mechanization** | **`dev/toolchain-preflight.sh`**, wired into `.github/workflows/actionlint.yml` as a step before `actionlint` runs. It resolves `actionlint` through `PATH` **and** `$(go env GOPATH)/bin` — a PATH-only lookup would have reported "not installed" on the very host where this happened, skipped the shellcheck question, and exited 0 — then fails when `shellcheck` is absent, because the runner has it and a local run without it checks no shell at all while exiting 0. `pyflakes` is reported and **not** failed: whether the runner image supplies it is unmeasured, and asserting parity we have not established would be this same mistake one level up. It also prints a provenance line (`actionlint=v1.7.12 shellcheck=0.11.0 …`) for the ledger, and flags version skew against the `ACTIONLINT_VERSION` the workflow pins — now equal at 1.7.12. Deliberately not a unittest, so a contributor without shellcheck is not punished for the harness's defect. Mutation-tested with a PATH that has actionlint and no shellcheck: exit 1. |
-| **Interim**       | `shellcheck` v0.11.0 installed on this host (`brew install shellcheck`); the P8-T5 re-run with it present found the four `SC2140` warnings that CI had found, and now exits 0 for the reason claimed. Any ledger row citing a linter must name its **version and plugin set**, not just the exit code.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+**Trigger.** P8-T5 recorded "`actionlint` on all 22 workflows → **exit 0**" in the ledger as
+evidence, then went red on the PR with four `SC2140` findings. `actionlint` shells out to
+`shellcheck` for `run:` blocks and **silently reports nothing when the binary is absent**. It was
+not installed. The local run and the CI run were different checks wearing the same name and the same
+exit code.
+
+**Root cause.** The evidence recorded was the exit code of a command, and an exit code cannot
+distinguish "the rule held" from "the rule never ran". Optional-dependency degradation is the normal
+design of lint tooling — it is a convenience for the many contributors who lack the plugin — so
+nothing was misconfigured and nothing warned. The failure mode is specific to graceful degradation:
+a **missing** linter is loud, a **partial** one is silent.
+
+**Generalize.** **A green from a tool is evidence only for the rules that tool actually ran.** This
+is V-MET-014 ("a check that cannot fail is not evidence") turned on the toolchain instead of the
+assertions: the harness has been careful that its _checks_ cannot be vacuous while trusting that its
+_linters_ are whole. Before recording a lint pass as evidence, establish that the local tool has the
+same rule set as the one whose verdict is binding — for actionlint that means `shellcheck` on
+`PATH`, and the same question is open for every plugin-extensible linter in the chain.
+
+**Mechanization.** **`dev/toolchain-preflight.sh`**, wired into `.github/workflows/actionlint.yml`
+as a step before `actionlint` runs. It resolves `actionlint` through `PATH` **and** `$(go env
+GOPATH)/bin` — a PATH-only lookup would have reported "not installed" on the very host where this
+happened, skipped the shellcheck question, and exited 0 — then fails when `shellcheck` is absent,
+because the runner has it and a local run without it checks no shell at all while exiting 0.
+`pyflakes` is reported and **not** failed: whether the runner image supplies it is unmeasured, and
+asserting parity we have not established would be this same mistake one level up. It also prints a
+provenance line (`actionlint=v1.7.12 shellcheck=0.11.0 …`) for the ledger, and flags version skew
+against the `ACTIONLINT_VERSION` the workflow pins — now equal at 1.7.12. Deliberately not a
+unittest, so a contributor without shellcheck is not punished for the harness's defect.
+Mutation-tested with a PATH that has actionlint and no shellcheck: exit 1.
+
+**Interim.** `shellcheck` v0.11.0 installed on this host (`brew install shellcheck`); the P8-T5
+re-run with it present found the four `SC2140` warnings that CI had found, and now exits 0 for the
+reason claimed. Any ledger row citing a linter must name its **version and plugin set**, not just
+the exit code.
 
 ---
 
@@ -364,14 +777,42 @@ first question this pass asks of anything still open.
 
 `clis, callers` · **closed** 2026-07-25 (improvement pass)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | `verify-phase3.sh` check **P3-K7** reported "no identity file rendered" for a day. The renderer was correct, the check was correct, and the two had stopped being able to talk to each other.                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| **Root cause**    | P8-T4 removed `--github-cidrs` from `render_developer_team.py` — correctly: GitHub's blocks are fixed in the egress template. `verify-phase3.sh` still passed it. `argparse` exits **2** on an unknown flag, the invocation redirected `2>&1 >/dev/null`, so the bundle was never written and the only visible symptom was a file that did not exist. The check then skipped its two VAP dry-run assertions and went on to fail for a reason that named none of this. It cascaded: phase3 → phase6 → phase7 all red, and the top-level symptom was three phases away from the cause.                                                                  |
-| **Generalize**    | **A CLI's flags are a contract with callers it cannot see.** The parser and the caller are edited by different units at different times, and nothing in a language toolchain connects them — an unknown flag is a runtime error in a shell script, which is to say, no error at all until someone reads the output. Two consequences: a renderer that fails must say **why** (capture the rc and the stderr, never `>/dev/null` a command whose success you are about to assume), and the flag surface needs a check that sweeps the **whole tree** rather than the callers you remember.                                                             |
-| **Mechanization** | **`dev/tests/cli-contract.py`**, in `dev/L0-CHAIN.txt`. It discovers every Python CLI in the tree, extracts each parser's real flag set (`--help`, unioned across one level of subparsers; an AST fallback for the four CLIs whose imports are unavailable offline), then greps every `.sh/.md/.yml/.yaml/.py/.txt` and `Dockerfile` for invocations of those CLIs and fails on any flag no parser accepts. The sweep is deliberately whole-tree: a check that knew about `verify-phase3.sh` would have to be edited to notice the next caller, which is the same defect wearing a check's clothes. `docs/build/**` is excluded as historical record. |
-| **Also fixed**    | `verify-phase3.sh` now captures the renderer's exit code and stderr and fails with them. The absent-file symptom is still there, but it is no longer the _only_ symptom.                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| **Verify**        | 8 self-test controls, all firing. Live: with the stale `--github-cidrs` restored, `cli-contract.py` exits 1 and names file, line, flag and parser; with it removed, exit 0. `verify-phase3.sh kind-kube-agents-dev` → ALL CHECKS PASSED, and `verify-phase7.sh` with it. **Not** checked, stated: missing _required_ flags, flag _values_, and whether a flag belongs to the subcommand actually being invoked (flags are unioned across subcommands, so `claim --report x` passes).                                                                                                                                                                  |
+**Trigger.** `verify-phase3.sh` check **P3-K7** reported "no identity file rendered" for a day. The
+renderer was correct, the check was correct, and the two had stopped being able to talk to each
+other.
+
+**Root cause.** P8-T4 removed `--github-cidrs` from `render_developer_team.py` — correctly: GitHub's
+blocks are fixed in the egress template. `verify-phase3.sh` still passed it. `argparse` exits **2**
+on an unknown flag, the invocation redirected `2>&1 >/dev/null`, so the bundle was never written and
+the only visible symptom was a file that did not exist. The check then skipped its two VAP dry-run
+assertions and went on to fail for a reason that named none of this. It cascaded: phase3 → phase6 →
+phase7 all red, and the top-level symptom was three phases away from the cause.
+
+**Generalize.** **A CLI's flags are a contract with callers it cannot see.** The parser and the
+caller are edited by different units at different times, and nothing in a language toolchain
+connects them — an unknown flag is a runtime error in a shell script, which is to say, no error at
+all until someone reads the output. Two consequences: a renderer that fails must say **why**
+(capture the rc and the stderr, never `>/dev/null` a command whose success you are about to assume),
+and the flag surface needs a check that sweeps the **whole tree** rather than the callers you
+remember.
+
+**Mechanization.** **`dev/tests/cli-contract.py`**, in `dev/L0-CHAIN.txt`. It discovers every Python
+CLI in the tree, extracts each parser's real flag set (`--help`, unioned across one level of
+subparsers; an AST fallback for the four CLIs whose imports are unavailable offline), then greps
+every `.sh/.md/.yml/.yaml/.py/.txt` and `Dockerfile` for invocations of those CLIs and fails on any
+flag no parser accepts. The sweep is deliberately whole-tree: a check that knew about
+`verify-phase3.sh` would have to be edited to notice the next caller, which is the same defect
+wearing a check's clothes. `docs/build/**` is excluded as historical record.
+
+**Also fixed.** `verify-phase3.sh` now captures the renderer's exit code and stderr and fails with
+them. The absent-file symptom is still there, but it is no longer the _only_ symptom.
+
+**Verify.** 8 self-test controls, all firing. Live: with the stale `--github-cidrs` restored,
+`cli-contract.py` exits 1 and names file, line, flag and parser; with it removed, exit 0.
+`verify-phase3.sh kind-kube-agents-dev` → ALL CHECKS PASSED, and `verify-phase7.sh` with it. **Not**
+checked, stated: missing _required_ flags, flag _values_, and whether a flag belongs to the
+subcommand actually being invoked (flags are unioned across subcommands, so `claim --report x`
+passes).
 
 ---
 
@@ -379,14 +820,43 @@ first question this pass asks of anything still open.
 
 `reverts, mutation` · **closed** 2026-07-25 (improvement pass) · **this pass's own mistake**
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Trigger**       | Five L2 scripts had just gained hand-written PRECONDITIONS blocks and P1 assertions — written, verified, not staged. A mutation test mutated three of the same files and reverted with `git checkout <path>`. Two hours of work vanished. It was noticed only because the _next_ mutation's output named three precondition fields that were supposed to be present and were not.                                                                                                                                                                                                                                                                                                                                                                                        |
-| **Root cause**    | `git checkout <path>` restores the path **from the index**, and the index held `HEAD`. There was no reflog entry and no dangling blob to recover from: git had never been shown those bytes. The revert was correct git and the wrong operation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| **Generalize**    | A revert in a mutation test must be defined by **what the file contained a moment ago**. Git can only answer _what the file contained at a commit or in the index_ — the same answer exactly when the tree is clean, which is precisely when a mutation test is least necessary. The general form: when a tool's undo is defined against a state you did not choose, it is not an undo. This is also why mutation tests should not be run against a dirty tree casually — but "be careful" is the sentence LSN-001 already survived three times, so the fix is a primitive, not a habit.                                                                                                                                                                                 |
-| **Mechanization** | **`dev/mutate.sh`** — `mutate.sh FILE... -- COMMAND...` snapshots each file with `cp -p`, runs the command, and restores from the snapshot on success, on failure, and on SIGINT/SIGTERM, passing the command's exit code through. It refuses a path that does not exist (exit 2) rather than running a command over a file it cannot restore. **`dev/test_mutate.py`** (10 tests, picked up by `python3 -m unittest discover dev` in `L0-CHAIN.txt`) is what keeps it honest, and its central test is the LSN-022 scenario itself: a file with three live versions — HEAD, index, and unstaged working tree — where only the working-tree bytes are correct to restore. A `git checkout`-shaped implementation passes every other test in that file and fails this one. |
-| **Found by it**   | Writing the tests found two real defects in the first implementation. bash runs a trap only when the **foreground** command returns, so `"$@"` on its own meant a SIGTERM was queued behind the command: the script hung and the tree stayed mutated. And killing the command alone orphaned what _it_ had spawned, which outlived the restore and could write the mutation back afterwards — fixed by launching under `set -m` and signalling the process **group**. Both are the failure this primitive exists to prevent, reached from inside the primitive.                                                                                                                                                                                                          |
-| **Verify**        | 10 tests: restore after success, after failure, after SIGTERM; exit-code passthrough for 0/1/2/7/42; refusal on a missing path with the command never run; mode preservation; the three-version git scenario; and a late-writing command that must not be able to undo the restore. The whole precondition mutation battery for LSN-001/002/003 above was then run **through** `mutate.sh`, and the tree came back byte-clean.                                                                                                                                                                                                                                                                                                                                           |
+**Trigger.** Five L2 scripts had just gained hand-written PRECONDITIONS blocks and P1 assertions —
+written, verified, not staged. A mutation test mutated three of the same files and reverted with
+`git checkout <path>`. Two hours of work vanished. It was noticed only because the _next_ mutation's
+output named three precondition fields that were supposed to be present and were not.
+
+**Root cause.** `git checkout <path>` restores the path **from the index**, and the index held
+`HEAD`. There was no reflog entry and no dangling blob to recover from: git had never been shown
+those bytes. The revert was correct git and the wrong operation.
+
+**Generalize.** A revert in a mutation test must be defined by **what the file contained a moment
+ago**. Git can only answer _what the file contained at a commit or in the index_ — the same answer
+exactly when the tree is clean, which is precisely when a mutation test is least necessary. The
+general form: when a tool's undo is defined against a state you did not choose, it is not an undo.
+This is also why mutation tests should not be run against a dirty tree casually — but "be careful"
+is the sentence LSN-001 already survived three times, so the fix is a primitive, not a habit.
+
+**Mechanization.** **`dev/mutate.sh`** — `mutate.sh FILE... -- COMMAND...` snapshots each file with
+`cp -p`, runs the command, and restores from the snapshot on success, on failure, and on
+SIGINT/SIGTERM, passing the command's exit code through. It refuses a path that does not exist (exit
+2) rather than running a command over a file it cannot restore. **`dev/test_mutate.py`** (10 tests,
+picked up by `python3 -m unittest discover dev` in `L0-CHAIN.txt`) is what keeps it honest, and its
+central test is the LSN-022 scenario itself: a file with three live versions — HEAD, index, and
+unstaged working tree — where only the working-tree bytes are correct to restore. A `git
+checkout`-shaped implementation passes every other test in that file and fails this one.
+
+**Found by it.** Writing the tests found two real defects in the first implementation. bash runs a
+trap only when the **foreground** command returns, so `"$@"` on its own meant a SIGTERM was queued
+behind the command: the script hung and the tree stayed mutated. And killing the command alone
+orphaned what _it_ had spawned, which outlived the restore and could write the mutation back
+afterwards — fixed by launching under `set -m` and signalling the process **group**. Both are the
+failure this primitive exists to prevent, reached from inside the primitive.
+
+**Verify.** 10 tests: restore after success, after failure, after SIGTERM; exit-code passthrough for
+0/1/2/7/42; refusal on a missing path with the command never run; mode preservation; the
+three-version git scenario; and a late-writing command that must not be able to undo the restore.
+The whole precondition mutation battery for LSN-001/002/003 above was then run **through**
+`mutate.sh`, and the tree came back byte-clean.
 
 ---
 
@@ -394,13 +864,33 @@ first question this pass asks of anything still open.
 
 `checks, corpus` · **closed** 2026-07-25 (improvement pass)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | Mutation-testing the _new_ preconditions lint, an hour after writing it: deleting the `p1_assert_build_under_test` call from `verify-phase7.sh` while leaving its PRECONDITIONS block intact left `invariants-gate.py` **green**. The lint's whole purpose is to catch a declaration that the code does not back.                                                                                                                                       |
-| **Root cause**    | The check asked `"p1_assert_build_under_test" not in text` over the file's full contents. The declaration block four lines above the call says "**Asserted via p1_assert_build_under_test**" — in a comment. A substring search cannot distinguish the claim from the act, and here the claim was _required_ to be in the file by the same check. It was self-satisfying by construction.                                                               |
-| **Generalize**    | **A check that verifies code does X must exclude the text that describes X from its corpus.** This is LSN-017 ("a check's corpus is part of the check") pointed at a subtler boundary: not which files, but which _lines within_ a file. The tell is a check whose subject and whose evidence can appear in the same document — anything that lints a declaration against an implementation, or a doc against the thing it documents, is in this class. |
-| **Mechanization** | **`dev/tests/invariants-gate.py`** `_code_lines()`, applied to the P1 and P3 backing tests. It strips `#`-leading lines and trailing unquoted comments, so those tests read what the script **does**. Quote tracking is deliberately naive: the only cost of getting it wrong is keeping a line that was really a comment, which is the safe direction for a test that fails when a string is **absent**.                                               |
-| **Verify**        | The mutation that found it: delete the `p1_assert_build_under_test` call, keep the sentence describing it. Before, exit 0; after, exit 1 with "the declaration is ahead of the code". Both other precondition arms were re-run against the same corpus and still fire (M1–M8 in LSN-001's Verify row).                                                                                                                                                  |
+**Trigger.** Mutation-testing the _new_ preconditions lint, an hour after writing it: deleting the
+`p1_assert_build_under_test` call from `verify-phase7.sh` while leaving its PRECONDITIONS block
+intact left `invariants-gate.py` **green**. The lint's whole purpose is to catch a declaration that
+the code does not back.
+
+**Root cause.** The check asked `"p1_assert_build_under_test" not in text` over the file's full
+contents. The declaration block four lines above the call says "**Asserted via
+p1_assert_build_under_test**" — in a comment. A substring search cannot distinguish the claim from
+the act, and here the claim was _required_ to be in the file by the same check. It was
+self-satisfying by construction.
+
+**Generalize.** **A check that verifies code does X must exclude the text that describes X from its
+corpus.** This is LSN-017 ("a check's corpus is part of the check") pointed at a subtler boundary:
+not which files, but which _lines within_ a file. The tell is a check whose subject and whose
+evidence can appear in the same document — anything that lints a declaration against an
+implementation, or a doc against the thing it documents, is in this class.
+
+**Mechanization.** **`dev/tests/invariants-gate.py`** `_code_lines()`, applied to the P1 and P3
+backing tests. It strips `#`-leading lines and trailing unquoted comments, so those tests read what
+the script **does**. Quote tracking is deliberately naive: the only cost of getting it wrong is
+keeping a line that was really a comment, which is the safe direction for a test that fails when a
+string is **absent**.
+
+**Verify.** The mutation that found it: delete the `p1_assert_build_under_test` call, keep the
+sentence describing it. Before, exit 0; after, exit 1 with "the declaration is ahead of the code".
+Both other precondition arms were re-run against the same corpus and still fire (M1–M8 in LSN-001's
+Verify row).
 
 ---
 
@@ -408,13 +898,43 @@ first question this pass asks of anything still open.
 
 `checks, timing` · **closed** 2026-07-25 (P8-T8)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | Running `tenant-isolation-l2.sh` on the Calico target for the first time. It reported `quota does not bound "requests.cpu" — it caps nothing on that axis` and the same for all five axes, while section 2 of the **same run** proved the quota binds: a pod with no resources refused, a 200-CPU pod refused, `used.requests.cpu=500m` accounted. The quota was perfect. The check read `.status.hard` with no wait, and the quota controller on that cluster took **21 seconds and five empty polls** to write it. Five lines below, `.status.used` was read after a flat `sleep 3` against that same 21-second controller, and had simply been getting lucky.                                                                                                                   |
-| **Root cause**    | A `.status` subtree is not part of the object you applied; it is a controller's later reply to it. Reading one straight after the apply asks a question the cluster has not answered yet, and an unanswered question comes back as the empty string — which is byte-identical to the answer "this property does not exist". The check could not tell "not yet" from "not ever", so it chose the alarming one. A `sleep` does not fix this, it just moves the guess: it encodes an assumption about controller latency made on the day the number was typed, and every slower cluster re-tests that assumption silently.                                                                                                                                                            |
-| **Generalize**    | **An assertion on state a controller writes must be reached by polling for the value, not by waiting a while and hoping.** The field being read is itself the readiness signal, so there is never a need to guess — poll it, or `kubectl wait --for=` something that implies it. This is the same shape as P2 (a new VAP binding activates late, so poll a dry-run until it actually rejects) generalized off admission policies and onto every `.status` read.                                                                                                                                                                                                                                                                                                                    |
-| **Mechanization** | **`dev/tests/invariants-gate.py`** `check_l2_status_reads_are_polled`, registered as precondition **P9** in `binding.md` and run on every PR through `L0-CHAIN.txt`. Over the transitive L2 closure it finds every `jsonpath={.status.…}` read and requires each to sit inside a poll loop, be preceded by a `kubectl wait --for=`, or live in a function whose call sites are themselves loops (which is what makes `chaos-suite.sh`'s `is_ready()` correct). Deliberately a rule about the **read** and not a ban on `sleep`: seven sleeps in this corpus wait for Calico to program a NetworkPolicy, where no readiness field exists to poll and the sleep is the honest primitive. A lint whose findings are mostly legitimate is one that teaches people to write exemptions. |
-| **Verify**        | **4/4 mutations caught**, two of which are byte-exact reconstructions of the real defects: restoring the unwaited `.status.hard` read → flagged at line 143; restoring `sleep 3` before the `.status.used` read → flagged at line 210. Plus deleting the `kubectl wait` that synchronises the three `podIP` reads in `egress-enforcement-l2.sh` → flagged; and breaking the corpus pattern so nothing matches → the check reports itself **VACUOUS** rather than green (V-MET-014). Clean tree: 10 reads found across 15 scripts, all synchronised, gate 10/10 exit 0.                                                                                                                                                                                                             |
+**Trigger.** Running `tenant-isolation-l2.sh` on the Calico target for the first time. It reported
+`quota does not bound "requests.cpu" — it caps nothing on that axis` and the same for all five axes,
+while section 2 of the **same run** proved the quota binds: a pod with no resources refused, a
+200-CPU pod refused, `used.requests.cpu=500m` accounted. The quota was perfect. The check read
+`.status.hard` with no wait, and the quota controller on that cluster took **21 seconds and five
+empty polls** to write it. Five lines below, `.status.used` was read after a flat `sleep 3` against
+that same 21-second controller, and had simply been getting lucky.
+
+**Root cause.** A `.status` subtree is not part of the object you applied; it is a controller's
+later reply to it. Reading one straight after the apply asks a question the cluster has not answered
+yet, and an unanswered question comes back as the empty string — which is byte-identical to the
+answer "this property does not exist". The check could not tell "not yet" from "not ever", so it
+chose the alarming one. A `sleep` does not fix this, it just moves the guess: it encodes an
+assumption about controller latency made on the day the number was typed, and every slower cluster
+re-tests that assumption silently.
+
+**Generalize.** **An assertion on state a controller writes must be reached by polling for the
+value, not by waiting a while and hoping.** The field being read is itself the readiness signal, so
+there is never a need to guess — poll it, or `kubectl wait --for=` something that implies it. This
+is the same shape as P2 (a new VAP binding activates late, so poll a dry-run until it actually
+rejects) generalized off admission policies and onto every `.status` read.
+
+**Mechanization.** **`dev/tests/invariants-gate.py`** `check_l2_status_reads_are_polled`, registered
+as precondition **P9** in `binding.md` and run on every PR through `L0-CHAIN.txt`. Over the
+transitive L2 closure it finds every `jsonpath={.status.…}` read and requires each to sit inside a
+poll loop, be preceded by a `kubectl wait --for=`, or live in a function whose call sites are
+themselves loops (which is what makes `chaos-suite.sh`'s `is_ready()` correct). Deliberately a rule
+about the **read** and not a ban on `sleep`: seven sleeps in this corpus wait for Calico to program
+a NetworkPolicy, where no readiness field exists to poll and the sleep is the honest primitive. A
+lint whose findings are mostly legitimate is one that teaches people to write exemptions.
+
+**Verify.** **4/4 mutations caught**, two of which are byte-exact reconstructions of the real
+defects: restoring the unwaited `.status.hard` read → flagged at line 143; restoring `sleep 3`
+before the `.status.used` read → flagged at line 210. Plus deleting the `kubectl wait` that
+synchronises the three `podIP` reads in `egress-enforcement-l2.sh` → flagged; and breaking the
+corpus pattern so nothing matches → the check reports itself **VACUOUS** rather than green
+(V-MET-014). Clean tree: 10 reads found across 15 scripts, all synchronised, gate 10/10 exit 0.
 
 ---
 
@@ -422,13 +942,45 @@ first question this pass asks of anything still open.
 
 `checks, identity` · **closed** 2026-07-25 (P8-T8)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | `verify-phase3.sh` failed **2 runs in 3**, always with empty reads — `pod SA is ''`, `pod image '' not developer-team-agent:<tag>`, `pod tier label is ''`. The give-away was a run that read `.spec.serviceAccountName` **successfully** and then got `''` for the image and the tier one kubectl call later, and a run that pinned the pod name its **previous** run had created. The same full-chain log showed the same script green under phase 6 and red under phase 7, which reads as environmental until you notice both are the same coin toss. `verify-phase2.sh` carried a byte-identical block and was green throughout.      |
-| **Root cause**    | `p3_force_recreate` returns the instant the **Deployment's** uid changes. Pod garbage collection happens after that, asynchronously, so at the moment the caller starts looking the pod of the generation P3 has just deleted is still listed — and carries no `deletionTimestamp` yet, so even filtering on that does not exclude it. A `-l app=…` poll therefore returns the OLD pod, which is the precise object P3 exists to keep the assertion away from, and three separate `.items[0]` reads then re-resolve a list that GC is emptying between them. Not a race that waiting longer fixes: the wrong object was being waited for. |
-| **Generalize**    | **A label selector names a role, not an object.** Two generations of a workload answer to it, and the one you just deleted answers first and longest. Anything that has just replaced an object must reach the replacement by **identity** — the ownership chain, or a name captured once — and every field of one assertion must come from that single pinned object. Corollary, and the reason this kept being missed: the failure mode is an **empty** read, never a wrong value, so it is indistinguishable from the property genuinely being absent (the symptom [[lsn-024]] documents, arrived at by a different route).            |
-| **Mechanization** | `p3_pod_of_deploy` in **`dev/lib/preconditions.sh`** resolves Deployment uid → owning ReplicaSets → a live Pod owned by one of them, and echoes one name. Enforced by **`dev/tests/invariants-gate.py`** `check_p3_pods_resolved_by_ownership`, registered as the second half of precondition **P3** and run on every PR through `L0-CHAIN.txt`: no script that calls `p3_force_recreate` may index into `.items[]`. Scoped to those scripts on purpose — `.items[0]` off `get nodes` on a single-node Kind is a far weaker claim, and a lint whose findings are mostly legitimate teaches people to write exemptions.                    |
-| **Verify**        | **4/4 mutations caught**, two of them byte-exact reconstructions of the real defects: restoring the selector poll + three `.items[0]` reads in `verify-phase3.sh` → flagged; the same in `verify-phase2.sh` → flagged. Plus breaking the call pattern, and removing one of the two callers → the check reports itself **VACUOUS** rather than green, naming the count it expected (V-MET-014). Behavioural evidence, which is the part a lint cannot give: **6/6 clean runs** of each script, each resolving a **different** pod name, where before two consecutive runs latched onto the same stale pod. Gate 11/11, exit 0.             |
+**Trigger.** `verify-phase3.sh` failed **2 runs in 3**, always with empty reads — `pod SA is ''`,
+`pod image '' not developer-team-agent:<tag>`, `pod tier label is ''`. The give-away was a run that
+read `.spec.serviceAccountName` **successfully** and then got `''` for the image and the tier one
+kubectl call later, and a run that pinned the pod name its **previous** run had created. The same
+full-chain log showed the same script green under phase 6 and red under phase 7, which reads as
+environmental until you notice both are the same coin toss. `verify-phase2.sh` carried a
+byte-identical block and was green throughout.
+
+**Root cause.** `p3_force_recreate` returns the instant the **Deployment's** uid changes. Pod
+garbage collection happens after that, asynchronously, so at the moment the caller starts looking
+the pod of the generation P3 has just deleted is still listed — and carries no `deletionTimestamp`
+yet, so even filtering on that does not exclude it. A `-l app=…` poll therefore returns the OLD pod,
+which is the precise object P3 exists to keep the assertion away from, and three separate
+`.items[0]` reads then re-resolve a list that GC is emptying between them. Not a race that waiting
+longer fixes: the wrong object was being waited for.
+
+**Generalize.** **A label selector names a role, not an object.** Two generations of a workload
+answer to it, and the one you just deleted answers first and longest. Anything that has just
+replaced an object must reach the replacement by **identity** — the ownership chain, or a name
+captured once — and every field of one assertion must come from that single pinned object.
+Corollary, and the reason this kept being missed: the failure mode is an **empty** read, never a
+wrong value, so it is indistinguishable from the property genuinely being absent (the symptom
+[[lsn-024]] documents, arrived at by a different route).
+
+**Mechanization.** `p3_pod_of_deploy` in **`dev/lib/preconditions.sh`** resolves Deployment uid →
+owning ReplicaSets → a live Pod owned by one of them, and echoes one name. Enforced by
+**`dev/tests/invariants-gate.py`** `check_p3_pods_resolved_by_ownership`, registered as the second
+half of precondition **P3** and run on every PR through `L0-CHAIN.txt`: no script that calls
+`p3_force_recreate` may index into `.items[]`. Scoped to those scripts on purpose — `.items[0]` off
+`get nodes` on a single-node Kind is a far weaker claim, and a lint whose findings are mostly
+legitimate teaches people to write exemptions.
+
+**Verify.** **4/4 mutations caught**, two of them byte-exact reconstructions of the real defects:
+restoring the selector poll + three `.items[0]` reads in `verify-phase3.sh` → flagged; the same in
+`verify-phase2.sh` → flagged. Plus breaking the call pattern, and removing one of the two callers →
+the check reports itself **VACUOUS** rather than green, naming the count it expected (V-MET-014).
+Behavioural evidence, which is the part a lint cannot give: **6/6 clean runs** of each script, each
+resolving a **different** pod name, where before two consecutive runs latched onto the same stale
+pod. Gate 11/11, exit 0.
 
 ---
 
@@ -436,13 +988,73 @@ first question this pass asks of anything still open.
 
 `checks, infrastructure` · **closed** 2026-07-26 (P8-T8c) · opened 2026-07-25
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | `verify-phase8.sh`'s first end-to-end run reported that tenant isolation did not hold, that the egress default-deny did not hold, and that chaos C2 failed to replace a deleted pod. All three were **false**. `kube-scheduler` and `kube-controller-manager` were in CrashLoopBackOff on both Kind clusters — 31 and 29 restarts on `dev` — losing their leader leases because API-server calls were timing out under host memory pressure. The Docker VM had **2 GiB total and 2 CPUs** (Colima's stock defaults, never raised) and was carrying two Kind control planes. The give-away, visible only in hindsight: three properties with no code in common do not regress in the same run.                                                                                                                                                                                                                                                                                                                                                                 |
-| **Root cause**    | With no scheduler, fixture pods stay `Pending` forever; with no controller-manager, a new namespace never gets its `default` ServiceAccount and pod creation fails `Forbidden`. Every enforcement check is built the same way — create a fixture, try the thing that should be denied, observe that it was denied. When the fixture never runs, the thing that should be denied never happens, and the check observes exactly what a **working** policy looks like… on the way to concluding the property is ABSENT. This is [[lsn-024]]'s shape — an empty read is indistinguishable from the property being missing — aimed at infrastructure rather than at timing. Reachability was being mistaken for health: every one of these clusters answered `kubectl version` throughout.                                                                                                                                                                                                                                                                         |
-| **Generalize**    | **Before believing a claim about a cluster, assert the cluster can still run the experiment — and probe the capability, not a proxy for it.** Reading `.status.phase` of the static pods would have caught this particular outage, but it answers a question about pods when the question is whether the control plane still converges; creating a namespace and waiting for the ServiceAccount its controller must write is the same claim stated as an experiment, and costs about a second. Two corollaries the first draft got wrong. **(a)** The verdict is `rc 2`, could-not-run, **never `rc 1`** — an unhealthy cluster is not a failed security property, and "tenant isolation does not hold" is a sentence someone acts on. **(b)** "Healthy now" is the wrong property: a CrashLoopBackOff answers every liveness probe during its up-swing, and an L2 suite runs for half an hour, so a recent restart is the available evidence against it. Steps 1–3 of this very check all passed against the cluster that produced the three false failures. |
-| **Mechanization** | `p10_assert_control_plane_healthy` in **`dev/lib/preconditions.sh`**, registered as precondition **P10** in `binding.md`, called by **every one of the 15 cluster-reading scripts in the L2 transitive closure** -- not by the phase gate on their behalf, because each is independently runnable (which is how [[lsn-025]] was found) and on a sick cluster each still produces its own false failure. The floor is a rule rather than a convention: **`check_l2_scripts_assert_cluster_health`** in `dev/tests/invariants-gate.py` (L0-CHAIN, therefore CI on every PR) fails any script in the closure whose CODE calls `kubectl` and does not call P10. Scoped by what the script DOES, so there is no exemption ladder: `otel-endpoint.sh` is out of scope because it reads a Dockerfile and never contacts a cluster, and adding a `kubectl` line to it puts it in scope automatically -- the opposite of a roster someone must remember to extend. Memoized per target, so the nested calls down a `verify-phase7 -> 5 -> 2` chain cost ~6 ms. |
-| **Verify**        | Three defects found in P10 by **running** it, each fixed and re-tested: probe namespaces collided on `$$` (now server-assigned via `generateName` — verified on the exact shape that broke it, three piped calls all reporting the true failure); nested callers re-probed (memoized, 0.600s → 0.006s, second target still live, failures never cached); and the managed-control-plane branch returned early past the flap check. Behavioural evidence for the check itself: **rc 2 on both clusters** while they were inside the 900s flap window after a VM restart, **rc 0 on both** once it elapsed, with steps 1–3 passing throughout — i.e. the flap arm is the only thing standing between a just-booted cluster and a green verdict. `P10_FLAP_WINDOW=1` flips it, confirming the window is what decides. The BSD/GNU `date -u` parse was checked on this host: deltas come out positive (`+830s`), where the pre-`-u` draft produced negatives that flagged every restart ever recorded. The gate arm was mutation-tested three ways after it went green, since a check written against a corpus it already satisfies proves nothing: deleting the call from `chaos-suite.sh` and commenting it out in `tenant-isolation-l2.sh` (the LSN-023 shape -- paragraph kept, call gone) each turn it red naming that file, and raising the caller floor by one produces the VACUOUS message rather than a pass. Restoring all three returns 13/13. |
+**Trigger.** `verify-phase8.sh`'s first end-to-end run reported that tenant isolation did not hold,
+that the egress default-deny did not hold, and that chaos C2 failed to replace a deleted pod. All
+three were **false**. `kube-scheduler` and `kube-controller-manager` were in CrashLoopBackOff on
+both Kind clusters — 31 and 29 restarts on `dev` — losing their leader leases because API-server
+calls were timing out under host memory pressure. The Docker VM had **2 GiB total and 2 CPUs**
+(Colima's stock defaults, never raised) and was carrying two Kind control planes. The give-away,
+visible only in hindsight: three properties with no code in common do not regress in the same run.
+
+**Root cause.** With no scheduler, fixture pods stay `Pending` forever; with no controller-manager,
+a new namespace never gets its `default` ServiceAccount and pod creation fails `Forbidden`. Every
+enforcement check is built the same way — create a fixture, try the thing that should be denied,
+observe that it was denied. When the fixture never runs, the thing that should be denied never
+happens, and the check observes exactly what a **working** policy looks like… on the way to
+concluding the property is ABSENT. This is [[lsn-024]]'s shape — an empty read is indistinguishable
+from the property being missing — aimed at infrastructure rather than at timing. Reachability was
+being mistaken for health: every one of these clusters answered `kubectl version` throughout.
+
+**Generalize.** **Before believing a claim about a cluster, assert the cluster can still run the
+experiment — and probe the capability, not a proxy for it.** Reading `.status.phase` of the static
+pods would have caught this particular outage, but it answers a question about pods when the
+question is whether the control plane still converges; creating a namespace and waiting for the
+ServiceAccount its controller must write is the same claim stated as an experiment, and costs about
+a second. Two corollaries the first draft got wrong. **(a)** The verdict is `rc 2`, could-not-run,
+**never `rc 1`** — an unhealthy cluster is not a failed security property, and "tenant isolation
+does not hold" is a sentence someone acts on. **(b)** "Healthy now" is the wrong property: a
+CrashLoopBackOff answers every liveness probe during its up-swing, and an L2 suite runs for half an
+hour, so a recent restart is the available evidence against it. Steps 1–3 of this very check all
+passed against the cluster that produced the three false failures.
+
+**Mechanization.** `p10_assert_control_plane_healthy` in **`dev/lib/preconditions.sh`**, registered
+as precondition **P10** in `binding.md`, called by **every one of the 15 cluster-reading scripts in
+the L2 transitive closure** -- not by the phase gate on their behalf, because each is independently
+runnable (which is how [[lsn-025]] was found) and on a sick cluster each still produces its own
+false failure. The floor is a rule rather than a convention:
+**`check_l2_scripts_assert_cluster_health`** in `dev/tests/invariants-gate.py` (L0-CHAIN, therefore
+CI on every PR) fails any script in the closure whose CODE calls `kubectl` and does not call P10.
+Scoped by what the script DOES, so there is no exemption ladder: `otel-endpoint.sh` is out of scope
+because it reads a Dockerfile and never contacts a cluster, and adding a `kubectl` line to it puts
+it in scope automatically -- the opposite of a roster someone must remember to extend. Memoized per
+target, so the nested calls down a `verify-phase7 -> 5 -> 2` chain cost ~6 ms.
+
+**Verify.** Three defects found in P10 by **running** it, each fixed and re-tested: probe namespaces
+collided on `$$` (now server-assigned via `generateName` — verified on the exact shape that broke
+it, three piped calls all reporting the true failure); nested callers re-probed (memoized, 0.600s →
+0.006s, second target still live, failures never cached); and the managed-control-plane branch
+returned early past the flap check. Behavioural evidence for the check itself: **rc 2 on both
+clusters** while they were inside the 900s flap window after a VM restart, **rc 0 on both** once it
+elapsed, with steps 1–3 passing throughout — i.e. the flap arm is the only thing standing between a
+just-booted cluster and a green verdict. `P10_FLAP_WINDOW=1` flips it, confirming the window is what
+decides. The BSD/GNU `date -u` parse was checked on this host: deltas come out positive (`+830s`),
+where the pre-`-u` draft produced negatives that flagged every restart ever recorded. The gate arm
+was mutation-tested three ways after it went green, since a check written against a corpus it
+already satisfies proves nothing: deleting the call from `chaos-suite.sh` and commenting it out in
+`tenant-isolation-l2.sh` (the LSN-023 shape -- paragraph kept, call gone) each turn it red naming
+that file, and raising the caller floor by one produces the VACUOUS message rather than a pass.
+Restoring all three returns 13/13.
+
+**Substrate note (2026-07-26).** The two Kind-in-Colima clusters whose control planes crashlooped
+here no longer exist; L2 is a managed GKE control plane, where this specific outage cannot happen.
+That is not a reason to retire P10, and the lesson was careful about why before the move made it
+matter: the mechanization is a **capability probe** — create a namespace, wait for the
+ServiceAccount its controller must write — not a reading of `kube-scheduler`'s pod status. It
+therefore says nothing about Kind, and `p10_assert_control_plane_healthy` already carried the
+managed-control-plane branch (`sched_note`, "managed/unobservable scheduler; not asserted") before
+the move, because a managed cluster does not show you its static pods. A wedged cluster of any kind
+still fails the probe, and a GKE control plane mid-upgrade or out of quota is exactly the shape this
+catches. All 15 callers and the gate arm are unchanged. See also [[lsn-006]] and [[lsn-027]].
 
 ---
 
@@ -450,10 +1062,63 @@ first question this pass asks of anything still open.
 
 `infrastructure, preflight` · **closed** 2026-07-26 (P8-T8c)
 
-| Field             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trigger**       | `up-2node.sh`'s first run died at kubeadm `wait-control-plane`: `/healthz` context deadline exceeded, 4m0s. The memory preflight written two days earlier for [[lsn-026]] had just printed **5758Mi of headroom** and the host load was 1.79 across 6 cores, so the one resource anyone had thought to measure was not merely adequate but abundant. The actual limit was `fs.inotify.max_user_instances`, sitting at the Linux default of **128** and already consumed by the two Kind clusters on the VM. Nothing in the kubeadm output contains the words inotify, watch, or limit.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| **Root cause**    | Every Kind node's containerd opens fsnotify watchers; past the instance ceiling the CRI plugin never registers, and the log line that says so is three layers below where the error surfaces: containerd → `failed to create cni conf monitor: failed to create fsnotify watcher: too many open files`; kubelet → `unknown service runtime.v1.RuntimeService`; kubeadm → an HTTP timeout on `/healthz`. What the operator reads is a **timeout**, whose entire vocabulary is slow-and-small — so they go and look at memory and CPU, where the preflight has already certified everything is fine. A green preflight is not neutral here: it is positive evidence pointing the wrong way. And the resource it measured was memory precisely because memory is what failed **last** time. A preflight grown one incident at a time always measures the previous outage.                                                                                                                                                                                                                                                                                                                                                                                                             |
-| **Generalize**    | **A host-capacity preflight is only evidence about the resources it names, and a timeout is not a statement about size.** Three parts. **(a)** When a component times out, read _its_ log, not the log of the thing that reported the timeout — the reporter is usually the outermost layer and knows least. **(b)** Do not act on a plausible guess about the resource; I suspected inotify and was right, and it would have been wrong to fix it on that basis, because a guess that happens to work teaches the harness to guess. `kind create --retain` keeps the failed node so the containerd log can be read, and that is a one-line cost. **(c)** The preflight should print what it checked and what it did not, so "headroom: 5758Mi" cannot be read as "the host is fine". Per-host finite resources are a small enumerable set — memory, CPU, inotify instances, inotify watches, PIDs, file descriptors, loop devices — and each has a failure signature that looks like something else.                                                                                                                                                                                                                                                                              |
-| **Mechanization** | **`dev/lib/substrate-capacity.sh`** — one definition site per substrate, each entry point refusing with **rc 2** and the exact remediation. The two functions this lesson was written against, `assert_host_capacity` (Docker VM memory, inotify instances), were **deleted on 2026-07-26 with the host they measured**; the live entry point is `assert_project_capacity`, and that is this mechanization holding rather than lapsing — see the parse-the-annotations sentence below. The floor is a rule rather than a habit: **`check_cluster_creating_scripts_assert_capacity`** in `dev/tests/invariants-gate.py` (L0-CHAIN, therefore CI on every PR) fails any script under `dev/` whose CODE runs a cluster-creating command without calling the preflight that covers it. The command -> preflight map is PARSED out of `# @covers:` annotations in the library rather than hardcoded in the gate, which is what carried this lesson intact through the move off the host that taught it (2026-07-26): `assert_project_capacity` measures project, service APIs, regional CPUS quota and Artifact Registry reachability, and the rule needed no edit to start policing it. Retiring a substrate is a deletion, after which nothing matches that command and the map shrinks on its own -- a hardcoded table would instead have gone quietly green. This closed at the same moment three clusters became one — with a single `up-*.sh` left there is exactly one caller, and the check is what stops the second one from being written without a preflight, which is how the memory floor briefly existed twice with two different values.                                                                                                                                                                                                                                                                                                                                                                                                 |
-| **Verify**        | Mutation-tested on the live host in both directions: with `max_user_instances=128` the script refused with the full remediation and created nothing; raised to 512, the same script ran through to a 2-node cluster with CRD, controller, webhooks and VAP. The gate arm was mutation-tested too — commenting out the `assert_host_capacity` call in `up.sh` turns the check red naming that file, restoring it turns it green (12/12). It also found a real defect on its FIRST run, which is the evidence that matters most: `egress-enforcement.sh` printed "Stand one up: kind create cluster --config kind-config.yaml", advice that now yields a cluster with the default CNI disabled and no Calico — every node NotReady. The diagnosis behind the lesson was verified rather than assumed: the first failed cluster was re-created with `kind create --retain` and `docker exec` into the retained node produced the containerd line naming the resource, which is the only reason this entry says inotify instead of "probably memory again". Note for whoever hits this next: **the sysctl does not survive a Colima restart**, so a host that passed yesterday can refuse today; that is the check working, and the `provision:` block in the refusal text is the fix. |
+**Trigger.** `up-2node.sh`'s first run died at kubeadm `wait-control-plane`: `/healthz` context
+deadline exceeded, 4m0s. The memory preflight written two days earlier for [[lsn-026]] had just
+printed **5758Mi of headroom** and the host load was 1.79 across 6 cores, so the one resource anyone
+had thought to measure was not merely adequate but abundant. The actual limit was
+`fs.inotify.max_user_instances`, sitting at the Linux default of **128** and already consumed by the
+two Kind clusters on the VM. Nothing in the kubeadm output contains the words inotify, watch, or
+limit.
+
+**Root cause.** Every Kind node's containerd opens fsnotify watchers; past the instance ceiling the
+CRI plugin never registers, and the log line that says so is three layers below where the error
+surfaces: containerd → `failed to create cni conf monitor: failed to create fsnotify watcher: too
+many open files`; kubelet → `unknown service runtime.v1.RuntimeService`; kubeadm → an HTTP timeout
+on `/healthz`. What the operator reads is a **timeout**, whose entire vocabulary is slow-and-small —
+so they go and look at memory and CPU, where the preflight has already certified everything is fine.
+A green preflight is not neutral here: it is positive evidence pointing the wrong way. And the
+resource it measured was memory precisely because memory is what failed **last** time. A preflight
+grown one incident at a time always measures the previous outage.
+
+**Generalize.** **A host-capacity preflight is only evidence about the resources it names, and a
+timeout is not a statement about size.** Three parts. **(a)** When a component times out, read _its_
+log, not the log of the thing that reported the timeout — the reporter is usually the outermost
+layer and knows least. **(b)** Do not act on a plausible guess about the resource; I suspected
+inotify and was right, and it would have been wrong to fix it on that basis, because a guess that
+happens to work teaches the harness to guess. `kind create --retain` keeps the failed node so the
+containerd log can be read, and that is a one-line cost. **(c)** The preflight should print what it
+checked and what it did not, so "headroom: 5758Mi" cannot be read as "the host is fine". Per-host
+finite resources are a small enumerable set — memory, CPU, inotify instances, inotify watches, PIDs,
+file descriptors, loop devices — and each has a failure signature that looks like something else.
+
+**Mechanization.** **`dev/lib/substrate-capacity.sh`** — one definition site per substrate, each
+entry point refusing with **rc 2** and the exact remediation. The two functions this lesson was
+written against, `assert_host_capacity` (Docker VM memory, inotify instances), were **deleted on
+2026-07-26 with the host they measured**; the live entry point is `assert_project_capacity`, and
+that is this mechanization holding rather than lapsing — see the parse-the-annotations sentence
+below. The floor is a rule rather than a habit: **`check_cluster_creating_scripts_assert_capacity`**
+in `dev/tests/invariants-gate.py` (L0-CHAIN, therefore CI on every PR) fails any script under `dev/`
+whose CODE runs a cluster-creating command without calling the preflight that covers it. The command
+-> preflight map is PARSED out of `# @covers:` annotations in the library rather than hardcoded in
+the gate, which is what carried this lesson intact through the move off the host that taught it
+(2026-07-26): `assert_project_capacity` measures project, service APIs, regional CPUS quota and
+Artifact Registry reachability, and the rule needed no edit to start policing it. Retiring a
+substrate is a deletion, after which nothing matches that command and the map shrinks on its own --
+a hardcoded table would instead have gone quietly green. This closed at the same moment three
+clusters became one — with a single `up-*.sh` left there is exactly one caller, and the check is
+what stops the second one from being written without a preflight, which is how the memory floor
+briefly existed twice with two different values.
+
+**Verify.** Mutation-tested on the live host in both directions: with `max_user_instances=128` the
+script refused with the full remediation and created nothing; raised to 512, the same script ran
+through to a 2-node cluster with CRD, controller, webhooks and VAP. The gate arm was mutation-tested
+too — commenting out the `assert_host_capacity` call in `up.sh` turns the check red naming that
+file, restoring it turns it green (12/12). It also found a real defect on its FIRST run, which is
+the evidence that matters most: `egress-enforcement.sh` printed "Stand one up: kind create cluster
+--config kind-config.yaml", advice that now yields a cluster with the default CNI disabled and no
+Calico — every node NotReady. The diagnosis behind the lesson was verified rather than assumed: the
+first failed cluster was re-created with `kind create --retain` and `docker exec` into the retained
+node produced the containerd line naming the resource, which is the only reason this entry says
+inotify instead of "probably memory again". Note for whoever hits this next: **the sysctl does not
+survive a Colima restart**, so a host that passed yesterday can refuse today; that is the check
+working, and the `provision:` block in the refusal text is the fix.

@@ -30,6 +30,7 @@ Run: python3 dev/tests/invariants-gate.py [--update-baseline]
 
 from __future__ import annotations
 
+import csv
 import json
 import re
 import subprocess
@@ -39,6 +40,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 LESSONS = REPO / ".claude/harness/LESSONS.md"
 LEDGER = REPO / "docs/build/LEDGER.md"
+# The verification evidence corpus. It was one markdown table inside LEDGER.md until 2026-07-26,
+# when the by-check-ID rows moved to a CSV and the Phases 0-7 suite-level log moved to the archive.
+# All three are listed because the question the gate asks of them -- "is this check green anywhere?"
+# -- is about the corpus, not about the file it currently sits in. Splitting the corpus without
+# telling the gate is how a check goes quietly VACUOUS; see _verification_evidence_rows.
+LEDGER_ARCHIVE = REPO / "docs/build/archive/LEDGER-phases-0-7.md"
+RESULTS_CSV = REPO / "verification/results.csv"
 L0_CHAIN = REPO / "dev/L0-CHAIN.txt"
 L2_CHAIN = REPO / "dev/L2-CHAIN.txt"
 WORKFLOWS = REPO / ".github/workflows"
@@ -730,6 +738,56 @@ def _deferral_rows() -> list[list[str]]:
     return rows
 
 
+# The corpus was 39 rows when this floor was written -- 37 from results.csv and 2 markdown rows
+# naming a check ID. Set just under the CSV's own row count, because the record is append-only: it
+# grows on every run and never shrinks, so any real drop means the gate stopped reading it.
+#
+# The floor exists because the failure mode of a MOVED corpus is not the failure mode of a missing
+# one. Missing is safe: `green` goes False and the BLOCKING-ALWAYS arm fails loudly. But it fails
+# saying "V-CTN-020 is deferred and green nowhere", which sends whoever reads it to look at
+# V-CTN-020, and the actual defect is three directories away in the gate's own file list. A wrong
+# diagnosis delivered confidently is worse than a red build. Say which failure this is.
+EVIDENCE_ROW_FLOOR = 35
+
+
+def _verification_evidence_rows() -> list[str]:
+    """Every row of the verification record, wherever it currently lives, as searchable text.
+
+    Three sources, one question. The markdown sources are matched as whole lines exactly as they
+    were when the record was a single table in the ledger -- `cid in line and "**pass**" in line`
+    -- because that is the behaviour the BLOCKING-ALWAYS arm was mutation-tested against and a
+    corpus move is not the moment to also change the predicate.
+
+    The CSV is parsed with `csv.reader` rather than grepped, which makes it STRICTER than the
+    markdown path: `pass` has to be in the `result` field and the ID has to be in the `check_id`
+    field, so the word "passes" inside some other check's evidence paragraph cannot vouch for a
+    check that never ran. The rows are re-emitted in the pipe-delimited shape the caller expects,
+    with everything but those two fields dropped, so nothing else in the row can match either.
+
+    Rows are filtered to those that actually name a check. That is behaviour-preserving for the
+    caller, which only ever matched a row containing the ID it was asking about, and it is what
+    makes the floor below mean something: without it the count is dominated by the Status, Index,
+    Deferrals and Decisions tables, and the whole evidence record could vanish while the corpus
+    still measured two hundred rows.
+    """
+    rows: list[str] = []
+    for path in (LEDGER, LEDGER_ARCHIVE):
+        if path.exists():
+            rows += [
+                ln
+                for ln in path.read_text().splitlines()
+                if ln.startswith("|") and CHECK_ID.search(ln)
+            ]
+    if RESULTS_CSV.exists():
+        with RESULTS_CSV.open(newline="") as fh:
+            for rec in csv.DictReader(fh):
+                cid = (rec.get("check_id") or "").strip()
+                result = (rec.get("result") or "").strip()
+                if cid and "pass" in result.lower():
+                    rows.append(f"| {cid} | **pass** |")
+    return rows
+
+
 def _closed_deferral_failures(
     subject: str, blocker: str, promote: str, chain: str
 ) -> list[str]:
@@ -795,7 +853,16 @@ def check_deferrals_name_blockers() -> list[str]:
             f"deferrals reports the cleanest possible build."
         ]
 
-    ledger_text = LEDGER.read_text()
+    evidence = _verification_evidence_rows()
+    if len(evidence) < EVIDENCE_ROW_FLOOR:
+        return [
+            f"VACUOUS: the verification evidence corpus is {len(evidence)} rows; it was "
+            f"{EVIDENCE_ROW_FLOOR}+ when this floor was written. The BLOCKING-ALWAYS arm below "
+            f"asks whether a deferred check is green somewhere, and against an empty corpus the "
+            f"answer is always no — every deferral would fail, for a reason that has nothing to "
+            f"do with any deferral. Check whether the record moved again: "
+            f"{LEDGER.name}, {LEDGER_ARCHIVE.relative_to(REPO)}, {RESULTS_CSV.relative_to(REPO)}."
+        ]
     chain = regress_chain_text()
     failures = []
     for cells in rows:
@@ -821,12 +888,8 @@ def check_deferrals_name_blockers() -> list[str]:
             if not cid.startswith(BLOCKING_ALWAYS):
                 continue
             # A level of a BLOCKING-ALWAYS check may be deferred only if the check is green
-            # somewhere. Search the verification log for a pass row naming the same ID.
-            green = any(
-                cid in ln and "**pass**" in ln
-                for ln in ledger_text.splitlines()
-                if ln.startswith("|")
-            )
+            # somewhere. Search the verification record for a pass row naming the same ID.
+            green = any(cid in ln and "**pass**" in ln for ln in evidence)
             if not green:
                 failures.append(
                     f"deferral {subject!r} defers {cid}, a BLOCKING-ALWAYS check, and no row of "

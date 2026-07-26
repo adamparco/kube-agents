@@ -80,6 +80,13 @@ DOC_ALLOWLIST = (
     # docs/build/; it was missing only because nothing under .claude/harness/ had
     # ever mentioned the identifier until LSN-017 was written.
     ".claude/harness/",
+    # V-CTR-014's own evidence rows. These bytes were inside docs/build/LEDGER.md
+    # and exempt under the prefix above until 2026-07-26, when the by-check-ID
+    # table moved to a CSV; the exemption follows the content rather than being
+    # a new one. Named as an exact file, not as `verification/`, because the
+    # directory will later hold per-run manifests written by whatever produced
+    # them, and a prefix here would exempt those sight-unseen.
+    "verification/results.csv",
     "dev/tests/closed-allowlist.py",
 )
 
