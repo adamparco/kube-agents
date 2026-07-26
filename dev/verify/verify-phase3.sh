@@ -79,6 +79,10 @@ cd "$REPO_ROOT"
 # P1 and P3 are executed here, not described — the block above is only honest because of these calls.
 . "$REPO_ROOT/dev/lib/preconditions.sh"
 
+# P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+# three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
+
 echo "===================================================================="
 echo " Phase 3 Kind verification — context: $CTX"
 echo "===================================================================="

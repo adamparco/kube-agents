@@ -94,6 +94,7 @@ pass() { echo "PASS: $1"; }
 bad()  { echo "FAIL: $1"; fail=1; }
 note() { echo "  NOTE: $1"; }
 cd "$REPO_ROOT"
+. "$REPO_ROOT/dev/lib/preconditions.sh"
 
 # Run a python module dependency-free; PASS on rc 0, FAIL otherwise (show tail on failure).
 pytest_ok() { # <label> <path> [args...]
@@ -191,6 +192,11 @@ pytest_ok "submit-suggestion stamps Requested-by:/Trace-Id: trailers (flag>env>a
 # VAP admission is GA on k8s >= 1.30 (dev cluster is v1.31.x); egress enforcement needs Calico.
 echo; echo "== LIVE (Kind $CTX): VAP admission dry-run (c) + egress enforcement (b) =="
 if $K version >/dev/null 2>&1; then
+  # P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+  # three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+  # Inside the reachability branch, so the no-cluster CI path is untouched: a cluster that ANSWERS
+  # and cannot converge is a different situation from no cluster, and the first one lies.
+  p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
   # (c) LIVE: install the pod-hardening VAP, then prove admission with server-side dry-run in a namespace
   #     WITHOUT PSS enforcement (default) so the ONLY thing that can reject a labeled-but-unhardened pod
   #     is THIS VAP — isolating the proof from PSS.

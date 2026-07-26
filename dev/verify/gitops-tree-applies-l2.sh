@@ -65,6 +65,10 @@ if ! $K version >/dev/null 2>&1; then
   echo "DEFERRED: context '$CTX' is not reachable."
   exit 3
 fi
+# P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+# three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+. "$REPO/dev/lib/preconditions.sh"
+p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
 if ! $K get crd agents.kubeagents.x-k8s.io >/dev/null 2>&1; then
   echo "DEFERRED: the Agent CRD is not installed on '$CTX', so the Agent CRs in the tree would be"
   echo "  rejected as an unknown kind — which is a missing prerequisite, not a defect in the tree."

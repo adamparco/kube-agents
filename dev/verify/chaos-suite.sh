@@ -214,9 +214,16 @@ echo " Phase 6 chaos suite (05 §8 failure isolation) — context: $CTX"
 echo "===================================================================="
 
 if ! $K version >/dev/null 2>&1; then
-  echo "REFUSING: context '$CTX' is not reachable — the chaos suite needs a live Kind cluster." >&2
+  echo "REFUSING: context '$CTX' is not reachable — the chaos suite needs a live cluster." >&2
   exit 2
 fi
+
+# P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+# three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+# One of those three false failures was C2 in this file — "the controller did not replace a deleted
+# pod" — reported against a cluster whose scheduler had lost its lease. That is a sentence someone
+# acts on, and there is no way to tell it from a real cascade by reading the output.
+p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
 
 # P1 — C1 and C2 are claims about how THIS controller behaves when it is killed and restarted. A
 # controller from three phases ago fails and recovers just as convincingly, so without the digest the

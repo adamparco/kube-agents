@@ -66,6 +66,12 @@ if ! $K version >/dev/null 2>&1; then
   echo "  Stand one up: dev/cluster/up.sh"
   exit 3
 fi
+# P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+# three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+# The baseline in section 2 catches most of this — it refuses to proceed unless both destinations
+# are reachable with no policy — but it catches it as an "unreachable fixture", which reads as a
+# setup problem in one namespace rather than as a control plane that is not converging at all.
+p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
 # P4, from the library: an allow-list of dataplanes known to ENFORCE, not a hard requirement for one
 # named product. This is deferred-not-faked (E-A) — exit 3, never a green.
 p4_assert_enforcing_dataplane "$K" || exit 3

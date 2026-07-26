@@ -104,6 +104,11 @@ kubectl --context "$CTX" version >/dev/null 2>&1 || reachable=0
 . "$REPO_ROOT/dev/lib/preconditions.sh"
 live_ok=1
 if [ "$reachable" -eq 1 ]; then
+  # P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+  # three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+  # Inside the reachability branch, so the no-cluster CI path is untouched: a cluster that ANSWERS
+  # and cannot converge is a different situation from no cluster, and the first one lies.
+  p10_assert_control_plane_healthy "kubectl --context $CTX" "$CTX" || exit 2
   p1_assert_build_under_test "kubectl --context $CTX" kubeagents-system control-plane=controller-manager
   case "$?" in
     0) pass "P1: the running operator is the build under test" ;;

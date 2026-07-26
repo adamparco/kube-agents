@@ -87,6 +87,10 @@ if ! $K version >/dev/null 2>&1; then
   echo "DEFERRED: context '$CTX' is not reachable."
   exit 3
 fi
+# P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+# three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+. "$(dirname "$0")/../lib/preconditions.sh"
+p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
 if ! $K get crd agents.kubeagents.x-k8s.io >/dev/null 2>&1; then
   echo "DEFERRED: the Agent CRD is not installed on '$CTX' — nothing would reconcile these CRs."
   echo "  Stand it up: dev/cluster/up.sh"
@@ -102,7 +106,6 @@ fi
 # and follow it with a note reminding the reader to rebuild -- which is addressed to whoever already
 # knows, and is why LSN-001 recurred three times. p1_assert_build_under_test compares the digest and
 # returns three states, so "could not look" is a deferral and "does not match" is a failure.
-. "$(dirname "$0")/../lib/preconditions.sh"
 p1_assert_build_under_test "$K" kubeagents-system control-plane=controller-manager
 case "$?" in
   0) pass "P1: the running operator is the build under test" ;;

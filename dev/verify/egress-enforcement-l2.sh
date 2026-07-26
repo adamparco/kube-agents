@@ -90,6 +90,12 @@ if ! $K version >/dev/null 2>&1; then
   echo "DEFERRED: context '$CTX' is not reachable. Stand it up: dev/cluster/up.sh"
   exit 3
 fi
+# P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+# three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+# One of those three was this file. Every negative below is "the probe pod could not reach X", and
+# a probe pod that never got scheduled cannot reach anything — which is what a working default-deny
+# looks like right up to the moment the script concludes the default-deny is missing.
+p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
 # P4, from the library. This used to hard-require `ds/calico-node`, which is not the property — the
 # property is "a dataplane that ENFORCES NetworkPolicy", and Calico is one of at least three. On a
 # GKE Dataplane V2 cluster the old line deferred a suite that would have passed, which is the quiet

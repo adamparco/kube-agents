@@ -1319,6 +1319,65 @@ def check_p3_pods_resolved_by_ownership() -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------
+# P10 — a script that reads a cluster asserts the cluster can still run the experiment
+# ---------------------------------------------------------------------------------------------
+
+# LSN-026. verify-phase8.sh's first end-to-end run reported that tenant isolation did not hold, that
+# the egress default-deny did not hold, and that chaos C2 failed to replace a deleted pod. All three
+# were false: kube-scheduler and kube-controller-manager were in CrashLoopBackOff, so fixture pods
+# stayed Pending and new namespaces never got a `default` ServiceAccount. Every enforcement check in
+# this corpus has the same shape -- create a fixture, attempt the thing that must be denied, observe
+# that it was denied -- and when the fixture never runs, the attempt never happens, which is
+# indistinguishable from a policy working right up to the moment the script concludes it is ABSENT.
+#
+# P10 was written that day and wired into verify-phase8.sh alone. That covered the phase gate and
+# nothing else: every other script in the L2 closure is independently runnable -- which is how
+# LSN-025 was found -- and on a sick cluster each still produces its own false failure. A
+# precondition installed at one caller on everyone else's behalf is the shape L2_SCOPE_FLOOR exists
+# to reject, so this makes it a rule.
+#
+# SCOPED BY WHAT THE SCRIPT DOES, not by a roster. A closure script that never invokes kubectl makes
+# no claim about a cluster and cannot assert one is healthy -- otel-endpoint.sh reads a Dockerfile
+# and an entrypoint. That is a derived predicate, not an exemption: adding a kubectl call to it puts
+# it in scope automatically, which is the opposite of a list someone must remember to extend.
+# CODE lines only (LSN-023): a PRECONDITIONS paragraph saying "P10 is asserted" is not the call.
+P10_CALL = re.compile(r"(?<![\w-])p10_assert_control_plane_healthy\s+\S")
+# Fifteen of the sixteen closure scripts touch a cluster today. A floor, not a ratchet: how many L2
+# scripts exist is not itself a property worth defending, but a rule that applies to nothing has
+# stopped being evidence (V-MET-014), and the way this one would silently empty out is a change to
+# _l2_scripts_in_scope or to the kubectl predicate rather than a deletion anyone would notice.
+P10_CALLER_FLOOR = 15
+
+
+def check_l2_scripts_assert_cluster_health() -> list[str]:
+    """Precondition P10 / LSN-026. Every L2 script that reads a cluster first proves it converges."""
+    callers, failures = [], []
+    for p in sorted(_l2_scripts_in_scope()):
+        if not p.exists():
+            continue
+        code = _code_lines(p.read_text())
+        if "kubectl" not in code:
+            continue
+        callers.append(p)
+        if not P10_CALL.search(code):
+            failures.append(
+                f"{p.relative_to(REPO)} reads a cluster and never calls "
+                f"p10_assert_control_plane_healthy. Its verdict cannot distinguish a security "
+                f"property that is missing from a control plane that has stopped converging, and "
+                f"it reports the first (LSN-026). Call P10 before the first claim; rc 2 is "
+                f"could-not-run, never a failure."
+            )
+    if len(callers) < P10_CALLER_FLOOR:
+        return [
+            f"VACUOUS: only {len(callers)} script(s) in the L2 scope read a cluster; there were "
+            f"{P10_CALLER_FLOOR} when this was written. Either the closure shrank or the kubectl "
+            f"predicate stopped matching, and in both cases this check is now reporting green "
+            f"about nothing. Move this floor in the same commit that removes the script."
+        ]
+    return failures
+
+
+# ---------------------------------------------------------------------------------------------
 
 def check_cluster_creating_scripts_assert_host_capacity() -> list[str]:
     """LSN-027. Anything that creates a Kind cluster measures the host first, from one definition site.
@@ -1383,6 +1442,10 @@ CHECKS = [
     ("invariant 13 / LSN-019 — closed lessons are executable", check_closed_lessons_are_executable),
     ("P9 — `.status` reads are polled, not slept on", check_l2_status_reads_are_polled),
     ("P3 — recreated pods are resolved by ownership", check_p3_pods_resolved_by_ownership),
+    (
+        "LSN-026 / P10 — L2 scripts assert the cluster can run the experiment",
+        check_l2_scripts_assert_cluster_health,
+    ),
     (
         "LSN-027 — cluster-creating scripts measure the host first",
         check_cluster_creating_scripts_assert_host_capacity,

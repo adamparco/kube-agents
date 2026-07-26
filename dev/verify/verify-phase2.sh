@@ -68,6 +68,10 @@ cd "$REPO_ROOT"
 # recurred anyway; the declaration block above is only honest because these two calls exist.
 . "$REPO_ROOT/dev/lib/preconditions.sh"
 
+# P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+# three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
+
 echo "===================================================================="
 echo " Phase 2 Kind verification — context: $CTX"
 echo "===================================================================="

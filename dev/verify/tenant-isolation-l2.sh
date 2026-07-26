@@ -100,6 +100,13 @@ if ! $K version >/dev/null 2>&1; then
   exit 3
 fi
 
+# P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+# three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+# One of those three was this file — "tenant isolation does not hold" — reported against a cluster
+# whose controller-manager had stopped writing default ServiceAccounts, so the fixtures the quota
+# was supposed to refuse were being refused for a reason nobody had configured.
+p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
+
 # P4 from the library, not from a copy here. This detector WAS here, and it was the only correct one
 # in the tree — the two egress suites hard-required `ds/calico-node` and would have deferred on a
 # Dataplane V2 cluster that enforces perfectly. It answers 0 or 3 and never 1; section 4 below is the

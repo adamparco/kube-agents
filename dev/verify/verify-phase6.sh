@@ -61,6 +61,7 @@ pass() { echo "PASS: $1"; }
 bad()  { echo "FAIL: $1"; fail=1; }
 note() { echo "  NOTE: $1"; }
 cd "$REPO_ROOT"
+. "$REPO_ROOT/dev/lib/preconditions.sh"
 
 echo "===================================================================="
 echo " Phase 6 verification (failure-isolation & resilience) — context: $CTX"
@@ -68,6 +69,15 @@ echo "===================================================================="
 
 reachable=1
 kubectl --context "$CTX" version >/dev/null 2>&1 || reachable=0
+# P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+# three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+# Inside the reachability branch, so the no-cluster CI path is untouched: a cluster that ANSWERS
+# and cannot converge is a different situation from no cluster, and the first one lies. It matters
+# most here — section A treats unreachable as a FAILURE, so a sick cluster would produce a red
+# "the chaos suite could not recover a deleted pod" that is a statement about the cluster.
+if [ "$reachable" -eq 1 ]; then
+  p10_assert_control_plane_healthy "kubectl --context $CTX" "$CTX" || exit 2
+fi
 
 # ---- A. NET-NEW load-bearing: 05 §8 failure isolation (chaos) ---------------------------------------
 echo; echo "== A. 05 §8 failure isolation (chaos) — chaos-suite.sh (NET-NEW load-bearing) =="

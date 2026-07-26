@@ -68,12 +68,16 @@ echo "===================================================================="
 
 $K version >/dev/null 2>&1 || { echo "FAIL: context '$CTX' is not reachable." >&2; exit 1; }
 
+# P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+# three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+. "$REPO_ROOT/dev/lib/preconditions.sh"
+p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
+
 # --- P1: the webhook doing the rejecting must be the build under test ---------------------------
 # L2-2 asserts that four degenerate allowlist shapes are REFUSED. A stale operator refuses them with
 # the old rules -- or, if the CRD's CEL is doing the work, refuses them for a reason the webhook
 # change under test had nothing to do with. Either way the run is green about code that is not
 # there, which is LSN-001's shape and the reason it recurred three times.
-. "$REPO_ROOT/dev/lib/preconditions.sh"
 p1_assert_build_under_test "$K" "$NS" control-plane=controller-manager
 case "$?" in
   0) pass "P1: the running operator is the build under test" ;;

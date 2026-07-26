@@ -45,6 +45,13 @@ fail=0
 pass() { echo "PASS: $1"; }
 bad()  { echo "FAIL: $1"; fail=1; }
 
+# P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
+# three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
+# Every assertion here is "the API server REFUSED this" — and an API server that has stopped
+# answering refuses everything, so a wedged cluster reads as a perfect read-only ceiling.
+. "$REPO_ROOT/dev/lib/preconditions.sh"
+p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
+
 echo "== applying ValidatingAdmissionPolicy =="
 $K apply -f "$VAP" || { echo "could not apply VAP"; exit 1; }
 $K create namespace team-x --dry-run=client -o yaml | $K apply -f - >/dev/null 2>&1 || true
