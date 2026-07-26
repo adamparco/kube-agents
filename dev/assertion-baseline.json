@@ -6,6 +6,25 @@
       "test_the_router_env_is_empty_not_fake",
       "test_the_scanner_distinguishes_a_value_from_a_comment"
     ],
+    "dev/test_build_under_test_precondition.py": [
+      "test_a_build_of_a_different_commit_is_a_failure_not_a_deferral",
+      "test_a_clean_build_with_uncommitted_operator_changes_is_stale",
+      "test_a_digest_with_no_commit_carrying_tag_is_undecidable",
+      "test_a_dirty_build_newer_than_the_edit_is_fresh",
+      "test_a_dirty_build_older_than_the_edit_is_stale",
+      "test_abbreviated_shas_compare_as_prefixes_in_both_directions",
+      "test_an_unmapped_image_is_undecidable_and_says_so",
+      "test_dirt_outside_the_build_inputs_does_not_make_the_image_stale",
+      "test_repo_path_strips_tag_and_digest_but_keeps_a_registry_port",
+      "test_tag_naming_head_on_a_clean_tree_is_fresh",
+      "test_the_makefile_src_prefix_counts_as_provenance_too",
+      "test_the_right_tag_among_several_is_the_one_that_decides"
+    ],
+    "dev/test_dataplane_precondition.py": [
+      "test_only_known_enforcing_dataplanes_are_accepted",
+      "test_p4_never_returns_one",
+      "test_rejection_says_what_it_found"
+    ],
     "dev/test_detect_drift.py": [
       "test_detects_real_field_change",
       "test_emit_corrective_artifact_without_push",

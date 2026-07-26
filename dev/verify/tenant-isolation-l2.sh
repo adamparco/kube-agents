@@ -46,6 +46,8 @@ CTX="${1:-kind-kube-agents-dev}"
 K="kubectl --context $CTX"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPTS="$REPO/k8s-operator/scripts"
+# shellcheck source=dev/lib/preconditions.sh
+. "$REPO/dev/lib/preconditions.sh"
 
 # Two scratch namespaces, not one. The quota forces every pod in its namespace to declare
 # requests+limits, which would otherwise silently constrain the network fixtures and make a
@@ -98,14 +100,13 @@ if ! $K version >/dev/null 2>&1; then
   exit 3
 fi
 
-ENFORCING="unknown"
-if $K -n kube-system get daemonset calico-node >/dev/null 2>&1; then
-  ENFORCING="calico"
-elif $K -n kube-system get daemonset anetd >/dev/null 2>&1 || $K -n kube-system get daemonset cilium >/dev/null 2>&1; then
-  ENFORCING="dataplane-v2"
-elif $K -n kube-system get daemonset kindnet >/dev/null 2>&1; then
-  ENFORCING="kindnet"
-fi
+# P4 from the library, not from a copy here. This detector WAS here, and it was the only correct one
+# in the tree — the two egress suites hard-required `ds/calico-node` and would have deferred on a
+# Dataplane V2 cluster that enforces perfectly. It answers 0 or 3 and never 1; section 4 below is the
+# only part that depends on it, so a deferral there does not touch the RBAC and quota halves.
+p4_assert_enforcing_dataplane "$K"
+P4_RC=$?
+ENFORCING="$P4_DATAPLANE"
 note "dataplane: $ENFORCING"
 pass "cluster reachable"
 
@@ -219,11 +220,12 @@ else
 fi
 
 # --- 3) network fixtures ----------------------------------------------------------------------------
-if [ "$ENFORCING" != "calico" ] && [ "$ENFORCING" != "dataplane-v2" ]; then
+# The allow-list is P4's, read from its exit code rather than re-tested here against a copy of the
+# names it accepts — a second list is a second thing to forget to extend (V-MET-013).
+if [ "$P4_RC" -ne 0 ]; then
   echo
-  echo "DEFERRED (network half): dataplane is '$ENFORCING', which ACCEPTS NetworkPolicy and ENFORCES"
-  echo "  NOTHING. Any deny observed here would be a false green. Re-run on Calico:"
-  echo "    dev/cluster/up.sh && $0 kind-kube-agents-dev"
+  echo "DEFERRED (network half): dataplane is '$ENFORCING' — see the P4 deferral in section 0. Any"
+  echo "  deny observed here would be a false green, so the network half is not attempted."
   echo
   if [ "$fail" -ne 0 ]; then
     echo "V-CMP-001 (L2, quota half): FAILURES ABOVE"

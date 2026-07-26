@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Phase-5 Accept (b) / E-A: EGRESS ENFORCEMENT proof (load-bearing).
 #
-# Proves that on a NetworkPolicy-ENFORCING CNI (Calico), a tier-shaped default-deny + pure-allowlist
+# Proves that on a NetworkPolicy-ENFORCING dataplane, a tier-shaped default-deny + pure-allowlist
 # egress policy actually BLOCKS an off-allowlist destination while ALLOWING an on-allowlist one — the
 # thing kindnet cannot do (verify-phase3 P3-K6 + the P5 shape checks are structural-only). It uses a
 # representative in-cluster policy of the SAME shape as the production tier netpols (podSelector by tier
@@ -14,7 +14,7 @@
 #
 # DESTRUCTIVE-TEST GUARD: only runs against a Kind or scratch-GKE context.
 # Exit codes: 0 = enforcement PROVEN; 1 = enforcement FAILED (halt condition); 3 = DEFERRED (no
-# NetworkPolicy-enforcing CNI reachable — not faked green; stand up dev/kind/kind-config.yaml).
+# NetworkPolicy-enforcing dataplane reachable — not faked green; stand one up with dev/cluster/up.sh).
 # Usage: dev/tests/egress-enforcement.sh [kube-context]
 #
 # PRECONDITIONS (binding.md §Preconditions; linted by invariants-gate.py
@@ -33,11 +33,14 @@
 #      live pod IPs — plus the baseline that proves both were reachable before the policy existed. That
 #      baseline is what makes the artifact authoritative rather than merely live: without it, a DNS or
 #      scheduling failure would present as a successful deny. P4 also applies and is enforced in code:
-#      absent calico-node this exits 3 (DEFERRED), never 0.
+#      absent an enforcing dataplane this exits 3 (DEFERRED), never 0.
 set -uo pipefail # -e omitted deliberately: kubectl/exec exit codes are inspected manually.
 
 CTX="${1:-kind-kube-agents-dev}"
 K="kubectl --context $CTX"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=dev/lib/preconditions.sh
+. "$REPO/dev/lib/preconditions.sh"
 NS="egress-test"
 TIER="egress-probe"
 ALLOWED_IMG="nginx:1.27-alpine"
@@ -57,18 +60,16 @@ cleanup() { $K delete namespace "$NS" --ignore-not-found --wait=false >/dev/null
 trap cleanup EXIT
 
 # --- 0) require a NetworkPolicy-enforcing CNI; otherwise DEFER (do not fake) ---------------------------
-echo "== 0) checking for a NetworkPolicy-enforcing CNI (Calico) =="
+echo "== 0) checking for a NetworkPolicy-enforcing dataplane (P4) =="
 if ! $K version >/dev/null 2>&1; then
   echo "DEFERRED: context '$CTX' is not reachable — no enforcing cluster to test against."
   echo "  Stand one up: dev/cluster/up.sh"
   exit 3
 fi
-if ! $K -n kube-system get daemonset calico-node >/dev/null 2>&1; then
-  echo "DEFERRED: no calico-node found — kindnet does NOT enforce NetworkPolicy, so egress deny cannot be"
-  echo "  proven here. This is deferred-not-faked (E-A). Use dev/kind/kind-config.yaml + install Calico."
-  exit 3
-fi
-pass "Calico (NetworkPolicy-enforcing CNI) present"
+# P4, from the library: an allow-list of dataplanes known to ENFORCE, not a hard requirement for one
+# named product. This is deferred-not-faked (E-A) — exit 3, never a green.
+p4_assert_enforcing_dataplane "$K" || exit 3
+pass "NetworkPolicy-enforcing dataplane present ($P4_DATAPLANE)"
 
 # --- 1) fixtures: two server pods (allowed + denied targets) + a client pod --------------------------
 echo "== 1) deploying fixtures in namespace $NS =="
@@ -133,12 +134,12 @@ spec:
       ports:
         - { protocol: TCP, port: 80 }
 EOF
-sleep 5 # let Calico program the policy
+sleep 5 # let the dataplane program the policy
 
 # --- 4) the load-bearing assertions: on-allowlist ALLOWED, off-allowlist DENIED ----------------------
 echo "== 4) enforcement assertions =="
 if probe "$ALLOWED_IP"; then pass "on-allowlist destination ($ALLOWED_IP) is ALLOWED"; else
-  bad "on-allowlist destination is BLOCKED — policy over-blocks (or Calico not ready)"; fi
+  bad "on-allowlist destination is BLOCKED — policy over-blocks (or the dataplane is not ready)"; fi
 if probe "$DENIED_IP"; then
   bad "off-allowlist destination ($DENIED_IP) is REACHABLE — egress is NOT enforced (HALT: Accept b fails)"; else
   pass "off-allowlist destination ($DENIED_IP) is DENIED (egress enforced)"; fi

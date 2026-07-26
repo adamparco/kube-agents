@@ -2,8 +2,9 @@
 # V-CTN-020 at L2 — "Egress default-deny holds while Workload Identity still functions" (BLOCKING-ALWAYS).
 #
 # WHAT MAKES THIS DIFFERENT FROM dev/tests/egress-enforcement.sh. That suite proves the
-# MECHANISM: a policy of the right shape blocks an off-allowlist destination on Calico. It builds its
-# own synthetic policy, so it stays green no matter what the shipped policies say. This suite renders
+# MECHANISM: a policy of the right shape blocks an off-allowlist destination on any dataplane P4
+# accepts as enforcing. It builds its own synthetic policy, so it stays green no matter what the
+# shipped policies say. This suite renders
 # THE ACTUAL SHIPPED POLICY — the same `render_egress_policy` the installer calls — and asserts
 # against that. A regression in the template is invisible to the first suite and fatal to this one.
 #
@@ -36,7 +37,7 @@
 # check_l2_scripts_declare_preconditions). Declared, not assumed: LSN-001 and LSN-002 each
 # recurred against scripts whose authors believed the preconditions held.
 #   P1 image-under-test:  none — nothing here is served by an operator image. The policy under test is rendered by this
-#      script through the installer's own `render_egress_policy`, and enforcement is Calico's, not
+#      script through the installer's own `render_egress_policy`, and enforcement is the dataplane's, not
 #      the operator's. A stale operator cannot make an off-allowlist packet arrive.
 #   P3 admission-recreate: the NetworkPolicy objects and every probe pod. Section 3 deletes and re-applies the policy
 #      between stages, and each probe pod is created after the policy it is probing — a pod that
@@ -50,6 +51,8 @@ CTX="${1:-kind-kube-agents-dev}"
 K="kubectl --context $CTX"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPTS="$REPO/k8s-operator/scripts"
+# shellcheck source=dev/lib/preconditions.sh
+. "$REPO/dev/lib/preconditions.sh"
 
 CTRL_NS="kubeagents-system"  # where the policy and the agent pod live
 TENANT_NS="egress-l2-tenant" # a foreign namespace the policy must NOT admit
@@ -87,12 +90,12 @@ if ! $K version >/dev/null 2>&1; then
   echo "DEFERRED: context '$CTX' is not reachable. Stand it up: dev/cluster/up.sh"
   exit 3
 fi
-if ! $K -n kube-system get daemonset calico-node >/dev/null 2>&1; then
-  echo "DEFERRED: no enforcing CNI (calico-node absent). kindnet accepts NetworkPolicy and enforces"
-  echo "  nothing, so an egress claim here would be false. Run: dev/cluster/up.sh"
-  exit 3
-fi
-pass "enforcing dataplane present (calico-node)"
+# P4, from the library. This used to hard-require `ds/calico-node`, which is not the property — the
+# property is "a dataplane that ENFORCES NetworkPolicy", and Calico is one of at least three. On a
+# GKE Dataplane V2 cluster the old line deferred a suite that would have passed, which is the quiet
+# half of a badly-scoped precondition: not a false green, a permanent silence.
+p4_assert_enforcing_dataplane "$K" || exit 3
+pass "enforcing dataplane present ($P4_DATAPLANE)"
 
 # --- 1) render the SHIPPED policy, both ways ---------------------------------------------------------
 echo
@@ -253,7 +256,7 @@ printf '%s\n' "$POLICY_NOWI" | $K apply -f - >/dev/null || {
   exit 1
 }
 pass "the shipped policy applies cleanly"
-sleep 6 # let Calico program it
+sleep 6 # let the dataplane program it
 
 echo
 echo "== 6) enforcement assertions =="

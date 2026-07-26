@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# preconditions.sh — the executable form of binding.md §Preconditions P1 and P3.
+# preconditions.sh — the executable form of binding.md §Preconditions P1, P3, P4 and P10.
 #
 # WHY THIS FILE EXISTS. P1 and P3 were prose in binding.md, and prose is what LSN-001 and LSN-002
 # have each already survived: LSN-001 recurred THREE times (Phase 3, Phase 6, the first live
@@ -27,20 +27,37 @@
 # Usage:  . "$(dirname "$0")/../lib/preconditions.sh"
 #         p1_assert_build_under_test "$K" kubeagents-system control-plane=controller-manager
 
-# --- P1, the freshness half ------------------------------------------------------------------------
-# THE HOLE THIS CLOSES, found 2026-07-25 by running P1 for the first time on kind-kube-agents-dev.
-# The digest comparison below answers "is the cluster running MY LOCAL IMAGE of this tag" — and it
-# answered yes about an image built six hours and twenty-five minutes BEFORE the last commit that
-# touched the operator source. That is not a corner case: "ran the gate, forgot to rebuild" is
-# LSN-001's actual recurrence mode, and the check written to mechanize LSN-001 could not fail in it.
-# V-MET-014, on the very check that exists to stop the thing it could not see.
+# --- P1, and why the registry is now the only witness ----------------------------------------------
 #
-# Freshness is decided against the newest of (a) the commit time of the last commit touching the
-# image's build inputs and (b) the mtime of any DIRTY file among them. Commit time rather than mtime
-# for tracked files, because a fresh clone or a branch switch rewrites every mtime and would report
-# a perfectly current image as stale — a check that cries wolf is the other way to make one
-# decorative. Dirty files have no commit time, so mtime is the only answer for them, and it is the
-# right one: an uncommitted edit to the controller is exactly the code a local L2 run is about.
+# THE HOLE THIS CLOSES, found 2026-07-25 by running P1 for the first time. The digest half answers
+# "is the cluster running the image I have" — and it answered yes about an image built six hours and
+# twenty-five minutes BEFORE the last commit that touched the operator source. That is not a corner
+# case: "ran the gate, forgot to rebuild" is LSN-001's actual recurrence mode, and the check written
+# to mechanize LSN-001 could not fail in it. V-MET-014, on the check that exists to stop the thing it
+# could not see. So P1 makes TWO claims, and the second one is the one that keeps needing defending.
+#
+# WHAT CHANGED WHEN THE INNER LOOP LEFT THIS HOST. Both halves used to be answered by `docker image
+# inspect` — the config digest for identity, `.Created` for freshness. That worked for exactly one
+# reason: `kind load docker-image` side-loads the host's image into the node's containerd, so the
+# host's copy and the cluster's copy were the same object by construction. On a remote cluster there
+# is no local copy and there cannot be one: the nodes are amd64, this host is arm64, and Cloud Build
+# builds on neither. `docker image inspect` would return nothing every time and P1 would answer 3
+# forever — the decorative state this file was written to escape, arrived at by a different road.
+#
+# Both halves therefore move to Artifact Registry, which is the one party that the builder wrote to
+# AND the kubelet pulled from:
+#
+#   identity  — the digest the pod reports is looked up in the registry, by digest.
+#   freshness — the TAGS that digest carries are read back, and one of them must name the commit
+#               this tree is on. `reload-images.sh` derives the tag from `git rev-parse --short
+#               HEAD`, so the tag is not a label someone typed; it is the build's own statement of
+#               where it came from, recorded by the builder and read from a third party.
+#
+# That is more than the old check could see, not less. `.Created` versus the newest source commit
+# was an inference about provenance drawn from two clocks; a commit sha is the provenance. The clock
+# survives in exactly one place — an UNCOMMITTED edit has no commit to name, so the build tag
+# carries `-dirty-<epoch>` and that epoch is compared against the mtime of the dirty files. The
+# fresh-clone / branch-switch special case that the mtime arithmetic needed is gone with it.
 
 # Build inputs per image, keyed by the repository's last path segment. Deliberately small and
 # deliberately NOT defaulted to the repo root: a docs commit would then mark every image stale, and
@@ -62,49 +79,133 @@ _p1_mtime() {
   stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
 }
 
-# _p1_newest_source_epoch <path> -> epoch on stdout; empty if git cannot answer.
-_p1_newest_source_epoch() {
-  local path="$1" newest t f
-  newest="$(git log -1 --format=%ct -- "$path" 2>/dev/null)"
-  [ -n "$newest" ] || return 1
+# _p1_newest_dirty_epoch <path> -> newest mtime among DIRTY files under <path>; EMPTY if none.
+#
+# Replaces `_p1_newest_source_epoch`, which took the newest of (last commit touching <path>, mtime of
+# anything dirty under it) so that an image's `.Created` could be compared against it. The commit
+# half is now answered by the tag — `dev-<HEAD-sha>` states the commit outright, which no comparison
+# of two clocks can improve on — so what is left is the part a commit cannot speak for. Empty is a
+# meaningful return here and not a failure: it means every build input is committed.
+_p1_newest_dirty_epoch() {
+  local path="$1" newest="" t f
   while IFS= read -r f; do
     [ -n "$f" ] && [ -f "$f" ] || continue
     t="$(_p1_mtime "$f")"
-    [ -n "$t" ] && [ "$t" -gt "$newest" ] && newest="$t"
+    [ -n "$t" ] || continue
+    if [ -z "$newest" ] || [ "$t" -gt "$newest" ]; then newest="$t"; fi
   done <<EOF
 $(git status --porcelain --untracked-files=all -- "$path" 2>/dev/null | cut -c4-)
 EOF
   echo "$newest"
 }
 
-# _p1_assert_image_is_current <image> -> 0 fresh, 1 stale, 3 undecidable (all print their reason).
-_p1_assert_image_is_current() {
-  local image="$1" inputs created img_epoch src_epoch
+# _p1_repo_path <image-reference> -> the registry path with any digest and any tag removed.
+# The tag comes off the LAST segment only, because a registry host may legitimately carry a port.
+_p1_repo_path() {
+  local ref="${1%%@*}"
+  case "${ref##*/}" in
+    *:*) ref="${ref%:*}" ;;
+  esac
+  echo "$ref"
+}
+
+# _p1_registry_tags <repo-path> <sha256:digest> -> every tag that digest carries, space separated.
+#
+# The filter key is `version`, not `digest`. `--filter=digest=...` matches no field on this resource:
+# gcloud prints "the following filter keys were not present in any resource" to STDERR and exits 0
+# with empty stdout, which is byte-for-byte what "that digest is not in this registry" looks like.
+# `describe` is not an option either — it returns digest, registry, repository and an SLSA level,
+# and no tags at all. The project and location come from the URI, not from the active gcloud config.
+_p1_registry_tags() {
+  gcloud artifacts docker images list "$1" --include-tags \
+    --filter="version=$2" --format='value(tags)' 2>/dev/null |
+    tr ',\n' '  ' | tr -s ' ' | sed 's/^ *//; s/ *$//'
+}
+
+# Abbreviated shas compared as prefixes, in both directions. `git rev-parse --short` picks a length
+# that grows with the object count, so the tag written at build time and the sha computed now can
+# legitimately differ in length while naming the same commit — and a length-sensitive comparison
+# would report that as "the cluster runs a different commit", which is a false accusation of exactly
+# the kind that teaches people to skip this check.
+_p1_sha_eq() {
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  case "$1" in "$2"*) return 0 ;; esac
+  case "$2" in "$1"*) return 0 ;; esac
+  return 1
+}
+
+# _p1_assert_tag_is_current <image> <tags> -> 0 fresh, 1 stale, 3 undecidable (all print a reason).
+_p1_assert_tag_is_current() {
+  local image="$1" tags="$2"
+  local inputs head_sha t rest sha epoch cand="" cand_sha="" cand_epoch="" dirty
+
   if ! inputs="$(_p1_build_inputs "$image")"; then
-    echo "  P1 freshness UNVERIFIED: no build-input mapping for '$image'. The digest matched, so the"
-    echo "    cluster runs your local copy — but nothing here can tell whether that copy predates the"
-    echo "    source. Add the image to _p1_build_inputs in $(basename "${BASH_SOURCE[0]}")."
+    echo "  P1 freshness UNVERIFIED: no build-input mapping for '$image'. The digest resolved, so the"
+    echo "    cluster runs an image from your registry — but nothing here can tell whether that image"
+    echo "    predates the source. Add it to _p1_build_inputs in $(basename "${BASH_SOURCE[0]}")."
     return 3
   fi
-  created="$(docker image inspect "$image" --format '{{.Created}}' 2>/dev/null)"
-  img_epoch="$(python3 -c 'import sys,re,datetime
-s=re.sub(r"\.\d+","",sys.argv[1])
-print(int(datetime.datetime.fromisoformat(s).timestamp()))' "$created" 2>/dev/null)"
-  src_epoch="$(_p1_newest_source_epoch "$inputs")"
-  if [ -z "$img_epoch" ] || [ -z "$src_epoch" ]; then
-    echo "  P1 freshness UNVERIFIED: could not read the image's creation time or git's newest change"
-    echo "    to $inputs (image='$created' src='$src_epoch'). Not a pass."
+  head_sha="$(git rev-parse --short HEAD 2>/dev/null)"
+  if [ -z "$head_sha" ]; then
+    echo "  P1 freshness UNVERIFIED: git cannot name HEAD from $PWD, so there is no commit to compare"
+    echo "    the deployed tag against. Not a pass."
     return 3
   fi
-  if [ "$img_epoch" -ge "$src_epoch" ]; then
+
+  # Pick the commit-carrying tag, preferring one that names HEAD. A digest usually carries several
+  # tags -- `buildcache` from the cache write, `dev-<sha>` from reload-images.sh, `src-<sha>` from
+  # `make cloud-build-push` -- and only some of them say anything about provenance.
+  for t in $tags; do
+    case "$t" in
+      dev-* | src-*) : ;;
+      *) continue ;;
+    esac
+    rest="${t#*-}"
+    sha="${rest%%-*}"
+    case "$rest" in *-dirty-*) epoch="${rest##*-dirty-}" ;; *) epoch="" ;; esac
+    if [ -z "$cand" ] || _p1_sha_eq "$sha" "$head_sha"; then
+      cand="$t" cand_sha="$sha" cand_epoch="$epoch"
+    fi
+    _p1_sha_eq "$sha" "$head_sha" && break
+  done
+
+  if [ -z "$cand" ]; then
+    echo "  P1 freshness UNVERIFIED: the running digest carries no commit-carrying tag (has: ${tags:-none})."
+    echo "    Only dev-<sha> and src-<sha> record which commit a build came from, so provenance cannot"
+    echo "    be read off this image. Not a pass — rebuild through dev/cluster/reload-images.sh."
+    return 3
+  fi
+  if ! _p1_sha_eq "$cand_sha" "$head_sha"; then
+    echo "P1 FAILED: the cluster runs a build of a DIFFERENT COMMIT."
+    echo "    deployed:  $cand  (commit $cand_sha)"
+    echo "    this tree: $head_sha"
+    echo "  The digest matches an image in your registry; it is an image of code that is no longer"
+    echo "  what you are testing. This is LSN-001 in its actual recurrence mode — the gate was run,"
+    echo "  the rebuild was not. Fix, do not skip:"
+    echo "      dev/cluster/reload-images.sh operator <kube-context>"
+    return 1
+  fi
+
+  # The commit matches. What a commit cannot account for is an uncommitted edit to the build inputs,
+  # so the dirty half is judged against the epoch the builder stamped into the tag.
+  dirty="$(_p1_newest_dirty_epoch "$inputs")"
+  if [ -z "$dirty" ]; then
     return 0
   fi
-  echo "P1 FAILED: the image is the one the cluster runs, and it is OLDER THAN THE SOURCE."
-  echo "    image built:  $(date -r "$img_epoch" 2>/dev/null || echo "$img_epoch")  ($image)"
-  echo "    $inputs last changed: $(date -r "$src_epoch" 2>/dev/null || echo "$src_epoch")"
-  echo "  The digest matches because you are running your own build; it is a build of code that is"
-  echo "  no longer in the tree. This is LSN-001 in its actual recurrence mode — the gate was run,"
-  echo "  the rebuild was not. Fix, do not skip:"
+  if [ -z "$cand_epoch" ]; then
+    echo "P1 FAILED: the deployed image is a clean build of $cand_sha, and $inputs has UNCOMMITTED"
+    echo "  changes that are not in it (newest edit $(date -r "$dirty" 2>/dev/null || echo "$dirty"))."
+    echo "  The commit is right and the code under test is not. Rebuild:"
+    echo "      dev/cluster/reload-images.sh operator <kube-context>"
+    return 1
+  fi
+  if [ "$cand_epoch" -ge "$dirty" ]; then
+    return 0
+  fi
+  echo "P1 FAILED: the deployed image was built from a dirty tree BEFORE the newest edit under $inputs."
+  echo "    image built: $(date -r "$cand_epoch" 2>/dev/null || echo "$cand_epoch")  ($cand)"
+  echo "    last edited: $(date -r "$dirty" 2>/dev/null || echo "$dirty")"
+  echo "  Rebuild, do not skip:"
   echo "      dev/cluster/reload-images.sh operator <kube-context>"
   return 1
 }
@@ -113,15 +214,15 @@ print(int(datetime.datetime.fromisoformat(s).timestamp()))' "$created" 2>/dev/nu
 # p1_assert_build_under_test <kubectl-cmd> <namespace> <label-selector> [container-index]
 #
 # THE IDENTITY THIS RELIES ON, stated because it is the part that could silently stop being true:
-# for an image side-loaded with `kind load docker-image`, the pod's
-# `status.containerStatuses[].imageID` digest equals `docker image inspect --format '{{.Id}}'` of the
-# local image -- containerd records the image CONFIG digest, which is what docker calls .Id. Verified
-# on kind-kube-agents-dev: running ee4699b1... == local ee4699b1... For an image PULLED from a
-# registry, imageID is instead `repo@sha256:<manifest digest>`, which .Id does not match; that case
-# falls back to RepoDigests, and to state 3 if the host has never seen the image at all.
+# for an image PULLED from a registry, containerd records `status.containerStatuses[].imageID` as
+# `<repo>@sha256:<manifest digest>` -- the same digest Artifact Registry indexes the image under, so
+# the pod's own report and the registry's record are directly comparable with no third party in
+# between. (The old side-loaded identity, imageID == `docker image inspect --format '{{.Id}}'`, held
+# only for `kind load` and is gone with it.) A container that reports no manifest digest falls back
+# to the digest PINNED IN THE POD SPEC, and to state 3 if there is no digest anywhere.
 p1_assert_build_under_test() {
   local K="$1" ns="$2" sel="$3" idx="${4:-0}"
-  local running spec_image local_id pod
+  local running spec_image pod
 
   # The NEWEST Running pod, not `.items[0]`. Measured 2026-07-25: immediately after a `rollout
   # status` reported success, items[0] was the previous revision's pod, still Terminating and still
@@ -151,62 +252,121 @@ p1_assert_build_under_test() {
     return 3
   fi
 
-  local running_digest="${running##*@}"
-  running_digest="${running_digest#sha256:}"
-
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "P1 UNVERIFIABLE: no docker on this host, so the build under test has no local identity"
-    echo "  to compare against. running=${running_digest:0:12} image=$spec_image"
+  # The digest, and where it is allowed to come from. The container's own report is authoritative and
+  # is used whenever it carries one. The fallback to the SPEC's digest is not a softening: a digest
+  # reference is unresolvable to anything else, so a kubelet given one either pulled that exact
+  # manifest or failed to start the container -- and this code only runs for a pod that is Running.
+  # That is the whole argument for deploying by digest rather than by tag, stated as code.
+  local digest="" digest_src="the running container"
+  case "$running" in *@sha256:*) digest="sha256:${running##*@sha256:}" ;; esac
+  if [ -z "$digest" ]; then
+    case "$spec_image" in
+      *@sha256:*)
+        digest="sha256:${spec_image##*@sha256:}"
+        digest_src="the pod spec's digest pin"
+        ;;
+    esac
+  fi
+  if [ -z "$digest" ]; then
+    echo "P1 UNVERIFIABLE: neither the running container nor the pod spec names a manifest digest"
+    echo "  (running='$running' spec='$spec_image'), so there is nothing to look up. Not a pass."
+    echo "  Deploy by digest: dev/cluster/reload-images.sh operator <kube-context>"
     return 3
   fi
 
-  local_id="$(docker image inspect "$spec_image" --format '{{.Id}}' 2>/dev/null)"
-  local_id="${local_id#sha256:}"
-
-  if [ -z "$local_id" ]; then
-    echo "P1 UNVERIFIABLE: '$spec_image' is not present in this host's docker images, so there is"
-    echo "  no local build to compare the running one to. This is the honest answer for an image"
-    echo "  pulled from a registry; it is NOT evidence that the cluster runs the current code."
-    echo "  running=${running_digest:0:12}"
-    return 3
-  fi
-
-  if [ "$running_digest" = "$local_id" ]; then
-    # The digest half is satisfied. It is only half: see _p1_assert_image_is_current above.
-    _p1_assert_image_is_current "$spec_image"
-    local fresh=$?
-    [ "$fresh" -eq 1 ] && return 1
-    echo "P1 ok: running ${running_digest:0:12} == local build of $spec_image$(
-      [ "$fresh" -eq 0 ] && echo ", built from the current source"
-    )"
-    [ "$fresh" -eq 3 ] && return 3
-    return 0
-  fi
-
-  # The image exists locally and differs. Before calling it a mismatch, check the manifest digests --
-  # a pulled image legitimately reports a different digest kind, and reporting that as "stale bits"
-  # would be a false accusation that trains everyone to ignore this check.
-  local repo_digests
-  repo_digests="$(docker image inspect "$spec_image" --format '{{join .RepoDigests " "}}' 2>/dev/null)"
-  case " $repo_digests " in
-    *"@sha256:$running_digest"*)
-      _p1_assert_image_is_current "$spec_image"
-      local fresh=$?
-      [ "$fresh" -eq 1 ] && return 1
-      echo "P1 ok: running ${running_digest:0:12} matches a RepoDigest of $spec_image"
-      [ "$fresh" -eq 3 ] && return 3
-      return 0
+  local repo
+  repo="$(_p1_repo_path "$spec_image")"
+  case "$repo" in
+    *.pkg.dev/*) : ;;
+    *)
+      # Not a finding about bits, a finding about provenance: nothing built from this tree is
+      # published anywhere but Artifact Registry, so an image from elsewhere is the UPSTREAM build.
+      # That is the plainest possible form of LSN-001 -- the suite would be measuring somebody
+      # else's binary -- and it is a failure, not a skip.
+      echo "P1 FAILED: the cluster is not running an image built from this tree."
+      echo "    deployed: $spec_image"
+      echo "  This tree publishes only to Artifact Registry (*.pkg.dev). Anything else is the"
+      echo "  upstream published image, so every result below would describe code you did not build."
+      echo "      dev/cluster/reload-images.sh operator <kube-context>"
+      return 1
       ;;
   esac
 
-  echo "P1 FAILED: the cluster is NOT running the build under test."
-  echo "    running:     ${running_digest:0:12}  (from $running)"
-  echo "    local build: ${local_id:0:12}  ($spec_image)"
-  echo "  Every result below this line describes different code. This is LSN-001, which has already"
-  echo "  recurred three times. Fix, do not skip:"
-  echo "      make -C k8s-operator docker-build && kind load docker-image $spec_image --name <cluster>"
-  echo "      kubectl -n $ns rollout restart deploy && kubectl -n $ns rollout status deploy"
-  return 1
+  if ! command -v gcloud >/dev/null 2>&1; then
+    echo "P1 UNVERIFIABLE: no gcloud on this host, so the registry cannot be asked what ${digest:7:12}"
+    echo "  is. Not a pass. image=$spec_image"
+    return 3
+  fi
+
+  local tags
+  tags="$(_p1_registry_tags "$repo" "$digest")"
+  if [ -z "$tags" ]; then
+    # The digest came out of the cluster, so this is not "the image is missing" -- it is "the
+    # registry the cluster pulled from will not confirm it to me". Credentials, network, or a
+    # repository this account cannot read. All three are could-not-look, none is evidence.
+    echo "P1 UNVERIFIABLE: $repo has no record of ${digest:0:19}..., so the registry cannot confirm"
+    echo "  what the cluster is running. Check credentials and the repository path. Not a pass."
+    return 3
+  fi
+
+  # The identity half is satisfied: the running manifest is one the registry holds under this repo.
+  # It is only half -- see _p1_assert_tag_is_current above.
+  _p1_assert_tag_is_current "$spec_image" "$tags"
+  local fresh=$?
+  [ "$fresh" -eq 1 ] && return 1
+  echo "P1 ok: $repo @ ${digest:7:12} (per $digest_src), tagged '$tags'$(
+    [ "$fresh" -eq 0 ] && echo " — built from the current source"
+  )"
+  [ "$fresh" -eq 3 ] && return 3
+  return 0
+}
+
+# --- P4 ------------------------------------------------------------------------------------------
+# p4_assert_enforcing_dataplane <kubectl-cmd>
+#
+# Sets $P4_DATAPLANE to the dataplane's name. rc 0 = it is known to ENFORCE NetworkPolicy · rc 3 =
+# it is not known to, so any network claim here is deferred. Never rc 1: a cluster whose CNI ignores
+# NetworkPolicy has not failed a security property, it cannot host the experiment (the P10 rule,
+# applied one layer down), and "egress default-deny does not hold" is a sentence someone acts on.
+#
+# AN ALLOW-LIST OF KNOWN-ENFORCING DATAPLANES, not a deny-list of known-broken ones. LSN-006: kindnet
+# ACCEPTS a NetworkPolicy object, stores it, returns 201, and enforces nothing — so every green from
+# a network check on kindnet was a statement about the API server's willingness to persist YAML. The
+# deny-list shape (`if kindnet then defer`) gets that case right and gets the NEXT unrecognised
+# dataplane wrong in the direction that produces a false green, which is the only direction that
+# matters. Anything not named here is deferred, including things that would in fact have enforced;
+# a spurious deferral costs a line in the ledger, a spurious pass costs the credibility of the suite.
+#
+# This lived in tenant-isolation-l2.sh, where it was the only correct copy, while egress-enforcement
+# (both the L2 script and the L1 test) hard-required `ds/calico-node` and would have deferred on a
+# GKE Dataplane V2 cluster that enforces perfectly. One definition site, per V-MET-013.
+
+# The function's second return value. A shell function has one exit code and P4 spends it on the
+# 0/3 verdict, so the NAME of the dataplane travels in a global. tenant-isolation-l2.sh prints it
+# and needs it separately from the rc; folding it into the exit code would mean numbering CNIs.
+# shellcheck disable=SC2034  # assigned here, read by callers of the library.
+P4_DATAPLANE=""
+
+p4_assert_enforcing_dataplane() {
+  local K="$1" probe seen
+  # GKE's Dataplane V2 ships Cilium under the name `anetd`; upstream Cilium keeps its own. Both are
+  # eBPF NetworkPolicy enforcement, and the DaemonSet name is the only thing that differs.
+  for probe in calico-node:calico anetd:dataplane-v2 cilium:cilium; do
+    if $K -n kube-system get daemonset "${probe%%:*}" >/dev/null 2>&1; then
+      P4_DATAPLANE="${probe##*:}"
+      return 0
+    fi
+  done
+  seen="$($K -n kube-system get ds -o jsonpath='{range .items[*]}{.metadata.name} {end}' 2>/dev/null)"
+  # shellcheck disable=SC2034  # see the declaration above: read by callers, not by this library.
+  P4_DATAPLANE="unknown"
+  echo "DEFERRED (P4): no dataplane that is KNOWN to enforce NetworkPolicy."
+  echo "  looked for: calico-node · anetd (GKE Dataplane V2) · cilium"
+  echo "  kube-system has: ${seen:-<nothing readable>}"
+  echo "  A NetworkPolicy applies cleanly on a CNI that ignores it entirely (LSN-006), so a pass here"
+  echo "  would be evidence about the API server and not about the network. Bring up a cluster with"
+  echo "  an enforcing dataplane: dev/cluster/up.sh"
+  return 3
 }
 
 # --- P3 ------------------------------------------------------------------------------------------
