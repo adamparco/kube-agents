@@ -24,7 +24,10 @@ set -euo pipefail
 
 N="${1:-}"
 CLUSTER="${CLUSTER:-kube-agents-dev}"
-PROJECT_ID="${PROJECT_ID:-$(gcloud config get core/project 2>/dev/null)}"
+PROJECT_ID="${PROJECT_ID:-}"
+# Not `${PROJECT_ID:-$(gcloud ...)}`: under `set -e` a failing substitution in an assignment
+# aborts here, with gcloud's exit code and no message, instead of reaching the check below.
+[ -n "$PROJECT_ID" ] || PROJECT_ID="$(gcloud config get core/project 2>/dev/null)" || PROJECT_ID=""
 ZONE="${ZONE:-us-east4-a}"
 CTX="gke-scratch-$CLUSTER"
 

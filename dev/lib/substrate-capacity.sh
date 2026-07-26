@@ -28,12 +28,29 @@
 #   taught it: a quota check that passes says nothing about IAM, and reads as "the project is fine".
 #   Hence the closing note in each entry point: it says what it checked AND what it did not.
 #
+# EVERY PROBE READ IS `x="$(...)" || x=""`, AND THAT IS LOAD-BEARING
+#   Each check below has a "could not read it — proceed, and here is what to read INSTEAD if the
+#   create fails" branch, which is the whole LSN-027 idea: never let an unmeasurable resource send
+#   you to the wrong layer. Under a caller running `set -euo pipefail` — which up.sh does, and
+#   should — a bare `x="$(cmd | head -1)"` whose command fails does not reach that branch: the
+#   assignment fails, `set -e` kills the CALLER, and the exit status is the tool's. Found on the
+#   first real run, 2026-07-26: `gcloud compute regions describe` was called with a flag it does
+#   not accept, and up.sh exited 2 having printed nothing at all after the APIs line. A preflight
+#   that dies silently is strictly worse than no preflight, because the reader now has a script to
+#   debug on top of whatever they came for. So every probe is written with the `|| x=""` escape,
+#   which makes the assignment a compound command that `set -e` does not act on and routes the
+#   failure into the branch written for it.
+#
 # Usage (source it):
 #   . "$(dirname "$0")/../lib/substrate-capacity.sh"
 #   assert_project_capacity         # prints its findings; exits 2 if the project cannot hold one
 
 # --- knobs, remote substrate ---------------------------------------------------------------------
-CAP_PROJECT_ID="${PROJECT_ID:-$(gcloud config get core/project 2>/dev/null)}"
+# Two lines rather than `${PROJECT_ID:-$(gcloud ...)}` for the reason in the header: the fallback
+# only runs when PROJECT_ID is unset, which is exactly the case _check_project was written to
+# refuse — and a bare substitution there kills the sourcing script before it can say so.
+CAP_PROJECT_ID="${PROJECT_ID:-}"
+[ -n "$CAP_PROJECT_ID" ] || CAP_PROJECT_ID="$(gcloud config get core/project 2>/dev/null)" || CAP_PROJECT_ID=""
 CAP_REGION="${REGION:-us-east4}"
 CAP_AR_REPO="${AR_REPO:-kube-agents}"
 # 2 x e2-standard-4. Stated as vCPU rather than as a machine type because CPUS is the quota that is
@@ -68,7 +85,7 @@ EOF
 _check_apis() {
   local enabled missing="" api
   enabled="$(gcloud services list --enabled --project "$CAP_PROJECT_ID" \
-    --format='value(config.name)' 2>/dev/null)"
+    --format='value(config.name)' 2>/dev/null)" || enabled=""
   if [ -z "$enabled" ]; then
     echo "   APIs: could not list enabled services — proceeding, but if cluster creation fails with"
     echo "   an access error, read 'gcloud services list --enabled' before reading IAM."
@@ -98,11 +115,14 @@ EOF
 # reports 0 nodes — a shape that looks like a broken script rather than a full region.
 _check_quota() {
   local line limit usage free
+  # `--filter` is not a flag `compute regions describe` accepts (it is a LIST flag), so the metric
+  # is selected here rather than server-side. That was the first-run defect: gcloud exited 2, the
+  # command substitution took the caller down with it, and nothing was printed.
   line="$(gcloud compute regions describe "$CAP_REGION" --project "$CAP_PROJECT_ID" \
-    --flatten='quotas[]' --filter='quotas.metric=CPUS' \
-    --format='value(quotas.limit,quotas.usage)' 2>/dev/null | head -1)"
-  limit="$(printf '%s' "$line" | awk '{printf "%d", $1}')"
-  usage="$(printf '%s' "$line" | awk '{printf "%d", $2}')"
+    --flatten='quotas[]' --format='value(quotas.metric,quotas.limit,quotas.usage)' 2>/dev/null |
+    awk '$1 == "CPUS" {print $2, $3; exit}')" || line=""
+  limit="$(printf '%s' "$line" | awk '{printf "%d", $1}')" || limit=0
+  usage="$(printf '%s' "$line" | awk '{printf "%d", $2}')" || usage=0
   if [ -z "$line" ] || [ "${limit:-0}" -le 0 ]; then
     echo "   quota: could not read CPUS for $CAP_REGION — proceeding, but if the node pool never"
     echo "   materialises, read 'gcloud container operations list' rather than the cluster."
