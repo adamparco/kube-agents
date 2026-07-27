@@ -7272,6 +7272,111 @@ spec:
                             "!has(self.enabled) || self.enabled == false || (has(self.allowedUsers)
                             && self.allowedUsers.exists(u, u.trim().size() > 0))"
                   type: object
+                operations:
+                  description: |-
+                    Operations carries the operational brakes and caps (06 §1.1). Schema only in Phase 8 — the
+                    admission rules V-6 (a paused parent may not provision) and V-8 (no leaf above its code
+                    ceiling) are what read it today.
+                  properties:
+                    initiativeBudget:
+                      description:
+                        InitiativeBudget caps self-initiated and human-requested
+                        work per risk class (06 §1.1).
+                      properties:
+                        flapThreshold:
+                          description: |-
+                            FlapThreshold is how many repeats of the same (target, intent) within FlapWindow trip the
+                            flap brake. Default 3, code ceiling 5.
+                          format: int32
+                          type: integer
+                        flapWindow:
+                          description: |-
+                            FlapWindow is the window in which repeats of the same (target, intent) count towards
+                            FlapThreshold. Default 30m, code FLOOR 5m — this is the one leaf where a SMALLER value is the
+                            dangerous direction, because a short window lets a flapping agent reset its own counter.
+                          type: string
+                        humanRequested:
+                          description: |-
+                            HumanRequested caps actions a human asked for: trigger.source ∈ {chat, undo} (06 §1.1).
+                            Deliberately a separate, larger allowance — a human in the loop is itself a control.
+                          properties:
+                            actionsPerDay:
+                              description:
+                                ActionsPerDay caps all classes together per
+                                rolling 24h.
+                              format: int32
+                              type: integer
+                            elevatedPerHour:
+                              description: |-
+                                ElevatedPerHour caps `elevated` actions per rolling hour — deliberately an order of magnitude
+                                tighter than routine.
+                              format: int32
+                              type: integer
+                            gatedPerHour:
+                              description: |-
+                                GatedPerHour caps `gated` SUBMISSIONS per rolling hour. Approval consumes nothing: a human is
+                                already in the loop, so charging the approval too would penalise the safest path.
+                              format: int32
+                              type: integer
+                            routinePerHour:
+                              description:
+                                RoutinePerHour caps `routine` actions per
+                                rolling hour.
+                              format: int32
+                              type: integer
+                          type: object
+                        maxObjectsPerAction:
+                          description: |-
+                            MaxObjectsPerAction is the per-envelope object cap. Default 25, code ceiling 50 — 50 is where
+                            the code floor gates regardless (06 §4.2), so a higher value is meaningless and is rejected
+                            rather than accepted-and-ignored.
+                          format: int32
+                          type: integer
+                        selfInitiated:
+                          description: |-
+                            SelfInitiated caps actions the agent started itself: trigger.source ∈
+                            {watch, alert, cron, delegation, escalation} (06 §1.1).
+                          properties:
+                            actionsPerDay:
+                              description:
+                                ActionsPerDay caps all classes together per
+                                rolling 24h.
+                              format: int32
+                              type: integer
+                            elevatedPerHour:
+                              description: |-
+                                ElevatedPerHour caps `elevated` actions per rolling hour — deliberately an order of magnitude
+                                tighter than routine.
+                              format: int32
+                              type: integer
+                            gatedPerHour:
+                              description: |-
+                                GatedPerHour caps `gated` SUBMISSIONS per rolling hour. Approval consumes nothing: a human is
+                                already in the loop, so charging the approval too would penalise the safest path.
+                              format: int32
+                              type: integer
+                            routinePerHour:
+                              description:
+                                RoutinePerHour caps `routine` actions per
+                                rolling hour.
+                              format: int32
+                              type: integer
+                          type: object
+                      type: object
+                    pauseReason:
+                      description: |-
+                        PauseReason is free text set alongside Paused and surfaced in chat and status. Bounded because
+                        it is operator-supplied and echoed into messages.
+                      maxLength: 512
+                      type: string
+                    paused:
+                      default: false
+                      description: |-
+                        Paused is THE BRAKE (03 §6). When true the broker refuses new envelopes for this agent — and,
+                        per 06 §1.2 V-6, a paused agent may not act as a PARENT either: provisioning a child is an
+                        action, so the brake covers it.
+                      type: boolean
+                  type: object
                 parentRef:
                   description:
                     ParentRef links a non-platform agent to its parent (06

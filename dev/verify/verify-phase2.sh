@@ -52,6 +52,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 K="kubectl --context $CTX"
 NS=kubeagents-system
 AGENT=examples/gitops-repo/clusters/cluster-a/agents/agent.yaml
+# The cluster-admin CR above is a CHILD (`parentRef: platform-agent`), and since P8-T9 the webhook
+# refuses a child whose parent it cannot read (06 §1.2 V-6). Seeded from the shipped fleet manifest —
+# see dev/lib/parent-chain.sh for why that is setup and not laundering.
+PARENT=examples/gitops-repo/fleet/platform-agent.yaml
 IDENTITY=examples/gitops-repo/clusters/cluster-a/agents/identity/cluster-admin-identity.yaml
 VAP=examples/gitops-repo/policy/vap-agent-readonly.yaml
 
@@ -67,6 +71,7 @@ cd "$REPO_ROOT"
 # P1 and P3 are executed here, not described. Both were prose in binding.md for four phases and both
 # recurred anyway; the declaration block above is only honest because these two calls exist.
 . "$REPO_ROOT/dev/lib/preconditions.sh"
+. "$REPO_ROOT/dev/lib/parent-chain.sh"
 
 # P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
 # three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
@@ -121,11 +126,30 @@ esac
 # Placed after P1 and before the first apply, so it is armed for every exit path below, including a
 # `bad` that halts mid-suite. No assertion is weakened: the trap runs strictly after the last read,
 # and :127 still asserts the ghcr tag string on the rendered pod exactly as before.
+#
+# The seeded parent (below) is cleaned up on the same path and for the same reason: it is this run's
+# object, it exists only so the child can be submitted at all, and leaving it behind would make the
+# NEXT run's V-6 pass for a reason that run did not establish.
+SEEDED=()
 cleanup() {
   $K -n "$NS" delete agent cluster-admin-cluster-a cluster-admin-cluster-a-dup \
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  unseed_parent_agents "$K" "${SEEDED[@]:-}"
 }
 trap cleanup EXIT
+
+# --- setup: the parent the cluster-admin CR names (06 §1.2 V-6) --------------------------------
+# NOT a check. `cluster-admin-cluster-a` carries `parentRef: platform-agent`, and since P8-T9 a child
+# whose parent cannot be read is REJECTED, because an unverifiable ceiling is not a satisfied one.
+# Without this, V-K9's admission and both halves of V-K1 below fail on a NotFound parent while still
+# printing "cardinality" — a check reporting on something other than what it claims.
+echo; echo "== setup: parent Agent for the cluster-admin child (06 §1.2 V-6) =="
+if ref="$(seed_parent_agent "$K" "$PARENT")"; then
+  SEEDED+=("$ref")
+  echo "  seeded $ref from $PARENT (scaleToZero; removed on exit)"
+else
+  bad "could not seed the parent Agent, so V-K9/V-K1 below would fail on a NotFound parent rather than on what they test: $ref"
+fi
 
 # --- V-K9 (out-of-order half): Agent CR before CRD would fail (proved on fresh cluster). --------
 # Here the CRD exists, so instead prove identity-before-pod: apply identity + CR in order.

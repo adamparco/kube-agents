@@ -57,3 +57,10 @@ bash dev/verify/tenant-isolation-l2.sh gke-scratch-kube-agents-dev
 bash dev/verify/closed-allowlist-l2.sh gke-scratch-kube-agents-dev
 bash dev/verify/gitops-tree-applies-l2.sh gke-scratch-kube-agents-dev
 bash dev/verify/multi-agent-namespace-l2.sh gke-scratch-kube-agents-dev
+
+# V-CTR-002 in full: one REJECTED fixture for each of 06 §1.2's V-1…V-10, every rejection asserted to
+# name its own field path. closed-allowlist-l2.sh above is the deep-dive on one of those rules (V-7);
+# this is the roll call, so a rule that stops being enforced shows up as a missing line rather than
+# as nothing at all. It runs LAST because it is the only Phase 8 script that persists an Agent, and
+# running it after the others means its fixtures cannot be mistaken for their scenery.
+bash dev/verify/webhook-negatives-l2.sh gke-scratch-kube-agents-dev

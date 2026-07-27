@@ -33,9 +33,11 @@
 # recurred against scripts whose authors believed the preconditions held.
 #   P1 image-under-test:  none — this is a server-side dry-run of shipped YAML against the API server's own validators.
 #      No first-party image participates; the operator is not even required to be installed.
-#   P3 admission-recreate: none — no admission property is claimed about a persisted object. Every apply is
-#      --dry-run=server, which runs admission in full and persists nothing, so there is no object
-#      that could have been grandfathered.
+#   P3 admission-recreate: every manifest UNDER TEST is applied with --dry-run=server, which runs admission in full
+#      and persists nothing, so no manifest this check judges can have been grandfathered. Section 1b
+#      does persist the tree's two parent Agents — see the long note there — but they are setup, not
+#      subjects: each is deleted and recreated by this script rather than reused, and the shipped
+#      files that declare them are still dry-run in the loop like every other file.
 #   P6 runtime-authoritative: examples/gitops-repo/ as shipped, plus the rendered egress policies. The tree IS the artifact
 #      under test here; there is no rendered layer above it.
 set -uo pipefail
@@ -68,6 +70,7 @@ fi
 # P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
 # three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
 . "$REPO/dev/lib/preconditions.sh"
+. "$REPO/dev/lib/parent-chain.sh"
 p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
 if ! $K get crd agents.kubeagents.x-k8s.io >/dev/null 2>&1; then
   echo "DEFERRED: the Agent CRD is not installed on '$CTX', so the Agent CRs in the tree would be"
@@ -85,6 +88,59 @@ for ns in kubeagents-system team-x; do
   $K create namespace "$ns" --dry-run=client -o yaml | $K apply -f - >/dev/null 2>&1
 done
 pass "target namespaces present"
+
+# --- 1b) the parent chain the tree's own Agent CRs declare ------------------------------------------
+# WHY THIS EXISTS. 06 §1.2 V-6 (the cross-object ceiling, implemented in P8-T9) resolves a child
+# Agent's `spec.parentRef.name` against a REAL object and refuses the child when the parent cannot be
+# read — an unverifiable ceiling is not a pass. That is the right rule, and it costs this check
+# something specific: `--dry-run=server` persists nothing, so a one-shot pass over the tree submits
+# `clusters/cluster-a/agents/agent.yaml` (a cluster-admin child) into a cluster where its parent
+# `platform-agent` has never existed, and V-6 correctly refuses it. The tree is not broken — a real
+# reconciler (Argo, Flux, provision_08) retries to convergence and lands parents first. A single
+# non-converging pass cannot, and `find | sort` makes it worse: `clusters/` sorts BEFORE `fleet/`, so
+# the children are submitted first even though the tree declares the chain correctly.
+#
+# So the chain is established as SETUP, for the same reason section 1 creates namespaces: a NotFound
+# parent would fail the child manifests for a reason that has nothing to do with V-CMP-003. Two
+# properties keep this from becoming a way to launder a failure:
+#
+#   1. The parents are DISCOVERED from the tree by tier, not from a path list maintained here. A path
+#      list is something I could quietly extend the next time this goes red; `grep '^  tier:'` is not.
+#   2. The parent files are still dry-run in the loop below like every other file. Persisting them
+#      here does not excuse them from the check — it makes them subjects twice.
+#
+# The apply/scaleToZero/cleanup mechanics live in dev/lib/parent-chain.sh, because this was the first
+# of FOUR suites V-6 sent looking for the same three lines (verify-phase2, verify-phase3 and
+# multi-agent-namespace-l2 followed within the hour). What stays here is the part that is specific to
+# this check: discovering the parents from the tree rather than from a list.
+echo
+echo "== 1b) parent Agents the tree's children reference (setup for 06 §1.2 V-6) =="
+
+PARENT_FILES=()
+for tier in platform cluster-admin; do # platform first: cluster-admin is itself a child
+  while IFS= read -r f; do
+    [ -n "$f" ] && PARENT_FILES+=("$f")
+  done < <(grep -rl '^kind: Agent$' "$TREE" --include='*.yaml' | xargs grep -l "^  tier: $tier\$" 2>/dev/null | sort)
+done
+
+seeded=() # entries are "<namespace>/<name>"
+seed_cleanup() { unseed_parent_agents "$K" "${seeded[@]:-}"; }
+trap seed_cleanup EXIT INT TERM
+
+for pf in "${PARENT_FILES[@]:-}"; do
+  [ -n "$pf" ] || continue
+  prel="${pf#"$REPO"/}"
+  if ref="$(seed_parent_agent "$K" "$pf")"; then
+    seeded+=("$ref")
+    pass "seeded parent $ref from $prel"
+  else
+    bad "could not seed parent from $prel, so its children cannot be judged: $ref"
+  fi
+done
+if [ "${#PARENT_FILES[@]:-0}" -eq 0 ]; then
+  bad "found no platform/cluster-admin Agent in $TREE — either the tree lost its parents or the"
+  bad "  tier discovery above stopped matching, and every child below would fail V-6 spuriously"
+fi
 
 # --- 2) the whole shipped tree, server-side ---------------------------------------------------------
 echo

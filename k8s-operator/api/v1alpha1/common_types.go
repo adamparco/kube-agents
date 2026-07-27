@@ -215,12 +215,101 @@ type ScopeSpec struct {
 }
 
 // ParentRefSpec links a non-platform agent to its parent agent (06 §1.2). It is required for
-// non-platform tiers. The cross-object checks (correct parent tier; child ⊆ parent attenuation
-// ceiling) are deferred to the hardening admission webhook (08 §5) — Phase 1 carries the field only.
+// non-platform tiers. The cross-object ceiling — correct parent tier and child scope ⊂ parent scope
+// — is enforced by the validating webhook as 06 §1.2 V-6 (P8-T9).
 type ParentRefSpec struct {
 	// Name is the parent Agent's name.
 	// +optional
 	Name string `json:"name,omitempty"`
+}
+
+// InitiativeBudgetSpec caps how much an agent may do on its own initiative, per origin and per risk
+// class (06 §1.1). Every leaf is a CAP, never a grant: the value is the lower of what is written
+// here and the code ceiling in the 06 §1.1 table, and a value ABOVE its ceiling is rejected at
+// admission by V-8 rather than silently clamped.
+//
+// Rejecting rather than clamping is the whole point of the rule. A clamp makes an operator who asked
+// for 500 elevated actions per hour believe they got them; the CR reads 500, the runtime enforces 10,
+// and the disagreement surfaces as an incident nobody can explain from the manifest. 06 §1.2 V-8 is
+// explicit that the leaf is "rejected, not silently clamped".
+//
+// The fields carry no authority on their own. Nothing in this phase reads them — the broker that
+// spends the budget arrives with the imperative model — but the CEILING has to exist before the
+// spender does, which is 07 §5's ordering constraint (machinery before authority) applied to the
+// budget itself.
+type InitiativeBudgetSpec struct {
+	// SelfInitiated caps actions the agent started itself: trigger.source ∈
+	// {watch, alert, cron, delegation, escalation} (06 §1.1).
+	// +optional
+	SelfInitiated *BudgetClassSpec `json:"selfInitiated,omitempty"`
+
+	// HumanRequested caps actions a human asked for: trigger.source ∈ {chat, undo} (06 §1.1).
+	// Deliberately a separate, larger allowance — a human in the loop is itself a control.
+	// +optional
+	HumanRequested *BudgetClassSpec `json:"humanRequested,omitempty"`
+
+	// MaxObjectsPerAction is the per-envelope object cap. Default 25, code ceiling 50 — 50 is where
+	// the code floor gates regardless (06 §4.2), so a higher value is meaningless and is rejected
+	// rather than accepted-and-ignored.
+	// +optional
+	MaxObjectsPerAction *int32 `json:"maxObjectsPerAction,omitempty"`
+
+	// FlapWindow is the window in which repeats of the same (target, intent) count towards
+	// FlapThreshold. Default 30m, code FLOOR 5m — this is the one leaf where a SMALLER value is the
+	// dangerous direction, because a short window lets a flapping agent reset its own counter.
+	// +optional
+	FlapWindow *metav1.Duration `json:"flapWindow,omitempty"`
+
+	// FlapThreshold is how many repeats of the same (target, intent) within FlapWindow trip the
+	// flap brake. Default 3, code ceiling 5.
+	// +optional
+	FlapThreshold *int32 `json:"flapThreshold,omitempty"`
+}
+
+// BudgetClassSpec is the per-risk-class allowance for one origin (06 §1.1). The same shape is used
+// for both self-initiated and human-requested work; only the ceilings differ, and those live in the
+// webhook rather than here because V-8 must name the offending leaf's field path in its rejection.
+type BudgetClassSpec struct {
+	// RoutinePerHour caps `routine` actions per rolling hour.
+	// +optional
+	RoutinePerHour *int32 `json:"routinePerHour,omitempty"`
+
+	// ElevatedPerHour caps `elevated` actions per rolling hour — deliberately an order of magnitude
+	// tighter than routine.
+	// +optional
+	ElevatedPerHour *int32 `json:"elevatedPerHour,omitempty"`
+
+	// GatedPerHour caps `gated` SUBMISSIONS per rolling hour. Approval consumes nothing: a human is
+	// already in the loop, so charging the approval too would penalise the safest path.
+	// +optional
+	GatedPerHour *int32 `json:"gatedPerHour,omitempty"`
+
+	// ActionsPerDay caps all classes together per rolling 24h.
+	// +optional
+	ActionsPerDay *int32 `json:"actionsPerDay,omitempty"`
+}
+
+// OperationsSpec carries the operational brakes and caps (06 §1.1). Phase 8 introduces the SCHEMA
+// only: no controller, broker, or agent reads these fields yet, and the CRD carrying them grants
+// nothing. It exists now because 06 §1.2 V-6 and V-8 are admission rules ABOUT these fields, and
+// 07 §5 requires the ceiling to be enforceable before anything can spend against it.
+type OperationsSpec struct {
+	// Paused is THE BRAKE (03 §6). When true the broker refuses new envelopes for this agent — and,
+	// per 06 §1.2 V-6, a paused agent may not act as a PARENT either: provisioning a child is an
+	// action, so the brake covers it.
+	// +kubebuilder:default=false
+	// +optional
+	Paused *bool `json:"paused,omitempty"`
+
+	// PauseReason is free text set alongside Paused and surfaced in chat and status. Bounded because
+	// it is operator-supplied and echoed into messages.
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	PauseReason string `json:"pauseReason,omitempty"`
+
+	// InitiativeBudget caps self-initiated and human-requested work per risk class (06 §1.1).
+	// +optional
+	InitiativeBudget *InitiativeBudgetSpec `json:"initiativeBudget,omitempty"`
 }
 
 // IACFormat selects the infrastructure-as-code artifact an agent authors when proposing a change.
@@ -259,6 +348,12 @@ type AgentSpec struct {
 	// ParentRef links a non-platform agent to its parent (06 §1.2). Required for non-platform tiers.
 	// +optional
 	ParentRef *ParentRefSpec `json:"parentRef,omitempty"`
+
+	// Operations carries the operational brakes and caps (06 §1.1). Schema only in Phase 8 — the
+	// admission rules V-6 (a paused parent may not provision) and V-8 (no leaf above its code
+	// ceiling) are what read it today.
+	// +optional
+	Operations *OperationsSpec `json:"operations,omitempty"`
 
 	// IAC selects the IaC artifact this agent authors when proposing changes via GitOps (06 §1.1, §4).
 	// +optional

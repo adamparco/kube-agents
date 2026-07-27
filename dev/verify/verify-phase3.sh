@@ -69,6 +69,14 @@ TEAMX=examples/gitops-repo/clusters/cluster-a/namespaces/team-x
 VAP=examples/gitops-repo/policy/vap-agent-readonly.yaml
 CR="$TEAMX/60-developer-team-agent.yaml"
 IDENTITY="$TEAMX/50-developer-team-identity.yaml"
+# The dev-team CR is the BOTTOM of a three-tier chain (`parentRef: cluster-admin-cluster-a`, which is
+# itself `parentRef: platform-agent`), and since P8-T9 the webhook refuses a child whose parent it
+# cannot read (06 §1.2 V-6). Both ancestors are seeded from their shipped manifests, platform first —
+# see dev/lib/parent-chain.sh for why that is setup and not laundering.
+PARENTS=(
+  examples/gitops-repo/fleet/platform-agent.yaml
+  examples/gitops-repo/clusters/cluster-a/agents/agent.yaml
+)
 
 case "$CTX" in
   gke-scratch-*) : ;;
@@ -81,6 +89,7 @@ bad()  { echo "FAIL: $1"; fail=1; }
 cd "$REPO_ROOT"
 # P1 and P3 are executed here, not described — the block above is only honest because of these calls.
 . "$REPO_ROOT/dev/lib/preconditions.sh"
+. "$REPO_ROOT/dev/lib/parent-chain.sh"
 
 # P10 (LSN-026), before any claim: can this cluster still RUN the experiment? Rationale and the
 # three false failures that bought it are at the definition site. rc 2 = could-not-run, never 1.
@@ -123,13 +132,33 @@ esac
 # that check degrades to a note instead of failing, which is the silent-skip shape LSN-021 is about.
 # The CR is a rendering of the operator under test and belongs to this run; the namespace scaffolding
 # is a cluster fixture and does not.
+#
+# The two seeded ancestors go with them, for the same reason: they are this run's objects, they exist
+# only so the dev-team CR can be submitted at all, and leaving them behind would make the NEXT run's
+# V-6 pass for a reason that run did not establish.
+SEEDED=()
 cleanup() {
   $K -n "$NSX" delete agent developer-team-team-x developer-team-team-x-dup \
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
   $K -n default delete agent developer-team-team-x \
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  unseed_parent_agents "$K" "${SEEDED[@]:-}"
 }
 trap cleanup EXIT
+
+# --- setup: the two ancestors the dev-team CR hangs beneath (06 §1.2 V-6) ----------------------
+# NOT a check. Applied platform-first, because the cluster-admin manifest is a child too and would be
+# refused on its own. Without this the three dev-team CRs below are all rejected on a NotFound parent
+# and P3-K1/K2/K4 report "placement" and "cardinality" failures that are nothing of the kind.
+echo; echo "== setup: parent chain for the dev-team child (06 §1.2 V-6) =="
+for pf in "${PARENTS[@]}"; do
+  if ref="$(seed_parent_agent "$K" "$pf")"; then
+    SEEDED+=("$ref")
+    echo "  seeded $ref from $pf (scaleToZero; removed on exit)"
+  else
+    bad "could not seed $pf, so P3-K1/K2/K4 below would fail on a NotFound parent rather than on what they test: $ref"
+  fi
+done
 
 # --- P3-K1: placement clause (A1) — apply namespace prereqs + identity, then CR ----------------
 # The egress netpol (30-) carries REPLACE_WITH_* CIDR placeholders (invalid CIDRs) so it is NOT
