@@ -281,6 +281,15 @@ provision gcp-provision: ## Bootstrap GCP, GKE resources, and deploy Agent.
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/provision.sh $(ARGS)
 
+# Build every image from the working tree and roll the live install in one command: the pipeline
+# above plus the image build it deliberately does not do (no provision_NN script builds anything --
+# they consume OPERATOR_IMAGE/ROUTER_IMAGE/AGENT_IMAGE+AGENT_TAG and deploy whatever those name).
+# Defined at the repo root because it drives `cloud-build-push`, which is a root target; reachable
+# from here too, since this is the directory the provisioner is normally run from.
+.PHONY: live-refresh
+live-refresh: ## Rebuild all seven images and roll the LIVE install (repo-root target; runs from here too).
+	@$(MAKE) -C .. live-refresh ARGS="$(ARGS)"
+
 .PHONY: teardown gcp-teardown
 teardown gcp-teardown: ## Clean up and delete all provisioned GCP and GKE resources.
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true

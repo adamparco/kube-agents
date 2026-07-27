@@ -97,6 +97,26 @@ make cloud-build-push TAG=my-experiment
 It prints the `AGENT_IMAGE` / `AGENT_TAG` / `OPERATOR_IMAGE` / `ROUTER_IMAGE` values to set in
 `k8s-operator/scripts/vars.sh` afterwards.
 
+## Refreshing a live install
+
+`make cloud-build-push` builds and pushes; it does not deploy, and no `provision_NN` script builds.
+`make live-refresh` is the one command that does both ends:
+
+```bash
+make live-refresh                    # build all seven, pin them, provision, verify by digest
+make live-refresh ARGS="--skip-build"  # the images already exist at this tag
+```
+
+It reads the target cluster from `k8s-operator/scripts/vars.sh` rather than prompting, prints the
+exact tag change, and requires the cluster name typed back before doing anything. Because the
+provisioning path is tag-based end to end, it deploys by tag and then **verifies by digest**: every
+tag is resolved against Artifact Registry before anything is pinned, and afterwards every running
+container's `imageID` is compared to those digests. A workload still on the old digest exits 5, which
+is a different failure from an image that never built (exit 4).
+
+It refuses a `gke-scratch-*` cluster. For the inner loop use `dev/cluster/reload-images.sh`, which
+deploys by digest directly and refuses everything that is _not_ `gke-scratch-*`.
+
 ## Local builds
 
 For development iteration, `make dev-rebuild-agent` (from `k8s-operator/`) is the fast path — it

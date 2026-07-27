@@ -146,6 +146,24 @@ make dev-rebuild-agent ARGS="platform"
   - Ensures the GCP Artifact Registry repository exists.
   - Builds and pushes the updated container image via Google Cloud Build. That is the only build path: the `--local` docker-build flag was removed and now exits non-zero, because it produced an arm64 image for amd64 nodes and the mismatch only surfaced later as an `exec format error` CrashLoopBackOff.
   - Automatically updates any running Custom Resources and rolling-restarts Kubernetes Deployments in GKE with the new image.
+  - **Platform tier only**, and it does not write the tag into `scripts/vars.sh` — so the next `provision_08` reverts it. Use it for iterating on prompts and skills, not for validating a release.
+
+#### Refreshing the whole live install
+
+`make live-refresh` is the single command for the outer loop. No `provision_NN` script builds an image — they consume `OPERATOR_IMAGE` / `ROUTER_IMAGE` / `AGENT_IMAGE` + `AGENT_TAG` and deploy whatever those name — so this wraps the build, the pin and the pipeline together:
+
+```bash
+make live-refresh                        # from here or from the repo root
+make live-refresh ARGS="--yes"           # skip the typed confirmation
+make live-refresh ARGS="--skip-build"    # images for this tag already exist
+```
+
+- **[live_refresh.sh](scripts/live_refresh.sh)**:
+  - Builds all seven first-party images on Cloud Build at `src-<sha>`, concurrently.
+  - Resolves every tag against Artifact Registry before pinning anything — a build exiting 0 is not the same fact as the tag existing in the registry the cluster pulls from.
+  - Writes the five image pins into `scripts/vars.sh`, then runs all 13 provisioning steps.
+  - Compares every running container's `imageID` to the digests it published, so the run can only report success if the cluster actually converged.
+  - Reads the target cluster from `scripts/vars.sh` and **requires the cluster name typed back**. It refuses `gke-scratch-*` — that is [`dev/cluster/reload-images.sh`](../dev/cluster/reload-images.sh)'s target, and that script refuses everything else.
 
 ---
 
@@ -574,6 +592,7 @@ The [Makefile](Makefile) provides several targets to automate development workfl
 | `make gcp-provision-12-agent-tiers`       | Step 12: Deploy the cluster-admin and developer-team Agent CRs.          |
 | `make gcp-provision-13-network-policies`  | Step 13: Apply per-tier egress allowlist + tenant default-deny floor.    |
 | `make dev-rebuild-agent`                  | Fast local iteration: rebuild and redeploy an agent image.               |
+| `make live-refresh`                       | Rebuild all seven images and roll the live install, verified by digest.  |
 | `make gcp-teardown-13-network-policies`   | Teardown Step 13: Remove agent egress and tenant default-deny policies.  |
 | `make gcp-teardown-12-agent-tiers`        | Teardown Step 12: Remove the cluster-admin and developer-team tiers.     |
 | `make gcp-teardown-11-inference-replay`   | Teardown Step 11: Undeploy Inference Replay proxy.                       |
