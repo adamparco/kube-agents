@@ -537,10 +537,37 @@ The three personas form a **cascade** that mirrors containment: each layer owns 
 layer beneath it, and now **executes** that lifecycle itself.
 
 ```
-Platform Agent  (1 / project)
-   └─ provisions & governs →  Cluster Admin Agent  (1 / cluster)
+Platform Agent  (1 / project)          ← installed; the only agent that is
+   └─ provisions & governs →  Cluster Admin Agent  (1 / cluster)      ← created WITH the cluster
                                  └─ provisions & governs →  Developer Team Agent  (1 / namespace)
+                                                                      ← created WITH the namespace
 ```
+
+**When a child is created: the moment its scope exists, and not before.** The fleet is not sized in
+advance and no tier is pre-provisioned. One Platform Agent is installed per project and is the root;
+every agent below it is created **on demand, as part of the same action that creates the scope it
+will manage**:
+
+| The parent creates…                                  | …and in the same journaled action creates       | Which then manages |
+| ---------------------------------------------------- | ----------------------------------------------- | ------------------ |
+| Platform Agent → a **cluster** in its project        | the **Cluster Admin Agent** for that cluster    | that one cluster   |
+| Cluster Admin Agent → a **namespace** in its cluster | the **Developer Team Agent** for that namespace | that one namespace |
+
+Provisioning the scope and provisioning its agent are **one** operation, not two steps that could be
+performed in either order or forgotten independently: a cluster is not finished until it has a
+Cluster Admin Agent, and a namespace is not finished until it has a Developer Team Agent. The
+consequences are worth stating plainly, because they are what the cardinalities in §1 actually mean:
+
+- **No scope without an agent.** A cluster with no `cluster-admin` agent, or a namespace with no
+  `developer-team` agent, is a defect the tier above detects on its proactive loop (§2.2) and
+  remediates by creating the missing agent — it is not a configuration someone forgot to fill in.
+- **No agent without a scope.** There is no `cluster-admin` agent for a cluster that does not exist
+  and no `developer-team` agent for a namespace that does not exist. Scope removal is what removes
+  the agent, and it is `gated` because it destroys an identity (below).
+- **The hierarchy is the creation order.** `parentRef` is not metadata added afterwards; it names
+  the agent that performed the creating, which is by construction exactly one tier up. This is why
+  the ceiling webhook can refuse a child whose parent it cannot read
+  ([06](06-api-and-data-contracts.md) §1.2 V-6) without that ever being a legitimate state.
 
 **How provisioning works now.** A parent submits **one Action Envelope** whose targets are the
 child's complete bundle, rendered from the **tier template** with only `(tier, scope, parentRef)` as
@@ -784,6 +811,13 @@ created by the imperative model.
 
 **Cascading provisioning (§6)**
 
+- **(new) Creation is coupled to the scope, both ways:** creating a cluster in the project yields a
+  `cluster-admin` agent for that cluster, and creating a namespace in a cluster yields a
+  `developer-team` agent for that namespace — each within the same journaled action, with no
+  separate step. In the reverse direction, no `cluster-admin` agent exists whose
+  `scope.clusterName` names no live cluster and no `developer-team` agent exists whose
+  `scope.namespace` names no live namespace. A scope that comes up unagented, or an agent that
+  outlives its scope, **fails**.
 - **(inverted) A parent provisions a child directly:** the Platform Agent creates a Cluster Admin
   Agent — CR + reader/actor identities + egress policy — in one journaled action, and the child
   reaches Ready. Replaces "the parent opens a PR".

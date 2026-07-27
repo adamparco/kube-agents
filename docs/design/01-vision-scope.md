@@ -116,6 +116,22 @@ more scope than it holds.** The concrete roles, boundaries, and relationships of
 personas are specified in [02-agent-personas.md](02-agent-personas.md); how their boundaries are
 enforced is in [03-security-model.md](03-security-model.md).
 
+**Agents come into being with their scope, on demand — the fleet is not sized in advance.** Only the
+Platform Agent is installed: one per project, and it is the root. Everything below it is created at
+the moment the scope it manages is created, by the agent one level up, as part of the same action:
+
+- The Platform Agent creates a **cluster** in its project → and, in the same journaled action,
+  the **Cluster Admin Agent** that will manage that cluster.
+- That Cluster Admin Agent creates a **namespace** in its cluster → and, in the same journaled
+  action, the **Developer Team Agent** that will manage that namespace.
+
+So the shape of the agent fleet is a consequence of the shape of the infrastructure, not a separate
+thing to keep in sync with it: a new cluster arrives already administered, a new namespace arrives
+already owned, and there is never a scope with no agent or an agent with no scope. The cardinalities
+in the table above are therefore invariants the cascade maintains, not quotas someone allocates.
+The mechanics — one Action Envelope carrying the child's CR, identities and egress policy, and the
+`parentRef` link it establishes — are [02](02-agent-personas.md) §6.
+
 Layers **talk to each other directly**. A Cluster Admin Agent that needs a bigger node pool asks
 the Platform Agent; a Platform Agent rolling out a policy delegates the per-namespace work to
 Developer Team Agents. The callee always re-authorizes the request in its own scope
