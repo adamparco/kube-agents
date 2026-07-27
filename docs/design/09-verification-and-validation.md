@@ -193,6 +193,14 @@ check that proves they left the critical path.
   component parked at zero is reported as **not wired**. `L2`
 - **V-CMP-005** — the optional components are genuinely optional: a full install with C7/C8/C13
   absent passes V-CTN, V-BRK, V-REV, V-GAT, V-PRO. `L2`
+- **V-CMP-006** — every MCP server whose script reads a credential from the environment declares
+  that variable in its **own** `env:` block, asserted against the **runtime-authoritative** rendered
+  ConfigMap and not the image-baked `config.yaml` (§11.3). A container that holds the secret is not
+  the process that needs it: Hermes passes an MCP server only what its config declares, so a server
+  with no `env:` block reads an empty value and fails closed at the first call. Reports **fail**,
+  never partial — the symptom surfaces as a runtime refusal in a component whose pod is Ready and
+  whose unit tests are green. Negative control: strip `API_SERVER_KEY` from a fixture's
+  `platform_control` block and confirm the check goes red. `L0`, `L2`
 
 ### 5.2 Contract inventory (from [06](06-api-and-data-contracts.md))
 
