@@ -1,0 +1,47 @@
+{
+  "apiVersion": "kubeagents.x-k8s.io/v1alpha1",
+  "kind": "ActionEnvelope",
+  "intent": "raise the checkout worker poll interval to 30s",
+  "rationale": "The queue depth alert is firing because the workers poll faster than the downstream rate limit.",
+  "operations": [
+    {
+      "op": "apply",
+      "target": {
+        "version": "v1",
+        "kind": "ConfigMap",
+        "namespace": "checkout",
+        "name": "worker-config"
+      },
+      "desiredState": {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+          "name": "worker-config",
+          "namespace": "checkout"
+        },
+        "data": {
+          "pollIntervalSeconds": "30",
+          "maxInFlight": "8"
+        }
+      }
+    }
+  ],
+  "requester": {
+    "kind": "system",
+    "id": "alertmanager",
+    "platform": "kubectl"
+  },
+  "trigger": {
+    "source": "alert",
+    "ref": "alertmanager:QueueDepthHigh",
+    "detail": "QueueDepthHigh firing for 12m"
+  },
+  "trace": {
+    "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "spanId": "00f067aa0ba902b7",
+    "sessionId": "s-2026-07-24-01"
+  },
+  "issuedAt": "2026-07-24T18:02:41Z",
+  "nonce": "9f2b1c7d4e6a8b0c3d5e7f9a1b2c3d4e",
+  "idempotencyKey": "sha256:638391a8a581fdb1cd7ee49216b3e99c7ed19f7d091bc8d000befa77e4d78829"
+}

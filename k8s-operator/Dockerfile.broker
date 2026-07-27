@@ -1,0 +1,44 @@
+# Build stage for the kage-broker (the Action Broker, 03 §4.1 / 08 §2.3). Mirrors ./Dockerfile.router
+# but builds cmd/broker, so the three Go binaries ship as three separate minimal images.
+FROM golang:1.25-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETPLATFORM
+# When set, skip compilation and use the pre-built binary instead (used by GoReleaser)
+ARG PREBUILT_BINARY
+
+WORKDIR /workspace
+
+# Copy dependency files first for caching
+COPY go.mod go.sum ./
+RUN if [ -z "$PREBUILT_BINARY" ]; then go mod download; fi
+
+# Copy everything else (source code, and GoReleaser platform dirs if present)
+COPY . .
+
+# Use pre-built binary if available, otherwise build from source.
+RUN if [ -n "$PREBUILT_BINARY" ] && [ -f "${TARGETPLATFORM}/${PREBUILT_BINARY}" ]; then \
+      cp "${TARGETPLATFORM}/${PREBUILT_BINARY}" broker; \
+    else \
+      CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -a -o broker cmd/broker/main.go; \
+    fi
+
+# Runtime stage.
+#
+# V-RUN-010 is stricter for this image than for the other six, and the reason is the RBAC: this is
+# the one pod in the mesh whose ServiceAccount can write. distroless/static:nonroot has no shell, no
+# package manager, no busybox and no coreutils, so `kubectl exec -it <broker> -- sh` fails at exec
+# rather than landing an operator -- or an attacker who reached the agent container -- on a prompt
+# next to the write credential. Nothing may be added to this stage that brings a shell back: not a
+# debug variant, not a healthcheck that shells out, not an entrypoint wrapper script. The liveness
+# probe is an HTTPS GET to /healthz for exactly this reason.
+FROM gcr.io/distroless/static:nonroot
+
+WORKDIR /
+
+COPY --from=builder /workspace/broker .
+
+USER 65532:65532
+
+ENTRYPOINT ["/broker"]

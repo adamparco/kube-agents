@@ -78,11 +78,11 @@ jobs:
             echo "${name}=${digest}" >> "$GITHUB_OUTPUT"
           done
 
-      - name: Build and Push Controller + kage-router (GCP Cloud Build)
+      - name: Build and Push Controller + kage-router + kage-broker (GCP Cloud Build)
         id: gcp-operator
         run: |
           set -euo pipefail
-          for spec in k8s-operator:k8s-operator/Dockerfile kage-router:k8s-operator/Dockerfile.router; do
+          for spec in k8s-operator:k8s-operator/Dockerfile kage-router:k8s-operator/Dockerfile.router kage-broker:k8s-operator/Dockerfile.broker; do
             name="${spec%%:*}"; dockerfile="${spec##*:}"
             echo ">>> $name"
             gcloud builds submit \
@@ -114,4 +114,5 @@ jobs:
           cosign sign --yes "${GCP_REGISTRY}/credential-proxy@${{ steps.gcp-agents.outputs.credential-proxy }}"
           cosign sign --yes "${GCP_REGISTRY}/k8s-operator@${{ steps.gcp-operator.outputs.k8s-operator }}"
           cosign sign --yes "${GCP_REGISTRY}/kage-router@${{ steps.gcp-operator.outputs.kage-router }}"
+          cosign sign --yes "${GCP_REGISTRY}/kage-broker@${{ steps.gcp-operator.outputs.kage-broker }}"
           cosign sign --yes "${GCP_REGISTRY}/replay-proxy@${{ steps.gcp-replay-proxy.outputs.digest }}"

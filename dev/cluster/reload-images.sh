@@ -25,13 +25,21 @@
 #   deployment mechanism makes unrepresentable. It also makes the pull policy irrelevant rather
 #   than load-bearing.
 #
-# Usage: dev/cluster/reload-images.sh [operator|router|agents|all|digest|digest-router] [kube-context]
+# Usage: dev/cluster/reload-images.sh [operator|router|broker|agents|all|digest|digest-router|digest-broker] [kube-context]
 #   operator (default)  build+push the controller image, repoint + restart the controller
 #   router              build+push the kage-router image, repoint + restart the router
+#   broker              build+push the kage-broker image and print its digest. It repoints NOTHING,
+#                       and that is the honest state of the tree, not an omission: the broker has no
+#                       standalone Deployment. The operator renders one per Agent CR (P9-T7), so
+#                       until that lands there is no workload to `set image` on, and a target that
+#                       printed "OK: broker reloaded" would be 09 §11.9 -- built, never wired -- said
+#                       out loud by the tool whose job is to catch it. Once P9-T7 lands this grows a
+#                       deploy_broker that repoints the rendered pair.
 #   agents              build+push the three tier agent images, repoint every Agent CR of each tier
-#   all                 all three
+#   all                 all of the above
 #   digest              build+push the controller image and print its DIGEST reference on stdout,
-#   digest-router       same for the router. Both touch no cluster. They are for up.sh on a cluster
+#   digest-router       same for the router,
+#   digest-broker       same for the broker. All three touch no cluster. They are for up.sh on a cluster
 #                       that has no Deployment to repoint yet: `make deploy` needs an IMG and a
 #                       ROUTER_IMG, and the alternative — deploy the upstream tag as a placeholder,
 #                       then repoint — means rolling out somebody else's binary inside a script
@@ -158,6 +166,7 @@ ref_for() { tr -d '\n' <"$BUILD_REFS/$1.ref" 2>/dev/null; }
 # builds on Cloud Build at once and then deploy them. Each `reload_*` still reads as build-then-deploy.
 OPERATOR_SPEC='k8s-operator:_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile'
 ROUTER_SPEC='kage-router:_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile.router'
+BROKER_SPEC='kage-broker:_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile.broker'
 agent_spec() { echo "$1-agent:_TARGET=$1,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG"; }
 
 deploy_operator() {
@@ -209,6 +218,27 @@ reload_router() {
   echo "== router =="
   build_concurrently "$ROUTER_SPEC" || return 4
   deploy_router "$(ref_for kage-router)"
+}
+
+# report_broker — the broker is built and pushed, and nothing is repointed.
+#
+# Stated rather than skipped. The digest is printed so the next thing that DOES consume it (a
+# hand-rolled pair, or P9-T7's renderer once it exists) has the reference this build produced, and
+# so the difference between "the broker image is current" and "the running broker is current" stays
+# visible instead of being answered by the absence of a line.
+report_broker() {
+  local ref="$1"
+  [ -n "$ref" ] || return 4
+  echo "OK: broker image built and pushed at $TAG"
+  echo "   $ref"
+  echo "   NOT deployed: the broker has no standalone Deployment; the operator renders one per Agent"
+  echo "   CR (P9-T7). Nothing on $CTX is running this image yet."
+}
+
+reload_broker() {
+  echo "== broker =="
+  build_concurrently "$BROKER_SPEC" || return 4
+  report_broker "$(ref_for kage-broker)"
 }
 
 # patch_agent_crs — repoint every Agent CR at the digest built for ITS tier.
@@ -263,8 +293,8 @@ reload_agents() {
   fi
 }
 
-# `all` is not `operator && router && agents`: that chain is five Cloud Build submissions one after
-# another, and the deploy step of each is seconds of work gating the next five-minute build. One
+# `all` is not `operator && router && broker && agents`: that chain is six Cloud Build submissions one
+# after another, and the deploy step of each is seconds of work gating the next five-minute build. One
 # concurrent build of everything, then the deploys, is the same work in the time of the slowest image.
 #
 # The router's rc 5 -- deployed at the right digest, will not start for want of config -- is carried
@@ -272,11 +302,12 @@ reload_agents() {
 # `&&` would have made it silently skip the rest of the reload.
 reload_all() {
   local rc=0 router_rc=0
-  build_concurrently "$OPERATOR_SPEC" "$ROUTER_SPEC" \
+  build_concurrently "$OPERATOR_SPEC" "$ROUTER_SPEC" "$BROKER_SPEC" \
     "$(agent_spec platform)" "$(agent_spec cluster-admin)" "$(agent_spec developer-team)" || return 4
   echo "== operator =="; deploy_operator "$(ref_for k8s-operator)" || return 4
   echo "== router ==";   deploy_router   "$(ref_for kage-router)" || router_rc=$?
   [ "$router_rc" -eq 4 ] && return 4
+  echo "== broker ==";   report_broker   "$(ref_for kage-broker)" || return 4
   echo "== agents =="
   patch_agent_crs || return 4
   echo "OK: 3 agent images built and pushed at $TAG; $AGENT_CRS_PATCHED Agent CR(s) repointed at their digest."
@@ -287,6 +318,7 @@ reload_all() {
 case "$TARGET" in
   operator) reload_operator ;;
   router)   reload_router ;;
+  broker)   reload_broker ;;
   agents)   reload_agents ;;
   all)      reload_all ;;
   # The guard above still ran, and deliberately, even though this arm touches no cluster. A guard
@@ -294,5 +326,6 @@ case "$TARGET" in
   # of; this one is uniform and costs nothing here.
   digest)        build_and_resolve k8s-operator "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile" ;;
   digest-router) build_and_resolve kage-router "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile.router" ;;
-  *) echo "usage: $0 [operator|router|agents|all|digest|digest-router] [kube-context]" >&2; exit 1 ;;
+  digest-broker) build_and_resolve kage-broker "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile.broker" ;;
+  *) echo "usage: $0 [operator|router|broker|agents|all|digest|digest-router|digest-broker] [kube-context]" >&2; exit 1 ;;
 esac
