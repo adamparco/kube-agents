@@ -1326,3 +1326,80 @@ tree, non-`Bash` tools ignored, garbage stdin non-blocking). Two tests assert th
 than the logic — that `.claude/settings.json` registers the script as a `PreToolUse` hook on `Bash`,
 and that the script is executable — because a guard nothing invokes is a comment, which is precisely
 how [[lsn-022]] came back.
+
+---
+
+## LSN-031 — Every rule passed its own test; three of them were switched off
+
+`verification, security` · **closed** 2026-07-27 (P9-T3a) · found by writing a corpus, not by running one
+
+**Trigger.** The classifier for 06 §4.2 was finished and green: seventeen code-floor rules, a
+per-rule table test for each, plus direction, path-dialect, production-ladder, blast-radius and
+secret-egress suites. Then the 09 §7.1 corpus got written — 165 already-resolved envelopes and the
+class a human would defend for each. Three of them failed, and none of the three was a corpus
+mistake.
+
+1. **A scope escape.** `gat-151`: a developer-team agent scoped to `team-a` patching a
+   **ClusterRole** classified `routine`. `ScopeOfTarget` read
+   `if namespace != "" { s.Namespace = namespace }`, so a cluster-scoped target — which has no
+   namespace — kept the **caller's** namespace and resolved to the caller's own scope, which
+   trivially contains itself. Step 1 waved through every cluster-scoped object in the cluster for
+   every namespace-scoped agent: every ClusterRole, every webhook configuration, every
+   PersistentVolume.
+2. **`security-loosen` could not fire on three kind families.** The rule carried a `Kinds` list
+   *and* `Direction: loosen`, and the list had been written by hand from the RBAC/NetworkPolicy/
+   webhook/quota kinds. `direction.go` understands three more: a Namespace's `pod-security.*`
+   labels, a workload's `securityContext` and `serviceAccountName`, and a Service's `/spec/type`.
+   A loosening on any of them computed a direction correctly and then matched no rule.
+3. **`public-exposure` was near-dead on the path that matters.** Whole-object direction had one
+   uniform rule — delete loosens, create tightens — which is right for a NetworkPolicy and exactly
+   backwards for an Ingress. `public-exposure` requires `DirectionLoosen`, so **creating** an
+   internet-facing Ingress came out `tighten` and gated nothing, while **deleting** one gated.
+
+**Root cause.** Every rule was right about itself. What was wrong was the combination, in the same
+shape all three times: **a decision the codebase had already made once, re-made by hand somewhere
+downstream.** Which kinds are security controls is decided in `direction.go`; `floor.go` kept a
+second copy, and two whitelists that must agree are an AND gate. Whether an object's *existence*
+restricts or opens is a per-kind fact; the code inferred it from the verb instead, uniformly, and a
+uniform answer to a two-valued question is confidently wrong on half the domain. And a target's
+scope is a function of the target; the conditional made it a function of the caller whenever the
+target had no namespace to offer.
+
+Each failure resolves toward **silence** — no rule fires, the action is `routine`, nothing is
+logged as suppressed. A gate that fails loud gets fixed on the first false positive. A gate that
+fails quiet is indistinguishable from a gate with nothing to catch, which is what all seventeen
+rules' unit tests were reporting.
+
+**Generalize.** A per-rule test can only ever tell you a rule works *when it is reached*. Nothing in
+a suite of per-rule tests asks **whether every rule is reachable**, and that is the question a
+corpus answers, because a corpus is written from the outside — from what a human would defend —
+rather than from the rule under test. Write the corpus before believing the unit tests. And when a
+rule needs a fact the codebase already encodes, **import the encoding; never restate it** — the
+restatement is not defence in depth, it is a second thing that has to be maintained and a silent
+`AND` when it is not.
+
+**Mechanization.** Four, each at the definition site:
+
+- **`security-loosen` keys off direction alone** and carries no `Kinds` list (`floor.go`). The
+  whitelist already happened once, in `ControlOfKind`; the dead `securityControlKinds` and
+  `rbacKinds` were deleted rather than left beside the rule that stopped consulting them.
+- **`Polarity` in `direction.go`** — a table, not an inference. `PolarityRestriction`
+  (NetworkPolicy, webhook configs, ResourceQuota, LimitRange, PDB): create tightens.
+  `PolarityOpening` (Ingress, Gateway, HTTPRoute, ComputeForwardingRule, ComputeFirewall, every
+  RBAC kind): create loosens. The object-level twin of `boolFieldLoosensWhenTrue`, which exists for
+  the same reason and was already right.
+- **`ScopeOfTarget` assigns the namespace unconditionally**, with the escape written into the
+  function's comment, because the conditional is the version that looks correct.
+- **`TestEverySecurityControlCanReachAGate`** — for each of the eight controls of 03 §5.2, a
+  loosening operation on a kind that control governs must reach a gate. A control the direction
+  analysis models but no floor rule can act on is now a test failure rather than a quiet `routine`.
+
+**Verify.** `go test ./internal/broker/classify/... -count=1`: the 165-case corpus, the reachability
+test, six polarity cases in `TestWholeObjectDirection` (the old suite asserted "deleting a
+ClusterRole loosens" — the **test** was wrong, and it encoded the bug), and a direct regression for
+the scope escape in `classify_test.go`. On the L0 chain,
+**`python3 dev/tests/classifier-corpus-lint.py`** requires that every floor rule have a case
+asserting it FIRES **and** a case asserting it STAYS QUIET — the negative half is what a corpus
+author skips, and it is the half that catches an over-eager gate, which is not a safe failure
+either: it trains operators to approve without reading. **`python3
+dev/tests/classifier-is-model-free.py`** is the same instinct applied to the package boundary.
