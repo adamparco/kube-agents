@@ -41,8 +41,12 @@ python3 dev/tests/cli-contract.py
 # cleanly, grandfathered every running pod, and locked platform-agent-gateway out at 0/1 with
 # `exceeded quota` — the install looked green the whole time. Nothing compared the two numbers.
 python3 dev/tests/quota-admits-agent.py
-# 09 §14's own lints (V-MET-010/012/013-for-check-IDs). They were written `L0` and never built, so
-# 09 §5.1 lost two load-bearing components and 09 §5.2 five contracts with nothing to notice (LSN-014).
+# 09 §14's own lints (V-MET-010/011/012/013-for-check-IDs). They were written `L0` and never built,
+# so 09 §5.1 lost two load-bearing components and 09 §5.2 five contracts with nothing to notice
+# (LSN-014). V-MET-011 joined them in P8-T10 and polices `verification/traceability.yaml`, the
+# curated map from all 176 Verification-section bullets in 01-08 to the checks that assert them —
+# in BOTH directions, so a spec growing a bullet nobody verified is a red line here and not a
+# catalog that merely looks complete.
 python3 dev/tests/spec-ids.py
 # Documentation a reader ACTS on, checked against the build (P8-T7). Three of the 74 falsehoods it
 # first found were created by earlier units of phase 8 itself: P8-T1 deleted the allow-all escape
