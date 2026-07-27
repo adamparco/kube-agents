@@ -58,6 +58,7 @@ will start selecting.
 | **LSN-027** | infrastructure, preflight | A preflight reports the host is fine, and the cluster still refuses to start | closed | `invariants-gate.py` `check_cluster_creating_scripts_assert_capacity` · `dev/lib/substrate-capacity.sh` |
 | **LSN-028** | netpol, substrate | An allowlist denies the destination it lists, and the over-block reads as a fixture bug | closed | `egress-enforcement.sh` §3/§4 (run by `verify-phase7.sh` → phase5, L2-CHAIN) |
 | **LSN-029** | portability, substrate | A portability fallback runs the wrong tool first, and the failure arrives on stdout | closed | `invariants-gate.py` `check_platform_idioms_are_gnu_first` (L0-CHAIN) · `test_build_under_test_precondition.py` |
+| **LSN-030** | git, reverts | Work you finished an hour ago is gone again, and the verb that ate it is not the one you guarded | closed | `git-destructive-guard.py` (PreToolUse hook, `.claude/settings.json`) · `test_git_destructive_guard.py` (`unittest discover dev`) |
 
 **Open: 0 of 29.**
 
@@ -1251,3 +1252,77 @@ is 12/12 on each. The full L0 chain is **13/13 on macOS and 13/13 on Linux** —
 Cloud Build against the whole tree, with `gcloud` at `/usr/bin/gcloud` to keep the leak reachable had
 it survived. The gate check was mutation-tested: reverting `_p1_mtime` to BSD-first fails the gate and
 reports `dev/lib/preconditions.sh:98`, the actual line; restored, the gate is 14/14.
+
+---
+
+## LSN-030 — Work you finished an hour ago is gone again, and the verb that ate it is not the one you guarded
+
+`git, reverts` · **closed** 2026-07-27 (improvement pass) · **this pass's own mistake** ·
+recurrence of [[lsn-022]]
+
+**Trigger.** P8-T10 was finished: the traceability matrix, the V-MET-011 lint, and the hierarchy
+edits across 01/02/07/09 — written, run against the L0 chain, not yet staged. The next command was a
+compound one-liner that ended `git fetch origin -q && git reset --hard origin/main -q`, issued while
+still on the T9 branch. Seven modified tracked files were destroyed. `git fsck --lost-found` found
+nothing, `git stash list` was empty, and VSCode local history had nothing, because git had never been
+shown those bytes. The work came back only by replaying every `Edit` tool call for those paths out of
+the session transcript JSONL (`applied=30 skipped=0`) and hand-repairing the two edits that had
+originally been made through Bash. That is luck with a good audit log, not a recovery path.
+
+**Root cause.** Two of them, and the second is the interesting one.
+
+The proximate cause: the same line's earlier `git checkout main` had already **aborted** on the dirty
+tree and said so, in the output I had just read. `git reset --hard` does not abort. Reading a refusal
+and then issuing the verb whose entire purpose is to overwrite that refusal is the whole of the
+mistake.
+
+The real cause: [[lsn-022]] recorded this exact failure two days earlier, and its mechanization —
+`dev/mutate.sh` — is scoped to **mutation tests**. The lesson generalized ("when a tool's undo is
+defined against a state you did not choose, it is not an undo"); the guard did not. So a
+correctly-closed lesson sat in this file while the identical loss arrived through a different verb
+(`reset --hard`, not `checkout <path>`), in an ad-hoc shell line, nowhere near a mutation test. This
+is [[lsn-019]] in a form its own check cannot see: `check_closed_lessons_are_executable` asks whether
+a mechanization **exists and runs**, not whether it **covers the act** the lesson is about. A guard
+scoped to one caller only ever protects that caller.
+
+**Generalize.** Scope a mechanization to the **act**, not to the **caller**, whenever the act is
+available everywhere. Discarding uncommitted work is available in every shell command this harness
+will ever run, so the guard has to sit where every shell command passes.
+
+**Mechanization.** **`dev/git-destructive-guard.py`**, wired as a `PreToolUse` hook on `Bash` in
+**`.claude/settings.json`** — the first hook this repository has, and the reason that file now
+exists. It splits the proposed command on `;`, `&&`, `||`, `|` and newlines (the incident's
+`reset --hard` was the **third** segment of a line whose first segment had already failed), skips env
+assignments and git's own global flags (`git -C <dir> reset --hard`), and refuses only if
+`git status --porcelain` reports uncommitted work. Blocked: `reset --hard`, `checkout -- <path>`,
+`checkout <ref> -- <path>`, `checkout <existing-path>`, `restore <path>`, `clean -f`, `stash drop`,
+`stash clear`. Deliberately **not** blocked: `checkout <branch>`, `switch`, `merge`, `rebase`, `pull`
+— each aborts on a dirty tree by itself, and that distinction is the lesson: the dangerous verbs are
+exactly the ones that cannot warn you, because overwriting is what they are for. Exit 2 with the
+reason on stderr blocks the call and hands the model the list of files it was about to lose plus the
+`git stash push -u -m pre-destructive` that makes the command safe. A clean tree refuses nothing, so
+this is free in the common case and safe to leave on permanently. Unparseable hook input exits 0: a
+guard that wedges the session would be removed within the day, and then it guards nothing.
+
+**Found by it.** The first command the guard ever blocked was the `cat >> LESSONS.md` heredoc writing
+**this entry**, because the paragraphs above quote the incident command verbatim — and the refusal
+reported the offending segment as `git reset --hard origin/main -q`, issued while`, prose sliced at a
+period. A heredoc body is data; the shell never executes it. So `strip_heredocs()` removes bodies
+(quoted, unquoted and `<<-` forms, several per line, closed in order) before splitting, keeping the
+header line. This is not a weakening — it is the difference between a command and a string — and it
+is load-bearing for adoption: a guard that cannot let you write down the thing it guards against is a
+guard that gets switched off within the day. `TestHeredocBodiesAreData` pins it, including that a
+real `git reset --hard` **after** the terminator is still caught.
+
+**Verify.** **`dev/test_git_destructive_guard.py`**, 27 tests, picked up by
+`python3 -m unittest discover dev` on the L0 chain. Each runs against a real throwaway repo with a
+real dirty file, because the guard's job is to read real `git status` output. The first test is the
+**literal** incident command, asserted refused on a dirty tree and allowed on a clean one; if this
+file is ever refactored, that is the case that must survive, since it is the incident and not an
+example of it. The rest cover every blocked verb, every allowed verb, all four separators, the
+`-C`-flag form, `--soft`/`--mixed` and `clean -n` staying allowed, the five heredoc cases, and the
+hook protocol end-to-end through the real process (exit 2 + `LSN-030` on stderr, exit 0 on a clean
+tree, non-`Bash` tools ignored, garbage stdin non-blocking). Two tests assert the **wiring** rather
+than the logic — that `.claude/settings.json` registers the script as a `PreToolUse` hook on `Bash`,
+and that the script is executable — because a guard nothing invokes is a comment, which is precisely
+how [[lsn-022]] came back.
