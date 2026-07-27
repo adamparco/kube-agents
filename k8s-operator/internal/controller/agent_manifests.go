@@ -153,9 +153,24 @@ func renderConfigYAML(agent *agentv1alpha1.Agent) string {
 				"API_SERVER_KEY":                "${API_SERVER_KEY}",
 			},
 		},
+		// The `env:` block is load-bearing, not decoration. Hermes passes an MCP server ONLY what its
+		// own config declares -- the gateway container holding API_SERVER_KEY does not put it in the
+		// server's process. Declared nothing, `agent_common` read an empty key and every inter-agent
+		// call died on its own fail-closed refusal, on a pod that was Ready and unit tests that were
+		// green (V-CMP-006, dev/test_mcp_env_declared.py). SLACK_BOT_TOKEN is deliberately NOT here:
+		// agent_common_server.load_slack_token() keys on `"SLACK_BOT_TOKEN" not in os.environ` and
+		// falls back to reading the Secret directly, and a declared-but-empty value would defeat that
+		// fallback rather than fix it. KUBERNETES_SERVICE_* is what makes that fallback's kubectl work.
 		"agent_common": map[string]any{
 			"command": "/opt/hermes/.venv/bin/python3",
 			"args":    []string{"/opt/data/scripts/agent_common_server.py"},
+			"env": map[string]string{
+				"KUBERNETES_SERVICE_HOST": "${KUBERNETES_SERVICE_HOST}",
+				"KUBERNETES_SERVICE_PORT": "${KUBERNETES_SERVICE_PORT}",
+				"HERMES_HOME":             "${HERMES_HOME}",
+				"SESSION_KV_DB_PATH":      "${SESSION_KV_DB_PATH}",
+				"API_SERVER_KEY":          "${API_SERVER_KEY}",
+			},
 		},
 		// Bridged with the pod's own Workload Identity token, not an OAuth flow. `mcp-remote`
 		// authenticates by opening a browser and listening for a loopback redirect; a pod has

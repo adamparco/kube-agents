@@ -58,6 +58,12 @@ data:
         args:
         - /opt/data/scripts/agent_common_server.py
         command: /opt/hermes/.venv/bin/python3
+        env:
+          API_SERVER_KEY: ${API_SERVER_KEY}
+          HERMES_HOME: ${HERMES_HOME}
+          KUBERNETES_SERVICE_HOST: ${KUBERNETES_SERVICE_HOST}
+          KUBERNETES_SERVICE_PORT: ${KUBERNETES_SERVICE_PORT}
+          SESSION_KV_DB_PATH: ${SESSION_KV_DB_PATH}
       developer_knowledge:
         args:
         - /opt/data/scripts/mcp_http_bridge.py
@@ -230,7 +236,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 2f19fdd3d5629a26d16b8a7199137b7b3fe1e7b51ae28f5fa9df719ebbda40fc
+        kubeagents.x-k8s.io/config-hash: 5b9319d96561fcca2130461731e859188f20bdfecaba674c6767945291f4a454
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
