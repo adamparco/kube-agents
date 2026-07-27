@@ -116,6 +116,33 @@ is_ci_pipeline() {
   return 1
 }
 
+# True when nothing may read from stdin: there is no operator at the keyboard to answer.
+#
+# THE SINGLE DEFINITION SITE for that question. It was previously spelled inline, as
+# `[ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline`, at eleven prompt sites across common.sh,
+# provision_05, provision_06 and provision_07 — and NO_CONFIRM was in none of them. Only
+# `confirm_action` honoured it. So `--no-confirm`/`-y` suppressed the "are you sure" gates and left
+# every CONFIGURATION prompt live, which is a flag that announces a non-interactive run and does not
+# deliver one.
+#
+# That is not a cosmetic gap. `make live-refresh ARGS="--yes"` builds seven images, pins them in
+# vars.sh, and then runs the 13-step provisioner; on 2026-07-26 it reached provision_06, blocked on
+# the Slack token prompt with no stdin, took EOF, and aborted under `set -e` at step 06 of 13. The
+# operator was already on the new build and the three agent tiers were not — a half-refreshed live
+# install, produced by a flag whose entire purpose was to make the run unattended.
+#
+# DRY_RUN and CI are folded in because they were already the de-facto members of this set at every
+# call site; keeping them here means a prompt site asks one question instead of remembering three.
+# The distinction between "don't ask, you may assume the default" and "don't ask, and there IS no
+# safe default" stays with the CALLER — init_var takes the default, init_var_required exits 1 — and
+# this predicate deliberately does not decide it.
+is_non_interactive() {
+  if [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+    return 0
+  fi
+  return 1
+}
+
 init_var() {
   local var_name=$1
   local default_val=$2
@@ -123,7 +150,7 @@ init_var() {
   local current_val="${!var_name:-}"
   if [ -z "$current_val" ]; then
     local final_val
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+    if is_non_interactive; then
       final_val="$default_val"
     else
       echo -ne "  ${C_CYAN}${prompt_msg} [${C_WHITE}${default_val}${C_CYAN}]: ${C_RESET}"
@@ -152,7 +179,7 @@ init_var_required() {
     return 0
   fi
 
-  if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+  if is_non_interactive; then
     print_error "${var_name} is required and has no safe default."
     print_error "Set it in vars.sh (or the environment) before running non-interactively."
     exit 1
@@ -260,6 +287,15 @@ ensure_teardown_state() {
       export PROJECT_ID="${ACTIVE_PROJECT:-dummy-project}"
       export REGION="us-east4"
       export CLUSTER_NAME="platform-agent-host"
+    elif is_non_interactive; then
+      # Deliberately NOT the dry-run branch's defaults. Those name the LIVE install
+      # (`platform-agent-host`), which is a safe thing to print and an unsafe thing to apply to: an
+      # unattended run that cannot find its state file would silently adopt production as its
+      # target. There is no default that is right here, so there is no default.
+      print_error "${VARS_FILE} does not exist and this is a non-interactive run."
+      print_error "PROJECT_ID, REGION and CLUSTER_NAME would have to be guessed, and the guess"
+      print_error "would be the live install. Set them in vars.sh (or the environment) first."
+      exit 1
     else
       echo -ne "  ${C_CYAN}Enter Target GCP Project ID [${C_WHITE}${ACTIVE_PROJECT}${C_CYAN}]: ${C_RESET}"
       read -r INPUT_PROJECT_ID
@@ -771,7 +807,10 @@ confirm_action() {
   local warning_msg=$1
   shift
 
-  if [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+  # The one prompt site that already honoured NO_CONFIRM. It reads the shared predicate now so the
+  # set of "no operator at the keyboard" conditions cannot diverge between this gate and the
+  # configuration prompts it runs alongside.
+  if is_non_interactive; then
     return 0
   fi
   

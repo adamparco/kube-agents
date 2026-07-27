@@ -39,6 +39,13 @@ loop_add_tokens() {
   local token_prefix=$2
   local start_index=${3:-1}
 
+  # Every caller is already behind an interactive branch. Guarded anyway: this function's loop only
+  # terminates on an empty line, so reaching it without a keyboard is an unbounded read on EOF.
+  if is_non_interactive; then
+    print_warning "Non-interactive run — not prompting for additional ${var_name} values."
+    return 0
+  fi
+
   print_info "Enter additional tokens one by one. Press [Enter] without typing a token when finished."
   while true; do
     echo -ne "  ${C_CYAN}Enter ${var_name} #${start_index} (${token_prefix} or press ENTER to finish): ${C_RESET}"
@@ -64,9 +71,16 @@ else
   if [ -n "${SLACK_BOT_TOKEN:-}" ]; then
     IFS=',' read -r -a existing_bot <<< "$SLACK_BOT_TOKEN"
     print_info "Detected ${#existing_bot[@]} Slack bot token(s) currently configured."
-    echo -ne "  ${C_CYAN}Do you want to (a)dd additional tokens, (r)eplace existing tokens, or (k)eep current configuration? [a/r/K]: ${C_RESET}"
-    read -r action_bot
-    action_bot=$(echo "${action_bot:-k}" | tr '[:upper:]' '[:lower:]')
+    # Non-interactive: KEEP, which is this prompt's own default (`${action_bot:-k}`) and the only
+    # answer that is not a mutation. `add` and `replace` both need a token nobody is there to type.
+    if is_non_interactive; then
+      action_bot="k"
+      print_info "Non-interactive run — keeping the existing bot token(s)."
+    else
+      echo -ne "  ${C_CYAN}Do you want to (a)dd additional tokens, (r)eplace existing tokens, or (k)eep current configuration? [a/r/K]: ${C_RESET}"
+      read -r action_bot
+      action_bot=$(echo "${action_bot:-k}" | tr '[:upper:]' '[:lower:]')
+    fi
 
     if [ "$action_bot" = "a" ] || [ "$action_bot" = "add" ]; then
       loop_add_tokens "SLACK_BOT_TOKEN" "xoxb-..." $((${#existing_bot[@]} + 1))
@@ -74,6 +88,10 @@ else
       export SLACK_BOT_TOKEN=""
       loop_add_tokens "SLACK_BOT_TOKEN" "xoxb-..." 1
     fi
+  elif is_non_interactive; then
+    # No token configured and nobody to type one. Fall through to the existing empty-token warning
+    # below rather than inventing a value: SLACK_ENABLED may legitimately be false.
+    print_warning "No SLACK_BOT_TOKEN configured and this is a non-interactive run — leaving it unset."
   else
     echo -ne "  ${C_CYAN}Enter your primary SLACK_BOT_TOKEN (xoxb-...): ${C_RESET}"
     read -s -r input_bot
@@ -101,9 +119,14 @@ else
   if [ -n "${SLACK_APP_TOKEN:-}" ]; then
     IFS=',' read -r -a existing_app <<< "$SLACK_APP_TOKEN"
     print_info "Detected ${#existing_app[@]} Slack app token(s) currently configured."
-    echo -ne "  ${C_CYAN}Do you want to (r)eplace existing app tokens or (k)eep current configuration? [r/K]: ${C_RESET}"
-    read -r action_app
-    action_app=$(echo "${action_app:-k}" | tr '[:upper:]' '[:lower:]')
+    if is_non_interactive; then
+      action_app="k"
+      print_info "Non-interactive run — keeping the existing app token(s)."
+    else
+      echo -ne "  ${C_CYAN}Do you want to (r)eplace existing app tokens or (k)eep current configuration? [r/K]: ${C_RESET}"
+      read -r action_app
+      action_app=$(echo "${action_app:-k}" | tr '[:upper:]' '[:lower:]')
+    fi
 
     if [ "$action_app" = "r" ] || [ "$action_app" = "replace" ]; then
       export SLACK_APP_TOKEN=""
@@ -111,10 +134,14 @@ else
   fi
 
   if [ -z "${SLACK_APP_TOKEN:-}" ]; then
-    echo -ne "  ${C_CYAN}Enter your SLACK_APP_TOKEN (xapp-...): ${C_RESET}"
-    read -s -r INPUT_APP_TOKEN
-    echo ""
-    export SLACK_APP_TOKEN="${INPUT_APP_TOKEN:-}"
+    if is_non_interactive; then
+      print_warning "No SLACK_APP_TOKEN configured and this is a non-interactive run — leaving it unset."
+    else
+      echo -ne "  ${C_CYAN}Enter your SLACK_APP_TOKEN (xapp-...): ${C_RESET}"
+      read -s -r INPUT_APP_TOKEN
+      echo ""
+      export SLACK_APP_TOKEN="${INPUT_APP_TOKEN:-}"
+    fi
   fi
 fi
 
