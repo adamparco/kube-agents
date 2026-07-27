@@ -74,6 +74,15 @@ python3 dev/tests/classifier-corpus-lint.py
 # that reaches for a chat client and turns the gate into a model's opinion. `time` is on the
 # forbidden list beside the inference clients, for the same reason and with better odds of arriving.
 python3 dev/tests/classifier-is-model-free.py
+# LSN-032. The operator's API group is declared once, in groupversion_info.go, and this asserts that
+# nothing restates it wrongly. Five of the forbidden set's nine entries named `kubeagents.gke-labs.dev`
+# -- a group this operator has never served -- so `delete ActionRecord`, `patch ChangePolicy`,
+# `delete FleetFreeze`, `create ApprovalRoster` and `patch Agent` fell through the forbidden check and
+# classified `routine`. The corpus agreed, because its fixtures were written from the same wrong
+# string. A wrong group is not a compile error and not a runtime error: the rule looks right, the
+# fixture looks right, they match each other, and only the API server disagrees -- silently, by never
+# matching. Found by reading; this is so the next one is not.
+python3 dev/tests/api-group-single-sourced.py
 
 # --- repository mechanics (LSN-012) ---------------------------------------------------------
 # Which remote carries the work, and does `main` point at it? Local main tracked `upstream/main`

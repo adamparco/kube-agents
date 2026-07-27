@@ -246,7 +246,7 @@ func TestOwnerLookupSkipsTerminatingAgents(t *testing.T) {
 	dying := agentCR("dev-team-a", "p", "c", "team-a")
 	now := metav1.Now()
 	dying.DeletionTimestamp = &now
-	dying.Finalizers = []string{"kubeagents.gke-labs.dev/cleanup"}
+	dying.Finalizers = []string{"kubeagents.x-k8s.io/finalizer"}
 
 	l := OwnerLookup{Agents: []agentv1alpha1.Agent{dying}}
 	got, err := l.Find(caller, scope.Scope{ProjectID: "p", ClusterName: "c", Namespace: "team-a"})

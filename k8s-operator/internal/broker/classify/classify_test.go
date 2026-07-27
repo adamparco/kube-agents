@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/scope"
 )
 
@@ -131,7 +132,7 @@ func TestOutOfScopeIsForbiddenAndShortCircuits(t *testing.T) {
 
 func TestForbiddenSetShortCircuits(t *testing.T) {
 	c := mustClassifier(t, nil, seenAll{})
-	got := classify(t, c, input(op("delete", "kubeagents.gke-labs.dev", "ActionRecord", "kube-agents-system", "ar-1")))
+	got := classify(t, c, input(op("delete", "kubeagents.x-k8s.io", "ActionRecord", "kube-agents-system", "ar-1")))
 	wantClass(t, got, ClassForbidden)
 	wantReason(t, got, RuleForbiddenSet)
 	if len(got.Reasons) != 1 {
@@ -223,7 +224,7 @@ func TestDryRunWithoutUndoPlanDoesNotGate(t *testing.T) {
 
 func TestDryRunOfForbiddenIsStillForbidden(t *testing.T) {
 	c := mustClassifier(t, nil, seenAll{})
-	in := input(op("delete", "kubeagents.gke-labs.dev", "ActionRecord", "kube-agents-system", "ar-1"))
+	in := input(op("delete", "kubeagents.x-k8s.io", "ActionRecord", "kube-agents-system", "ar-1"))
 	in.DryRun = true
 	got := classify(t, c, in)
 	wantClass(t, got, ClassForbidden)
@@ -236,7 +237,7 @@ func TestRequireApprovalRaisesOnly(t *testing.T) {
 	wantClass(t, classify(t, c, in), ClassGated)
 
 	// And it cannot lower: a forbidden action asking for approval is still forbidden.
-	in2 := input(op("delete", "kubeagents.gke-labs.dev", "ActionRecord", "kube-agents-system", "ar-1"))
+	in2 := input(op("delete", "kubeagents.x-k8s.io", "ActionRecord", "kube-agents-system", "ar-1"))
 	in2.RequireApproval = true
 	wantClass(t, classify(t, c, in2), ClassForbidden)
 }
@@ -619,6 +620,43 @@ func TestEverySecurityControlCanReachAGate(t *testing.T) {
 			}
 			if got.Class != ClassGated {
 				t.Fatalf("a loosening of %s classified as %s, not gated; reasons: %v", ctrl, got.Class, got.Reasons)
+			}
+		})
+	}
+}
+
+// TestForbiddenSetNamesTheLiveAPIGroup is the mechanization of a defect that switched off five of
+// the nine forbidden-set entries at once.
+//
+// The set was written with the group `kubeagents.gke-labs.dev`, which this operator has never
+// served -- the real one is in groupversion_info.go and has always been `kubeagents.x-k8s.io`. Every
+// kube-agents entry therefore matched nothing: deleting an ActionRecord, editing a ChangePolicy,
+// lifting a FleetFreeze and rewriting the ApprovalRoster all fell through step 2 of the evaluation
+// order and were classified on their merits, which for a `patch` of a CR nobody has a rule about is
+// `routine`. The corpus agreed, because the fixtures were written from the same wrong string.
+//
+// This test does not compare strings. It builds an operation from the SCHEME -- the same place the
+// API server gets the group -- and asserts the classifier refuses it. A future rename that updates
+// groupversion_info.go and forgets floor.go fails here rather than in production.
+func TestForbiddenSetNamesTheLiveAPIGroup(t *testing.T) {
+	c := mustClassifier(t, nil, seenAll{})
+	group := agentv1alpha1.GroupVersion.Group
+
+	// One representative verb per control-plane kind, drawn from the forbidden set's own reasons.
+	cases := []struct{ verb, kind string }{
+		{"delete", "ActionRecord"},
+		{"patch", "ChangePolicy"},
+		{"delete", "FleetFreeze"},
+		{"create", "ApprovalRoster"},
+		{"patch", "Agent"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.kind, func(t *testing.T) {
+			got := classify(t, c, input(op(tc.verb, group, tc.kind, "kube-agents-system", "x")))
+			if got.Class != ClassForbidden {
+				t.Fatalf("%s %s.%s classified %s, not forbidden. The forbidden set names a group the "+
+					"scheme does not serve, so the entry matches nothing; reasons: %v",
+					tc.verb, tc.kind, group, got.Class, got.Reasons)
 			}
 		})
 	}
