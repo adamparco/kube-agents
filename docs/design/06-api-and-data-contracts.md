@@ -1946,6 +1946,10 @@ status:
     executionEnded: "2026-07-24T17:58:04Z"
     verified: "2026-07-24T18:03:11Z"
   message: "raised memory limit to 512Mi and restarted api-gateway"
+  exported: # the durability receipt; the retention controller reads ONLY this
+    confirmed: true
+    at: "2026-07-24T18:03:12Z"
+    sink: stdout
 ```
 
 **`status.report` is structured, and the chat text is rendered from it — never the reverse.** The
@@ -1960,6 +1964,27 @@ the two can then disagree.
 agent never skips a rung silently and never restarts at the bottom for the same target after a
 rollback. Neither is checkable unless the rung is recorded, so it is: `transitions` is append-only,
 non-decreasing in `rung`, and any skip carries a `reason`.
+
+**`status.exported` is the durability receipt, and it is a field so that deletion has something to
+read.** [05](05-system-architecture.md) §1.2 makes the export — not the CR — the durable record, and
+makes the retention controller's `delete` conditional on the exporter having confirmed. A condition
+with no field behind it is a sentence in a design document: the controller would have to _infer_
+durability, and every way of inferring it (elapsed time, sink liveness, a metric) fails in the same
+direction, deleting evidence that never landed. So the journal reconciler (`C-JR`,
+[05](05-system-architecture.md) §1.2) writes `{confirmed, at, sink}` **after** the sink accepts the
+entry, and `journal.DeletableAt` reads `confirmed` and nothing else.
+
+| Field       | Type     | Set by | Rule                                                                                                                                                      |
+| ----------- | -------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `confirmed` | bool     | `C-JR` | Written only after the sink returned success. Never set speculatively, never set by anything else — it is the sole input to the deletion predicate        |
+| `at`        | RFC-3339 | `C-JR` | When the sink accepted it. An `at` far past the phase timestamp is a late export; the 60 s freshness budget of [05](05-system-architecture.md) §1.2       |
+| `sink`      | string   | `C-JR` | Where the evidence went. A reader holding only the CR needs to know which archive to search, and an install that changed sinks needs the per-record value |
+
+A record is exported when it reaches a **terminal** phase, not on every transition: the terminal
+record carries the timestamps, the applied diff, the verification result and the report, so the
+intermediate states are reconstructable from it. With **no sink configured**, nothing is ever
+confirmed and therefore nothing is ever deleted — records accumulate. That is the correct
+degradation, and the only one that is visible and recoverable.
 
 **Status lifecycle.**
 
@@ -2033,14 +2058,15 @@ broker and the undo controller" is too loose to conformance-test — the check n
 and a field list. This is that list; `vap-agent-scope-journal` enforces it on
 `actionrecords/status`, and any principal or field pair not in the table is **denied**:
 
-| Principal                                                                      | Subresource            | May write                                                                                                                                             | Constraint                                                                                                                             |
-| ------------------------------------------------------------------------------ | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `system:serviceaccount:<ns>:<tier>-<scope>-actor` — **the owning broker**      | `actionrecords/status` | `phase`, `observedGeneration`, `applied`, `verification`, `recovery`, `report`, `timestamps`, `message`                                               | Only on records whose `spec.agentIdentity` equals the broker's own derived identity. **Never** `approvals`, `contested`, or `undoneBy` |
-| `system:serviceaccount:kubeagents-system:kube-agents-undo-controller` (`C-UC`) | `actionrecords/status` | `phase` (→ `Undone` only), `undoneBy`, `contested`, `message`                                                                                         | Any record in any namespace — undo must work for an agent that no longer exists ([05](05-system-architecture.md) §1.3)                 |
-| `system:serviceaccount:kubeagents-system:kube-agents-chatops-gateway`          | `actionrecords/status` | `approvals` (`granted`, `rejected`, `expiresAt`), `phase` (`PendingApproval` → `Pending`/`Rejected`), `contested` (clear only, for `/kage uncontest`) | Enforces the roster, four-eyes, and `minApprovals` before writing (§4.4). Cannot touch `applied` or `verification`                     |
-| `system:serviceaccount:kubeagents-system:kube-agents-retention-controller`     | (main resource)        | nothing — `delete` only                                                                                                                               | May `delete` only when `now > spec.retention.expiresAt` **and** the exporter has confirmed the record landed in the audit sink         |
-| **Every agent reader SA**                                                      | —                      | nothing                                                                                                                                               | `get`/`list`/`watch` only (§2.1)                                                                                                       |
-| **A human `cluster-admin`**                                                    | —                      | **nothing.** Explicitly denied                                                                                                                        | See below                                                                                                                              |
+| Principal                                                                                  | Subresource            | May write                                                                                                                                             | Constraint                                                                                                                                                                                                                       |
+| ------------------------------------------------------------------------------------------ | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `system:serviceaccount:<ns>:<tier>-<scope>-actor` — **the owning broker**                  | `actionrecords/status` | `phase`, `observedGeneration`, `applied`, `verification`, `recovery`, `report`, `timestamps`, `message`                                               | Only on records whose `spec.agentIdentity` equals the broker's own derived identity. **Never** `approvals`, `contested`, `undoneBy`, or `exported`                                                                               |
+| `system:serviceaccount:kubeagents-system:kube-agents-undo-controller` (`C-UC`)             | `actionrecords/status` | `phase` (→ `Undone` only), `undoneBy`, `contested`, `message`                                                                                         | Any record in any namespace — undo must work for an agent that no longer exists ([05](05-system-architecture.md) §1.3)                                                                                                           |
+| `system:serviceaccount:kubeagents-system:kube-agents-chatops-gateway`                      | `actionrecords/status` | `approvals` (`granted`, `rejected`, `expiresAt`), `phase` (`PendingApproval` → `Pending`/`Rejected`), `contested` (clear only, for `/kage uncontest`) | Enforces the roster, four-eyes, and `minApprovals` before writing (§4.4). Cannot touch `applied` or `verification`                                                                                                               |
+| `system:serviceaccount:kubeagents-system:kubeagents-controller` (`C-JR`, **the exporter**) | `actionrecords/status` | `exported` (`confirmed`, `at`, `sink`) and nothing else                                                                                               | Any record in any namespace. Writes it only after the sink accepted the entry. Deliberately cannot touch `phase` — an exporter that could advance the lifecycle could manufacture a terminal record for an action that never ran |
+| `system:serviceaccount:kubeagents-system:kube-agents-retention-controller`                 | (main resource)        | nothing — `delete` only                                                                                                                               | May `delete` only when `now > spec.retention.expiresAt` **and** `status.exported.confirmed` is true                                                                                                                              |
+| **Every agent reader SA**                                                                  | —                      | nothing                                                                                                                                               | `get`/`list`/`watch` only (§2.1)                                                                                                                                                                                                 |
+| **A human `cluster-admin`**                                                                | —                      | **nothing.** Explicitly denied                                                                                                                        | See below                                                                                                                                                                                                                        |
 
 **A human cluster-admin may not write `ActionRecord.status`, and this is deliberate.** The
 `vap-agent-scope-journal` policy matches on **all** principals, not just agent identities, so a

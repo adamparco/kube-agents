@@ -1,0 +1,39 @@
+# V-BRK-003 fixture: the mutating-write stream a completeness scan reads.
+#
+# This file is the L1 instance of V-BRK-003 and, more importantly, its NEGATIVE CONTROL. The check
+# asserts "every audit-log write by an actor identity has a matching ActionRecord". On a healthy
+# cluster that is vacuously true, so a scan that reads only healthy traffic is green whether or not
+# it works. Lines 3 and 4 of the data below are writes that MUST be reported; a run of the check
+# against this file that returns nothing has found a bug in the check, not a clean cluster.
+#
+# One AuditWrite per line. Blank lines and #-comments are skipped so cases can explain themselves.
+# Fields: at, principal, verb, resource, actionId.
+
+# --- journaled writes: an action that fanned out over two objects, one action id ------------
+{"at":"2026-07-27T12:00:01Z","principal":"system:serviceaccount:team-x:developer-team-team-x-actor","verb":"patch","resource":"apps/v1/Deployment team-x/api-gateway","actionId":"01JZQ8X9K7M4N2P6R8T0V3W5YZ"}
+{"at":"2026-07-27T12:00:02Z","principal":"system:serviceaccount:team-x:developer-team-team-x-actor","verb":"update","resource":"v1/ConfigMap team-x/api-gateway-config","actionId":"01JZQ8X9K7M4N2P6R8T0V3W5YZ"}
+
+# --- negative control 1: an actor identity wrote with NO action id at all --------------------
+# Admission is supposed to make this impossible (05 §1.1), so it means the policy is missing from
+# this cluster or something authenticated as an actor SA outside the broker. Reported as `unlabeled`.
+{"at":"2026-07-27T12:00:03Z","principal":"system:serviceaccount:team-x:developer-team-team-x-actor","verb":"delete","resource":"v1/Pod team-x/api-gateway-7d9f"}
+
+# --- negative control 2: an action id that names no record -----------------------------------
+# The broker journaled after writing, or not at all, or the record was deleted inside its TTL.
+# Reported as `unmatched` -- a broker failure, not a policy one, and fixed somewhere else.
+{"at":"2026-07-27T12:00:04Z","principal":"system:serviceaccount:cluster-a:cluster-admin-cluster-a-actor","verb":"create","resource":"v1/Namespace /team-y","actionId":"01JZQ8X9K7M4N2P6R8T0V3WAAA"}
+
+# --- a second journaled write, later, by a different actor -----------------------------------
+{"at":"2026-07-27T12:05:00Z","principal":"system:serviceaccount:cluster-a:cluster-admin-cluster-a-actor","verb":"patch","resource":"v1/ResourceQuota team-y/default","actionId":"01JZQ8X9K7M4N2P6R8T0V3W5ZZ"}
+
+# --- not an actor identity: must never appear in a finding -----------------------------------
+# kubelet, the controller-manager and every human with a kubeconfig write constantly and none of
+# them are required to journal. A scan that swept them in would produce a wall of findings
+# indistinguishable from a broken check, which is why CheckCompleteness refuses an empty principal
+# list rather than defaulting to "everyone".
+{"at":"2026-07-27T12:00:05Z","principal":"system:serviceaccount:kube-system:replicaset-controller","verb":"create","resource":"v1/Pod team-x/api-gateway-7d9f"}
+{"at":"2026-07-27T12:00:06Z","principal":"alice@example.com","verb":"delete","resource":"apps/v1/Deployment team-x/legacy"}
+
+# --- outside the window used by the tests: proves [since, until) is actually applied ----------
+{"at":"2026-07-26T23:59:59Z","principal":"system:serviceaccount:team-x:developer-team-team-x-actor","verb":"patch","resource":"apps/v1/Deployment team-x/old","actionId":"01JZQ8X9K7M4N2P6R8T0V3W0LD"}
+{"at":"2026-07-28T00:00:00Z","principal":"system:serviceaccount:team-x:developer-team-team-x-actor","verb":"patch","resource":"apps/v1/Deployment team-x/future","actionId":"01JZQ8X9K7M4N2P6R8T0V3WNEW"}

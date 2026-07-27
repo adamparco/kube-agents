@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -37,6 +38,7 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/journal"
 	agentwebhook "github.com/gke-labs/kube-agents/k8s-operator/internal/webhook"
 	// +kubebuilder:scaffold:imports
 )
@@ -62,6 +64,8 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var auditSink string
+	var exportBudget, retentionInterval time.Duration
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -80,6 +84,14 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&auditSink, "audit-sink", "stdout",
+		"Where ActionRecords are exported for durable retention: stdout (structured JSON lines, picked "+
+			"up by the GKE logging agent) or none. With none, nothing is ever confirmed exported and the "+
+			"retention controller never deletes a record (05 §1.2).")
+	flag.DurationVar(&exportBudget, "audit-export-budget", 60*time.Second,
+		"The freshness target for exporting a terminal ActionRecord. Exceeding it is logged, not enforced.")
+	flag.DurationVar(&retentionInterval, "retention-sweep-interval", time.Hour,
+		"How often each ActionRecord is re-checked for expiry. TTLs are measured in days.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -176,6 +188,44 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "agent")
+		os.Exit(1)
+	}
+
+	// The journal's durability path (05 §1.2). The default sink is this process's stdout: on GKE the
+	// node agent picks up container stdout and parses structured JSON into jsonPayload, so a log sink
+	// routes it to a retention-locked bucket or BigQuery with no client library, no credential and no
+	// hole in the default-deny egress policy.
+	//
+	// `--audit-sink=none` is a real choice and not a way to silence a warning: with no sink nothing
+	// is ever confirmed exported, and the retention controller therefore never deletes anything.
+	// Records accumulate. That is the correct degradation -- visible, and recoverable.
+	var journalSink journal.AuditSink
+	switch auditSink {
+	case "stdout":
+		journalSink = journal.NewWriterSink("stdout", os.Stdout)
+	case "none":
+		setupLog.Info("no audit sink configured: ActionRecords will never be confirmed exported, and the retention controller will therefore never delete one (05 §1.2)")
+	default:
+		setupLog.Error(nil, "unknown --audit-sink", "value", auditSink, "supported", "stdout, none")
+		os.Exit(1)
+	}
+
+	if err := (&controller.JournalReconciler{
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		Sink:         journalSink,
+		ExportBudget: exportBudget,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "journal")
+		os.Exit(1)
+	}
+
+	if err := (&controller.RetentionReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Interval: retentionInterval,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "retention")
 		os.Exit(1)
 	}
 

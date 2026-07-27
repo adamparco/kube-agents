@@ -26,7 +26,7 @@
 #
 # WHAT IT INSTALLS, in order: project preflight -> cluster -> credentials + context rename ->
 # node/dataplane assertions -> cert-manager -> operator (Cloud Build, push, deploy BY DIGEST) ->
-# read-only VAP -> the three tier agent images.
+# read-only VAP -> ActionRecord.status write policy -> the three tier agent images.
 #
 # Idempotent: safe to re-run, and re-running is the supported way to pick up a source change.
 # Exit: 0 = ready · 2 = refused (project preflight) · 3 = tool missing · 4 = cluster is the wrong
@@ -228,6 +228,13 @@ esac
 echo "== applying the read-only VAP =="
 $K apply -f "$REPO_ROOT/examples/gitops-repo/policy/vap-agent-readonly.yaml"
 
+# The ActionRecord.status write policy (06 §4.3). This cluster is where the L2 journal checks run,
+# and every one of them asserts a DENIAL — so on a cluster missing this file they would all pass by
+# passing nothing. Applied here, next to the CRD it guards, rather than left to provision_03: this
+# script is not the install path, it is the scratch cluster the install path is tested against.
+echo "== applying the ActionRecord.status write policy =="
+$K apply -f "$REPO_ROOT/k8s-operator/config/policy/vap-agent-scope-journal.yaml"
+
 # --- agent images -----------------------------------------------------------------------------------
 # No per-node placement worry any more. `kind load` had to put the image on EVERY node, because an
 # image present on only one turns a cross-node placement into an ImagePullBackOff — a false failure
@@ -247,7 +254,7 @@ cat <<EOF
 ====================================================================
  '$CLUSTER' is ready.  Context: $CTX
    $nodes nodes · $P4_DATAPLANE (NetworkPolicy ENFORCED) · Workload Identity
-   CRD + controller + webhooks at a digest · read-only VAP
+   CRD + controller + webhooks at a digest · read-only + journal VAPs
    kage-router at a digest · $ROUTER_STATE
 ====================================================================
 Every line of dev/L2-CHAIN.txt targets this one cluster:
