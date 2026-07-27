@@ -260,6 +260,19 @@ broker unit, it repairs a defect on a running install, and it is the smallest un
 deleted before the next begins** (`binding.md` §Branching, §Merge). A unit is not "done" until its
 PR is merged green.
 
+**P9-T3 ships as two units** (the P8-T8a/b/c precedent), because the row above is two deliverables
+that share a heading and nothing else:
+
+- **P9-T3a** — the classifier itself: `internal/broker/classify/`, the shared scope predicate
+  extracted to `internal/scope/` and reused by the V-6 webhook rule, the 09 §7.1 corpus, and the two
+  L0 lints. Covers V-GAT-001/010/011/012/017/021/022 at L1 and V-MET-005.
+- **P9-T3b** — `ChangePolicy`: the CRD, the stricter-only admission rule, the `/`-prefix rejection
+  on `fieldPaths`, and the broker taking the max over policy sources. Covers V-GAT-009.
+
+The seam is real rather than administrative: `NewClassifier` already takes `[]RuleSet` and the code
+floor is one of them, so T3b adds a source to a list T3a shipped. The order matters in one
+direction only — a policy that can tighten needs something to tighten first.
+
 ---
 
 ## Deferrals opened by this phase (each with a named external blocker)

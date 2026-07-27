@@ -33,6 +33,7 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/agentindex"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/scope"
 )
 
 // agentGroupKind is the GroupKind used in admission error responses.
@@ -318,36 +319,59 @@ func validateParentCeiling(child *agentv1alpha1.Agent, list *agentv1alpha1.Agent
 			"parent Agent %q is paused (%s); a paused agent may not provision children", name, reason))
 	}
 
-	// Scope subset, field-wise.
-	var cProject, cCluster, cNamespace string
-	if s := child.Spec.Scope; s != nil {
-		cProject, cCluster, cNamespace = s.ProjectID, s.ClusterName, s.Namespace
-	}
-	var pProject, pCluster, pNamespace string
-	if s := parent.Spec.Scope; s != nil {
-		pProject, pCluster, pNamespace = s.ProjectID, s.ClusterName, s.Namespace
+	// Scope subset. The predicate itself lives in internal/scope and is SHARED with the classifier's
+	// `cross-tier-direct-operation` rule (06 §4.2: "the same subset predicate V-6 uses (§1.2),
+	// reused so the two cannot drift"). This function keeps its own messages -- an admission
+	// rejection has to say which field to edit -- by asking the predicate which clause failed
+	// rather than by deciding containment a second time.
+	c := scope.Of(child)
+	p := scope.Of(parent)
+
+	// CONTAINMENT is tested against a masked parent; STRICTNESS is tested against the raw one. The
+	// two halves of V-6 genuinely read the parent's scope differently and collapsing them is a
+	// behaviour change, which a test caught the first time this was refactored:
+	//
+	//   - Containment must ignore a PLATFORM parent's clusterName. A platform scope narrows to a
+	//     project (06 §1.2); a clusterName on one is conventional at most, and comparing it would
+	//     reject every cluster-admin child of a platform agent that happens to carry one.
+	//   - Strictness must NOT ignore it. V-6's clause is `scope(C) != scope(P)` over the declared
+	//     scopes, so a child that reproduces its parent's triple exactly has narrowed nothing and is
+	//     an authority clone -- whether or not the field that makes them equal was load-bearing for
+	//     containment.
+	//
+	// Hence one shared predicate for the part that must not drift from the classifier (which level
+	// contains which), and a local equality for the part that is V-6's alone.
+	pContain := p
+	if parentTier != agentv1alpha1.TierClusterAdmin {
+		pContain.ClusterName, pContain.Namespace = "", ""
 	}
 
-	if pProject != "" && cProject != pProject {
-		return field.Invalid(parentPath, name, fmt.Sprintf(
-			"scope.projectId %q is outside parent %q's project %q; a child's scope must be a subset of its parent's",
-			cProject, name, pProject))
+	if ok, clause := scope.Contains(pContain, c); !ok {
+		switch clause {
+		case scope.ClauseProject:
+			return field.Invalid(parentPath, name, fmt.Sprintf(
+				"scope.projectId %q is outside parent %q's project %q; a child's scope must be a subset of its parent's",
+				c.ProjectID, name, p.ProjectID))
+		case scope.ClauseCluster:
+			return field.Invalid(parentPath, name, fmt.Sprintf(
+				"scope.clusterName %q is outside parent %q's cluster %q; a child's scope must be a subset of its parent's",
+				c.ClusterName, name, p.ClusterName))
+		case scope.ClauseNamespace:
+			return field.Invalid(parentPath, name, fmt.Sprintf(
+				"scope.namespace %q is outside parent %q's namespace %q; a child's scope must be a subset of its parent's",
+				c.Namespace, name, p.Namespace))
+		}
 	}
-	if parentTier == agentv1alpha1.TierClusterAdmin && pCluster != "" && cCluster != pCluster {
-		return field.Invalid(parentPath, name, fmt.Sprintf(
-			"scope.clusterName %q is outside parent %q's cluster %q; a child's scope must be a subset of its parent's",
-			cCluster, name, pCluster))
-	}
-	if childTier == agentv1alpha1.TierDeveloperTeam && cNamespace == "" {
+
+	if childTier == agentv1alpha1.TierDeveloperTeam && c.Namespace == "" {
 		// V-2 already requires this; repeated here so the subset predicate is total rather than
 		// relying on an earlier rule's ordering to make it so.
 		return field.Invalid(parentPath, name,
 			"a developer-team child must narrow its parent's scope with a namespace, but scope.namespace is empty")
 	}
 
-	// Strict subset: a child whose scope EQUALS its parent's has narrowed nothing, and an
-	// equal-scope child is an authority clone rather than an attenuation.
-	if cProject == pProject && cCluster == pCluster && cNamespace == pNamespace {
+	// Strict subset: a child whose scope EQUALS its parent's has narrowed nothing.
+	if c == p {
 		return field.Invalid(parentPath, name, fmt.Sprintf(
 			"scope is identical to parent %q's; a child's scope must be a STRICT subset (it must narrow project, cluster or namespace)", name))
 	}

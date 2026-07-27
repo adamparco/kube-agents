@@ -1,0 +1,288 @@
+package classify
+
+// The seventeen code-floor rules of 06 §4.2.
+//
+// "Code floor" means two things. It is the MINIMUM classification for every action, which no
+// ChangePolicy can lower (03 §5.3). And it is literally in code -- not in a ConfigMap, not in a CR,
+// not in a file the operator reads at start-up -- because a floor that can be edited by whoever can
+// edit cluster state is not a floor, and an agent whose job is editing cluster state is exactly the
+// thing it exists to constrain.
+//
+// Seven of the seventeen are steps in the evaluation order rather than rows in the table, because
+// they need something a `When` cannot express: `out-of-scope` and `forbidden-set` short-circuit,
+// `blast-radius-*` compare counts, `production-environment` and `novel-action` contribute `+1`
+// rather than a class, `object-override` reads an annotation, and the default is the absence of
+// every other rule. They live in classify.go. The remaining ten are here.
+//
+// Every rule's Reason is written to be read by the person deciding whether to approve, at the
+// moment they are deciding, on a phone. Not to be read by an engineer debugging the classifier.
+
+// Rule IDs. Referenced by the corpus fixtures, the traceability matrix and the audit journal, so
+// they are constants: a fixture naming a rule that no longer exists must fail to compile the lint,
+// not silently match nothing.
+const (
+	RuleOutOfScope                = "out-of-scope"
+	RuleForbiddenSet              = "forbidden-set"
+	RuleNoUndoPlan                = "no-undo-plan"
+	RuleDestructiveStatefulDelete = "destructive-stateful-delete"
+	RuleSecurityLoosen            = "security-loosen"
+	RulePublicExposure            = "public-exposure"
+	RuleTrafficShiftProduction    = "traffic-shift-production"
+	RuleIdentityChange            = "identity-change"
+	RuleBlastRadiusCap            = "blast-radius-cap"
+	RuleBlastRadiusHardCap        = "blast-radius-hard-cap"
+	RuleSecretWrite               = "secret-write"
+	RuleSecretMaterialEgress      = "secret-material-egress"
+	RuleCrossTierDirectOperation  = "cross-tier-direct-operation"
+	RuleProductionEnvironment     = "production-environment"
+	RuleNovelAction               = "novel-action"
+	RuleObjectOverride            = "object-override"
+	RuleDefaultRoutine            = "default-routine"
+)
+
+// AllFloorRuleIDs is every ID above, for the corpus lint (V-MET-005), which asserts the corpus
+// exercises each one at least once. A floor rule with no fixture is a rule nobody has ever seen
+// fire.
+var AllFloorRuleIDs = []string{
+	RuleOutOfScope, RuleForbiddenSet, RuleNoUndoPlan, RuleDestructiveStatefulDelete,
+	RuleSecurityLoosen, RulePublicExposure, RuleTrafficShiftProduction, RuleIdentityChange,
+	RuleBlastRadiusCap, RuleBlastRadiusHardCap, RuleSecretWrite, RuleSecretMaterialEgress,
+	RuleCrossTierDirectOperation, RuleProductionEnvironment, RuleNovelAction, RuleObjectOverride,
+	RuleDefaultRoutine,
+}
+
+// statefulKinds are the kinds whose deletion destroys data that no undo plan can restore.
+//
+// The distinction this list draws is not "important" -- a Deployment is important -- it is
+// RECOVERABLE. Deleting a Deployment loses a spec, and the undo plan holds the spec. Deleting a
+// PersistentVolumeClaim loses the volume, and there is no field in an undo plan that contains a
+// disk. That is why these gate on delete while far more disruptive operations on stateless objects
+// do not.
+var statefulKinds = []KindRef{
+	{Group: "", Kind: "PersistentVolumeClaim"},
+	{Group: "", Kind: "PersistentVolume"},
+	{Group: "apps", Kind: "StatefulSet"},
+	{Group: "", Kind: "Secret"},
+	{Group: "", Kind: "ConfigMap"},
+	{Group: "", Kind: "Namespace"},
+	{Group: "snapshot.storage.k8s.io", Kind: "VolumeSnapshot"},
+	{Group: "snapshot.storage.k8s.io", Kind: "VolumeSnapshotContent"},
+}
+
+// identityKinds are the objects that decide WHO something is, as opposed to what it may do.
+var identityKinds = []KindRef{
+	{Group: "", Kind: "ServiceAccount"},
+	{Group: "rbac.authorization.k8s.io", Kind: "RoleBinding"},
+	{Group: "rbac.authorization.k8s.io", Kind: "ClusterRoleBinding"},
+	{Group: "iam.cnrm.cloud.google.com", Kind: "IAMPolicyMember"},
+	{Group: "iam.cnrm.cloud.google.com", Kind: "IAMServiceAccount"},
+	{Group: "iam.cnrm.cloud.google.com", Kind: "IAMPartialPolicy"},
+}
+
+// There is deliberately no `securityControlKinds` list here. The set of kinds whose direction the
+// classifier understands is defined exactly once, in direction.go (ControlOfKind and
+// looseningFieldPaths), and `security-loosen` keys off the resulting direction rather than off a
+// copy of the list. See the rule's own comment for what the copy cost.
+
+// exposureKinds are the objects that can put something on the internet.
+var exposureKinds = []KindRef{
+	{Group: "", Kind: "Service"},
+	{Group: "networking.k8s.io", Kind: "Ingress"},
+	{Group: "gateway.networking.k8s.io", Kind: "Gateway"},
+	{Group: "gateway.networking.k8s.io", Kind: "HTTPRoute"},
+	{Group: "compute.cnrm.cloud.google.com", Kind: "ComputeForwardingRule"},
+	{Group: "compute.cnrm.cloud.google.com", Kind: "ComputeFirewall"},
+}
+
+// trafficKinds are the objects that decide where live traffic goes.
+var trafficKinds = []KindRef{
+	{Group: "", Kind: "Service"},
+	{Group: "networking.k8s.io", Kind: "Ingress"},
+	{Group: "gateway.networking.k8s.io", Kind: "HTTPRoute"},
+	{Group: "networking.istio.io", Kind: "VirtualService"},
+	{Group: "networking.istio.io", Kind: "DestinationRule"},
+}
+
+// writeVerbs are every op that changes state. `cloud` is included: a Config Connector write is
+// still a write, and the fact that it lands in GCP rather than in etcd makes it more consequential,
+// not less.
+var writeVerbs = []string{"create", "apply", "patch", "delete", "scale", "cloud"}
+
+// CodeFloor returns the table-expressible half of the floor. The evaluation-order half is in
+// classify.go; the two together are AllFloorRuleIDs.
+//
+// Order within the slice is presentation order for the reasons list, not precedence -- precedence
+// is Max over classes and does not depend on order. Reasons are ordered so the most serious reads
+// first, because a chat notification truncates.
+func CodeFloor() RuleSet {
+	return RuleSet{
+		Source: "code-floor",
+		Rules: []Rule{
+			{
+				ID:    RuleSecretMaterialEgress,
+				When:  When{Verbs: writeVerbs, ExcludeKinds: []KindRef{{Group: "", Kind: "Secret"}}},
+				Class: Contributes(ClassGated),
+				// Matched by the classifier's secret scan rather than by When -- the When here only
+				// narrows the candidate set, and floorSecretEgress does the real work. Kept as a row
+				// anyway so the rule has an ID, a reason and a place in the policy listing.
+				Reason: "writes the value of a Secret into an object that is not a Secret; anyone who can read that object can now read the secret",
+			},
+			{
+				ID:     RuleDestructiveStatefulDelete,
+				When:   When{Verbs: []string{"delete"}, Kinds: statefulKinds},
+				Class:  Contributes(ClassGated),
+				Reason: "deletes an object that holds data; the undo plan can restore the object but not its contents",
+			},
+			{
+				ID: RuleSecurityLoosen,
+				// DIRECTION ONLY -- deliberately no Kinds list.
+				//
+				// The first version of this rule ANDed the direction with a list of control-bearing
+				// kinds, and the list was wrong in three places at once: a Namespace carries the
+				// pod-security labels, a ResourceQuota carries spec.hard, and every workload kind
+				// carries securityContext and serviceAccountName. All three are controls the direction
+				// analysis models -- looseningFieldPaths names their exact paths -- so the analysis
+				// would correctly return `loosen` and then no rule would fire, because the kind was not
+				// on a second list that had to be kept in sync by hand. A silently disabled security
+				// gate is the worst failure this package has, since nothing about it is visible: the
+				// action succeeds and the digest says routine.
+				//
+				// The kind list is redundant as well as wrong. `Direction` is never `loosen` unless
+				// direction.go concluded that a control on its fixed, conservative list actually moved
+				// (see directionOf in resolve.go) -- so the whitelist already happened, once, in the
+				// place that has the field diff. Restricting by kind here re-derives it from memory.
+				When:   When{Verbs: writeVerbs, Direction: DirectionLoosen},
+				Class:  Contributes(ClassGated),
+				Reason: "removes or widens a security control",
+			},
+			{
+				ID:     RulePublicExposure,
+				When:   When{Verbs: writeVerbs, Kinds: exposureKinds, Direction: DirectionLoosen},
+				Class:  Contributes(ClassGated),
+				Reason: "exposes a workload to a wider network than it was reachable from before",
+			},
+			{
+				ID: RuleTrafficShiftProduction,
+				When: When{
+					Verbs:      writeVerbs,
+					Kinds:      trafficKinds,
+					FieldPaths: []string{"spec.selector", "spec.rules", "spec.http", "spec.backendRefs", "spec.subsets"},
+				},
+				Class:  Contributes(ClassGated),
+				Reason: "changes where live traffic goes",
+			},
+			{
+				ID:     RuleIdentityChange,
+				When:   When{Verbs: writeVerbs, Kinds: identityKinds},
+				Class:  Contributes(ClassGated),
+				Reason: "changes who a workload runs as, or what an identity is bound to",
+			},
+			{
+				ID:     RuleCrossTierDirectOperation,
+				When:   When{Verbs: writeVerbs, OwnedByLowerTier: true},
+				Class:  Contributes(ClassGated),
+				Reason: "writes directly to an object managed by a lower-tier agent, which will not know the state changed underneath it",
+			},
+			{
+				ID:     RuleSecretWrite,
+				When:   When{Verbs: writeVerbs, Kinds: []KindRef{{Group: "", Kind: "Secret"}}},
+				Class:  Contributes(ClassElevated),
+				Reason: "writes a Secret",
+			},
+		},
+	}
+}
+
+// forbiddenSet is step 2 of 06 §4.2: actions with no path through an agent at all, not even with a
+// human approving.
+//
+// The membership test for this list is narrow on purpose. "Forbidden" is not "very dangerous" --
+// dangerous things gate, and gating is what a human is for. Forbidden is reserved for actions where
+// a human's approval would not make the action safe, because the action destroys the ability to
+// review, undo or audit it. Deleting the audit journal is forbidden; deleting a production database
+// is merely gated, because a human can meaningfully say yes to that and there is a record either
+// way.
+var forbiddenSet = []forbiddenEntry{
+	{
+		Kinds:  []KindRef{{Group: "kubeagents.gke-labs.dev", Kind: "ActionRecord"}},
+		Verbs:  []string{"delete", "patch", "apply"},
+		Reason: "modifies or deletes the action journal, which is the record this action would itself be written to",
+	},
+	{
+		Kinds:  []KindRef{{Group: "kubeagents.gke-labs.dev", Kind: "ChangePolicy"}},
+		Verbs:  []string{"delete", "patch", "apply", "create"},
+		Reason: "edits the policy that decides which actions need approval",
+	},
+	{
+		Kinds:  []KindRef{{Group: "kubeagents.gke-labs.dev", Kind: "FleetFreeze"}},
+		Verbs:  []string{"delete", "patch", "apply"},
+		Reason: "removes the fleet-wide brake",
+	},
+	{
+		Kinds:  []KindRef{{Group: "kubeagents.gke-labs.dev", Kind: "ApprovalRoster"}},
+		Verbs:  []string{"delete", "patch", "apply", "create"},
+		Reason: "edits the list of humans who may approve the agent's actions",
+	},
+	{
+		Kinds:  []KindRef{{Group: "kubeagents.gke-labs.dev", Kind: "Agent"}},
+		Verbs:  []string{"create", "patch", "apply"},
+		Reason: "creates or modifies an Agent, which is how an agent would grant itself a wider scope",
+	},
+	{
+		Kinds: []KindRef{
+			{Group: "admissionregistration.k8s.io", Kind: "ValidatingWebhookConfiguration"},
+			{Group: "admissionregistration.k8s.io", Kind: "MutatingWebhookConfiguration"},
+		},
+		Names:  []string{"kube-agents-validating-webhook", "kube-agents-mutating-webhook"},
+		Verbs:  []string{"delete", "patch", "apply"},
+		Reason: "disables the admission webhook that enforces the agent hierarchy",
+	},
+	{
+		Kinds:  []KindRef{{Group: "apiserver.config.k8s.io", Kind: "AuditPolicy"}},
+		Verbs:  writeVerbs,
+		Reason: "changes what the cluster records",
+	},
+	{
+		Kinds: []KindRef{
+			{Group: "logging.cnrm.cloud.google.com", Kind: "LoggingLogSink"},
+			{Group: "logging.cnrm.cloud.google.com", Kind: "LoggingLogExclusion"},
+		},
+		Verbs:  []string{"delete", "patch", "apply", "create", "cloud"},
+		Reason: "changes where the audit log goes",
+	},
+	{
+		Kinds:  []KindRef{{Group: "", Kind: "Namespace"}},
+		Names:  []string{"kube-system", "kube-agents-system", "gke-system", "gmp-system"},
+		Verbs:  []string{"delete"},
+		Reason: "deletes a system namespace, taking the control plane's own workloads with it",
+	},
+}
+
+type forbiddenEntry struct {
+	Kinds []KindRef
+	// Names narrows the entry to specific objects. Empty means every object of the kind.
+	Names  []string
+	Verbs  []string
+	Reason string
+}
+
+// IsForbidden reports whether an operation is in the forbidden set, with the reason.
+func IsForbidden(op *ResolvedOp) (bool, string) {
+	for _, e := range forbiddenSet {
+		if !matchesKind(e.Kinds, op.Kind) {
+			continue
+		}
+		if len(e.Names) > 0 && !contains(e.Names, op.Name) {
+			continue
+		}
+		if len(e.Verbs) > 0 && !contains(e.Verbs, op.Verb) {
+			continue
+		}
+		return true, e.Reason
+	}
+	return false, ""
+}
+
+// ForbiddenSetSize is exported for the corpus lint, which asserts the fixture set covers every
+// entry. A forbidden-set entry with no fixture is an entry nobody has proven refuses anything.
+func ForbiddenSetSize() int { return len(forbiddenSet) }
