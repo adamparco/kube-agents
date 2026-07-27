@@ -1,5 +1,33 @@
 # MCP Servers configuration.
 mcp_servers:
+  # Inter-agent calls. Hermes hands an MCP server ONLY what its own `env:` block declares, so a
+  # server with no `env:` reads an empty API_SERVER_KEY and refuses every inter-agent call it is
+  # asked to make -- on a pod that is Ready and unit tests that are green (V-CMP-006).
+  # SLACK_BOT_TOKEN is deliberately absent: load_slack_token() keys on
+  # `"SLACK_BOT_TOKEN" not in os.environ` and reads the Secret itself, so a declared-but-empty
+  # value would defeat that fallback rather than fix it. KUBERNETES_SERVICE_* is what lets that
+  # fallback's kubectl reach the API server.
+  agent_common:
+    command: "/opt/hermes/.venv/bin/python3"
+    args:
+      - "/opt/data/scripts/agent_common_server.py"
+    env:
+      KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
+      KUBERNETES_SERVICE_PORT: "${KUBERNETES_SERVICE_PORT}"
+      HERMES_HOME: "${HERMES_HOME}"
+      SESSION_KV_DB_PATH: "${SESSION_KV_DB_PATH}"
+      API_SERVER_KEY: "${API_SERVER_KEY}"
+  # Read-only knowledge API, bridged with the pod's own Workload Identity token (the bridge reads
+  # GCE metadata, not an env credential), which is why it declares no `env:`. Mirrors the
+  # runtime-authoritative renderConfigYAML(); listed in platform_toolsets below, so it has to be
+  # declared here too or the toolset entry names a server that does not exist.
+  developer_knowledge:
+    command: "/opt/hermes/.venv/bin/python3"
+    args:
+      - "/opt/data/scripts/mcp_http_bridge.py"
+      - "https://developerknowledge.googleapis.com/mcp"
+    connect_timeout: 30
+    timeout: 120
   platform_control:
     command: "/opt/hermes/.venv/bin/python3"
     args:

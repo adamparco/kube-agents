@@ -19,8 +19,13 @@
 # substring, and a compound line hides what it runs.
 
 # --- unittest modules (dev/test_*.py) -------------------------------------------------
-# Discovered as one command; 69 tests at time of writing. Individually re-runnable with
-# `python3 -m unittest dev.test_<name>`.
+# Discovered as one command; 148 tests at time of writing. Individually re-runnable with
+# `python3 -m unittest dev.test_<name>`. Discovery is the wiring: a new dev/test_*.py needs no
+# line here, which is why the count is written down -- it is the only thing that notices a module
+# that stopped being discovered. Includes V-CMP-006 (dev/test_mcp_env_declared.py): an MCP server
+# whose script reads a credential the server's own `env:` block never declares. Hermes passes a
+# server only what it declares, so `agent_common` shipped credential-less and refused every
+# inter-agent call from a pod that was Ready with green tests -- invisible to every other line here.
 python3 -m unittest discover dev
 
 # --- standalone L0 checks (dev/tests/*.py) --------------------------------------------
