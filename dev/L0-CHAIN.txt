@@ -58,6 +58,22 @@ python3 dev/tests/spec-ids.py
 # hatch and left two documents still promising it, and P8-T3 shipped provisioning step 13 with no
 # `make` target while every step list stopped at 11. Docs drift on the same schedule as code.
 python3 dev/tests/docs-truth.py
+# V-MET-005's YAML half: does the risk-classification corpus cover the rule set it claims to?
+# corpus_test.go asserts the same property with a Go toolchain and a compiled package; this half
+# needs neither and fails in seconds. Both halves matter. The one that earns its place is the
+# NEGATIVE coverage requirement -- every gating rule needs a case asserting it stays QUIET, because
+# positive-only coverage is satisfied by a classifier that gates everything, and a broker that gates
+# everything is not a safe failure: it trains operators to approve without reading, which is how a
+# gate stops being a control.
+python3 dev/tests/classifier-corpus-lint.py
+# V-GAT-017's L0 half: a closed import allowlist over internal/broker/classify, plus a ban on prose
+# fields on its input surface. The L1 half (classify_test.go) permutes inputs and asserts the answer
+# is byte-identical, which is the property that matters and is also limited to the inputs somebody
+# thought to permute. This half is about shape, and the failure it prevents is not a deliberate one:
+# it is the plausible refactor -- "let the classifier summarise the diff for the approval prompt" --
+# that reaches for a chat client and turns the gate into a model's opinion. `time` is on the
+# forbidden list beside the inference clients, for the same reason and with better odds of arriving.
+python3 dev/tests/classifier-is-model-free.py
 
 # --- repository mechanics (LSN-012) ---------------------------------------------------------
 # Which remote carries the work, and does `main` point at it? Local main tracked `upstream/main`
