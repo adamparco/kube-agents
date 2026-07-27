@@ -61,8 +61,9 @@ will start selecting.
 | **LSN-030** | git, reverts | Work you finished an hour ago is gone again, and the verb that ate it is not the one you guarded | closed | `git-destructive-guard.py` (PreToolUse hook, `.claude/settings.json`) · `test_git_destructive_guard.py` (`unittest discover dev`) |
 | **LSN-031** | verification, security | Every rule passes its own test and three of them are switched off | closed | `classifier-corpus-lint.py` (L0-CHAIN) · `TestEverySecurityControlCanReachAGate` in `classify_test.go` |
 | **LSN-032** | security, codegen, corpus | A deny-list names a group nobody serves, and the corpus that checks it agrees | closed | `api-group-single-sourced.py` (L0-CHAIN) · `TestForbiddenSetNamesTheLiveAPIGroup` in `classify_test.go` |
+| **LSN-033** | security, scope, corpus | A safety list is complete for the domain its author had in mind, and empty for the one where the damage is | closed | `TestNonRecreatableKindsAreGatedByTheClassifier` in `internal/broker/undo/` · `undo-corpus-lint.py` (L0-CHAIN) · corpus §M |
 
-**Open: 0 of 32.**
+**Open: 0 of 33.**
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -1472,3 +1473,81 @@ definition site makes it exit 1 and name `floor.go:241`. `go test ./internal/bro
 not that you were right. Ask what the **third party** is — the API server, the kernel, the remote —
 and find the one artifact that party actually reads. If your code cannot read that same artifact,
 the agreement between your rule and your fixture is worth nothing.
+
+---
+
+## LSN-033 — A safety list is complete for the domain its author had in mind, and empty for the one where the damage is
+
+**Tags:** security, scope, corpus · **Phase:** 9 (P9-T4) · **Status:** closed
+
+**What happened.** P9-T4 built the undo-plan generator, which needs a list of kinds whose deletion
+it cannot reverse. `classify` already had a list of kinds whose deletion destroys data. Rather than
+share one list — the two ask different questions, and a Secret is stateful and *is* recreatable — I
+wrote both and mechanized the one-directional invariant that must hold between them: **anything the
+undo package cannot restore must be gated by the classifier**. The test builds a real classifier and
+runs a `delete` of each non-recreatable kind through it.
+
+Thirteen of seventeen came back `routine`, reason `default-routine: no rule matched`.
+
+The split was perfectly clean. All four that passed were Kubernetes-native — PVC, PV, VolumeSnapshot,
+Namespace. All thirteen that failed were Config Connector. `delete SQLInstance`, `delete
+StorageBucket`, `delete BigQueryDataset`, `delete ComputeDisk`, `delete ComputeSnapshot` and
+`delete ContainerCluster` were all executable by an agent with no human ever seeing them, while
+`delete ConfigMap` — six lines away in the same file — required approval. A separate instance of the
+same shape sat beside it: `IAMServiceAccount` was on the identity list and `IAMServiceAccountKey`,
+the credential itself, was not, so deleting an account gated and revoking its key did not.
+
+**Why nothing caught it.** `statefulKinds` was not wrong. Every kind on it belongs on it, the rule
+that reads it works, and its six corpus cases were green from the day they were written. The list
+was **complete for the domain its author had in mind** — objects that live in etcd — and the domain
+where the data actually lives was not absent from the list so much as absent from the question. A
+missing entry looks exactly like a kind nobody has needed yet.
+
+This is [[lsn-032]]'s corpus finding arriving from the other direction, and it is worth being precise
+about the difference. LSN-032: the corpus was derived from the rule table, so it inherited the
+table's *errors*. Here it inherited the table's *silence*, which is harder, because there is nothing
+to compare. Section C of the classifier corpus asserts six kinds gate and three do not, and it is a
+faithful, well-written test of a list with a hole in it. No amount of care applied to that section
+finds a kind that is not in it. **A corpus derived from a list can only ever check the list's
+interior.** What found this was a *second list, written from a different question* — and then only
+because the two were forced to agree.
+
+The near-miss is worth recording too. Sharing one list between the two packages was the obvious
+move, and it was the wrong one twice over: it would have made one of the two questions wrong, and it
+would have propagated the hole silently into the new consumer instead of exposing it. [[lsn-031]]
+says two whitelists that must agree are an `AND` gate; the refinement here is that **two lists
+answering different questions must not be merged — they must be reconciled by a test**, and the
+reconciliation is where the evidence comes from.
+
+**Mechanization.** Three, and the first is the one that matters:
+
+- **`TestNonRecreatableKindsAreGatedByTheClassifier`** (`internal/broker/undo/invariant_test.go`) —
+  runs every kind in `nonRecreatableKinds` through the **real classifier** with the weakest
+  configuration the product ships (no policies, novel-action suppressed, `UndoPlanPresent: true` so
+  no case can pass via step 6's backstop) and fails on `routine` or `elevated`. It compares two lists
+  by *executing* one against the other rather than by diffing them, so it stays correct while their
+  memberships legitimately diverge. It has a vacuity guard at ten kinds ([[lsn-013]]).
+- **`statefulKinds` extended by twelve CNRM kinds** and `identityKinds` by one, at the definition
+  site in `floor.go`, with the shape of the gap written into the comment beside the divider — the
+  next person to add a kind sees why the list has two halves.
+- **`dev/tests/undo-corpus-lint.py`** on the L0 chain, plus **section M of the classifier corpus**
+  (16 new cases, three of them negative). The lint's negative-set check is keyed on *kinds* rather
+  than fixture ids, so adding a storage kind to `strategy.go` without a fixture fails the lint. All
+  ten of its checks were mutation-tested against a deliberately broken corpus and all ten fired.
+
+**Verify.** `go test ./internal/broker/undo/ -count=1` → ok (the invariant fails on all 13 kinds if
+the `floor.go` change is reverted). `python3 dev/tests/undo-corpus-lint.py` → PASS, 31 cases, 6 verbs
+planned. `python3 dev/tests/classifier-corpus-lint.py` → PASS, 181 cases. L0 chain 18/18.
+
+**Generalize.** Before trusting a safety list, name the domain its author was thinking in, then name
+one it excludes. Not "is anything missing" — that question has no handle — but "what *kind* of thing
+is uniformly absent". A list that is 100% Kubernetes-native in a product that manages cloud resources
+is not a list with gaps; it is a list that answered a smaller question than the one it is being asked.
+The tell is uniformity: when everything on a list shares a property the list is not about, the
+property is a boundary somebody drew without noticing.
+
+**Postscript.** 09 §5 already has a check for this — V-GAT-014, the gated-class conformance matrix,
+scheduled for phase 11. It would have found the hole two phases from now, in a check whose whole
+purpose is finding it. It was found here instead, by a test written for an unrelated reason, because
+that test was the first thing to ask a question from outside the list. Scheduling a check for later
+is not the same as the property holding in the meantime.

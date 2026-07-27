@@ -66,6 +66,13 @@ python3 dev/tests/docs-truth.py
 # everything is not a safe failure: it trains operators to approve without reading, which is how a
 # gate stops being a control.
 python3 dev/tests/classifier-corpus-lint.py
+# V-REV-004's coverage half: does the undo round-trip corpus have a case for every verb in the 06
+# §4.3.1 table, and does its negative set cover the three effects 09 §7.3 names by hand? The Go
+# table test runs the cases and cannot notice one that was never written -- a corpus that quietly
+# loses the `scale` row still passes every test in it. The check that earns its place is the
+# POSITIVE one: a generator that refuses everything satisfies "no plan means gated" perfectly and is
+# useless, so every verb needs a fixture where its inverse is seen to work.
+python3 dev/tests/undo-corpus-lint.py
 # V-GAT-017's L0 half: a closed import allowlist over internal/broker/classify, plus a ban on prose
 # fields on its input surface. The L1 half (classify_test.go) permutes inputs and asserts the answer
 # is byte-identical, which is the property that matters and is also limited to the inputs somebody
