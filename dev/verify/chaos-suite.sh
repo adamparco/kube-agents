@@ -103,6 +103,11 @@ REAL_CR=cluster-admin-cluster-a
 # own against a clean cluster -- which is now the normal state, because phase 2 cleans up after itself.
 REAL_AGENT=examples/gitops-repo/clusters/cluster-a/agents/agent.yaml
 REAL_IDENTITY=examples/gitops-repo/clusters/cluster-a/agents/identity/cluster-admin-identity.yaml
+# ...and the platform Agent above it, because REAL_AGENT is a cluster-admin CR and 06 §1.2 V-6 makes
+# an unreadable parent a REJECTION: the webhook cannot measure a child's ceiling against a parent it
+# cannot see, so it refuses rather than admitting-and-hoping. Applying the child alone now fails at
+# admission, and C1/C2 would report "the controller never reconciled it" — the wrong subject.
+PARENT_AGENT=examples/gitops-repo/fleet/platform-agent.yaml
 PAUSE=registry.k8s.io/pause:3.9
 
 case "$CTX" in
@@ -116,9 +121,11 @@ bad()  { echo "FAIL: $1"; fail=1; }
 note() { echo "  NOTE: $1"; }
 cd "$REPO_ROOT"
 . "$REPO_ROOT/dev/lib/preconditions.sh"
+. "$REPO_ROOT/dev/lib/parent-chain.sh"
 
 # ---- helpers -----------------------------------------------------------------------------------------
 CM_ORIG_REPLICAS=""
+SEEDED=()
 
 cleanup() {
   # Restore the controller replica count (C1 scales it) and remove the chaos namespace. Best-effort.
@@ -130,6 +137,9 @@ cleanup() {
   # Agent CRD carries no finalizer, so deleting the CR is enough and is prompt. The identity SA and
   # ClusterRole are left in place: they are cluster fixtures other suites read, not this run's state.
   $K -n "$REAL_NS" delete agent "$REAL_CR" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  # The parent seeded so the CR above could be admitted at all. Removed after it, since deleting a
+  # parent out from under a live child is precisely the state V-6 exists to keep off the cluster.
+  unseed_parent_agents "$K" "${SEEDED[@]:-}"
 }
 trap cleanup EXIT
 
@@ -263,13 +273,24 @@ esac
 #
 # Verdicts are pass/bad, not `|| true`. A swallowed apply surfaces three assertions later as C1/C2
 # failing about the controller, which is the wrong subject and the expensive kind of wrong.
-echo; echo "== fixture: this suite's own Agent CR (identity, then CR) =="
+echo; echo "== fixture: this suite's own Agent CR (parent, identity, then CR) =="
+if _ref="$(seed_parent_agent "$K" "$PARENT_AGENT")"; then
+  SEEDED+=("$_ref")
+  pass "parent Agent $_ref seeded from $PARENT_AGENT (06 §1.2 V-6; scaleToZero, removed on exit)"
+else
+  bad "parent Agent could not be seeded, so the fixture CR below is rejected at admission and C1/C2 would blame the controller: $_ref"
+fi
 $K apply -f "$REAL_IDENTITY" >/dev/null 2>&1 \
   && pass "fixture identity applied (SA + read-only ClusterRole the gateway pod binds)" \
   || bad "fixture identity apply failed — the gateway pod cannot be created, so C1/C2 would test nothing"
-$K apply -f "$REAL_AGENT" >/dev/null 2>&1 \
-  && pass "fixture Agent CR $REAL_CR applied (the object C1/C2 watch the controller reconcile)" \
-  || bad "fixture Agent CR apply failed — C1/C2 below have no Deployment to observe"
+# The apply's own message is printed on failure rather than discarded: this apply started failing on
+# an admission rule (V-6), and "fixture Agent CR apply failed" alone sent the reader looking at the
+# controller for an hour. The reason the API server gives is the whole diagnosis.
+if _apply_out="$($K apply -f "$REAL_AGENT" 2>&1)"; then
+  pass "fixture Agent CR $REAL_CR applied (the object C1/C2 watch the controller reconcile)"
+else
+  bad "fixture Agent CR apply failed — C1/C2 below have no Deployment to observe: $_apply_out"
+fi
 
 # Fresh chaos namespace (PSS restricted so stand-ins face the same ceiling a real agent pod does).
 $K delete ns "$CHAOS_NS" --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true

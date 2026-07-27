@@ -194,7 +194,11 @@ func TestAgentCardinality(t *testing.T) {
 	})
 
 	t.Run("allows different tiers in the same project to coexist", func(t *testing.T) {
-		existing := agentWithScope("agent-a", "kubeagents-system", agentv1alpha1.TierPlatform, "project-x", "", "")
+		// The seeded platform agent is named "parent-agent" so it IS the parent agentWithScope points
+		// non-platform tiers at. Before V-6 (P8-T9) any name worked here, because nothing read the
+		// parent; now a cluster-admin whose parentRef dangles is refused, and a cardinality fixture
+		// that cannot survive the ceiling check is testing the wrong rule.
+		existing := agentWithScope("parent-agent", "kubeagents-system", agentv1alpha1.TierPlatform, "project-x", "", "")
 		val := &AgentCustomValidator{Client: newTestClient(t, existing)}
 
 		clusterAdmin := agentWithScope("agent-ca", "default", agentv1alpha1.TierClusterAdmin, "project-x", "cluster-1", "")

@@ -62,13 +62,40 @@ A2="beta-agent"
 # have gone ImagePullBackOff and the claim would have failed for a reason unrelated to RWO. It now
 # names the tag `reload-images.sh agents` pushes for THIS commit, and section 3 resolves that tag to
 # a digest in Artifact Registry before asserting anything (P8 also wants zero ghcr.io/gke-labs
-# containers). The dirty-tree variant carries an epoch that cannot be re-derived here, so a dirty
-# tree resolves the clean-commit tag; that is visible in the deferral message when it is absent.
+# containers).
+#
+# THE DIRTY-TREE TAG IS DISCOVERED, NOT GUESSED. `reload-images.sh` tags a dirty tree
+# `dev-<sha>-dirty-<epoch>`, and that epoch cannot be re-derived from here. The first version of this
+# block therefore fell back to the clean-commit tag and DEFERRED whenever the tree was dirty — which
+# is every run inside a build session, so a check written to run on the inner loop could only ever
+# run outside it. That is the shape LSN-007 is about, one step removed: not a check nobody wired up,
+# but a check whose one precondition is false exactly when it would be used. The tag is now looked up
+# in the registry the kubelet pulls from, newest-epoch-first for THIS sha, and the resolved tag is
+# printed so the run says out loud which build it measured.
+#
+# The looked-up image is not claimed to match the working tree byte for byte, and does not need to
+# be: CLAIM 2 is about two agents sharing a namespace without an RWO collision, and it needs a
+# PULLABLE agent image, not a specific one. P1 — which does make the stronger claim — is asserted
+# separately, against the operator.
 PROJECT_ID="${PROJECT_ID:-$(gcloud config get core/project 2>/dev/null)}"
 REGION="${REGION:-us-east4}"
 AR_REPO="${AR_REPO:-kube-agents}"
 AGENT_IMAGE_REPO="${AGENT_IMAGE_REPO:-$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO}"
-AGENT_IMAGE_TAG="${AGENT_IMAGE_TAG:-dev-$(git -C "$(dirname "$0")/../.." rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+if [ -z "${AGENT_IMAGE_TAG:-}" ]; then
+  _sha="$(git -C "$(dirname "$0")/../.." rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  AGENT_IMAGE_TAG="dev-$_sha"
+  if ! git -C "$(dirname "$0")/../.." diff --quiet HEAD 2>/dev/null; then
+    # Sorted by the trailing epoch, numerically, so 1785163224 beats 999999999 rather than losing to
+    # it on a string compare. Any tier would do for the lookup; all three are pushed together.
+    _dirty="$(gcloud artifacts docker tags list "$AGENT_IMAGE_REPO/cluster-admin-agent" \
+      --project "$PROJECT_ID" --format='value(tag)' 2>/dev/null |
+      grep "^dev-$_sha-dirty-[0-9]\{1,\}$" | sort -t- -k4,4n | tail -1)"
+    if [ -n "$_dirty" ]; then
+      AGENT_IMAGE_TAG="$_dirty"
+      echo "  working tree is dirty; resolved the newest pushed build for $_sha: $AGENT_IMAGE_TAG"
+    fi
+  fi
+fi
 
 case "$CTX" in
   gke-scratch-*) : ;;
@@ -136,6 +163,14 @@ create_agent() { # create_agent <name> <tier> <extra-scope-yaml> <extra-spec-yam
   # names are reconciled from the CR, so the naming property is decided before any pod is scheduled;
   # CLAIM 1 is therefore strictly cheaper than CLAIM 2 and must not acquire CLAIM 2's dependencies.
   # Section 3 seeds both fixtures (lib/agent-fixtures.sh) at the point it actually needs pods.
+  #
+  # `serviceAccountName` is the TIER'S READER SA, not `<name>-sa`. It used to be the latter, and
+  # 06 §1.2 V-10 — implemented in P8-T9 — now refuses that: the spec may name only the reader SA,
+  # because an arbitrary name is an authority the CR author picks rather than one the tier template
+  # grants. Both CRs were rejected on the first run after V-10 landed and this script reported four
+  # failures about PVC naming, which is what a fixture carrying an over-broad grant looks like from
+  # the outside. The value below is what the operator would have derived anyway, so section 3's
+  # seeding still finds a name to create.
   cat <<YAML | $K apply -f - >/dev/null || bad "could not create Agent $name"
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: Agent
@@ -162,10 +197,43 @@ ${scope_extra}
     tag: ${AGENT_IMAGE_TAG}
     imagePullPolicy: IfNotPresent
   security:
-    serviceAccountName: ${name}-sa
+    serviceAccountName: ${tier}-agent
 ${spec_extra}
 YAML
 }
+
+# The parent chain, seeded before the children — 06 §1.2 V-6. A cluster-admin CR names a platform
+# parent, and the ceiling webhook rejects a child whose parent it cannot READ: an unverifiable
+# ceiling is not a satisfied one, the same rule P1/P4/P10 apply on the verification side. So the
+# root has to exist here, and it is setup, exactly like the namespace above.
+#
+# Its scope is the project alone, which strictly CONTAINS $A1's {project, cluster} and transitively
+# $A2's {project, cluster, namespace}. `scaleToZero` because this fixture is a ceiling to measure
+# against and not a workload: without it the root's gateway Deployment sits in ImagePullBackOff for
+# the whole run and the next suite reads it as scenery (LSN-026).
+$K apply -f - >/dev/null <<YAML || bad "could not create the platform root"
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: Agent
+metadata:
+  name: platform-agent
+  namespace: $NS
+spec:
+  tier: platform
+  scope:
+    projectId: multi-agent-l2-project
+  harness:
+    clusterName: cluster-a
+    location: us-central1
+    hermes:
+      agentHome: /opt/data
+      apiServerSecretRef:
+        name: platform-agent-secrets
+        key: API_SERVER_KEY
+  deployment:
+    image: ${AGENT_IMAGE_REPO}/platform-agent
+    tag: ${AGENT_IMAGE_TAG}
+    scaleToZero: true
+YAML
 
 create_agent "$A1" cluster-admin "" "  parentRef:
     name: platform-agent"
