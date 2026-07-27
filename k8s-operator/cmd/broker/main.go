@@ -1,0 +1,321 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Command kage-broker is the Action Broker (03 §4.1, 06 §4.1, 08 §2.3). It is the ONLY path by
+// which an agent mutates anything: the agent container itself holds no write credentials, and this
+// process holds them on its behalf, behind the envelope schema, the anti-replay rules, the risk
+// classifier and the journal.
+//
+// It is tier-neutral. One binary and one image serve a platform agent, a cluster-admin agent and a
+// developer-team agent; which one it is serving comes from its own flags -- set by the operator
+// when it renders the pair -- and never from anything a caller sends. That is why `--tier` and
+// `--scope` are startup configuration here rather than envelope fields: 03 §4.1 step 1 derives
+// (tier, scope) from the authenticated identity, and a value the caller could supply would be an
+// authority claim wearing the shape of a parameter.
+//
+// # What this process deliberately does not have
+//
+// One listening port and one mutating route (V-BRK-021). No metrics listener, no pprof, no admin
+// socket, no second Service. Each of those would be a door, and the non-skippability argument for
+// the broker is not "the pipeline checks everything" -- it is "there is nowhere else to go".
+//
+// The image it ships in has no shell (V-RUN-010). `kubectl exec` into this pod gets you a failed
+// exec, not a prompt, which matters because this is the one pod in the mesh whose ServiceAccount
+// can write.
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"flag"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+
+	// Import all Kubernetes client auth plugins (e.g. GCP, OIDC) so in-cluster and exec auth both work.
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/journal"
+)
+
+var (
+	scheme   = runtime.NewScheme()
+	setupLog = ctrl.Log.WithName("setup")
+)
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(agentv1alpha1.AddToScheme(scheme))
+}
+
+// options is every knob this process has. Collected in one struct so that `validate` can be a
+// single function that runs before anything is dialled -- a broker that starts and then discovers
+// it has no client CA is a broker that spent some seconds accepting connections it could not
+// authenticate.
+type options struct {
+	agentName   string
+	tier        string
+	scope       string
+	namespace   string
+	readerSA    string
+	trustDomain string
+
+	certFile     string
+	keyFile      string
+	clientCAFile string
+
+	shutdownGrace time.Duration
+}
+
+func main() {
+	var o options
+	// Every flag has an env fallback because the operator renders a Deployment, and a value that
+	// can only be a flag has to be spelled into an argv array where a typo is invisible until the
+	// pod crash-loops.
+	flag.StringVar(&o.agentName, "agent-name", os.Getenv("KAGE_AGENT_NAME"),
+		"The Agent CR this broker serves. Env: KAGE_AGENT_NAME.")
+	flag.StringVar(&o.tier, "tier", os.Getenv("KAGE_AGENT_TIER"),
+		"platform, cluster-admin or developer-team. Env: KAGE_AGENT_TIER.")
+	flag.StringVar(&o.scope, "scope", os.Getenv("KAGE_AGENT_SCOPE"),
+		"The agent's scope leaf: project for platform, cluster for cluster-admin, namespace for developer-team. Env: KAGE_AGENT_SCOPE.")
+	flag.StringVar(&o.namespace, "namespace", os.Getenv("KAGE_NAMESPACE"),
+		"The namespace this broker and its agent run in, and where ActionRecords are written. Env: KAGE_NAMESPACE.")
+	flag.StringVar(&o.readerSA, "reader-service-account", os.Getenv("KAGE_READER_SERVICE_ACCOUNT"),
+		"The ONE ServiceAccount permitted to submit actions here. Env: KAGE_READER_SERVICE_ACCOUNT.")
+	flag.StringVar(&o.trustDomain, "trust-domain", envOr("KAGE_TRUST_DOMAIN", broker.DefaultTrustDomain),
+		"SPIFFE trust domain the client certificate must belong to. Empty disables the certificate-to-token binding. Env: KAGE_TRUST_DOMAIN.")
+	flag.StringVar(&o.certFile, "tls-cert-file", envOr("KAGE_TLS_CERT_FILE", "/etc/kage/tls/tls.crt"),
+		"Server certificate. Env: KAGE_TLS_CERT_FILE.")
+	flag.StringVar(&o.keyFile, "tls-key-file", envOr("KAGE_TLS_KEY_FILE", "/etc/kage/tls/tls.key"),
+		"Server private key. Env: KAGE_TLS_KEY_FILE.")
+	flag.StringVar(&o.clientCAFile, "client-ca-file", envOr("KAGE_CLIENT_CA_FILE", "/etc/kage/tls/ca.crt"),
+		"CA bundle that client certificates are verified against. Env: KAGE_CLIENT_CA_FILE.")
+	flag.DurationVar(&o.shutdownGrace, "shutdown-grace", 20*time.Second,
+		"How long in-flight submissions have to finish after SIGTERM.")
+
+	opts := zap.Options{Development: true}
+	opts.BindFlags(flag.CommandLine)
+	flag.Parse()
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if err := run(ctrl.SetupSignalHandler(), o); err != nil {
+		setupLog.Error(err, "broker exited with error")
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, o options) error {
+	tier, err := o.validate()
+	if err != nil {
+		return err
+	}
+
+	cfg, err := ctrl.GetConfig()
+	if err != nil {
+		return fmt.Errorf("load kubeconfig: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("build clientset for TokenReview: %w", err)
+	}
+	// A direct client, not a cached one. The broker's reads are its own writes read back, and a
+	// cache would answer "did the record land?" from a watch that may not have caught up -- which
+	// is the one question where a stale yes is worse than a slow no.
+	k8s, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		return fmt.Errorf("build API client: %w", err)
+	}
+
+	security := broker.LogSecuritySink{Log: ctrl.Log.WithName("security")}
+
+	server, err := broker.NewServer(broker.Config{
+		Authenticator: &broker.Authenticator{
+			Reviewer: broker.APITokenReviewer{Client: clientset},
+			Expected: broker.ExpectedCaller{
+				Namespace:      o.namespace,
+				ServiceAccount: o.readerSA,
+				AgentName:      o.agentName,
+				Tier:           tier,
+				Scope:          o.scope,
+			},
+			TrustDomain: o.trustDomain,
+			Security:    security,
+		},
+		Guard: broker.NewReplayGuard(time.Now),
+		// P9-T2 ships the front of the pipeline. Every envelope that survives auth, the schema, the
+		// key recomputation and the three anti-replay mechanisms gets a 503 that names this build --
+		// not a 202 for an action nobody performed. See the Pipeline doc comment.
+		Pipeline: broker.UnavailablePipeline{},
+		Journal: &broker.StoreRejectionJournal{
+			Store:               journal.NewStore(k8s, nil),
+			Namespace:           o.namespace,
+			AgentName:           o.agentName,
+			ActorServiceAccount: brokerServiceAccount(),
+		},
+		Security:  security,
+		Log:       ctrl.Log.WithName("broker"),
+		Namespace: o.namespace,
+	})
+	if err != nil {
+		return err
+	}
+
+	tlsConfig, err := o.tlsConfig()
+	if err != nil {
+		return err
+	}
+	if o.trustDomain == "" {
+		// Loud, because it removes the binding between the certificate and the token: with no trust
+		// domain the broker still requires a client certificate, but stops checking that the
+		// certificate names the same workload the token does.
+		setupLog.Info("WARNING: --trust-domain is empty; the certificate-to-token binding is disabled and only a mesh sidecar that has already verified the peer makes that safe")
+	}
+
+	// ONE listener. Not a metrics listener alongside it, not a debug listener behind a flag: the
+	// route inventory in V-BRK-021 is only meaningful if this is the whole surface.
+	addr := net.JoinHostPort("", strconv.Itoa(broker.Port))
+	httpServer := &http.Server{
+		Addr:      addr,
+		Handler:   server,
+		TLSConfig: tlsConfig,
+		// Bounded, because the broker is the one process in the pod that must stay up: an idle
+		// half-open connection per attempt is a denial of service that needs no exploit.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ErrorLog:          nil,
+	}
+
+	setupLog.Info("starting kage-broker",
+		"agent", o.agentName, "tier", o.tier, "scope", o.scope, "namespace", o.namespace,
+		"reader", o.readerSA, "addr", addr, "routes", server.Routes(), "mutating", server.MutatingRoutes(),
+		"audience", broker.TokenAudience)
+
+	errCh := make(chan error, 1)
+	go func() {
+		// Certificates and key come from TLSConfig, so both arguments are empty.
+		if err := httpServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+	}
+
+	setupLog.Info("shutting down", "grace", o.shutdownGrace)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), o.shutdownGrace)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("graceful shutdown: %w", err)
+	}
+	return <-errCh
+}
+
+// validate refuses to start on anything missing. Every one of these is load-bearing, and a default
+// for any of them would be a broker serving an agent it was not deployed for.
+func (o *options) validate() (agentv1alpha1.AgentTier, error) {
+	for _, f := range []struct{ name, value string }{
+		{"--agent-name / KAGE_AGENT_NAME", o.agentName},
+		{"--tier / KAGE_AGENT_TIER", o.tier},
+		{"--scope / KAGE_AGENT_SCOPE", o.scope},
+		{"--namespace / KAGE_NAMESPACE", o.namespace},
+		{"--reader-service-account / KAGE_READER_SERVICE_ACCOUNT", o.readerSA},
+		{"--tls-cert-file", o.certFile},
+		{"--tls-key-file", o.keyFile},
+		{"--client-ca-file", o.clientCAFile},
+	} {
+		if f.value == "" {
+			return "", fmt.Errorf("missing required %s", f.name)
+		}
+	}
+
+	tier := agentv1alpha1.AgentTier(o.tier)
+	switch tier {
+	case agentv1alpha1.TierPlatform, agentv1alpha1.TierClusterAdmin, agentv1alpha1.TierDeveloperTeam:
+	default:
+		return "", fmt.Errorf("--tier must be %s, %s or %s, got %q",
+			agentv1alpha1.TierPlatform, agentv1alpha1.TierClusterAdmin, agentv1alpha1.TierDeveloperTeam, o.tier)
+	}
+	return tier, nil
+}
+
+// tlsConfig builds the mutual-TLS configuration.
+//
+// RequireAndVerifyClientCert, not VerifyClientCertIfGiven. The difference is the whole of V-BRK-007:
+// with the permissive setting a caller that presents no certificate at all still gets a TLS
+// connection, and the broker's own transport check becomes the only thing standing between an
+// anonymous peer and the actions route. Refusing in the handshake means the request never becomes
+// a request.
+func (o *options) tlsConfig() (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(o.certFile, o.keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load server keypair: %w", err)
+	}
+	caPEM, err := os.ReadFile(o.clientCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("read client CA bundle: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		// An empty pool with RequireAndVerifyClientCert would refuse everything, which fails safe --
+		// but it would fail safe as a mysterious handshake error on every request rather than as a
+		// startup message naming the file.
+		return nil, fmt.Errorf("no certificates found in the client CA bundle %s", o.clientCAFile)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    pool,
+		MinVersion:   tls.VersionTLS13,
+	}, nil
+}
+
+// brokerServiceAccount reports the broker's own write identity for the journal's `actor` field.
+// Recorded so a record says who COULD have written, distinct from who asked.
+func brokerServiceAccount() string {
+	if v := os.Getenv("KAGE_BROKER_SERVICE_ACCOUNT"); v != "" {
+		return v
+	}
+	return "kage-broker"
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}

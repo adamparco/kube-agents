@@ -4,7 +4,8 @@ name: Docker Build
 # docker-publish-ghcr.yml / docker-publish-k8s-operator.yml must match: an image whose first build
 # happens on main, after merge, has no PR that could have caught it breaking. That is how
 # cluster-admin-agent, developer-team-agent and kage-router reached Phase 8 with Dockerfile targets
-# that nothing ever built.
+# that nothing ever built. dev/test_image_provenance.py (V-CMP-002) asserts the two sets are equal,
+# which is what caught kage-broker being added to the publish workflow and not to this one.
 #
 # The tiers all derive FROM agent-base, so they share one gha cache scope and the expensive Hermes
 # layer is built once per run rather than once per tier. Tags are :ci -- these are never pushed, and
@@ -101,6 +102,15 @@ jobs:
           push: false
           cache-from: type=gha,scope=k8s-operator
           tags: kage-router:ci
+
+      - name: Build kage-broker
+        uses: docker/build-push-action@v7
+        with:
+          context: k8s-operator
+          file: k8s-operator/Dockerfile.broker
+          push: false
+          cache-from: type=gha,scope=k8s-operator
+          tags: kage-broker:ci
 
       - name: Build Replay Proxy
         uses: docker/build-push-action@v7

@@ -200,10 +200,16 @@ else
   TAG="src-${SHA}"
 fi
 
-# ─── The seven images ─────────────────────────────────────────────────────────
+# ─── The eight images ─────────────────────────────────────────────────────────
 # Kept in step with `make cloud-build-push` by hand, and asserted against it below rather than
 # trusted: the target's own help text said "every first-party image" while omitting replay-proxy,
-# and a list that silently disagrees would verify six images and report seven refreshed.
+# and a list that silently disagrees would verify seven images and report eight refreshed.
+#
+# kage-broker is built and its presence in the registry verified, but no BROKER_IMAGE is pinned in
+# vars.sh below. That is deliberate and not an omission: nothing reads such a pin yet -- the broker
+# has no standalone Deployment, the operator renders one per Agent CR in P9-T7 -- and a variable
+# written for a consumer that does not exist is the kind of pin that gets trusted before it is
+# wired. P9-T7 adds the pin and its reader together.
 IMAGES=(
   platform-agent
   cluster-admin-agent
@@ -211,6 +217,7 @@ IMAGES=(
   credential-proxy
   k8s-operator
   kage-router
+  kage-broker
   replay-proxy
 )
 

@@ -287,7 +287,7 @@ provision gcp-provision: ## Bootstrap GCP, GKE resources, and deploy Agent.
 # Defined at the repo root because it drives `cloud-build-push`, which is a root target; reachable
 # from here too, since this is the directory the provisioner is normally run from.
 .PHONY: live-refresh
-live-refresh: ## Rebuild all seven images and roll the LIVE install (repo-root target; runs from here too).
+live-refresh: ## Rebuild all eight images and roll the LIVE install (repo-root target; runs from here too).
 	@$(MAKE) -C .. live-refresh ARGS="$(ARGS)"
 
 .PHONY: teardown gcp-teardown

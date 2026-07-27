@@ -33,3 +33,14 @@ docs/build/LEDGER.md
 # The archive is the moved half of LEDGER.md and was de-padded in the same pass. Left out, prettier
 # would re-pad it on the next run and hand back the 290 KB the move just removed.
 docs/build/archive/LEDGER-phases-0-7.md
+
+# --- Reason 3: the file's malformation IS the fixture. ---
+#
+# verification/fixtures/envelopes/malformed/ is the negative corpus the broker's decoder is tested
+# against. Two of them are not parseable JSON at all -- a truncated document, and two JSON values
+# concatenated -- so prettier exits with a SyntaxError and fails `prettier --check` over the branch
+# diff. Formatting the rest is worse than useless: several assert a property of the BYTES (a
+# duplicate key, a specific escape, trailing content after the value), and a formatter that
+# round-trips them through a parser repairs the exact defect the fixture exists to carry, leaving a
+# test that passes while asserting nothing.
+verification/fixtures/envelopes/malformed/

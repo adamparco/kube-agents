@@ -4,8 +4,9 @@
 #   agent tiers / credential-proxy : _CONTEXT=.            _DOCKERFILE=deploy/docker/Dockerfile  _TARGET=<stage>
 #   controller                     : _CONTEXT=k8s-operator _DOCKERFILE=k8s-operator/Dockerfile
 #   kage-router                    : _CONTEXT=k8s-operator _DOCKERFILE=k8s-operator/Dockerfile.router
-# _TARGET is optional -- the operator and router Dockerfiles are single-purpose and have no stage to
-# select -- so the argument list is assembled in bash rather than declared statically.
+#   kage-broker                    : _CONTEXT=k8s-operator _DOCKERFILE=k8s-operator/Dockerfile.broker
+# _TARGET is optional -- the operator, router and broker Dockerfiles are single-purpose and have no
+# stage to select -- so the argument list is assembled in bash rather than declared statically.
 #
 # On _CACHE_URI. It is a BuildKit inline-cache tag (":buildcache"): pulled for --cache-from, pushed
 # so the next build can pull it. It is the one deliberately mutable tag this repo publishes, and it

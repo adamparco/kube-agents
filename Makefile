@@ -32,7 +32,7 @@ default: docker-build
 # push into the same Artifact Registry a real install pulls from, so the damage outlives the build.
 #
 # Refuse rather than quietly emulate. `--platform linux/amd64` under QEMU is the slowness this
-# branch exists to delete: `make cloud-build-push` builds all seven amd64 images in parallel,
+# branch exists to delete: `make cloud-build-push` builds all eight amd64 images in parallel,
 # off-host. Set ALLOW_HOST_ARCH_BUILD=1 to build for THIS machine anyway (not for the cluster).
 HOST_ARCH := $(shell uname -m)
 
@@ -46,7 +46,7 @@ assert-amd64-host:
 	      echo "$(HOST_ARCH) image, and the nodes it would be deployed to are amd64. It would" >&2; \
 	      echo "push and pull cleanly and then die with 'exec format error'." >&2; \
 	      echo "" >&2; \
-	      echo "  make cloud-build-push      # all seven images, amd64, in parallel, off-host" >&2; \
+	      echo "  make cloud-build-push      # all eight images, amd64, in parallel, off-host" >&2; \
 	      echo "  make <target> ALLOW_HOST_ARCH_BUILD=1   # build for this machine anyway" >&2; \
 	      exit 2; \
 	    fi; \
@@ -83,31 +83,37 @@ dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image 
 # use from an arm64 machine (Apple silicon) — a local `docker build` there yields images the GKE
 # nodes cannot run. It also pushes straight into the project's Artifact Registry.
 #
-# The other arm64 escape hatch is $PREBUILT_BINARY: both k8s-operator/Dockerfile and
-# Dockerfile.router skip compilation and copy $TARGETPLATFORM/<binary> instead when it is set, which
-# is how GoReleaser cross-compiles the Go images. It does NOT help the agent tiers — those are
+# The other arm64 escape hatch is $PREBUILT_BINARY: k8s-operator/Dockerfile, Dockerfile.router and
+# Dockerfile.broker all skip compilation and copy $TARGETPLATFORM/<binary> instead when it is set,
+# which is how GoReleaser cross-compiles the Go images. It does NOT help the agent tiers — those are
 # FROM nousresearch/hermes-agent, a whole userspace rather than one static binary, so Cloud Build is
 # the only path for them. See docs/site/.../deploy/docker-images.md.
 #
-# Covers the operator and the router as well as the agent tiers: they are amd64-only for the same
-# reason and were previously buildable on Apple silicon by no documented path at all.
+# Covers the operator, the router and the broker as well as the agent tiers: they are amd64-only
+# for the same reason and were previously buildable on Apple silicon by no documented path at all.
 #
-# The seven builds run CONCURRENTLY, and that is the whole performance story. Cloud Build schedules
+# The eight builds run CONCURRENTLY, and that is the whole performance story. Cloud Build schedules
 # each submission on its own worker, so they were never competing for anything -- the serial loop
-# this replaced simply blocked the Mac on `Waiting for build to complete` seven times in a row.
+# this replaced simply blocked the Mac on `Waiting for build to complete` once per image in a row.
 # Measured 2026-07-26: ~5 min per image, ~35 min serial, and the slowest single image concurrently.
 # Nothing here is shared between builds, so there is no ordering to preserve.
 #
-# Each job's output goes to its own log rather than the terminal: seven `gcloud` progress streams
+# Each job's output goes to its own log rather than the terminal: eight `gcloud` progress streams
 # interleaved line-by-line is not readable, and the failing one has to be findable afterwards. The
 # PID of every job is recorded and waited on INDIVIDUALLY -- a bare `wait` returns 0 and would
 # report a green build for a push that never happened.
 #
-# SEVEN, and the seventh is why this is spelled out. `replay-proxy` is built and signed by
-# docker-publish-ghcr.yml, is deployed on the live install as `standalone-replay`, and was in no
-# `make` target at all -- so the one image with no local build path also had no remote one, while
-# this target's own help text said "every first-party image". Its context is its own directory, not
-# the repo root, which is why the spec list carries a context field rather than assuming one.
+# `replay-proxy` is why the spec list carries a context field rather than assuming one: it is built
+# and signed by docker-publish-ghcr.yml, is deployed on the live install as `standalone-replay`, and
+# was in no `make` target at all -- so the one image with no local build path also had no remote
+# one, while this target's own help text said "every first-party image". Its context is its own
+# directory, not the repo root.
+#
+# `kage-broker` is the eighth, added in P9-T2. It is the third Go binary out of the k8s-operator
+# context and it MUST be here rather than in a broker-specific path: an install that pulls seven
+# images at tag T and a broker at some earlier tag is an install where the process holding the write
+# credential is not the one this tree describes. If it is not built with the rest, `reload-images.sh`
+# would deploy a stale broker by digest and truthfully report success.
 .PHONY: cloud-build-push
 cloud-build-push: ## Build+push every first-party image via Cloud Build, concurrently (LOCATION/TAG overridable).
 	@set -u; \
@@ -130,6 +136,7 @@ cloud-build-push: ## Build+push every first-party image via Cloud Build, concurr
 	submit credential-proxy "_TARGET=credential-proxy,_HERMES_AGENT_TAG=$$HERMES_AGENT_TAG"; \
 	submit k8s-operator "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile"; \
 	submit kage-router  "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile.router"; \
+	submit kage-broker  "_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile.broker"; \
 	submit replay-proxy "_CONTEXT=examples/inference-replay/replay-proxy,_DOCKERFILE=examples/inference-replay/replay-proxy/Dockerfile"; \
 	echo "== $$(echo $$jobs | wc -w | tr -d ' ') builds running concurrently =="; \
 	rc=0; \
@@ -144,7 +151,8 @@ cloud-build-push: ## Build+push every first-party image via Cloud Build, concurr
 	fi; \
 	echo "Done. In k8s-operator/scripts/vars.sh set:"; \
 	echo "  AGENT_IMAGE=$$REPO/platform-agent   AGENT_TAG=$$TAG"; \
-	echo "  OPERATOR_IMAGE=$$REPO/k8s-operator:$$TAG   ROUTER_IMAGE=$$REPO/kage-router:$$TAG"
+	echo "  OPERATOR_IMAGE=$$REPO/k8s-operator:$$TAG   ROUTER_IMAGE=$$REPO/kage-router:$$TAG"; \
+	echo "  BROKER_IMAGE=$$REPO/kage-broker:$$TAG"
 
 
 # The outer-loop counterpart to `dev/cluster/reload-images.sh`, which is the inner-loop button and
@@ -163,7 +171,7 @@ cloud-build-push: ## Build+push every first-party image via Cloud Build, concurr
 # `gke-scratch-*` cluster and names reload-images.sh. See the script header for why it deploys by
 # tag and verifies by digest.
 .PHONY: live-refresh
-live-refresh: ## Rebuild all seven images and roll the LIVE install named in k8s-operator/scripts/vars.sh.
+live-refresh: ## Rebuild all eight images and roll the LIVE install named in k8s-operator/scripts/vars.sh.
 	@chmod +x k8s-operator/scripts/*.sh 2>/dev/null || true
 	@./k8s-operator/scripts/live_refresh.sh $(ARGS)
 

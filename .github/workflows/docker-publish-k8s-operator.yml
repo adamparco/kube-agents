@@ -92,6 +92,24 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
+      # The kage-broker is the Action Broker (03 §4.1, 08 §2.3): the third Go binary from this same
+      # context, and the one whose ServiceAccount can write. It is built here rather than anywhere
+      # else so that the operator, the router and the broker are always published together at one
+      # tag -- an install running k8s-operator:T beside a broker from an earlier tag is an install
+      # where the process holding the write credential is not the one this tree describes.
+      - name: Build and Push kage-broker Image
+        uses: docker/build-push-action@v7
+        id: build-broker
+        with:
+          context: k8s-operator
+          file: k8s-operator/Dockerfile.broker
+          push: true
+          provenance: false
+          cache-from: type=gha,scope=k8s-operator
+          tags: ghcr.io/${{ env.IMAGE_REPOSITORY }}/kage-broker:${{ env.KAGE_TAG }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.1.2
 
@@ -99,3 +117,4 @@ jobs:
         run: |
           cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator@${{ steps.build-controller.outputs.digest }}"
           cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/kage-router@${{ steps.build-router.outputs.digest }}"
+          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/kage-broker@${{ steps.build-broker.outputs.digest }}"
