@@ -35,6 +35,12 @@ python3 dev/okf-validate.py
 # verify-phase3.sh passing it: argparse exited 2, stderr went to /dev/null, and P3-K7 verified
 # nothing for a day (LSN-021). Nothing in L0 looked at a CLI's callers until this line existed.
 python3 dev/tests/cli-contract.py
+# Quota sizing vs the pod it must admit. The agent gateway's footprint is decided in
+# agent_manifests.go (3700m/6528Mi across four containers); the quota that has to hold it is
+# decided in common.sh. On 2026-07-27 a hand-sized control-namespace quota of 8 CPU / 16Gi applied
+# cleanly, grandfathered every running pod, and locked platform-agent-gateway out at 0/1 with
+# `exceeded quota` — the install looked green the whole time. Nothing compared the two numbers.
+python3 dev/tests/quota-admits-agent.py
 # 09 §14's own lints (V-MET-010/012/013-for-check-IDs). They were written `L0` and never built, so
 # 09 §5.1 lost two load-bearing components and 09 §5.2 five contracts with nothing to notice (LSN-014).
 python3 dev/tests/spec-ids.py

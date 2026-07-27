@@ -1,0 +1,46 @@
+# control-quota.yaml.template
+#
+# Blast-radius bound for the CONTROL namespace (`kubeagents-system`), rendered by
+# `render_control_quota` in common.sh and applied by `provision_03_gcp_gke_operator.sh` immediately
+# after `make deploy` creates the namespace — before steps 08-12 put anything else in it.
+#
+# WHY THIS EXISTS AS A SEPARATE TEMPLATE FROM tenant-quota.yaml.template
+#   The two namespaces hold different things, and the tenant numbers do not transfer. A tenant
+#   namespace holds ONE agent gateway plus the tenant's own workloads. The control namespace holds
+#   the operator, LiteLLM, the GitHub token minter, the inference replay proxy AND one gateway per
+#   co-located tier (platform + cluster-admin). Sizing it from the tenant knobs undercounts by the
+#   whole control plane plus a second gateway.
+#
+#   This is not hypothetical. On 2026-07-27 a hand-written ResourceQuota was applied to
+#   kubeagents-system at HALF the tenant default (8 CPU / 16Gi limits) — plausible-looking numbers
+#   for a namespace that actually needs 10.4 CPU / 18.4Gi. The already-running pods were
+#   grandfathered, so the install looked healthy; `platform-agent-gateway` happened to be
+#   mid-rollout with no surviving old pod and was locked out completely. The deployment sat at 0/1
+#   with `FailedCreate: exceeded quota` while every other pod in the namespace stayed green. The
+#   fix is not a bigger number typed by hand — it is that the number is DERIVED here and checked by
+#   `dev/tests/quota-admits-agent.py` against the gateway footprint the controller actually stamps.
+#
+# WHY IT IS APPLIED BEFORE THE REST OF THE CONTROL PLANE
+#   Same reason as the tenant quota, and see that template's header for the long form: once a quota
+#   sets `requests.*`/`limits.*`, every pod in the namespace MUST declare both or admission rejects
+#   it. Applying it first means a mis-sized control plane fails loudly on the step that creates the
+#   offending pod. Applying it late leaves a trap that springs on whoever triggers the next rollout
+#   rather than on whoever caused it — which is exactly how the incident above presented.
+#
+# THE COMPUTE BOUNDS ARE NOT FREE-HAND. See common.sh `CONTROL_QUOTA_*` for the arithmetic:
+# baseline control plane + (CONTROL_QUOTA_GATEWAYS x the golden gateway footprint), rounded up.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ${CONTROL_QUOTA_NAME}
+  namespace: ${CONTROL_QUOTA_NAMESPACE}
+  labels:
+    kube-agents/control-plane: "true"
+    app.kubernetes.io/managed-by: kube-agents-installer
+spec:
+  hard:
+    requests.cpu: "${CONTROL_QUOTA_REQUESTS_CPU}"
+    requests.memory: ${CONTROL_QUOTA_REQUESTS_MEMORY}
+    limits.cpu: "${CONTROL_QUOTA_LIMITS_CPU}"
+    limits.memory: ${CONTROL_QUOTA_LIMITS_MEMORY}
+    pods: "${CONTROL_QUOTA_PODS}"

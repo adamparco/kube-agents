@@ -114,6 +114,22 @@ execute_operator() {
   wait_for_k8s_resource "deployment/kubeagents-controller-manager" "${NAMESPACE:-kubeagents-system}" "Available" "180s" || return 1
 }
 
+# The control namespace's blast-radius bound. Runs HERE — after `make deploy` has created
+# `kubeagents-system`, and before steps 08-12 put the platform agent, LiteLLM, the token minter,
+# the replay proxy and the cluster-admin gateway into it — so every one of those pods is admitted
+# against the quota on the step that creates it. Applied later, a mis-sized quota instead springs
+# on whoever triggers the next rollout; see control-quota.yaml.template for the incident that
+# taught this.
+#
+# Always reconciles, for the same reason step 3 does: `make deploy` can recreate the namespace, and
+# a quota that exists with the WRONG numbers is the failure being prevented, not a state to skip.
+verify_control_quota() {
+  return 1
+}
+execute_control_quota() {
+  apply_control_quota "${NAMESPACE:-kubeagents-system}"
+}
+
 # The Phase 5 admission layer: the read-only RBAC ceiling and the agent pod hardening rule.
 # These are cluster-scoped and must exist BEFORE any Agent CR is applied (step 08), so a
 # non-conforming agent pod or a write-capable tier role is rejected at admission rather than
@@ -174,7 +190,8 @@ execute_router_config() {
 run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
 run_deploy_step "2. Ensure cert-manager" verify_cert_manager execute_cert_manager 5
 run_deploy_step "3. Deploy Kubernetes Operator" verify_operator execute_operator 0
-run_deploy_step "4. Apply agent admission policies (VAP)" verify_policy execute_policy 5
-run_deploy_step "5. Configure kage-router" verify_router_config execute_router_config 5
+run_deploy_step "4. Bound the control namespace (ResourceQuota)" verify_control_quota execute_control_quota 5
+run_deploy_step "5. Apply agent admission policies (VAP)" verify_policy execute_policy 5
+run_deploy_step "6. Configure kage-router" verify_router_config execute_router_config 5
 
 print_success "Kubernetes Operator deployed successfully!"

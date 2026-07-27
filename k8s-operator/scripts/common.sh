@@ -650,6 +650,166 @@ render_tenant_quota() { # render_tenant_quota <namespace>
   printf '%s\n' "${rendered}"
 }
 
+# ─── Control-namespace quota ──────────────────────────────────────────────────
+#
+# THE SIZING IS ARITHMETIC, NOT A GUESS, AND `dev/tests/quota-admits-agent.py` ENFORCES IT.
+#
+# The control namespace must hold, simultaneously:
+#
+#   baseline control plane   3000m CPU / 5760Mi   (operator 500m/128Mi, LiteLLM x2 500m/2Gi each,
+#                                                  github-token-minter x2 500m/256Mi each,
+#                                                  inference-replay 500m/1Gi) — limits
+#   + N agent gateways       3700m CPU / 6528Mi each — limits
+#
+# The gateway term is NOT written down here. It is the sum of the four containers the controller
+# stamps (agent, dashboard, fluent-bit, event-watcher), and the check reads it out of the golden
+# render at k8s-operator/internal/testing/testdata/platform/expected/agent.yaml. That coupling is
+# the entire point: bump the agent's memory limit in agent_manifests.go and the golden test forces
+# the golden file to change, and the moment it does, the check re-does this arithmetic and fails if
+# these defaults no longer fit. A quota sized by hand is only correct until the pod grows.
+#
+# CONTROL_QUOTA_GATEWAYS is 3, not 2: platform + cluster-admin are resident, and the third is the
+# headroom that lets a rolling update run (new pod admitted before the old one is released) without
+# the rollout stalling on admission. Two resident gateways with no spare is the configuration that
+# produced the 2026-07-27 lockout described in control-quota.yaml.template.
+#
+#   limits.cpu      3000m + 3 x 3700m  = 14100m -> 16
+#   limits.memory   5760Mi + 3 x 6528Mi = 25344Mi -> 32Gi
+#   requests.cpu     510m + 3 x  906m  =  3228m -> 8
+#   requests.memory 1600Mi + 3 x 2752Mi =  9856Mi -> 16Gi
+#
+# The baseline figures are declared rather than derived because the components are spread across
+# provision_03/09/10/11 and a kustomize base; they are a measured floor, and the check treats them
+# as such. Raising a component's limits without raising the baseline here is the one drift this
+# arrangement does not catch — which is why they are named individually above.
+CONTROL_QUOTA_BASELINE_LIMITS_CPU_MILLIS="${CONTROL_QUOTA_BASELINE_LIMITS_CPU_MILLIS:-3000}"
+CONTROL_QUOTA_BASELINE_LIMITS_MEMORY_MIB="${CONTROL_QUOTA_BASELINE_LIMITS_MEMORY_MIB:-5760}"
+CONTROL_QUOTA_BASELINE_REQUESTS_CPU_MILLIS="${CONTROL_QUOTA_BASELINE_REQUESTS_CPU_MILLIS:-510}"
+CONTROL_QUOTA_BASELINE_REQUESTS_MEMORY_MIB="${CONTROL_QUOTA_BASELINE_REQUESTS_MEMORY_MIB:-1600}"
+CONTROL_QUOTA_GATEWAYS="${CONTROL_QUOTA_GATEWAYS:-3}"
+
+render_control_quota() { # render_control_quota [namespace]
+  local namespace="${1:-${CONTROL_NAMESPACE:-kubeagents-system}}"
+  local template="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/control-quota.yaml.template"
+
+  if [ ! -f "${template}" ]; then
+    print_error "Control quota template not found: ${template}"
+    exit 1
+  fi
+
+  local rendered
+  rendered="$(
+    CONTROL_QUOTA_NAMESPACE="${namespace}" \
+      CONTROL_QUOTA_NAME="${CONTROL_QUOTA_NAME:-${namespace}-quota}" \
+      CONTROL_QUOTA_REQUESTS_CPU="${CONTROL_QUOTA_REQUESTS_CPU:-8}" \
+      CONTROL_QUOTA_REQUESTS_MEMORY="${CONTROL_QUOTA_REQUESTS_MEMORY:-16Gi}" \
+      CONTROL_QUOTA_LIMITS_CPU="${CONTROL_QUOTA_LIMITS_CPU:-16}" \
+      CONTROL_QUOTA_LIMITS_MEMORY="${CONTROL_QUOTA_LIMITS_MEMORY:-32Gi}" \
+      CONTROL_QUOTA_PODS="${CONTROL_QUOTA_PODS:-60}" \
+      envsubst '${CONTROL_QUOTA_NAMESPACE} ${CONTROL_QUOTA_NAME} ${CONTROL_QUOTA_REQUESTS_CPU} ${CONTROL_QUOTA_REQUESTS_MEMORY} ${CONTROL_QUOTA_LIMITS_CPU} ${CONTROL_QUOTA_LIMITS_MEMORY} ${CONTROL_QUOTA_PODS}' \
+      <"${template}"
+  )"
+  printf '%s\n' "${rendered}"
+}
+
+# Applies the quota to the control namespace. Called from provision_03 immediately after
+# `make deploy` creates the namespace, so every pod steps 08-12 create is admitted against it.
+#
+# REFUSES TO SHRINK BELOW WHAT IS ALREADY RUNNING. `kubectl apply` of a ResourceQuota whose `hard`
+# is under current `used` succeeds — the API server accepts it, existing pods are grandfathered,
+# and the namespace is left unable to admit the next pod. That is precisely the 2026-07-27 failure,
+# and it is silent. So this reads `used` back first and refuses rather than arming the trap.
+apply_control_quota() { # apply_control_quota [namespace]
+  local namespace="${1:-${CONTROL_NAMESPACE:-kubeagents-system}}" rendered
+
+  if [ "${CONTROL_QUOTA_ENABLED:-true}" != "true" ]; then
+    print_warning "CONTROL_QUOTA_ENABLED=${CONTROL_QUOTA_ENABLED} — skipping. '${namespace}' will have NO compute bound."
+    return 0
+  fi
+
+  rendered="$(render_control_quota "${namespace}")" || return 1
+
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    print_info "[dry-run] would apply ResourceQuota in ${namespace}"
+    printf '%s\n' "${rendered}" | kubectl apply --dry-run=server -f - >/dev/null || return 1
+    print_success "Control ResourceQuota validates against the API server"
+    return 0
+  fi
+
+  assert_control_quota_fits_current_usage "${namespace}" || return 1
+
+  printf '%s\n' "${rendered}" | kubectl apply -f - || return 1
+  print_success "ResourceQuota applied in ${namespace} (${CONTROL_QUOTA_LIMITS_CPU:-16} CPU / ${CONTROL_QUOTA_LIMITS_MEMORY:-32Gi} limits)."
+}
+
+# Reads what the namespace is ALREADY consuming and refuses a quota that cannot cover it. Uses the
+# live ResourceQuota's `used` when one exists; otherwise sums the pods directly, because on a first
+# install there is no quota to read `used` from.
+assert_control_quota_fits_current_usage() { # assert_control_quota_fits_current_usage <namespace>
+  local namespace="$1"
+  local want_cpu want_mem used_cpu used_mem
+
+  want_cpu="$(_cpu_to_millis "${CONTROL_QUOTA_LIMITS_CPU:-16}")"
+  want_mem="$(_mem_to_mib "${CONTROL_QUOTA_LIMITS_MEMORY:-32Gi}")"
+
+  # Sum limits over non-terminal pods. `|| true` throughout: an unreadable namespace must not kill
+  # the caller under `set -e` — it means "could not measure", and an unmeasured namespace is not
+  # evidence of a problem. Same discipline as dev/lib/substrate-capacity.sh.
+  local raw
+  raw="$(kubectl get pods -n "${namespace}" \
+    -o jsonpath='{range .items[?(@.status.phase!="Succeeded")]}{range .spec.containers[*]}{.resources.limits.cpu}{" "}{.resources.limits.memory}{"\n"}{end}{end}' \
+    2>/dev/null)" || raw=""
+
+  if [ -z "${raw}" ]; then
+    print_info "Could not read current pod usage in '${namespace}' (new namespace, or no read access)."
+    print_info "Applying the quota unvalidated. If a later step fails with 'exceeded quota', that is why."
+    return 0
+  fi
+
+  used_cpu=0
+  used_mem=0
+  local c m
+  while read -r c m; do
+    [ -z "${c}" ] && continue
+    used_cpu=$((used_cpu + $(_cpu_to_millis "${c}")))
+    used_mem=$((used_mem + $(_mem_to_mib "${m:-0}")))
+  done <<<"${raw}"
+
+  if [ "${used_cpu}" -gt "${want_cpu}" ] || [ "${used_mem}" -gt "${want_mem}" ]; then
+    print_error "Refusing to apply a ResourceQuota that '${namespace}' already exceeds."
+    print_error "  quota would allow : ${want_cpu}m CPU / ${want_mem}Mi"
+    print_error "  already committed : ${used_cpu}m CPU / ${used_mem}Mi"
+    print_error "Applying it would succeed and then silently block the NEXT pod rollout."
+    print_error "Raise CONTROL_QUOTA_LIMITS_CPU / CONTROL_QUOTA_LIMITS_MEMORY, or reduce what runs here."
+    return 1
+  fi
+
+  print_success "Control quota fits current usage (${used_cpu}m/${want_cpu}m CPU, ${used_mem}Mi/${want_mem}Mi)."
+}
+
+# Kubernetes quantity -> integer millicores. "2" -> 2000, "500m" -> 500, "" -> 0.
+_cpu_to_millis() {
+  local v="${1:-0}"
+  case "${v}" in
+    "") echo 0 ;;
+    *m) echo "${v%m}" ;;
+    *) awk -v x="${v}" 'BEGIN { printf "%d", x * 1000 }' ;;
+  esac
+}
+
+# Kubernetes quantity -> integer MiB. Handles Ki/Mi/Gi/Ti and bare bytes.
+_mem_to_mib() {
+  local v="${1:-0}"
+  case "${v}" in
+    "" | 0) echo 0 ;;
+    *Ki) awk -v x="${v%Ki}" 'BEGIN { printf "%d", x / 1024 }' ;;
+    *Mi) echo "${v%Mi}" ;;
+    *Gi) awk -v x="${v%Gi}" 'BEGIN { printf "%d", x * 1024 }' ;;
+    *Ti) awk -v x="${v%Ti}" 'BEGIN { printf "%d", x * 1024 * 1024 }' ;;
+    *) awk -v x="${v}" 'BEGIN { printf "%d", x / 1048576 }' ;;
+  esac
+}
+
 render_tenant_default_deny() { # render_tenant_default_deny <namespace>
   local namespace="$1"
   local template="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/netpol-tenant-default-deny.yaml.template"

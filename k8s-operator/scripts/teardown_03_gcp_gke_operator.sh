@@ -58,6 +58,19 @@ else
   echo -e "  ${C_GREEN}✓ Agent admission policies removed.${C_RESET}"
 fi
 
+# ─── Step 1c: Remove the control-namespace quota ──────────────────────────────
+# Mirrors step 4 of provision_03. `make undeploy` deletes the namespace on a full teardown, which
+# takes the quota with it — but a partial teardown that leaves the namespace standing would
+# otherwise strand a quota with no control plane to size it against, and the next provision run
+# would apply over it rather than from a clean slate.
+echo -e "  ${C_CYAN}ℹ Removing control-namespace ResourceQuota...${C_RESET}"
+if [ "${DRY_RUN:-0}" -eq 1 ]; then
+  echo -e "  ${C_GREEN}[DRY-RUN] Would delete ResourceQuota ${CONTROL_QUOTA_NAME:-${NAMESPACE}-quota} in ${NAMESPACE}.${C_RESET}"
+else
+  kubectl delete resourcequota "${CONTROL_QUOTA_NAME:-${NAMESPACE}-quota}" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
+  echo -e "  ${C_GREEN}✓ Control-namespace ResourceQuota removed.${C_RESET}"
+fi
+
 # ─── Step 2: Undeploy Operator Manager ────────────────────────────────────────
 OPERATOR_DEPLOYED=""
 if [ "${DRY_RUN:-0}" -ne 1 ]; then
