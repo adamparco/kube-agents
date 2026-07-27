@@ -215,19 +215,40 @@ IMAGES=(
 )
 
 MAKEFILE="${REPO_ROOT}/Makefile"
+# The tiers are NOT named in the Makefile. They are submitted by `for target in $(AGENTS)`, where
+# AGENTS is `$(notdir $(wildcard agents/*/))` — so the recipe mentions no tier by name and the only
+# evidence that a tier is built is that its directory exists and that loop is still there. Grepping
+# the Makefile for the tier name therefore fails for every tier, which is how this guard refused
+# `cluster-admin-agent` on an image set `dev/test_live_refresh_image_set.py` was passing on: the
+# guard asserted a stronger property than the build actually has. Derive it the same way the
+# Makefile and that test do instead. Only the explicitly-named submissions are greppable, and those
+# are matched on `submit <name>` rather than anywhere in the file — `platform` was matching a
+# comment, so the one tier that "passed" was passing for no reason.
 for _img in "${IMAGES[@]}"; do
   case "$_img" in
-    # The three tiers are submitted by a `for target in $(AGENTS)` loop over agents/*/, so they
-    # appear in the Makefile as directory names without the -agent suffix.
-    *-agent) _needle="${_img%-agent}" ;;
-    *) _needle="$_img" ;;
+    *-agent)
+      _tier="${_img%-agent}"
+      if [ ! -d "${REPO_ROOT}/agents/${_tier}" ]; then
+        print_error "'${_img}' is in this script's image list but agents/${_tier}/ does not exist,"
+        print_error "so cloud-build-push's \$(AGENTS) loop would not build it and the verification"
+        print_error "below would fail on a missing tag. Reconcile the two lists."
+        exit 3
+      fi
+      if ! grep -q 'submit "\$\$target-agent"' "$MAKEFILE"; then
+        print_error "The root Makefile no longer submits the agent tiers via the \$(AGENTS) loop."
+        print_error "This script's tier images (${_img} and its siblings) would not be built."
+        exit 3
+      fi
+      ;;
+    *)
+      if ! grep -qE "^[[:space:]]*submit ${_img}([[:space:]]|\$)" "$MAKEFILE"; then
+        print_error "'${_img}' is in this script's image list but the root Makefile's"
+        print_error "cloud-build-push recipe has no 'submit ${_img}' line. It would not be built and"
+        print_error "the verification below would fail on a missing tag. Reconcile the two lists."
+        exit 3
+      fi
+      ;;
   esac
-  if ! grep -q -- "$_needle" "$MAKEFILE"; then
-    print_error "'${_img}' is in this script's image list but nothing in the root Makefile mentions"
-    print_error "'${_needle}'. cloud-build-push would not build it and the verification below would"
-    print_error "fail on a missing tag. Reconcile the two lists."
-    exit 3
-  fi
 done
 
 # ─── The summary, and the affirmative confirmation ────────────────────────────
@@ -410,7 +431,15 @@ check_namespace() {
 
   # One call per namespace. The inner range walks containerStatuses within the current pod, so each
   # line is: pod, deletionTimestamp, then (image, imageID) pairs.
-  while IFS=$'\t' read -r -a line; do
+  #
+  # The separator is '|', not a tab, and that is load-bearing. Tab is IFS *whitespace*: bash
+  # collapses runs of it and discards empty fields, so a healthy pod — whose deletionTimestamp is
+  # empty — arrived as `pod, image, imageID` and `deleted` held the image name. Non-empty means
+  # "being torn down", so the loop skipped every healthy pod and every namespace verified nothing.
+  # The MATCHED=0 guard below caught that and refused to report a pass, which is the only reason
+  # this surfaced as exit 5 rather than a false green. '|' is not IFS whitespace, so empty fields
+  # survive; it cannot occur in a pod name, an image reference or a digest.
+  while IFS='|' read -r -a line; do
     [ "${#line[@]}" -ge 3 ] || continue
     pod="${line[0]}"
     deleted="${line[1]}"
@@ -440,7 +469,7 @@ check_namespace() {
       fi
     done
   done < <(kubectl --context "$KUBE_CONTEXT" -n "$ns" get pods \
-    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{range .status.containerStatuses[*]}{"\t"}{.image}{"\t"}{.imageID}{end}{"\n"}{end}' 2>/dev/null)
+    -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.metadata.deletionTimestamp}{range .status.containerStatuses[*]}{"|"}{.image}{"|"}{.imageID}{end}{"\n"}{end}' 2>/dev/null)
 }
 
 check_namespace "${NAMESPACE:-kubeagents-system}"

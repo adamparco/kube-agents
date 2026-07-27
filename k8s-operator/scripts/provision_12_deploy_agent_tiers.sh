@@ -105,8 +105,15 @@ execute_kubeconfig() { connect_cluster; }
 
 # ─── Step 2: cluster-admin tier ───────────────────────────────────────────────
 verify_cluster_admin() {
+  # Disabled is genuinely "nothing to do".
   [ "${CLUSTER_ADMIN_ENABLED}" != "true" ] && return 0
-  kubectl get agent "${CLUSTER_ADMIN_AGENT_NAME}" -n "${NAMESPACE}" >/dev/null 2>&1
+  # Otherwise always re-apply, the same way provision_08 treats the platform Agent CR. This used to
+  # ask only "does the Agent CR exist", which made the tier write-once: on 2026-07-26 a live refresh
+  # rolled the operator and the platform tier onto src-49cd0e3 while this step printed "Already
+  # completed" and left cluster-admin pinned at src-e8e6423. The image is not the only casualty —
+  # every field the template carries (chat enablement, secret refs, harness config) staled the same
+  # way. `kubectl apply` is idempotent, so re-applying costs a no-op diff when nothing changed.
+  return 1
 }
 execute_cluster_admin() {
   if [ "${CLUSTER_ADMIN_ENABLED}" != "true" ]; then
@@ -130,8 +137,9 @@ execute_cluster_admin() {
 
 # ─── Step 3: developer-team tier ──────────────────────────────────────────────
 verify_developer_team() {
+  # See verify_cluster_admin: existence is not convergence, so always re-apply.
   [ -z "${DEVELOPER_TEAM_NAMESPACE}" ] && return 0
-  kubectl get agent "${DEVELOPER_TEAM_AGENT_NAME}" -n "${DEVELOPER_TEAM_NAMESPACE}" >/dev/null 2>&1
+  return 1
 }
 execute_developer_team() {
   if [ -z "${DEVELOPER_TEAM_NAMESPACE}" ]; then

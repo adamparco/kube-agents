@@ -97,6 +97,25 @@ execute_operator() {
   # Honour OPERATOR_IMAGE / ROUTER_IMAGE from vars.sh. Without this, `make deploy` falls back to
   # the Makefile defaults (ghcr.io/gke-labs/...:v0.1.0) and silently ships the PUBLISHED images
   # even when the operator was built from local source into the project's Artifact Registry.
+  # Both image pins below are written by `kustomize edit set image` INTO TRACKED FILES. Note which
+  # were already dirty so the restore at the end of this function never discards somebody's edit —
+  # the same record-and-restore dev/cluster/up.sh does for the manager kustomization, for the same
+  # reason (a deploy must not leave build inputs dirtier than the image it just built, P1).
+  #
+  # There is a second cost specific to the router file, paid on 2026-07-26: rewriting newName to the
+  # project's Artifact Registry makes the pin stop matching `ghcr.io/gke-labs/kube-agents/...`, and
+  # test_image_provenance scans for exactly that. The released tag it guards became invisible and
+  # the suite failed on `the router kustomization was not scanned` — a local deploy blinding a
+  # release check. Restoring the files closes both.
+  local -a _kust_files=("config/manager/kustomization.yaml" "config/router/kustomization.yaml")
+  local -a _kust_restore=()
+  local _f
+  for _f in "${_kust_files[@]}"; do
+    if git -C "$OPERATOR_DIR" diff --quiet -- "$_f" 2>/dev/null; then
+      _kust_restore+=("$_f")
+    fi
+  done
+
   local -a deploy_args=()
   if [ -n "${OPERATOR_IMAGE:-}" ]; then
     print_info "Deploying controller image ${OPERATOR_IMAGE}"
@@ -110,7 +129,16 @@ execute_operator() {
   fi
 
   print_info "Deploying Operator Controller Manager to the GKE cluster..."
-  make -C "$OPERATOR_DIR" deploy KUBE_CONTEXT="$KUBE_CONTEXT" "${deploy_args[@]}" || return 1
+  local _deploy_rc=0
+  make -C "$OPERATOR_DIR" deploy KUBE_CONTEXT="$KUBE_CONTEXT" "${deploy_args[@]}" || _deploy_rc=1
+
+  # Restore unconditionally, including on a failed deploy: the manifests are already rewritten by
+  # then, so bailing out early is exactly the case that leaves the tree dirty.
+  for _f in "${_kust_restore[@]}"; do
+    git -C "$OPERATOR_DIR" checkout -- "$_f" 2>/dev/null || true
+  done
+  [ "$_deploy_rc" -eq 0 ] || return 1
+
   wait_for_k8s_resource "deployment/kubeagents-controller-manager" "${NAMESPACE:-kubeagents-system}" "Available" "180s" || return 1
 }
 

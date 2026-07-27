@@ -45,6 +45,12 @@ if [ -z "${PROJECT_NUMBER:-}" ]; then
   if [ -z "$PROJECT_NUMBER_VAL" ]; then
     if [ "${DRY_RUN:-0}" -eq 1 ]; then
       PROJECT_NUMBER_VAL="123456789012"
+    elif is_non_interactive; then
+      # Left empty on purpose: the `-z` check immediately below turns that into a named failure.
+      # The dry-run placeholder above must not leak into a real run — a fabricated project number
+      # would be written to vars.sh by save_var and wire Google Chat to a project nobody chose.
+      print_error "Could not resolve the project number for ${PROJECT_ID} and cannot prompt."
+      PROJECT_NUMBER_VAL=""
     else
       echo -ne "  ${C_YELLOW}Failed to resolve project number automatically. Please enter it manually: ${C_RESET}"
       read -r PROJECT_NUMBER_VAL
