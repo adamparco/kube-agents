@@ -32,7 +32,8 @@ When any script is run:
 
 ### Orchestration Scripts
 
-- **[provision.sh](provision.sh)**: Master script that coordinates the sequential execution of all core provisioning steps.
+- **[provision.sh](provision.sh)**: Master script that coordinates the sequential execution of all core provisioning steps. It deploys the images named by `OPERATOR_IMAGE` / `ROUTER_IMAGE` / `AGENT_IMAGE` + `AGENT_TAG`; **no provisioning step builds an image**.
+- **[live_refresh.sh](live_refresh.sh)** (`make live-refresh`): The build half plus `provision.sh`, for refreshing an install that already exists. Builds all seven first-party images on Cloud Build, confirms each tag resolves in Artifact Registry, writes the pins into `vars.sh`, runs the pipeline, and then compares every running container's `imageID` against the digests it published. Reads the target cluster from `vars.sh` and requires the cluster name typed back (`--yes` to skip); refuses `gke-scratch-*`, which belongs to `dev/cluster/reload-images.sh`. Exit codes: `0` ok, `1` usage, `2` refused, `3` missing tooling or config, `4` an image did not build or is absent from the registry, `5` published but the cluster did not converge.
 - **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (conditionally including auxiliary scripts).
 
 #### Provisioning Steps

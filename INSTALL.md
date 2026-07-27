@@ -113,6 +113,34 @@ make gcp-provision
 > [!TIP]
 > Each stage of the provisioning pipeline can also be run individually using step-specific Makefile targets (e.g., `make gcp-provision-01-cluster`, `make gcp-provision-02-gvisor`, ..., `make gcp-provision-11-inference-replay`). See [k8s-operator/README.md](k8s-operator/README.md#running-individual-steps-with-make) for the complete list of individual provisioning and teardown targets.
 
+#### Refreshing an existing install
+
+Once the install exists, `make live-refresh` (from the repo root, or from `k8s-operator/`) is the
+single command that puts your working tree on it:
+
+```bash
+make live-refresh
+```
+
+It builds all seven first-party images on Cloud Build at tag `src-<sha>`, confirms each one resolves
+in Artifact Registry, writes the five image pins into `scripts/vars.sh`, runs all 13 provisioning
+steps, and then compares every running container's `imageID` against the digests it just published —
+so a green run means the cluster really is on that build, not that a command completed.
+
+- The target cluster is **read from `scripts/vars.sh`, never prompted for**, and the script prints
+  it along with the exact tag change and requires you to type the cluster name back. Pass
+  `ARGS="--yes"` to skip that prompt in automation.
+- It **refuses a `gke-scratch-*` cluster** and points at `dev/cluster/reload-images.sh`, which is
+  the inner-loop equivalent and deploys by digest.
+- A dirty working tree is refused, because the tag `src-<sha>` would name a commit that does not
+  contain your changes. `ARGS="--allow-dirty"` tags it as visibly not a commit.
+- Other flags: `ARGS="--dry-run"`, `ARGS="--skip-build"` (images for this tag already exist),
+  `ARGS="--tag my-experiment"`.
+
+Exit codes distinguish the failures that need different responses: `2` refused, `3` missing tooling
+or configuration, `4` an image did not build or is absent from the registry, `5` the images are
+published and correct but a workload did not converge onto them.
+
 #### Step 3: Verify Running Components
 
 Verify that the operator, LiteLLM gateway, and custom resources are healthy:
@@ -368,6 +396,9 @@ webhook that is not serving.
 
 To rebuild and roll out a **platform** agent image on the Method 1 install (the cluster named in
 `k8s-operator/scripts/vars.sh`, not the inner-loop cluster), use `make dev-rebuild-agent ARGS="platform"`.
+That covers the platform agent image only — not the operator, the router, or the two child tiers —
+and it does not write the tag back to `vars.sh`, so the next `provision_08` reverts it. To refresh
+the whole install, use [`make live-refresh`](#refreshing-an-existing-install).
 
 ### Build your working tree onto the cluster (read this before any phase)
 

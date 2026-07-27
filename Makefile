@@ -18,7 +18,7 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 # undo` had nothing distinct to roll back to. Override with `make docker-push TAG=my-experiment`.
 TAG ?= src-$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
-.PHONY: cloud-build-push default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write validate
+.PHONY: cloud-build-push default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent live-refresh status prettier-check prettier-write validate
 
 AGENTS := $(notdir $(patsubst %/,%,$(wildcard agents/*/)))
 
@@ -146,6 +146,26 @@ cloud-build-push: ## Build+push every first-party image via Cloud Build, concurr
 	echo "  AGENT_IMAGE=$$REPO/platform-agent   AGENT_TAG=$$TAG"; \
 	echo "  OPERATOR_IMAGE=$$REPO/k8s-operator:$$TAG   ROUTER_IMAGE=$$REPO/kage-router:$$TAG"
 
+
+# The outer-loop counterpart to `dev/cluster/reload-images.sh`, which is the inner-loop button and
+# refuses any context that is not `gke-scratch-*` -- correctly, since it repoints running workloads
+# and the live install is one `*` away from every script in that directory. Refreshing the live
+# install therefore had no single command: `cloud-build-push`, then five hand-edited lines of
+# vars.sh, then `make gcp-provision`. The hand-edit in the middle is the step that gets skipped, and
+# a skipped pin is how an install ends up running a build nobody chose.
+#
+# `dev-rebuild-agent` is not that command either: it covers the platform agent IMAGE only -- not the
+# operator, not the router, not the two child tiers -- and it never writes the tag back, so the next
+# provision_08 silently reverts it.
+#
+# The guard is inverted rather than absent: the script states the target and the exact change and
+# requires the cluster name typed back (`ARGS="--yes"` for automation), and it REFUSES a
+# `gke-scratch-*` cluster and names reload-images.sh. See the script header for why it deploys by
+# tag and verifies by digest.
+.PHONY: live-refresh
+live-refresh: ## Rebuild all seven images and roll the LIVE install named in k8s-operator/scripts/vars.sh.
+	@chmod +x k8s-operator/scripts/*.sh 2>/dev/null || true
+	@./k8s-operator/scripts/live_refresh.sh $(ARGS)
 
 status:
 	git status
