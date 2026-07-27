@@ -1,0 +1,796 @@
+# The undo round-trip corpus of 09 §7.3, for V-REV-003 and V-REV-004.
+#
+# "One fixture per supported verb x resource-kind class, each recording a pre-state, an action, and
+# the expected restored state. Includes the NEGATIVE SET: actions whose effects are not undoable
+# (deleted PVC data, released IP, rotated credential), which must classify as gated rather than
+# produce a plan that silently loses data."
+#
+# WRITTEN FROM 06 §4.3.1's TABLE, NOT FROM strategy.go. That distinction is the whole reason this
+# file is worth having, and P9-T3b is why it is stated here: the 165-case classifier corpus was
+# written from the rule table it was meant to check, so it agreed with a defect in that table for
+# three phases. A corpus derived from the implementation is the implementation restated in YAML.
+# Each `expect` below is the answer a reader of the spec would defend before looking at any Go.
+#
+# Block style, no flow collections. Prettier owns this file and explodes an over-width flow mapping
+# into a tower of trailing commas; the classifier corpus learned that the expensive way.
+#
+# Fields:
+#   operation.verb            one of create/apply/patch/delete/scale/cloud, or a bad one on purpose
+#   operation.existed         did the target exist before the action (selects between the two
+#                             `apply` rows -- the single most consequential bit in the table)
+#   operation.preState        the object as it was, UNSANITIZED. Omitted where there was none.
+#   operation.snapshotFailed  the broker tried to capture preState and could not
+#   operation.inboundRefs     what the reference index reports points at the target
+#   operation.priorReplicas   the replica count before a scale
+#   expect.strategy           the §4.3.1 strategy column
+#   expect.undoable           false means the action must reclassify gated (V-REV-003)
+#   expect.stepOps            the ops of the generated steps, in order
+#   expect.refusalContains    a substring the refusal must state, so a passing test also proves the
+#                             human-facing reason names what was lost
+
+cases:
+  # ---------------------------------------------------------------------------------------------
+  # create -> delete. "Removing something that did not exist restores the prior state precisely."
+  # ---------------------------------------------------------------------------------------------
+  - id: create-deployment
+    description: Creating a workload is reversed by deleting it. Exact.
+    operation:
+      verb: create
+      target:
+        group: apps
+        version: v1
+        kind: Deployment
+        namespace: team-x
+        name: api-gateway
+      existed: false
+    expect:
+      strategy: delete
+      undoable: true
+      stepOps:
+        - delete
+
+  - id: create-configmap
+    description: Same shape for a config object; the kind does not change the inverse of a create.
+    operation:
+      verb: create
+      target:
+        version: v1
+        kind: ConfigMap
+        namespace: team-x
+        name: app-config
+      existed: false
+    expect:
+      strategy: delete
+      undoable: true
+      stepOps:
+        - delete
+
+  - id: create-networkpolicy
+    description: Creating a policy object is reversible even though the object is security-relevant.
+    operation:
+      verb: create
+      target:
+        group: networking.k8s.io
+        version: v1
+        kind: NetworkPolicy
+        namespace: team-x
+        name: default-deny
+      existed: false
+    expect:
+      strategy: delete
+      undoable: true
+      stepOps:
+        - delete
+
+  # ---------------------------------------------------------------------------------------------
+  # apply. Two rows, selected by `existed`. Getting this backwards deletes an object that was only
+  # modified, which is the most destructive mistake the generator could make.
+  # ---------------------------------------------------------------------------------------------
+  - id: apply-over-existing-deployment
+    description: An apply over an object that was already there is a restore, never a delete.
+    operation:
+      verb: apply
+      target:
+        group: apps
+        version: v1
+        kind: Deployment
+        namespace: team-x
+        name: api-gateway
+        uid: 2f1c0000-0000-0000-0000-000000000001
+      existed: true
+      preState:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: api-gateway
+          namespace: team-x
+        spec:
+          replicas: 3
+    expect:
+      strategy: restore
+      undoable: true
+      stepOps:
+        - apply
+
+  - id: apply-creating-new-service
+    description: An apply over an object that was NOT there is a create wearing an apply's name.
+    operation:
+      verb: apply
+      target:
+        version: v1
+        kind: Service
+        namespace: team-x
+        name: api
+      existed: false
+    expect:
+      strategy: delete
+      undoable: true
+      stepOps:
+        - delete
+
+  # ---------------------------------------------------------------------------------------------
+  # patch -> restore. Always a restore: a patch by definition targets something that exists.
+  # ---------------------------------------------------------------------------------------------
+  - id: patch-deployment-image
+    description: Patching a field is reversed by reapplying the whole prior object.
+    operation:
+      verb: patch
+      target:
+        group: apps
+        version: v1
+        kind: Deployment
+        namespace: team-x
+        name: api-gateway
+        uid: 2f1c0000-0000-0000-0000-000000000002
+      existed: true
+      preState:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: api-gateway
+          namespace: team-x
+        spec:
+          replicas: 3
+    expect:
+      strategy: restore
+      undoable: true
+      stepOps:
+        - apply
+
+  - id: patch-service-type
+    description: Same for a networking object.
+    operation:
+      verb: patch
+      target:
+        version: v1
+        kind: Service
+        namespace: team-x
+        name: api
+        uid: 2f1c0000-0000-0000-0000-000000000003
+      existed: true
+      preState:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: api
+          namespace: team-x
+        spec:
+          type: ClusterIP
+    expect:
+      strategy: restore
+      undoable: true
+      stepOps:
+        - apply
+
+  # ---------------------------------------------------------------------------------------------
+  # scale -> restore, with the fidelity caveat the spec insists on.
+  # ---------------------------------------------------------------------------------------------
+  - id: scale-deployment
+    description: Scaling back is exact for the field; the pods are not the same pods.
+    operation:
+      verb: scale
+      target:
+        group: apps
+        version: v1
+        kind: Deployment
+        namespace: team-x
+        name: api-gateway
+        uid: 2f1c0000-0000-0000-0000-000000000004
+      existed: true
+      priorReplicas: 3
+      preState:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: api-gateway
+          namespace: team-x
+        spec:
+          replicas: 3
+    expect:
+      strategy: restore
+      undoable: true
+      stepOps:
+        - scale
+
+  - id: scale-with-no-recorded-replicas
+    description: A scale whose prior count was never recorded has nothing to scale back to.
+    operation:
+      verb: scale
+      target:
+        group: apps
+        version: v1
+        kind: Deployment
+        namespace: team-x
+        name: api-gateway
+        uid: 2f1c0000-0000-0000-0000-000000000005
+      existed: true
+      preState:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: api-gateway
+          namespace: team-x
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: no recorded prior replica count
+
+  # ---------------------------------------------------------------------------------------------
+  # delete -> recreate. Structural only, and downgraded to `none` the moment anything points at it.
+  # ---------------------------------------------------------------------------------------------
+  - id: delete-stateless-deployment
+    description: Deleting a stateless workload with nothing referencing it recreates cleanly.
+    operation:
+      verb: delete
+      target:
+        group: apps
+        version: v1
+        kind: Deployment
+        namespace: team-x
+        name: api-gateway
+      existed: true
+      preState:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: api-gateway
+          namespace: team-x
+        spec:
+          replicas: 3
+    expect:
+      strategy: recreate
+      undoable: true
+      stepOps:
+        - create
+
+  - id: delete-configmap
+    description: A ConfigMap's contents ARE in the snapshot, so a recreate genuinely restores it.
+    operation:
+      verb: delete
+      target:
+        version: v1
+        kind: ConfigMap
+        namespace: team-x
+        name: app-config
+      existed: true
+      preState:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: app-config
+          namespace: team-x
+        data:
+          LOG_LEVEL: debug
+    expect:
+      strategy: recreate
+      undoable: true
+      stepOps:
+        - create
+
+  - id: delete-secret
+    description: >-
+      A Secret is recreatable even though the classifier gates it. The two questions differ: the
+      classifier asks whether deleting destroys data, this asks whether a recreate restores it, and
+      the snapshot holds the material.
+    operation:
+      verb: delete
+      target:
+        version: v1
+        kind: Secret
+        namespace: team-x
+        name: api-credentials
+      existed: true
+      preState:
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: api-credentials
+          namespace: team-x
+        data:
+          token: c3VwZXItc2VjcmV0LXZhbHVlLWhlcmU=
+    expect:
+      strategy: recreate
+      undoable: true
+      stepOps:
+        - create
+      redactedKeys:
+        - token
+
+  - id: delete-with-inbound-owner-reference
+    description: >-
+      The downgrade case. A recreated object gets a NEW uid, so anything holding the old one is
+      dangling -- the garbage collector sees an ownerReference pointing at a UID that no longer
+      exists and deletes the children. The recreate SUCCEEDS, which is why this must be caught at
+      plan time rather than reported by the replay.
+    operation:
+      verb: delete
+      target:
+        version: v1
+        kind: ConfigMap
+        namespace: team-x
+        name: cache-config
+      existed: true
+      inboundRefs:
+        - kind: StatefulSet
+          name: cache
+          via: ownerReference
+      preState:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: cache-config
+          namespace: team-x
+        data:
+          MAX_ENTRIES: "1024"
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: would be left pointing at a UID that no longer exists
+
+  - id: delete-with-unanswerable-reference-index
+    description: >-
+      An index that errors is not an index that found nothing. Conflating the two is the difference
+      between "nothing points at it" and "I could not look".
+    operation:
+      verb: delete
+      target:
+        version: v1
+        kind: ConfigMap
+        namespace: team-x
+        name: app-config
+      existed: true
+      referenceIndexError: informer cache has not synced
+      preState:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: app-config
+          namespace: team-x
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: could not determine whether anything references
+
+  - id: delete-referenced-service
+    description: >-
+      A recreatable kind that is nonetheless downgraded, because something points at it. This is the
+      case that proves the downgrade is driven by references and not only by the kind list.
+    operation:
+      verb: delete
+      target:
+        version: v1
+        kind: Service
+        namespace: team-x
+        name: api
+      existed: true
+      inboundRefs:
+        - kind: Ingress
+          name: public
+          via: spec.rules[0].http.paths[0].backend.service.name
+      preState:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: api
+          namespace: team-x
+        spec:
+          type: ClusterIP
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: would be left pointing at a UID that no longer exists
+
+  - id: delete-with-no-reference-index
+    description: >-
+      Fail closed. A generator that was never wired to a reference index has not proven the recreate
+      is safe; it has failed to ask. Answering `recreate` here would make the downgrade optional in
+      exactly the deployment where the wiring was forgotten.
+    operation:
+      verb: delete
+      target:
+        group: apps
+        version: v1
+        kind: Deployment
+        namespace: team-x
+        name: api-gateway
+      existed: true
+      noReferenceIndex: true
+      preState:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: api-gateway
+          namespace: team-x
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: no reference index is wired
+
+  # ---------------------------------------------------------------------------------------------
+  # THE NEGATIVE SET (09 §7.3). Effects that are not undoable. Each must refuse rather than emit a
+  # plan that silently loses data -- the refusal is what raises the action to gated.
+  # ---------------------------------------------------------------------------------------------
+  - id: negative-delete-bound-pvc
+    description: Deleting a bound PVC. A recreate yields a new empty volume with the same name.
+    operation:
+      verb: delete
+      target:
+        version: v1
+        kind: PersistentVolumeClaim
+        namespace: team-x
+        name: postgres-data
+      existed: true
+      preState:
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: postgres-data
+          namespace: team-x
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: destroys state that no snapshot contains
+
+  - id: negative-delete-namespace
+    description: Cascading and non-atomic. Recreating the container does not recreate its contents.
+    operation:
+      verb: delete
+      target:
+        version: v1
+        kind: Namespace
+        name: team-x
+      existed: true
+      preState:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: team-x
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: destroys state that no snapshot contains
+
+  - id: negative-delete-sql-instance
+    description: >-
+      A cloud database. Named in 06 §4.3.1 and, until P9-T4, classified `routine` by the code floor
+      -- the classifier's stateful list was Kubernetes-native and the cloud was not on it.
+    operation:
+      verb: delete
+      target:
+        group: sql.cnrm.cloud.google.com
+        version: v1beta1
+        kind: SQLInstance
+        namespace: team-x
+        name: orders-primary
+      existed: true
+      preState:
+        apiVersion: sql.cnrm.cloud.google.com/v1beta1
+        kind: SQLInstance
+        metadata:
+          name: orders-primary
+          namespace: team-x
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: destroys state that no snapshot contains
+
+  - id: negative-delete-storage-bucket
+    description: A bucket. Same list, same reason.
+    operation:
+      verb: delete
+      target:
+        group: storage.cnrm.cloud.google.com
+        version: v1beta1
+        kind: StorageBucket
+        namespace: team-x
+        name: customer-exports
+      existed: true
+      preState:
+        apiVersion: storage.cnrm.cloud.google.com/v1beta1
+        kind: StorageBucket
+        metadata:
+          name: customer-exports
+          namespace: team-x
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: destroys state that no snapshot contains
+
+  - id: negative-delete-compute-address
+    description: >-
+      The released-IP case the spec names. The address is re-allocated within seconds, so a
+      recreated object has the same name and a different address -- everything pointing at the old
+      one resolves and reaches a stranger.
+    operation:
+      verb: delete
+      target:
+        group: compute.cnrm.cloud.google.com
+        version: v1beta1
+        kind: ComputeAddress
+        namespace: team-x
+        name: ingress-static-ip
+      existed: true
+      preState:
+        apiVersion: compute.cnrm.cloud.google.com/v1beta1
+        kind: ComputeAddress
+        metadata:
+          name: ingress-static-ip
+          namespace: team-x
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: destroys state that no snapshot contains
+
+  - id: negative-delete-service-account-key
+    description: >-
+      The rotated-credential case. Deleting the IAMServiceAccount gated before P9-T4; deleting its
+      KEY -- the credential itself -- classified routine.
+    operation:
+      verb: delete
+      target:
+        group: iam.cnrm.cloud.google.com
+        version: v1beta1
+        kind: IAMServiceAccountKey
+        namespace: team-x
+        name: exporter-key
+      existed: true
+      preState:
+        apiVersion: iam.cnrm.cloud.google.com/v1beta1
+        kind: IAMServiceAccountKey
+        metadata:
+          name: exporter-key
+          namespace: team-x
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: destroys state that no snapshot contains
+
+  - id: negative-create-job
+    description: >-
+      "A Job that sent mail, charged a card, or called a webhook. The object is restorable; the
+      effect is not." Deleting the Job removes the record of the work, not the work.
+    operation:
+      verb: create
+      target:
+        group: batch
+        version: v1
+        kind: Job
+        namespace: team-x
+        name: send-invoices
+      existed: false
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: effects leave the API server
+
+  - id: negative-cloud-op-with-no-inverse
+    description: >-
+      A provider call on a kind with no documented inverse. `inverse` is granted per kind, so the
+      default for a cloud operation is that it cannot be undone.
+    operation:
+      verb: cloud
+      target:
+        group: compute.cnrm.cloud.google.com
+        version: v1beta1
+        kind: ComputeFirewall
+        namespace: team-x
+        name: allow-ingress
+      existed: true
+      preState:
+        apiVersion: compute.cnrm.cloud.google.com/v1beta1
+        kind: ComputeFirewall
+        metadata:
+          name: allow-ingress
+          namespace: team-x
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: exposes no documented inverse
+
+  - id: negative-snapshot-failed
+    description: >-
+      06 §4.4's fail-closed table: "cannot persist a pre-state snapshot => refuse that envelope".
+      Distinct from having no snapshot to take.
+    operation:
+      verb: patch
+      target:
+        group: apps
+        version: v1
+        kind: Deployment
+        namespace: team-x
+        name: api-gateway
+      existed: true
+      snapshotFailed: true
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: pre-state snapshot could not be captured
+
+  - id: negative-restore-with-no-snapshot
+    description: A restore needs something to restore. Nil pre-state is a refusal, not an empty apply.
+    operation:
+      verb: patch
+      target:
+        group: apps
+        version: v1
+        kind: Deployment
+        namespace: team-x
+        name: api-gateway
+      existed: true
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: no pre-state snapshot was supplied
+
+  - id: negative-unknown-verb
+    description: >-
+      The table's last row. An unrecognised verb is not an error to retry, it is `none` -- and
+      `none` gates, which is the correct outcome for an operation the generator does not understand.
+    operation:
+      verb: teleport
+      target:
+        group: apps
+        version: v1
+        kind: Deployment
+        namespace: team-x
+        name: api-gateway
+      existed: true
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: has no inverse in the 06 §4.3.1 strategy table
+      # An unrecognised verb never reaches step 6: the classifier rejects the envelope at input
+      # validation, which is a stronger outcome than gating and a different one. Declared here rather
+      # than special-cased in the test, so the two layers' division of labour is written down where a
+      # reviewer reads it -- and so that a future verb the envelope accepts but this table does not
+      # would fail loudly instead of quietly matching this row's exemption.
+      classifierRejectsInput: true
+
+  # ---------------------------------------------------------------------------------------------
+  # cloud -> inverse, where the provider exposes one.
+  # ---------------------------------------------------------------------------------------------
+  - id: cloud-node-pool-resize
+    description: >-
+      A node pool resize has a true inverse -- set the count back. The caveat says what it does not
+      restore: the nodes are new, and the workloads that were evicted are not un-evicted.
+    operation:
+      verb: cloud
+      target:
+        group: container.cnrm.cloud.google.com
+        version: v1beta1
+        kind: ContainerNodePool
+        namespace: team-x
+        name: default-pool
+        uid: 2f1c0000-0000-0000-0000-000000000006
+      existed: true
+      preState:
+        apiVersion: container.cnrm.cloud.google.com/v1beta1
+        kind: ContainerNodePool
+        metadata:
+          name: default-pool
+          namespace: team-x
+        spec:
+          nodeCount: 6
+    expect:
+      strategy: inverse
+      undoable: true
+      stepOps:
+        - apply
+
+  - id: negative-delete-node-pool
+    description: >-
+      The same kind as the case above, and the opposite answer, because the strategy is a property of
+      the VERB and not of the kind. Resizing a node pool has an inverse; deleting one does not, and a
+      generator that keyed on the kind alone would offer to undo this.
+    operation:
+      verb: delete
+      target:
+        group: container.cnrm.cloud.google.com
+        version: v1beta1
+        kind: ContainerNodePool
+        namespace: team-x
+        name: default-pool
+      existed: true
+      preState:
+        apiVersion: container.cnrm.cloud.google.com/v1beta1
+        kind: ContainerNodePool
+        metadata:
+          name: default-pool
+          namespace: team-x
+        spec:
+          nodeCount: 6
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: destroys state that no snapshot contains
+
+  # ---------------------------------------------------------------------------------------------
+  # Multi-operation envelopes. 06 §4.1 makes the envelope the unit, so one un-invertible operation
+  # refuses the whole thing -- a plan that reverses three of four leaves a state nobody designed.
+  # ---------------------------------------------------------------------------------------------
+  - id: multi-all-invertible
+    description: Two reversible operations produce one plan with two steps.
+    operations:
+      - verb: create
+        target:
+          group: apps
+          version: v1
+          kind: Deployment
+          namespace: team-x
+          name: api-gateway
+        existed: false
+      - verb: patch
+        target:
+          version: v1
+          kind: Service
+          namespace: team-x
+          name: api
+          uid: 2f1c0000-0000-0000-0000-000000000007
+        existed: true
+        preState:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: api
+            namespace: team-x
+          spec:
+            type: ClusterIP
+    expect:
+      strategy: restore
+      undoable: true
+      stepOps:
+        - delete
+        - apply
+
+  - id: multi-one-poisons-the-envelope
+    description: >-
+      A reversible create beside an irreversible bucket delete. The whole envelope refuses; there is
+      no such thing as undoing 50% of an atomic unit.
+    operations:
+      - verb: create
+        target:
+          group: apps
+          version: v1
+          kind: Deployment
+          namespace: team-x
+          name: api-gateway
+        existed: false
+      - verb: delete
+        target:
+          group: storage.cnrm.cloud.google.com
+          version: v1beta1
+          kind: StorageBucket
+          namespace: team-x
+          name: customer-exports
+        existed: true
+        preState:
+          apiVersion: storage.cnrm.cloud.google.com/v1beta1
+          kind: StorageBucket
+          metadata:
+            name: customer-exports
+            namespace: team-x
+    expect:
+      strategy: none
+      undoable: false
+      refusalContains: destroys state that no snapshot contains
+      noSteps: true

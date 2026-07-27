@@ -280,6 +280,22 @@ informer that would supply live policies belongs to **P9-T7**, which is where a 
 first exists to consult one. Wiring a watch into a process that classifies nothing would be
 scenery. **V-GAT-009 is therefore claimed at L1 and its L2 instance stays open.**
 
+**T3b's scope note has a T3a sibling that only became visible in T4, and it is a defect rather than
+a boundary.** T3a's 165-case corpus was green over a `statefulKinds` list that covered no Config
+Connector kind at all, so thirteen irreversible cloud deletes — a database, a bucket, a dataset, two
+disk kinds, a GKE cluster — classified `routine` with reason `no rule matched`. Section C of the
+corpus tests that list faithfully and could never have found this: **a corpus derived from a list
+can only check the list's interior.** What found it was T4's cross-package invariant, which runs the
+real classifier over the undo generator's own list of kinds it cannot restore. Fixed at the
+definition site with 16 new corpus cases (§M, three of them negative) and recorded as [[lsn-033]];
+**V-GAT-001 is re-recorded at L1 as a correction, over 181 cases.**
+
+**T4 claims V-REV-003 and V-REV-004 at L1 only.** V-REV-001 (coverage over executed
+`ActionRecord`s) and V-REV-009 (a destructive undo is itself gated) are listed L2-only in 09 §5 and
+belong to units that do not exist yet — there is nothing executing and no undo controller to gate.
+The L2 instances of 003 and 004 need an envtest round-trip against a real API server, which is
+**P9-T5**'s, since that is where the executor that produces the pre-states first exists.
+
 ---
 
 ## Deferrals opened by this phase (each with a named external blocker)

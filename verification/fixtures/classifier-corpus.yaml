@@ -2575,3 +2575,245 @@ cases:
         - object-override
       notRules:
         - blast-radius-cap
+
+  # ---------------------------------------------------------------------------------------------
+  # M. destructive-stateful-delete, WHERE THE DATA ACTUALLY LIVES.
+  #
+  #    Added in P9-T4, after `TestNonRecreatableKindsAreGatedByTheClassifier` found that thirteen of
+  #    the seventeen kinds the undo generator cannot restore classified `routine`, reason
+  #    "default-routine: no rule matched". The split was perfectly clean: every kind the floor knew
+  #    about was Kubernetes-native, and every kind it missed was a Config Connector object. So
+  #    `delete SQLInstance` executed without anyone being asked, while `delete ConfigMap` -- section
+  #    C, six cases, all green since P9-T3a -- required approval.
+  #
+  #    Section C is why this section is separate rather than folded into it. Those cases were
+  #    written from the rule table they were meant to check, so they agreed with it, including where
+  #    it was silent. Every case below was written from the OTHER side: from the list of kinds an
+  #    undo plan provably cannot restore. The two lists are maintained apart and reconciled by a
+  #    test, which is the only arrangement that would have caught this.
+  # ---------------------------------------------------------------------------------------------
+  - id: gat-227
+    description: deleting a Cloud SQL instance gates -- the database is not in any undo plan
+    ops:
+      - verb: delete
+        group: sql.cnrm.cloud.google.com
+        kind: SQLInstance
+        namespace: team-a
+        name: orders-primary
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-228
+    description: deleting a Cloud SQL database gates
+    ops:
+      - verb: delete
+        group: sql.cnrm.cloud.google.com
+        kind: SQLDatabase
+        namespace: team-a
+        name: orders
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-229
+    description: deleting a storage bucket gates
+    ops:
+      - verb: delete
+        group: storage.cnrm.cloud.google.com
+        kind: StorageBucket
+        namespace: team-a
+        name: customer-exports
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-230
+    description: deleting a BigQuery dataset gates
+    ops:
+      - verb: delete
+        group: bigquery.cnrm.cloud.google.com
+        kind: BigQueryDataset
+        namespace: team-a
+        name: analytics
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-231
+    description: deleting a BigQuery table gates
+    ops:
+      - verb: delete
+        group: bigquery.cnrm.cloud.google.com
+        kind: BigQueryTable
+        namespace: team-a
+        name: events
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-232
+    description: deleting a persistent disk gates
+    ops:
+      - verb: delete
+        group: compute.cnrm.cloud.google.com
+        kind: ComputeDisk
+        namespace: team-a
+        name: postgres-pd
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-233
+    description: deleting a disk snapshot gates -- a backup is the last copy by definition
+    ops:
+      - verb: delete
+        group: compute.cnrm.cloud.google.com
+        kind: ComputeSnapshot
+        namespace: team-a
+        name: nightly-2026-07-26
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-234
+    description: >-
+      deleting a GKE cluster gates. Cascading and non-atomic: recreating the container does not
+      recreate what was inside it.
+    ops:
+      - verb: delete
+        group: container.cnrm.cloud.google.com
+        kind: ContainerCluster
+        namespace: team-a
+        name: prod-us-east4
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-235
+    description: deleting a node pool gates
+    ops:
+      - verb: delete
+        group: container.cnrm.cloud.google.com
+        kind: ContainerNodePool
+        namespace: team-a
+        name: default-pool
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-236
+    description: >-
+      deleting a reserved static IP gates. The address is re-allocated within seconds, so a
+      recreated object has the same name and a different address -- worse than a missing one,
+      because everything pointing at it resolves and reaches a stranger.
+    ops:
+      - verb: delete
+        group: compute.cnrm.cloud.google.com
+        kind: ComputeAddress
+        namespace: team-a
+        name: ingress-static-ip
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-237
+    description: deleting a global static IP gates, for the same reason
+    ops:
+      - verb: delete
+        group: compute.cnrm.cloud.google.com
+        kind: ComputeGlobalAddress
+        namespace: team-a
+        name: global-lb-ip
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-238
+    description: >-
+      deleting a DNS zone gates. The records are the data, and re-creating the zone gives you an
+      empty one with new nameservers.
+    ops:
+      - verb: delete
+        group: dns.cnrm.cloud.google.com
+        kind: DNSManagedZone
+        namespace: team-a
+        name: example-com
+    expect:
+      class: gated
+      rules:
+        - destructive-stateful-delete
+
+  - id: gat-239
+    description: >-
+      deleting a service account KEY gates. `IAMServiceAccount` was already on the identity list and
+      `IAMServiceAccountKey` -- the credential itself -- was not, so deleting the account required
+      approval and revoking its key did not. It is on the IDENTITY list rather than the stateful
+      one: a key is not data someone authored, and putting the kind on both lists would make two
+      rules fire for one fact and leave a human reading a duplicated reason.
+    ops:
+      - verb: delete
+        group: iam.cnrm.cloud.google.com
+        kind: IAMServiceAccountKey
+        namespace: team-a
+        name: exporter-key
+    expect:
+      class: gated
+      rules:
+        - identity-change
+      notRules:
+        - destructive-stateful-delete
+
+  # The negative half, and the half that makes the section mean something. A floor that gated every
+  # CNRM kind would pass all thirteen cases above and be useless: `patch` is how a node pool is
+  # resized and how a bucket's lifecycle policy is set, and gating those teaches people that the
+  # gate is noise. The rule is about DELETING data, not about touching cloud objects.
+  - id: gat-240
+    description: patching a Cloud SQL instance does not fire the delete rule
+    ops:
+      - verb: patch
+        group: sql.cnrm.cloud.google.com
+        kind: SQLInstance
+        namespace: team-a
+        name: orders-primary
+    expect:
+      notRules:
+        - destructive-stateful-delete
+
+  - id: gat-241
+    description: creating a storage bucket does not fire the delete rule
+    ops:
+      - verb: create
+        group: storage.cnrm.cloud.google.com
+        kind: StorageBucket
+        namespace: team-a
+        name: customer-exports
+    expect:
+      notRules:
+        - destructive-stateful-delete
+
+  - id: gat-242
+    description: >-
+      deleting a cloud object that holds no data is not covered by this rule. A ComputeFirewall
+      delete is a security change and is caught by `security-loosen`; it is not a data loss, and
+      claiming it here would make the rule mean "any CNRM delete".
+    ops:
+      - verb: delete
+        group: compute.cnrm.cloud.google.com
+        kind: ComputeFirewall
+        namespace: team-a
+        name: allow-ingress
+    expect:
+      notRules:
+        - destructive-stateful-delete

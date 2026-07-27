@@ -62,7 +62,18 @@ var AllFloorRuleIDs = []string{
 // PersistentVolumeClaim loses the volume, and there is no field in an undo plan that contains a
 // disk. That is why these gate on delete while far more disruptive operations on stateless objects
 // do not.
+//
+// THE SECOND HALF OF THIS LIST WAS MISSING UNTIL P9-T4, and the shape of the gap is worth keeping
+// written down. Every kind above the divider is Kubernetes-native; every kind below it is a Config
+// Connector object. The list was complete for the domain whoever wrote it had in mind -- etcd -- and
+// empty for the domain where the data actually lives. `delete SQLInstance`, `delete StorageBucket`,
+// `delete BigQueryDataset`, `delete ComputeDisk` and `delete ContainerCluster` all classified
+// `routine`, reason "no rule matched": an agent could drop a production database without anyone
+// being asked, while deleting the ConfigMap next to it required approval. Found by
+// TestNonRecreatableKindsAreGatedByTheClassifier, which asks the undo generator what it cannot
+// restore and then asks the classifier what it lets through.
 var statefulKinds = []KindRef{
+	// --- Kubernetes-native ---
 	{Group: "", Kind: "PersistentVolumeClaim"},
 	{Group: "", Kind: "PersistentVolume"},
 	{Group: "apps", Kind: "StatefulSet"},
@@ -71,6 +82,51 @@ var statefulKinds = []KindRef{
 	{Group: "", Kind: "Namespace"},
 	{Group: "snapshot.storage.k8s.io", Kind: "VolumeSnapshot"},
 	{Group: "snapshot.storage.k8s.io", Kind: "VolumeSnapshotContent"},
+
+	// --- Config Connector: the cloud resources whose deletion destroys the actual data ---
+	// 06 §4.3.1 names these explicitly -- "a cloud disk, bucket, database, snapshot, or backup" --
+	// and 03 §5.2 repeats them under `destructiveness`. A recreate yields an empty resource with
+	// the same name, which is the most dangerous possible outcome: everything that addresses it by
+	// name reconnects, and finds nothing.
+	{Group: "compute.cnrm.cloud.google.com", Kind: "ComputeDisk"},
+	{Group: "compute.cnrm.cloud.google.com", Kind: "ComputeSnapshot"},
+	{Group: "storage.cnrm.cloud.google.com", Kind: "StorageBucket"},
+	{Group: "sql.cnrm.cloud.google.com", Kind: "SQLInstance"},
+	{Group: "sql.cnrm.cloud.google.com", Kind: "SQLDatabase"},
+	{Group: "bigquery.cnrm.cloud.google.com", Kind: "BigQueryDataset"},
+	{Group: "bigquery.cnrm.cloud.google.com", Kind: "BigQueryTable"},
+
+	// --- Config Connector: containers whose deletion is cascading and non-atomic ---
+	// "recreating the container does not recreate its contents" (06 §4.3.1) applies to a GKE
+	// cluster exactly as it applies to a Namespace, and a node pool takes local state and in-flight
+	// work with it.
+	{Group: "container.cnrm.cloud.google.com", Kind: "ContainerCluster"},
+	{Group: "container.cnrm.cloud.google.com", Kind: "ContainerNodePool"},
+
+	// --- Reserved names, which are re-allocated to somebody else on release ---
+	// Not "data" in the ordinary sense, and on this list for the same reason as the rest: what is
+	// lost is not restorable by recreating the object. A released static IP is handed to the next
+	// caller within seconds, so a recreated ComputeAddress has the same object name and a different
+	// address -- and every DNS record, firewall rule and allowlist still pointing at the old one now
+	// resolves to a stranger.
+	{Group: "compute.cnrm.cloud.google.com", Kind: "ComputeAddress"},
+	{Group: "compute.cnrm.cloud.google.com", Kind: "ComputeGlobalAddress"},
+	{Group: "dns.cnrm.cloud.google.com", Kind: "DNSManagedZone"},
+}
+
+// IsStatefulKind reports whether deleting this kind destroys data the undo plan cannot hold.
+//
+// Exported for the cross-package invariant in internal/broker/undo, which asserts that everything
+// the undo generator cannot restore is gated here. It is a read-only predicate rather than an
+// exported slice on purpose: a caller handed the slice could append to it, and appending to the
+// code floor from outside the package is not a thing that should be possible.
+func IsStatefulKind(k KindRef) bool {
+	for _, s := range statefulKinds {
+		if s.Group == k.Group && s.Kind == k.Kind {
+			return true
+		}
+	}
+	return false
 }
 
 // identityKinds are the objects that decide WHO something is, as opposed to what it may do.
@@ -81,6 +137,12 @@ var identityKinds = []KindRef{
 	{Group: "iam.cnrm.cloud.google.com", Kind: "IAMPolicyMember"},
 	{Group: "iam.cnrm.cloud.google.com", Kind: "IAMServiceAccount"},
 	{Group: "iam.cnrm.cloud.google.com", Kind: "IAMPartialPolicy"},
+	// The KEY, not just the account. Added in P9-T4 by the same invariant that found the cloud data
+	// kinds: deleting an IAMServiceAccount gated, and deleting its key -- which is the credential
+	// itself, and the thing 06 §4.3.1 names under "rotating or deleting a credential" -- classified
+	// routine. Revoking a credential is the more immediate of the two: the account can be rebound,
+	// the key material is gone.
+	{Group: "iam.cnrm.cloud.google.com", Kind: "IAMServiceAccountKey"},
 }
 
 // There is deliberately no `securityControlKinds` list here. The set of kinds whose direction the
