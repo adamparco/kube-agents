@@ -53,6 +53,26 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
+      - actionrecords
+    verbs:
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - actionrecords/status
+      - agents/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
       - agents
     verbs:
       - create
@@ -67,14 +87,6 @@ rules:
     resources:
       - agents/finalizers
     verbs:
-      - update
-  - apiGroups:
-      - kubeagents.x-k8s.io
-    resources:
-      - agents/status
-    verbs:
-      - get
-      - patch
       - update
   - apiGroups:
       - node.k8s.io

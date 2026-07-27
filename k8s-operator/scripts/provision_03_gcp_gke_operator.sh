@@ -162,9 +162,18 @@ execute_control_quota() {
 # These are cluster-scoped and must exist BEFORE any Agent CR is applied (step 08), so a
 # non-conforming agent pod or a write-capable tier role is rejected at admission rather than
 # grandfathered in. Both match ONLY resources labelled kube-agents/tier.
+#
+# The journal policy joins them here (06 §4.3). It comes from the operator's own config/ rather
+# than examples/gitops-repo/ because it guards a CRD the operator owns, and it is applied AFTER
+# step 3 for that reason: a VAP whose matchConstraints name a resource the cluster has never heard
+# of is accepted and then matches nothing. Its binding is what makes it enforce, so both documents
+# ship in the one file and both are checked by verify_policy -- a policy present without its
+# binding is the shape of "installed and inert".
 verify_policy() {
   kubectl get validatingadmissionpolicy kube-agents-agent-readonly >/dev/null 2>&1 &&
-    kubectl get validatingadmissionpolicy kube-agents-agent-pod-hardening >/dev/null 2>&1
+    kubectl get validatingadmissionpolicy kube-agents-agent-pod-hardening >/dev/null 2>&1 &&
+    kubectl get validatingadmissionpolicy kube-agents-agent-scope-journal >/dev/null 2>&1 &&
+    kubectl get validatingadmissionpolicybinding kube-agents-agent-scope-journal >/dev/null 2>&1
 }
 execute_policy() {
   local policy_dir="$OPERATOR_DIR/../examples/gitops-repo/policy"
@@ -175,6 +184,9 @@ execute_policy() {
   print_info "Applying agent admission policies (read-only ceiling + pod hardening)..."
   kubectl apply -f "${policy_dir}/vap-agent-readonly.yaml" || return 1
   kubectl apply -f "${policy_dir}/vap-agent-pod-hardening.yaml" || return 1
+
+  print_info "Applying the ActionRecord.status write policy (06 §4.3)..."
+  kubectl apply -f "$OPERATOR_DIR/config/policy/vap-agent-scope-journal.yaml" || return 1
 }
 
 # The kage-router is the Google CHAT front door: it drains an inbound Pub/Sub subscription and
