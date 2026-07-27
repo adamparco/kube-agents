@@ -214,9 +214,10 @@ func (c *Classifier) classifyOne(in *Input, op *ResolvedOp) (opResult, error) {
 			if !ok {
 				continue
 			}
-			// The secret-egress row only fires when the scan actually found material; its `When` is
-			// a pre-filter, not the test.
-			if r.ID == RuleSecretMaterialEgress && len(op.SecretMaterial) == 0 {
+			// Some rows have a `When` that is a pre-filter and a runtime condition that decides. The
+			// set of them is in floor.go so that this file and the ChangePolicy containment check
+			// read the same list rather than two copies of an ID comparison.
+			if cond, prefilter := prefilterRules[r.ID]; prefilter && !cond(op) {
 				continue
 			}
 			contributed[rs.Source] = true

@@ -1,5 +1,9 @@
 package classify
 
+import (
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
 // The seventeen code-floor rules of 06 §4.2.
 //
 // "Code floor" means two things. It is the MINIMUM classification for every action, which no
@@ -193,6 +197,25 @@ func CodeFloor() RuleSet {
 	}
 }
 
+// prefilterRules maps a rule ID to the runtime condition that decides whether it actually fires.
+//
+// A rule listed here has a `When` that NARROWS CANDIDATES rather than deciding: matching `When` is
+// necessary and not sufficient. Two readers need to know which rules those are, and they are two
+// different files, so the set is written down once here instead of as an ID comparison in each:
+//
+//   - classify.go skips the rule when the condition is false, or `secret-material-egress` would
+//     gate every write in the product.
+//   - stricter.go skips the rule when checking a ChangePolicy for containment, because "your rule
+//     sits inside this rule's When" does not imply "the floor assigns this class", and treating it
+//     as though it did would force every policy rule anyone could write to be `gated`.
+//
+// The condition is a func rather than a bool flag so that adding a rule here forces the author to
+// say what the condition IS. A flag would let a rule be marked as prefiltered with nothing
+// deciding it, which reads as a gate and behaves as an unconditional one.
+var prefilterRules = map[string]func(*ResolvedOp) bool{
+	RuleSecretMaterialEgress: func(op *ResolvedOp) bool { return len(op.SecretMaterial) > 0 },
+}
+
 // forbiddenSet is step 2 of 06 §4.2: actions with no path through an agent at all, not even with a
 // human approving.
 //
@@ -202,29 +225,44 @@ func CodeFloor() RuleSet {
 // review, undo or audit it. Deleting the audit journal is forbidden; deleting a production database
 // is merely gated, because a human can meaningfully say yes to that and there is a record either
 // way.
+// KubeAgentsGroup is this operator's own API group, READ FROM THE SCHEME rather than written out.
+//
+// It was written out, once, as "kubeagents.gke-labs.dev" — a group this operator has never served.
+// Five of the nine forbidden-set entries below name a kube-agents kind, so five of them matched
+// nothing: an agent deleting an ActionRecord, editing a ChangePolicy, lifting a FleetFreeze or
+// rewriting the ApprovalRoster would have sailed past step 2 of the evaluation order. The corpus
+// did not catch it because the fixtures were written from the same wrong string, which is what
+// happens whenever a fixture and the code under test are copied from each other rather than from
+// the definition site.
+//
+// This is LSN-031's shape again — a decision the codebase already made once, in
+// groupversion_info.go, re-made by hand downstream — and TestForbiddenSetNamesTheLiveAPIGroup is
+// the mechanization: any kube-agents kind in the floor whose group is not this constant fails.
+var KubeAgentsGroup = agentv1alpha1.GroupVersion.Group
+
 var forbiddenSet = []forbiddenEntry{
 	{
-		Kinds:  []KindRef{{Group: "kubeagents.gke-labs.dev", Kind: "ActionRecord"}},
+		Kinds:  []KindRef{{Group: KubeAgentsGroup, Kind: "ActionRecord"}},
 		Verbs:  []string{"delete", "patch", "apply"},
 		Reason: "modifies or deletes the action journal, which is the record this action would itself be written to",
 	},
 	{
-		Kinds:  []KindRef{{Group: "kubeagents.gke-labs.dev", Kind: "ChangePolicy"}},
+		Kinds:  []KindRef{{Group: KubeAgentsGroup, Kind: "ChangePolicy"}},
 		Verbs:  []string{"delete", "patch", "apply", "create"},
 		Reason: "edits the policy that decides which actions need approval",
 	},
 	{
-		Kinds:  []KindRef{{Group: "kubeagents.gke-labs.dev", Kind: "FleetFreeze"}},
+		Kinds:  []KindRef{{Group: KubeAgentsGroup, Kind: "FleetFreeze"}},
 		Verbs:  []string{"delete", "patch", "apply"},
 		Reason: "removes the fleet-wide brake",
 	},
 	{
-		Kinds:  []KindRef{{Group: "kubeagents.gke-labs.dev", Kind: "ApprovalRoster"}},
+		Kinds:  []KindRef{{Group: KubeAgentsGroup, Kind: "ApprovalRoster"}},
 		Verbs:  []string{"delete", "patch", "apply", "create"},
 		Reason: "edits the list of humans who may approve the agent's actions",
 	},
 	{
-		Kinds:  []KindRef{{Group: "kubeagents.gke-labs.dev", Kind: "Agent"}},
+		Kinds:  []KindRef{{Group: KubeAgentsGroup, Kind: "Agent"}},
 		Verbs:  []string{"create", "patch", "apply"},
 		Reason: "creates or modifies an Agent, which is how an agent would grant itself a wider scope",
 	},

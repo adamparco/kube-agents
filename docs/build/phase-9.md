@@ -273,6 +273,13 @@ The seam is real rather than administrative: `NewClassifier` already takes `[]Ru
 floor is one of them, so T3b adds a source to a list T3a shipped. The order matters in one
 direction only — a policy that can tighten needs something to tighten first.
 
+**T3b shipped with one scope boundary worth stating, because it is easy to read as a gap.** Nothing
+reads a `ChangePolicy` out of a cluster yet. `FromChangePolicy` converts a CR into the `RuleSet` the
+classifier already consumes, and the max-over-sources property is proven against it at L1 — but the
+informer that would supply live policies belongs to **P9-T7**, which is where a broker pipeline
+first exists to consult one. Wiring a watch into a process that classifies nothing would be
+scenery. **V-GAT-009 is therefore claimed at L1 and its L2 instance stays open.**
+
 ---
 
 ## Deferrals opened by this phase (each with a named external blocker)

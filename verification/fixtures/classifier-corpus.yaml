@@ -1777,7 +1777,7 @@ cases:
     description: deleting an ActionRecord is forbidden -- it is the journal this action lands in
     ops:
       - verb: delete
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: ActionRecord
         namespace: kube-agents-system
         name: ar-1
@@ -1790,7 +1790,7 @@ cases:
     description: patching an ActionRecord is forbidden
     ops:
       - verb: patch
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: ActionRecord
         namespace: kube-agents-system
         name: ar-1
@@ -1803,7 +1803,7 @@ cases:
     description: editing a ChangePolicy is forbidden -- it decides which actions need approval
     ops:
       - verb: apply
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: ChangePolicy
         name: tenant-floor
     expect:
@@ -1815,7 +1815,7 @@ cases:
     description: deleting a FleetFreeze is forbidden -- it is the brake
     ops:
       - verb: delete
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: FleetFreeze
         name: global
     expect:
@@ -1827,7 +1827,7 @@ cases:
     description: editing an ApprovalRoster is forbidden -- it lists the humans who may approve
     ops:
       - verb: patch
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: ApprovalRoster
         name: oncall
     expect:
@@ -1839,7 +1839,7 @@ cases:
     description: creating an Agent is forbidden -- it is how an agent would widen its own scope
     ops:
       - verb: create
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: Agent
         namespace: kube-agents-system
         name: new-agent
@@ -1952,7 +1952,7 @@ cases:
     description: CREATING an ActionRecord is not in the set -- the broker writes the journal
     ops:
       - verb: create
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: ActionRecord
         namespace: kube-agents-system
         name: ar-2
@@ -2013,7 +2013,7 @@ cases:
     undoPlan: false
     ops:
       - verb: delete
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: ActionRecord
         namespace: kube-agents-system
         name: ar-1
@@ -2061,7 +2061,7 @@ cases:
     requireApproval: true
     ops:
       - verb: delete
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: ActionRecord
         namespace: kube-agents-system
         name: ar-1
@@ -2075,7 +2075,7 @@ cases:
     dryRun: true
     ops:
       - verb: delete
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: ActionRecord
         namespace: kube-agents-system
         name: ar-1
@@ -2182,7 +2182,7 @@ cases:
         namespace: team-a
         name: web
       - verb: delete
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: ActionRecord
         namespace: kube-agents-system
         name: ar-1
@@ -2362,7 +2362,7 @@ cases:
     description: a forbidden-set operation beats an abort in the same envelope
     ops:
       - verb: delete
-        group: kubeagents.gke-labs.dev
+        group: kubeagents.x-k8s.io
         kind: ActionRecord
         namespace: kube-agents-system
         name: ar-1

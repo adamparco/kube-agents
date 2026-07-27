@@ -235,6 +235,7 @@ func main() {
 			setupFunc func(ctrl.Manager) error
 		}{
 			{"Agent", agentwebhook.SetupAgentWebhookWithManager},
+			{"ChangePolicy", agentwebhook.SetupChangePolicyWebhookWithManager},
 		}
 
 		for _, wh := range webhooks {

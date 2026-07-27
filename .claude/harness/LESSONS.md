@@ -59,8 +59,10 @@ will start selecting.
 | **LSN-028** | netpol, substrate | An allowlist denies the destination it lists, and the over-block reads as a fixture bug | closed | `egress-enforcement.sh` §3/§4 (run by `verify-phase7.sh` → phase5, L2-CHAIN) |
 | **LSN-029** | portability, substrate | A portability fallback runs the wrong tool first, and the failure arrives on stdout | closed | `invariants-gate.py` `check_platform_idioms_are_gnu_first` (L0-CHAIN) · `test_build_under_test_precondition.py` |
 | **LSN-030** | git, reverts | Work you finished an hour ago is gone again, and the verb that ate it is not the one you guarded | closed | `git-destructive-guard.py` (PreToolUse hook, `.claude/settings.json`) · `test_git_destructive_guard.py` (`unittest discover dev`) |
+| **LSN-031** | verification, security | Every rule passes its own test and three of them are switched off | closed | `classifier-corpus-lint.py` (L0-CHAIN) · `TestEverySecurityControlCanReachAGate` in `classify_test.go` |
+| **LSN-032** | security, codegen, corpus | A deny-list names a group nobody serves, and the corpus that checks it agrees | closed | `api-group-single-sourced.py` (L0-CHAIN) · `TestForbiddenSetNamesTheLiveAPIGroup` in `classify_test.go` |
 
-**Open: 0 of 29.**
+**Open: 0 of 32.**
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -1403,3 +1405,70 @@ asserting it FIRES **and** a case asserting it STAYS QUIET — the negative half
 author skips, and it is the half that catches an over-eager gate, which is not a safe failure
 either: it trains operators to approve without reading. **`python3
 dev/tests/classifier-is-model-free.py`** is the same instinct applied to the package boundary.
+
+---
+
+## LSN-032 — A deny-list names a group nobody serves, and the corpus that checks it agrees
+
+`security, codegen, corpus` · **closed** 2026-07-27 (P9-T3b) · found by reading the code, not by
+running it
+
+**Trigger.** None. Nothing failed. The forbidden set in `internal/broker/classify/floor.go` was
+green under seventeen per-rule table tests and a 165-case corpus, and five of its nine entries were
+keyed on `kubeagents.gke-labs.dev` — an API group this operator has never served. The operator
+serves `kubeagents.x-k8s.io`, and has since the CRD was scaffolded. So `delete ActionRecord`,
+`patch ChangePolicy`, `delete FleetFreeze`, `create ApprovalRoster` and `patch Agent` all fell
+straight through 06 §4.2 step 2 and came out **`routine`** — the four control-plane objects an agent
+must never touch, plus the Agent CR itself, classified as needing no approval at all. It was noticed
+while reading the file for a different reason.
+
+**Why nothing caught it.** A wrong API group is not a compile error, not a runtime error, and not
+observable from either side of the comparison. The rule reads correctly. The fixture that exercises
+the rule reads correctly. They agree with **each other**, which is all a test can see. The only
+party that disagrees is the API server, and its way of disagreeing is to serve a group the rule
+never mentions — the rule does not error, it simply never matches, and a forbidden rule that never
+matches is indistinguishable from one with nothing to forbid.
+
+**Root cause, and the part worth keeping.** The group is a fact the codebase already encodes exactly
+once, in generated code (`SchemeGroupVersion` in `groupversion_info.go`) that is also what the scheme
+registers and therefore what the API server actually serves. `floor.go` restated it as a string
+literal. That is [[lsn-031]]'s shape — *a decision the codebase had already made once, re-made by
+hand downstream* — one level worse, because LSN-031's restatements were of a **judgement** (which
+kinds are security controls), which a careful reader can re-derive and check. This one is an
+**identifier**, and there is nothing to re-derive: it is either byte-equal to what codegen produced
+or it is dead, and a reader cannot tell which by reading.
+
+**The second finding is about the corpus.** LSN-031 closed on "write the corpus before believing the
+unit tests", and the corpus is exactly what should have caught this. It did not, because its
+fixtures were **written from the rule table**, so they inherited the table's errors — twelve
+occurrences of the same wrong group, copied across. A corpus is only independent evidence if it was
+derived independently. Derived from the implementation, it is the implementation restated in YAML,
+and it agrees with every defect the implementation has. That is a real limit on LSN-031's own
+mechanization and is recorded here rather than left as a footnote on that entry.
+
+**Mechanization.** Three, all at the definition site:
+
+- **`KubeAgentsGroup = agentv1alpha1.GroupVersion.Group`** in `floor.go` — the literals are gone;
+  `classify` now imports the API package and reads the group from the same variable the scheme
+  registers. There is no spelling left to get wrong.
+- **`TestForbiddenSetNamesTheLiveAPIGroup`** (`classify_test.go`) builds an operation for each of
+  the five entries from `agentv1alpha1.GroupVersion.Group` — the value the API server uses, not a
+  string in the test — and asserts `forbidden`. If the constant and the served group ever diverge,
+  the test cannot pass, because both sides move together only when they are the same thing.
+- **`dev/tests/api-group-single-sourced.py`** on the L0 chain — no code line in any `.go`, `.yaml`,
+  `.sh` or `.json` file may name a `kubeagents.*` group other than the one parsed out of
+  `groupversion_info.go`. Comments are stripped first ([[lsn-023]]: the paragraph describing this
+  defect must not satisfy or fail the check that prevents it, and three files now discuss the old
+  string by name). The OpenTelemetry `kubeagents.*` attribute keys are a **closed allowlist** rather
+  than a pattern, so a typo in one of those — same silent failure, empty dashboard panel instead of
+  an ungated delete — is a line in this file and not a diff nobody read.
+
+**Verify.** `python3 dev/tests/api-group-single-sourced.py` → PASS, 96 files naming the served
+group and none naming another. Mutation-tested: restoring `kubeagents.gke-labs.dev` at the
+definition site makes it exit 1 and name `floor.go:241`. `go test ./internal/broker/classify/...
+-count=1` covers the five forbidden entries against the live group.
+
+**Generalize.** When a check compares two things you wrote, it is testing that you were consistent,
+not that you were right. Ask what the **third party** is — the API server, the kernel, the remote —
+and find the one artifact that party actually reads. If your code cannot read that same artifact,
+the agreement between your rule and your fixture is worth nothing.

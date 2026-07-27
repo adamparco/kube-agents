@@ -476,6 +476,54 @@ def check_closed_lessons_are_executable() -> list[str]:
     return failures
 
 
+LESSON_BODY = re.compile(r"^##\s+(LSN-\d+)\b", re.MULTILINE)
+
+
+def check_every_lesson_has_an_index_row() -> list[str]:
+    """LSN-019, one level up: a lesson the gate cannot see is a lesson the gate does not enforce.
+
+    `check_closed_lessons_are_executable` iterates the INDEX TABLE. A lesson body appended without
+    its index row is therefore not checked at all — not reported as open, not reported as
+    unmechanized, not reported. It reads as closed to a human (the body says `closed`) and does not
+    exist to the gate.
+
+    That is not hypothetical. LSN-031 was written in P9-T3a with a full body, a `closed` status and
+    two named mechanizations, and no index row. It went unenforced until LSN-032 was being written
+    against the same table and the row was missing from the count.
+
+    The table is also the only place the tag lives, and the tag is how ORIENT decides which lessons
+    to read. A lesson with no row is invisible to the reader who needed it, too.
+    """
+    if not LESSONS.exists():
+        return [f"{LESSONS.relative_to(REPO)} not found"]
+
+    text = LESSONS.read_text()
+    bodies = LESSON_BODY.findall(text)
+    rows = {lid for lid, *_ in LESSON_ROW.findall(text)}
+
+    if len(bodies) < 15:
+        return [
+            f"VACUOUS: parsed only {len(bodies)} lesson bodies from "
+            f"{LESSONS.relative_to(REPO)}; the heading format changed and this check stopped "
+            f"checking. Fix the parser, not the file."
+        ]
+
+    failures = []
+    for lid in bodies:
+        if lid not in rows:
+            failures.append(
+                f"{lid} has a body but no row in the index table. Every other check in this file "
+                f"reads the table, so the lesson is unenforced and its tag is unreadable during "
+                f"ORIENT — it looks closed and is not checked."
+            )
+    for lid in sorted(rows - set(bodies)):
+        failures.append(
+            f"{lid} has an index row and no body. The row's citations are checked and its "
+            f"substance is nowhere; a reader following the tag arrives at nothing."
+        )
+    return failures
+
+
 # ---------------------------------------------------------------------------------------------
 # The chain itself must be real
 # ---------------------------------------------------------------------------------------------
@@ -1663,6 +1711,7 @@ CHECKS = [
         check_l2_scripts_declare_preconditions,
     ),
     ("invariant 13 / LSN-019 — closed lessons are executable", check_closed_lessons_are_executable),
+    ("LSN-019 — every lesson body has an index row", check_every_lesson_has_an_index_row),
     ("P9 — `.status` reads are polled, not slept on", check_l2_status_reads_are_polled),
     ("P3 — recreated pods are resolved by ownership", check_p3_pods_resolved_by_ownership),
     (

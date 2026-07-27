@@ -66,6 +66,7 @@ rules:
     resources:
       - actionrecords/status
       - agents/status
+      - changepolicies/status
     verbs:
       - get
       - patch
@@ -88,6 +89,14 @@ rules:
       - agents/finalizers
     verbs:
       - update
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - changepolicies
+    verbs:
+      - get
+      - list
+      - watch
   - apiGroups:
       - node.k8s.io
     resources:
