@@ -19,7 +19,9 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -316,8 +318,42 @@ type rig struct {
 	pauser  *fakePauser
 	records *fakeRecords
 	brake   *fakeBrake
+	classes *fakeClassifierSource
 
 	pipeline *Pipeline
+}
+
+// fakeClassifierSource is a ClassifierSource a test can change between two submissions -- which is
+// the only way to assert the property the seam exists for, that a policy applied while the broker
+// is running is in force for the next action rather than the next restart.
+type fakeClassifierSource struct {
+	mu  sync.Mutex
+	c   *classify.Classifier
+	err error
+}
+
+func (f *fakeClassifierSource) Current() (*classify.Classifier, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.c, nil
+}
+
+func (f *fakeClassifierSource) set(c *classify.Classifier, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.c, f.err = c, err
+}
+
+func mustClassifier(t *testing.T, policies []classify.RuleSet) *classify.Classifier {
+	t.Helper()
+	c, err := classify.New(policies, seenEverything{})
+	if err != nil {
+		t.Fatalf("classify.New: %v", err)
+	}
+	return c
 }
 
 func liveConfigMap() *unstructured.Unstructured {
@@ -409,21 +445,17 @@ func newRig(t *testing.T, tweaks ...func(*rig)) *rig {
 			Freezes: &broker.FreezeView{ObservedAt: testClock},
 			Journal: broker.BrakeOK,
 		}},
+		classes: &fakeClassifierSource{c: mustClassifier(t, nil)},
 	}
 	for _, tw := range tweaks {
 		tw(r)
-	}
-
-	classifier, err := classify.New(nil, seenEverything{})
-	if err != nil {
-		t.Fatalf("classify.New: %v", err)
 	}
 
 	p, err := New(Config{
 		AgentName:           testAgent,
 		Namespace:           testNamespace,
 		ActorServiceAccount: "platform-agent-actor",
-		Classifier:          classifier,
+		Classifier:          r.classes,
 		Live:                r.live,
 		Refs:                r.refs,
 		Planner:             r.planner,
@@ -834,7 +866,122 @@ func assertNoStepAfter(t *testing.T, tr *broker.StepTrace, last broker.Step) {
 	}
 }
 
-// --- negative controls (09 §6: V-BRK-014 is marked ¬, so this is mandatory) -----------------------
+// --- V-GAT-009: the policy set is resolved per submission, and fails closed ----------------------
+
+// gateCreates is a ChangePolicy that raises every create to gated, converted through the same
+// FromChangePolicy the loader uses -- so this test is exercising the CRD path and not a rule table
+// hand-written in the shape the classifier happens to want.
+func gateCreates(t *testing.T, name string) classify.RuleSet {
+	t.Helper()
+	rs, err := classify.FromChangePolicy(&agentv1alpha1.ChangePolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: agentv1alpha1.ChangePolicySpec{Rules: []agentv1alpha1.ChangeRule{{
+			ID:     "gate-creates-while-ramping",
+			When:   agentv1alpha1.ChangeRuleWhen{Verbs: []agentv1alpha1.ChangeVerb{"create"}},
+			Class:  agentv1alpha1.ChangePolicyClassGated,
+			Reason: "trust-building period: creates are reviewed",
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("FromChangePolicy: %v", err)
+	}
+	return rs
+}
+
+// TestAPolicyAppliedBetweenTwoSubmissionsBindsTheSecond is the property the ClassifierSource seam
+// exists for. Before it, Config held a fixed *classify.Classifier built at startup, so a
+// ChangePolicy an operator applied took effect on the next broker restart -- and the restart would
+// happen some time after the action the policy was written to stop.
+func TestAPolicyAppliedBetweenTwoSubmissionsBindsTheSecond(t *testing.T) {
+	r := newRig(t)
+
+	_, first, err := r.submit(createEnvelope())
+	if err != nil {
+		t.Fatalf("first submit: %v", err)
+	}
+	if first.Decision == "gated" {
+		t.Fatalf("the baseline create is already gated, so this test could not detect the policy taking effect")
+	}
+
+	r.classes.set(mustClassifier(t, []classify.RuleSet{gateCreates(t, "ramp-up")}), nil)
+
+	tr, second, err := r.submit(createEnvelope())
+	if err != nil {
+		t.Fatalf("second submit: %v\ntrace: %s", err, tr)
+	}
+	if second.Decision != "gated" {
+		t.Fatalf("decision = %q, want gated: a policy applied while the broker is running must bind the next action\ntrace: %s",
+			second.Decision, tr)
+	}
+	if got := tr.Reached(); got != broker.StepGate {
+		t.Fatalf("reached %s, want %s\ntrace: %s", got, broker.StepGate, tr)
+	}
+}
+
+// TestAnUnknownPolicySetRefusesRatherThanFallingBackToTheFloor.
+//
+// The tempting failure is the quiet one: the code floor is always available, so a broker that
+// cannot read its ChangePolicy objects could carry on classifying against the floor alone and look
+// completely healthy. It must not. The floor alone is a strictly WEAKER rule table than the floor
+// plus policies -- the classifier maxes over sources -- so that fallback is a silent downgrade of
+// every policy in the cluster, arriving at exactly the moment the cluster is unhealthy.
+func TestAnUnknownPolicySetRefusesRatherThanFallingBackToTheFloor(t *testing.T) {
+	r := newRig(t)
+	r.classes.set(nil, errors.New("the ChangePolicy set was last read 45s ago, past the 30s staleness limit"))
+
+	tr, _, err := r.submit(createEnvelope())
+	if err == nil {
+		t.Fatalf("submit succeeded with an unreadable policy set\ntrace: %s", tr)
+	}
+	var ref *broker.Refusal
+	if !errors.As(err, &ref) {
+		t.Fatalf("err = %v (%T), want a *broker.Refusal", err, err)
+	}
+	if ref.Reason != broker.ReasonPolicyUnavailable {
+		t.Errorf("reason = %q, want %q", ref.Reason, broker.ReasonPolicyUnavailable)
+	}
+	if ref.Status != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", ref.Status, http.StatusServiceUnavailable)
+	}
+	if !ref.Journal {
+		t.Error("a policy-unavailable refusal must be journaled; a refusal nobody records is a refusal nobody investigates")
+	}
+	if !ref.SecurityEvent {
+		t.Error("a broker that cannot see its policies is a control-plane condition an operator has to be told about")
+	}
+	if ref.RetryAfterSeconds <= 0 {
+		t.Error("the refusal is temporary and must say so, or every caller retries immediately and hammers a struggling API server")
+	}
+	if !strings.Contains(ref.Detail, "staleness limit") {
+		t.Errorf("the detail must carry the source's own diagnosis, got %q", ref.Detail)
+	}
+	// The pipeline stops at step 4, before the brake and before any pre-state is written.
+	if got := tr.Reached(); got != broker.StepClassify {
+		t.Fatalf("reached %s, want %s\ntrace: %s", got, broker.StepClassify, tr)
+	}
+	assertNoStepAfter(t, tr, broker.StepClassify)
+	if r.applier.mutations != 0 || r.applier.dryRuns != 0 {
+		t.Errorf("an unclassified action reached the applier: %d dry runs, %d mutations", r.applier.dryRuns, r.applier.mutations)
+	}
+}
+
+func TestNewRejectsAMissingClassifierSource(t *testing.T) {
+	if _, err := New(Config{AgentName: testAgent, Namespace: testNamespace}); err == nil {
+		t.Fatal("New must reject a Config with no ClassifierSource")
+	} else if !strings.Contains(err.Error(), "ClassifierSource") {
+		t.Fatalf("the error must name what is missing: %v", err)
+	}
+	if _, err := (StaticClassifier{}).Current(); err == nil {
+		t.Fatal("an empty StaticClassifier must return an error rather than a nil classifier")
+	}
+	c := mustClassifier(t, nil)
+	got, err := StaticClassifier{C: c}.Current()
+	if err != nil || got != c {
+		t.Fatalf("StaticClassifier.Current = (%v, %v), want the classifier it holds", got, err)
+	}
+}
+
+// --- negative controls (09 §6: V-BRK-014 and V-GAT-009 are marked ¬, so this is mandatory) --------
 
 // TestTheseAssertionsCanFail is the negative control for both checks in this file.
 //
@@ -875,5 +1022,36 @@ func TestTheseAssertionsCanFail(t *testing.T) {
 			t.Errorf("Ran(%s) is true on a trace that faulted at step 5; the V-BRK-011 "+
 				"per-step assertion would pass on a pipeline that skipped six steps\ntrace: %s", s, partial)
 		}
+	}
+
+	// 4. V-GAT-009's control. "The second submission is gated" proves a policy took effect only if
+	//    a broker with no such policy does NOT gate the same envelope. A change that gated every
+	//    action -- an inverted comparison in Max, a floor rule widened by accident -- would make
+	//    TestAPolicyAppliedBetweenTwoSubmissionsBindsTheSecond pass while proving nothing about
+	//    ChangePolicy at all. Both directions are asserted here, from one place, over one envelope.
+	unpoliced := newRig(t)
+	_, without, err := unpoliced.submit(createEnvelope())
+	if err != nil {
+		t.Fatalf("the unpoliced reference submission failed: %v", err)
+	}
+	policed := newRig(t, func(r *rig) {
+		r.classes.set(mustClassifier(t, []classify.RuleSet{gateCreates(t, "ramp-up")}), nil)
+	})
+	_, with, err := policed.submit(createEnvelope())
+	if err != nil {
+		t.Fatalf("the policed reference submission failed: %v", err)
+	}
+	if without.Decision == with.Decision {
+		t.Errorf("the same envelope decides %q both with and without a gating ChangePolicy; the "+
+			"V-GAT-009 assertion cannot distinguish a policy taking effect from one being ignored",
+			with.Decision)
+	}
+
+	// 5. The policy-unavailable control. A healthy source must not produce the refusal the
+	//    fail-closed test looks for, or that test would pass on a broker that refused everything.
+	var ref *broker.Refusal
+	if errors.As(err, &ref) && ref.Reason == broker.ReasonPolicyUnavailable {
+		t.Error("a healthy ClassifierSource produced a policy-unavailable refusal; the fail-closed " +
+			"assertion would pass on a broker that never classifies anything")
 	}
 }

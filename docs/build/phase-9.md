@@ -646,9 +646,13 @@ type safety over a value nothing in this process reads. They are rendered as `un
   - **P9-T7c-1** — `internal/broker/steps.go` and `internal/broker/pipeline/`: the observable step
     trace and the assembly of steps 3–11. **Claims V-BRK-011 and V-BRK-014 at L1. Done
     2026-07-28.**
-  - **P9-T7c-2** — the two deferrals: the `ChangePolicy` informer (from T3b) and the
-    `POST /v1alpha1/actions/{actionId}/replay` route plus the HTTP `Replayer` (from T6c).
-    V-GAT-009's L2 instance stays open.
+  - **P9-T7c-2** — the two deferrals, **split again into 2a and 2b** when 2b turned out to be a
+    halt. See "Why T7c-2 split" below.
+    - **P9-T7c-2a** — the live `ChangePolicy` source (from T3b): `internal/broker/policy/` and the
+      `pipeline.Config.Classifier` seam. **Re-records V-GAT-009 at L1 over the live loader. Done
+      2026-07-28.** V-GAT-009's L2 instance stays open.
+    - **P9-T7c-2b** — the `POST /v1alpha1/actions/{actionId}/replay` route plus the HTTP
+      `Replayer` (from T6c). **HALTED** — see the ledger's Blockers table.
   - **P9-T7c-3** — **the runtime wiring.** Real client-backed adapters for the twelve seams
     `pipeline.Config` takes — `LiveState`, `Applier`, `Reader`, `BodyStore`, `Prober`,
     `Rollbacker`, `Pager`, `Pauser`, the cooldown registry, `ActionHistory`, `ReferenceIndex`,
@@ -699,6 +703,68 @@ a phase that claims the action completed.
 caller while step 11 journaled `terminal(s)`. Those agree on every path except a dry run, where the
 verifier never runs: the record said `DryRun` and the HTTP response said nothing at all. Both now
 derive from `terminal(s)`.
+
+**Why T7c-2 split.** T7c-2 was "the two deferrals", and the two turned out to be unrelated in the
+way that matters: one was unblocked and one is a halt.
+
+**T7c-2b is halted on a spec contradiction.** 05 §1.3's route table names three broker routes —
+`POST /v1alpha1/actions`, `.../{actionId}/approve` and `.../{actionId}/replay` — while V-BRK-021,
+which is **BLOCKING-ALWAYS**, asserts "one listening port, **one mutating route**". Adding the
+replay route makes the second. PROTOCOL §10.2 forbids resolving that autonomously, and the
+alternative resolution is arguably the worse one: replay-as-submission (C-UC POSTs to
+`/v1alpha1/actions` with `spec.trigger.undoOf`) keeps the route count at one but forces the
+broker's `Authenticator.ExpectedCaller` to accept a **second identity submitting caller-supplied
+operations**, which is a wider widening than a `/replay` route that accepts an action ID and no
+operations at all. Sharpening the question: **09 §6 cites 03 §4.1 as V-BRK-021's source, and 03
+§4.1 does not contain the phrase.** What it requires is step non-skippability, not a route count.
+The narrowest question a human can answer is in the ledger's Blockers table.
+
+**What T7c-2a asserts.** `internal/broker/policy/` is what makes `ChangePolicy` load-bearing.
+Before it, `classify.FromChangePolicy` had no caller: an operator could apply a policy, see it in
+`kubectl get`, see `status.agentsMatched` count the agents, and have every action classify as
+though it were not there. Three things came out of building it.
+
+The first is that **the binding predicate did not exist.** `ChangePolicySpec.AgentSelector` had zero
+consumers anywhere in the Go tree. `policy.Binds` is it: `Tiers` is exact membership (a tier is a
+kind of authority, not an amount of one, so a `cluster-admin` policy does not bind the
+developer-team agents beneath it), `Scopes` is `scope.Contains` — "at or beneath", as the field
+documents — and the two clauses are **ANDed**. An ill-formed selector scope (a hole in the middle,
+which `scope.Contains` would read as a wildcard and match cluster `c` in every project) is skipped
+by the predicate _and_ refuses the whole snapshot in the loader; both halves are needed, because
+the first alone would be silent.
+
+The second is that **every decision in the package follows from one asymmetry.** The classifier
+takes the maximum over its sources (06 §4.2 step 3), so a policy can only ever raise a class —
+which means every way of failing to see a policy is a **loosening**, and there is no symmetric
+failure to trade against. So a bad policy fails the whole snapshot naming the policy rather than
+being skipped; an unresolvable policy set refuses the action rather than falling back to the code
+floor; and `Build` runs the same `classify.ValidateChangeRule` the admission webhook runs, so a
+rule the broker would refuse and admission accepted cannot exist.
+
+The third is that **it polls rather than watches, and the deferral's own name was the wrong
+design.** The deferral said "the `ChangePolicy` informer". An informer needs a freshness signal its
+own cache cannot supply — this repo already wrote down why, in `broker.MaxFreezeStaleness`: "a
+watch that silently stopped delivering is not an error at all — the informer's List succeeds, the
+cache answers instantly, and every answer is from before the incident started." Every way of
+building that signal ends in a periodic read against the API server, at which point the cache is
+buying latency and not correctness. `ChangePolicy` is cluster-scoped, human-authored and will
+number in the single digits, so the source polls every 10s against a 30s staleness limit — three
+polls per window, so one lost poll does not refuse and two consecutive ones do — and freshness is
+true by construction. The cost is that a tightening binds within 10s instead of within a round
+trip, which for a policy a human just typed is not a cost.
+
+**The envtest run found a design flaw the unit tests could not.** The first draft treated all poll
+failures alike: retain the last good snapshot, let it age out at 30s. Against a real API server
+that is wrong, because two failures were being conflated. A **read** failure (the List did not
+answer) is transient and retaining is right. A **load** failure (the set was read and will not
+convert) is not transient at all — it will fail every poll until a human edits the object — so
+aging it out means 30 seconds of classifying against a set the broker already knows is wrong, and
+the operator who applied the bad policy learns about it from a delayed timeout instead of at once.
+The two are now handled oppositely and the distinction is asserted from one place so the pair
+cannot drift.
+
+**LSN-007 still applies.** Like T7c-1, this lands reachable from a test and not from
+`cmd/broker/main.go`, which still installs `broker.UnavailablePipeline{}`. T7c-3 is what closes it.
 
 **The split is driven by level as much as by size.** Of T7's fifteen listed check IDs only five are
 reachable without a cluster — V-RUN-011 (L0, L1), V-RUN-003 (L0), V-BRK-012 (L0), V-BRK-011 (L1) and
