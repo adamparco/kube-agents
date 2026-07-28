@@ -416,6 +416,11 @@
   checks:
     - V-PRO-012
     - V-PRO-013
+    # V-PRO-013 asks whether every row of the 04 §5.1 table is exercised; V-PRO-027 asks whether the
+    # evidence those rows consume comes from the cluster at all. "Fails its per-kind predicate" is
+    # only a meaningful clause if the predicate can fail — a prober that answered all eight rows from
+    # the write's own return value would satisfy V-PRO-013's letter and make this bullet vacuous.
+    - V-PRO-027
 
 "04§9#16":
   bullet: "**(new) Transient vs terminal.** A conflict retries; an admission denial rolls back rather than retrying."

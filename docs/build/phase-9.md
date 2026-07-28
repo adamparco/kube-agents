@@ -665,7 +665,19 @@ type safety over a value nothing in this process reads. They are rendered as `un
     - **P9-T7c-3b** — `undo.ReferenceIndex` and `execute.BodyStore`. **Allocates and claims
       V-REV-010 at L1 and L2. Done 2026-07-28.**
     - **P9-T7c-3c** — the verify adapters: `verify.Prober` (eight methods), `Rollbacker`, `Pager`,
-      `Pauser`, `CooldownRegistry`.
+      `Pauser`, `CooldownRegistry`. **Split into three at ORIENT**, see "Why T7c-3c split into
+      three" below.
+      - **P9-T7c-3c-i** — `internal/broker/probe`, the `verify.Prober`: the eight probes behind the
+        eight rows of the 04 §5.1 table. **Allocates and claims V-PRO-027 at L1 and L2. Done
+        2026-07-28** — seven of the eight rows exercised; the eighth, connectivity, is deferred with
+        a named human owner, because a prober that can dial from another pod's network position is a
+        deployable workload with its own RBAC and blast-radius argument, not a method body.
+      - **P9-T7c-3c-ii** — `Rollbacker`, `Pager`, `Pauser`: the three effects rungs 3 and 5 of the
+        04 §5 ladder actually have on the world.
+      - **P9-T7c-3c-iii** — a durable `CooldownRegistry`. `verify.MemoryCooldown` says in its own
+        doc comment that it is "deliberately not the production store: a cooldown that dies with
+        the broker process is a cooldown an operator can clear by deleting a pod, and 04 §4.2
+        controls must survive that."
     - **P9-T7c-3d** — `pipeline.BrakeSource`, `broker.ContestedIndex`, and the `pipeline.New` call
       in `cmd/broker/main.go` that replaces `broker.UnavailablePipeline{}`, plus `policy.Source`
       construction with a synchronous startup `Refresh`. **Closes LSN-007.** Necessarily last: it
@@ -787,6 +799,20 @@ needs to exist before an action runs, 3c is everything **verification** does aft
 wiring that makes the binary reach any of it. 3d must be last because it is the only one whose
 precondition is all the others; the cost is that the broker keeps 503ing until it lands, which is
 LSN-007 remaining true for three more units and is recorded rather than worked around.
+
+**Why T7c-3c split into three.** Found at ORIENT, before any code: 3c is five interfaces, and only
+the first of them is an adapter in the sense 3a and 3b were. `verify.Prober` is eight methods whose
+cluster mechanics have almost nothing in common — an EndpointSlice enumeration, a restart-count
+aggregation that has to resolve a workload's selector, a provider read that is really a Config
+Connector CR plus a node-label count, a `SubjectAccessReview`, a dry-run admission observation —
+and it is the whole of 04 §5.1's evidence surface. The other four are the ladder's **effects**:
+`Rollbacker`, `Pager` and `Pauser` write to the world (3c-ii), and `CooldownRegistry` needs a
+durable store rather than the in-process map, which `verify/cooldown.go` already says in its own
+doc comment (3c-iii). Cutting between "what verification reads" and "what recovery does" also puts
+the destructive L2 surface in exactly one sub-unit: 3c-i only reads and dry-runs.
+
+**What T7c-3c-i asserts.** V-PRO-027, newly allocated. See the check text in 09 §6.6; the argument
+for allocating it rather than claiming V-PRO-013 is in this unit's ledger row.
 
 **What T7c-3a asserts.** `livestate.Source` is the adapter behind every rung of 06 §4.2's
 ladder: object labels and annotations, namespace labels, the blast-radius denominator, the secret
