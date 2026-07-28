@@ -66,8 +66,9 @@ will start selecting.
 | **LSN-035** | checks, mutation, negative-controls | A mutation survives, and the rule it broke turns out to be one no input can reach | **open** | — the ladder's own properties are now held by `TestLadderPropertiesHoldOverEveryAcceptedHistory`; the **general** check is for the next `harness-improve` |
 | **LSN-036** | checks, renderers, allowlists, controller | A uniqueness check goes red on correct code, and the one-line green is an allowlist entry | closed | `pause-is-not-scale-to-zero.py` file-keyed `ALLOWED_REPLICAS_RHS` + `BROKER_REPLICAS_CONST` + stale-owner arm (L0-CHAIN) · `TestPauseDoesNotChangeTheRenderedBroker` in `pause_not_scale_to_zero_test.go` |
 | **LSN-037** | builds, dockerfiles, ci, toolchain | An image build fails on symbols that `go build ./...` resolves fine | closed | `dev/tests/go-build-targets-packages.py` + `--negative-control` (L0-CHAIN) · package-path builds in all 3 Dockerfiles + 2 Makefile recipes |
+| **LSN-038** | checks, probes, discovery, negative-controls | A guard that fails safe still fails, and a green run is how it tells you | closed | `check_machinery_probes_resolve` + `CLOSED_MARKER` + the Go arm of `_invoked_by` in `invariants-gate.py` (L0-CHAIN) · `dev/test_invariants_gate.py` (19 negative controls) · `dev/tests/golex.py` shared by `scope-label-single-sourced.py` and `api-group-single-sourced.py` |
 
-**Open: 1 of 37** (LSN-035).
+**Open: 1 of 38** (LSN-035).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -1833,3 +1834,79 @@ four were latent, one second file away from an identical eleven-minute red.
 one, the two are not testing the same artifact. Ask what the slow check does differently — here,
 "names files instead of packages" — and make the fast check assert that difference away. Related:
 [[lsn-036]] for the discovery-not-enumeration arm, [[lsn-035]] for non-vacuity.
+
+---
+
+## LSN-038 — A guard that fails safe still fails, and a green run is how it tells you
+
+**Tags:** checks, probes, discovery, negative-controls · **Phase:** 9 (P9-T7d-3) · **Status:** closed
+
+Invariant 7 — _authority never precedes machinery_ — forbids a write verb on an agent identity until
+the Action Broker, the risk classifier, the ActionRecord journal and the undo path all exist and are
+tested. `invariants-gate.py` implemented it by probing for each of the four at a hardcoded pair of
+candidate directories. Two of the four pairs were wrong: the classifier landed at
+`internal/broker/classify/` and undo at `internal/broker/undo/`, neither of which the list guessed.
+
+So from P9-T3a onward the gate believed half the machinery did not exist. It printed
+`✓ invariant 7 — authority never precedes machinery` on every run of six merged units, and the tick
+was true — no identity had a write verb yet, so the rule had nothing to fire on. The false belief
+was doing nothing, correctly.
+
+P9-T7d-3 adds the 06 §2.2.1 broker-operations grant: the first `create` verb on an agent identity in
+the project's history. That unit turns the gate red on correct code, and the one-line diff to green
+is to edit the candidate list — which is [[lsn-036]] exactly, the lesson about a check whose fix is
+an allowlist entry. The unit that pays is never the unit that erred.
+
+**Why "fails safe" was the whole problem.** A probe that wrongly reports machinery *present* fails
+open, and everyone treats that as the serious direction. This one failed closed. But the direction
+of a wrong answer only matters at the moment the answer is used, and this answer went unused for six
+units — during which the only observable was a green tick. There is no run, no log line and no diff
+that distinguishes "this property holds" from "this check has not been able to see its subject since
+March". [[lsn-035]] is the same shape one level down: a rule no input reaches.
+
+Two more instances of it surfaced in the same file once the pattern had a name:
+
+- `"CLOSED" in blocker.upper()` decided whether a deferral row still owed a promote-when condition.
+  A blocker reading _"blocked until the maintenance window closed"_ satisfies it, and the row stops
+  being asked the one question that makes it a deferral rather than a shrug.
+- `_invoked_by` knew that `python3 -m unittest discover dev` runs every `dev/test_*.py` without
+  naming one, but not that `make -C k8s-operator test` runs every Go test without naming one. A
+  lesson mechanized as a Go test therefore read as "run by nothing" and could not close on its own
+  merits — so LSN-032, LSN-033 and LSN-034 each also cite whichever `.py` was nearby. The citations
+  are true; they just do not describe the mechanization, and the pressure that produced them was a
+  bug in the checker.
+
+**Mechanization.** Four parts, all on the L0 chain.
+
+1. **The probe's answer is itself a claim, checked every run.** `check_machinery_probes_resolve()`
+   runs whether or not any write verb exists. Machinery that does not resolve must be *declared* in
+   `UNBUILT_UNTIL_PHASE` with the phase by which it is expected, cross-checked against the ledger's
+   current phase — the declare-or-fail idiom `pause-is-not-scale-to-zero.py` already uses. Silence
+   is no longer an available answer, in either direction: a stale declaration on machinery that
+   _does_ exist fails too.
+2. **Discovery by glob, not by list** ([[lsn-036]]), and qualification by content: a match counts
+   only if it holds a non-test `func` and a `func Test` beside it, which is what invariant 7's
+   "exist **and are tested**" actually says. The classifier globs are package directories rather
+   than a `classif*` stem, because that stem also matches `internal/router/classify.go` — the
+   chat-intent classifier — and a probe resolving against the wrong subsystem fails *open*.
+3. **`dev/test_invariants_gate.py`** — the first negative controls the gate has ever had. Nineteen
+   tests, each breaking a property on purpose: the exact LSN-038 state fails, a future-phase
+   declaration is accepted, an expired one fails, Go source with no test beside it is not machinery,
+   a blocker that merely uses the word "closed" is still asked for its promote-when, and every
+   branch of the new Go arm of `_invoked_by` including the `/e2e` exclusion the Makefile applies.
+   Run by `python3 -m unittest discover dev`, already on the chain.
+4. **One Go comment scanner, in `dev/tests/golex.py`.** Auditing for the same shape turned up two
+   more copies of the line-oriented `line.split("//", 1)[0]` blanking, each with a docstring arguing
+   it was safe there. In `scope-label-single-sourced.py` and `api-group-single-sourced.py` it is
+   not: a key or an API group on the same line as a `https://` URL is truncated away and the check
+   reports nothing. Both now import the literal-aware scanner, and `scope-label`'s negative control
+   gained a sixth mutation — a respelled key hidden behind a URL — that only the shared scanner
+   catches, so the port is load-bearing rather than tidy.
+
+**The general shape.** When check A consults check B's answer, B's answer is an input like any other
+and must be validated like any other. Ask of every guard: _if its subject vanished, what would the
+run look like?_ If the answer is "the same", the guard is reporting on itself. The tell is a
+predicate that can only ever make the caller stricter — nobody writes a negative control for those,
+because the failure mode is not scary until the day it is the only thing standing between a correct
+change and a red build. Related: [[lsn-035]] (unreachable rules), [[lsn-036]] (enumeration goes
+stale), [[lsn-023]] (the prose satisfying the check).

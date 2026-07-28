@@ -54,6 +54,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from golex import strip_go_comments  # noqa: E402
+
 REPO = pathlib.Path(__file__).resolve().parents[2]
 PKG = REPO / "k8s-operator" / "internal" / "agentlabels"
 DEFINITION_SITE = PKG / "labels.go"
@@ -137,35 +140,6 @@ def tracked_go_files() -> list[pathlib.Path]:
         text=True,
     ).stdout
     return [REPO / p for p in out.split("\0") if p.endswith(".go")]
-
-
-def strip_go_comments(text: str) -> str:
-    """Blank comment lines rather than dropping them, so reported line numbers match the editor.
-
-    LSN-023: the sentence describing a defect must not satisfy or fail the check that prevents it.
-    This file, labels.go and store.go all discuss these keys by name in prose.
-    """
-    lines: list[str] = []
-    in_block = False
-    for raw in text.splitlines():
-        line = raw
-        if in_block:
-            if "*/" in line:
-                line = line.split("*/", 1)[1]
-                in_block = False
-            else:
-                lines.append("")
-                continue
-        if "/*" in line:
-            head, rest = line.split("/*", 1)
-            if "*/" in rest:
-                line = head + rest.split("*/", 1)[1]
-            else:
-                line, in_block = head, True
-        if "//" in line:
-            line = line.split("//", 1)[0]
-        lines.append(line)
-    return "\n".join(lines)
 
 
 def check(sources: dict[str, str]) -> list[str]:
@@ -280,6 +254,18 @@ def negative_control() -> int:
             lambda s: {
                 **s,
                 "some_renderer.go": "package controller\n\nvar l = map[string]string{agentlabels.Scope: agent.Spec.Scope.Namespace}\n",
+            },
+        ),
+        (
+            # The same respelling, hidden behind a URL on the same line. This is the mutation that
+            # makes the shared golex scanner load-bearing rather than a tidy-up: the line-oriented
+            # `line.split("//", 1)[0]` this check used until LSN-038's pass truncates at the `//`
+            # in `https://`, drops the rest of the line, and reports nothing. A false negative here
+            # is permanent and silent -- the selector just stops distinguishing two credentials.
+            "a caller respells a key on a line that also contains a URL",
+            lambda s: {
+                **s,
+                "some_renderer.go": 'package controller\n\nvar u, l = "https://kubernetes.default.svc", map[string]string{"kube-agents/tier": t}\n',
             },
         ),
         (

@@ -53,6 +53,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from golex import strip_go_comments  # noqa: E402
+
 REPO = pathlib.Path(__file__).resolve().parents[2]
 CONTROLLER = REPO / "k8s-operator" / "internal" / "controller"
 DEFINITION_SITE = CONTROLLER / "broker_manifests.go"
@@ -133,67 +136,6 @@ def is_test_file(name: str) -> bool:
     from a selector matching a legitimately empty set.
     """
     return name.endswith("_test.go")
-
-
-def strip_go_comments(text: str) -> str:
-    """Blank comments, preserving line numbering and STRING LITERALS.
-
-    LSN-023: the sentence describing a defect must not satisfy or fail the check that prevents it.
-    This file and broker_manifests.go both discuss `-broker` names in prose at length.
-
-    This is a character-level scanner rather than the `line.split("//", 1)[0]` idiom the sibling
-    checks use, and the difference is not stylistic. The naive version truncates
-
-        return fmt.Sprintf("https://%s.%s.svc.cluster.local:%d", brokerName(agent), ...)
-
-    at the `//` inside the URL, discarding the rest of the line -- so the brace matcher never finds
-    the closing `}`, the function body comes back truncated, and property 1 reports that
-    brokerEndpoint has stopped depending on the CR when it plainly has not. It cost one false
-    positive to find here. In a check that scanned for a FORBIDDEN pattern rather than a required
-    one, the same bug would have been a false negative, and false negatives in this file are silent
-    by construction.
-    """
-    out: list[str] = []
-    i, n = 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch == '"' or ch == "`" or ch == "'":
-            quote = ch
-            out.append(ch)
-            i += 1
-            while i < n:
-                out.append(text[i])
-                if text[i] == "\\" and quote != "`" and i + 1 < n:
-                    # An escaped character cannot close the literal. Raw (backtick) strings have no
-                    # escapes, so the backslash is literal there.
-                    out.append(text[i + 1])
-                    i += 2
-                    continue
-                if text[i] == quote:
-                    i += 1
-                    break
-                if text[i] == "\n" and quote != "`":
-                    # Unterminated interpreted literal: malformed Go. Stop rather than run on.
-                    i += 1
-                    break
-                i += 1
-            continue
-        if ch == "/" and i + 1 < n and text[i + 1] == "/":
-            while i < n and text[i] != "\n":
-                i += 1
-            continue
-        if ch == "/" and i + 1 < n and text[i + 1] == "*":
-            i += 2
-            while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
-                # Keep newlines so line numbers survive a block comment.
-                if text[i] == "\n":
-                    out.append("\n")
-                i += 1
-            i += 2
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
 
 
 def function_body(code: str, name: str) -> str | None:
