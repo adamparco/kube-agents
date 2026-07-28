@@ -63,6 +63,7 @@ will start selecting.
 | **LSN-032** | security, codegen, corpus | A deny-list names a group nobody serves, and the corpus that checks it agrees | closed | `api-group-single-sourced.py` (L0-CHAIN) · `TestForbiddenSetNamesTheLiveAPIGroup` in `classify_test.go` |
 | **LSN-033** | security, scope, corpus | A safety list is complete for the domain its author had in mind, and empty for the one where the damage is | closed | `TestNonRecreatableKindsAreGatedByTheClassifier` in `internal/broker/undo/` · `undo-corpus-lint.py` (L0-CHAIN) · corpus §M |
 | **LSN-034** | security, gating, api-design | A value compared against itself will never tell you it is the wrong shape | closed | `assertLeafOps` + `TestDiffEmitsOnlyLeafOps` / `TestDiffKeepsAnEmptyMapVisible` in `k8s-operator/internal/broker/execute/diff_test.go`, run on every PR by `k8s-operator-test.yml` · `subtreeOps` doc at the definition site |
+| **LSN-035** | checks, mutation, negative-controls | A mutation survives, and the rule it broke turns out to be one no input can reach | **open** | — the ladder's own properties are now held by `TestLadderPropertiesHoldOverEveryAcceptedHistory`; the **general** check is for the next `harness-improve` |
 
 **Open: 0 of 33.**
 
@@ -1641,3 +1642,74 @@ it is a coupling nobody would find by reading either file alone: **the function 
 out of the record also decides what the integrity check is able to notice.** It cost a test in this
 unit, which asserted `/metadata/uid` would appear in an executed diff — `uid` is dropped, so the
 assertion could not have held in either direction and proved nothing about the property it named.
+
+---
+
+## LSN-035 — A redundant guard and an unenforced guard look identical from a green suite
+
+**Tags:** checks, mutation, negative-controls · **Phase:** 9 (P9-T5b) · **Status:** open
+
+**What happened.** V-PRO-021 is a `¬` check, so P9-T5b mutation-tested the recovery ladder: neuter
+each of `ladder.go`'s eleven invariants in turn, confirm the suite goes red, restore. Nine died. The
+two survivors were **the two properties the check text names by hand** — "allows at most one rung-2
+alternative" and "never restarts at rung 1 after a rollback".
+
+The first read of that is "two missing tests". Both rules had tests, and the tests passed, and the
+tests were worthless. `TestLadderAllowsExactlyOneAlternative` built a history that entered rung 2
+twice — and to get back to rung 2 a second time it had to come *down* from rung 3, so the
+**non-decreasing** rule rejected it first and the one-alternative rule never executed. Same for the
+rung-1 test. Every negative control written to exercise a rule was rejected by a *different* rule,
+and a test that asserts "this is rejected" cannot tell you which rule did the rejecting.
+
+The deeper finding is that this was not fixable by writing better histories. **Within a chain-valid
+history those two rules are logically unreachable.** Monotonicity plus the no-self-transition rule
+already make each rung enterable at most once, which *implies* both named properties. There is no
+input that reaches either `if`. They are dead code that reads as a safety rail.
+
+**Why it matters.** The two facts a green suite cannot distinguish:
+
+1. a rule that is **redundant** — some other rule already covers every input, and deleting it
+   changes nothing observable; and
+2. a rule that is **unenforced** — the property it names is not actually held, and the tests that
+   appear to cover it pass for an unrelated reason.
+
+Mutation testing reports these **identically**: a survivor. So a survivor is not a verdict, it is a
+question — *is this rule reachable at all?* — and the two answers need opposite responses. For (1)
+the property is safe and the rule is documentation; for (2) the property is unheld and the check is
+lying. Answering "add a test for the surviving rule" without asking the question produces, in case
+(1), another test that passes for the wrong reason, which is where this started.
+
+**The general shape.** `¬` in 09 §6 means "a negative control is mandatory", and the whole point is
+to establish that the check *can* fail. But a negative control only proves the **suite** fails; it
+never proves **which rule** made it fail. When several rules overlap, every negative control lands
+on whichever fires first — typically the broadest one — and the narrow rules beneath it accumulate
+tests that have never once executed them. The overlap is not a smell to remove: monotonicity and
+"at most one alternative" *should* both be stated, because they come from different sentences of
+04 §5. What is missing is any signal that one has stopped carrying its own weight.
+
+**What was done here, and what is still open.** The ladder was repaired by moving the assertions off
+the rules and onto the **properties**: `TestLadderPropertiesHoldOverEveryAcceptedHistory` enumerates
+all 1554 histories of length ≤ 4 over the six rungs, validates each, and asserts that nothing
+accepted violates either property — pinning the accepted count at exactly **30**
+(C(5,1)+C(5,2)+C(5,3)+C(5,4), the strictly-ascending sequences over rungs 1..5), which is two-sided:
+loosening the ladder makes it larger, over-tightening makes it smaller. Deleting monotonicity or the
+no-movement rule now fails *that* test by name, confirmed by re-mutating. Both derived rules were
+**kept**, with the finding written into `ladder.go` at the definition site, because the implication
+runs one way: if a future revision relaxes monotonicity they stop being derived and become the only
+thing enforcing the bound, and a rule deleted for being redundant is a rule nobody restores when the
+premise changes.
+
+That fixes one ladder. **It does not mechanize the lesson**, which is why this is open. Exhaustive
+enumeration worked here only because the state space is tiny (six rungs, four steps); it is not a
+general technique. The candidate mechanizations, for the next `harness-improve` to choose between:
+require every `¬` check to record *which* rule its negative control exercised and assert the error
+identifies that rule; or add reachability as an explicit question a mutation survivor must answer in
+writing before the survivor is allowed onto an allowlist. Whatever is chosen has to survive the
+LSN-019 bar — an artifact on disk, invoked by a chain or a workflow — and note that this lesson's
+own evidence came from a Go test, which is the gap [[lsn-034]] already handed to the same pass.
+
+**Related.** [[lsn-032]] is this one's sibling and the reason it was recognized: there, a corpus
+derived from the rule table agreed with the table's defects for three phases. Here, a negative
+control derived from the rule set is intercepted by the rule set. Both are the same geometry — **a
+check that shares a premise with the thing it checks cannot see a defect in the premise** — and
+[[lsn-033]] is the version where it arrives as silence rather than as error.
