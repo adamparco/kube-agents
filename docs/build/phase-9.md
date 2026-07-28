@@ -662,7 +662,8 @@ type safety over a value nothing in this process reads. They are rendered as `un
     T7c-3 split into four" below.
     - **P9-T7c-3a** — `livestate.Source`, the `LiveState` adapter: the five reads every
       classification rung depends on. **Claims V-GAT-022 at L2. Done 2026-07-28.**
-    - **P9-T7c-3b** — `undo.ReferenceIndex` and `execute.BodyStore`.
+    - **P9-T7c-3b** — `undo.ReferenceIndex` and `execute.BodyStore`. **Allocates and claims
+      V-REV-010 at L1 and L2. Done 2026-07-28.**
     - **P9-T7c-3c** — the verify adapters: `verify.Prober` (eight methods), `Rollbacker`, `Pager`,
       `Pauser`, `CooldownRegistry`.
     - **P9-T7c-3d** — `pipeline.BrakeSource`, `broker.ContestedIndex`, and the `pipeline.New` call
@@ -835,6 +836,66 @@ and argues **in writing that P1 does not apply**: nothing under test runs from a
 the working tree is the build under test by construction. That argument is now also the qualifier on
 `dev/L2-CHAIN.txt`'s blanket P1 statement, and it names its own expiry — when 3d wires the broker,
 the end-to-end successor in `broker-execute-l2.sh` needs P1 in full.
+
+**What T7c-3b asserts.** Two adapters, one seam each: `refindex.Source` behind
+`undo.ReferenceIndex`, and `bodystore.Journal` behind `execute.BodyStore`. Three things came out of
+building them.
+
+The first, and the reason the unit needed a check of its own, is that **the hard question is not
+"can it find references" but "what counts as one"** — and the answer is the loosening direction, so
+it is argued in the package doc where someone would undo it. 06 §4.3.1 says "every ownerReference,
+PVC binding, and external reference pointing at **the old one**". What a recreate destroys is the
+**UID**, so a reference bound to the UID is left dangling and a reference bound to the **name**
+resolves to the new object — it is _repaired_ by the recreate, not broken by it. That collapses the
+domain to UID-valued references, which in practice is `metadata.ownerReferences`. The tempting
+generalization — report every reference-shaped field the scan can see — reads as extra safety and is
+the opposite: on a real cluster nearly every object is named by something, so it would downgrade
+nearly every `delete` to `none`, make the whole `recreate` strategy dead code, and be reported as a
+tightening while it happened. A gate that always fires is indistinguishable from no gate. The
+residual is written down because it is the direction that needs an argument: a UID-valued field
+outside `ownerReferences` (only `PV.spec.claimRef.uid` in core Kubernetes, and unreachable anyway
+because PV and PVC are on `undo.nonRecreatableKinds`, so the strategy short-circuits before the
+index is consulted), and references held outside the cluster, which no in-cluster scan can see.
+V-REV-010's mandatory negative control **is** that boundary: a Pod mounting the target ConfigMap by
+name must change nothing.
+
+The second is that **`refindex.Source` and `livestate.Source` fail in opposite directions, one week
+apart, and neither is a copy of the other's default.** A kind `livestate.Source` cannot list is
+skipped; a kind `refindex.Source` cannot list fails the entire scan, with `IsForbidden` given its
+own message naming the grant that is missing. The direction is not a house style — it follows from
+what a partial answer means to the caller. A missing kind shrinks the blast-radius **denominator**,
+which makes every fraction larger and the abort _more_ likely, so skipping is the tightening move
+there. A missing kind in a reference scan means a referrer might exist and be unseen, and the caller
+reads an empty slice as "nothing points at it, the recreate is safe" — which
+`undo.ReferenceIndex`'s own doc comment already forbids: "'nothing points at it' and 'I could not
+look' are the two answers this package must never conflate." Both directions are mutation-tested.
+
+The third is that **only a real cluster can demonstrate the harm, and until this unit nothing had.**
+envtest runs no kube-controller-manager, so an `ownerReference` there is an annotation with no
+consequences and 06 §4.3.1's premise — "the garbage collector sees owner references pointing at a
+UID that no longer exists and deletes the children" — was a sentence in a spec that nothing
+executed. `TestREV010TheGarbageCollectorDoesWhatTheDowngradePrevents` performs the sequence a
+`recreate` plan would have performed: delete the owner, watch a real GC destroy the dependent,
+recreate the owner from its snapshot, observe a new UID and the dependent still gone. That is the
+state an undo reporting `done` would have left behind, and it is now on the record rather than
+described. The probe fails loudly rather than skipping if no collection is observed, because "the
+dependent survived" would otherwise read as evidence the downgrade is unnecessary.
+
+`bodystore.Journal` is smaller and is [[LSN-034]] applied **before** the fact rather than after a
+green run: `execute.capture` digests the body itself and compares against what the store returns,
+which is only worth doing if the two numbers have independent provenance, so the adapter returns the
+**sink's** digest unaltered. It calls `journal.SnapshotKey` — extracted this unit from `snapshot.go`,
+which had the format string inline — rather than re-deriving the layout at a second site.
+
+**Two findings, neither failure-driven, both carried to Deferrals rather than fixed here.** A
+full-surface scan of one namespace on a 57-kind cluster takes **9.1 s**; it is sequential, O(kinds),
+and sits in the request path at pipeline step 4, so a CRD-heavy cluster is worse and nothing
+measures it. And **no production `journal.BlobSink` exists anywhere in the tree** — the interface has
+been there since T1, `cmd/broker` passes `nil`, and `bodystore.Journal` is now complete with nothing
+to talk to, so any pre-state over 1 MiB refuses its action outright. That is 03 §6's fail-closed
+direction and not a hole, but it is an availability cost invisible until someone patches a large
+ConfigMap, and a real sink needs a bucket, a GSA through Workload Identity and a lifecycle policy
+matching 06 §4.3's TTLs — a provisioning unit, not an adapter unit.
 
 **The split is driven by level as much as by size.** Of T7's fifteen listed check IDs only five are
 reachable without a cluster — V-RUN-011 (L0, L1), V-RUN-003 (L0), V-BRK-012 (L0), V-BRK-011 (L1) and

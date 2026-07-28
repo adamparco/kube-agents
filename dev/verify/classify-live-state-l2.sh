@@ -91,10 +91,14 @@ p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
 # The probe is behind the `l2` build tag, so `go test ./...` and the L0 chain never compile it and
 # no CI runner can reach a cluster by accident. Both assertions are in one package and one run: they
 # share the connection cost, and a failure in either is a failure of this script.
+#
+# -run pins this script to ITS OWN tests. test/l2/ is a shared package and other checks now keep
+# probes in it; without the filter, their red would be reported here as V-GAT-022 failing, and a
+# check that goes red for a reason outside its own subject is a check nobody can act on.
 echo
 echo "--- running the classifier against $CTX ---"
 out="$(cd "$REPO_ROOT/k8s-operator" && KAGE_L2_CONTEXT="$CTX" \
-  go test -tags l2 -count=1 -v -timeout 15m ./test/l2/ 2>&1)"
+  go test -tags l2 -count=1 -v -timeout 15m -run 'TestGAT022' ./test/l2/ 2>&1)"
 rc=$?
 echo "$out"
 echo "--- end probe output ---"
