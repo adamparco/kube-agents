@@ -35,10 +35,20 @@
 #
 # Run:  while read -r c; do case "$c" in ''|\#*) continue ;; esac; eval "$c"; done < dev/L2-CHAIN.txt
 #
-# Precondition P1 applies to every line: `bash dev/cluster/reload-images.sh <what> <ctx>` builds,
-# pushes, and deploys BY DIGEST, then P1 asserts the running imageID digest equals the build under
-# test. A green here against a stale image is LSN-001, and no line of this file can detect that on
-# its own — deploying by digest is what makes that trap unrepresentable rather than merely detected.
+# Precondition P1 applies to every line that tests a DEPLOYED image, which is every line above the
+# Phase 9 heading: `bash dev/cluster/reload-images.sh <what> <ctx>` builds, pushes, and deploys BY
+# DIGEST, then P1 asserts the running imageID digest equals the build under test. A green here
+# against a stale image is LSN-001, and no line of this file can detect that on its own — deploying
+# by digest is what makes that trap unrepresentable rather than merely detected.
+#
+# The qualifier is new and it is a narrowing of scope, not of rigour. A CLIENT-SIDE probe — one that
+# compiles the working tree and connects to the cluster as a client, rather than asserting against
+# something running in a pod — has the working tree as its build under test by construction, which
+# is the property P1 exists to establish. Demanding P1 there would mean deploying an image the check
+# never looks at, and a precondition satisfied by an irrelevant act is worse than no precondition:
+# it reads as coverage. Each such line says so in its own header and says what replaces P1. When the
+# component a client-side probe stands in for becomes reachable in a pod, its successor check needs
+# P1 in full, and the header names that successor.
 
 # --- the standing regression suite ----------------------------------------------------------
 # verify-phase7.sh is the whole prior build in one command: it runs verify-phase{2,3,4,5,6}.sh,
@@ -64,3 +74,13 @@ bash dev/verify/multi-agent-namespace-l2.sh gke-scratch-kube-agents-dev
 # as nothing at all. It runs LAST because it is the only Phase 8 script that persists an Agent, and
 # running it after the others means its fixtures cannot be mistaken for their scenery.
 bash dev/verify/webhook-negatives-l2.sh gke-scratch-kube-agents-dev
+
+# --- Phase 9 L2 checks --------------------------------------------------------------------------
+# V-GAT-022: classification reads live state, not the payload. A CLIENT-SIDE probe (see the P1 note
+# above): it drives classify.ClientLiveState — the production LiveState — against this cluster from
+# the working tree, because the broker's pipeline is still UnavailablePipeline{} until P9-T7c-3d and
+# no deployed surface reaches the classifier yet. What makes it L2 rather than L1 is what only a
+# real cluster has: GKE's full discovery surface for the blast-radius denominator, real RBAC for the
+# skip-don't-refuse path, and real admission deciding a namespace's final label set. Its successor
+# is the end-to-end form in broker-execute-l2.sh (P9-T9), which WILL need P1.
+bash dev/verify/classify-live-state-l2.sh gke-scratch-kube-agents-dev
