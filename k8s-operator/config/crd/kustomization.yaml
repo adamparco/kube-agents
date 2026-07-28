@@ -2,3 +2,6 @@ resources:
   - bases/kubeagents.x-k8s.io_agents.yaml
   - bases/kubeagents.x-k8s.io_actionrecords.yaml
   - bases/kubeagents.x-k8s.io_changepolicies.yaml
+  - bases/kubeagents.x-k8s.io_fleetfreezes.yaml
+  - bases/kubeagents.x-k8s.io_undorequests.yaml
+  - bases/kubeagents.x-k8s.io_approvalrosters.yaml

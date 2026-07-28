@@ -7278,6 +7278,69 @@ spec:
                     admission rules V-6 (a paused parent may not provision) and V-8 (no leaf above its code
                     ceiling) are what read it today.
                   properties:
+                    approvalRosterRef:
+                      description: |-
+                        ApprovalRosterRef names the ApprovalRoster consulted for `gated` actions, and for `resume`
+                        and `uncontest` (06 §4.4).
+
+                        A dangling reference is NOT an open gate. 06 §4.4's sixth fail-closed rule: with no roster to
+                        consult, a gated action stays `PendingApproval` and expires unapproved. Admission does not
+                        require the roster to exist, because ordering a roster before the agent that names it would
+                        make a two-object install order-dependent; the runtime handles the gap by refusing, not by
+                        skipping.
+                      properties:
+                        name:
+                          description: Name is the roster's name.
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        namespace:
+                          description:
+                            Namespace is where the roster lives. Empty means
+                            the referring object's own namespace.
+                          maxLength: 253
+                          type: string
+                      required:
+                        - name
+                      type: object
+                    changePolicyRefs:
+                      description: |-
+                        ChangePolicyRefs are stricter-only classification overlays (06 §4.2). Ordered, all applied.
+
+                        "Ordered" is for reporting, not for precedence — the classifier takes the MAXIMUM class over
+                        every source and the MINIMUM over every cap, so no ordering of these refs can change the
+                        result. The order is preserved because `classification.reasons[]` reads better when the rules
+                        appear in the order the operator wrote them.
+                      items:
+                        description: |-
+                          PolicyRef names a cluster-scoped ChangePolicy. No namespace field: ChangePolicy is cluster-scoped
+                          (06 §4.2), and a namespace here would be a field the API server accepts and nothing reads.
+                        properties:
+                          name:
+                            description: Name is the ChangePolicy's name.
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                        required:
+                          - name
+                        type: object
+                      maxItems: 16
+                      type: array
+                    dryRunOnly:
+                      default: false
+                      description: |-
+                        DryRunOnly is shadow mode (06 §1.1): classify and journal every action, execute none.
+
+                        STRICTER-ONLY, like every other overlay in this system. It forces `dryRun: true` on the
+                        envelope (06 §4.1) and there is no field anywhere that can force it back off, so the composed
+                        result of dry-run mode and any policy is always dry-run. An agent cannot clear it, because
+                        `Agent` is a control-plane object no agent identity may write.
+
+                        Distinct from `paused`: a paused agent refuses envelopes and produces no record, while a
+                        dry-run agent produces a full classified, journaled `DryRun` record of what it WOULD have
+                        done. That difference is the whole value of shadow mode — it is how an operator finds out
+                        what an agent would do before granting it the authority to do it.
+                      type: boolean
                     initiativeBudget:
                       description:
                         InitiativeBudget caps self-initiated and human-requested
@@ -7363,6 +7426,20 @@ spec:
                               type: integer
                           type: object
                       type: object
+                    notifyOn:
+                      default: elevated
+                      description: |-
+                        NotifyOn is the minimum class that pings humans at once. Default `elevated`.
+
+                        `elevated` rather than `routine` because a notification stream that includes every routine
+                        action is a stream nobody reads, and an unread notification is indistinguishable from one
+                        that was never sent. `gated` actions always notify regardless — they are blocked on a human
+                        by definition, so there is nothing for this field to suppress.
+                      enum:
+                        - routine
+                        - elevated
+                        - gated
+                      type: string
                     pauseReason:
                       description: |-
                         PauseReason is free text set alongside Paused and surfaced in chat and status. Bounded because
@@ -7375,6 +7452,13 @@ spec:
                         Paused is THE BRAKE (03 §6). When true the broker refuses new envelopes for this agent — and,
                         per 06 §1.2 V-6, a paused agent may not act as a PARENT either: provisioning a child is an
                         action, so the brake covers it.
+
+                        `paused` is NOT scale-to-zero (08 §2.4, V-RUN-007, V-RUN-012). The pod keeps running, keeps
+                        its work queue, and keeps observing; only the write path closes. Scaling to zero would look
+                        equivalent and is not: it discards in-memory queue state, it makes the agent unable to report
+                        why it is refusing, and it means "resume" is a cold start rather than a released brake — so
+                        the operator who paused for thirty seconds during a deploy gets an agent that comes back
+                        having forgotten what it was doing.
                       type: boolean
                   type: object
                 parentRef:
@@ -7449,6 +7533,39 @@ spec:
                     Address is the fully qualified domain name (FQDN) of
                     the agent service.
                   type: string
+                broker:
+                  description:
+                    Broker is the observed state of this agent's broker sidecar
+                    (06 §1.1).
+                  properties:
+                    actorServiceAccount:
+                      description: |-
+                        ActorServiceAccount is the derived actor SA (06 §2). Reported, never settable: the CRD has,
+                        and must never gain, a field that names it, because a spec-settable actor SA is a spec-settable
+                        authority level.
+                      maxLength: 253
+                      type: string
+                    endpoint:
+                      description: |-
+                        Endpoint is the broker's mTLS address. Read by nothing in the write path — the broker is
+                        reached over localhost within the pod — and present so an operator can confirm which broker
+                        an agent is bound to without inspecting the pod spec.
+                      maxLength: 253
+                      type: string
+                    journalReachable:
+                      description: |-
+                        JournalReachable is false when the broker cannot reach the journal store, in which case it is
+                        fail-closed and executing nothing (06 §4.4, fail-closed rule 3 — which also auto-pauses).
+
+                        It defaults to the Go zero value `false`, and that is the correct default for once: an agent
+                        whose status has never been written has not demonstrated that its journal is reachable, and
+                        the fail-closed reading of "unknown" is "unreachable". Every other boolean in this block
+                        reads the same way — absent means the safe answer, not the convenient one.
+                      type: boolean
+                    ready:
+                      description: Ready is whether the broker is accepting envelopes.
+                      type: boolean
+                  type: object
                 conditions:
                   description:
                     Conditions represent the latest available observations
@@ -7533,6 +7650,43 @@ spec:
                     last updated this status.
                   format: date-time
                   type: string
+                operations:
+                  description: Operations is the observed brake state (06 §1.1).
+                  properties:
+                    dryRunOnly:
+                      description: DryRunOnly is whether shadow mode is in force.
+                      type: boolean
+                    frozenBy:
+                      description: |-
+                        FrozenBy is the name of the FleetFreeze covering this scope, if any (06 §4.4). Empty means no
+                        freeze — and, because a freeze is cluster-scoped and this field is per-agent, it is the only
+                        per-agent answer to "am I covered", which otherwise requires listing every freeze and
+                        evaluating each scope by hand.
+                      maxLength: 253
+                      type: string
+                    paused:
+                      description: Paused is whether the brake is actually engaged.
+                      type: boolean
+                    pausedBy:
+                      description: |-
+                        PausedBy is the chat user ID or Kubernetes username that set the brake. Free text rather than
+                        a V-11-patterned principal, unlike the spec-side `requestedBy` fields on the brake objects:
+                        this is written by the controller from whatever the API server reported as the mutating user,
+                        and a `system:serviceaccount:…` username has no platform prefix to canonicalize to. A pattern
+                        here would force the controller to either discard the identity or invent one.
+                      maxLength: 253
+                      type: string
+                    pausedSince:
+                      description: PausedSince is when it engaged.
+                      format: date-time
+                      type: string
+                    reason:
+                      description: |-
+                        Reason mirrors `spec.operations.pauseReason` at the moment the brake engaged, so editing the
+                        spec reason later does not rewrite the history of why this pause happened.
+                      maxLength: 512
+                      type: string
+                  type: object
                 phase:
                   description:
                     Phase is the overall state (Pending, Provisioning, Ready,
