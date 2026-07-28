@@ -62,6 +62,7 @@ will start selecting.
 | **LSN-031** | verification, security | Every rule passes its own test and three of them are switched off | closed | `classifier-corpus-lint.py` (L0-CHAIN) · `TestEverySecurityControlCanReachAGate` in `classify_test.go` |
 | **LSN-032** | security, codegen, corpus | A deny-list names a group nobody serves, and the corpus that checks it agrees | closed | `api-group-single-sourced.py` (L0-CHAIN) · `TestForbiddenSetNamesTheLiveAPIGroup` in `classify_test.go` |
 | **LSN-033** | security, scope, corpus | A safety list is complete for the domain its author had in mind, and empty for the one where the damage is | closed | `TestNonRecreatableKindsAreGatedByTheClassifier` in `internal/broker/undo/` · `undo-corpus-lint.py` (L0-CHAIN) · corpus §M |
+| **LSN-034** | security, gating, api-design | A value compared against itself will never tell you it is the wrong shape | closed | `assertLeafOps` + `TestDiffEmitsOnlyLeafOps` / `TestDiffKeepsAnEmptyMapVisible` in `k8s-operator/internal/broker/execute/diff_test.go`, run on every PR by `k8s-operator-test.yml` · `subtreeOps` doc at the definition site |
 
 **Open: 0 of 33.**
 
@@ -1551,3 +1552,92 @@ scheduled for phase 11. It would have found the hole two phases from now, in a c
 purpose is finding it. It was found here instead, by a test written for an unrelated reason, because
 that test was the first thing to ask a question from outside the list. Scheduling a check for later
 is not the same as the property holding in the meantime.
+
+---
+
+## LSN-034 — A value compared against itself will never tell you it is the wrong shape
+
+**Tags:** security, gating, api-design · **Phase:** 9 (P9-T5a) · **Status:** closed
+
+**What happened.** P9-T5a built the executor's diff — the function that turns a before/after pair of
+objects into a list of `AppliedDiffOp{op, path, from, value}`. When a map key existed on one side and
+not the other, it emitted a single whole-value op: the annotations block appearing for the first time
+produced one `add` at `/metadata/annotations` whose `value` was the entire block, rather than one
+`add` per annotation inside it.
+
+Against the check the function was written for — V-BRK-020, the classify/execute integrity check,
+which compares the diff the classifier saw with the diff the server's dry run would produce — this is
+**perfectly correct**. Both sides are computed by the same function, so both are coarse in the same
+places, and every comparison comes out right. It is invisible from there, and it will stay invisible
+however hard that check is exercised.
+
+The diff has a second consumer. It is also what `when.fieldPaths` is matched against, and
+`classify.PointerPrefixMatch` requires the **rule** to be the prefix of the **diff path**. A rule
+naming `metadata.annotations['kube-agents/restarted-at']` is *longer* than `/metadata/annotations`,
+so against a coarse op it does not match. That turns "set the whole annotations block in one apply,
+having first ensured there was no annotations block" into a way to write a gated annotation without
+tripping the gate. The change happens; the gate says `routine`; nothing errors.
+
+**Why nothing caught it.** Every test that could see the problem was aimed elsewhere. It surfaced in
+`TestDiffEscapesPointerTokens`, which exists to pin the `~1` escaping of a slash in an annotation
+key, and in `TestDiffTruncatesLoudly`, which reported `Truncated=false` for 250 added labels because
+250 labels under a new `labels` map were **one op**. Neither test was about granularity. Both failed
+for the same reason and neither said so.
+
+The generalizable part is the asymmetry between the two consumers. The integrity check reads the diff
+**relative to another diff**; the gate matcher reads it **against an externally-authored string**. A
+self-relative consumer cannot detect a systematic error, because a systematic error cancels. So the
+correctness bar for the value is set entirely by the *other* consumer — the one comparing it to
+something outside the process — and if that consumer is the newer or the quieter of the two, the bar
+never gets checked. [[lsn-032]] is the same geometry one level out: a corpus derived from the rule
+table compares the implementation to itself and agrees with all of its defects.
+
+Related but distinct from [[lsn-031]]: there, two lists that had to agree formed a silent `AND`. Here
+there is one value and two readers, and the readers disagree about what precision means.
+
+**Mechanization.**
+
+- **`assertLeafOps` + `TestDiffEmitsOnlyLeafOps`** (`k8s-operator/internal/broker/execute/diff_test.go`) — asserts
+  the property directly on the op, with no reference to any other diff: if `value` or `from` parses
+  as a **non-empty JSON object**, the op names a subtree, and every field inside it has a path longer
+  than the op's, so no rule naming one of them can prefix-match. Checked on both the add arm and the
+  remove arm, which are separate code paths and were separately wrong. The error message states the
+  gating consequence rather than the shape mismatch, so the next person to trip it does not have to
+  re-derive why it matters. Mutation-tested by reverting `subtreeOps` to a no-op: it fires on both
+  arms, and the two tests that originally caught the bug fire too.
+- **`TestDiffKeepsAnEmptyMapVisible`** — the paired negative. Recursion alone would make
+  `annotations: {}` vanish from the diff entirely, which is a change the executed record would not
+  carry; the fallback to the whole-value op is deliberate and now pinned. This test stays green under
+  the mutation above, which is what makes the pair a specification rather than a ratchet.
+- **`subtreeOps`'s doc comment** carries the reason at the definition site — that the coarse version
+  is consistent, and consistent is not the bar.
+
+**Verify.** `go test ./internal/broker/execute/ -count=1` → ok, 82.6% coverage. Mutation: with
+`subtreeOps` stubbed to return nothing, `TestDiffEmitsOnlyLeafOps`, `TestDiffEscapesPointerTokens` and
+`TestDiffTruncatesLoudly` all fail and `TestDiffKeepsAnEmptyMapVisible` passes. L0 chain 18/18.
+
+The 'Closed by' row names `k8s-operator-test.yml` as well as the test file, and that is not padding.
+`invariants-gate.py`'s `_invoked_by` recognizes three ways an artifact can be automatic — a literal
+line of a declared chain, a PR-triggered workflow of the same basename, and `dev/test_*.py` under
+`unittest discover` — and **none of them is a Go test**. A Go mechanization is therefore invisible to
+the gate unless the row also names the workflow that runs it. This lesson was the first to notice
+because it is the first closed with a Go test and nothing else: [[lsn-032]] and [[lsn-033]] both name
+Go invariant tests, and both satisfied the gate on the strength of the Python lint listed beside
+them, with the Go half contributing nothing to the verdict. That is a gap in the gate, not in this
+lesson, and fixing a check in the unit whose failure surfaced it is what PROTOCOL §10 forbids — it is
+recorded as a finding in the ledger and belongs to the next `harness-improve` pass.
+
+**Generalize.** When one value has two consumers, find the one that compares it to something *outside
+the process* and set the precision bar there — the self-relative consumer is not a weaker check of the
+same property, it is a check of a different property that happens to pass. The practical form: for any
+derived value, ask "who reads this against a string a human wrote?" If the answer is anyone, that
+reader owns the value's shape, even if it is not the reason the value exists.
+
+**Postscript.** The scope boundary this leaves is worth stating rather than discovering later. The
+diff is computed over `undo.Sanitize`d objects, so its blind spots are exactly that function's DROP
+list — the integrity check cannot see a server-side change to `metadata.managedFields`,
+`spec.clusterIP` or a `nodePort`. That is defensible today (all server-owned, none classifiable) and
+it is a coupling nobody would find by reading either file alone: **the function that keeps secrets
+out of the record also decides what the integrity check is able to notice.** It cost a test in this
+unit, which asserted `/metadata/uid` would appear in an executed diff — `uid` is dropped, so the
+assertion could not have held in either direction and proved nothing about the property it named.

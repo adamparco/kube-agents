@@ -143,6 +143,23 @@ func unescapePointerToken(s string) string {
 	return strings.ReplaceAll(s, "~0", "~")
 }
 
+// JoinPointer builds an RFC 6901 pointer from unescaped tokens.
+//
+// Exported so that the ONE implementation of `~0`/`~1` escaping in this tree is the one that
+// PointerPrefixMatch's parser is the inverse of. The broker's diff builder (internal/broker/execute)
+// produces the pointers this file's matcher consumes; a second escaper over there would agree with
+// this one on the day it was written and then diverge on the first annotation key containing a
+// slash -- at which point a rule stops matching a change it names, silently, which is the failure
+// mode the whole of this file exists to prevent.
+func JoinPointer(tokens ...string) string {
+	var b strings.Builder
+	for _, t := range tokens {
+		b.WriteByte('/')
+		b.WriteString(escapePointerToken(t))
+	}
+	return b.String()
+}
+
 // splitPointer splits an RFC 6901 pointer into unescaped tokens. The empty pointer "" is the whole
 // document and yields no tokens; "/" is one empty token, which is a legal (if strange) key.
 func splitPointer(ptr string) []string {
