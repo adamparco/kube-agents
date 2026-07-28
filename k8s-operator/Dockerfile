@@ -21,7 +21,7 @@ COPY . .
 RUN if [ -n "$PREBUILT_BINARY" ] && [ -f "${TARGETPLATFORM}/${PREBUILT_BINARY}" ]; then \
       cp "${TARGETPLATFORM}/${PREBUILT_BINARY}" manager; \
     else \
-      CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -a -o manager cmd/main.go; \
+      CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -a -o manager ./cmd; \
     fi
 
 # Runtime stage - use distroless for minimal attack surface

@@ -65,8 +65,9 @@ will start selecting.
 | **LSN-034** | security, gating, api-design | A value compared against itself will never tell you it is the wrong shape | closed | `assertLeafOps` + `TestDiffEmitsOnlyLeafOps` / `TestDiffKeepsAnEmptyMapVisible` in `k8s-operator/internal/broker/execute/diff_test.go`, run on every PR by `k8s-operator-test.yml` · `subtreeOps` doc at the definition site |
 | **LSN-035** | checks, mutation, negative-controls | A mutation survives, and the rule it broke turns out to be one no input can reach | **open** | — the ladder's own properties are now held by `TestLadderPropertiesHoldOverEveryAcceptedHistory`; the **general** check is for the next `harness-improve` |
 | **LSN-036** | checks, renderers, allowlists, controller | A uniqueness check goes red on correct code, and the one-line green is an allowlist entry | closed | `pause-is-not-scale-to-zero.py` file-keyed `ALLOWED_REPLICAS_RHS` + `BROKER_REPLICAS_CONST` + stale-owner arm (L0-CHAIN) · `TestPauseDoesNotChangeTheRenderedBroker` in `pause_not_scale_to_zero_test.go` |
+| **LSN-037** | builds, dockerfiles, ci, toolchain | An image build fails on symbols that `go build ./...` resolves fine | closed | `dev/tests/go-build-targets-packages.py` + `--negative-control` (L0-CHAIN) · package-path builds in all 3 Dockerfiles + 2 Makefile recipes |
 
-**Open: 1 of 36** (LSN-035).
+**Open: 1 of 37** (LSN-035).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -1776,3 +1777,59 @@ new legitimate call site away from the same conversation, and each should say wh
 **Related.** [[lsn-035]] is the failure mode arm 3 defends against. This is also the second time a
 check written by an earlier unit of phase 9 caught the unit after it — P9-T6c's `undo_controller.go`
 was the first, but that one only needed classifying; this one needed the implementation changed.
+
+---
+
+## LSN-037 — The build that ships is not the build you tested
+
+**Tags:** builds, dockerfiles, ci, toolchain · **Phase:** 9 (P9-T7b) · **Status:** closed
+
+P9-T7b added `waitforbroker.go` next to `cmd/broker/main.go`. Locally, `go build ./...`,
+`go vet ./...` and `go test ./...` were clean. On the PR, six of seven checks were green and `build`
+was red, eleven minutes in:
+
+```
+cmd/broker/main.go:128:8: undefined: waitOptions
+cmd/broker/main.go:150:13: undefined: runWaitForBroker
+```
+
+`Dockerfile.broker` compiled `cmd/broker/main.go` — the file — instead of `./cmd/broker` — the
+package. Passing a file list to `go build` compiles exactly those files and treats the rest of the
+package as absent, so the new file's symbols were undefined in the only build that mattered.
+
+**Why it survived so long.** The file-list form is the kubebuilder scaffold's default, and it is
+*correct in every observable way* while a `main` package holds one file. It had been right for the
+operator and the router for eight phases. Nothing was wrong with it until the population of the
+directory changed, at which point it became wrong instantly and in a place nobody was looking. Both
+spellings produce a working binary from an identical tree; they differ only in a future that had not
+happened yet.
+
+**Why the local signal did not help.** Every local command names packages (`./...`). Only the
+container images named files. So the repository had two build systems that agreed on every input
+except the one that had just changed, and the disagreeing one ran last, slowest, and furthest from
+the edit — where a compile error reads as a broken base image or a bad cache rather than as one
+token in a `RUN` line. The cost is not the fix; it is the eleven minutes plus the wrong first
+hypothesis.
+
+**Mechanization.** `dev/tests/go-build-targets-packages.py`, on the L0 chain with its negative
+control. It sweeps every build input — Dockerfiles, Makefiles, shell scripts, workflow YAML — and
+fails any `go build` whose target is a `.go` file. Three deliberate properties:
+
+1. **Discovery, not enumeration.** Build inputs are globbed by filename pattern, so the next
+   Dockerfile is covered the day it lands. This is [[lsn-036]] applied on the way in rather than
+   learned again: the same unit that taught "do not write a check that lists what it knows about"
+   is the unit that would have written one here.
+2. **Non-vacuity.** Finding zero `go build` invocations is a FAIL, not a pass ([[lsn-035]]) — if the
+   builds move somewhere the glob does not look, the check must say so rather than go quiet.
+3. **Accepts the fix, and the prose.** Six non-mutations pin that `./cmd/broker`, `./...`, `.`, a
+   trailing slash, `-o weird.go`, and a *comment describing the rule* all pass. A check that also
+   rejects the correct spelling teaches people to route around it; a check that fires on the
+   sentence explaining it is [[lsn-023]].
+
+Fixed in all three kubebuilder Dockerfiles and both Makefile recipes, not only the broker: the other
+four were latent, one second file away from an identical eleven-minute red.
+
+**The general shape.** When a defect is invisible in every fast check and visible only in the slow
+one, the two are not testing the same artifact. Ask what the slow check does differently — here,
+"names files instead of packages" — and make the fast check assert that difference away. Related:
+[[lsn-036]] for the discovery-not-enumeration arm, [[lsn-035]] for non-vacuity.
