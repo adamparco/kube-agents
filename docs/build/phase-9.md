@@ -446,7 +446,9 @@ thing both halves depend on, then the rendering of the pair, then the objects th
 actually talk, then the pipeline that runs behind it. (T7d was split out of T7b mid-unit, then split
 again into T7d-1/T7d-2, and T7d-2 split once more into T7d-2/T7d-3/T7d-4 when implementing it showed
 that its three deliverables live in three different layers with three different verification levels.
-See "Why T7b stops at the render", "Why T7d split in two" and "Why T7d-2 split again" below.)
+**T7d-5 was then added ahead of T7d-4**, from a user question at T7d-3's checkpoint that found the
+identities T7d-3 had just written had no install path. See "Why T7b stops at the render", "Why T7d
+split in two" and "Why T7d-2 split again" below.)
 
 - **P9-T7a** — `internal/agentlabels/`: the five 08 §2.5 label keys spelled once, and the injective
   scope renderer. Every other T7 deliverable stamps these; nothing else in T7 can be written without
@@ -476,28 +478,48 @@ See "Why T7b stops at the render", "Why T7d split in two" and "Why T7d-2 split a
   needs, added to `netpol-agent-egress.yaml.template` as a rendered optional block with the
   control-plane CIDR supplied by `vars.sh`, plus the regenerated exemplars. Verified by
   `dev/tests/reference-render.py` at L0 and by V-ISO at L2 in P9-T9.
-- **P9-T7d-5** — **the install path for the identities T7d-3 just wrote.** Added 2026-07-28, and it
-  **runs before T7d-4**. Render the reader and actor `ServiceAccount`s, Roles and RoleBindings from
-  `common.sh` — the `render_tenant_quota` / `render_wi_metadata_block` idiom, one source and one
-  render with the exemplar derived — and apply them from a numbered provisioning step. Then close the
-  class: extend `dev/tests/install-path-wired.py` with a sixth property requiring every manifest under
-  `examples/gitops-repo/` to be applied by a step, rendered from a template the install path uses, an
-  input to a check or fixture, or **declared** inert with a reason.
+- **P9-T7d-5** — **the install path for the identities T7d-3 just wrote.** Added 2026-07-28, run
+  before T7d-4, **done 2026-07-28**. Renders the reader and actor `ServiceAccount`s, the shared
+  broker-operations `ClusterRole`/`Role` and the two bindings from `common.sh` — the
+  `render_tenant_quota` / `render_wi_metadata_block` idiom, one source and one render — applied from
+  numbered steps in `provision_08` (platform) and `provision_12` (cluster-admin, developer-team),
+  with matching `delete_agent_identity` calls in both teardowns. **Claims V-CMP-007 at L0** as
+  `dev/tests/identity-has-install-path.py`.
 
   **Why it exists.** T7d-3 shipped the actor identity into `policy/rbac-overlay/` and the per-cluster
-  bundles, and a user question at CHECKPOINT surfaced that **no `provision_NN_*.sh` step creates any
-  agent ServiceAccount, Role or RoleBinding at all** — the live reader SA is
-  `kubeagents-platform-agent` while the exemplar says `platform-agent`. So the actor SA the broker
-  Deployment references does not exist on any cluster, and the pod would not start. That is
-  [[LSN-039]], an escape against the already-closed [[LSN-007]]: `install-path-wired.py` walks the
-  _script_ graph and every one of its five properties passes on a repository whose steps run
-  perfectly and apply none of the security manifests. `common.sh:656` had already found and fixed the
-  same class for the tenant quota and the namespace default-deny without generalizing, so this is the
-  third instance.
+  bundles, and a user question at CHECKPOINT surfaced that nothing on the install path creates it.
+  The accurate finding, narrowed after a read-only sweep of the live `platform-agent-host`, has three
+  parts: the cluster-admin and developer-team **reader** SAs _were_ created imperatively, inline in
+  `cluster-admin-agent.yaml.template` and `developer-team-agent.yaml.template`; the **platform**
+  reader SA was created by nothing at all — `kubeagents-platform-agent` on the live cluster is a bare
+  hand-applied SA whose `last-applied-configuration` carries no labels and whose Workload Identity
+  annotation is not in it either; and **no actor SA and no broker-operations grant existed anywhere
+  on any install path**, so the broker Deployment T7d-3 renders would reference an identity that does
+  not exist and the pod would not start. No install-path identity carried `kube-agents/role`, which
+  is the label both VAP arms now select on.
+
+  That is [[LSN-039]], an escape against the already-closed [[LSN-007]]: `install-path-wired.py`
+  walks the _script_ graph and every one of its five properties passes on a repository whose steps
+  run perfectly and apply none of the security manifests. `common.sh:656` had already found and fixed
+  the same class for the tenant quota and the namespace default-deny without generalizing, so this is
+  the third instance.
+
+  **Two changes beyond the literal scope, both single-definition-site moves.** The inline
+  `ServiceAccount` blocks were **deleted** from the two tier templates rather than relabelled, so the
+  reader identity has exactly one source; what stays in those templates is the tier's authority.
+  And `platform-agent.yaml.template` gained `spec.scope.projectId`: without it the platform actor
+  renders `platform--actor` and the broker's `validate()` refuses an empty `--scope`, so the pair
+  would come up `BrokerReady=false` forever. `spec.scope` is mutable (only `spec.tier` is immutable),
+  and the added scope still strictly contains every cluster-admin scope under it.
 
   **Deliberately not in scope**, by user decision: the 45 stale `app.kubernetes.io/managed-by: gitops`
   sites across 24 files, and the 08 §2 / §2.7 / §4 "GitOps-managed" wording that contradicts 05 §C13
   and 06 §4. Those are documentation and a spec correction; this is a pod that will not start.
+  **Also not in scope, and carried forward explicitly**: the planned declare-or-fail table over
+  `examples/gitops-repo/` — V-CMP-007 walks the manifest→step edge for the **install path**
+  (`k8s-operator/scripts/`), which is what makes the identities real, but it says nothing about which
+  files in the exemplar tree are inert. That property belongs to the queued sweep unit, which is the
+  unit that touches that tree.
 
 **Why T7d split in two.** Two reasons, and the second one changed what T7d-2 is allowed to contain.
 

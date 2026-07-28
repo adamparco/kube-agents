@@ -201,6 +201,20 @@ check that proves they left the critical path.
   never partial — the symptom surfaces as a runtime refusal in a component whose pod is Ready and
   whose unit tests are green. Negative control: strip `API_SERVER_KEY` from a fixture's
   `platform_control` block and confirm the check goes red. `L0`, `L2`
+- **V-CMP-007** — every identity the broker resolves by name is **created by something the install
+  path runs**. V-CMP-001 walks the script graph and stops there; this walks the three links beyond
+  it — a template must be rendered by a step that is itself reachable, a ServiceAccount named as an
+  RBAC subject or a `roleRef` must be one the install path creates, and every agent tier present in
+  `agents/` must have an `apply_agent_identity` call site. It also asserts that the two derivations
+  of the actor ServiceAccount name — `actorServiceAccountName` in Go and `actor_service_account_name`
+  in `common.sh` — agree, since 06 §2.2.1 forbids the CR from naming its own actor and so leaves no
+  third place where a drift between them would surface. Every ServiceAccount the install path
+  creates must carry both `kube-agents/tier` and `kube-agents/role`: those two labels are the whole
+  selector surface of `vap-agent-pod-hardening` and of `vap-agent-readonly`'s actor carve-out, and
+  an identity missing them is not denied but **invisible** to the rules written to bound it. Reports
+  **fail**, never partial — the symptom is a policy that matches nothing, which reports the same
+  green as a policy that passes. Negative control: stop applying one tier's identity and confirm the
+  check goes red while the other two tiers still install. `L0`
 
 ### 5.2 Contract inventory (from [06](06-api-and-data-contracts.md))
 

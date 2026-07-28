@@ -8,6 +8,16 @@ metadata:
 spec:
   # Persona / containment level (06 §1.1). Immutable after creation.
   tier: platform
+  # Admission requires no scope of the platform tier (06 §1.2 V-2) and this used to be omitted
+  # entirely. It cannot be, once the tier has a broker. The actor identity's name is
+  # `<tier>-<scope-leaf>-actor` and the leaf of a scope-less platform agent is the empty string, so
+  # the controller renders `platform--actor` while the broker's own validate() refuses to start with
+  # an empty --scope: the pair comes up BrokerReady=false and stays there. `projectId` is the
+  # conventional platform scope (agent_webhook.go:384 says so), it makes the leaf well defined, and
+  # it strictly contains every cluster-admin scope beneath it, which is what V-6's parent ceiling
+  # asks for. Scope is mutable — only `tier` is not — so this applies cleanly to an existing CR.
+  scope:
+    projectId: "${PROJECT_ID}"
   harness:
     clusterName: "${CLUSTER_NAME}"
     location: "${REGION}"
