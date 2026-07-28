@@ -267,6 +267,17 @@ type Refusal struct {
 	Detail        string // human-readable; safe to return to the caller
 	Journal       bool   // write a Rejected ActionRecord
 	SecurityEvent bool   // emit a security event
+
+	// RetryAfterSeconds is how long the caller should wait before trying again. Zero means "do not
+	// retry", which is the right answer for every schema and authorization refusal: a malformed
+	// envelope is not going to become well-formed on its own.
+	//
+	// It lives here rather than being computed at the write site for the same reason Journal does:
+	// 06 §4.4 puts `retryAfterSeconds` on the pause refusal, the brake is what knows whether a
+	// refusal is temporary, and a value derived at the HTTP boundary would be derived from the
+	// status code -- which cannot distinguish a freeze that clears in an hour from one with no
+	// expiry at all.
+	RetryAfterSeconds int
 }
 
 func (r *Refusal) Error() string { return r.Reason + ": " + r.Detail }
@@ -285,6 +296,17 @@ const (
 	ReasonIdempotencyKeyMismatch = "idempotency-key-mismatch"
 	ReasonScopeSpoof             = "scope-spoofed"
 	ReasonForbiddenCaller        = "forbidden-caller"
+
+	// The brake (06 §4.4). Same list, deliberately, rather than a second const block in brake.go:
+	// these strings are a single namespace as far as a caller matching on `reason` is concerned,
+	// and two definition sites is how the same string ends up meaning two things.
+	ReasonAgentPaused        = "agent-paused"
+	ReasonScopeFrozen        = "scope-frozen"
+	ReasonTargetContested    = "target-contested"
+	ReasonJournalUnavailable = "journal-unavailable"
+	ReasonSnapshotFailed     = "snapshot-failed"
+	ReasonBudgetExhausted    = "budget-exhausted"
+	ReasonFlapDetected       = "flap-detected"
 )
 
 func invalid(format string, args ...any) *Refusal {

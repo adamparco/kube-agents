@@ -835,4 +835,4 @@ func TestReservedKeyOf(t *testing.T) {
 	}
 }
 
-var errJournalDown = &Refusal{Reason: "journal-unavailable", Detail: "etcd is unreachable"}
+var errJournalDown = &Refusal{Reason: ReasonJournalUnavailable, Detail: "etcd is unreachable"}
