@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,6 +28,11 @@ func init() {
 	_ = corev1.AddToScheme(testScheme)
 	_ = appsv1.AddToScheme(testScheme)
 	_ = rbacv1.AddToScheme(testScheme)
+	// networking/v1 because the controller renders the pair's two NetworkPolicies (P9-T7d-2). The
+	// real manager gets these from clientgoscheme; this scheme is hand-built and enumerates only what
+	// the render actually emits, so a new object kind is a registration line here as well as a
+	// golden diff.
+	_ = networkingv1.AddToScheme(testScheme)
 }
 
 func TestAgentsGolden(t *testing.T) {

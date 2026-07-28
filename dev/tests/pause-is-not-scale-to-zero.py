@@ -139,6 +139,11 @@ RENDERING = {
     "withholding a certificate from a paused agent takes the pair's TRANSPORT down, which reads as a "
     "broker outage and drops the agent into observe-and-report (08 §2.4) instead of letting it refuse "
     "with a reason (06 §4.4). RENDERING is the strict arm; classify here when in doubt",
+    "pair_netpol.go": "renders the pair's two NetworkPolicies from an Agent. Same argument as "
+    "mesh_trust.go and one step worse: the tempting wrong implementation is 'a paused agent's egress "
+    "rule should not admit the broker hop', which is the SAME misreading of 06 §4.4 -- it makes the "
+    "pause indistinguishable from a network fault, and it does it at the layer where the agent cannot "
+    "even report the refusal, because the connection is dropped rather than answered",
 }
 
 # Controllers that may legitimately read `spec.operations`, each with the reason. Property 2 still

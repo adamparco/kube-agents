@@ -441,11 +441,12 @@ reverse write cannot leave 06 §4.3's bidirectional link one-way.
   says so outright, since the commonest contested case is a human undoing a create and a deleted
   object cannot hold an annotation. Tested both directions.
 
-**P9-T7 ships as five units**, on the same layering seam T3a/T3b, T5a/T5b and T6a/b/c used: the
-thing both halves depend on, then the rendering of the pair, then the cluster-scoped objects that
-pair needs to actually talk, then the pipeline that runs behind it. (T7d was split out of T7b
-mid-unit, then split again into T7d-1/T7d-2; see "Why T7b stops at the render" and
-"Why T7d split in two" below.)
+**P9-T7 ships as seven units**, on the same layering seam T3a/T3b, T5a/T5b and T6a/b/c used: the
+thing both halves depend on, then the rendering of the pair, then the objects that pair needs to
+actually talk, then the pipeline that runs behind it. (T7d was split out of T7b mid-unit, then split
+again into T7d-1/T7d-2, and T7d-2 split once more into T7d-2/T7d-3/T7d-4 when implementing it showed
+that its three deliverables live in three different layers with three different verification levels.
+See "Why T7b stops at the render", "Why T7d split in two" and "Why T7d-2 split again" below.)
 
 - **P9-T7a** — `internal/agentlabels/`: the five 08 §2.5 label keys spelled once, and the injective
   scope renderer. Every other T7 deliverable stamps these; nothing else in T7 can be written without
@@ -462,11 +463,19 @@ mid-unit, then split again into T7d-1/T7d-2; see "Why T7b stops at the render" a
   `Certificate`s behind `<agent>-broker-tls` and `<agent>-mesh-tls`, rendered by the controller and
   owner-referenced. **Claims no new L0 check**; six L1 property tests, of which the load-bearing one
   is the SPIFFE binding (below).
-- **P9-T7d-2** — **isolation**: the broker's ingress NetworkPolicy (from `role: reader` with
-  matching `kube-agents/agent`) and the agent's egress-to-broker rule; the actor ServiceAccounts
-  bound to empty roles; the derived exemplars under `examples/gitops-repo/`. **Claims no new L0
-  check** — its properties are the L2 set already routed to P9-T9 (V-RUN-001/002/004/005/009,
-  V-ISO-001/002).
+- **P9-T7d-2** — **the pair's own NetworkPolicies**, rendered by the controller and
+  owner-referenced: `<agent>-broker-ingress` (the broker default-deny on ingress, admitting exactly
+  the peer matching `kube-agents/agent: <name>` **and** `kube-agents/role: reader`) and
+  `<agent>-to-broker` (the agent's one egress hop to :8443). **Claims no new L0 check** — six L1
+  property tests over the selectors; the packet-level properties are V-ISO-001/002 at L2 in P9-T9.
+- **P9-T7d-3** — **the actor identity**: the actor `ServiceAccount` per agent and the Role/RoleBinding
+  carrying **exactly** 06 §2.2.1's broker-operations grant and nothing else, as GitOps artifacts under
+  `policy/rbac-overlay/` with the derived exemplars under `examples/gitops-repo/`. **Claims V-BRK-013
+  at L0** — the two-sided assertion planning defect 1 resolves Accept (e) into.
+- **P9-T7d-4** — **the install-path egress holes**: the API-server rule the broker's own pipeline
+  needs, added to `netpol-agent-egress.yaml.template` as a rendered optional block with the
+  control-plane CIDR supplied by `vars.sh`, plus the regenerated exemplars. Verified by
+  `dev/tests/reference-render.py` at L0 and by V-ISO at L2 in P9-T9.
 
 **Why T7d split in two.** Two reasons, and the second one changed what T7d-2 is allowed to contain.
 
@@ -483,9 +492,34 @@ the reader identity: the controller holds `serviceaccounts: get;list;watch` and 
 pre-created and GitOps-managed, enforced by `vap-agent-readonly`. The actor SA is the _higher_-
 authority half of the pair, so if the reader's may not be minted at runtime, the actor's certainly
 may not — 06 §2.2.1's "the ability to name the actor identity is the ability to choose an authority
-level" applies with more force, not less. T7d-2 is therefore a GitOps-artifacts unit
-(`policy/rbac-overlay/`, the `netpol-*.yaml.template` provisioning path, `examples/gitops-repo/`),
-not a controller unit, which is a different kind of work from T7d-1 and shares no code with it.
+level" applies with more force, not less. The actor identity is therefore a GitOps-artifacts unit
+(`policy/rbac-overlay/`, `examples/gitops-repo/`), not a controller unit, which is a different kind
+of work from T7d-1 and shares no code with it.
+
+**Why T7d-2 split again.** The sentence above lumped three deliverables under "GitOps artifacts", and
+implementing the first one showed that only two of the three are. **The pair's NetworkPolicies are
+controller output, not install-time YAML** — 08 §2.7's grant table gives the controller full CRUD on
+`NetworkPolicies`, bounded to "objects the controller owns via `OwnerReference`", and
+[05](../design/05-system-architecture.md) §1 C1 lists "the pair's NetworkPolicies" among what the
+controller reconciles. They cannot be install-time artifacts anyway: they select on
+`kube-agents/agent`, and the CR that value names does not exist when the installer runs. The per-tier
+egress policies stay exactly where they are, because they select on `kube-agents/tier` and encode a
+fleet decision a human makes in a PR. So the split is by **layer**, and it lines up with the levels:
+selectors are L1, RBAC verbs are a static L0 assertion (V-BRK-013), and the install-path template has
+its own L0 check in `reference-render.py`.
+
+**What T7d-2 found and did not close: the broker cannot reach the API server.** The broker pod carries
+`kube-agents/tier`, so the per-tier egress policy selects it and makes it default-deny on egress — and
+that allowlist has no API-server rule. Its four destinations are DNS, the control namespace on
+:80/:8080 (LiteLLM and the token minter), `restricted.googleapis.com`, and GitHub's published CIDRs.
+None of those is the kube-apiserver, which the broker needs for **three of its eleven pipeline steps**:
+TokenReview (step 1), the FleetFreeze read (step 5), and the ActionRecord write (step 11). Nothing
+rendered by the controller can fix it — NetworkPolicy cannot name a Service, so "allow the
+`kubernetes` endpoint" is not expressible, and the control-plane CIDR is per-cluster and known only at
+install time. It is **P9-T7d-4**, and it is called out here rather than left in a code comment because
+the symptom is a broker that authenticates nobody, which reads as an auth bug and sends the debugger
+at `internal/broker/auth.go`. Note that the same gap has been latent for the READER since Phase 5 —
+whether the agent's own API reads survive it is an L2 question, and P9-T9 is where it gets asked.
 
 **What T7d-1 found: the mesh certificate is half of the broker's identity check, not just its
 transport.** `internal/broker/auth.go` authenticates the caller by TokenReview, compares the result
