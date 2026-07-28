@@ -210,6 +210,78 @@ metadata:
       name: agent
       uid: ""
 ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  creationTimestamp: null
+  labels:
+    kube-agents/agent: agent
+    kube-agents/parent: ""
+    kube-agents/role: actor
+    kube-agents/scope: ""
+    kube-agents/tier: platform
+  name: agent-broker-ingress
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Agent
+      name: agent
+      uid: ""
+spec:
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              kube-agents/agent: agent
+              kube-agents/role: reader
+      ports:
+        - port: 8443
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      kube-agents/agent: agent
+      kube-agents/role: actor
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  creationTimestamp: null
+  labels:
+    kube-agents/agent: agent
+    kube-agents/parent: ""
+    kube-agents/role: reader
+    kube-agents/scope: ""
+    kube-agents/tier: platform
+  name: agent-to-broker
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Agent
+      name: agent
+      uid: ""
+spec:
+  egress:
+    - ports:
+        - port: 8443
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              kube-agents/agent: agent
+              kube-agents/role: actor
+  podSelector:
+    matchLabels:
+      kube-agents/agent: agent
+      kube-agents/role: reader
+  policyTypes:
+    - Egress
+---
 apiVersion: v1
 kind: Service
 metadata:

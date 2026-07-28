@@ -66,6 +66,11 @@ type AgentReconciler struct {
 // projected token in that namespace. Namespaced only: the mesh CA ClusterIssuer is install-time
 // (config/mesh-ca/), not something the controller may create.
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
+// The pair's own NetworkPolicies (08 §2.7, P9-T7d-2) — the broker's ingress default-deny and the
+// agent's one egress hop to it. Granted explicitly by 08 §2.7's table, and bounded there to
+// "objects the controller owns via OwnerReference"; both carry one. This is not authority over a
+// tenant's own policies, which the controller may not write and does not select.
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 
 func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -256,6 +261,13 @@ func (r *AgentReconciler) reconcileWorkloadPair(ctx context.Context, agent *agen
 	// This is best-effort by design: no cert-manager means no certificates and a pair that stays
 	// BrokerReady: false — see reconcileMeshCertificates.
 	if err := r.reconcileMeshCertificates(ctx, agent); err != nil {
+		return err
+	}
+
+	// Then the pair's NetworkPolicies, and before the Deployments for the same reason: the ingress
+	// policy is the one that CLOSES the broker's door, so applying it after the broker is already
+	// serving leaves a window in which any pod in the namespace can reach :8443. See pair_netpol.go.
+	if err := r.reconcilePairNetworkPolicies(ctx, agent); err != nil {
 		return err
 	}
 
