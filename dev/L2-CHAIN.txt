@@ -93,3 +93,15 @@ bash dev/verify/classify-live-state-l2.sh gke-scratch-kube-agents-dev
 # the harm — delete an owner, watch the dependent be destroyed, recreate the owner and watch it stay
 # destroyed. That is the state a `recreate` plan would have reported as a completed undo.
 bash dev/verify/reference-index-l2.sh gke-scratch-kube-agents-dev
+
+# V-PRO-027: verification evidence is READ FROM THE CLUSTER. The third client-side probe, same P1
+# waiver, same named successor. Its L1 half runs under `make test` and is a real result — it proves
+# the prober reads the right fields. It cannot prove anything ever writes them, because envtest runs
+# an API server and no controllers, so every status the L1 suite reads is one the L1 suite wrote.
+# What is only here: a real kubelet restarting a real container after it had been Ready; a real
+# deployment controller not having converged yet, which is the only way to assert 04 §5.1's opening
+# sentence — the write returned success and the verdict is not Satisfied; a real endpoint-slice
+# controller publishing a count from live pod readiness; GKE's full admission chain, against which
+# the two-leg admission probe's negative control is a real experiment rather than a simulated one;
+# and a real deletion, so a recreated object genuinely gets a new uid.
+bash dev/verify/verify-prober-l2.sh gke-scratch-kube-agents-dev
