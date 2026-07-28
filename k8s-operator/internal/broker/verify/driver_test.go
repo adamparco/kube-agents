@@ -49,14 +49,16 @@ func (f *flippingProber) Get(context.Context, agentv1alpha1.TargetRef) (*unstruc
 }
 
 type fakeRollbacker struct {
-	calls int
-	err   error
-	plans []agentv1alpha1.UndoPlan
+	calls      int
+	err        error
+	plans      []agentv1alpha1.UndoPlan
+	identities []string
 }
 
-func (f *fakeRollbacker) Rollback(_ context.Context, _ string, plan agentv1alpha1.UndoPlan) error {
+func (f *fakeRollbacker) Rollback(_ context.Context, _ string, agentIdentity string, plan agentv1alpha1.UndoPlan) error {
 	f.calls++
 	f.plans = append(f.plans, plan)
+	f.identities = append(f.identities, agentIdentity)
 	return f.err
 }
 
@@ -424,6 +426,13 @@ func TestDriverPagesAndPausesWhenTheRollbackFails(t *testing.T) {
 	// "An immediate page, not a retry loop."
 	if rb.calls != 1 {
 		t.Errorf("rollback attempted %d times, want exactly 1", rb.calls)
+	}
+	// The replayer turns this into its field manager (V-BRK-019). The driver is the only layer
+	// holding it, so a driver that dropped it would leave the replay to guess -- and this suite is
+	// the last place that could notice, because the guess would still produce a valid manager
+	// string, just one naming the wrong agent.
+	if len(rb.identities) != 1 || rb.identities[0] != "developer-team/prod" {
+		t.Errorf("rollback was given identities %v, want exactly [developer-team/prod]", rb.identities)
 	}
 	if pager.calls != 1 || !res.Paged {
 		t.Errorf("pages = %d, res.Paged = %v", pager.calls, res.Paged)

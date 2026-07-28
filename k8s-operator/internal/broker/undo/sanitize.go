@@ -37,6 +37,65 @@ var droppedMetadataFields = []string{
 	"selfLink",
 }
 
+// DroppedMetadataFields is the drop list, for callers that must detect a body which did NOT go
+// through Sanitize.
+//
+// Exported as a function over a copy rather than as the slice, because a caller that ranged over an
+// exported var could append to it and silently shrink what the sanitizer drops from every future
+// snapshot.
+func DroppedMetadataFields() []string {
+	out := make([]string, len(droppedMetadataFields))
+	copy(out, droppedMetadataFields)
+	return out
+}
+
+// secretDigestMarker prefixes a Secret value that has been replaced by the digest of itself.
+//
+// One definition site, two readers: redactSecretData writes it, RedactedSecretKeys finds it. They
+// were briefly a literal in one place and a promise in a doc comment in the other, which is the
+// shape of LSN-031 -- a decision the codebase has already made, re-made by hand downstream.
+const secretDigestMarker = "sha256:"
+
+// RedactedSecretKeys reports the Secret keys in obj whose values are digests rather than material.
+//
+// It exists so the rollback replayer can REFUSE. 06 §4.3.1 says a redacted plan's material "lives in
+// the journal store and is verified against those digests on replay"; it does not, because the only
+// unredacted copy of a Secret is execute.Snapshot.Live, which is documented as never leaving memory.
+// So replaying such a body would not fail -- it would succeed, writing the hex of each value's own
+// digest into the Secret, and break every pod that mounts it in a way that reads as a completed
+// undo.
+//
+// Two decisions worth stating:
+//
+// Keyed on kind, exactly as redactSecretData is, and for the same reason inverted. A ConfigMap may
+// perfectly legitimately hold a value like "sha256:abc..." -- an image digest is the obvious one --
+// and matching on the value alone would refuse to restore it. The sanitizer only ever writes this
+// marker into a Secret, so only a Secret is asked about.
+//
+// In `data` the marker cannot be forged: those values are base64, and base64's alphabet has no
+// colon, so a real value can never look like this one. `stringData` is arbitrary text and a genuine
+// value COULD begin with "sha256:" -- a false refusal, which pages a human and preserves the
+// object. That is the direction to be wrong in; the other one silently destroys a credential.
+func RedactedSecretKeys(obj *unstructured.Unstructured) []string {
+	if obj == nil || obj.GetKind() != "Secret" || obj.GetAPIVersion() != "v1" {
+		return nil
+	}
+	var keys []string
+	for _, field := range []string{"data", "stringData"} {
+		m, found, err := unstructured.NestedStringMap(obj.Object, field)
+		if err != nil || !found {
+			continue
+		}
+		for k, v := range m {
+			if strings.HasPrefix(v, secretDigestMarker) {
+				keys = append(keys, field+"["+k+"]")
+			}
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // droppedAnnotations are annotations that describe a previous apply rather than the object.
 //
 // `last-applied-configuration` is a whole second copy of the object as it was at some earlier
@@ -192,7 +251,7 @@ func redactSecretData(out *unstructured.Unstructured) ([]Redaction, error) {
 		for k, v := range m {
 			s, _ := v.(string)
 			d := digestOfSecretValue(field, s)
-			redacted[k] = "sha256:" + d
+			redacted[k] = secretDigestMarker + d
 			redactions = append(redactions, Redaction{Key: k, SHA256: d})
 		}
 		if err := unstructured.SetNestedMap(out.Object, redacted, field); err != nil {

@@ -230,10 +230,15 @@ func (f *fakeProber) AccessReview(context.Context, verify.AccessQuery) (bool, er
 type fakeRollback struct {
 	err   error
 	calls int
+	// identity is recorded, not ignored: it is what the replayer turns into a field manager, and
+	// the pipeline is the only layer that knows which agent the request belongs to. A test that
+	// accepted the argument and dropped it would pass just as happily if the pipeline passed "".
+	identity string
 }
 
-func (f *fakeRollback) Rollback(context.Context, string, agentv1alpha1.UndoPlan) error {
+func (f *fakeRollback) Rollback(_ context.Context, _ string, agentIdentity string, _ agentv1alpha1.UndoPlan) error {
 	f.calls++
+	f.identity = agentIdentity
 	return f.err
 }
 

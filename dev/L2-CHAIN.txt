@@ -105,3 +105,16 @@ bash dev/verify/reference-index-l2.sh gke-scratch-kube-agents-dev
 # the two-leg admission probe's negative control is a real experiment rather than a simulated one;
 # and a real deletion, so a recreated object genuinely gets a new uid.
 bash dev/verify/verify-prober-l2.sh gke-scratch-kube-agents-dev
+
+# V-REV-011: a rollback REPLAYS THE PRE-STATE OR REFUSES. The fourth client-side probe, same P1
+# waiver, same named successor (broker-execute-l2.sh, P9-T9). Its L1 half is a 28-test hermetic
+# suite plus an envtest suite, and that envtest suite is a genuine result — real uids, real
+# server-side apply, real field-ownership conflicts. What it cannot reach is the word "pre-state".
+# At L1 a successful replay means a field changed; the pre-state of a scaled-down Deployment is
+# RUNNING PODS, and only a real controller and a real kubelet put them back, so a replayer that
+# wrote the number and restored nothing passes the whole L1 suite. Also only here: a real deletion
+# under Foreground propagation with the garbage collector reaping the dependents, which is what
+# makes "a name taken since the action" a situation rather than a staging trick; and the read-back
+# that L1's fake writer cannot answer — after a redacted Secret snapshot is refused, does the live
+# Secret still hold its password, at an unchanged resourceVersion?
+bash dev/verify/rollback-replayer-l2.sh gke-scratch-kube-agents-dev

@@ -86,6 +86,29 @@ func (a *ClientApplier) Apply(ctx context.Context, obj *unstructured.Unstructure
 	return out, nil
 }
 
+// Create makes an object that does not exist, and FAILS if the name is taken.
+//
+// Deliberately not on the Applier interface, and no execution path calls it: an agent's `create`
+// verb goes through Apply like every other write, because server-side apply is what carries the
+// field-manager attribution the whole broker is built around. The one caller is the rollback
+// replayer, and it needs this method for the property Apply does not have. A recreate step reverses
+// a delete, so it carries no uid precondition -- the uid died with the object -- and its ONLY
+// protection against restoring a snapshot on top of a stranger who has since taken the name is that
+// a create returns AlreadyExists. Apply at that same name merges the snapshot into the stranger's
+// object and reports success where their fields do not collide, and raises a field-ownership
+// conflict where they do; neither answer tells the operator that the object is gone.
+//
+// It lives here rather than in the rollback package because this file is the single place in the
+// broker that talks to an API server, and a second client opened next to it would be a second set
+// of answers to the same questions. LSN-040.
+func (a *ClientApplier) Create(ctx context.Context, obj *unstructured.Unstructured, fieldManager string) (*unstructured.Unstructured, error) {
+	out := obj.DeepCopy()
+	if err := a.Client.Create(ctx, out, client.FieldOwner(fieldManager)); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Patch applies a raw patch of the given media type.
 func (a *ClientApplier) Patch(ctx context.Context, ref agentv1alpha1.TargetRef, patchType string, body []byte, fieldManager string, dryRun bool) (*unstructured.Unstructured, error) {
 	pt, err := patchTypeOf(patchType)

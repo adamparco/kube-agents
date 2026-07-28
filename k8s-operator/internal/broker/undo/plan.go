@@ -359,6 +359,10 @@ func ValidateReplayable(plan *agentv1alpha1.UndoPlan) error {
 		return fmt.Errorf("the undo plan was never dry-run against the API server, so nothing has checked that its steps would apply")
 	}
 	for i, s := range plan.Steps {
+		if !isReplayableOp(s.Op) {
+			return fmt.Errorf("step %d has op %q, which is not one of the replayable ops (%s)",
+				i, s.Op, strings.Join(ReplayableOps(), ", "))
+		}
 		switch s.Op {
 		case "delete":
 			if s.Preconditions == nil || s.Preconditions.UID == "" {
@@ -374,11 +378,34 @@ func ValidateReplayable(plan *agentv1alpha1.UndoPlan) error {
 			if s.Object == nil && s.ObjectRef == nil {
 				return fmt.Errorf("step %d recreates %s %s with no snapshot body", i, s.Target.Kind, s.Target.Name)
 			}
-		default:
-			return fmt.Errorf("step %d has op %q, which the replayer does not implement", i, s.Op)
 		}
 	}
 	return nil
+}
+
+// ReplayableOps is the set of step ops this package emits and the replayer implements.
+//
+// One definition site for a set that has to be agreed on by two packages that cannot see each
+// other's switch statements. Until `internal/broker/rollback` existed, this validator's default arm
+// said an unknown op was one "which the replayer does not implement" -- an assertion about the
+// behaviour of a component that had not been written, and which nothing could have contradicted.
+// Now that both ends exist, the membership test above and the replayer's dispatch read the same
+// list, and `TestReplayerImplementsEveryReplayableOp` fails if one of them grows an entry the other
+// has not. LSN-040.
+//
+// Adding an op here is therefore a three-part change on purpose: the planner emits it, this
+// validator gets its detail arm, and the replayer gets a case. Any two without the third is a red.
+func ReplayableOps() []string {
+	return []string{"apply", "create", "delete", "scale"}
+}
+
+func isReplayableOp(op string) bool {
+	for _, want := range ReplayableOps() {
+		if op == want {
+			return true
+		}
+	}
+	return false
 }
 
 // combineStrategies reduces a multi-operation envelope's strategies to the one recorded on the plan.
