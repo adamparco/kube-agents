@@ -52,6 +52,7 @@ PLACEHOLDER_DEFAULTS = {
 ASSET_MAP = {
     "agent.yaml.tmpl": "clusters/@@CLUSTER@@/agents/agent.yaml",
     "identity/cluster-admin-identity.yaml.tmpl": "clusters/@@CLUSTER@@/agents/identity/cluster-admin-identity.yaml",
+    "identity/broker-operations.yaml.tmpl": "clusters/@@CLUSTER@@/agents/identity/broker-operations.yaml",
     "netpol-cluster-admin-egress.yaml.tmpl": "clusters/@@CLUSTER@@/agents/netpol-cluster-admin-egress.yaml",
     "bootstrap/README.md.tmpl": "clusters/@@CLUSTER@@/bootstrap/README.md",
     "bootstrap/00-cert-manager/kustomization.yaml.tmpl": "clusters/@@CLUSTER@@/bootstrap/00-cert-manager/kustomization.yaml",

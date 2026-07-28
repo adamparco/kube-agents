@@ -1,0 +1,98 @@
+# VAP positive fixture — the actor carve-out admits 06 §2.2.1's grant, and nothing wider (P9-T7d-3).
+#
+# These objects MUST be ADMITTED by `kube-agents-agent-readonly`. They are the exact shape the actor
+# identities ship (policy/rbac-overlay/broker-operations.yaml) — the two halves of the
+# broker-operations grant, split cluster-scoped / namespaced along the API's own seam.
+#
+# A positive fixture is not a formality here. The change that added the actor arm also widened the
+# policy's match condition and prefixed its read-only validation with `variables.isActor ||`; the
+# cheapest way to get every negative fixture passing is a policy that admits everything, and the only
+# thing standing between that and a green suite is a fixture that fails when the policy is too
+# STRICT. Its pair is vap_actor_negatives.yaml.
+#
+# Consumed by tests/e2e/vap_negative_test.sh and by dev/verify/gitops-tree-applies-l2.sh (expect
+# apply to SUCCEED). Lives under policy/tests/ and is excluded from the actuation pipeline's apply
+# paths — it is fixture input, not cluster state.
+---
+# DOC 1 — the cluster-scoped half. EXPECT: ADMITTED.
+# Carries `role: actor` and NO tier, which is the case the match condition had to grow a second
+# disjunct for: matching on `kube-agents/tier` alone would leave the only cluster-scoped actor grant
+# in the system ungoverned by the policy whose job is to bound actor RBAC. `create` on `tokenreviews`
+# is the one write verb, and it persists nothing.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vaptest-broker-operations-cluster
+  labels:
+    kube-agents/role: actor
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["fleetfreezes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["changepolicies"]
+    verbs: ["get", "list", "watch"]
+---
+# DOC 2 — the namespaced half. EXPECT: ADMITTED.
+# `create` on `actionrecords` and `update`/`patch` on `actionrecords/status` are the only verbs in
+# the whole grant that change stored state. Before the actor arm existed this object was impossible:
+# validation 1 denied any non-read verb on anything the policy selected, so an actor identity could
+# not be applied at all.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vaptest-broker-operations-namespaced
+  namespace: kubeagents-system
+  labels:
+    kube-agents/role: actor
+rules:
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["agents"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["approvalrosters"]
+    verbs: ["get", "list", "watch"]
+---
+# DOC 3 — a TIERED actor object. EXPECT: ADMITTED.
+# The per-tier actor Role/ClusterRole of 06 §2.2 does not exist until P10-T1, but when it does it
+# will carry both labels, and validation 3 must select on `role` regardless of whether a tier is also
+# present. This fixture pins that: an object carrying `tier: developer-team` AND `role: actor`, whose
+# rules are inside the grant, is admitted — the read-only arm does not fire on it, and the wrong-scope
+# arm does not either, because it is a Role and not a ClusterRole.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vaptest-developer-team-actor
+  namespace: team-x
+  labels:
+    kube-agents/tier: developer-team
+    kube-agents/role: actor
+rules:
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["get", "list", "watch", "create"]
+---
+# DOC 4 — a READER object, unchanged by the carve-out. EXPECT: ADMITTED.
+# The regression guard for V-CTN-004. The actor arm was written to apply unless `role: actor`, never
+# gated on `role: reader`, so an object that carries the reader label must behave exactly as it did
+# before the arm existed: read verbs admitted, everything else denied by validation 1.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vaptest-reader-labelled-readonly
+  labels:
+    kube-agents/tier: cluster-admin
+    kube-agents/role: reader
+rules:
+  - apiGroups: ["", "apps"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]

@@ -23,6 +23,12 @@ metadata:
   namespace: @@NAMESPACE@@
   labels:
     kube-agents/tier: developer-team
+    # 06 §2.1 calls this "the only change" the actor generation makes to a reader object, and it is
+    # not decoration — `vap-agent-pod-hardening` asserts a pod bound to a reader SA carries it and
+    # cannot mount an actor token (08 §2.5), and vap-agent-readonly's actor arm applies ONLY to
+    # `role: actor`, so an object that omits the label stays under the blanket write denial rather
+    # than escaping both arms.
+    kube-agents/role: reader
     app.kubernetes.io/managed-by: gitops
   annotations:
     # Workload Identity: binds this KSA to the VIEWER-ONLY cloud GSA (06 §2; mirrors the cluster-admin
@@ -45,6 +51,7 @@ metadata:
   namespace: @@NAMESPACE@@
   labels:
     kube-agents/tier: developer-team
+    kube-agents/role: reader
 rules:
   - apiGroups: ["", "apps", "batch", "networking.k8s.io"]
     resources: ["*"]
@@ -57,6 +64,7 @@ metadata:
   namespace: @@NAMESPACE@@
   labels:
     kube-agents/tier: developer-team
+    kube-agents/role: reader
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -64,4 +72,106 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: developer-team-agent
+    namespace: @@NAMESPACE@@
+---
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# ACTOR identity — held by the broker pod, never by the agent pod (P9-T7d-3).
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+#
+# The second half of 06 §2's reader/actor split. The agent pod above holds get/list/watch and nothing
+# else, which is what makes "the LLM holds no write credential" a fact about which token is mounted
+# where rather than a policy someone has to enforce.
+#
+# NAME `<tier>-<scope>-actor` — a developer-team agent's scope leaf IS its namespace, so this is
+# 06 §2.2's own worked example spelled the same way. DERIVED by `actorServiceAccountName`
+# (k8s-operator/internal/controller/broker_manifests.go) from tier + scope alone; the CRD has no field
+# a CR author could use to point their broker at a different authority level (06 §2.2.1).
+#
+# AUTHORITY, in this phase: exactly 06 §2.2.1's broker-operations grant — journal, brake, pause state,
+# TokenReview — and nothing over any workload in this namespace. The tenant template of 06 §2.2 lands
+# in P10-T1. No Workload Identity annotation and no `kube-agents/scope` label; see
+# policy/rbac-overlay/platform.yaml for why both wait for that task.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: developer-team-@@NAMESPACE@@-actor
+  namespace: @@NAMESPACE@@
+  labels:
+    kube-agents/tier: developer-team
+    kube-agents/role: actor
+    app.kubernetes.io/managed-by: gitops
+---
+# Cluster-scoped half of the grant, bound to a NAMESPACE-scoped tier — deliberate, not an oversight.
+#
+# The three resources in the shared ClusterRole are cluster-scoped objects of the kube-agents control
+# plane, not tenant resources: `tokenreviews` (a request API that stores nothing), `fleetfreezes` and
+# `changepolicies`. 06 §2.2.1 is explicit that the grant "is identical across tiers and is not
+# scoped… it confers no authority over tenant resources, so widening it does not widen an agent's
+# reach", and that `fleetfreezes` "MUST be readable by every tier" — a tier that cannot read the
+# freeze object fails closed permanently (§4.4), so omitting it would not fail safe, it would brick
+# the tier.
+#
+# This does not weaken the wrong-scope rule, which forbids a ClusterRole LABELLED
+# `tier: developer-team`; the shared object carries no tier because it belongs to none. What is
+# namespaced about this tier is what it can CHANGE, and every verb that changes anything is in the
+# Role below, bound only in @@NAMESPACE@@.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: developer-team-@@NAMESPACE@@-broker-operations
+  labels:
+    kube-agents/tier: developer-team
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeagents-broker-operations
+subjects:
+  - kind: ServiceAccount
+    name: developer-team-@@NAMESPACE@@-actor
+    namespace: @@NAMESPACE@@
+---
+# Namespaced half of the grant, instantiated IN THIS NAMESPACE. The other two tiers share the
+# `kubeagents-system` instance; a team namespace carries its own, because an actor appends
+# ActionRecords where it lives and @@NAMESPACE@@'s broker must not reach kubeagents-system's journal.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubeagents-broker-operations
+  namespace: @@NAMESPACE@@
+  labels:
+    kube-agents/role: actor
+    app.kubernetes.io/managed-by: gitops
+rules:
+  # Identical to the `kubeagents-system` instance, and `dev/tests/actor-grant-single-sourced.py`
+  # checks that against 06 §2.2.1 rather than against the sibling copy — two copies agreeing with
+  # each other is not the property that matters (V-BRK-013).
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["agents"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["approvalrosters"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: developer-team-@@NAMESPACE@@-broker-operations
+  namespace: @@NAMESPACE@@
+  labels:
+    kube-agents/tier: developer-team
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeagents-broker-operations
+subjects:
+  - kind: ServiceAccount
+    name: developer-team-@@NAMESPACE@@-actor
     namespace: @@NAMESPACE@@

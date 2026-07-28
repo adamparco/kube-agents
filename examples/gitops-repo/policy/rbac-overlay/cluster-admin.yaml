@@ -1,5 +1,12 @@
-# Cluster-admin tier — pre-created read-only identity (06 §2, 03 §4).
-# Cluster-scoped read-only. One per cluster. Controller references, never mints (08 §4).
+# Cluster-admin tier — pre-created identities (06 §2, 03 §4).
+#
+# TWO ServiceAccounts (06 §2, the reader/actor split). The READER is cluster-scoped read-only, one
+# per cluster, and is what the agent pod — the container the model runs in — is bound to. The ACTOR
+# is held by the broker pod and carries, in phase 9, exactly 06 §2.2.1's broker-operations grant:
+# journal, brake, pause state, TokenReview. The tenant template that lets a cluster-admin actor
+# create namespaces and quotas (06 §2.2) is P10-T1.
+#
+# Controller references both, never mints (08 §4).
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -7,6 +14,12 @@ metadata:
   namespace: kubeagents-system
   labels:
     kube-agents/tier: cluster-admin
+    # 06 §2.1 calls this "the only change" the actor generation makes to a reader object, and it is
+    # not decoration — `vap-agent-pod-hardening` asserts a pod bound to a reader SA carries it and
+    # cannot mount an actor token (08 §2.5), and vap-agent-readonly's actor arm applies ONLY to
+    # `role: actor`, so an object that omits the label stays under the blanket write denial rather
+    # than escaping both arms.
+    kube-agents/role: reader
     app.kubernetes.io/managed-by: gitops
   annotations:
     # Workload Identity: binds this KSA to the VIEWER-ONLY cloud GSA (06 §2; mirrors the platform
@@ -27,6 +40,7 @@ metadata:
   name: cluster-admin-agent-explorer
   labels:
     kube-agents/tier: cluster-admin
+    kube-agents/role: reader
 rules:
   - apiGroups:
       ["", "apps", "batch", "networking.k8s.io", "rbac.authorization.k8s.io"]
@@ -39,6 +53,7 @@ metadata:
   name: cluster-admin-agent-explorer
   labels:
     kube-agents/tier: cluster-admin
+    kube-agents/role: reader
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -46,4 +61,68 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: cluster-admin-agent
+    namespace: kubeagents-system
+---
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# ACTOR identity — held by the broker pod, never by the agent pod (P9-T7d-3).
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+#
+# NAME: `<tier>-<scope>-actor` (06 §2), <scope> being the tier's scope LEAF — the cluster, here.
+# DERIVED rather than chosen: `actorServiceAccountName` in
+# k8s-operator/internal/controller/broker_manifests.go computes it from tier + scope alone and
+# publishes it in `status.broker.actorServiceAccount`. 06 §2.2.1 states the reason in one line — the
+# ability to name the actor identity is the ability to choose an authority level — so the CRD has no
+# field for it, and this file must follow that function rather than the other way round.
+# `CLUSTER_NAME` is substituted per cluster by CI/CD. An unsubstituted apply fails CLOSED: the broker
+# references an SA that does not exist and never starts, rather than starting as someone else.
+#
+# NO WORKLOAD IDENTITY ANNOTATION. 06 §2.3's actor GSA carries cloud WRITE roles, IAM-Conditioned to
+# the cluster. Binding it in the phase whose actor template is broker-operations only would hand out
+# a cloud-write credential ahead of the Kubernetes machinery that bounds one; it lands with the
+# tenant template in P10-T1. See ./platform.yaml for why `kube-agents/scope` is also absent.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cluster-admin-CLUSTER_NAME-actor
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: cluster-admin
+    kube-agents/role: actor
+    app.kubernetes.io/managed-by: gitops
+---
+# The cluster-scoped half of 06 §2.2.1's grant — one SHARED, tier-neutral ClusterRole for the whole
+# fleet. ./broker-operations.yaml explains why the grant splits in two and why it is not copied per
+# tier.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-admin-agent-broker-operations
+  labels:
+    kube-agents/tier: cluster-admin
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeagents-broker-operations
+subjects:
+  - kind: ServiceAccount
+    name: cluster-admin-CLUSTER_NAME-actor
+    namespace: kubeagents-system
+---
+# The namespaced half — the journal, and the only two verbs in the grant that change stored state.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cluster-admin-agent-broker-operations
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: cluster-admin
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeagents-broker-operations
+subjects:
+  - kind: ServiceAccount
+    name: cluster-admin-CLUSTER_NAME-actor
     namespace: kubeagents-system

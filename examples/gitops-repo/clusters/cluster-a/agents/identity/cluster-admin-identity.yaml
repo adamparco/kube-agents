@@ -23,6 +23,12 @@ metadata:
   namespace: kubeagents-system
   labels:
     kube-agents/tier: cluster-admin
+    # 06 §2.1 calls this "the only change" the actor generation makes to a reader object, and it is
+    # not decoration — `vap-agent-pod-hardening` asserts a pod bound to a reader SA carries it and
+    # cannot mount an actor token (08 §2.5), and vap-agent-readonly's actor arm applies ONLY to
+    # `role: actor`, so an object that omits the label stays under the blanket write denial rather
+    # than escaping both arms.
+    kube-agents/role: reader
     app.kubernetes.io/managed-by: gitops
   annotations:
     # Workload Identity: binds this KSA to the VIEWER-ONLY cloud GSA (06 §2; mirrors the platform
@@ -43,6 +49,7 @@ metadata:
   name: cluster-admin-agent-explorer
   labels:
     kube-agents/tier: cluster-admin
+    kube-agents/role: reader
 rules:
   - apiGroups:
       ["", "apps", "batch", "networking.k8s.io", "rbac.authorization.k8s.io"]
@@ -55,6 +62,7 @@ metadata:
   name: cluster-admin-agent-explorer
   labels:
     kube-agents/tier: cluster-admin
+    kube-agents/role: reader
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -62,4 +70,69 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: cluster-admin-agent
+    namespace: kubeagents-system
+---
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# ACTOR identity — held by the broker pod, never by the agent pod (P9-T7d-3).
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+#
+# The second half of 06 §2's reader/actor split, and the reason the split is "the single most
+# load-bearing contract in the document": the agent pod above holds get/list/watch and nothing else,
+# so "the LLM holds no write credential" is a fact about which token is mounted where, not a policy.
+#
+# NAME `<tier>-<scope>-actor`, the scope leaf being the cluster. DERIVED, not chosen —
+# `actorServiceAccountName` (k8s-operator/internal/controller/broker_manifests.go) computes it from
+# tier + scope alone and publishes it in `status.broker.actorServiceAccount`; the CRD has no field a
+# CR author could use to point their broker at a different authority level (06 §2.2.1).
+#
+# AUTHORITY, in this phase: exactly 06 §2.2.1's broker-operations grant and nothing else — journal,
+# brake, pause state, TokenReview. It confers nothing over any tenant resource. The per-tier tenant
+# template of 06 §2.2 lands in P10-T1, after the machinery that makes a write survivable.
+#
+# No Workload Identity annotation and no `kube-agents/scope` label: see
+# policy/rbac-overlay/platform.yaml, which records why both wait for P10-T1.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cluster-admin-cluster-a-actor
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: cluster-admin
+    kube-agents/role: actor
+    app.kubernetes.io/managed-by: gitops
+---
+# Cluster-scoped half of the grant — the SHARED, tier-neutral ClusterRole applied by
+# ./broker-operations.yaml, which explains why the grant is two objects rather than one.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-admin-agent-broker-operations
+  labels:
+    kube-agents/tier: cluster-admin
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeagents-broker-operations
+subjects:
+  - kind: ServiceAccount
+    name: cluster-admin-cluster-a-actor
+    namespace: kubeagents-system
+---
+# Namespaced half — the journal, and the only two verbs in the whole grant that change stored state.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cluster-admin-agent-broker-operations
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: cluster-admin
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeagents-broker-operations
+subjects:
+  - kind: ServiceAccount
+    name: cluster-admin-cluster-a-actor
     namespace: kubeagents-system

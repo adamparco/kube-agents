@@ -1,7 +1,19 @@
-# Platform tier — pre-created read-only identity (06 §2, 03 §4).
-# Project-scoped read-only. The controller REFERENCES this SA (serviceAccountName); it never mints
-# RBAC (08 §4). The `kube-agents/tier` label is the selector the ValidatingAdmissionPolicy uses.
-# Verbs are read-only (get/list/watch) — a write verb here would be rejected by vap-agent-readonly.
+# Platform tier — pre-created identities (06 §2, 03 §4).
+#
+# TWO ServiceAccounts, and 06 §2 calls that split "the single most load-bearing contract in the
+# document: it is what makes 'the LLM holds no write credential' a structural fact rather than a
+# policy". The READER below is held by the agent pod — the container the model runs in — and holds
+# get/list/watch and nothing else, ever. The ACTOR is held by the broker pod and is the only identity
+# in the tier that can change anything.
+#
+# In phase 9 the actor's authority is exactly 06 §2.2.1's broker-operations grant and nothing more:
+# it can append to its own journal, read the brake, read its own pause state, and authenticate the
+# caller. The per-tier tenant template of 06 §2.2 — the rules that let the platform actor create a
+# cluster through KCC — is P10-T1. Until then this identity can write nothing but ActionRecords,
+# which is the correct order: the machinery that makes a write survivable ships before the write.
+#
+# The controller REFERENCES both SAs (serviceAccountName); it never mints RBAC (08 §4). The
+# `kube-agents/tier` and `kube-agents/role` labels are the selectors vap-agent-readonly uses.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -9,6 +21,11 @@ metadata:
   namespace: kubeagents-system
   labels:
     kube-agents/tier: platform
+    # 06 §2.1: "the only change is the added `kube-agents/role: reader` label". It is not decoration.
+    # `vap-agent-pod-hardening` asserts a pod bound to a reader SA carries `role: reader` and cannot
+    # mount an actor token (08 §2.5), and vap-agent-readonly's actor arm is written to apply ONLY to
+    # `role: actor` — so an object that omits this label still falls under the blanket write denial.
+    kube-agents/role: reader
     app.kubernetes.io/managed-by: gitops
   annotations:
     # Workload Identity: binds this KSA to the VIEWER-ONLY cloud GSA (06 §2; provisioned by
@@ -24,6 +41,7 @@ metadata:
   name: platform-agent-explorer
   labels:
     kube-agents/tier: platform
+    kube-agents/role: reader
 rules:
   - apiGroups:
       ["", "apps", "batch", "networking.k8s.io", "rbac.authorization.k8s.io"]
@@ -42,6 +60,7 @@ metadata:
   name: platform-agent-explorer
   labels:
     kube-agents/tier: platform
+    kube-agents/role: reader
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -49,4 +68,83 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: platform-agent
+    namespace: kubeagents-system
+---
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# ACTOR identity — held by the broker pod, never by the agent pod (P9-T7d-3).
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+#
+# NAME: `<tier>-<scope>-actor` (06 §2, table row 2), where <scope> is the tier's scope LEAF — the
+# project for platform. The name is DERIVED, not chosen: `actorServiceAccountName` in
+# k8s-operator/internal/controller/broker_manifests.go computes it from tier + scope alone and
+# publishes the result in `status.broker.actorServiceAccount`. 06 §2.2.1 gives the reason in one
+# line — the ability to name the actor identity is the ability to choose an authority level — which
+# is why the CRD has no field for it and why this file must agree with that function rather than the
+# other way round. `PROJECT_ID` is substituted per project by CI/CD, exactly as in the WI annotation
+# above. An unsubstituted apply fails CLOSED: the broker pod references an SA that does not exist and
+# never starts, rather than starting under some other identity.
+#
+# NO WORKLOAD IDENTITY ANNOTATION, deliberately. 06 §2.3 gives the actor a cloud GSA
+# (`kubeagents-platform-actor-gsa`, `roles/container.admin` + friends, IAM-Conditioned to the
+# project) — and that GSA can write cloud resources. Binding it here, in the phase whose actor
+# template is broker-operations only, would hand the actor a cloud-write credential months before
+# the Kubernetes-side machinery that bounds one. It lands with the tenant template in P10-T1.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-PROJECT_ID-actor
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: platform
+    kube-agents/role: actor
+    app.kubernetes.io/managed-by: gitops
+    #
+    # NO `kube-agents/scope` LABEL, though 06 §2's identity table lists one for the actor row. The
+    # label's value is NOT the scope leaf that appears in the SA name — it is
+    # `agentlabels.RenderScope`, which joins every non-empty level with '.' and falls back to a
+    # digest when the join would be ambiguous (k8s-operator/internal/agentlabels/labels.go). For this
+    # tier the two happen to coincide; for cluster-admin they do not
+    # (`your-gcp-project-id.cluster-a` vs a leaf of `cluster-a`), so writing the label by hand here
+    # would create a second definition site for a value that already has one in Go, and the two would
+    # disagree on the first tier where they can. `vap-agent-scope` (P10-T1) is what will select on it
+    # — the label lands when the controller stamps it, from the function that defines it. Recorded as
+    # an open question in the ledger: whether the label means the leaf or the whole rendered scope.
+---
+# The cluster-scoped half of 06 §2.2.1's grant. One SHARED, tier-neutral ClusterRole for the whole
+# fleet — see ./broker-operations.yaml for why the grant splits in two and why it is not copied
+# per tier.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: platform-agent-broker-operations
+  labels:
+    kube-agents/tier: platform
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeagents-broker-operations
+subjects:
+  - kind: ServiceAccount
+    name: platform-PROJECT_ID-actor
+    namespace: kubeagents-system
+---
+# The namespaced half — the journal, and the two verbs in the whole grant that change stored state.
+# Bound in `kubeagents-system` only: the platform actor appends to the journal where it lives and
+# nowhere else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: platform-agent-broker-operations
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: platform
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeagents-broker-operations
+subjects:
+  - kind: ServiceAccount
+    name: platform-PROJECT_ID-actor
     namespace: kubeagents-system
