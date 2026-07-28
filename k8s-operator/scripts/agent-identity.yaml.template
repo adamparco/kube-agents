@@ -1,0 +1,99 @@
+# Agent identity for one tier — the reader/actor pair of 06 §2, and the actor's binding to the
+# broker-operations grant of 06 §2.2.1.
+#
+# Rendered by `render_agent_identity` in common.sh and applied by the provisioning step that installs
+# the tier, BEFORE the Agent CR. Identity-before-pod is not a style preference: the controller
+# REFERENCES both ServiceAccounts by name and never mints a KSA or writes RBAC (08 §4, and
+# agent_controller.go says so in as many words). If the identity is not already there, the pod the
+# controller creates has nothing to bind to.
+#
+# ── Why this is a template and not three copies ────────────────────────────────────────────────
+# Before P9-T7d-5 the reader identity was spelled out inline in cluster-admin-agent.yaml.template and
+# developer-team-agent.yaml.template, the platform reader was spelled out nowhere at all (it existed
+# on the live cluster only because someone had typed `kubectl create sa` once, undocumented), and no
+# actor identity existed on any install path. Three near-copies and one hole is exactly the shape
+# where a security label gets added to two of them.
+#
+# ── The two labels, and why the second one is load-bearing ─────────────────────────────────────
+# `kube-agents/tier` says which tier this identity belongs to. `kube-agents/role` says whether it may
+# write. Both admission policies select on the pair:
+#
+#   vap-agent-pod-hardening — a pod bound to a `role: reader` SA may not mount an actor token.
+#   vap-agent-readonly      — the blanket write denial has ONE carve-out, and it applies only to
+#                             `role: actor`. An RBAC object that omits the label stays under the
+#                             blanket denial; a ServiceAccount that omits it is invisible to the
+#                             pod-hardening rule that is supposed to protect it.
+#
+# The reader identities on the live cluster carried `kube-agents/tier` alone until this template
+# existed, so both policies were selecting on a label no identity had. Nothing failed — that is the
+# problem. A policy whose selector matches nothing reports the same green as a policy that passes.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${AGENT_READER_KSA}
+  namespace: ${AGENT_NAMESPACE}
+  labels:
+    kube-agents/tier: ${AGENT_TIER}
+    kube-agents/role: reader
+${AGENT_READER_ANNOTATIONS}
+---
+# The actor. 06 §2.2.1: "the ability to name the actor identity is the ability to choose an authority
+# level", so this name is DERIVED, never chosen — `<tier>-<scope-leaf>-actor`, computed by
+# `actorServiceAccountName` in internal/controller/broker_manifests.go and published (read-only) in
+# `status.broker.actorServiceAccount`. common.sh recomputes the same string; if the two ever disagree
+# the broker resolves a ServiceAccount that does not exist and fails closed, which is the safe
+# direction and still an outage, so `dev/tests/identity-has-install-path.py` (V-CMP-007) holds them
+# together at L0.
+#
+# NO WORKLOAD IDENTITY ANNOTATION HERE, deliberately. 06 §2.3 eventually gives the actor a cloud GSA
+# that can write cloud resources. Phase 9's actor authority is the broker-operations grant and
+# nothing else, and binding a cloud-write credential to it now would hand the actor months of
+# authority ahead of the controls that are supposed to bound it (P10-T1 owns that).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${AGENT_ACTOR_KSA}
+  namespace: ${AGENT_NAMESPACE}
+  labels:
+    kube-agents/tier: ${AGENT_TIER}
+    kube-agents/role: actor
+---
+# The cluster-scoped half of 06 §2.2.1's grant: TokenReview plus three reads. Bound cluster-wide
+# because all three of its resources are cluster-scoped, and carrying no write verb on a persisted
+# object is what makes that acceptable — see broker-operations-grant.yaml.template.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ${AGENT_READER_KSA}-broker-operations
+  labels:
+    kube-agents/tier: ${AGENT_TIER}
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeagents-broker-operations
+subjects:
+  - kind: ServiceAccount
+    name: ${AGENT_ACTOR_KSA}
+    namespace: ${AGENT_NAMESPACE}
+---
+# The namespaced half — the journal, and the only two verbs in the whole grant that change stored
+# state. Bound in this agent's namespace ONLY: an actor appends ActionRecords where it lives. A
+# ClusterRoleBinding here would make the fleet's journal writable from any tenant, which is the
+# fleet-wide-writer shape V-BRK-012 forbids one layer down.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ${AGENT_READER_KSA}-broker-operations
+  namespace: ${AGENT_NAMESPACE}
+  labels:
+    kube-agents/tier: ${AGENT_TIER}
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeagents-broker-operations
+subjects:
+  - kind: ServiceAccount
+    name: ${AGENT_ACTOR_KSA}
+    namespace: ${AGENT_NAMESPACE}

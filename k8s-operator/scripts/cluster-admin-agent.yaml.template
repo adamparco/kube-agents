@@ -1,18 +1,16 @@
-# Cluster Admin Agent (tier 2): read-only identity + Agent CR for one cluster.
+# Cluster Admin Agent (tier 2): read-only AUTHORITY + Agent CR for one cluster.
 #
 # Rendered by provision_12_deploy_agent_tiers.sh. The identity is applied before the CR
 # (identity-before-pod): the controller REFERENCES the ServiceAccount by name and never mints
 # RBAC or a KSA itself (08 §4).
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ${CLUSTER_ADMIN_KSA_NAME}
-  namespace: ${NAMESPACE}
-  labels:
-    kube-agents/tier: cluster-admin
-  annotations:
-    iam.gke.io/gcp-service-account: "${CLUSTER_ADMIN_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
----
+#
+# THE SERVICEACCOUNTS ARE NOT IN THIS FILE. They used to be — one reader SA, written inline here and
+# again in developer-team-agent.yaml.template, with the platform reader written nowhere and no actor
+# identity anywhere. They come from `agent-identity.yaml.template` now, applied by
+# `apply_agent_identity` in the step above, so that all three tiers get identical labels and the
+# actor half arrives with the reader half. What stays here is the tier's AUTHORITY — what this agent
+# may read — which genuinely differs per tier and is the reason the two concerns were ever separable.
+#
 # Read verbs only. The kube-agents-agent-readonly ValidatingAdmissionPolicy rejects any
 # tier-labelled role carrying a write or privilege-escalation verb, so this is enforced at
 # admission and not merely by convention.
@@ -22,6 +20,7 @@ metadata:
   name: ${CLUSTER_ADMIN_KSA_NAME}-explorer
   labels:
     kube-agents/tier: cluster-admin
+    kube-agents/role: reader
 rules:
   - apiGroups:
       ["", "apps", "batch", "networking.k8s.io", "rbac.authorization.k8s.io"]
@@ -34,6 +33,7 @@ metadata:
   name: ${CLUSTER_ADMIN_KSA_NAME}-explorer
   labels:
     kube-agents/tier: cluster-admin
+    kube-agents/role: reader
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

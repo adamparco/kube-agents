@@ -963,6 +963,150 @@ apply_tenant_service_aliases() { # apply_tenant_service_aliases <namespace>
   print_success "Service aliases applied in ${namespace} — litellm/github-token-minter now resolve to ${control}."
 }
 
+# ------------------------------------------------------------------------------
+# Agent identity: the reader/actor pair (06 §2) and the broker-operations grant (06 §2.2.1)
+# ------------------------------------------------------------------------------
+# LSN-039. The reader identities used to be written inline in the two tier templates, the platform
+# reader was written nowhere (it existed on the live cluster because a human had typed it once), and
+# the actor identity and its grant existed only under examples/gitops-repo/ — a reference tree that
+# no install path reads. The check that was supposed to catch this, `install-path-wired.py`, walks
+# the SCRIPT graph: every numbered step is invoked by the driver, so it passed, and it would have
+# passed just as green on a repository whose steps apply none of the security manifests. A closed
+# lesson is closed against an instance; the next instance arrives one edge over.
+#
+# So: one definition site per object, in a template beside these functions, applied by the step that
+# installs the tier. `dev/tests/identity-has-install-path.py` (V-CMP-007) is the mechanization —
+# every ServiceAccount the install path REFERENCES must be one the install path CREATES.
+
+# actor_service_account_name <tier> <scope-leaf>
+#
+# The bash half of `actorServiceAccountName` (internal/controller/broker_manifests.go). 06 §2.2.1
+# forbids the CR from naming its own actor — the ability to name the identity is the ability to
+# choose an authority level — so the name is a pure function of tier and scope leaf, computed
+# identically in both places. The leaf is `scope.Of(agent).Leaf()`: namespace if set, else cluster,
+# else project.
+#
+# The Go side has a >253-character truncation arm that hashes the leaf. It is not reproduced here,
+# and that is deliberate rather than an omission: a bash sha256 would be a second implementation of
+# a rule that only fires on names no Kubernetes namespace or GKE cluster name can produce (both cap
+# well below the limit). If a leaf ever gets long enough to matter, this function returns a name the
+# controller does not, the broker resolves a ServiceAccount that does not exist, and it fails closed
+# with BrokerReady false. V-CMP-007 asserts the two agree on every name the install path renders.
+actor_service_account_name() { # actor_service_account_name <tier> <scope-leaf>
+  printf '%s-%s-actor\n' "$1" "$2"
+}
+
+# render_broker_operations_grant <namespace>
+#
+# The shared, tier-neutral grant. Rendered once per namespace that hosts an agent, because the
+# namespaced half must exist in each of them; the ClusterRole half is identical every time and
+# `kubectl apply` makes the repeats no-ops.
+render_broker_operations_grant() { # render_broker_operations_grant <namespace>
+  local namespace="$1"
+  local template="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/broker-operations-grant.yaml.template"
+
+  if [ ! -f "${template}" ]; then
+    print_error "Broker operations grant template not found: ${template}"
+    exit 1
+  fi
+
+  local rendered
+  rendered="$(
+    AGENT_NAMESPACE="${namespace}" \
+      envsubst '${AGENT_NAMESPACE}' \
+      <"${template}"
+  )"
+  printf '%s\n' "${rendered}"
+}
+
+# render_agent_identity <tier> <namespace> <reader-ksa> <scope-leaf> [reader-gsa-email]
+#
+# The reader SA, the actor SA, and the two bindings that attach the actor to the grant above.
+#
+# The GSA email is optional and only ever lands on the READER. An empty value renders no annotations
+# block at all rather than an annotation with an empty value: `iam.gke.io/gcp-service-account: ""` is
+# a Workload Identity binding to nothing, which GKE reports as a token-exchange failure at the first
+# cloud call rather than as a misconfiguration at apply time.
+render_agent_identity() { # render_agent_identity <tier> <namespace> <reader-ksa> <scope-leaf> [gsa-email]
+  local tier="$1" namespace="$2" reader_ksa="$3" leaf="$4" gsa_email="${5:-}"
+  local template="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/agent-identity.yaml.template"
+
+  if [ ! -f "${template}" ]; then
+    print_error "Agent identity template not found: ${template}"
+    exit 1
+  fi
+
+  local actor_ksa annotations=""
+  actor_ksa="$(actor_service_account_name "${tier}" "${leaf}")"
+
+  if [ -n "${gsa_email}" ]; then
+    annotations="  annotations:
+    iam.gke.io/gcp-service-account: \"${gsa_email}\""
+  fi
+
+  # Command substitution strips every trailing newline, so `printf '%s\n'` leaves exactly one — the
+  # same reason render_egress_policy does it, and the same two gates in conflict if it does not.
+  local rendered
+  rendered="$(
+    AGENT_TIER="${tier}" \
+      AGENT_NAMESPACE="${namespace}" \
+      AGENT_READER_KSA="${reader_ksa}" \
+      AGENT_ACTOR_KSA="${actor_ksa}" \
+      AGENT_READER_ANNOTATIONS="${annotations}" \
+      envsubst '${AGENT_TIER} ${AGENT_NAMESPACE} ${AGENT_READER_KSA} ${AGENT_ACTOR_KSA} ${AGENT_READER_ANNOTATIONS}' \
+      <"${template}"
+  )"
+  printf '%s\n' "${rendered}"
+}
+
+# apply_agent_identity <tier> <namespace> <reader-ksa> <scope-leaf> [reader-gsa-email]
+#
+# Grant first, then the identity that binds to it. The order matters on a fresh cluster: a
+# RoleBinding whose roleRef names a Role that does not exist yet is accepted by the API server and
+# then grants nothing until the Role appears, so the failure is a silent authorization denial rather
+# than an apply error. Applying the grant first removes the window entirely.
+#
+# No opt-out flag, unlike the quota and the service aliases. Those degrade an install; skipping this
+# one produces a broker that cannot authenticate its own caller, and an "off" switch for it would
+# only ever be used by someone who had not read this paragraph.
+apply_agent_identity() { # apply_agent_identity <tier> <namespace> <reader-ksa> <scope-leaf> [gsa-email]
+  local tier="$1" namespace="$2" reader_ksa="$3" leaf="$4" gsa_email="${5:-}"
+  local grant identity actor_ksa
+
+  actor_ksa="$(actor_service_account_name "${tier}" "${leaf}")"
+  grant="$(render_broker_operations_grant "${namespace}")" || return 1
+  identity="$(render_agent_identity "${tier}" "${namespace}" "${reader_ksa}" "${leaf}" "${gsa_email}")" || return 1
+
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    print_info "[dry-run] would apply the broker-operations grant and the ${tier} reader/actor identity in ${namespace}"
+    printf '%s\n' "${grant}" | kubectl apply --dry-run=server -f - >/dev/null || return 1
+    printf '%s\n' "${identity}" | kubectl apply --dry-run=server -f - >/dev/null || return 1
+    print_success "Identity manifests validate against the API server"
+    return 0
+  fi
+
+  printf '%s\n' "${grant}" | kubectl apply -f - || return 1
+  printf '%s\n' "${identity}" | kubectl apply -f - || return 1
+  print_success "Identity applied in ${namespace}: reader '${reader_ksa}', actor '${actor_ksa}' bound to the 06 §2.2.1 grant."
+}
+
+# delete_agent_identity <tier> <namespace> <reader-ksa> <scope-leaf>
+#
+# The teardown half. The namespaced objects would go with the namespace for a tenant tier, but the
+# control namespace outlives every tier that lives in it and the ClusterRoleBinding is cluster-scoped
+# in every case — an undeleted binding survives into the next provision holding a subject name that
+# a later install may reuse. The shared ClusterRole and Role are NOT deleted here: they are fleet
+# objects, and removing them while another tier still binds to them would brick that tier's broker.
+delete_agent_identity() { # delete_agent_identity <tier> <namespace> <reader-ksa> <scope-leaf>
+  local tier="$1" namespace="$2" reader_ksa="$3" leaf="$4" actor_ksa
+  actor_ksa="$(actor_service_account_name "${tier}" "${leaf}")"
+
+  kubectl delete clusterrolebinding "${reader_ksa}-broker-operations" --ignore-not-found=true || true
+  kubectl delete rolebinding "${reader_ksa}-broker-operations" -n "${namespace}" --ignore-not-found=true || true
+  kubectl delete serviceaccount "${actor_ksa}" -n "${namespace}" --ignore-not-found=true || true
+  kubectl delete serviceaccount "${reader_ksa}" -n "${namespace}" --ignore-not-found=true || true
+}
+
 confirm_action() {
   local warning_msg=$1
   shift

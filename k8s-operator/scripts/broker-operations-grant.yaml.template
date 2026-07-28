@@ -1,0 +1,79 @@
+# Broker operations grant — 06 §2.2.1. THE INSTALL-PATH COPY.
+#
+# Rendered by `render_broker_operations_grant` in common.sh and applied by every step that installs
+# an agent tier. `examples/gitops-repo/policy/rbac-overlay/broker-operations.yaml` is the reference
+# copy a human reads; this is the one that lands on a cluster. Both are held to 06 §2.2.1 itself by
+# `dev/tests/actor-grant-single-sourced.py` (V-BRK-013), in both directions — neither is checked
+# against the other, because two copies that agree with each other and disagree with the spec is the
+# failure mode a copy-to-copy check cannot see.
+#
+# WHY THIS FILE EXISTS AT ALL. Until P9-T7d-5 the grant existed only under examples/, and nothing on
+# the install path applied it. Every actor identity the broker resolves by name would have been
+# absent from a freshly provisioned cluster: the broker authenticates its caller with a TokenReview
+# it has no permission to create, and fails closed on step 1 of its own pipeline. That is LSN-039 —
+# the reference tree is not an install path, and a manifest nobody applies is a design document with
+# YAML syntax.
+#
+# TIER-NEUTRAL BY SPECIFICATION. One ClusterRole and one Role *shape* for the whole fleet; each tier
+# binds to them from `agent-identity.yaml.template`. There is deliberately no `kube-agents/tier`
+# label here — stamping one on a shared object would be a lie the ValidatingAdmissionPolicy would
+# then enforce. `kube-agents/role: actor` is what selects it into `vap-agent-readonly`'s actor arm,
+# which is why that policy's match condition tests for either label rather than for tier alone.
+#
+# THE SPLIT IS THE API'S OWN SEAM. tokenreviews, fleetfreezes and changepolicies are cluster-scoped
+# and cannot be granted by a namespaced Role; actionrecords, actionrecords/status, agents and
+# approvalrosters are namespaced. The split is chosen so that every verb in the grant that changes
+# PERSISTED state lands in the namespaced half: an actor appends to the journal in its own namespace
+# and nowhere else. `create tokenreviews` is the one write verb above, and it stores nothing.
+#
+# NOT HERE, DELIBERATELY: `update` and `delete` on `actionrecords`. The broker appends and advances
+# `status`; it can never rewrite or remove a record, including its own (06 §2.2.1, 03 §3.3 rule 4).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeagents-broker-operations
+  labels:
+    kube-agents/role: actor
+rules:
+  # step 1: authenticate the calling agent. Creates nothing; TokenReview is a request object.
+  # Not `system:auth-delegator`, which also confers subjectaccessreviews — this grant must be
+  # EXACTLY 06 §2.2.1 and V-BRK-013 fails on a superset as readily as on a subset.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # step 5: the brake. MUST be readable by every tier — a tier that cannot read the freeze object
+  # fails closed permanently (06 §4.4), so omitting this does not fail safe, it bricks the tier.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["fleetfreezes"]
+    verbs: ["get", "list", "watch"]
+  # step 4: classification input.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["changepolicies"]
+    verbs: ["get", "list", "watch"]
+---
+# The namespaced half. One instance per namespace that hosts an agent, which is why this template is
+# rendered once per tier rather than once per install: `kubeagents-system` serves the platform and
+# cluster-admin tiers, and each tenant namespace needs its own.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubeagents-broker-operations
+  namespace: ${AGENT_NAMESPACE}
+  labels:
+    kube-agents/role: actor
+rules:
+  # step 11: the journal. `create` but never `update`/`delete`.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords/status"]
+    verbs: ["get", "update", "patch"]
+  # step 5: its own pause state.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["agents"]
+    verbs: ["get", "list", "watch"]
+  # step 7: approval input.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["approvalrosters"]
+    verbs: ["get", "list", "watch"]

@@ -128,6 +128,18 @@ execute_cluster_admin() {
 
   ensure_api_secret "${CLUSTER_ADMIN_KSA_NAME}-secrets" "${NAMESPACE}" || return 1
 
+  # Identity before the CR (08 §4). The reader half used to live inline in the tier template; it is
+  # rendered from agent-identity.yaml.template now so that all three tiers get the same two labels
+  # and so that the actor half — which existed on no install path at all — arrives with it. The
+  # scope leaf of a cluster-admin agent is its cluster (scope.Of().Leaf(): namespace, else cluster,
+  # else project), so the actor is `cluster-admin-${CLUSTER_NAME}-actor`.
+  apply_agent_identity \
+    "cluster-admin" \
+    "${NAMESPACE}" \
+    "${CLUSTER_ADMIN_KSA_NAME}" \
+    "${CLUSTER_NAME}" \
+    "${CLUSTER_ADMIN_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" || return 1
+
   print_info "Rendering and applying cluster-admin tier (image ${CLUSTER_ADMIN_IMAGE}:${CLUSTER_ADMIN_TAG})..."
   envsubst "${TIER_VARS}" < "${SCRIPT_DIR}/cluster-admin-agent.yaml.template" \
     | kubectl apply -f - || return 1
@@ -160,6 +172,17 @@ execute_developer_team() {
   # do. Applied afterwards, the pod's first inference call fails on NXDOMAIN while the readiness
   # wait below counts down against an error that never mentions DNS.
   apply_tenant_service_aliases "${DEVELOPER_TEAM_NAMESPACE}" || return 1
+  # Identity before the CR, and after the Namespace above — see execute_cluster_admin. A
+  # developer-team scope carries a namespace, so its leaf is the namespace and the actor is
+  # `developer-team-${DEVELOPER_TEAM_NAMESPACE}-actor`, which is 06 §2.2's own worked example.
+  # The namespaced half of the grant is rendered into this tenant namespace too: an actor appends
+  # ActionRecords where it lives, and team-x's broker must not be able to write the fleet's journal.
+  apply_agent_identity \
+    "developer-team" \
+    "${DEVELOPER_TEAM_NAMESPACE}" \
+    "${DEVELOPER_TEAM_KSA_NAME}" \
+    "${DEVELOPER_TEAM_NAMESPACE}" \
+    "${DEVELOPER_TEAM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" || return 1
 
   print_info "Rendering and applying developer-team tier (image ${DEVELOPER_TEAM_IMAGE}:${DEVELOPER_TEAM_TAG})..."
   envsubst "${TIER_VARS}" < "${SCRIPT_DIR}/developer-team-agent.yaml.template" \

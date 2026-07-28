@@ -63,7 +63,20 @@ else
   echo -e "  ${C_GREEN}✓ CRD 'agents.kubeagents.x-k8s.io' is not registered. Skipping.${C_RESET}"
 fi
 
-# ─── Step 3: Clean up Local Manifest File ─────────────────────────────────────
+# ─── Step 3: Delete the platform reader/actor identity ────────────────────────
+# Mirrors step 2 of provision_08. After the CR, not before: the controller's finalizer cleans up the
+# pod, and deleting its ServiceAccount first only removes the credential the cleanup runs under.
+# The shared broker-operations ClusterRole and Role survive — other tiers bind to them, and
+# teardown_12 leaves them for the same reason. What must go is the ClusterRoleBinding, which is
+# cluster-scoped and would otherwise outlive the install holding a subject the next one reuses.
+if [ "${DRY_RUN:-0}" -eq 1 ]; then
+  echo -e "  ${C_GREEN}[DRY-RUN] Would delete the platform reader/actor identity in '${NAMESPACE}'.${C_RESET}"
+else
+  delete_agent_identity "platform" "${NAMESPACE}" "${PLATFORM_AGENT_KSA_NAME}" "${PROJECT_ID}"
+  echo -e "  ${C_GREEN}✓ Platform reader/actor identity removed.${C_RESET}"
+fi
+
+# ─── Step 4: Clean up Local Manifest File ─────────────────────────────────────
 local_yaml="${SCRIPT_DIR}/platform-agent.yaml"
 if [ -f "$local_yaml" ]; then
   if [ "${DRY_RUN:-0}" -eq 1 ]; then

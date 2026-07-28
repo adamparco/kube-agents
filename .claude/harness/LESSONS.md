@@ -66,10 +66,10 @@ will start selecting.
 | **LSN-035** | checks, mutation, negative-controls | A mutation survives, and the rule it broke turns out to be one no input can reach | **open** | — the ladder's own properties are now held by `TestLadderPropertiesHoldOverEveryAcceptedHistory`; the **general** check is for the next `harness-improve` |
 | **LSN-036** | checks, renderers, allowlists, controller | A uniqueness check goes red on correct code, and the one-line green is an allowlist entry | closed | `pause-is-not-scale-to-zero.py` file-keyed `ALLOWED_REPLICAS_RHS` + `BROKER_REPLICAS_CONST` + stale-owner arm (L0-CHAIN) · `TestPauseDoesNotChangeTheRenderedBroker` in `pause_not_scale_to_zero_test.go` |
 | **LSN-037** | builds, dockerfiles, ci, toolchain | An image build fails on symbols that `go build ./...` resolves fine | closed | `dev/tests/go-build-targets-packages.py` + `--negative-control` (L0-CHAIN) · package-path builds in all 3 Dockerfiles + 2 Makefile recipes |
-| **LSN-039** | wiring, completeness, manifests, install-path | The manifest is correct, the check that reads it is green, and no install path ever applies it | **open** | _planned: P9-T7d-5 — extend `install-path-wired.py` from step→driver reachability to manifest→install-path reachability_ |
+| **LSN-039** | wiring, completeness, manifests, install-path | The manifest is correct, the check that reads it is green, and no install path ever applies it | closed | `dev/tests/identity-has-install-path.py` (**V-CMP-007**, L0-CHAIN) — manifest→step reachability over `k8s-operator/scripts/`, 7 properties, 8 negative controls including a reproduction of the original defect · the install path itself in `common.sh` (`render_agent_identity`, `apply_agent_identity`, `delete_agent_identity`) + `agent-identity.yaml.template` + `broker-operations-grant.yaml.template`, applied from `provision_08` and `provision_12` |
 | **LSN-038** | checks, probes, discovery, negative-controls | A guard that fails safe still fails, and a green run is how it tells you | closed | `check_machinery_probes_resolve` + `CLOSED_MARKER` + the Go arm of `_invoked_by` in `invariants-gate.py` (L0-CHAIN) · `dev/test_invariants_gate.py` (19 negative controls) · `dev/tests/golex.py` shared by `scope-label-single-sourced.py` and `api-group-single-sourced.py` |
 
-**Open: 1 of 38** (LSN-035).
+**Open: 1 of 39** (LSN-035).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -1916,16 +1916,39 @@ stale), [[lsn-023]] (the prose satisfying the check).
 
 ## LSN-039 — Reachability was checked one link short
 
-**Tag:** wiring, completeness, manifests, install-path · **Status: open** · Mechanization planned in
-P9-T7d-5.
+**Tag:** wiring, completeness, manifests, install-path · **Status: closed** (mechanized by
+**V-CMP-007**, `dev/tests/identity-has-install-path.py`, in P9-T7d-5).
 
 **Trigger.** A user asked why `examples/gitops-repo/policy/rbac-overlay/developer-team.yaml` says
 `app.kubernetes.io/managed-by: gitops` when the design no longer has a GitOps control path. Chasing
-the label found the label was the smaller half. **No `provision_NN_*.sh` step creates any agent
-ServiceAccount, Role, or RoleBinding.** The live install's platform reader SA is
-`kubeagents-platform-agent` (`common.sh:262`); the exemplar those files describe says
-`platform-agent`. The tree under `examples/gitops-repo/` that six phases of checks have been reading,
-asserting against, and recording green is applied by nothing.
+the label found the label was the smaller half. The tree under `examples/gitops-repo/` that six
+phases of checks have been reading, asserting against, and recording green is applied by nothing.
+
+**The finding as first written was too broad, and the correction is part of the lesson.** The first
+statement of it — quoted here because it stood in this file, in the ledger, in `phase-9.md`, in a
+commit message and in PR #47's body — was _"no `provision_NN_*.sh` step creates any agent
+ServiceAccount, Role or RoleBinding."_ That came from a grep over `*.sh`, and the identities are
+created from `.yaml.template` files piped through `envsubst | kubectl apply -f -`, which that grep
+could not see. The accurate finding, confirmed by a read-only sweep of the live
+`platform-agent-host` before anything was changed, is three narrower claims:
+
+1. The **cluster-admin and developer-team reader** SAs _were_ created imperatively, inline in
+   `cluster-admin-agent.yaml.template` and `developer-team-agent.yaml.template`.
+2. The **platform reader** SA was created by nothing. `kubeagents-platform-agent` on the live cluster
+   is a bare hand-applied SA: its `last-applied-configuration` has no labels and no annotations, and
+   the `iam.gke.io/gcp-service-account` annotation present on the object is absent from it — added by
+   a separate hand `kubectl annotate`. (Note also that the live name is `kubeagents-platform-agent`
+   while the exemplar says `platform-agent`; two names for one identity is its own tell.)
+3. **No actor SA and no broker-operations grant existed on any install path at all**, so the broker
+   Deployment T7d-3 renders would reference an identity nothing creates and the pod would not start.
+   No install-path identity carried `kube-agents/role`, which is the label both VAP arms select on.
+
+The over-broad version and the accurate version motivate the same unit and the same mechanization,
+which is exactly why it survived four artifacts before being caught. **A finding stated one
+generalization wider than the evidence is not a harmless rounding: it is a claim the next reader
+cannot reproduce**, and the reader who tries and fails learns to discount the finding rather than to
+narrow it. The evidence sweep that narrowed it is also what proved claim 2, which is the worst of the
+three and which the broad version had flattened into the others.
 
 **Why the existing mechanization did not catch it.** This is LSN-007 — "built, tested, and
 unreachable" — and LSN-007 **is closed**, by `dev/tests/install-path-wired.py`. That check is good
@@ -1959,13 +1982,45 @@ five `verify-phase*.sh` suites, applied selectively by `dev/cluster/up.sh` and b
 application is worse than none: it means "is this tree applied?" has the answer *yes, some of it*,
 and no reader can tell which files are in the some.
 
-**Mechanization (planned, P9-T7d-5).** Extend `install-path-wired.py` with a sixth property: every
-Kubernetes manifest under the exemplar tree is either (a) applied by a provisioning step, (b)
-rendered by `common.sh` from a template the install path uses, (c) an input to a check or fixture, or
-(d) **declared** inert, with a reason, in an explicit table — the declare-or-fail idiom from
-[[lsn-038]], so that "this file is documentation" is a claim someone made rather than a state
-something drifted into. Then create the identities from the install path so the answer for these
-files is (a).
+**Mechanization (P9-T7d-5, `V-CMP-007` = `dev/tests/identity-has-install-path.py`, on L0-CHAIN).**
+The plan above was to add a sixth property to `install-path-wired.py` over the exemplar tree. What
+shipped instead is a separate check over the **install path** (`k8s-operator/scripts/`), and the
+difference is deliberate: the property that makes an identity real is not "is this exemplar inert?"
+but "does every identity the broker references get created by a step someone runs?" — the exemplar
+tree could be deleted entirely and the pod would still not start. Seven properties, of which the
+first two are the class:
+
+1. Every `*.yaml.template` under the scripts tree is read by a **reachable** step.
+2. Every manifest-emitting shell function — discovered by **body** (it names a template, or it runs
+   `kubectl apply|delete`), never by a list ([[lsn-036]]) — is transitively reachable from a numbered
+   step.
+3. Every ServiceAccount created carries both `kube-agents/tier` and `kube-agents/role`.
+4. Every RBAC ServiceAccount subject resolves to an SA some manifest creates.
+5. Every `roleRef` resolves, or is in `BUILTIN_ROLES` — currently **empty**, with a comment saying an
+   entry needs a sentence.
+6. The Go and bash actor-name format strings agree, plus five non-vacuity floors ([[lsn-035]]).
+7. Every tier with an `agents/<tier>/config.yaml` has an `apply_agent_identity <tier> …` call site —
+   discovered from `agents/`, so a fourth tier is covered the day it appears.
+
+Eight negative controls, all firing. The one that matters is **"one tier's identity stops being
+applied while the others keep working"** — LSN-039 itself, reproduced, and the shape a per-tier check
+written as a global count would miss.
+
+**Property 4 forced a real design decision, and it is worth recording as a pattern.** The check first
+failed on two bindings whose subjects looked dangling: the identity template creates
+`${AGENT_READER_KSA}` while the tier templates beside it bind `${CLUSTER_ADMIN_KSA_NAME}` — the same
+ServiceAccount under a different variable name, joined only at the `apply_agent_identity` call site.
+Comparing the spellings reports a false dangling subject; ignoring the difference accepts any
+spelling at all. The fix was to **parse the call sites** and derive the alias from the actual wiring,
+which is both stricter than either alternative and what unlocked property 7. When a check finds two
+names for one object, the answer is usually to read the thing that joins them, not to relax the
+comparison.
+
+**Not closed by this, and stated so it does not evaporate:** the declare-or-fail table over
+`examples/gitops-repo/` — part (d) of the original plan, so that "this file is documentation" is a
+claim someone made rather than a state something drifted into. V-CMP-007 says nothing about which
+files in the exemplar tree are inert. That property is carried by the queued `managed-by: gitops`
+sweep, which is the unit that touches that tree.
 
 Related: [[lsn-007]] (the closed lesson this walked around), [[lsn-006]] (well-formed is not
 enforced — the same gap between an artifact and its effect), [[lsn-036]] (enumeration goes stale),

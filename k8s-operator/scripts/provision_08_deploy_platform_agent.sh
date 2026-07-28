@@ -65,7 +65,31 @@ execute_kubeconfig() {
 }
 
 
-# Step 2: Apply Agent Custom Resource
+# Step 2: Apply the platform reader/actor identity (06 §2, §2.2.1)
+#
+# Before the CR, always. The controller REFERENCES both ServiceAccounts by name and never mints one
+# (08 §4); a CR applied first produces a pod that cannot bind its own identity.
+#
+# The platform reader `kubeagents-platform-agent` was referenced by this step, by common.sh and by
+# the operator's own examples for eight phases and CREATED BY NOTHING. On the live cluster it exists
+# only because somebody ran `kubectl create sa` by hand in July — its last-applied-configuration is
+# a bare SA with no labels, and the Workload Identity annotation is not in it either. A fresh
+# provision of this repository produced a platform agent with no identity at all (LSN-039).
+verify_platform_identity() {
+  # Always re-apply: the labels and the actor binding are the kind of thing that gets edited by hand
+  # during an incident and must come back on the next run. `kubectl apply` makes that a no-op diff.
+  return 1
+}
+execute_platform_identity() {
+  apply_agent_identity \
+    "platform" \
+    "${NAMESPACE}" \
+    "${PLATFORM_AGENT_KSA_NAME}" \
+    "${PROJECT_ID}" \
+    "${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+}
+
+# Step 3: Apply Agent Custom Resource
 verify_custom_resource() {
   # Always return false to ensure configuration updates are applied to the Custom Resource
   return 1
@@ -151,7 +175,8 @@ execute_custom_resource() {
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
-run_step "2. Apply Agent Custom Resource" verify_custom_resource execute_custom_resource 0
+run_step "2. Apply Platform Agent Identity" verify_platform_identity execute_platform_identity 0
+run_step "3. Apply Agent Custom Resource" verify_custom_resource execute_custom_resource 0
 
 # ─── Conclusion Checklist ─────────────────────────────────────────────────────
 echo -e "\n${C_GREEN}${C_BOLD}✓ Agent Custom Resource applied successfully to GKE!${C_RESET}"

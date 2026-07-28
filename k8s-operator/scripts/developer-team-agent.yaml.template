@@ -1,8 +1,9 @@
-# Developer Team Agent (tier 3): namespace, read-only identity, and Agent CR for one tenant.
+# Developer Team Agent (tier 3): namespace, read-only AUTHORITY, and Agent CR for one tenant.
 #
-# Rendered by provision_12_deploy_agent_tiers.sh. In steady state the Cluster Admin Agent
-# proposes this bundle as a GitOps PR; provisioning renders the same shape so a fresh install
-# has a working tenant to exercise.
+# Rendered by provision_12_deploy_agent_tiers.sh, which applies this tenant's reader/actor
+# ServiceAccounts from `agent-identity.yaml.template` first — see the header of
+# cluster-admin-agent.yaml.template for why the identity no longer lives inline here. What remains
+# is the tenant boundary and this tier's authority within it.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -13,16 +14,6 @@ metadata:
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ${DEVELOPER_TEAM_KSA_NAME}
-  namespace: ${DEVELOPER_TEAM_NAMESPACE}
-  labels:
-    kube-agents/tier: developer-team
-  annotations:
-    iam.gke.io/gcp-service-account: "${DEVELOPER_TEAM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
----
 # A namespaced Role, deliberately NOT a ClusterRole: the tenant boundary is structural, so the
 # agent cannot read another team's namespace even if it tried.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -32,6 +23,7 @@ metadata:
   namespace: ${DEVELOPER_TEAM_NAMESPACE}
   labels:
     kube-agents/tier: developer-team
+    kube-agents/role: reader
 rules:
   - apiGroups: ["", "apps", "batch", "networking.k8s.io"]
     resources: ["*"]
@@ -44,6 +36,7 @@ metadata:
   namespace: ${DEVELOPER_TEAM_NAMESPACE}
   labels:
     kube-agents/tier: developer-team
+    kube-agents/role: reader
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

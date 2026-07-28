@@ -36,7 +36,11 @@ if [ -n "${DEVELOPER_TEAM_NAMESPACE}" ]; then
   kubectl delete agent "${DEVELOPER_TEAM_AGENT_NAME}" -n "${DEVELOPER_TEAM_NAMESPACE}" --ignore-not-found=true --timeout=120s || true
   kubectl delete rolebinding "${DEVELOPER_TEAM_KSA_NAME}-explorer" -n "${DEVELOPER_TEAM_NAMESPACE}" --ignore-not-found=true || true
   kubectl delete role "${DEVELOPER_TEAM_KSA_NAME}-explorer" -n "${DEVELOPER_TEAM_NAMESPACE}" --ignore-not-found=true || true
-  kubectl delete serviceaccount "${DEVELOPER_TEAM_KSA_NAME}" -n "${DEVELOPER_TEAM_NAMESPACE}" --ignore-not-found=true || true
+  # The reader/actor pair and the actor's two bindings (06 §2). The shared broker-operations
+  # ClusterRole and Role are left alone — they are fleet objects and the cluster-admin tier below
+  # still binds to them; the tenant namespace's Role goes with the namespace, if the operator ever
+  # deletes it. delete_agent_identity removes the reader SA too, so no separate line for it.
+  delete_agent_identity "developer-team" "${DEVELOPER_TEAM_NAMESPACE}" "${DEVELOPER_TEAM_KSA_NAME}" "${DEVELOPER_TEAM_NAMESPACE}"
   kubectl delete secret "${DEVELOPER_TEAM_KSA_NAME}-secrets" -n "${DEVELOPER_TEAM_NAMESPACE}" --ignore-not-found=true || true
   # The ExternalName aliases provision_12 applied. Deleted only if they are still ExternalName:
   # if someone has since replaced one with a real Service, that Service is theirs, and teardown of
@@ -56,7 +60,10 @@ echo -e "  ${C_CYAN}ℹ Removing cluster-admin tier...${C_RESET}"
 kubectl delete agent "${CLUSTER_ADMIN_AGENT_NAME}" -n "${NAMESPACE}" --ignore-not-found=true --timeout=120s || true
 kubectl delete clusterrolebinding "${CLUSTER_ADMIN_KSA_NAME}-explorer" --ignore-not-found=true || true
 kubectl delete clusterrole "${CLUSTER_ADMIN_KSA_NAME}-explorer" --ignore-not-found=true || true
-kubectl delete serviceaccount "${CLUSTER_ADMIN_KSA_NAME}" -n "${NAMESPACE}" --ignore-not-found=true || true
+# Leaf is the cluster for this tier, so the actor is `cluster-admin-${CLUSTER_NAME}-actor` — the same
+# string apply_agent_identity rendered. Its ClusterRoleBinding is cluster-scoped and would otherwise
+# survive teardown holding a subject name the next provision reuses.
+delete_agent_identity "cluster-admin" "${NAMESPACE}" "${CLUSTER_ADMIN_KSA_NAME}" "${CLUSTER_NAME}"
 kubectl delete secret "${CLUSTER_ADMIN_KSA_NAME}-secrets" -n "${NAMESPACE}" --ignore-not-found=true || true
 echo -e "  ${C_GREEN}✓ cluster-admin tier removed.${C_RESET}"
 

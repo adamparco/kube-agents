@@ -137,6 +137,24 @@ python3 dev/tests/one-broker-per-agent.py --negative-control
 python3 dev/tests/actor-grant-single-sourced.py
 python3 dev/tests/actor-grant-single-sourced.py --negative-control
 
+# V-CMP-007 (P9-T7d-5): every identity the broker resolves by name is created by something the
+# install path RUNS. `install-path-wired.py` two lines up walks the script graph — every numbered
+# step is invoked by its driver — and it was green for eight phases on a repository where the
+# platform reader ServiceAccount was created by nothing (it exists on the live cluster because a
+# human typed `kubectl create sa` once, with no labels), the actor identity and its 06 §2.2.1 grant
+# lived only under examples/gitops-repo/ where no install path reads, and every reader that WAS
+# created carried `kube-agents/tier` alone while both admission policies select on
+# `kube-agents/role`. A policy whose selector matches nothing reports the same green as a policy
+# that passes, which is why nothing noticed. This walks the three links past reachability-of-steps:
+# template rendered by a reachable step, RBAC subject and roleRef resolving to objects the install
+# path creates, and one `apply_agent_identity` call site per tier in agents/. It also holds the Go
+# and bash derivations of the actor SA name together — 06 §2.2.1 forbids the CR from naming its own
+# actor, so a drift surfaces nowhere except as BrokerReady=false. Tiers are read off agents/ and
+# emitters discovered by body, not listed (LSN-036); the floors are FAILs (LSN-035).
+# `--negative-control` is the `¬` of 09 §6, and one of its eight mutations is LSN-039 itself.
+python3 dev/tests/identity-has-install-path.py
+python3 dev/tests/identity-has-install-path.py --negative-control
+
 # --- builds compile whole packages (LSN-037) -------------------------------------------------
 # `go build cmd/broker/main.go` compiles one file and pretends the rest of the package is absent.
 # It is indistinguishable from the correct spelling until a package gains its second file, and then
