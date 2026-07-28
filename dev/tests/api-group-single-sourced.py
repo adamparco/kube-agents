@@ -37,6 +37,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from golex import strip_go_comments  # noqa: E402
+
 REPO = pathlib.Path(__file__).resolve().parents[2]
 GROUPVERSION_GO = REPO / "k8s-operator" / "api" / "v1alpha1" / "groupversion_info.go"
 
@@ -86,37 +89,31 @@ def tracked_files() -> list[pathlib.Path]:
 def strip_comments(path: pathlib.Path, text: str) -> str:
     """Comment-free text, per language.
 
-    Naive on purpose, and biased in the safe direction for THIS check: keeping a line that is
-    really a comment produces a false failure, which someone reads; dropping a line that is really
-    code produces a false pass, which nobody does. So block-comment handling is line-oriented and
-    a `//` inside a string literal costs at most a truncated line -- and a group string that
-    survives truncation is still found, because the truncation happens after it.
+    Go goes through the shared literal-aware scanner in `golex.py`. It used to use the same
+    line-oriented `line.split("//", 1)[0]` as the YAML arm below, defended by the argument that a
+    truncated line is safe "because the truncation happens after" the group string. That argument
+    is only true when the group string precedes the `//`, and the case that matters is the one
+    where it does not:
+
+        endpoint := "https://audit.example/kubeagents.wrong.io/agents"
+
+    The line truncates at the `//` in `https://`, the unserved group is never seen, and the check
+    prints PASS. A false negative here is exactly the defect [[LSN-032]] is about -- a group nobody
+    serves, agreed with by the thing that was supposed to catch it.
+
+    The YAML/shell arm keeps its line-oriented reading: `#` has no equivalent of `https://`, and
+    its quote tracking already covers the literal case.
 
     Comment lines are BLANKED rather than dropped: every failure this check emits carries a line
     number, and a number that points somewhere other than what the reader's editor shows is worse
     than no number at all.
     """
+    if path.suffix == ".go":
+        return strip_go_comments(text)
     lines = []
-    in_block = False
     for raw in text.splitlines():
         line = raw
-        if path.suffix == ".go":
-            if in_block:
-                if "*/" in line:
-                    line = line.split("*/", 1)[1]
-                    in_block = False
-                else:
-                    lines.append("")
-                    continue
-            if "/*" in line:
-                head, rest = line.split("/*", 1)
-                if "*/" in rest:
-                    line = head + rest.split("*/", 1)[1]
-                else:
-                    line, in_block = head, True
-            if "//" in line:
-                line = line.split("//", 1)[0]
-        elif path.suffix in {".yaml", ".yml", ".sh"}:
+        if path.suffix in {".yaml", ".yml", ".sh"}:
             stripped = line.lstrip()
             if stripped.startswith("#"):
                 lines.append("")

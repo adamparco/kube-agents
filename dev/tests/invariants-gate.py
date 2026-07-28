@@ -69,31 +69,62 @@ READ_VERBS = {"get", "list", "watch"}
 TIER_LABEL = "kube-agents/tier"
 
 # The machinery that must exist before any agent identity may hold a write verb (07 §5, 03 §6).
-# Probed as paths rather than as prose so that this check STOPS failing on its own the moment the
-# machinery actually lands -- a gate that needs hand-editing to notice progress gets hand-edited to
-# pass. Each entry: (human name, [candidate paths], substring that must appear in one of them).
+# Probed against the tree rather than described in prose so that this check STOPS failing on its own
+# the moment the machinery actually lands -- a gate that needs hand-editing to notice progress gets
+# hand-edited to pass.
+#
+# DISCOVERED BY GLOB, NOT BY A LIST OF PATHS, and that is [[LSN-038]]. The first draft named two
+# candidate directories per item. Both guesses for the classifier (`internal/classifier`,
+# `internal/risk`) and both for undo (`internal/undo`, `internal/broker/undo.go`) were wrong by the
+# time the code existed: P9-T3a put the classifier at `internal/broker/classify/` and P9-T5b put undo
+# at `internal/broker/undo/`. The probe therefore reported two of four absent for six merged units,
+# and NOTHING NOTICED -- because a false "absent" only makes this check stricter, and no agent
+# identity had a write verb yet to be strict about. The bill arrives at the unit that first adds one:
+# a gate that has been lying in the safe direction goes red on correct code, and the one-line green
+# is to edit the list, which is [[LSN-036]] exactly.
+#
+# Each entry: (human name, glob patterns, what proves it is real rather than an empty directory).
 MACHINERY = [
     (
         "Action Broker",
-        ["k8s-operator/internal/broker", "k8s-operator/internal/actionbroker"],
+        ["k8s-operator/internal/**/broker", "k8s-operator/internal/**/actionbroker"],
         None,
     ),
     (
+        # Package directories, not `classif*` — a bare stem also matches
+        # `internal/router/classify.go`, which classifies chat intents and has nothing to do with
+        # action risk. A probe that resolves against the wrong subsystem is worse than one that
+        # resolves against nothing: it reports the machinery present and would let a write verb
+        # through on the strength of the router.
         "risk classifier",
-        ["k8s-operator/internal/classifier", "k8s-operator/internal/risk"],
+        [
+            "k8s-operator/internal/**/classify",
+            "k8s-operator/internal/**/classifier",
+            "k8s-operator/internal/**/risk",
+        ],
         None,
     ),
     (
         "ActionRecord journal",
-        ["k8s-operator/api/v1alpha1/actionrecord_types.go"],
+        [
+            "k8s-operator/api/**/actionrecord_types.go",
+            "k8s-operator/internal/journal",
+        ],
         None,
     ),
     (
         "undo path",
-        ["k8s-operator/internal/undo", "k8s-operator/internal/broker/undo.go"],
+        ["k8s-operator/internal/**/undo", "k8s-operator/internal/**/undo.go"],
         None,
     ),
 ]
+
+# Machinery that has NOT been built yet must be declared here, `name -> the phase that builds it`,
+# and the declaration is checked against the ledger's current phase. Absence is then a stated fact
+# with an expiry rather than an inference from a path that may simply be wrong, which is the half of
+# [[LSN-038]] a better glob does not fix: the four probes were wrong in the direction that produces
+# no output at all. Empty today because 07 §5 orders all four before Phase 10 and all four exist.
+UNBUILT_UNTIL_PHASE: dict[str, int] = {}
 
 RULES_BLOCK = re.compile(r"^\s*rules:\s*$")
 VERBS_LINE = re.compile(r"^\s*(?:-\s*)?verbs:\s*(\[.*\]|)\s*$")
@@ -154,12 +185,106 @@ def agent_rbac_documents() -> list[tuple[Path, int, str]]:
     return found
 
 
+def _go_files(root: Path) -> tuple[list[Path], list[Path]]:
+    """(non-test .go files, _test.go files) under a path that may be a file or a directory."""
+    if root.is_file():
+        siblings = sorted(root.parent.glob("*.go"))
+    else:
+        siblings = sorted(root.rglob("*.go"))
+    return (
+        [p for p in siblings if not p.name.endswith("_test.go")],
+        [p for p in siblings if p.name.endswith("_test.go")],
+    )
+
+
+def discover_machinery(name: str) -> tuple[list[Path], str | None]:
+    """Find one machinery item in the tree. Returns (paths that qualify, why nothing did).
+
+    Invariant 7 asks for machinery that "exist**s** and **is tested**", so both halves are probed:
+    a match must carry at least one non-test `.go` file declaring a function and at least one
+    `_test.go` declaring a `func Test`. A directory holding a doc.go and a TODO is not the undo
+    path, and a package with no test is not machinery this invariant will accept -- an agent with
+    write RBAC and an untested undo path is the situation the invariant names in its own sentence.
+    """
+    entry = next((m for m in MACHINERY if m[0] == name), None)
+    if entry is None:
+        return [], f"{name!r} is not a declared machinery item"
+    _, globs, _ = entry
+    candidates = sorted({p for g in globs for p in REPO.glob(g)})
+    if not candidates:
+        return [], f"no path in the tree matches any of {globs}"
+    qualified, why = [], []
+    for path in candidates:
+        src, tests = _go_files(path)
+        rel = path.relative_to(REPO).as_posix()
+        if not any(re.search(r"^func ", p.read_text(), re.MULTILINE) for p in src):
+            why.append(f"{rel} has no non-test Go function")
+            continue
+        if not any(re.search(r"^func Test", p.read_text(), re.MULTILINE) for p in tests):
+            why.append(f"{rel} has Go code but no `func Test` beside it")
+            continue
+        qualified.append(path)
+    return qualified, None if qualified else "; ".join(why)
+
+
 def missing_machinery() -> list[str]:
-    absent = []
-    for name, candidates, _ in MACHINERY:
-        if not any((REPO / c).exists() for c in candidates):
-            absent.append(name)
-    return absent
+    return [name for name, _, _ in MACHINERY if not discover_machinery(name)[0]]
+
+
+def check_machinery_probes_resolve() -> list[str]:
+    """[[LSN-038]]. The probe's own answer is a claim, and it is checked before it is used.
+
+    `check_write_verbs_have_machinery` consults `missing_machinery()` only when a write verb turns
+    up, so a probe that cannot find code which is merged and tested reads as "stricter than needed"
+    and produces no output at all -- for as long as it takes someone to add the first write verb.
+    That is six units in this repo's case. Here the same answer is asked for on every run, and an
+    unresolvable probe must be DECLARED in UNBUILT_UNTIL_PHASE with the phase that ends it.
+
+    Deliberately not "the machinery must exist": during Phases 0-7 it correctly did not. What may
+    not happen is machinery being absent *silently*.
+    """
+    failures = []
+    current = _current_phase()
+    for name, globs, _ in MACHINERY:
+        found, why = discover_machinery(name)
+        if found:
+            if name in UNBUILT_UNTIL_PHASE:
+                failures.append(
+                    f"machinery {name!r} resolves to {[p.relative_to(REPO).as_posix() for p in found]} "
+                    f"but is still declared unbuilt until phase {UNBUILT_UNTIL_PHASE[name]}. Drop "
+                    f"the declaration; a stale one hides the next probe that goes wrong."
+                )
+            continue
+        if name not in UNBUILT_UNTIL_PHASE:
+            failures.append(
+                f"machinery {name!r} is not discoverable ({why}), and is not declared in "
+                f"UNBUILT_UNTIL_PHASE. Either it moved and the globs {globs} no longer find it — "
+                f"which makes invariant 7 fail on correct code the day someone adds a write verb — "
+                f"or it does not exist yet and the declaration is missing."
+            )
+        elif current is not None and current >= UNBUILT_UNTIL_PHASE[name]:
+            failures.append(
+                f"machinery {name!r} is declared unbuilt until phase {UNBUILT_UNTIL_PHASE[name]} "
+                f"and the ledger says the build is in phase {current}, but nothing in the tree "
+                f"matches {globs} ({why}). Either that phase closed without building it, or it was "
+                f"built somewhere the probe cannot see."
+            )
+    return failures
+
+
+CURRENT_PHASE = re.compile(r"^\|\s*Current phase\s*\|.*?Phase\s+(\d+)", re.MULTILINE)
+
+
+def _current_phase() -> int | None:
+    """The phase number from the ledger's Status table, or None if it cannot be read.
+
+    None is not a pass: it only suppresses the phase-expiry arm, and the "declared or discoverable"
+    arm above runs regardless.
+    """
+    if not LEDGER.exists():
+        return None
+    m = CURRENT_PHASE.search(LEDGER.read_text())
+    return int(m.group(1)) if m else None
 
 
 def check_write_verbs_have_machinery() -> list[str]:
@@ -400,6 +525,22 @@ def _invoked_by(artifact: str, chain: str) -> bool:
         and "unittest discover dev" in chain
     ):
         return True
+    # Same argument for Go, and it was missing until LSN-038's pass. `make -C k8s-operator test`
+    # (the required `Run Controller Tests` check) runs `go test $(go list ./... | grep -v /e2e)`,
+    # which names no file either -- so a lesson mechanized as a Go test read as "run by nothing"
+    # and had to be co-signed by a Python script to close. That pushed three lessons (LSN-032/033/
+    # 034) into citing whichever `.py` was nearby, which is a citation that does not describe the
+    # mechanization. The `/e2e` exclusion is copied from the Makefile line, not assumed: a test
+    # under `test/e2e/` is genuinely run by nothing automatic.
+    if base.endswith("_test.go"):
+        for hit in REPO.rglob(base):
+            rel = hit.relative_to(REPO).as_posix()
+            if "/e2e/" in rel or not rel.startswith("k8s-operator/"):
+                continue
+            if not re.search(r"^func Test", hit.read_text(), re.MULTILINE):
+                continue
+            if "k8s-operator test" in chain or "go test" in chain:
+                return True
     return False
 
 
@@ -772,6 +913,11 @@ BLOCKING_ALWAYS = ("V-CTN", "V-BRK", "V-REV", "V-ISO", "V-ADV", "V-MET")
 CHECK_ID = re.compile(r"\bV-[A-Z]{3}-\d{3}\b")
 
 
+# A deferral row declares itself closed with `**CLOSED <date> by ...**` in the blocker cell.
+# Leading markdown (bold, italic, strikethrough) is skipped; the word itself must be first.
+CLOSED_MARKER = re.compile(r"[\s*~_]*closed(?![A-Za-z0-9])", re.IGNORECASE)
+
+
 def _deferral_rows() -> list[list[str]]:
     """Every data row of the Deferrals table, PADDED to five cells rather than filtered to five.
 
@@ -930,7 +1076,14 @@ def check_deferrals_name_blockers() -> list[str]:
     failures = []
     for cells in rows:
         _date, subject, blocker, owner, promote = cells[:5]
-        closed = "CLOSED" in blocker.upper()
+        # Anchored to the START of the cell, not searched anywhere inside it. `"CLOSED" in
+        # blocker.upper()` is satisfied by a blocker that merely uses the word -- "the L3
+        # maintenance window closed", "closed beta" -- and the consequence is silent and
+        # backwards: the row stops being asked for a promote-when condition, which is the
+        # one question a still-open deferral exists to answer. The convention every closed
+        # row in the ledger already follows is `**CLOSED <date> by ...**` as the cell's
+        # first token, so requiring that costs nothing and closes the false positive.
+        closed = bool(CLOSED_MARKER.match(blocker))
         # Only the promote-when question changes shape when a row closes. The first draft skipped
         # the whole loop for a closed row, and a mutation that blanked the owner of a CLOSED row
         # went straight through: typing one word had quietly dropped two of the three questions,
@@ -1701,6 +1854,7 @@ def check_platform_idioms_are_gnu_first() -> list[str]:
 
 CHECKS = [
     ("invariant 7 — authority never precedes machinery", check_write_verbs_have_machinery),
+    ("LSN-038 — the machinery probes resolve against the tree", check_machinery_probes_resolve),
     ("invariant 8 / V-MET-003 — assertion ratchet", check_assertion_ratchet),
     ("V-MET-004 — retirements name replacements", check_retirements_name_replacements),
     ("LSN-005 — destructive-test guards stay anchored", check_destructive_guards_are_anchored),
