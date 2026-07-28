@@ -65,6 +65,7 @@ substitution over `assets/`) — no credentials, no mutation:
   [--hub-inference-cidr <hub LiteLLM private CIDR>] \
   [--hub-minty-cidr <hub Minty private CIDR>] \
   [--mcp-cidrs <MCP grounding CIDRs>] \
+  --kube-apiserver-cidrs <apiserver IP(s) this cluster's pods reach> \
   --repo-root .
 ```
 
@@ -77,6 +78,17 @@ a CIDR, the API server rejects the object, and the whole bundle stops applying (
 rule you needed produces a narrower policy and a connection that fails loudly; stubbing it produced a
 bundle that could not be applied at all. GitHub is not a flag — its four published IPv4 blocks are
 fixed in the egress template, the same for every tenant.
+
+`--kube-apiserver-cidrs` is unbracketed above because it is the one flag here whose omission is **not**
+the conservative choice. Egress rule 9 is what lets the tenant agent reach the API server at all —
+without it every kubectl-shaped skill fails, and the broker can neither TokenReview the agent nor write
+its ActionRecord, which surfaces as an authentication error that never mentions the network. It has no
+default because there is nothing to default to: the address is per-cluster, and on a public GKE endpoint
+it is a bare IP nobody publishes. The installer resolves it from the cluster at apply time; this bundle
+is applied by the customer's CI/CD instead, so you must supply it. Read it off the target cluster with
+`kubectl get service kubernetes -n default -o jsonpath='{.spec.clusterIP}'` plus the control-plane
+endpoint, as `<ip>/32` each. If you cannot, say so in the PR body — a reviewer adding rule 9 by hand is
+a worse outcome than a reviewer being told it is missing, and both beat a silently unreachable agent.
 
 `--workload-identity` is the one widening you must match to the cluster rather than to the tenant. On a
 GKE cluster with Workload Identity the tenant agent has **no cloud identity at all** without it; on a

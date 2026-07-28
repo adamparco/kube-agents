@@ -476,8 +476,44 @@ split in two" and "Why T7d-2 split again" below.)
   at L0** — the two-sided assertion planning defect 1 resolves Accept (e) into.
 - **P9-T7d-4** — **the install-path egress holes**: the API-server rule the broker's own pipeline
   needs, added to `netpol-agent-egress.yaml.template` as a rendered optional block with the
-  control-plane CIDR supplied by `vars.sh`, plus the regenerated exemplars. Verified by
-  `dev/tests/reference-render.py` at L0 and by V-ISO at L2 in P9-T9.
+  control-plane CIDR supplied by `vars.sh`, plus the regenerated exemplars. **Done 2026-07-28.**
+  Verified by `dev/tests/reference-render.py` at L0 (**V-CTN-020**, L0 half) and by V-ISO at L2 in
+  P9-T9.
+
+  **Rule 9 is the one destination in this allowlist that cannot be pinned in a committed file**, and
+  that shaped the whole unit. Every other address here is published and stable — Google's restricted
+  VIP, GitHub's four blocks, GKE's two metadata pairings — so the exemplars can state them as facts.
+  The API server's is per-cluster, and these clusters are public GKE (no `--master-ipv4-cidr` or
+  `enable-private-nodes` anywhere under `k8s-operator/scripts/` or `dev/cluster/`), so the endpoint
+  is a bare IP with no range anyone publishes. A committed exemplar could only pin a fiction about
+  somebody's cluster. So `provision_13` resolves it at apply time — the `kubernetes` Service
+  ClusterIP, the kubeconfig endpoint, or an explicit `KUBE_APISERVER_CIDR` — and **refuses to apply
+  without one** unless `KUBE_APISERVER_EGRESS_ENABLED=false` is set deliberately.
+
+  **That inverts this file's default on purpose.** Every other optional block is absent-unless-asked
+  because absent is the safe direction. Rule 9's absent direction closes the broker's write path:
+  no TokenReview (pipeline step 1), no FleetFreeze read (step 5), no ActionRecord write (step 11),
+  and no kubectl-shaped skill for the reader — reported to the operator as an authentication error
+  that never mentions the network. A default of "absent" would rebuild the hole this unit closes.
+
+  **Two changes beyond the literal scope of the bullet.** First, `dev/tests/reference-render.py`
+  gained a **source** property (10) as well as three behavioural ones: properties 7–9 are all true
+  of a resolver nobody obeys, so an edit turning `provision_13`'s `else` arm into a warning would
+  leave them green. Second — and this is the real find — the byte-for-byte gate caught the drift in
+  the exemplars (regenerated; comment-only, no rule 9 in them) and `dev/test_skill_templates.py`
+  then caught the third copy, which surfaced that the `propose-developer-team` bundle is a **second
+  install path** for the developer-team tier: it is applied by the customer's CI/CD, not by
+  `provision_13`, so a tenant provisioned through the F4 cascade would have shipped without rule 9.
+  Hence `--kube-apiserver-cidrs` on `render_developer_team.py`, documented **unbracketed** in
+  SKILL.md as the one flag whose omission is not the conservative choice, and bound in both
+  `WIDE_ENV` and `WIDE_FLAGS` so the two halves cannot diverge.
+
+  **Deliberately not in scope**: the L2 half of V-CTN-020 — that the policy is actually enforced and
+  that the broker's pipeline actually completes over it — is P9-T9's, and P4 still governs it (on a
+  non-enforcing dataplane an egress claim is `deferred`, never `pass`). Nor does this resolve a
+  hostname in the kubeconfig `server:` URL: a policy pinned to whatever DNS answered at install time
+  stops matching after a control-plane rotation, silently, and refusing is the better failure.
+
 - **P9-T7d-5** — **the install path for the identities T7d-3 just wrote.** Added 2026-07-28, run
   before T7d-4, **done 2026-07-28**. Renders the reader and actor `ServiceAccount`s, the shared
   broker-operations `ClusterRole`/`Role` and the two bindings from `common.sh` — the
@@ -564,6 +600,15 @@ install time. It is **P9-T7d-4**, and it is called out here rather than left in 
 the symptom is a broker that authenticates nobody, which reads as an auth bug and sends the debugger
 at `internal/broker/auth.go`. Note that the same gap has been latent for the READER since Phase 5 —
 whether the agent's own API reads survive it is an L2 question, and P9-T9 is where it gets asked.
+
+**Closed by T7d-4 as egress rule 9** (2026-07-28). The prediction above held in every respect except
+one, and the exception is worth keeping: "the control-plane CIDR is per-cluster and known only at
+install time" is right, but it understates the case for a public GKE endpoint, where there is no
+_range_ at all — only a bare IP that changes when the control plane rotates. That is why rule 9 is
+the one rule in the file with no committed exemplar and why `provision_13` refuses to apply without
+resolving it, rather than shipping a default. It also emits **both** address forms (the `kubernetes`
+Service ClusterIP and the kubeconfig endpoint), because whether NetworkPolicy sees egress before or
+after DNAT is dataplane-specific — the same reason `GKE_DATAPLANE` defaults to `auto`.
 
 **What T7d-1 found: the mesh certificate is half of the broker's identity check, not just its
 transport.** `internal/broker/auth.go` authenticates the caller by TokenReview, compares the result

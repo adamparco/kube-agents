@@ -22,6 +22,16 @@
 # LIMITATION (hostname precision): NetworkPolicy is L3/L4 and cannot express hostnames, so GitHub is
 # allowlisted by published IP CIDRs, which drift. Refresh them from https://api.github.com/meta. The
 # hostname-precise L7 egress proxy remains deferred hardening (08 §5).
+#
+# THE ONE RULE THAT IS NOT IN THIS FILE AND MUST STILL BE THERE: the kube-apiserver. It is rule 9,
+# appended by common.sh:render_apiserver_block, and it is absent from the base render for a reason
+# that does not apply to any other destination here — every other address in this allowlist is
+# published and stable (Google's restricted VIP, GitHub's four blocks, GKE's two metadata pairings),
+# and the API server's is not. It is per-cluster, and on a public GKE endpoint it is a bare IP with
+# no range anyone publishes, so the committed exemplars cannot pin it without stating a fiction
+# about somebody's cluster. `provision_13` resolves it at apply time and REFUSES TO APPLY WITHOUT IT
+# unless KUBE_APISERVER_EGRESS_ENABLED=false is set deliberately — because the failure mode of a
+# missing API-server rule is a broker that authenticates nobody, reported as an auth bug.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
