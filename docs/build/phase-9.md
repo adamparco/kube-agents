@@ -441,10 +441,11 @@ reverse write cannot leave 06 §4.3's bidirectional link one-way.
   says so outright, since the commonest contested case is a human undoing a create and a deleted
   object cannot hold an annotation. Tested both directions.
 
-**P9-T7 ships as four units**, on the same layering seam T3a/T3b, T5a/T5b and T6a/b/c used: the
+**P9-T7 ships as five units**, on the same layering seam T3a/T3b, T5a/T5b and T6a/b/c used: the
 thing both halves depend on, then the rendering of the pair, then the cluster-scoped objects that
 pair needs to actually talk, then the pipeline that runs behind it. (T7d was split out of T7b
-mid-unit; see "Why T7b stops at the render" below.)
+mid-unit, then split again into T7d-1/T7d-2; see "Why T7b stops at the render" and
+"Why T7d split in two" below.)
 
 - **P9-T7a** — `internal/agentlabels/`: the five 08 §2.5 label keys spelled once, and the injective
   scope renderer. Every other T7 deliverable stamps these; nothing else in T7 can be written without
@@ -455,13 +456,66 @@ mid-unit; see "Why T7b stops at the render" below.)
   conjunction; the `wait-for-broker` init container with observe-and-report on timeout; the five
   `KUBEAGENTS_BROKER_*` env vars, injected last so a CR author cannot redirect them; the actor
   ServiceAccount **name**; goldens. **Claims V-RUN-003 and V-BRK-012, both L0.**
-- **P9-T7d** — the objects the rendered pair references but does not create: the mesh CA
-  `ClusterIssuer` and the two cert-manager `Certificate`s behind `<agent>-broker-tls` and
-  `<agent>-mesh-tls`; the broker's ingress NetworkPolicy (from `role: reader` with matching
-  `kube-agents/agent`) and the agent's egress-to-broker rule; the actor ServiceAccounts bound to
-  empty roles; the derived exemplars under `examples/gitops-repo/`. **Claims no new L0 check** —
-  its properties are the L2 set already routed to P9-T9 (V-RUN-001/002/004/005/009,
+- **P9-T7d-1** — **trust**: the mesh CA (`kubeagents-mesh-selfsign` ClusterIssuer → an `isCA`
+  `Certificate` in cert-manager's namespace → the `kubeagents-mesh-ca` ClusterIssuer) as static
+  install-time manifests under `config/mesh-ca/`, plus the two per-agent cert-manager
+  `Certificate`s behind `<agent>-broker-tls` and `<agent>-mesh-tls`, rendered by the controller and
+  owner-referenced. **Claims no new L0 check**; six L1 property tests, of which the load-bearing one
+  is the SPIFFE binding (below).
+- **P9-T7d-2** — **isolation**: the broker's ingress NetworkPolicy (from `role: reader` with
+  matching `kube-agents/agent`) and the agent's egress-to-broker rule; the actor ServiceAccounts
+  bound to empty roles; the derived exemplars under `examples/gitops-repo/`. **Claims no new L0
+  check** — its properties are the L2 set already routed to P9-T9 (V-RUN-001/002/004/005/009,
   V-ISO-001/002).
+
+**Why T7d split in two.** Two reasons, and the second one changed what T7d-2 is allowed to contain.
+
+The first is the level seam, which is the same one that produced T7b/T7d: T7d-1's properties are
+_renderable_ — one issuer for both ends, the right SPIFFE URI, key rotation on renewal, the Secret
+names matching what T7b mounts — and every one of them is an L1 assertion that would otherwise
+surface at L2 as a TLS handshake error, the least informative available report. T7d-2's properties
+are packet-level (V-ISO-001/002 assert a packet is _dropped_) and are already routed to P9-T9.
+
+The second is that **the actor ServiceAccounts cannot be controller-minted**, and finding that out
+is what forced the split rather than merely justifying it. P1-T4/T5 (08 §4) already settled this for
+the reader identity: the controller holds `serviceaccounts: get;list;watch` and a comment in
+`agent_controller.go` reading _"Do not re-add RBAC write verbs"_, because agent identity is
+pre-created and GitOps-managed, enforced by `vap-agent-readonly`. The actor SA is the _higher_-
+authority half of the pair, so if the reader's may not be minted at runtime, the actor's certainly
+may not — 06 §2.2.1's "the ability to name the actor identity is the ability to choose an authority
+level" applies with more force, not less. T7d-2 is therefore a GitOps-artifacts unit
+(`policy/rbac-overlay/`, the `netpol-*.yaml.template` provisioning path, `examples/gitops-repo/`),
+not a controller unit, which is a different kind of work from T7d-1 and shares no code with it.
+
+**What T7d-1 found: the mesh certificate is half of the broker's identity check, not just its
+transport.** `internal/broker/auth.go` authenticates the caller by TokenReview, compares the result
+against the single `ExpectedCaller` it serves, and then _binds the two layers_ — it refuses with
+`ReasonPeerMismatch` unless the client certificate's SPIFFE URI equals the ID derived from the
+token. So `<agent>-mesh-tls` must carry `spiffe://cluster.local/ns/<ns>/sa/<readerSA>` exactly, or
+every envelope in the fleet is refused at the transport layer, with an error message about trust
+domains, discoverable only at L2 after a rollout. The format now has **one definition site**,
+`broker.SPIFFEID`, called by both `auth.go` and the renderer; a test asserts both that the rendered
+URI equals what that function produces _and_ that the function still produces the canonical
+`spiffe://<td>/ns/<ns>/sa/<sa>` shape, since two callers agreeing with each other is not the same as
+being right.
+
+**And a uniqueness dependency worth stating.** Certificate and Secret names derive from `agent.Name`
+and are unique because the API server says so; the _actor_ SPIFFE ID derives from `(tier, scope)`
+and not from the name at all (06 §5.1 forbids the name being an input, since naming the identity is
+choosing the authority). Its uniqueness therefore rests entirely on admission enforcing (tier, scope)
+uniqueness fleet-wide. Two same-tier same-scope agents would get distinct certificates carrying the
+_same_ actor identity — unrepresentable today, but the mesh's identity uniqueness is a property of
+the **webhook**, not of the renderer, and nothing in the renderer would notice if that changed. This
+was found by writing the collision test with a two-agent fixture and having it fail (LSN-015 again:
+one CR could not have caught it).
+
+**cert-manager's Go types are deliberately not a dependency.** Adding
+`github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1` was tried and reverted: it upgrades
+every `k8s.io/*` module in the operator and pulls `sigs.k8s.io/gateway-api` — an unrelated API
+surface — into the binary that reconciles the write-credential path. Two struct literals do not
+justify that, and the controller only ever _writes_ these objects, so the type safety traded away is
+type safety over a value nothing in this process reads. They are rendered as `unstructured`.
+
 - **P9-T7c** — the pipeline behind the pair: **V-BRK-011** and **V-BRK-014** at L1, the
   `ChangePolicy` informer T3b deferred here (V-GAT-009's L2 instance stays open), and the
   `POST /v1alpha1/actions/{actionId}/replay` route plus the HTTP `Replayer` T6c deferred here.
