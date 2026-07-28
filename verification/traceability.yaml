@@ -802,12 +802,14 @@
   bullet: "**Retention vs undo window (§4.3):** every executed record carries both `expiresAt` and `undoWindowExpiresAt`, with `undoWindow ≤ ttl` (CEL rejects a record violating it); the per-class pairs are 30/7, 90/30, 365/90 days; an `UndoRequest` filed **inside** the window executes; one filed after it is `Refused` with the expiry in the message **while the record still exists** — proving the two clocks are independent rather than one field read twice."
   checks:
     - V-REV-008
+    - V-CTR-016
 
 "06§10#42":
   bullet: "**Undo linkage is bidirectional (§4.3):** after an undo, the undo record carries `spec.trigger.undoOf` **and** the label `kube-agents/undo-of`, and the original carries `status.undoneBy`; each direction is resolvable by a label or field query without scanning; a record with `trigger.source: undo` and an empty `undoOf` is **rejected at admission**; and after the original is deleted at its TTL the undo record still names what it reverted."
   checks:
     - V-REV-005
     - V-CTR-006
+    - V-CTR-016
 
 "06§10#43":
   bullet: "**`chainId` (§4.3, §7):** a delegated fleet rollout across three tiers yields `kubectl get actionrecords -A -l kube-agents/chain-id=<id>` returning every record in the chain and nothing else; a non-chained action's `chainId` equals its own `actionId`; a forged `chainId` in a `MeshRequest` changes attribution only and grants nothing."
