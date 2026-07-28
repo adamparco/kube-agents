@@ -289,14 +289,41 @@ type BudgetClassSpec struct {
 	ActionsPerDay *int32 `json:"actionsPerDay,omitempty"`
 }
 
-// OperationsSpec carries the operational brakes and caps (06 §1.1). Phase 8 introduces the SCHEMA
-// only: no controller, broker, or agent reads these fields yet, and the CRD carrying them grants
-// nothing. It exists now because 06 §1.2 V-6 and V-8 are admission rules ABOUT these fields, and
-// 07 §5 requires the ceiling to be enforceable before anything can spend against it.
+// NotifyClass is the minimum risk class that pings humans at once (06 §1.1).
+// +kubebuilder:validation:Enum=routine;elevated;gated
+type NotifyClass string
+
+const (
+	// NotifyRoutine notifies on everything.
+	NotifyRoutine NotifyClass = "routine"
+	// NotifyElevated notifies on elevated and above — the default posture.
+	NotifyElevated NotifyClass = "elevated"
+	// NotifyGated notifies only when a human decision is actually required.
+	NotifyGated NotifyClass = "gated"
+)
+
+// OperationsSpec carries the operational brakes and caps (06 §1.1, §4.4).
+//
+// Phase 8 introduced `paused`, `pauseReason` and `initiativeBudget` as SCHEMA ONLY, because 06 §1.2
+// V-6 and V-8 are admission rules about those fields and 07 §5 requires a ceiling to be enforceable
+// before anything can spend against it. Phase 9 completes the block with the remaining four fields
+// of 06 §1.1 and gives the brake a reader.
+//
+// Everything here is settable through `kubectl` alone. That is a requirement, not a consequence:
+// 06 §4.4 specifies that all five brake controls work "with inference down — no dependency on the
+// model, the router, or the agent pod", and a brake reachable only through the chat surface shares
+// a failure domain with the thing it is supposed to stop.
 type OperationsSpec struct {
 	// Paused is THE BRAKE (03 §6). When true the broker refuses new envelopes for this agent — and,
 	// per 06 §1.2 V-6, a paused agent may not act as a PARENT either: provisioning a child is an
 	// action, so the brake covers it.
+	//
+	// `paused` is NOT scale-to-zero (08 §2.4, V-RUN-007, V-RUN-012). The pod keeps running, keeps
+	// its work queue, and keeps observing; only the write path closes. Scaling to zero would look
+	// equivalent and is not: it discards in-memory queue state, it makes the agent unable to report
+	// why it is refusing, and it means "resume" is a cold start rather than a released brake — so
+	// the operator who paused for thirty seconds during a deploy gets an agent that comes back
+	// having forgotten what it was doing.
 	// +kubebuilder:default=false
 	// +optional
 	Paused *bool `json:"paused,omitempty"`
@@ -307,9 +334,88 @@ type OperationsSpec struct {
 	// +optional
 	PauseReason string `json:"pauseReason,omitempty"`
 
+	// DryRunOnly is shadow mode (06 §1.1): classify and journal every action, execute none.
+	//
+	// STRICTER-ONLY, like every other overlay in this system. It forces `dryRun: true` on the
+	// envelope (06 §4.1) and there is no field anywhere that can force it back off, so the composed
+	// result of dry-run mode and any policy is always dry-run. An agent cannot clear it, because
+	// `Agent` is a control-plane object no agent identity may write.
+	//
+	// Distinct from `paused`: a paused agent refuses envelopes and produces no record, while a
+	// dry-run agent produces a full classified, journaled `DryRun` record of what it WOULD have
+	// done. That difference is the whole value of shadow mode — it is how an operator finds out
+	// what an agent would do before granting it the authority to do it.
+	// +kubebuilder:default=false
+	// +optional
+	DryRunOnly *bool `json:"dryRunOnly,omitempty"`
+
+	// ApprovalRosterRef names the ApprovalRoster consulted for `gated` actions, and for `resume`
+	// and `uncontest` (06 §4.4).
+	//
+	// A dangling reference is NOT an open gate. 06 §4.4's sixth fail-closed rule: with no roster to
+	// consult, a gated action stays `PendingApproval` and expires unapproved. Admission does not
+	// require the roster to exist, because ordering a roster before the agent that names it would
+	// make a two-object install order-dependent; the runtime handles the gap by refusing, not by
+	// skipping.
+	// +optional
+	ApprovalRosterRef *RosterRef `json:"approvalRosterRef,omitempty"`
+
+	// ChangePolicyRefs are stricter-only classification overlays (06 §4.2). Ordered, all applied.
+	//
+	// "Ordered" is for reporting, not for precedence — the classifier takes the MAXIMUM class over
+	// every source and the MINIMUM over every cap, so no ordering of these refs can change the
+	// result. The order is preserved because `classification.reasons[]` reads better when the rules
+	// appear in the order the operator wrote them.
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	ChangePolicyRefs []PolicyRef `json:"changePolicyRefs,omitempty"`
+
 	// InitiativeBudget caps self-initiated and human-requested work per risk class (06 §1.1).
 	// +optional
 	InitiativeBudget *InitiativeBudgetSpec `json:"initiativeBudget,omitempty"`
+
+	// NotifyOn is the minimum class that pings humans at once. Default `elevated`.
+	//
+	// `elevated` rather than `routine` because a notification stream that includes every routine
+	// action is a stream nobody reads, and an unread notification is indistinguishable from one
+	// that was never sent. `gated` actions always notify regardless — they are blocked on a human
+	// by definition, so there is nothing for this field to suppress.
+	// +kubebuilder:default=elevated
+	// +optional
+	NotifyOn NotifyClass `json:"notifyOn,omitempty"`
+}
+
+// PolicyRef names a cluster-scoped ChangePolicy. No namespace field: ChangePolicy is cluster-scoped
+// (06 §4.2), and a namespace here would be a field the API server accepts and nothing reads.
+type PolicyRef struct {
+	// Name is the ChangePolicy's name.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+}
+
+// Brake reports the three spec-side brake states with their defaults applied.
+//
+// One function rather than three nil-checks at each call site: every one of these defaults to the
+// PERMISSIVE value when absent, so a forgotten nil-dereference guard reads as "not paused, not
+// dry-run" — the direction that fails open. Keeping the three together also means a caller cannot
+// consult `paused` and forget `dryRunOnly`, which is how shadow mode stops shadowing.
+func (o *OperationsSpec) Brake() (paused, dryRun bool, reason string) {
+	if o == nil {
+		return false, false, ""
+	}
+	paused = o.Paused != nil && *o.Paused
+	dryRun = o.DryRunOnly != nil && *o.DryRunOnly
+	return paused, dryRun, o.PauseReason
+}
+
+// EffectiveNotifyOn applies the `elevated` default.
+func (o *OperationsSpec) EffectiveNotifyOn() NotifyClass {
+	if o == nil || o.NotifyOn == "" {
+		return NotifyElevated
+	}
+	return o.NotifyOn
 }
 
 // IACFormat selects the infrastructure-as-code artifact an agent authors when proposing a change.
@@ -429,4 +535,87 @@ type AgentStatus struct {
 	// StorageStatus tracks PVC binding state.
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
+
+	// Operations is the observed brake state (06 §1.1).
+	// +optional
+	Operations *OperationsStatus `json:"operations,omitempty"`
+
+	// Broker is the observed state of this agent's broker sidecar (06 §1.1).
+	// +optional
+	Broker *BrokerStatus `json:"broker,omitempty"`
+}
+
+// OperationsStatus is the OBSERVED brake state (06 §1.1) — what is actually in force, as opposed to
+// `spec.operations`, which is what somebody asked for.
+//
+// The two are separate because they answer different questions and can legitimately disagree. An
+// agent with `spec.operations.paused: false` can still be executing nothing, because a FleetFreeze
+// covers its scope; `frozenBy` is the only place that shows it. Reading the spec alone during an
+// incident produces the conclusion "the agent is not paused, so why is nothing happening".
+type OperationsStatus struct {
+	// Paused is whether the brake is actually engaged.
+	// +optional
+	Paused bool `json:"paused,omitempty"`
+
+	// PausedSince is when it engaged.
+	// +optional
+	PausedSince *metav1.Time `json:"pausedSince,omitempty"`
+
+	// PausedBy is the chat user ID or Kubernetes username that set the brake. Free text rather than
+	// a V-11-patterned principal, unlike the spec-side `requestedBy` fields on the brake objects:
+	// this is written by the controller from whatever the API server reported as the mutating user,
+	// and a `system:serviceaccount:…` username has no platform prefix to canonicalize to. A pattern
+	// here would force the controller to either discard the identity or invent one.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	PausedBy string `json:"pausedBy,omitempty"`
+
+	// Reason mirrors `spec.operations.pauseReason` at the moment the brake engaged, so editing the
+	// spec reason later does not rewrite the history of why this pause happened.
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// DryRunOnly is whether shadow mode is in force.
+	// +optional
+	DryRunOnly bool `json:"dryRunOnly,omitempty"`
+
+	// FrozenBy is the name of the FleetFreeze covering this scope, if any (06 §4.4). Empty means no
+	// freeze — and, because a freeze is cluster-scoped and this field is per-agent, it is the only
+	// per-agent answer to "am I covered", which otherwise requires listing every freeze and
+	// evaluating each scope by hand.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	FrozenBy string `json:"frozenBy,omitempty"`
+}
+
+// BrokerStatus is the observed state of the agent's broker sidecar (06 §1.1).
+type BrokerStatus struct {
+	// Endpoint is the broker's mTLS address. Read by nothing in the write path — the broker is
+	// reached over localhost within the pod — and present so an operator can confirm which broker
+	// an agent is bound to without inspecting the pod spec.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// ActorServiceAccount is the derived actor SA (06 §2). Reported, never settable: the CRD has,
+	// and must never gain, a field that names it, because a spec-settable actor SA is a spec-settable
+	// authority level.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	ActorServiceAccount string `json:"actorServiceAccount,omitempty"`
+
+	// Ready is whether the broker is accepting envelopes.
+	// +optional
+	Ready bool `json:"ready,omitempty"`
+
+	// JournalReachable is false when the broker cannot reach the journal store, in which case it is
+	// fail-closed and executing nothing (06 §4.4, fail-closed rule 3 — which also auto-pauses).
+	//
+	// It defaults to the Go zero value `false`, and that is the correct default for once: an agent
+	// whose status has never been written has not demonstrated that its journal is reachable, and
+	// the fail-closed reading of "unknown" is "unreachable". Every other boolean in this block
+	// reads the same way — absent means the safe answer, not the convenient one.
+	// +optional
+	JournalReachable bool `json:"journalReachable,omitempty"`
 }

@@ -90,6 +90,16 @@ python3 dev/tests/classifier-is-model-free.py
 # fixture looks right, they match each other, and only the API server disagrees -- silently, by never
 # matching. Found by reading; this is so the next one is not.
 python3 dev/tests/api-group-single-sourced.py
+# V-RUN-012's L0 half: `pause` is structurally not a scale-to-zero. 08 §2.4 and 06 §4.4 both promise
+# the pod keeps running while an agent is paused -- same UID, same start time, same in-memory queue --
+# so only the WRITE path closes, and it closes in the broker. The forbidden change is not exotic:
+# `resolveDeploymentReplicasAndStrategy` already renders `replicas: 0` for the unrelated
+# `spec.deployment.scaleToZero` idling feature, so wiring pause into it is one `||` three lines away
+# from code that already does exactly that, it reads in a diff as tidy reuse, and it passes every test
+# that does not specifically render a paused agent. The L1 half renders both and compares; this half
+# asserts the shape that survives the renderer moving. `--negative-control` is the `¬` of 09 §6.
+python3 dev/tests/pause-is-not-scale-to-zero.py
+python3 dev/tests/pause-is-not-scale-to-zero.py --negative-control
 
 # --- repository mechanics (LSN-012) ---------------------------------------------------------
 # Which remote carries the work, and does `main` point at it? Local main tracked `upstream/main`

@@ -361,6 +361,52 @@ both are in this phase's ratchet, and neither could be claimed by any unit that 
 Recording both rather than quietly widening T5b: a unit that claims a check it structurally cannot
 exercise is worse than one that leaves it open, because the ratchet then reads as satisfied.
 
+**P9-T6 ships as three units.** The row above is not one deliverable either: it is the brake's
+objects, the brake's decision, and the one controller that acts on a brake object. The seam is the
+same layering seam T3a/T3b and T5a/T5b used — schema, then the function that reads it, then the
+thing that runs. Split before writing code rather than after, per SELECT §2.
+
+- **P9-T6a** — the objects. The rest of `Agent.spec.operations` (06 §1.1's full seven fields),
+  `status.operations` and `status.broker`, the three new CRDs (`FleetFreeze`, `ApprovalRoster`,
+  `UndoRequest`), their admission webhooks, and `pause` proven inert in the renderer. **Claims
+  exactly one check: V-RUN-012 at L0.**
+- **P9-T6b** — `internal/broker/brake.go`: the nine fail-closed rules of 06 §4.4 as one decision
+  function, plus the contested index.
+- **P9-T6c** — `internal/controller/undo_controller.go` (`C-UC`), the advisory
+  `kube-agents/contested: <action-id>` annotation, and its envtest.
+
+**Seven of T6's eight checks are L2-only, and T6a claims none of them.** The same finding as T5a's
+and T5b's, in the same direction. V-BRK-005, V-RUN-007, V-RUN-008, V-RUN-013, V-REV-007, V-GAT-003
+and V-GAT-007 are all `L2` in 09 §6: every one of them is about the brake's OBSERVABLE effect on a
+running fleet — an agent that stops writing, a freeze that covers a scope, an undo that reverses a
+real object — and none is reachable from a Go test, however good. Only **V-RUN-012** lists an L0
+instance, and that is what T6a claims. The seven go to `verify-phase9.sh` and `broker-execute-l2.sh`
+in **P9-T9**, alongside the ten already routed there.
+
+**V-RUN-012 ships as two halves, and the negative control is not hypothetical.**
+`resolveDeploymentReplicasAndStrategy` already renders `replicas: 0` for `spec.deployment.scaleToZero`,
+an unrelated idling feature. So "make pause set replicas to 0" is one `||` three lines from code that
+already does exactly that, it reads in a diff as tidy reuse, and it passes every test that does not
+specifically render a paused agent. The L1 half
+(`internal/controller/pause_not_scale_to_zero_test.go`) renders a paused and an unpaused Agent and
+asserts the Deployment specs are deeply equal — deep equality rather than a replica assertion,
+because any difference rolls the pod and V-RUN-012 requires the pod UID and start time to survive.
+The L0 half (`dev/tests/pause-is-not-scale-to-zero.py`) asserts the shape that survives the renderer
+moving. `scaleToZero` itself is the `¬` control: the same mechanism, reached through the field that
+is allowed to use it.
+
+**A spec rule with no check and no owner, found while writing T6a's principal patterns.** 06 §1.2
+**V-11** requires platform-qualified principals (`^(slack|googlechat):\S+$`) on
+`Agent.spec.integration.*.allowedUsers`. It is enforced nowhere in Go, it has **no check ID anywhere
+in 09**, and no task in `docs/build/` names it — P8-T9 covered V-6, V-8 and V-10 only. Not fixed
+here: adding a validation rule to satisfy a check that does not exist is a different unit of work
+(PROTOCOL §10), and the missing check is the larger half of the problem. T6a does implement the V-11
+FORM on every principal field it introduces (`FleetFreeze.spec.requestedBy`,
+`UndoRequest.spec.requestedBy`, `Approver.Principal()`), extended with a third platform, `k8s:` — a
+human running `kubectl` during an outage has a Kubernetes username and no Slack ID, and a schema
+that could not express that identity would make the API brake unusable in the exact failure it is
+specified for.
+
 ---
 
 ## Deferrals opened by this phase (each with a named external blocker)

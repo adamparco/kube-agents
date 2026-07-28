@@ -236,6 +236,11 @@ func main() {
 		}{
 			{"Agent", agentwebhook.SetupAgentWebhookWithManager},
 			{"ChangePolicy", agentwebhook.SetupChangePolicyWebhookWithManager},
+			// The three brake objects of 06 §4.4, registered together because they share a
+			// failurePolicy and a reason for it: these webhooks are `Ignore`, so a dead operator
+			// cannot make it impossible to create a FleetFreeze. Every rule the brake objects may
+			// not violate is CRD-level CEL and holds without this process.
+			{"Brake", agentwebhook.SetupBrakeWebhooksWithManager},
 		}
 
 		for _, wh := range webhooks {
