@@ -441,6 +441,64 @@ reverse write cannot leave 06 §4.3's bidirectional link one-way.
   says so outright, since the commonest contested case is a human undoing a create and a deleted
   object cannot hold an annotation. Tested both directions.
 
+**P9-T7 ships as three units**, on the same layering seam T3a/T3b, T5a/T5b and T6a/b/c used: the
+thing both halves depend on, then the rendering of the pair, then the pipeline that runs behind it.
+
+- **P9-T7a** — `internal/agentlabels/`: the five 08 §2.5 label keys spelled once, and the injective
+  scope renderer. Every other T7 deliverable stamps these; nothing else in T7 can be written without
+  agreeing on them first. **Claims V-RUN-011 at L0 and L1.**
+- **P9-T7b** — the pair itself: broker Deployment, `<agent>-broker` Service on 8443 and the
+  certificate Secret rendered **before** the agent Deployment, both owner-referenced; the
+  pair-atomic `LaunchSpec`; `BrokerReady`/`AgentReady` with `Ready` their conjunction; the
+  `wait-for-broker` init container with observe-and-report on timeout; `KUBEAGENTS_BROKER_ENDPOINT`
+  injection; the broker NetworkPolicy and the agent's egress-to-broker rule; goldens. **Claims
+  V-RUN-003 and V-BRK-012, both L0.**
+- **P9-T7c** — the pipeline behind the pair: **V-BRK-011** and **V-BRK-014** at L1, the
+  `ChangePolicy` informer T3b deferred here (V-GAT-009's L2 instance stays open), and the
+  `POST /v1alpha1/actions/{actionId}/replay` route plus the HTTP `Replayer` T6c deferred here.
+
+**The split is driven by level as much as by size.** Of T7's fifteen listed check IDs only five are
+reachable without a cluster — V-RUN-011 (L0, L1), V-RUN-003 (L0), V-BRK-012 (L0), V-BRK-011 (L1) and
+V-BRK-014 (L1). V-RUN-001/002/004/005/009 and V-ISO-001/002 are `L2` in 09 §6: they assert that the
+pair actually runs, that the init container actually blocks, and that the NetworkPolicy actually
+drops a packet. Those go to **P9-T9** with the seventeen already routed there. V-RUN-006 is 09-listed
+against the hardened `securityContext` P8 already renders and is re-asserted by T7b's goldens.
+
+**Why the label renderer is its own unit and not three constants at the top of `agent_manifests.go`.**
+V-RUN-011 calls a scope-label collision "an authority bug, not a cosmetic one", and it is right in a
+way that is easy to under-read. 03 §4.2 pins a pod to its ServiceAccount by asserting the pod's
+`kube-agents/tier`, `kube-agents/scope` and `kube-agents/role` match the SA's; 08 §2.5 keys the mesh
+NetworkPolicy and the per-scope quota on the same value. A scope key is
+`<project>.<cluster>.<namespace>` — 30 + 40 + 63 characters against a 63-byte label ceiling — so
+**truncation is the default path, not an edge case**, and truncation alone maps two namespaces in one
+long-named cluster onto one label. The pinning selector then stops distinguishing two credentials it
+exists to distinguish. So `RenderScope` is built to make injectivity an argument rather than a hope:
+a short legal value passes through unchanged (output _is_ input), anything else becomes a readable
+prefix plus a 10-hex digest **of a length-prefixed canonical encoding** of the three levels, and a
+literal that would _look_ hashed is pushed into the hashed set so the two sets cannot overlap. The
+residual is stated, not hidden: a 40-bit digest collision between two scopes that also share a
+52-byte prefix.
+
+**T7a found a real defect in its own renderer, and the corpus is why.** The first draft hashed the
+readable join, so `{acme, prod.eu, payments}` and `{acme, prod, eu.payments}` both rendered
+`acme.prod.eu.payments` — and both were short and legal, so both took the pass-through path and the
+digest never ran. The join is ambiguous; the fix is to hash a length-prefixed encoding instead, and
+to require every level to be a DNS-1123 label (which forbids `.`) before allowing pass-through. The
+`¬` control 09 requires is `TestTheCollisionCorpusBreaksANaiveRenderer`, which runs a naive
+`truncate(sanitize(key), 63)` over the same 16-entry corpus and asserts it collides — without it, a
+corpus that everything survives would prove nothing about the corpus.
+
+**The journal's `kube-agents/scope` means something else, and T7a does not change it.** 08 §2.5
+defines the key as the rendering of the whole scope key; 06 §4.3's ActionRecord examples and the
+06 §5.1 ServiceAccount table use the same key for the scope **leaf** (`team-x`, `cluster-a`). These
+are different objects, so it is not a contradiction — but 03 §4.2 compares a pod's value to its SA's,
+and a leaf is not injective across a fleet (two clusters each with a `team-x` namespace render the
+same label). T7a single-sources the **key spellings** so that `internal/journal` and the renderer
+cannot drift on the string, leaves the journal's value derivation exactly as it is, and declares it
+in the lint's exemption table with that reason. Reconciling the two meanings is a spec question with
+a real blast radius and no check pointed at it, so it is recorded as an open item rather than settled
+inside an implementation unit (PROTOCOL §10).
+
 **V-RUN-012 ships as two halves, and the negative control is not hypothetical.**
 `resolveDeploymentReplicasAndStrategy` already renders `replicas: 0` for `spec.deployment.scaleToZero`,
 an unrelated idling feature. So "make pause set replicas to 0" is one `||` three lines from code that

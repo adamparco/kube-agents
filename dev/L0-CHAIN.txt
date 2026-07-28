@@ -101,6 +101,15 @@ python3 dev/tests/api-group-single-sourced.py
 python3 dev/tests/pause-is-not-scale-to-zero.py
 python3 dev/tests/pause-is-not-scale-to-zero.py --negative-control
 
+# V-RUN-011's L0 half: the five 08 §2.5 label keys have one definition site and the scope value has
+# one renderer. The L1 half proves `RenderScope` is injective over an adversarial corpus; it cannot
+# prove the renderer is the ONLY renderer, and the second one is always three cheap lines at the call
+# site (`"kube-agents/scope": agent.Spec.Scope.Namespace`) that neither truncate, sanitize nor hash.
+# 03 §4.2 pins a pod to its ServiceAccount by comparing these labels, so a value built any other way
+# is a selector that silently stops distinguishing two credentials. `--negative-control` is the `¬`.
+python3 dev/tests/scope-label-single-sourced.py
+python3 dev/tests/scope-label-single-sourced.py --negative-control
+
 # --- repository mechanics (LSN-012) ---------------------------------------------------------
 # Which remote carries the work, and does `main` point at it? Local main tracked `upstream/main`
 # (gke-labs) for the whole of phases 2-8: a bare `git pull` would have fetched a tree with none of

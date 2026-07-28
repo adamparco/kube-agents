@@ -33,6 +33,7 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/agentindex"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/agentlabels"
 )
 
 const defaultPlatformAgentSecrets = "platform-agent-secrets"
@@ -539,12 +540,14 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      agent.Name + "-gateway",
 			Namespace: agent.Namespace,
-			Labels: map[string]string{
+			// The five 08 §2.5 labels come from internal/agentlabels, which is the only place they
+			// are spelled and the only place a scope value is rendered (V-RUN-011). They are merged
+			// UNDER `app` so a future `app` change cannot silently shadow one of them, and they are
+			// deliberately NOT in the (immutable) selector below: a selector that carried them
+			// could never be corrected on a live Deployment.
+			Labels: mergeLabels(agentlabels.For(agent, agentlabels.RoleReader), map[string]string{
 				"app": agent.Name + "-gateway",
-				// The tier label lets a per-tier egress NetworkPolicy (03 §10) select every agent
-				// pod of a tier without knowing agent names. NOT part of the (immutable) selector.
-				"kube-agents/tier": string(tier),
-			},
+			}),
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
@@ -556,10 +559,13 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":              agent.Name + "-gateway",
-						"kube-agents/tier": string(tier),
-					},
+					// Same set on the pod template. This is the copy that matters most: 03 §4.2
+					// pins a pod to its ServiceAccount by comparing the POD's tier/scope/role
+					// labels against the SA's, and `vap-agent-pod-hardening` selects pods, not
+					// Deployments.
+					Labels: mergeLabels(agentlabels.For(agent, agentlabels.RoleReader), map[string]string{
+						"app": agent.Name + "-gateway",
+					}),
 					Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 				},
 				Spec: corev1.PodSpec{
@@ -1069,6 +1075,11 @@ func buildAgentService(agent *agentv1alpha1.Agent) *corev1.Service {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      agent.Name,
 			Namespace: agent.Namespace,
+			// 08 §2.5 stamps the five on the Service too, so "show me both halves of this agent"
+			// (`-l kube-agents/agent=<name>`) returns the Services as well as the workloads. A
+			// Service selector is mutable, but this one stays `app`-only: it must keep matching
+			// pods from a Deployment rolled before these labels existed.
+			Labels: agentlabels.For(agent, agentlabels.RoleReader),
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{
