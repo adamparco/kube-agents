@@ -307,6 +307,11 @@ const (
 	ReasonSnapshotFailed     = "snapshot-failed"
 	ReasonBudgetExhausted    = "budget-exhausted"
 	ReasonFlapDetected       = "flap-detected"
+
+	// ReasonPolicyUnavailable is step 4's counterpart to ReasonJournalUnavailable: the broker could
+	// not establish which ChangePolicy objects are in force. It is in this list rather than in the
+	// policy package for the reason the comment above gives -- one namespace, one definition site.
+	ReasonPolicyUnavailable = "policy-unavailable"
 )
 
 func invalid(format string, args ...any) *Refusal {

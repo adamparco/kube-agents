@@ -89,6 +89,39 @@ type BrakeSource interface {
 	Observe(ctx context.Context) BrakeView
 }
 
+// policyRetryAfterSeconds is what a caller is told to wait after a policy-unavailable refusal. Long
+// enough that a broker whose API server is down does not get hammered by every agent it serves,
+// short enough that a single dropped List does not stall an incident response for a minute.
+const policyRetryAfterSeconds = 15
+
+// ClassifierSource supplies the classifier for one submission.
+//
+// A seam rather than a `*classify.Classifier` because a ChangePolicy an operator applies has to
+// take effect on the next action, not on the next broker restart. A fixed classifier built at
+// startup would make `kubectl apply -f tighten.yaml` a no-op until someone noticed -- and the
+// noticing would happen after the action the policy was written to stop.
+//
+// Current returns an error rather than a nil classifier when the policy set is unknown, and step 4
+// turns that error into a refusal. That is the fail-closed direction, and it is forced: the
+// classifier maxes over its sources (06 §4.2 step 3), so a policy set that is missing entries can
+// only ever under-classify. "Classify against what we have" and "classify against nothing" are the
+// same bug at different sizes.
+type ClassifierSource interface {
+	Current() (*classify.Classifier, error)
+}
+
+// StaticClassifier adapts a fixed classifier to ClassifierSource, for tests and for any caller
+// whose policy set genuinely cannot change -- the code floor alone, for instance.
+type StaticClassifier struct{ C *classify.Classifier }
+
+// Current returns the fixed classifier.
+func (s StaticClassifier) Current() (*classify.Classifier, error) {
+	if s.C == nil {
+		return nil, errors.New("pipeline: StaticClassifier holds no classifier")
+	}
+	return s.C, nil
+}
+
 // Planner produces the undo plan for an envelope's operations. undo.Generate is the implementation;
 // the interface exists so that the failure mode is injectable -- see Config.Planner.
 type Planner interface {
@@ -120,7 +153,7 @@ type Config struct {
 	Namespace           string
 	ActorServiceAccount string
 
-	Classifier *classify.Classifier
+	Classifier ClassifierSource
 	Live       classify.LiveState
 	Refs       undo.ReferenceIndex
 	// Planner generates the undo plan. Defaults to undo.Generate; it is a seam for the same reason
@@ -160,7 +193,7 @@ func New(cfg Config) (*Pipeline, error) {
 	case cfg.Namespace == "":
 		return nil, errors.New("pipeline: a namespace is required; it is where ActionRecords are written")
 	case cfg.Classifier == nil:
-		return nil, errors.New("pipeline: a Classifier is required; without one every action would execute unclassified")
+		return nil, errors.New("pipeline: a ClassifierSource is required; without one every action would execute unclassified")
 	case cfg.Live == nil:
 		return nil, errors.New("pipeline: a LiveState is required; classify.Resolve on a nil LiveState yields ops with no live data, which LOOSENS every live-dependent rule (see classify.Resolve)")
 	case cfg.Refs == nil:
@@ -388,7 +421,29 @@ func (p *Pipeline) stepClassify(ctx context.Context, s *state) (*broker.Result, 
 			MaxObjects:      s.env.EffectiveMaxObjects(),
 			UndoPlanPresent: plan.Undoable(),
 		}
-		cls, err := p.cfg.Classifier.Classify(in)
+		// Resolved per submission, not held from startup. A ChangePolicy applied a second ago is in
+		// force for this action; see ClassifierSource.
+		//
+		// An unresolvable policy set is a refusal and not a fallback to the code floor. The floor
+		// alone is a WEAKER rule table than the floor plus policies, always -- the classifier maxes
+		// over sources -- so "classify against the floor while the policy set is unknown" is a
+		// silent downgrade of every policy in the cluster, arriving at exactly the moment the
+		// cluster is unhealthy. Journaled and flagged as a security event because a broker that
+		// cannot see its policies is a control-plane condition an operator has to be told about,
+		// not a transient the caller absorbs.
+		classifier, err := p.cfg.Classifier.Current()
+		if err != nil {
+			return "", &broker.Refusal{
+				Status:            http.StatusServiceUnavailable,
+				Reason:            broker.ReasonPolicyUnavailable,
+				Detail:            err.Error(),
+				Journal:           true,
+				SecurityEvent:     true,
+				RetryAfterSeconds: policyRetryAfterSeconds,
+			}
+		}
+
+		cls, err := classifier.Classify(in)
 		if err != nil {
 			return "", fmt.Errorf("step 4: classifying: %w", err)
 		}
