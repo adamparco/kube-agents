@@ -285,6 +285,12 @@
   bullet: "**(new) Undo works:** for a sampled set across all three tiers, `undo <action-id>` restores the pre-state, verified by diffing against the recorded snapshot."
   checks:
     - V-REV-002
+    # V-REV-002 samples the CHAT path end to end. V-REV-011 is the component underneath it, and it
+    # carries the half of "restores the pre-state" that a diff against a snapshot cannot see: the
+    # pre-state of a scaled-down Deployment is running pods, and the object diff is clean the moment
+    # the replica count is written. Also the direction the bullet does not state — a replay that
+    # CANNOT restore the pre-state must refuse rather than write something else at the same name.
+    - V-REV-011
 
 "03§11#17":
   bullet: "**(new) Unrevertible ⇒ gated:** an action for which the broker cannot generate an undo plan is never auto-executed."
@@ -783,6 +789,10 @@
     # is right for objects already stipulated to be recreatable. V-REV-010 is the other half —
     # whether this object was ever one of those — decided against a live cluster.
     - V-REV-010
+    # "and then ACTUALLY REPLAYED" is a third thing again. V-REV-004 generates and validates plans;
+    # V-REV-010 decides recreatability. Neither runs a replayer, because until P9-T7c-3c-ii-a there
+    # was not one. V-REV-011 covers the replay itself, in both directions.
+    - V-REV-011
 
 "06§10#37":
   bullet: "**Unrevertible ⇒ gated:** deleting a bound PVC, deleting a namespace, and rotating a credential each produce `undoable: false` and park as `PendingApproval` — never execute."

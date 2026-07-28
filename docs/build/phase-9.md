@@ -673,7 +673,13 @@ type safety over a value nothing in this process reads. They are rendered as `un
         a named human owner, because a prober that can dial from another pod's network position is a
         deployable workload with its own RBAC and blast-radius argument, not a method body.
       - **P9-T7c-3c-ii** — `Rollbacker`, `Pager`, `Pauser`: the three effects rungs 3 and 5 of the
-        04 §5 ladder actually have on the world.
+        04 §5 ladder actually have on the world. **Split into two at IMPLEMENT**, see "Why
+        T7c-3c-ii split into two" below.
+        - **P9-T7c-3c-ii-a** — `internal/broker/rollback`, the `verify.Rollbacker`: rung 3, the
+          replay itself. **Allocates and claims V-REV-011 at L1 and L2. Done 2026-07-28.**
+        - **P9-T7c-3c-ii-b** — `Pager` and `Pauser`, rung 5, **plus the controller-side C-BR
+          reconciler they both have to go through.** Blocked on a component that does not exist,
+          which is why they are not in ii-a.
       - **P9-T7c-3c-iii** — a durable `CooldownRegistry`. `verify.MemoryCooldown` says in its own
         doc comment that it is "deliberately not the production store: a cooldown that dies with
         the broker process is a cooldown an operator can clear by deleting a pod, and 04 §4.2
@@ -813,6 +819,32 @@ the destructive L2 surface in exactly one sub-unit: 3c-i only reads and dry-runs
 
 **What T7c-3c-i asserts.** V-PRO-027, newly allocated. See the check text in 09 §6.6; the argument
 for allocating it rather than claiming V-PRO-013 is in this unit's ledger row.
+
+**Why T7c-3c-ii split into two.** Not a sizing call. `Pager` and `Pauser` cannot be written as
+adapters at all, and finding that out took reading one line of 06 §2.2.1: the **broker's operations
+grant is read-only on `agents` and carries no verb on `events`.** V-BRK-013 asserts that grant
+**exactly**, and V-BRK-013 is BLOCKING-ALWAYS. So the broker process cannot pause an agent — that is
+a write to an `Agent` — and cannot page — that is an Event. A `Pauser` implemented as a client call
+from the broker would need the grant widened, which is precisely the change PROTOCOL §10.2 forbids
+doing to get an implementation to work.
+
+The invariant-preserving shape is the one 05 §1.7 already names: **"exactly one code path that stops
+an agent."** The broker records the intent in the journal — which it can write — and a
+**controller-side C-BR reconciler** fans it out into the pause and the page, from the operator's
+identity, through the single stop path that already exists. That reconciler does not exist, and
+writing it is a controller unit, not an adapter unit. So ii-b is `Pager` + `Pauser` + C-BR together,
+and its precondition is a design decision recorded in the ledger rather than a missing file.
+
+Splitting here also keeps the two halves honest about their verification. ii-a's property —
+V-REV-011 — is provable today at L1 and L2 against a real cluster, with no deployed surface needed.
+ii-b's property is that a rung-5 escalation reaches an agent that then stops, which is an
+end-to-end claim over two processes and belongs with the wiring, not before it.
+
+**What T7c-3c-ii-a asserts.** V-REV-011, newly allocated in 09 §6.3. The clause that motivated
+allocating a new check rather than extending V-REV-004 is "**replays the pre-state**": at L1 a
+successful replay means a field changed, and the pre-state of a scaled-down Deployment is running
+pods. That distinction is only assertable where controllers run, so the check is L1+L2 from
+allocation and its L2 half shipped in the same unit.
 
 **What T7c-3a asserts.** `livestate.Source` is the adapter behind every rung of 06 §4.2's
 ladder: object labels and annotations, namespace labels, the blast-radius denominator, the secret

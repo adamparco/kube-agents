@@ -33,7 +33,14 @@ import (
 type Rollbacker interface {
 	// Rollback replays the plan. It is called AT MOST ONCE per action: 04 §5.1 makes a failed
 	// rollback an immediate page, "not a retry loop".
-	Rollback(ctx context.Context, actionID string, plan agentv1alpha1.UndoPlan) error
+	//
+	// agentIdentity is passed per-call rather than bound into the implementation because the
+	// replayer derives its FIELD MANAGER from it, and the manager string is security-relevant:
+	// V-BRK-019 fixes it at `kube-agents/<tier>/<scope>`, and `contested` in 03 §6 is a comparison
+	// against it. An implementation constructed once with a static identity writes the right
+	// manager until the process serves a second one, and the wrong one silently thereafter --
+	// attributing one agent's rollback to another in every managedFields entry it touches.
+	Rollback(ctx context.Context, actionID, agentIdentity string, plan agentv1alpha1.UndoPlan) error
 }
 
 // Pager raises a human page. A page that cannot be delivered is itself an error the driver
@@ -389,7 +396,7 @@ func (d *Driver) attemptRollback(ctx context.Context, req Request) error {
 	if err := undo.ValidateReplayable(&req.UndoPlan); err != nil {
 		return fmt.Errorf("undo plan is not replayable: %w", err)
 	}
-	return d.Rollback.Rollback(ctx, req.ActionID, req.UndoPlan)
+	return d.Rollback.Rollback(ctx, req.ActionID, req.AgentIdentity, req.UndoPlan)
 }
 
 // enterCooldown puts every target into the 04 §4.2 quiet period. A registry error is recorded in
