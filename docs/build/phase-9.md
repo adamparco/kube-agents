@@ -441,18 +441,27 @@ reverse write cannot leave 06 §4.3's bidirectional link one-way.
   says so outright, since the commonest contested case is a human undoing a create and a deleted
   object cannot hold an annotation. Tested both directions.
 
-**P9-T7 ships as three units**, on the same layering seam T3a/T3b, T5a/T5b and T6a/b/c used: the
-thing both halves depend on, then the rendering of the pair, then the pipeline that runs behind it.
+**P9-T7 ships as four units**, on the same layering seam T3a/T3b, T5a/T5b and T6a/b/c used: the
+thing both halves depend on, then the rendering of the pair, then the cluster-scoped objects that
+pair needs to actually talk, then the pipeline that runs behind it. (T7d was split out of T7b
+mid-unit; see "Why T7b stops at the render" below.)
 
 - **P9-T7a** — `internal/agentlabels/`: the five 08 §2.5 label keys spelled once, and the injective
   scope renderer. Every other T7 deliverable stamps these; nothing else in T7 can be written without
   agreeing on them first. **Claims V-RUN-011 at L0 and L1.**
-- **P9-T7b** — the pair itself: broker Deployment, `<agent>-broker` Service on 8443 and the
-  certificate Secret rendered **before** the agent Deployment, both owner-referenced; the
-  pair-atomic `LaunchSpec`; `BrokerReady`/`AgentReady` with `Ready` their conjunction; the
-  `wait-for-broker` init container with observe-and-report on timeout; `KUBEAGENTS_BROKER_ENDPOINT`
-  injection; the broker NetworkPolicy and the agent's egress-to-broker rule; goldens. **Claims
-  V-RUN-003 and V-BRK-012, both L0.**
+- **P9-T7b** — the pair itself, as the controller renders it: broker Deployment and
+  `<agent>-broker` Service on 8443 applied **before** the agent Deployment, both owner-referenced;
+  the pair-atomic `LaunchSpec` and `WorkloadPair`; `BrokerReady`/`AgentReady` with `Ready` their
+  conjunction; the `wait-for-broker` init container with observe-and-report on timeout; the five
+  `KUBEAGENTS_BROKER_*` env vars, injected last so a CR author cannot redirect them; the actor
+  ServiceAccount **name**; goldens. **Claims V-RUN-003 and V-BRK-012, both L0.**
+- **P9-T7d** — the objects the rendered pair references but does not create: the mesh CA
+  `ClusterIssuer` and the two cert-manager `Certificate`s behind `<agent>-broker-tls` and
+  `<agent>-mesh-tls`; the broker's ingress NetworkPolicy (from `role: reader` with matching
+  `kube-agents/agent`) and the agent's egress-to-broker rule; the actor ServiceAccounts bound to
+  empty roles; the derived exemplars under `examples/gitops-repo/`. **Claims no new L0 check** —
+  its properties are the L2 set already routed to P9-T9 (V-RUN-001/002/004/005/009,
+  V-ISO-001/002).
 - **P9-T7c** — the pipeline behind the pair: **V-BRK-011** and **V-BRK-014** at L1, the
   `ChangePolicy` informer T3b deferred here (V-GAT-009's L2 instance stays open), and the
   `POST /v1alpha1/actions/{actionId}/replay` route plus the HTTP `Replayer` T6c deferred here.
@@ -461,8 +470,37 @@ thing both halves depend on, then the rendering of the pair, then the pipeline t
 reachable without a cluster — V-RUN-011 (L0, L1), V-RUN-003 (L0), V-BRK-012 (L0), V-BRK-011 (L1) and
 V-BRK-014 (L1). V-RUN-001/002/004/005/009 and V-ISO-001/002 are `L2` in 09 §6: they assert that the
 pair actually runs, that the init container actually blocks, and that the NetworkPolicy actually
-drops a packet. Those go to **P9-T9** with the seventeen already routed there. V-RUN-006 is 09-listed
-against the hardened `securityContext` P8 already renders and is re-asserted by T7b's goldens.
+drops a packet. Those go to **P9-T9** with the seventeen already routed there, and so does
+V-RUN-003's own `L2` half — its `L0` half is the hardened `securityContext` P8 already renders,
+re-asserted here against the broker by T7b's goldens and by `TestBrokerDeploymentPosture`.
+V-RUN-006 ("agent with no broker fails closed into observe-and-report") is `L2` and **phase 10**, so
+it is claimed by nothing in phase 9; T7b's `cmd/broker` tests exercise the same clause at L1 as
+supporting evidence and no more.
+
+**Why T7b stops at the render, and T7d exists.** T7b as first written also owned the TLS Secrets,
+the broker NetworkPolicy and the agent's egress-to-broker rule. Two things came out of implementing
+it that make those a different unit rather than the tail of this one.
+
+The first is that **the Secrets cannot be rendered — only the certificates that fill them can, and
+the issuer they need does not exist.** 08 §2.3 wants mutual TLS between two ends that verify each
+other, which means one CA signing both. The only `Issuer` in this repo is the namespaced
+`selfsigned-issuer` the webhook uses, and self-signing each `Certificate` separately gives the
+broker end and the agent end **different** CAs — a pair that then fails the handshake it exists to
+perform. So T7d has to introduce a mesh CA `ClusterIssuer` and a CA `Certificate` under it first,
+which is a cert-manager API-types dependency and a cluster-scoped object, not a line in
+`broker_manifests.go`. Nothing in T7b is blocked by the gap: the Deployment mounts
+`<agent>-broker-tls` and `<agent>-mesh-tls` by name, and until T7d creates them the pair stays
+`BrokerReady: false` — fail-closed, which is the required direction.
+
+The second is that **the NetworkPolicy's whole property is at L2.** Its check IDs (V-ISO-001/002)
+assert that a packet is actually dropped; rendering the YAML proves nothing they ask about, and both
+are already routed to P9-T9. Pairing the policy with the certificates and the actor SAs — the three
+things that turn a rendered pair into a talking one — keeps one unit's worth of "the pair runs"
+together instead of splitting it across a render unit that cannot test it.
+
+Same reason for the actor ServiceAccounts. T7b derives the **name** (`<tier>-<leaf>-actor`,
+truncated per 06 §5.1) because the Deployment has to name something, and pins that derivation with a
+test. Creating the SA, and binding it to the empty role 06 §2.2.1 requires, is T7d's.
 
 **Why the label renderer is its own unit and not three constants at the top of `agent_manifests.go`.**
 V-RUN-011 calls a scope-label collision "an authority bug, not a cosmetic one", and it is right in a

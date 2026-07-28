@@ -114,6 +114,46 @@ func TestPauseDoesNotChangeTheRenderedDeployment(t *testing.T) {
 	}
 }
 
+// TestPauseDoesNotChangeTheRenderedBroker extends the same property to the other half of the pair.
+//
+// Added with the broker in P9-T7b, because "pause = scale the broker to zero" is the more tempting
+// of the two wrong implementations, not the less: pausing an agent DOES mean it must not write, and
+// the broker is the only thing in the pair that can. Removing it looks like closing the write path
+// at its source.
+//
+// What it actually removes is the explanation. 06 §4.4 wants a paused agent to keep saying why it
+// is refusing, and the refusal comes from the broker — so a fleet-wide pause implemented this way
+// reports itself to every operator as a broker outage, and `wait-for-broker` puts the pods into
+// observe-and-report, which is the same words for a different situation. Pause has to be a brake
+// the broker applies while running, not the broker's absence.
+func TestPauseDoesNotChangeTheRenderedBroker(t *testing.T) {
+	running := buildBrokerDeployment(pausableAgent(nil))
+
+	braked := buildBrokerDeployment(pausableAgent(&agentv1alpha1.OperationsSpec{
+		Paused:      ptr.To(true),
+		PauseReason: "INC-4471 — payments degraded",
+		DryRunOnly:  ptr.To(true),
+	}))
+
+	if got := *braked.Spec.Replicas; got != 1 {
+		t.Errorf("broker replicas is %d, want 1: a paused agent's broker keeps running so it can "+
+			"refuse with a reason (06 §4.4, V-RUN-012)", got)
+	}
+	if !reflect.DeepEqual(running.Spec, braked.Spec) {
+		t.Errorf("the rendered broker Deployment differs between a running and a paused agent.\n"+
+			"running: %+v\nbraked:  %+v", running.Spec, braked.Spec)
+	}
+
+	// And the brake must not reach the broker through the agent's own scale-to-zero either: an
+	// idled agent still has a broker, because `scaleToZero` idles the reader and says nothing
+	// about the write path.
+	idled := pausableAgent(nil)
+	idled.Spec.Deployment.ScaleToZero = ptr.To(true)
+	if got := *buildBrokerDeployment(idled).Spec.Replicas; got != 1 {
+		t.Errorf("broker replicas is %d under spec.deployment.scaleToZero, want 1", got)
+	}
+}
+
 // TestScaleToZeroStillWorks is the negative control for the test above.
 //
 // Without it, `TestPauseDoesNotChangeTheRenderedDeployment` passes just as happily against a

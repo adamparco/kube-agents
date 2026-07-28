@@ -210,6 +210,139 @@ metadata:
       name: agent
       uid: ""
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  creationTimestamp: null
+  labels:
+    kube-agents/agent: agent
+    kube-agents/parent: platform-agent
+    kube-agents/role: actor
+    kube-agents/scope: kube-agents-gkedemos.cluster-a
+    kube-agents/tier: cluster-admin
+  name: agent-broker
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Agent
+      name: agent
+      uid: ""
+spec:
+  ports:
+    - name: envelope
+      port: 8443
+      protocol: TCP
+      targetPort: envelope
+  selector:
+    kube-agents/agent: agent
+    kube-agents/role: actor
+status:
+  loadBalancer: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  creationTimestamp: null
+  labels:
+    kube-agents/agent: agent
+    kube-agents/parent: platform-agent
+    kube-agents/role: actor
+    kube-agents/scope: kube-agents-gkedemos.cluster-a
+    kube-agents/tier: cluster-admin
+  name: agent-broker
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Agent
+      name: agent
+      uid: ""
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      kube-agents/agent: agent
+      kube-agents/role: actor
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        kube-agents/agent: agent
+        kube-agents/parent: platform-agent
+        kube-agents/role: actor
+        kube-agents/scope: kube-agents-gkedemos.cluster-a
+        kube-agents/tier: cluster-admin
+    spec:
+      containers:
+        - args:
+            - --agent-name=agent
+            - --tier=cluster-admin
+            - --scope=cluster-a
+            - --namespace=kubeagents-system
+            - --reader-service-account=cluster-admin-agent
+            - --tls-cert-file=/etc/kage/tls/tls.crt
+            - --tls-key-file=/etc/kage/tls/tls.key
+            - --client-ca-file=/etc/kage/tls/ca.crt
+          image: ghcr.io/gke-labs/kube-agents/kage-broker:v0.1.0
+          livenessProbe:
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            tcpSocket:
+              port: envelope
+            timeoutSeconds: 3
+          name: broker
+          ports:
+            - containerPort: 8443
+              name: envelope
+              protocol: TCP
+          readinessProbe:
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            tcpSocket:
+              port: envelope
+            timeoutSeconds: 3
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          volumeMounts:
+            - mountPath: /etc/kage/tls
+              name: broker-tls
+              readOnly: true
+            - mountPath: /tmp
+              name: broker-tmp
+      securityContext:
+        fsGroup: 10000
+        runAsGroup: 10000
+        runAsNonRoot: true
+        runAsUser: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: cluster-admin-cluster-a-actor
+      volumes:
+        - name: broker-tls
+          secret:
+            defaultMode: 256
+            secretName: agent-broker-tls
+        - emptyDir: {}
+          name: broker-tmp
+status: {}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -294,6 +427,16 @@ spec:
             - name: GOOGLE_CHAT_HOME_CHANNEL
             - name: TOKEN_BROKER_URL
               value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+            - name: KUBEAGENTS_BROKER_ENDPOINT
+              value: https://agent-broker.kubeagents-system.svc.cluster.local:8443
+            - name: KUBEAGENTS_BROKER_SAN
+              value: agent-broker.kubeagents-system.svc.cluster.local
+            - name: KUBEAGENTS_BROKER_TOKEN_FILE
+              value: /var/run/secrets/kubeagents.x-k8s.io/broker/token
+            - name: KUBEAGENTS_BROKER_TLS_DIR
+              value: /etc/kage/tls
+            - name: KUBEAGENTS_BROKER_STATUS_FILE
+              value: /var/run/kage/broker-status
           image: ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0
           imagePullPolicy: IfNotPresent
           name: platform-agent
@@ -329,6 +472,15 @@ spec:
               subPath: session
             - mountPath: /tmp
               name: platform-agent-tmp
+            - mountPath: /etc/kage/tls
+              name: agent-mesh-tls
+              readOnly: true
+            - mountPath: /var/run/secrets/kubeagents.x-k8s.io/broker
+              name: broker-token
+              readOnly: true
+            - mountPath: /var/run/kage
+              name: broker-status
+              readOnly: true
         - args:
             - hermes
             - dashboard
@@ -447,6 +599,38 @@ spec:
           volumeMounts:
             - mountPath: /tmp
               name: event-watcher-tmp
+      initContainers:
+        - args:
+            - --wait-for-broker
+            - --broker-endpoint=https://agent-broker.kubeagents-system.svc.cluster.local:8443
+            - --broker-san=agent-broker.kubeagents-system.svc.cluster.local
+            - --wait-timeout=120s
+            - --status-file=/var/run/kage/broker-status
+            - --tls-cert-file=/etc/kage/tls/tls.crt
+            - --tls-key-file=/etc/kage/tls/tls.key
+            - --client-ca-file=/etc/kage/tls/ca.crt
+          image: ghcr.io/gke-labs/kube-agents/kage-broker:v0.1.0
+          name: wait-for-broker
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          volumeMounts:
+            - mountPath: /etc/kage/tls
+              name: agent-mesh-tls
+              readOnly: true
+            - mountPath: /var/run/kage
+              name: broker-status
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -484,6 +668,20 @@ spec:
           name: event-watcher-tmp
         - emptyDir: {}
           name: platform-agent-dashboard-tmp
+        - name: agent-mesh-tls
+          secret:
+            defaultMode: 256
+            secretName: agent-mesh-tls
+        - name: broker-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-broker
+                  expirationSeconds: 3600
+                  path: token
+        - emptyDir: {}
+          name: broker-status
 status: {}
 ---
 apiVersion: v1

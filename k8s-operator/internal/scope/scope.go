@@ -84,6 +84,34 @@ func (s Scope) Depth() int {
 	}
 }
 
+// Leaf is the value of the deepest narrowed level: the namespace for a namespace-scoped agent, the
+// cluster for a cluster-scoped one, the project for a project-scoped one, and "" for the fleet.
+//
+// 06 §5.1 builds the actor ServiceAccount name out of this (`<tier>-<leaf>-actor`), so it is an
+// identity input and not a display string. Two consequences follow.
+//
+// It reads the DEEPEST SET level rather than switching on the tier. For a well-formed scope those
+// two always agree. For a malformed one -- a hole in the middle, which IsWellFormed exists to catch
+// -- they disagree, and deepest-set is the narrower of the two answers. Narrower is the safe
+// direction here: it names an identity that either does not exist (the pod fails to start) or holds
+// less authority, never more.
+//
+// It is NOT injective, and callers that need injectivity must not get it from here. Distinct scopes
+// share a leaf all the time -- a `payments` namespace in two different clusters is the obvious case
+// -- so a leaf identifies an identity only once the tier and the namespace it lives in are also
+// fixed, which is exactly the context an actor SA name has. agentlabels.RenderScope is the
+// injective rendering; this is deliberately not a second one.
+func (s Scope) Leaf() string {
+	switch {
+	case s.Namespace != "":
+		return s.Namespace
+	case s.ClusterName != "":
+		return s.ClusterName
+	default:
+		return s.ProjectID
+	}
+}
+
 // Clause names the level at which a containment test failed, so a caller can phrase its own error
 // without re-deriving the answer. ClauseNone means containment holds.
 type Clause int

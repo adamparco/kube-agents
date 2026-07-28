@@ -431,23 +431,32 @@ func TestBuildDeployment(t *testing.T) {
 		}
 	}
 
-	if len(dep.Spec.Template.Spec.InitContainers) != 2 {
-		t.Errorf("expected 2 init containers, got %d", len(dep.Spec.Template.Spec.InitContainers))
+	// Three, not two: `wait-for-broker` is prepended ahead of whatever the CR asked for (08 §2.4).
+	// The position matters as much as the presence — a CR-supplied init container ahead of it would
+	// run before the pair is known to be up, which is precisely where an author who wanted the
+	// agent to act unobserved would put one.
+	if len(dep.Spec.Template.Spec.InitContainers) != 3 {
+		t.Errorf("expected 3 init containers, got %d", len(dep.Spec.Template.Spec.InitContainers))
 	} else {
-		initC1 := dep.Spec.Template.Spec.InitContainers[0]
-		if initC1.Name != "init-git" {
-			t.Errorf("expected first init container name init-git, got %s", initC1.Name)
-		}
-		if initC1.Image != "git-image:latest" {
-			t.Errorf("expected first init container image git-image:latest, got %s", initC1.Image)
+		initC0 := dep.Spec.Template.Spec.InitContainers[0]
+		if initC0.Name != "wait-for-broker" {
+			t.Errorf("expected wait-for-broker first, got %s", initC0.Name)
 		}
 
-		initC2 := dep.Spec.Template.Spec.InitContainers[1]
+		initC1 := dep.Spec.Template.Spec.InitContainers[1]
+		if initC1.Name != "init-git" {
+			t.Errorf("expected second init container name init-git, got %s", initC1.Name)
+		}
+		if initC1.Image != "git-image:latest" {
+			t.Errorf("expected second init container image git-image:latest, got %s", initC1.Image)
+		}
+
+		initC2 := dep.Spec.Template.Spec.InitContainers[2]
 		if initC2.Name != "init-bootstrap" {
-			t.Errorf("expected second init container name init-bootstrap, got %s", initC2.Name)
+			t.Errorf("expected third init container name init-bootstrap, got %s", initC2.Name)
 		}
 		if initC2.Image != "busybox:1.36" {
-			t.Errorf("expected second init container image busybox:1.36, got %s", initC2.Image)
+			t.Errorf("expected third init container image busybox:1.36, got %s", initC2.Image)
 		}
 	}
 

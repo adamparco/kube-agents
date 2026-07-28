@@ -501,6 +501,20 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)
 	}
 
+	// The envelope broker (08 §2.3) — a different thing from TOKEN_BROKER_URL above, which mints
+	// GitHub tokens for the suggestion path. This one is the only route by which this pod's
+	// intentions become cluster writes.
+	//
+	// Appended AFTER the merge, and that ordering is the security property. mergeEnvVars gives
+	// `spec.deployment.env` the last word, which is right for every other variable here and wrong
+	// for these five: a CR author who could set KUBEAGENTS_BROKER_ENDPOINT would be choosing which
+	// broker this agent's envelopes reach, and one who could set KUBEAGENTS_BROKER_SAN would be
+	// choosing which certificate the agent accepts on the way — together, enough to route a signed
+	// envelope and a projected token to a listener of their choosing. Applying them last, through
+	// the same merge in the other direction, makes such an override lose on name rather than
+	// produce a duplicate entry whose winner depends on how the kubelet folds the list.
+	envVars = mergeEnvVars(envVars, agentBrokerEnvVars(agent))
+
 	dashboardEnabled := isDashboardEnabled(agent)
 
 	var shareProcessNamespace *bool
@@ -525,12 +539,20 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 	}
 
 	volumes := buildDefaultVolumes(agent)
+	volumes = append(volumes, agentBrokerVolumes(agent)...)
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
 	}
 	if len(extraVolumes) > 0 {
 		volumes = append(volumes, extraVolumes...)
 	}
+
+	// `wait-for-broker` goes FIRST, ahead of anything the CR asked for (08 §2.4). Init containers
+	// run in order, so a CR-supplied init container placed before it would run while the agent's
+	// broker may not exist — and a CR author who wanted the agent to do something unobserved would
+	// put it exactly there. Prepending costs a CR nothing: its own init containers still run, just
+	// after the pair is known to be up or known to be absent.
+	initContainers = append([]corev1.Container{buildWaitForBrokerContainer(agent)}, initContainers...)
 
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
@@ -657,7 +679,11 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 					corev1.ResourceMemory: resource.MustParse("4Gi"),
 				},
 			},
-			VolumeMounts: append(defaultPlatformAgentVolumeMounts, extraVolumeMounts...),
+			// The broker mounts land on the AGENT container only, never on a sidecar or the
+			// dashboard: the mesh key and the audience-scoped token are what let a process speak
+			// as this agent to its broker, and every container that can read them is another
+			// place a compromise becomes a write.
+			VolumeMounts: append(append(defaultPlatformAgentVolumeMounts, agentBrokerVolumeMounts()...), extraVolumeMounts...),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				ReadOnlyRootFilesystem:   ptr.To(true),

@@ -19,6 +19,7 @@ package controller
 import (
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -65,20 +66,86 @@ func TestSelectPodLauncher_FallsBackWhenScionUnavailable(t *testing.T) {
 	}
 }
 
-// TestLaunchSpecFor extracts the per-pod contract from the CR.
+// TestLaunchSpecFor extracts the PAIR contract from the CR (08 §2.4): both halves, with distinct
+// identities, and the sandbox class applied only to the reader.
 func TestLaunchSpecFor(t *testing.T) {
 	spec := launchSpecFor(testAgentForLaunch())
-	if spec.Name != "launch-agent" || spec.Namespace != "launch-ns" {
-		t.Errorf("unexpected name/namespace: %+v", spec)
+	if spec.Namespace != "launch-ns" {
+		t.Errorf("unexpected namespace: %+v", spec)
 	}
-	if spec.ServiceAccountName != "platform-agent" {
-		t.Errorf("expected serviceAccountName platform-agent, got %q", spec.ServiceAccountName)
+	if spec.Reader.Name != "launch-agent-gateway" {
+		t.Errorf("expected reader launch-agent-gateway, got %q", spec.Reader.Name)
 	}
-	if spec.RuntimeClassName != "gvisor" {
-		t.Errorf("expected runtimeClassName gvisor, got %q", spec.RuntimeClassName)
+	if spec.Actor.Name != "launch-agent-broker" {
+		t.Errorf("expected actor launch-agent-broker, got %q", spec.Actor.Name)
 	}
-	if !spec.RunAsNonRoot || !spec.SeccompRuntimeDflt {
-		t.Errorf("expected hardened posture asserted, got %+v", spec)
+	if spec.Reader.ServiceAccountName != "platform-agent" {
+		t.Errorf("expected reader SA platform-agent, got %q", spec.Reader.ServiceAccountName)
+	}
+	// The credential split of 08 §2.2 is exactly this inequality. If the two halves ever resolve
+	// to one ServiceAccount, the pod separation is decoration.
+	if spec.Actor.ServiceAccountName == spec.Reader.ServiceAccountName {
+		t.Errorf("reader and actor must not share a ServiceAccount, both are %q", spec.Actor.ServiceAccountName)
+	}
+	if spec.Reader.RuntimeClassName != "gvisor" {
+		t.Errorf("expected reader runtimeClassName gvisor, got %q", spec.Reader.RuntimeClassName)
+	}
+	if spec.Actor.RuntimeClassName != "" {
+		t.Errorf("the sandbox class applies to the reader only, got actor %q", spec.Actor.RuntimeClassName)
+	}
+	for _, half := range []struct {
+		what string
+		id   PodIdentity
+	}{{"reader", spec.Reader}, {"actor", spec.Actor}} {
+		if !half.id.RunAsNonRoot || !half.id.SeccompRuntimeDflt {
+			t.Errorf("expected hardened posture asserted for %s, got %+v", half.what, half.id)
+		}
+	}
+	if !spec.Actor.ReadOnlyRootFS {
+		t.Error("08 §2.6 requires a read-only root filesystem on the broker")
+	}
+}
+
+// TestWorkloadPairRejectsAHalf is the compile-time-adjacent half of 08 §2.4(a): "launch an agent"
+// must not be an expressible operation. The constructor is the only way to obtain a WorkloadPair
+// and it refuses a nil half, so the unpaired state has no representation for a caller to reach.
+func TestWorkloadPairRejectsAHalf(t *testing.T) {
+	agent := testAgentForLaunch()
+	full := nativePodLauncher{}.BuildPair(agent, "h1", "h2", "h3")
+
+	for _, tc := range []struct {
+		name           string
+		broker, worker *appsv1.Deployment
+	}{
+		{"agent alone", nil, full.Agent()},
+		{"broker alone", full.Broker(), nil},
+		{"neither", nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected newWorkloadPair to reject a half-pair")
+				}
+			}()
+			_ = newWorkloadPair(tc.broker, tc.worker)
+		})
+	}
+}
+
+// TestBuildPairOrdersBrokerFirst pins 08 §2.4(b). The reconciler applies Ordered() in sequence and
+// returns on the first error, so this order is what makes "never proceed to the agent on a broker
+// failure" (§2.4(c)) a property of the data rather than of a rule someone must remember.
+func TestBuildPairOrdersBrokerFirst(t *testing.T) {
+	pair := nativePodLauncher{}.BuildPair(testAgentForLaunch(), "h1", "h2", "h3")
+	ordered := pair.Ordered()
+	if len(ordered) != 2 {
+		t.Fatalf("expected exactly two workloads, got %d", len(ordered))
+	}
+	if ordered[0].Name != "launch-agent-broker" {
+		t.Errorf("broker must be applied first, got %q", ordered[0].Name)
+	}
+	if ordered[1].Name != "launch-agent-gateway" {
+		t.Errorf("agent must be applied second, got %q", ordered[1].Name)
 	}
 }
 
@@ -88,8 +155,8 @@ func TestLaunchSpecFor(t *testing.T) {
 func TestScionLauncherParityWithNative(t *testing.T) {
 	agent := testAgentForLaunch()
 
-	native := nativePodLauncher{}.BuildDeployment(agent, "h1", "h2", "h3")
-	scion := scionPodLauncher{fallback: nativePodLauncher{}}.BuildDeployment(agent, "h1", "h2", "h3")
+	native := nativePodLauncher{}.BuildPair(agent, "h1", "h2", "h3").Agent()
+	scion := scionPodLauncher{fallback: nativePodLauncher{}}.BuildPair(agent, "h1", "h2", "h3").Agent()
 
 	nps := native.Spec.Template.Spec
 	sps := scion.Spec.Template.Spec

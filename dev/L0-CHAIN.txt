@@ -110,6 +110,19 @@ python3 dev/tests/pause-is-not-scale-to-zero.py --negative-control
 python3 dev/tests/scope-label-single-sourced.py
 python3 dev/tests/scope-label-single-sourced.py --negative-control
 
+# --- the broker pair (P9-T7b) ---------------------------------------------------------------
+# V-BRK-012's source half: one broker per Agent CR, and no way to render half a pair. 08 §2.4 makes
+# the broker per-agent because the actor credential IS the boundary -- a broker serving two agents
+# holds both their write authorities and the isolation argument collapses to "the process is
+# careful". Four properties: every broker-derived name is a function of the CR (a name that is a
+# constant is a fleet-wide broker with extra steps); nothing outside the definition site spells the
+# `-broker`/`-broker-tls`/`-mesh-tls` suffixes; the Deployment is single-replica and selects on both
+# labels; and the pair-atomicity scaffolding is still load-bearing -- the last is the LSN-035
+# non-vacuity arm, since a check for "no BuildDeployment" passes forever once the symbol is gone for
+# an unrelated reason. `--negative-control` is the `¬`.
+python3 dev/tests/one-broker-per-agent.py
+python3 dev/tests/one-broker-per-agent.py --negative-control
+
 # --- repository mechanics (LSN-012) ---------------------------------------------------------
 # Which remote carries the work, and does `main` point at it? Local main tracked `upstream/main`
 # (gke-labs) for the whole of phases 2-8: a bare `git pull` would have fetched a tree with none of
