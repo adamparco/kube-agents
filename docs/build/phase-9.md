@@ -658,7 +658,17 @@ type safety over a value nothing in this process reads. They are rendered as `un
     `Rollbacker`, `Pager`, `Pauser`, the cooldown registry, `ActionHistory`, `ReferenceIndex`,
     `BrakeSource` — and a `pipeline.New` call in `cmd/broker/main.go` where
     `broker.UnavailablePipeline{}` is today. Until it lands, **LSN-007 applies to the whole
-    pipeline**: it is built, tested, and unreachable from the binary.
+    pipeline**: it is built, tested, and unreachable from the binary. **Split into four**, see "Why
+    T7c-3 split into four" below.
+    - **P9-T7c-3a** — `livestate.Source`, the `LiveState` adapter: the five reads every
+      classification rung depends on. **Claims V-GAT-022 at L2. Done 2026-07-28.**
+    - **P9-T7c-3b** — `undo.ReferenceIndex` and `execute.BodyStore`.
+    - **P9-T7c-3c** — the verify adapters: `verify.Prober` (eight methods), `Rollbacker`, `Pager`,
+      `Pauser`, `CooldownRegistry`.
+    - **P9-T7c-3d** — `pipeline.BrakeSource`, `broker.ContestedIndex`, and the `pipeline.New` call
+      in `cmd/broker/main.go` that replaces `broker.UnavailablePipeline{}`, plus `policy.Source`
+      construction with a synchronous startup `Refresh`. **Closes LSN-007.** Necessarily last: it
+      is the only sub-unit that needs every other adapter to exist.
   - **P9-T7c-4** — **the classify→execute integrity seam for `apply`, `scale` and merge-patch.**
     See LSN-040. Today only `create`, `delete` and JSON-patch `patch` traverse the pipeline; the
     other three fail closed at step 9.
@@ -765,6 +775,66 @@ cannot drift.
 
 **LSN-007 still applies.** Like T7c-1, this lands reachable from a test and not from
 `cmd/broker/main.go`, which still installs `broker.UnavailablePipeline{}`. T7c-3 is what closes it.
+
+**Why T7c-3 split into four.** Twelve adapters is not one unit, and the reason is not only size.
+Each adapter's own property is "does this talk to a real API server correctly", which is an L2
+claim, and L2 claims are bought one cluster round trip at a time. A single unit holding all twelve
+would have had one checkpoint at the end and no honest partial state before it — exactly the shape
+`harness-run` §2 tells us to split rather than carry. The four sub-units are cut along the seams
+that already exist in the pipeline: 3a is everything **classification** reads, 3b is what **undo**
+needs to exist before an action runs, 3c is everything **verification** does after, and 3d is the
+wiring that makes the binary reach any of it. 3d must be last because it is the only one whose
+precondition is all the others; the cost is that the broker keeps 503ing until it lands, which is
+LSN-007 remaining true for three more units and is recorded rather than worked around.
+
+**What T7c-3a asserts.** `livestate.Source` is the adapter behind every rung of 06 §4.2's
+ladder: object labels and annotations, namespace labels, the blast-radius denominator, the secret
+digest set, and lower-tier ownership. Four things came out of building it.
+
+The first is that **its five methods do not share a failure direction, and treating them alike would
+have been a security bug in both directions.** `CountWorkloadObjects` is the denominator of
+`AbortScopeFraction`, and `ComputeBlastRadius` turns an error into a **nil** fraction — which
+disarms the abort rule entirely. So a kind the caller cannot list is **skipped, not fatal**: a
+smaller denominator makes every fraction larger, which makes the abort more likely. The reflex "I
+could not see everything, therefore I must refuse to answer" is the loosening direction here.
+`SecretDigests` is the opposite: an empty digest set is the exfiltration gate answering "no secrets
+here" to every payload, so a failed List is an error. `LowerTierOwner` is likewise fatal — "the
+Agent list did not answer" must not read as "nobody owns this". Each method's doc comment carries
+its own argument, because the next person to touch one of them will otherwise make them consistent.
+
+The second is that **the fake client cannot honestly test this adapter.** controller-runtime
+v0.19.0's fake tracker does not model `PartialObjectMetadata` at all — the type these reads are
+built on, because a classifier has no business fetching object bodies. A fake agrees with whatever
+shape the caller assumed, so a green there would be a green about code that never ran (LSN-001's
+shape, one layer in). Hence a three-level split, each file stating in its header what it does **not**
+attempt: hand-rolled stubs for the decision logic (which kinds are countable, which failures are
+fatal, when a cache expires), envtest for "a real API server answers this way", and an L2 probe for
+"a real GKE cluster with a real discovery surface and real RBAC answers this way".
+
+The third is that **the adapter does not belong in package `classify`, and the L0 chain is what
+said so.** It was written as `classify.ClientLiveState` and the first full L0 run rejected it:
+V-GAT-017 holds a **closed import allowlist** over `internal/broker/classify` which deliberately
+contains no Kubernetes client of any kind, because the classifier is handed already-resolved facts
+precisely so that it cannot go and look anything up. Eight imports were refused at once. The
+smallest diff to green was to widen the allowlist, and that is the move PROTOCOL §10.1 exists to
+forbid — the check's own doc comment argues that the failure it prevents is not somebody importing
+an SDK on purpose but a plausible refactor widening the list one line at a time. So the adapter
+moved to `internal/broker/livestate` and became `livestate.Source`, which is the same
+interface-here / implementation-there seam `internal/broker/policy` already uses for `ChangePolicy`.
+Two properties depend on the split: the classifier stays hermetic, so the 165-envelope corpus can
+permute every input and get a byte-identical answer, and the allowlist stays a conversation rather
+than a diff. The package comment records the argument at the place someone would undo it.
+
+The fourth is **a new pattern: `k8s-operator/test/l2/`, Go probes behind a `//go:build l2` tag.**
+Without the tag the file does not exist to the toolchain, so `go test ./...`, `go vet ./...` and the
+L0 chain stay hermetic and no CI runner can reach a cluster by accident. The destructive-test guard
+is duplicated inside the probe rather than left to its wrapper, because a probe that creates and
+deletes namespaces and can only be aimed safely by a shell script is one `go test` away from being
+aimed at the live install. Its wrapper, `dev/verify/classify-live-state-l2.sh`, declares P10 and P6
+and argues **in writing that P1 does not apply**: nothing under test runs from a deployed image, so
+the working tree is the build under test by construction. That argument is now also the qualifier on
+`dev/L2-CHAIN.txt`'s blanket P1 statement, and it names its own expiry — when 3d wires the broker,
+the end-to-end successor in `broker-execute-l2.sh` needs P1 in full.
 
 **The split is driven by level as much as by size.** Of T7's fifteen listed check IDs only five are
 reachable without a cluster — V-RUN-011 (L0, L1), V-RUN-003 (L0), V-BRK-012 (L0), V-BRK-011 (L1) and
