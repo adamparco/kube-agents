@@ -64,8 +64,10 @@ will start selecting.
 | **LSN-033** | security, scope, corpus | A safety list is complete for the domain its author had in mind, and empty for the one where the damage is | closed | `TestNonRecreatableKindsAreGatedByTheClassifier` in `internal/broker/undo/` · `undo-corpus-lint.py` (L0-CHAIN) · corpus §M |
 | **LSN-034** | security, gating, api-design | A value compared against itself will never tell you it is the wrong shape | closed | `assertLeafOps` + `TestDiffEmitsOnlyLeafOps` / `TestDiffKeepsAnEmptyMapVisible` in `k8s-operator/internal/broker/execute/diff_test.go`, run on every PR by `k8s-operator-test.yml` · `subtreeOps` doc at the definition site |
 | **LSN-035** | checks, mutation, negative-controls | A mutation survives, and the rule it broke turns out to be one no input can reach | **open** | — the ladder's own properties are now held by `TestLadderPropertiesHoldOverEveryAcceptedHistory`; the **general** check is for the next `harness-improve` |
+| **LSN-036** | checks, renderers, allowlists, controller | A uniqueness check goes red on correct code, and the one-line green is an allowlist entry | closed | `pause-is-not-scale-to-zero.py` file-keyed `ALLOWED_REPLICAS_RHS` + `BROKER_REPLICAS_CONST` + stale-owner arm (L0-CHAIN) · `TestPauseDoesNotChangeTheRenderedBroker` in `pause_not_scale_to_zero_test.go` |
+| **LSN-037** | builds, dockerfiles, ci, toolchain | An image build fails on symbols that `go build ./...` resolves fine | closed | `dev/tests/go-build-targets-packages.py` + `--negative-control` (L0-CHAIN) · package-path builds in all 3 Dockerfiles + 2 Makefile recipes |
 
-**Open: 0 of 33.**
+**Open: 1 of 37** (LSN-035).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -1713,3 +1715,121 @@ derived from the rule table agreed with the table's defects for three phases. He
 control derived from the rule set is intercepted by the rule set. Both are the same geometry — **a
 check that shares a premise with the thing it checks cannot see a defect in the premise** — and
 [[lsn-033]] is the version where it arrives as silence rather than as error.
+
+---
+
+## LSN-036 — A single-site check is a headcount, and headcounts go stale when the population grows
+
+**Tags:** checks, renderers, allowlists, controller · **Phase:** 9 (P9-T7b) · **Status:** closed
+
+**What happened.** V-RUN-012's L0 check exists to stop `pause` being implemented as a scale-to-zero.
+Its strongest property was a headcount: `Replicas:` is assigned in **exactly one place**, and the
+right-hand side is `&replicas`, from a decider that is structurally incapable of seeing the brake.
+That was true and load-bearing for four phases, because `internal/controller` rendered exactly one
+workload.
+
+P9-T7b added the second half of the 08 §2.4 pair. The broker Deployment sets `Replicas:
+ptr.To(int32(1))` — a constant, correct, and completely unrelated to the brake — and the check went
+red on a correct render, with the message "a second replica decision".
+
+**Why the obvious fix is the wrong one.** The one-line green is to add the literal to
+`ALLOWED_REPLICAS_RHS`. It is also the moment the check stops meaning anything: a flat allowlist
+says "these spellings are fine anywhere", so `Replicas: &replicas` would be legal in the broker
+renderer and the broker's spelling legal in the agent's, and the *next* workload adds a third entry
+by the same reasoning. A headcount widened once is a headcount that will be widened again.
+
+**What the check was actually right about.** Working out whether the broker's site was dangerous is
+where the value was. It is — and more so than the agent's. "Paused" means the agent must not write;
+the broker is the only half of the pair that can; so *delete the broker* reads in a design review as
+closing the write path at its source, and it is a smaller diff than touching the agent. What it
+deletes is the explanation. 06 §4.4 requires a paused agent to keep saying why it is refusing, and
+the refusal comes from the broker. Implemented this way, a pause reports itself to every operator as
+a **broker outage**, and `wait-for-broker` drops the pods into observe-and-report — the same words
+the design uses for an unrelated and much worse situation.
+
+**The mechanization.** Three changes, all tightening:
+
+1. The allowlist is **keyed by file**. Each workload's replica count may only be decided in the file
+   that owns that workload. Strictly narrower than the flat set — before this, one spelling was
+   legal in all eight controller sources.
+2. The broker's operand must be a **`const`**. There is no decider to constrain here, so property
+   1's argument ("the function cannot consult `paused` because it is not given it") is made by other
+   means: a constant cannot be derived from an Agent.
+3. A **stale-entry arm**: an owner that declares an allowed spelling but assigns no `Replicas:` at
+   all is a failure, not a pass. Otherwise a keyed allowlist rots in the [[lsn-035]] direction —
+   guarding nothing while looking like it guards something.
+
+The negative control went from 5 mutations to 8, and the L1 property test gained
+`TestPauseDoesNotChangeTheRenderedBroker`, which also pins that `spec.deployment.scaleToZero` idles
+the reader **without** touching the broker.
+
+**The general shape, and the thing to look for.** A check of the form "there is exactly one X"
+encodes a fact about the *shape of the codebase today*, not about the property. It is the strongest
+kind of check while the count holds and the most brittle the moment the count changes — and the
+change that breaks it is usually a legitimate feature, arriving under deadline, whose author will
+reach for the allowlist. When a uniqueness check fires on correct code, the question is not "how do
+I let this through" but **"what makes the new site safe, and can the check assert that instead?"**
+Here the answer was `const`. Grep for the geometry: `dev/tests/` currently holds several
+single-definition-site checks ([[lsn-020]]'s API group, P9-T7a's label keys, this one). Each is one
+new legitimate call site away from the same conversation, and each should say what makes a site
+*eligible* rather than how many sites there may be.
+
+**Related.** [[lsn-035]] is the failure mode arm 3 defends against. This is also the second time a
+check written by an earlier unit of phase 9 caught the unit after it — P9-T6c's `undo_controller.go`
+was the first, but that one only needed classifying; this one needed the implementation changed.
+
+---
+
+## LSN-037 — The build that ships is not the build you tested
+
+**Tags:** builds, dockerfiles, ci, toolchain · **Phase:** 9 (P9-T7b) · **Status:** closed
+
+P9-T7b added `waitforbroker.go` next to `cmd/broker/main.go`. Locally, `go build ./...`,
+`go vet ./...` and `go test ./...` were clean. On the PR, six of seven checks were green and `build`
+was red, eleven minutes in:
+
+```
+cmd/broker/main.go:128:8: undefined: waitOptions
+cmd/broker/main.go:150:13: undefined: runWaitForBroker
+```
+
+`Dockerfile.broker` compiled `cmd/broker/main.go` — the file — instead of `./cmd/broker` — the
+package. Passing a file list to `go build` compiles exactly those files and treats the rest of the
+package as absent, so the new file's symbols were undefined in the only build that mattered.
+
+**Why it survived so long.** The file-list form is the kubebuilder scaffold's default, and it is
+*correct in every observable way* while a `main` package holds one file. It had been right for the
+operator and the router for eight phases. Nothing was wrong with it until the population of the
+directory changed, at which point it became wrong instantly and in a place nobody was looking. Both
+spellings produce a working binary from an identical tree; they differ only in a future that had not
+happened yet.
+
+**Why the local signal did not help.** Every local command names packages (`./...`). Only the
+container images named files. So the repository had two build systems that agreed on every input
+except the one that had just changed, and the disagreeing one ran last, slowest, and furthest from
+the edit — where a compile error reads as a broken base image or a bad cache rather than as one
+token in a `RUN` line. The cost is not the fix; it is the eleven minutes plus the wrong first
+hypothesis.
+
+**Mechanization.** `dev/tests/go-build-targets-packages.py`, on the L0 chain with its negative
+control. It sweeps every build input — Dockerfiles, Makefiles, shell scripts, workflow YAML — and
+fails any `go build` whose target is a `.go` file. Three deliberate properties:
+
+1. **Discovery, not enumeration.** Build inputs are globbed by filename pattern, so the next
+   Dockerfile is covered the day it lands. This is [[lsn-036]] applied on the way in rather than
+   learned again: the same unit that taught "do not write a check that lists what it knows about"
+   is the unit that would have written one here.
+2. **Non-vacuity.** Finding zero `go build` invocations is a FAIL, not a pass ([[lsn-035]]) — if the
+   builds move somewhere the glob does not look, the check must say so rather than go quiet.
+3. **Accepts the fix, and the prose.** Six non-mutations pin that `./cmd/broker`, `./...`, `.`, a
+   trailing slash, `-o weird.go`, and a *comment describing the rule* all pass. A check that also
+   rejects the correct spelling teaches people to route around it; a check that fires on the
+   sentence explaining it is [[lsn-023]].
+
+Fixed in all three kubebuilder Dockerfiles and both Makefile recipes, not only the broker: the other
+four were latent, one second file away from an identical eleven-minute red.
+
+**The general shape.** When a defect is invisible in every fast check and visible only in the slow
+one, the two are not testing the same artifact. Ask what the slow check does differently — here,
+"names files instead of packages" — and make the fast check assert that difference away. Related:
+[[lsn-036]] for the discovery-not-enumeration arm, [[lsn-035]] for non-vacuity.

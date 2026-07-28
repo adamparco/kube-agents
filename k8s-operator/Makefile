@@ -109,7 +109,7 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	go build -o bin/manager ./cmd
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -146,7 +146,7 @@ docker-push: ## Push docker image with the manager.
 
 .PHONY: build-router
 build-router: manifests generate fmt vet ## Build kage-router binary.
-	go build -o bin/router cmd/router/main.go
+	go build -o bin/router ./cmd/router
 
 .PHONY: docker-build-router
 docker-build-router: assert-amd64-host ## Build docker image with the kage-router.

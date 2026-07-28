@@ -591,9 +591,10 @@ type OperationsStatus struct {
 
 // BrokerStatus is the observed state of the agent's broker sidecar (06 §1.1).
 type BrokerStatus struct {
-	// Endpoint is the broker's mTLS address. Read by nothing in the write path — the broker is
-	// reached over localhost within the pod — and present so an operator can confirm which broker
-	// an agent is bound to without inspecting the pod spec.
+	// Endpoint is the broker's mTLS address: `https://<agent>-broker.<ns>.svc.cluster.local:8443`.
+	// Reported so an operator can confirm which broker an agent is bound to without inspecting the
+	// pod spec. It is a mirror, not an input — the agent reads the same value from an env var the
+	// controller renders into the pod (08 §2.3), so editing this field points nothing anywhere.
 	// +kubebuilder:validation:MaxLength=253
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`

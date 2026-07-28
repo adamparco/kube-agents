@@ -121,10 +121,40 @@ func main() {
 	flag.DurationVar(&o.shutdownGrace, "shutdown-grace", 20*time.Second,
 		"How long in-flight submissions have to finish after SIGTERM.")
 
+	// --wait-for-broker runs this binary as the agent pod's init container instead of as the
+	// broker (08 §2.4). See waitforbroker.go for why the probe needs this binary and why it
+	// always exits 0. The three TLS flags above are shared; in this mode they name the AGENT's
+	// half of the mesh keypair rather than the broker's.
+	var w waitOptions
+	var waitMode bool
+	flag.BoolVar(&waitMode, "wait-for-broker", false,
+		"Run as the agent pod's init container: poll the broker's /healthz over mTLS, record the verdict, exit 0.")
+	flag.StringVar(&w.endpoint, "broker-endpoint", "",
+		"Broker base URL to poll. Only used with --wait-for-broker.")
+	flag.StringVar(&w.san, "broker-san", "",
+		"DNS name the broker's certificate must carry. Only used with --wait-for-broker.")
+	flag.DurationVar(&w.timeout, "wait-timeout", 120*time.Second,
+		"How long to wait for the broker before starting in observe-and-report mode.")
+	flag.DurationVar(&w.interval, "wait-interval", 2*time.Second,
+		"Delay between /healthz polls.")
+	flag.StringVar(&w.statusFile, "status-file", "",
+		"Path to write the readiness verdict to. Only used with --wait-for-broker.")
+
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if waitMode {
+		w.certFile, w.keyFile, w.clientCAFile = o.certFile, o.keyFile, o.clientCAFile
+		if err := runWaitForBroker(ctrl.SetupSignalHandler(), w); err != nil {
+			// A configuration fault, not an unready broker — see runWaitForBroker. Exiting
+			// non-zero here is correct precisely because it is NOT the timeout path.
+			setupLog.Error(err, "wait-for-broker could not run")
+			os.Exit(1)
+		}
+		return
+	}
 
 	if err := run(ctrl.SetupSignalHandler(), o); err != nil {
 		setupLog.Error(err, "broker exited with error")

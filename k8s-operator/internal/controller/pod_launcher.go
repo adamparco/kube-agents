@@ -45,15 +45,12 @@ import (
 // scionLaunchEnvVar gates the Scion launch path. Unset/empty ⇒ native build (v1 default).
 const scionLaunchEnvVar = "KUBEAGENTS_SCION_LAUNCH"
 
-// LaunchSpec is the minimal, framework-neutral per-pod contract the controller hands to a
-// launcher. It mirrors the fields Scion's launch primitive verifies (`pkg/api/types.go`):
-// identity (ServiceAccountName, Workload-Identity-bound), placement (Namespace), optional
-// sandbox (RuntimeClassName), and the hardened pod-security posture. It intentionally omits the
-// full container/volume graph — that stays the native builder's job in v1; the Scion path would
-// translate this contract into a Scion launch request.
-type LaunchSpec struct {
+// PodIdentity is the per-pod half of the contract: identity (ServiceAccountName,
+// Workload-Identity-bound), optional sandbox (RuntimeClassName), and the hardened pod-security
+// posture. It mirrors the fields Scion's launch primitive verifies (`pkg/api/types.go`) and
+// intentionally omits the full container/volume graph — that stays the native builder's job in v1.
+type PodIdentity struct {
 	Name               string
-	Namespace          string
 	ServiceAccountName string
 	RuntimeClassName   string
 	// Hardened posture (Scion's verified defaults): non-root + seccomp RuntimeDefault +
@@ -61,33 +58,103 @@ type LaunchSpec struct {
 	// verify parity with the native build.
 	RunAsNonRoot       bool
 	SeccompRuntimeDflt bool
+	// ReadOnlyRootFS is true only for the actor half (08 §2.6). The agent's harness writes to its
+	// workspace; the broker has nothing to write and therefore may not.
+	ReadOnlyRootFS bool
 }
 
-// launchSpecFor extracts the per-pod contract from an Agent CR (the same values the native
-// builder derives), so both launchers start from one source of truth.
+// LaunchSpec is the framework-neutral contract the controller hands to a launcher. It carries BOTH
+// members of the pair, and that is 08 §2.4(a) rather than a convenience:
+//
+//	"A single LaunchSpec must express both members of the pair … so 'launch an agent' is not an
+//	expressible operation on its own."
+//
+// The requirement is about what a future maintainer can do by accident. Every dangerous state in
+// this design is a pair that came apart: an agent running with no broker is merely degraded, but a
+// broker running with no agent is an unattended write credential, and an agent whose broker belongs
+// to a different scope is a scope escape. If "launch the agent" and "launch the broker" were two
+// calls, some later refactor — an early return, a retry that resumes halfway, an error path that
+// skips one — would eventually make one of those calls without the other, and nothing in the type
+// system would notice. One spec, two halves, no single-half constructor: the seam that could come
+// apart does not exist.
+type LaunchSpec struct {
+	Namespace string
+	// Reader is the agent pod: model, chat surface, no write verb.
+	Reader PodIdentity
+	// Actor is the broker pod: write credential, no model.
+	Actor PodIdentity
+}
+
+// launchSpecFor extracts the pair contract from an Agent CR (the same values the native builder
+// derives), so both launchers start from one source of truth.
 func launchSpecFor(agent *agentv1alpha1.Agent) LaunchSpec {
 	spec := LaunchSpec{
-		Name:               agent.Name,
-		Namespace:          agent.Namespace,
-		RunAsNonRoot:       true,
-		SeccompRuntimeDflt: true,
-	}
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		spec.ServiceAccountName = agent.Spec.Security.ServiceAccountName
+		Namespace: agent.Namespace,
+		Reader: PodIdentity{
+			Name:               agent.Name + "-gateway",
+			ServiceAccountName: readerServiceAccountName(agent),
+			RunAsNonRoot:       true,
+			SeccompRuntimeDflt: true,
+		},
+		Actor: PodIdentity{
+			Name:               brokerName(agent),
+			ServiceAccountName: actorServiceAccountName(agent),
+			RunAsNonRoot:       true,
+			SeccompRuntimeDflt: true,
+			ReadOnlyRootFS:     true,
+		},
 	}
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.RuntimeClassName != nil {
-		spec.RuntimeClassName = *agent.Spec.Deployment.RuntimeClassName
+		// The sandbox class applies to the READER only. The broker runs no untrusted code — it
+		// holds a credential and applies policy — so putting it in gVisor would buy nothing and
+		// cost it the syscall latency on the path every write in the system takes.
+		spec.Reader.RuntimeClassName = *agent.Spec.Deployment.RuntimeClassName
 	}
 	return spec
 }
 
-// PodLauncher constructs the agent's Deployment. Two implementations exist: the native builder
+// WorkloadPair is what a launcher returns: both Deployments, in the order they must be applied.
+//
+// The fields are unexported and newWorkloadPair rejects a nil half, so there is no way to obtain a
+// WorkloadPair holding an agent alone — the compiler enforces what the LaunchSpec doc describes.
+type WorkloadPair struct {
+	broker *appsv1.Deployment
+	agent  *appsv1.Deployment
+}
+
+// newWorkloadPair is the only constructor. It panics on a nil half rather than returning an error
+// because both halves are rendered from the same CR by pure functions a few lines earlier: a nil
+// here is not a runtime condition a caller could handle, it is a programming error, and the golden
+// tests would catch it long before a cluster did.
+func newWorkloadPair(broker, agent *appsv1.Deployment) WorkloadPair {
+	if broker == nil || agent == nil {
+		panic("controller: WorkloadPair requires both halves (08 §2.4) — an unpaired workload is not a launchable unit")
+	}
+	return WorkloadPair{broker: broker, agent: agent}
+}
+
+// Ordered returns the pair broker-first (08 §2.4(b)). Callers apply in this order and stop on the
+// first error, which is what makes the "never proceed to the agent on a broker failure" rule of
+// §2.4(c) fall out of ordinary sequential code rather than out of a rule someone must remember.
+func (p WorkloadPair) Ordered() []*appsv1.Deployment { return []*appsv1.Deployment{p.broker, p.agent} }
+
+// Broker and Agent are read accessors for the callers that must address one half specifically —
+// the reconciler's status derivation, and the golden tests. Neither can produce a half-pair,
+// because neither returns something another function accepts as a launchable unit.
+func (p WorkloadPair) Broker() *appsv1.Deployment { return p.broker }
+func (p WorkloadPair) Agent() *appsv1.Deployment  { return p.agent }
+
+// PodLauncher constructs the workload pair. Two implementations exist: the native builder
 // (v1 default) and a Scion-backed launcher (spike, gated + probed).
+//
+// Note what the interface does NOT have: a BuildDeployment returning one Deployment. It used to,
+// and removing it is the point of this seam — a launcher cannot implement "just the agent" even if
+// its author wanted to.
 type PodLauncher interface {
 	// name identifies the launcher for logging/telemetry.
 	name() string
-	// BuildDeployment returns the fully-specified agent Deployment.
-	BuildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment
+	// BuildPair returns both fully-specified Deployments, broker first.
+	BuildPair(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) WorkloadPair
 }
 
 // nativePodLauncher wraps the existing, verified native builder. This is the fallback and the
@@ -96,8 +163,11 @@ type nativePodLauncher struct{}
 
 func (nativePodLauncher) name() string { return "native" }
 
-func (nativePodLauncher) BuildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
-	return buildDeployment(agent, configHash, fluentBitHash, settingsConfigHash)
+func (nativePodLauncher) BuildPair(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) WorkloadPair {
+	return newWorkloadPair(
+		buildBrokerDeployment(agent),
+		buildDeployment(agent, configHash, fluentBitHash, settingsConfigHash),
+	)
 }
 
 // scionPodLauncher is the spike target: it would translate LaunchSpec into a Scion launch
@@ -110,12 +180,13 @@ type scionPodLauncher struct {
 
 func (scionPodLauncher) name() string { return "scion" }
 
-func (s scionPodLauncher) BuildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
+func (s scionPodLauncher) BuildPair(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) WorkloadPair {
 	// Spike placeholder: derive the contract (proving the extraction path), then build via the
 	// native fallback. A real integration would submit launchSpecFor(agent) to Scion's launch
-	// primitive and reconcile the returned pod. We assert parity here instead.
+	// primitive as ONE request carrying both halves — Scion's own pod-per-identity model is what
+	// makes the pair expressible there — and reconcile the returned pods. We assert parity here.
 	_ = launchSpecFor(agent)
-	return s.fallback.BuildDeployment(agent, configHash, fluentBitHash, settingsConfigHash)
+	return s.fallback.BuildPair(agent, configHash, fluentBitHash, settingsConfigHash)
 }
 
 // hardenedPodSpec is a small helper used by the parity test to read the native build's posture.

@@ -31,10 +31,20 @@ Five properties:
      one parameter, of type `*agentv1alpha1.DeploymentSpec`. `OperationsSpec` is not reachable from
      `DeploymentSpec`, so the function is structurally incapable of consulting `paused`. Widening
      the signature to take the whole Agent is the change this catches.
-  2. NOTHING ELSE DECIDES REPLICAS. `Replicas:` is assigned in exactly one place, from that
-     function's result. A second assignment site is a second decision, and the second one is where
-     the brake gets wired in. This one property holds over EVERY controller source, exempt or not,
-     because it is the concrete damage rather than a proxy for it.
+  2. NOTHING ELSE DECIDES REPLICAS. Every `Replicas:` assignment in this package is one of two
+     pinned spellings, keyed by the file it appears in: the agent's, from the decider's result, in
+     `agent_manifests.go`; and the broker's, from a `const`, in `broker_manifests.go`. Any other
+     right-hand side, or either spelling in a file that is not its own, is a second decision -- and
+     the second one is where the brake gets wired in. This property holds over EVERY controller
+     source, exempt or not, because it is the concrete damage rather than a proxy for it.
+
+     The broker's entry was added in P9-T7b, when the package gained a second workload, and the
+     `const` requirement is the point of it. There is no decider to constrain here, so property 1's
+     argument -- "the function cannot consult `paused` because it is not given it" -- is made by a
+     different structural means: a constant cannot be derived from an Agent. Scaling the BROKER to
+     zero is if anything the more attractive wrong implementation of pause, since "paused" and
+     "cannot write" coincide; what it breaks is 06 §4.4's other half, because an agent whose broker
+     is gone cannot say why it is refusing, and reports a broker outage instead of a pause.
   3. NO BRAKE FIELD IS READ IN THE RENDERING PATH. `Paused`, `PauseReason`, `DryRunOnly` and
      `FrozenBy` do not appear in the three files that turn an Agent into a workload. The brake
      belongs in the broker's refusal path; a renderer that reads it is a renderer that can act on it.
@@ -71,6 +81,7 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 CONTROLLER = REPO / "k8s-operator" / "internal" / "controller"
 HELPERS = CONTROLLER / "manifest_helpers.go"
 MANIFESTS = CONTROLLER / "agent_manifests.go"
+BROKER = CONTROLLER / "broker_manifests.go"
 PROPERTY_TEST = CONTROLLER / "pause_not_scale_to_zero_test.go"
 
 # The function that decides the replica count, and the only parameter list it may have.
@@ -82,7 +93,19 @@ ALLOWED_PARAM_TYPE = "*agentv1alpha1.DeploymentSpec"
 
 # Every assignment of a Deployment's replica count in the rendering path.
 REPLICAS_ASSIGN = re.compile(r"^\s*Replicas:\s*(.+?),?\s*$", re.MULTILINE)
-ALLOWED_REPLICAS_RHS = {"&replicas"}
+
+# Keyed by file, and deliberately so. A flat allowlist would let the broker's spelling appear in the
+# agent renderer and vice versa; keying it means each workload's replica count may only be decided
+# in the one file that owns that workload. This is narrower than the flat set it replaced, not
+# wider -- before P9-T7b, `Replicas: &replicas` was legal in any of the eight controller sources.
+ALLOWED_REPLICAS_RHS = {
+    "agent_manifests.go": {"&replicas"},
+    "broker_manifests.go": {"ptr.To(brokerReplicas)"},
+}
+
+# ...and the broker's operand must be a const. `brokerReplicas` as a var, or as a function call,
+# reopens exactly the door property 1 closes for the agent.
+BROKER_REPLICAS_CONST = re.compile(r"^\s*brokerReplicas\s+int32\s*=\s*1\s*$", re.MULTILINE)
 
 # Brake fields. Reading any of them while rendering a workload is the mistake, whatever it is then
 # used for -- a renderer that can see the brake is one `if` away from acting on it.
@@ -98,6 +121,7 @@ OPERATIONS_ACCESS = re.compile(r"\.Spec\.Operations\b")
 
 REQUIRED_TESTS = (
     "TestPauseDoesNotChangeTheRenderedDeployment",
+    "TestPauseDoesNotChangeTheRenderedBroker",
     "TestScaleToZeroStillWorks",
 )
 
@@ -105,6 +129,9 @@ REQUIRED_TESTS = (
 RENDERING = {
     "manifest_helpers.go": "decides replicas, strategy, resources -- the exact surface V-RUN-012 is about",
     "agent_manifests.go": "renders the Deployment, Service and ConfigMap the agent runs as",
+    "broker_manifests.go": "renders the OTHER half of the 08 §2.4 pair -- a brake read here would "
+    "scale or reshape the broker, and an agent whose broker is gone reports an outage rather than "
+    "a pause",
     "pod_launcher.go": "creates agent pods directly; a brake read here rolls the pod just as surely",
 }
 
@@ -169,13 +196,34 @@ def check(sources: dict[str, str], test_src: str) -> list[str]:
 
     # 2. Nothing else decides replicas -- over EVERY controller source, exempt or not.
     for name, src in sources.items():
+        allowed = ALLOWED_REPLICAS_RHS.get(name, set())
         for rhs in REPLICAS_ASSIGN.findall(strip_comments(src)):
-            if rhs.strip() not in ALLOWED_REPLICAS_RHS:
+            if rhs.strip() not in allowed:
                 failures.append(
-                    f"{name}: `Replicas: {rhs.strip()}` is a second replica decision. There is one, "
-                    f"and it comes from {DECIDER}; a second site is where the brake gets wired into "
-                    "the workload (V-RUN-012)"
+                    f"{name}: `Replicas: {rhs.strip()}` is not a replica decision this file is "
+                    f"allowed to make. The agent's comes from {DECIDER} in agent_manifests.go and "
+                    "the broker's is a const in broker_manifests.go; any third site, or either of "
+                    "those two moved, is where the brake gets wired into a workload (V-RUN-012)"
                 )
+    for owner in sorted(ALLOWED_REPLICAS_RHS):
+        if owner not in sources:
+            continue
+        if not REPLICAS_ASSIGN.search(strip_comments(sources[owner])):
+            failures.append(
+                f"{owner}: declares an allowed `Replicas:` spelling but assigns none. Either the "
+                "workload lost its replica count -- which hands the field to whoever scales it "
+                "last -- or this entry is stale and is now widening nothing while looking like it "
+                "guards something (LSN-035)"
+            )
+    if "broker_manifests.go" in sources and not BROKER_REPLICAS_CONST.search(
+        strip_comments(sources["broker_manifests.go"])
+    ):
+        failures.append(
+            "broker_manifests.go: `brokerReplicas` is not declared as `brokerReplicas int32 = 1` in "
+            "a const block. As a var or a call it becomes derivable from the Agent, which is the "
+            "whole of what property 1 rules out for the agent's own replica count -- and a broker "
+            "scaled to zero is a pause the agent cannot explain (06 §4.4, 08 §2.4)"
+        )
 
     # 3. No brake field is read in the rendering path.
     for name in sorted(RENDERING):
@@ -273,6 +321,46 @@ def negative_control() -> int:
             ),
         ),
         (
+            "the broker's replica count stops being a const",
+            lambda s, t: (
+                {
+                    **s,
+                    BROKER.name: s[BROKER.name].replace(
+                        "brokerReplicas int32 = 1", "brokerReplicas = replicasFor(agent)", 1
+                    ),
+                },
+                t,
+            ),
+        ),
+        (
+            "pause is implemented by scaling the broker to zero",
+            lambda s, t: (
+                {
+                    **s,
+                    BROKER.name: s[BROKER.name].replace(
+                        "Replicas: ptr.To(brokerReplicas),",
+                        "Replicas: ptr.To(pausedBrokerReplicas(agent)),",
+                        1,
+                    ),
+                },
+                t,
+            ),
+        ),
+        (
+            "the broker renderer reads the brake",
+            lambda s, t: (
+                {
+                    **s,
+                    BROKER.name: s[BROKER.name].replace(
+                        "labels := agentlabels.For(agent, agentlabels.RoleActor)",
+                        "_ = agent.Spec.Operations.Paused\n\tlabels := agentlabels.For(agent, agentlabels.RoleActor)",
+                        1,
+                    ),
+                },
+                t,
+            ),
+        ),
+        (
             "the L1 property test is deleted",
             lambda s, t: (s, t.replace(f"func {REQUIRED_TESTS[0]}(", "func disabled(", 1)),
         ),
@@ -331,8 +419,9 @@ def main() -> int:
 
     print(
         f"PASS: V-RUN-012 (L0) -- {len(RENDERING)} rendering sources carry no brake field, "
-        f"{DECIDER} is not given one, {len(sources)} controller sources hold a single replica "
-        "decision, and the L1 property test and its negative control are present"
+        f"{DECIDER} is not given one, the {len(ALLOWED_REPLICAS_RHS)} replica decisions across "
+        f"{len(sources)} controller sources are each in the file that owns their workload and the "
+        "broker's is a const, and the L1 property test and its negative control are present"
     )
     return 0
 

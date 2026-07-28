@@ -118,8 +118,9 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
-	// 7. Reconcile Deployment (with pod template hash annotation)
-	if err := r.reconcileDeployment(ctx, instance, configMapHash, fluentBitHash, settingsHash); err != nil {
+	// 7. Reconcile the workload PAIR — broker Service, then broker Deployment, then the agent
+	// (08 §2.4). Not "the Deployment": one Agent CR is two workloads, and the order matters.
+	if err := r.reconcileWorkloadPair(ctx, instance, configMapHash, fluentBitHash, settingsHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -229,15 +230,43 @@ func (r *AgentReconciler) reconcileSettingsConfigMap(ctx context.Context, agent 
 	return hash, nil
 }
 
-func (r *AgentReconciler) reconcileDeployment(ctx context.Context, agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsHash string) error {
-	// Pod construction goes through the launcher seam (08 §2 Scion spike): native build by
-	// default, Scion launch primitive when gated on and available, always with native fallback.
-	launcher := selectPodLauncher(logf.FromContext(ctx))
-	dep := launcher.BuildDeployment(agent, configHash, fluentBitHash, settingsHash)
-	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
+// reconcileWorkloadPair applies the broker and the agent, in that order (08 §2.4).
+//
+// One Reconcile renders both. The broker's Service is applied before either Deployment so that its
+// ClusterIP and DNS name exist by the time the agent's `wait-for-broker` init container resolves
+// them — a Service created after the pod that dials it turns a warm start into a two-minute wait
+// on the init container's timeout, for no reason.
+//
+// Then the Deployments in pair order. Applying broker-first and returning on the first error is
+// what implements §2.4(c): "if the broker launch fails … the launcher must not proceed to the
+// agent". There is no explicit rollback of a partially-created broker here and none is needed —
+// every object carries an OwnerReference to the CR, so the failure modes that would need unwinding
+// (CR deleted mid-reconcile, agent apply rejected) are collected by the garbage collector against
+// the owner rather than by an error path that has to be correct.
+func (r *AgentReconciler) reconcileWorkloadPair(ctx context.Context, agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsHash string) error {
+	brokerSvc := buildBrokerService(agent)
+	if err := ctrl.SetControllerReference(agent, brokerSvc, r.Scheme); err != nil {
 		return err
 	}
-	return r.Patch(ctx, dep, client.Apply, client.ForceOwnership, client.FieldOwner("agent-controller"))
+	if err := r.Patch(ctx, brokerSvc, client.Apply, client.ForceOwnership, client.FieldOwner("agent-controller")); err != nil {
+		return fmt.Errorf("failed to apply broker Service: %w", err)
+	}
+
+	// Pod construction goes through the launcher seam (08 §2 Scion spike): native build by
+	// default, Scion launch primitive when gated on and available, always with native fallback.
+	// BuildPair returns both halves or neither — see WorkloadPair.
+	launcher := selectPodLauncher(logf.FromContext(ctx))
+	pair := launcher.BuildPair(agent, configHash, fluentBitHash, settingsHash)
+
+	for _, dep := range pair.Ordered() {
+		if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.Patch(ctx, dep, client.Apply, client.ForceOwnership, client.FieldOwner("agent-controller")); err != nil {
+			return fmt.Errorf("failed to apply Deployment %q: %w", dep.Name, err)
+		}
+	}
+	return nil
 }
 
 func (r *AgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.Agent) error {
@@ -286,6 +315,16 @@ func (r *AgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1a
 		newAddress = fmt.Sprintf("%s.%s.svc.cluster.local", svc.Name, svc.Namespace)
 	}
 
+	// Fetch the broker half of the pair (08 §2.4). Its readiness is reported separately from the
+	// agent's, because "the agent is up" and "the agent can write" are different facts and an
+	// operator who cannot tell them apart will read a degraded agent as a broken one.
+	brokerDep := &appsv1.Deployment{}
+	errBroker := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: brokerName(agent)}, brokerDep)
+	if errBroker != nil && !errors.IsNotFound(errBroker) {
+		return fmt.Errorf("failed to get broker Deployment for status update: %w", errBroker)
+	}
+	brokerReady := errBroker == nil && brokerDep.Status.ReadyReplicas > 0
+
 	// Determine Phase and Condition
 	newPhase := "Provisioning"
 	condStatus := metav1.ConditionFalse
@@ -304,7 +343,43 @@ func (r *AgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1a
 		}
 	}
 
+	// `Ready` is the CONJUNCTION of the two halves (08 §2.4), and the phase follows it. An agent
+	// whose broker is down is running and answering questions, so it is not "Degraded" in the
+	// sense the phase already means — but it cannot execute anything, so reporting it Ready would
+	// be a lie to every dashboard and every `kubectl wait` in the provisioning path.
+	agentReady := condStatus
+	agentReason, agentMsg := condReason, condMsg
+	brokerCondStatus := metav1.ConditionFalse
+	brokerReason := "BrokerProvisioning"
+	brokerMsg := "Waiting for the broker Deployment to become ready"
+	switch {
+	case brokerReady:
+		brokerCondStatus = metav1.ConditionTrue
+		brokerReason = "BrokerReconciled"
+		brokerMsg = "Broker is accepting envelopes"
+	case errors.IsNotFound(errBroker):
+		brokerReason = "BrokerNotFound"
+		brokerMsg = fmt.Sprintf("Broker Deployment %s-broker does not exist; the agent cannot execute anything", agent.Name)
+	}
+	if condStatus == metav1.ConditionTrue && !brokerReady {
+		newPhase = "Provisioning"
+		condStatus = metav1.ConditionFalse
+		condReason = "BrokerNotReady"
+		condMsg = "Agent is running in observe-and-report mode: " + brokerMsg
+	}
+
+	newBroker := &agentv1alpha1.BrokerStatus{
+		Endpoint:            brokerEndpoint(agent),
+		ActorServiceAccount: actorServiceAccountName(agent),
+		Ready:               brokerReady,
+		// JournalReachable stays at its fail-closed zero until the broker itself reports it
+		// (06 §4.4). The controller cannot observe it — it would have to ask the broker, and the
+		// broker answering "yes" to the controller proves nothing about the broker's own writes.
+	}
+
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
+	existingAgentCond := meta.FindStatusCondition(agent.Status.Conditions, "AgentReady")
+	existingBrokerCond := meta.FindStatusCondition(agent.Status.Conditions, "BrokerReady")
 	// Check if anything actually changed
 	if agent.Status.Phase == newPhase &&
 		agent.Status.DeploymentStatus.Name == newDeploymentStatusName &&
@@ -312,6 +387,9 @@ func (r *AgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1a
 		agent.Status.StorageStatus.Bound == newStorageStatusBound &&
 		agent.Status.ServiceStatus.Endpoint == newServiceStatusEndpoint &&
 		agent.Status.Address == newAddress &&
+		brokerStatusEqual(agent.Status.Broker, newBroker) &&
+		existingAgentCond != nil && existingAgentCond.Status == agentReady && existingAgentCond.Reason == agentReason &&
+		existingBrokerCond != nil && existingBrokerCond.Status == brokerCondStatus && existingBrokerCond.Reason == brokerReason &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
 		return nil
 	}
@@ -323,20 +401,51 @@ func (r *AgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1a
 	agent.Status.StorageStatus.Bound = newStorageStatusBound
 	agent.Status.ServiceStatus.Endpoint = newServiceStatusEndpoint
 	agent.Status.Address = newAddress
+	agent.Status.Broker = newBroker
 
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
 
-	condition := metav1.Condition{
-		Type:               "Ready",
-		Status:             condStatus,
-		Reason:             condReason,
-		Message:            condMsg,
-		LastTransitionTime: now,
+	// Three conditions, in the order an operator reads them: the two halves, then the conjunction.
+	// `Ready` last so that a `kubectl describe` shows the summary beneath the two facts it
+	// summarizes rather than above them.
+	for _, condition := range []metav1.Condition{
+		{
+			Type:               "AgentReady",
+			Status:             agentReady,
+			Reason:             agentReason,
+			Message:            agentMsg,
+			LastTransitionTime: now,
+		},
+		{
+			Type:               "BrokerReady",
+			Status:             brokerCondStatus,
+			Reason:             brokerReason,
+			Message:            brokerMsg,
+			LastTransitionTime: now,
+		},
+		{
+			Type:               "Ready",
+			Status:             condStatus,
+			Reason:             condReason,
+			Message:            condMsg,
+			LastTransitionTime: now,
+		},
+	} {
+		meta.SetStatusCondition(&agent.Status.Conditions, condition)
 	}
-	meta.SetStatusCondition(&agent.Status.Conditions, condition)
 
 	return r.Status().Update(ctx, agent)
+}
+
+// brokerStatusEqual compares two broker status blocks for the no-op short-circuit above. A nil
+// `have` is never equal to a non-nil `want`, which is what makes the first reconcile after an
+// upgrade write the block rather than skip it as unchanged.
+func brokerStatusEqual(have, want *agentv1alpha1.BrokerStatus) bool {
+	if have == nil || want == nil {
+		return have == want
+	}
+	return *have == *want
 }
 
 func (r *AgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.Agent, dep *appsv1.Deployment) (phase string, reason string, message string) {

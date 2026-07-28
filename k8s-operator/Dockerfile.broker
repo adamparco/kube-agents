@@ -18,10 +18,17 @@ RUN if [ -z "$PREBUILT_BINARY" ]; then go mod download; fi
 COPY . .
 
 # Use pre-built binary if available, otherwise build from source.
+#
+# `./cmd/broker`, the PACKAGE, not `cmd/broker/main.go`, the file. Passing a file list to `go build`
+# compiles exactly those files, so every other file in the same `main` package is silently dropped
+# and the build fails on the symbols they defined. This image broke exactly that way when
+# `waitforbroker.go` landed beside `main.go` (P9-T7b): `go build ./...` was green on the branch and
+# the image build was the only thing red, because it was the only build that wasn't compiling the
+# whole package.
 RUN if [ -n "$PREBUILT_BINARY" ] && [ -f "${TARGETPLATFORM}/${PREBUILT_BINARY}" ]; then \
       cp "${TARGETPLATFORM}/${PREBUILT_BINARY}" broker; \
     else \
-      CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -a -o broker cmd/broker/main.go; \
+      CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -a -o broker ./cmd/broker; \
     fi
 
 # Runtime stage.
