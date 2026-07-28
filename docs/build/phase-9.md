@@ -371,7 +371,8 @@ thing that runs. Split before writing code rather than after, per SELECT §2.
   `UndoRequest`), their admission webhooks, and `pause` proven inert in the renderer. **Claims
   exactly one check: V-RUN-012 at L0.**
 - **P9-T6b** — `internal/broker/brake.go`: the nine fail-closed rules of 06 §4.4 as one decision
-  function, plus the contested index.
+  function, plus the contested index. **Claims exactly one check: V-CTR-015 at L1**, allocated in
+  09 §6.9 by this unit — see below.
 - **P9-T6c** — `internal/controller/undo_controller.go` (`C-UC`), the advisory
   `kube-agents/contested: <action-id>` annotation, and its envtest.
 
@@ -382,6 +383,28 @@ running fleet — an agent that stops writing, a freeze that covers a scope, an 
 real object — and none is reachable from a Go test, however good. Only **V-RUN-012** lists an L0
 instance, and that is what T6a claims. The seven go to `verify-phase9.sh` and `broker-execute-l2.sh`
 in **P9-T9**, alongside the ten already routed there.
+
+**T6b allocates V-CTR-015 rather than claiming nothing.** The consequence of the paragraph above is
+that T6b — the unit that writes the most safety-critical function in the broker — has no check it
+can reach, and would otherwise ship the nine fail-closed rules with their only coverage a shell
+script in a later unit that has never been run. The rules are a pure decision function of already-read
+inputs, so they are fully exercisable at L1 with no cluster; what was missing was a check ID saying
+so. `V-CTR-015` (L1, 06 §4.4, BLOCKING-PHASE) is added to 09 §6.9 and mapped alongside V-CTR-007 on
+`03§11#20`, `06§10#45` and `06§10#47`. It does not replace V-CTR-007, which stays L2 and stays T9's:
+one asserts the decision function, the other asserts the objects behave that way on a real fleet.
+Adding coverage for a property nothing asserted is a tightening, which is the direction PROTOCOL §10
+permits; the precedent is P8's `V-CTR-014`.
+
+**The one interpretation in T6b, flagged for a human.** 06 §4.4's pause row says the broker "refuses
+new envelopes" and carves out no exception, but **V-REV-007** — "undo works with the originating
+agent paused or deleted", BLOCKING-ALWAYS — requires one, because the same section makes an undo a
+first-class classified, journaled action, i.e. an envelope through this broker. Resolved by reading
+pause the way the same section already reads freeze (`allowUndo` defaults true): **undo is exempt by
+origin, not by class.** An undo cannot widen what an agent may newly do, so the exemption preserves
+every property pause protects; because an invariant-preserving resolution exists, PROTOCOL §8.5 makes
+this a decision and not a halt. The boundary is narrow and tested both ways: undo is exempt from rows
+1, 2, 8, pause, and freeze-with-`allowUndo`, and from nothing else — journal, snapshot, undo plan,
+roster, budget and post-execution verification all apply to an undo exactly as to any other write.
 
 **V-RUN-012 ships as two halves, and the negative control is not hypothetical.**
 `resolveDeploymentReplicasAndStrategy` already renders `replicas: 0` for `spec.deployment.scaleToZero`,

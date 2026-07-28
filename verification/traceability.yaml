@@ -309,6 +309,7 @@
   checks:
     - V-RUN-008
     - V-CTR-007
+    - V-CTR-015
     - V-ISO-009
 
 "03§11#21":
@@ -825,6 +826,7 @@
   bullet: "`pause` stops the agent mid-queue; the in-flight action lands or rolls back, never half-applied."
   checks:
     - V-CTR-007
+    - V-CTR-015
     - V-ISO-008
 
 "06§10#46":
@@ -837,6 +839,7 @@
   bullet: "A `FleetFreeze` blocks the scope; `allowUndo: true` still permits undo; **making the freeze object unreadable freezes the scope** rather than opening it."
   checks:
     - V-CTR-007
+    - V-CTR-015
     - V-ISO-009
 
 "06§10#48":

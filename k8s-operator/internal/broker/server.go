@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -361,6 +362,10 @@ type Response struct {
 	// Nonce and ExpiresInSeconds are the GET /v1alpha1/nonce reply.
 	Nonce            string `json:"nonce,omitempty"`
 	ExpiresInSeconds int    `json:"expiresInSeconds,omitempty"`
+	// RetryAfterSeconds mirrors the Retry-After header into the body, because 06 §4.4 specifies it
+	// as a body field on the pause refusal and an agent runtime that parses JSON should not also
+	// have to reach for headers to find out whether its refusal was temporary.
+	RetryAfterSeconds int `json:"retryAfterSeconds,omitempty"`
 }
 
 // refuse renders a refusal and performs its journaling and alarming side effects.
@@ -409,7 +414,18 @@ func (s *Server) write(w http.ResponseWriter, err error) {
 		writeStatus(w, http.StatusInternalServerError, Response{Reason: "internal-error"})
 		return
 	}
-	writeStatus(w, ref.Status, Response{Reason: ref.Reason, Message: ref.Detail, Decision: "rejected"})
+	if ref.RetryAfterSeconds > 0 {
+		// The header as well as the body: HTTP clients, proxies and retry middleware already
+		// understand Retry-After, and a refusal that only says "wait" in a field nobody reads is a
+		// refusal that gets retried immediately.
+		w.Header().Set("Retry-After", strconv.Itoa(ref.RetryAfterSeconds))
+	}
+	writeStatus(w, ref.Status, Response{
+		Reason:            ref.Reason,
+		Message:           ref.Detail,
+		Decision:          "rejected",
+		RetryAfterSeconds: ref.RetryAfterSeconds,
+	})
 }
 
 func writeStatus(w http.ResponseWriter, status int, body Response) {
