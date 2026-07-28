@@ -185,6 +185,13 @@ func mergeEnvVars(defaults []corev1.EnvVar, custom []corev1.EnvVar) []corev1.Env
 }
 
 // mergeAnnotations merges custom annotations into defaults. Custom annotations override defaults with the same key.
+// mergeLabels is mergeAnnotations under the name that reads correctly at a label call site. It is a
+// delegation rather than a copy so the two cannot drift: precedence is the same (custom wins on a
+// key collision), and so is the empty-in-empty-out behaviour.
+func mergeLabels(defaults map[string]string, custom map[string]string) map[string]string {
+	return mergeAnnotations(defaults, custom)
+}
+
 func mergeAnnotations(defaults map[string]string, custom map[string]string) map[string]string {
 	if len(defaults) == 0 && len(custom) == 0 {
 		return nil

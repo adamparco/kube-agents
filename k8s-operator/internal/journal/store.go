@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/agentlabels"
 )
 
 // The journal store (`C-JS`) is the ActionRecord custom resource itself, not a service in front of
@@ -41,10 +42,25 @@ import (
 // Label keys on an ActionRecord (06 §4.3). They exist so the common questions -- what did this agent
 // do, what is still pending, what did this chain touch -- are label selectors and not full scans.
 const (
-	// TierLabel is the agent tier: platform, cluster-admin, developer-team.
-	TierLabel = "kube-agents/tier"
-	// ScopeLabel is the agent's scope leaf, e.g. the namespace for a developer-team agent.
-	ScopeLabel = "kube-agents/scope"
+	// TierLabel is the agent tier: platform, cluster-admin, developer-team. Same KEY as the one
+	// internal/agentlabels stamps on workloads, and taken from there rather than respelled, because
+	// a record whose tier label differs from its agent's pods by one character joins to nothing.
+	TierLabel = agentlabels.Tier
+
+	// ScopeLabel is the agent's scope LEAF, e.g. the namespace for a developer-team agent. The key
+	// is shared with agentlabels.Scope; the VALUE is not the same rendering.
+	//
+	// 08 §2.5 defines this key on a workload as the DNS-safe rendering of the whole scope key
+	// (`<project>.<cluster>.<ns>`, hash-suffixed when long). 06 §4.3's ActionRecord examples and the
+	// 06 §5.1 ServiceAccount table use the same key for the leaf alone. Those are different objects
+	// so they do not contradict, but the leaf is NOT injective across a fleet -- two clusters each
+	// holding a `team-x` namespace produce the same value -- so this label is safe as an index and
+	// must never be treated as an identity. Whether the two meanings should be reconciled is a spec
+	// question with a real blast radius (03 §4.2 compares a pod's value against its SA's) and no
+	// check pointed at it; it is recorded as an open item rather than decided here. Nothing in this
+	// package may render a scope value through agentlabels.RenderScope until that is settled --
+	// changing the value silently would break every existing selector.
+	ScopeLabel = agentlabels.Scope
 	// RiskClassLabel mirrors spec.classification.class.
 	RiskClassLabel = "kube-agents/risk-class"
 	// StatusLabel mirrors status.phase. It is a LABEL as well as a status field so the ChatOps
