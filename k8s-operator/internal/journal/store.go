@@ -64,6 +64,17 @@ const (
 	// record. It is the join key for V-BRK-003, and admission rejects a write from an actor
 	// identity that lacks it (05 §1.1).
 	ActionIDLabel = "kube-agents/action-id"
+
+	// ContestedAnnotation is stamped on a TARGET object, not on the record, and it is ADVISORY
+	// (06 §4.4). Its value is the originating action id.
+	//
+	// An annotation and not a label because nothing selects on it: the authoritative refusal comes
+	// from the broker's in-memory index and from ActionRecord.status.contested, for the reason
+	// 06 §4.4 gives outright -- a deleted object cannot hold an annotation, and the commonest
+	// contested case is a human undoing a create. This exists so a person running `kubectl get -o
+	// yaml` on a live object learns why the agent stopped touching it, and it must never be the
+	// thing that decides.
+	ContestedAnnotation = "kube-agents/contested"
 )
 
 // Store is the journal's write and read surface. Everything the broker, the undo controller and the

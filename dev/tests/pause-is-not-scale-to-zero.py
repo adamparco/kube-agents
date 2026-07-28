@@ -115,6 +115,9 @@ EXEMPT = {
     "brake to REPORT it is the field's purpose",
     "journal_reconciler.go": "reconciles the append-only journal; brake state is journalled context",
     "retention_controller.go": "prunes journal records; unrelated to the brake but must stay classified",
+    "undo_controller.go": "reverses an executed action (05 §1.3) -- it reads the brake's own objects "
+    "(UndoRequest, ActionRecord) and writes only their status plus an advisory annotation on the "
+    "target; it renders no workload, so property 3 has nothing to bite on here",
 }
 
 

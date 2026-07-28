@@ -406,6 +406,41 @@ this a decision and not a halt. The boundary is narrow and tested both ways: und
 1, 2, 8, pause, and freeze-with-`allowUndo`, and from nothing else — journal, snapshot, undo plan,
 roster, budget and post-execution verification all apply to an undo exactly as to any other write.
 
+**T6c allocates V-CTR-016, for the third time and the same reason.** T6c writes `C-UC`, the
+controller that actually reverses a change, and every check 09 §6 routes at it is L2: V-REV-007 (L2,
+phase 10) and V-REV-001/005/009 all assert an undo against a real fleet. Shipping the preconditions
+of an undo with no check that has ever run is the failure mode T6a and T6b already argued; `V-CTR-016`
+(L1, 05 §1.3, BLOCKING-PHASE) is added to 09 §6.9 and mapped onto `06§10#41` and `06§10#42`. It
+displaces nothing — V-REV-007 stays L2 and stays T9's. Precedents: V-CTR-014 (P8), V-CTR-015 (T6b).
+What it asserts is the property a per-branch test would miss: **the preconditions are one shared
+predicate and each refuses in isolation against a baseline that is accepted**, plus the two things
+that make the linkage trustworthy — that the window is closed AT its boundary, and that a failed
+reverse write cannot leave 06 §4.3's bidirectional link one-way.
+
+**Three decisions in T6c, none of them a halt.**
+
+- **The replay route is P9-T7's, not T6c's.** 05 §1.3 step 4 calls
+  `POST /v1alpha1/actions/{actionId}/replay`, which does not exist, while V-BRK-021 requires one
+  listening port and one mutating route. T6c ships the `Replayer` interface plus `UnavailableReplayer`,
+  the same shape `broker.Pipeline`/`UnavailablePipeline` already uses, because the route needs a
+  Pipeline to call and T7 is where the pipeline gets constructed. Nothing in T6c claims the route
+  exists, and `UnavailableReplayer` makes "not installed" a loud terminal state rather than a silent
+  success — `TestUndoWithNoReplayerInstalledDoesNotClaimSuccess` pins it.
+- **`undoLinkPending` is a Condition on the `UndoRequest`, not a field on the `ActionRecord`.** 05
+  §1.3 names the flag but no API type carries it. It cannot live on the original: the case it exists
+  for is precisely a failed write to the original. It is set in the SAME status write that records
+  `undoExecuted`, and cleared only once the reverse link lands, so a crash between the two writes
+  leaves a durable flag the next reconcile picks up rather than an undo that happened and a record
+  that never heard about it.
+- **The advisory `contested` annotation is best-effort, and Forbidden is swallowed.** 06 §4.4 says
+  the broker "also stamps" it and 05 §1.3 step 5 has `C-UC` mark every target. `C-UC` attempts a raw
+  merge patch per target and ignores `Forbidden` and `NotFound`, because the alternative — granting
+  the undo controller patch on arbitrary GVKs in every namespace — gives it a write reach larger than
+  any agent's, which is the exact shape 03 §3.3 rule 3 exists to prevent. The authoritative refusal
+  was never the annotation: it is `status.contested` plus the broker's in-memory index, and 06 §4.4
+  says so outright, since the commonest contested case is a human undoing a create and a deleted
+  object cannot hold an annotation. Tested both directions.
+
 **V-RUN-012 ships as two halves, and the negative control is not hypothetical.**
 `resolveDeploymentReplicasAndStrategy` already renders `replicas: 0` for `spec.deployment.scaleToZero`,
 an unrelated idling feature. So "make pause set replicas to 0" is one `||` three lines from code that
