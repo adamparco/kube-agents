@@ -642,6 +642,63 @@ type safety over a value nothing in this process reads. They are rendered as `un
 - **P9-T7c** — the pipeline behind the pair: **V-BRK-011** and **V-BRK-014** at L1, the
   `ChangePolicy` informer T3b deferred here (V-GAT-009's L2 instance stays open), and the
   `POST /v1alpha1/actions/{actionId}/replay` route plus the HTTP `Replayer` T6c deferred here.
+  **Split into four**, see "Why T7c split into four" below.
+  - **P9-T7c-1** — `internal/broker/steps.go` and `internal/broker/pipeline/`: the observable step
+    trace and the assembly of steps 3–11. **Claims V-BRK-011 and V-BRK-014 at L1. Done
+    2026-07-28.**
+  - **P9-T7c-2** — the two deferrals: the `ChangePolicy` informer (from T3b) and the
+    `POST /v1alpha1/actions/{actionId}/replay` route plus the HTTP `Replayer` (from T6c).
+    V-GAT-009's L2 instance stays open.
+  - **P9-T7c-3** — **the runtime wiring.** Real client-backed adapters for the twelve seams
+    `pipeline.Config` takes — `LiveState`, `Applier`, `Reader`, `BodyStore`, `Prober`,
+    `Rollbacker`, `Pager`, `Pauser`, the cooldown registry, `ActionHistory`, `ReferenceIndex`,
+    `BrakeSource` — and a `pipeline.New` call in `cmd/broker/main.go` where
+    `broker.UnavailablePipeline{}` is today. Until it lands, **LSN-007 applies to the whole
+    pipeline**: it is built, tested, and unreachable from the binary.
+  - **P9-T7c-4** — **the classify→execute integrity seam for `apply`, `scale` and merge-patch.**
+    See LSN-040. Today only `create`, `delete` and JSON-patch `patch` traverse the pipeline; the
+    other three fail closed at step 9.
+
+**Why T7c split into four.** T7c-1 was scoped as "assemble the pipeline and claim the two L1
+checks", and the assembly turned out to be the small part. Three things came out of doing it.
+
+The first is that **the two deferrals are not part of the assembly.** The `ChangePolicy` informer
+and the replay route were parked on T7c because T7c was the next broker unit, not because they
+share a seam with the pipeline — the informer feeds the classifier a policy set and the replay
+route is a second HTTP handler. Neither is touched by wiring steps 3–11 together, and carrying them
+would have made the unit oversized in exactly the way `harness-run` §2 warns about.
+
+The second is that **the assembly and the wiring are different units with different verification.**
+`pipeline.Config` has twelve dependencies that are interfaces precisely so the pipeline can be
+driven at L1 with fakes; writing their real client-backed implementations is a dozen adapters whose
+own property is "does this talk to a real API server correctly", which is L2. Mixing them would
+have meant a unit where the L1 checks pass and the L2 half cannot run, i.e. a unit that cannot
+checkpoint. T7c-1 therefore ends with the pipeline reachable from a test and not from `main`, which
+is an honest partial state and is recorded as such in the `cmd/broker/main.go` comment.
+
+The third is LSN-040, below — a gap the assembly found, which is a fix rather than part of the
+assembly.
+
+**What T7c-1 actually asserts.** `broker.StepTrace` is not a log. Its `Run` refuses to record a step
+that is not the immediate successor of the last one recorded, and seals the trace on the first
+refusal or fault, so "step 7 ran before step 4" and "a step ran after the pipeline stopped" are
+errors the pipeline returns at the moment they are attempted rather than conditions a check hunts
+for afterwards. That inversion is what makes V-BRK-014 an L1 property: fault-inject at step k and
+the trace ends at k because there is no path to k+1 that does not go through a `Run` call the
+failure never reaches.
+
+The fault table covers steps 3–10 with one injected dependency failure each, step 11 has its own
+test, and steps 1–2 belong to the handler and are covered in the `broker` package.
+`TestEveryPipelineStepHasAFaultCase` closes the loop by iterating `broker.FirstStep..LastStep` and requiring
+every step to appear — so a twelfth step added to the pipeline fails that test the day it exists
+instead of quietly falling outside a hardcoded range (LSN-036). Each fault case also asserts the
+world stopped, not just the trace: zero applier calls for any fault before step 9, and no record in
+a phase that claims the action completed.
+
+**One bug fixed in the pipeline itself.** `Submit` reported `Phase: string(s.verify.Phase)` to the
+caller while step 11 journaled `terminal(s)`. Those agree on every path except a dry run, where the
+verifier never runs: the record said `DryRun` and the HTTP response said nothing at all. Both now
+derive from `terminal(s)`.
 
 **The split is driven by level as much as by size.** Of T7's fifteen listed check IDs only five are
 reachable without a cluster — V-RUN-011 (L0, L1), V-RUN-003 (L0), V-BRK-012 (L0), V-BRK-011 (L1) and

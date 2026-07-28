@@ -200,9 +200,15 @@ func run(ctx context.Context, o options) error {
 			Security:    security,
 		},
 		Guard: broker.NewReplayGuard(time.Now),
-		// P9-T2 ships the front of the pipeline. Every envelope that survives auth, the schema, the
-		// key recomputation and the three anti-replay mechanisms gets a 503 that names this build --
-		// not a 202 for an action nobody performed. See the Pipeline doc comment.
+		// Steps 3-11 exist and are tested end to end -- see internal/broker/pipeline -- but they are
+		// not constructed here yet, because pipeline.Config takes twelve client-backed seams
+		// (LiveState, Applier, Reader, BodyStore, Prober, Rollbacker, Pager, Pauser, cooldown
+		// registry, ActionHistory, ReferenceIndex, BrakeSource) and none of their real adapters is
+		// written. P9-T7c-3 writes them and replaces this line with a pipeline.New call.
+		//
+		// Until then every envelope that survives auth, the schema, the key recomputation and the
+		// three anti-replay mechanisms gets a 503 that names this build -- not a 202 for an action
+		// nobody performed. See the Pipeline doc comment.
 		Pipeline: broker.UnavailablePipeline{},
 		Journal: &broker.StoreRejectionJournal{
 			Store:               journal.NewStore(k8s, nil),

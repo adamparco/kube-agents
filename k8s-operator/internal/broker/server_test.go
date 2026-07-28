@@ -68,13 +68,16 @@ type stubPipeline struct {
 	calls  int
 	lastID *Identity
 	lastEn *Envelope
+	// lastTr is the trace the handler had already filled in by the time it called. Recorded so the
+	// handler's own half of the 03 §4.1 order is assertable without a real pipeline.
+	lastTr *StepTrace
 	result *Result
 	err    error
 }
 
-func (p *stubPipeline) Submit(_ context.Context, id *Identity, e *Envelope) (*Result, error) {
+func (p *stubPipeline) Submit(_ context.Context, id *Identity, e *Envelope, tr *StepTrace) (*Result, error) {
 	p.calls++
-	p.lastID, p.lastEn = id, e
+	p.lastID, p.lastEn, p.lastTr = id, e, tr
 	if p.err != nil {
 		return nil, p.err
 	}
@@ -97,6 +100,13 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newHarnessWithLog(t, logr.Discard())
+}
+
+// newHarnessWithLog is newHarness with an observable logger, for the tests that assert on the step
+// trace the handler emits.
+func newHarnessWithLog(t *testing.T, log logr.Logger) *harness {
+	t.Helper()
 	cl := newClock(testNow)
 	h := &harness{
 		guard:    NewReplayGuard(cl.Now),
@@ -116,7 +126,7 @@ func newHarness(t *testing.T) *harness {
 		Pipeline:      h.pipeline,
 		Journal:       h.journal,
 		Security:      h.security,
-		Log:           logr.Discard(),
+		Log:           log,
 		Namespace:     testNamespace,
 	})
 	if err != nil {
