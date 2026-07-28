@@ -84,3 +84,12 @@ bash dev/verify/webhook-negatives-l2.sh gke-scratch-kube-agents-dev
 # skip-don't-refuse path, and real admission deciding a namespace's final label set. Its successor
 # is the end-to-end form in broker-execute-l2.sh (P9-T9), which WILL need P1.
 bash dev/verify/classify-live-state-l2.sh gke-scratch-kube-agents-dev
+
+# V-REV-010: the recreate downgrade follows the LIVE owner graph. Another CLIENT-SIDE probe with the
+# same P1 waiver and the same named successor. Three things make it L2 and not a bigger envtest:
+# GKE's real discovery surface, against which the index's "any kind I cannot list fails the whole
+# scan" clause has a cost worth measuring; real RBAC, so the Forbidden branch is reachable by
+# something other than a stub; and a real garbage collector, which is the only way to DEMONSTRATE
+# the harm — delete an owner, watch the dependent be destroyed, recreate the owner and watch it stay
+# destroyed. That is the state a `recreate` plan would have reported as a completed undo.
+bash dev/verify/reference-index-l2.sh gke-scratch-kube-agents-dev

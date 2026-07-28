@@ -773,6 +773,11 @@
   bullet: "**Undo-plan generation per verb:** `create` → `delete`; `apply`/`patch` on an existing object → `restore`; `apply` on a new object → `delete`; `scale` → `restore`; `delete` of a reconstructable object → `recreate`; cloud `setSize` → `inverse`. Each generated plan is dry-run-validated and then **actually replayed**, and the resulting object diffed against the recorded snapshot."
   checks:
     - V-REV-004
+    # "of a RECONSTRUCTABLE object" is doing the work in that bullet, and V-REV-004 does not test it:
+    # a per-verb round-trip corpus supplies its own reference index, so it proves the recreate STEP
+    # is right for objects already stipulated to be recreatable. V-REV-010 is the other half —
+    # whether this object was ever one of those — decided against a live cluster.
+    - V-REV-010
 
 "06§10#37":
   bullet: "**Unrevertible ⇒ gated:** deleting a bound PVC, deleting a namespace, and rotating a credential each produce `undoable: false` and park as `PendingApproval` — never execute."

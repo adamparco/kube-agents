@@ -157,7 +157,7 @@ func Snapshot(ctx context.Context, sink BlobSink, targetIndex int32, obj *unstru
 			"journal: snapshot for target %d is %d bytes (over the %d-byte inline limit) and no blob sink is configured; refusing to execute an action whose pre-state cannot be persisted (03 §6)",
 			targetIndex, len(body), InlineSnapshotLimit)
 	}
-	key := fmt.Sprintf("%s/%d", keyPrefix, targetIndex)
+	key := SnapshotKey(keyPrefix, int(targetIndex))
 	stored, err := sink.Put(ctx, key, body)
 	if err != nil {
 		return agentv1alpha1.PreStateSnapshot{}, fmt.Errorf(
@@ -213,6 +213,17 @@ func LoadSnapshot(ctx context.Context, sink BlobSink, snap agentv1alpha1.PreStat
 // human reading sink keys can see which agent produced what without joining anything.
 func SnapshotKeyPrefix(agentIdentity, actionID string) string {
 	return fmt.Sprintf("%s/%s", agentIdentity, actionID)
+}
+
+// SnapshotKey is the full sink key for one target's body: the prefix, then the target index.
+//
+// One function rather than a format string at each site, because the WRITE key and the READ key are
+// the same string produced by two different packages -- Snapshot above puts the body there, and
+// whatever resolves an ObjectStoreRef at undo time goes looking. A divergence between them does not
+// fail at write time or at review time; it fails at replay, months later, as a snapshot that the
+// record swears exists and the sink has never heard of.
+func SnapshotKey(keyPrefix string, targetIndex int) string {
+	return fmt.Sprintf("%s/%d", keyPrefix, targetIndex)
 }
 
 // SortedTargetIndices returns the target indices a snapshot list covers, sorted. Used by callers
