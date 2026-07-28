@@ -68,8 +68,9 @@ will start selecting.
 | **LSN-037** | builds, dockerfiles, ci, toolchain | An image build fails on symbols that `go build ./...` resolves fine | closed | `dev/tests/go-build-targets-packages.py` + `--negative-control` (L0-CHAIN) · package-path builds in all 3 Dockerfiles + 2 Makefile recipes |
 | **LSN-039** | wiring, completeness, manifests, install-path | The manifest is correct, the check that reads it is green, and no install path ever applies it | closed | `dev/tests/identity-has-install-path.py` (**V-CMP-007**, L0-CHAIN) — manifest→step reachability over `k8s-operator/scripts/`, 7 properties, 8 negative controls including a reproduction of the original defect · the install path itself in `common.sh` (`render_agent_identity`, `apply_agent_identity`, `delete_agent_identity`) + `agent-identity.yaml.template` + `broker-operations-grant.yaml.template`, applied from `provision_08` and `provision_12` |
 | **LSN-038** | checks, probes, discovery, negative-controls | A guard that fails safe still fails, and a green run is how it tells you | closed | `check_machinery_probes_resolve` + `CLOSED_MARKER` + the Go arm of `_invoked_by` in `invariants-gate.py` (L0-CHAIN) · `dev/test_invariants_gate.py` (19 negative controls) · `dev/tests/golex.py` shared by `scope-label-single-sourced.py` and `api-group-single-sourced.py` |
+| **LSN-040** | seams, integration, assembly, broker | Two packages, each right, mean different things by the same field, and the first caller is the only thing that can tell | **open** | — fix scheduled as **P9-T7c-4**; the gap itself is pinned by `TestApplyFailsClosedAtTheIntegrityCheck` in `internal/broker/pipeline/pipeline_test.go` |
 
-**Open: 1 of 39** (LSN-035).
+**Open: 2 of 40** (LSN-035, LSN-040).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2025,3 +2026,64 @@ sweep, which is the unit that touches that tree.
 Related: [[lsn-007]] (the closed lesson this walked around), [[lsn-006]] (well-formed is not
 enforced — the same gap between an artifact and its effect), [[lsn-036]] (enumeration goes stale),
 [[lsn-035]] (a check whose subject was refactored away prints PASS forever).
+
+---
+
+## LSN-040 — Two packages, each right, about the same word
+
+**Tag:** seams, integration, assembly, broker · **Status: open** (fix scheduled as **P9-T7c-4**).
+
+**Trigger.** Assembling steps 3–11 into a working pipeline (P9-T7c-1) and driving one real envelope
+through it end to end. The very first happy-path fixture — `apply` a ConfigMap — was refused at step
+9 by an integrity check, with a message saying the classifier had been shown no changed fields.
+
+**The finding.** `classify` and `execute` both have a concept named `WholeObject`, and they mean
+different things by it.
+
+- `classify.Resolve` sets `WholeObject` for `create`, `apply` **and** `delete`. From a rule's point
+  of view that is correct: all three touch every field, so there is no path list to reason about.
+- `execute.CheckIntegrity` accepts `WholeObject` for `create` and `delete` **only**, and its
+  `default:` arm rejects anything else — "a field-level verb with no path set was not checked by
+  anything". That is also correct: for an `apply` there _is_ a computed diff, and accepting
+  "everything changed" would let a change pass the integrity check without any path being compared.
+- `execute/integrity_test.go`'s `TestIntegrityWholeObjectIsNotAnEscapeHatch` asserts the second
+  reading deliberately.
+
+Neither package is wrong. What was missing is the conversion between them, which did not exist
+because nothing had ever called one with the other's output. The pipeline is that first caller.
+
+**Consequence.** Only `create`, `delete` and JSON-patch `patch` can traverse the pipeline today.
+`apply`, `scale` and merge-patch fail closed at step 9 — refused, nothing mutated — so this is
+missing functionality and not a hole. It is recorded as a test
+(`TestApplyFailsClosedAtTheIntegrityCheck`) rather than a comment, so the gap is a property with a
+verdict instead of a surprise waiting for the next reader.
+
+**Root cause, one level down.** `classify.RawOp.Patch` is documented as carrying "the RFC 6902 patch
+for `patch`, **or the computed diff for `apply`**". `pipeline.rawOps` only fills it for the JSON
+Patch media type. So an `apply` reaches the classifier with no `TouchedPaths` at all — which means
+it is not only unexecutable, it was being classified without the per-path direction analysis every
+`patch` gets. Fail-closed saved it; the classification was the quieter defect.
+
+**Why this is a distinct class from [[lsn-007]], which it superficially resembles.** LSN-007 is
+"built, tested, and unreachable" — one component with no caller. This is two components each with
+callers and tests, which agree on a type signature and disagree on what a field of it means. No
+check on either package could have found it, because each package's tests assert its own reading and
+both readings are right. It is findable only by the first thing that puts them in a line, and
+therefore the mechanization has to be at the seam, not in either package:
+
+**Planned mechanization (P9-T7c-4).** Supply the classifier the computed
+`execute.Diff(snap.Live, desired)` for an `apply` and `/spec/replicas` for a `scale`, derive paths
+for a merge-patch, and then — the part that is the lesson rather than the bug — add a check that
+**every verb in the envelope's closed verb enum executes end to end through the assembled pipeline**,
+discovered from the enum rather than from a list of verbs someone wrote down ([[lsn-036]]). A table
+covering the three verbs that happen to work today would have printed green throughout the entire
+period in which the other three did not.
+
+**Complication for whoever does it.** `execute.DiffResult.Ops` are
+`agentv1alpha1.AppliedDiffOp{Op, Path, From, Value string}` — `Value` is a **rendered string**, so
+feeding a computed diff straight into `classify.PatchOp.Value` is lossy for the typed rules
+(`DirectionOfBoolField` would see `"true"`). Secret egress is unaffected: it is scanned from
+`RawOp.Payload`, the desired state, independently of the patch.
+
+Related: [[lsn-007]] (unreachable code), [[lsn-036]] (a list of verbs is a headcount),
+[[lsn-015]] (one fixture cannot find a disagreement between two).

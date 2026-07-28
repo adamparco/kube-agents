@@ -88,23 +88,29 @@ type Result struct {
 }
 
 // Pipeline is steps 3 through 11 of 03 §4.1 -- classify, plan undo, snapshot, journal, execute,
-// verify, report. P9-T2 ships the front of the pipeline only; this interface is the seam the
-// remaining tasks fill.
+// verify, report. `internal/broker/pipeline` is the implementation.
 //
 // It is an interface rather than a TODO in a handler so that "the pipeline is not installed" is a
 // distinct, visible runtime state with its own status code, rather than a code path that looks
 // like success. A skeleton that returned 202 for an action it never performed would be the worst
 // possible placeholder: correct-looking to a caller, invisible in a test, and a lie in the journal.
+//
+// The trace is a PARAMETER, not something the implementation makes for itself. Steps 1 and 2 have
+// already been recorded on it by the time Submit is called, so an implementation that started its
+// own would produce a trace beginning at step 3 -- and StepTrace, which admits only the successor
+// of the last step recorded, would reject step 3 as out of order. The signature is the reason the
+// order is checkable end to end rather than pipeline-only.
 type Pipeline interface {
-	Submit(ctx context.Context, id *Identity, e *Envelope) (*Result, error)
+	Submit(ctx context.Context, id *Identity, e *Envelope, tr *StepTrace) (*Result, error)
 }
 
 // UnavailablePipeline is what a broker built without a pipeline runs. Every accepted, fully
 // validated envelope gets a 503 that says exactly which build it is talking to.
 type UnavailablePipeline struct{}
 
-// Submit refuses.
-func (UnavailablePipeline) Submit(context.Context, *Identity, *Envelope) (*Result, error) {
+// Submit refuses. It records nothing on the trace, which leaves the trace showing steps 1 and 2
+// and nothing after -- an accurate account of a broker whose pipeline is not installed.
+func (UnavailablePipeline) Submit(context.Context, *Identity, *Envelope, *StepTrace) (*Result, error) {
 	return nil, &Refusal{
 		Status: http.StatusServiceUnavailable,
 		Reason: "pipeline-not-installed",
@@ -247,46 +253,77 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The step trace of 03 §4.1, started here and handed to the pipeline. It begins at the handler
+	// rather than inside the pipeline because steps 1 and 2 happen out here, and a trace that only
+	// covered steps 3-11 could not distinguish "authentication refused this" from "nothing ran".
+	tr := &StepTrace{}
+	// One line per submission, on every path, emitted whether the action executed or was refused
+	// at step 1. Deferred rather than written at each exit because there are seven exits and the
+	// one that would lose its line in a refactor is the one nobody is looking at. This is also
+	// what makes the handler's own two steps observable to a test without adding a hook to the
+	// Server that exists only for tests.
+	defer func() { s.cfg.Log.V(1).Info("action pipeline", "steps", tr.String()) }()
+
 	// Step 1: identity. Before the body is read, so an unauthenticated peer cannot make the broker
 	// allocate two megabytes.
-	id, err := s.cfg.Authenticator.Authenticate(ctx, r)
-	if err != nil {
+	var id *Identity
+	if err := tr.Run(StepAuthenticate, func() (string, error) {
+		var err error
+		id, err = s.cfg.Authenticator.Authenticate(ctx, r)
+		if err != nil {
+			return "", err
+		}
+		return id.AgentIdentity(), nil
+	}); err != nil {
 		s.write(w, err)
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBytes))
-	if err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			writeStatus(w, http.StatusRequestEntityTooLarge, Response{
-				Reason:  "envelope-too-large",
-				Message: fmt.Sprintf("the envelope exceeds %d bytes", MaxRequestBytes),
-			})
+	// Step 2: the envelope is well-formed, its key is the one its contents imply, and it is not a
+	// replay. One step because 06 §4.1 makes it one question -- "is this a submission this broker
+	// should consider at all" -- answered entirely from the body and the caller, with no cluster
+	// read anywhere in it.
+	var (
+		body     []byte
+		env      *Envelope
+		readFail error
+	)
+	if err := tr.Run(StepValidate, func() (string, error) {
+		var err error
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBytes))
+		if err != nil {
+			readFail = err
+			return "", err
+		}
+		if env, err = DecodeEnvelope(body); err != nil {
+			return "", err
+		}
+		// The recomputation, before the replay guard. Deliberately in that order: a key mismatch
+		// is a client bug, and running the guard first would burn a single-use nonce on every one
+		// of them until the caller hit its outstanding-nonce quota and started seeing a second,
+		// unrelated error. Nothing is skipped by the ordering -- both checks run on every
+		// submission, and both precede classification, which is what 06 §4.1 requires.
+		if err := CompareIdempotencyKey(id.AgentIdentity(), env); err != nil {
+			return "", err
+		}
+		// All three anti-replay mechanisms, before classification.
+		if err := s.cfg.Guard.Check(id, env); err != nil {
+			return "", err
+		}
+		return env.IdempotencyKey, nil
+	}); err != nil {
+		if readFail != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(readFail, &tooLarge) {
+				writeStatus(w, http.StatusRequestEntityTooLarge, Response{
+					Reason:  "envelope-too-large",
+					Message: fmt.Sprintf("the envelope exceeds %d bytes", MaxRequestBytes),
+				})
+				return
+			}
+			writeStatus(w, http.StatusBadRequest, Response{Reason: ReasonMalformed, Message: "could not read the request body"})
 			return
 		}
-		writeStatus(w, http.StatusBadRequest, Response{Reason: ReasonMalformed, Message: "could not read the request body"})
-		return
-	}
-
-	env, err := DecodeEnvelope(body)
-	if err != nil {
-		s.refuse(ctx, w, r, id, body, err)
-		return
-	}
-
-	// The recomputation, before the replay guard. Deliberately in that order: a key mismatch is a
-	// client bug, and running the guard first would burn a single-use nonce on every one of them
-	// until the caller hit its outstanding-nonce quota and started seeing a second, unrelated
-	// error. Nothing is skipped by the ordering -- both checks run on every submission, and both
-	// precede classification, which is what 06 §4.1 requires.
-	if err := CompareIdempotencyKey(id.AgentIdentity(), env); err != nil {
-		s.refuse(ctx, w, r, id, body, err)
-		return
-	}
-
-	// Step 2: anti-replay. All three mechanisms, before classification.
-	if err := s.cfg.Guard.Check(id, env); err != nil {
 		s.refuse(ctx, w, r, id, body, err)
 		return
 	}
@@ -304,7 +341,7 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.cfg.Pipeline.Submit(ctx, id, env)
+	result, err := s.cfg.Pipeline.Submit(ctx, id, env, tr)
 	if err != nil {
 		s.refuse(ctx, w, r, id, body, err)
 		return
