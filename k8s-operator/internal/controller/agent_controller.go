@@ -60,6 +60,12 @@ type AgentReconciler struct {
 // longer mints agent RBAC at runtime (P1-T4, 08 §4); the read-only agent identity is pre-created via
 // GitOps (policy/rbac-overlay/) and enforced by vap-agent-readonly. Do not re-add RBAC write verbs.
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
+// The mesh keypairs (08 §2.3, P9-T7d). The controller writes cert-manager Certificates and holds NO
+// verb on the Secrets those Certificates produce — 08 §2.7 withholds get/list/watch on Secrets from
+// this controller entirely, because a list verb in a namespace hosting an agent would hand it every
+// projected token in that namespace. Namespaced only: the mesh CA ClusterIssuer is install-time
+// (config/mesh-ca/), not something the controller may create.
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 
 func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -244,6 +250,15 @@ func (r *AgentReconciler) reconcileSettingsConfigMap(ctx context.Context, agent 
 // (CR deleted mid-reconcile, agent apply rejected) are collected by the garbage collector against
 // the owner rather than by an error path that has to be correct.
 func (r *AgentReconciler) reconcileWorkloadPair(ctx context.Context, agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsHash string) error {
+	// The mesh certificates first, because both halves mount them and cert-manager needs time to
+	// issue. Applying them ahead of the Deployments turns the usual first-reconcile race into a
+	// short ContainerCreating instead of a CrashLoopBackOff, and costs nothing when they exist.
+	// This is best-effort by design: no cert-manager means no certificates and a pair that stays
+	// BrokerReady: false — see reconcileMeshCertificates.
+	if err := r.reconcileMeshCertificates(ctx, agent); err != nil {
+		return err
+	}
+
 	brokerSvc := buildBrokerService(agent)
 	if err := ctrl.SetControllerReference(agent, brokerSvc, r.Scheme); err != nil {
 		return err

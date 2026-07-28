@@ -295,8 +295,24 @@ func spiffeFromCert(uris []*url.URL, trustDomain string) (string, error) {
 	return "", fmt.Errorf("client certificate carries no SPIFFE URI SAN in trust domain %q", trustDomain)
 }
 
-func spiffeID(trustDomain, namespace, serviceAccount string) string {
+// SPIFFEID renders a workload's mesh identity. Exported and used by BOTH sides on purpose.
+//
+// The broker refuses any request whose client-certificate SPIFFE URI does not equal the ID derived
+// from the TokenReview (`ReasonPeerMismatch`, above). The controller has to put that exact string
+// into the `Certificate` it asks cert-manager to issue. Two independent `fmt.Sprintf`s of the same
+// shape would agree today and diverge the first time either side gained a path segment — and the
+// failure would not be a compile error or a red unit test, it would be every envelope in the fleet
+// refused at the transport layer with a message about trust domains, at L2, after a rollout.
+//
+// So there is one definition site and both sides call it. `dev/tests/` has three checks whose whole
+// job is enforcing that property for other strings (the API group, the scope labels, the broker
+// name suffixes); this one is enforced by the type system instead, because both callers are Go.
+func SPIFFEID(trustDomain, namespace, serviceAccount string) string {
 	return fmt.Sprintf("spiffe://%s/ns/%s/sa/%s", trustDomain, namespace, serviceAccount)
+}
+
+func spiffeID(trustDomain, namespace, serviceAccount string) string {
+	return SPIFFEID(trustDomain, namespace, serviceAccount)
 }
 
 func bearerToken(r *http.Request) (string, error) {

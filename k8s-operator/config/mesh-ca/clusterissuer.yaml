@@ -1,0 +1,84 @@
+# The mesh certificate authority (08 §2.3, P9-T7d).
+#
+# Three objects, in a chain, because a CA has to be signed by something and the first link has to be
+# self-signed somewhere:
+#
+#   kubeagents-mesh-selfsign (ClusterIssuer, selfSigned)
+#     └── kubeagents-mesh-ca (Certificate, isCA)  -->  Secret kubeagents-mesh-ca-key-pair
+#           └── kubeagents-mesh-ca (ClusterIssuer, ca)  -->  signs every agent's mesh leaf
+#
+# The controller creates neither of these. It creates the per-agent `Certificate` leaves and nothing
+# else: these are cluster-scoped, install-time, and a trust-bootstrap decision, and the operator
+# holds no cluster-scoped write verb (08 §2.7). Applied by the provisioning path.
+#
+# ## Why a ClusterIssuer rather than an Issuer per namespace
+#
+# Agents live in many namespaces and the mesh spans all of them, so every pair must chain to the
+# SAME root — that is the entire reason this file exists, and why the broker/agent certificates
+# could not ship with the pair that mounts them. A namespaced `Issuer` would need the CA Secret
+# present in every namespace hosting an agent, which puts the CA PRIVATE KEY in every tenant
+# namespace, readable by anything the tenant's own RBAC grants. One compromised namespace would then
+# mint a valid mesh identity for any workload in the fleet. Here the key stays in cert-manager's
+# namespace and only leaves leave.
+#
+# ## The CA is not an authorization
+#
+# One CA signs every agent, so agent A's client certificate verifies against agent B's broker. That
+# is fine and it is checked: the broker authenticates the caller by TokenReview against a projected
+# token with audience `kubeagents-broker`, compares it to the single `ExpectedCaller` it serves, and
+# refuses if the client certificate's SPIFFE URI does not match the token's identity. Membership of
+# the mesh and permission to act are two different claims, proved by two different credentials.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: kubeagents-mesh-selfsign
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/component: mesh-ca
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kubeagents-mesh-ca
+  # cert-manager's own namespace, NOT an agent namespace. A ClusterIssuer resolves its CA Secret
+  # from the cluster resource namespace, which is where cert-manager runs; putting it anywhere an
+  # agent can be scheduled would defeat the point of using a ClusterIssuer at all.
+  namespace: cert-manager
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/component: mesh-ca
+spec:
+  isCA: true
+  commonName: kube-agents mesh CA
+  secretName: kubeagents-mesh-ca-key-pair
+  # Five years for the root, ninety days for the leaves it signs. The asymmetry is deliberate:
+  # rotating this root means every broker and every agent in the fleet must be re-issued and
+  # restarted together, so it is an event to plan, while a leaf rotation is routine and automatic.
+  duration: 43800h # 5y
+  renewBefore: 8760h # 1y — a year of warning on a fleet-wide event
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    # A root that reuses its key on renewal has not renewed anything that matters.
+    rotationPolicy: Always
+  issuerRef:
+    kind: ClusterIssuer
+    name: kubeagents-mesh-selfsign
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  # This name is the one string the operator hardcodes about the trust root
+  # (`meshCAIssuerName` in internal/controller/mesh_trust.go). Renaming it here without renaming it
+  # there leaves every per-agent Certificate stuck Pending on an issuer that does not exist, which
+  # surfaces as brokers that never become Ready.
+  name: kubeagents-mesh-ca
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/component: mesh-ca
+spec:
+  ca:
+    secretName: kubeagents-mesh-ca-key-pair

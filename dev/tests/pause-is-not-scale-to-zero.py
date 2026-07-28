@@ -46,7 +46,7 @@ Five properties:
      "cannot write" coincide; what it breaks is 06 §4.4's other half, because an agent whose broker
      is gone cannot say why it is refusing, and reports a broker outage instead of a pause.
   3. NO BRAKE FIELD IS READ IN THE RENDERING PATH. `Paused`, `PauseReason`, `DryRunOnly` and
-     `FrozenBy` do not appear in the three files that turn an Agent into a workload. The brake
+     `FrozenBy` do not appear in any file that renders from an Agent (the RENDERING set). The brake
      belongs in the broker's refusal path; a renderer that reads it is a renderer that can act on it.
   4. THE PROPERTY TEST EXISTS. `TestPauseDoesNotChangeTheRenderedDeployment` and its negative
      control `TestScaleToZeroStillWorks` are present. This check asserts shape and cannot observe
@@ -133,6 +133,12 @@ RENDERING = {
     "scale or reshape the broker, and an agent whose broker is gone reports an outage rather than "
     "a pause",
     "pod_launcher.go": "creates agent pods directly; a brake read here rolls the pod just as surely",
+    "mesh_trust.go": "renders the pair's mesh Certificates from an Agent. It creates no workload, so "
+    "property 2 has nothing to bite on -- but it lands in RENDERING rather than EXEMPT because it has "
+    "no business reading the brake, and the wrong implementation it would enable is a bad one: "
+    "withholding a certificate from a paused agent takes the pair's TRANSPORT down, which reads as a "
+    "broker outage and drops the agent into observe-and-report (08 §2.4) instead of letting it refuse "
+    "with a reason (06 §4.4). RENDERING is the strict arm; classify here when in doubt",
 }
 
 # Controllers that may legitimately read `spec.operations`, each with the reason. Property 2 still
