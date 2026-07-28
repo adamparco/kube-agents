@@ -609,6 +609,135 @@ render_remote_hub_block() {
   unset -f _emit_cidr_rule
 }
 
+# render_apiserver_block
+#
+# Emits the kube-apiserver allow rule for the per-tier egress policy, or nothing.
+#
+# WHY THIS EXISTS. The per-tier policy is a pure allowlist and its four base
+# destinations are DNS, the control namespace on :80/:8080, restricted.googleapis.com
+# and GitHub's published blocks. None of those is the API server. The BROKER pod
+# carries `kube-agents/tier`, so this policy selects it too, and the broker needs the
+# API server for three of its eleven pipeline steps — TokenReview (1), the FleetFreeze
+# read (5), the ActionRecord write (11). Without this rule the broker authenticates
+# nobody, and the symptom reads as an auth bug: a TokenReview that never returns looks
+# identical to a TokenReview that was refused. The READER needs it too, for every
+# kubectl-shaped skill it runs; that half has been latent since Phase 5.
+#
+# NOTHING THE CONTROLLER RENDERS CAN FIX THIS. NetworkPolicy is L3/L4 and cannot name
+# a Service, so "allow the `kubernetes` endpoint" is inexpressible — it has to be an
+# address, and which address is per-cluster and known only at install time. See
+# `resolve_apiserver_cidrs` below, and internal/controller/pair_netpol.go's header.
+#
+# THIS IS NOT A WIDENING OF AUTHORITY, and it is worth being explicit about that
+# because "the agent pod may now reach the API server" reads like one. Reachability is
+# not permission: the reader's RBAC is read-only and `vap-agent-readonly` denies it
+# every write verb at admission, and the actor's grant is exactly 06 §2.2.1's twenty
+# triples. What this rule changes is whether an authorized request can leave the pod,
+# not what the API server will do with it.
+#
+# BOTH ADDRESS FORMS ARE EMITTED, for the same reason GKE_DATAPLANE defaults to `auto`.
+# In-cluster clients dial the `kubernetes` Service ClusterIP and kube-proxy or the
+# dataplane DNATs that to the real control-plane endpoint. Whether NetworkPolicy
+# evaluates egress before or after that translation is dataplane-specific, so a policy
+# naming only one of the two fails on the other — as a connection timeout inside a
+# client library, with no mention of networking. Two /32s on 443 is a narrow price for
+# not having to be right about which.
+render_apiserver_block() {
+  local csv="${KUBE_APISERVER_CIDRS:-}"
+  local c
+
+  [ -z "$(printf '%s' "${csv}" | tr -d '[:space:]')" ] && return 0
+
+  echo "    # 9) The kube-apiserver. The BROKER cannot work without it — TokenReview (pipeline step 1),"
+  echo "    #    the FleetFreeze read (step 5) and the ActionRecord write (step 11) all go here — and the"
+  echo "    #    reader needs it for every kubectl-shaped skill. Reachability, not permission: RBAC and"
+  echo "    #    vap-agent-readonly still decide what the request is allowed to do."
+  echo "    #    Resolved at install time by common.sh:resolve_apiserver_cidrs; both the in-cluster"
+  echo "    #    Service address and the control-plane endpoint are listed, because which one the"
+  echo "    #    dataplane sees depends on where it evaluates egress relative to DNAT."
+  echo "    - to:"
+  local IFS=','
+  for c in ${csv}; do
+    c="$(printf '%s' "$c" | tr -d '[:space:]')"
+    [ -n "$c" ] && echo "        - ipBlock:
+            cidr: ${c}"
+    first=0
+  done
+  unset IFS
+  echo "      ports:"
+  echo "        - protocol: TCP"
+  echo "          port: 443"
+}
+
+# resolve_apiserver_cidrs
+#
+# Writes the comma-separated CIDR list render_apiserver_block consumes, or exits
+# non-zero having written nothing. FAIL-CLOSED IS THE POINT: an empty answer that
+# looks like a success renders a policy with no API-server rule, which is precisely
+# the hole this unit closes, and it would be invisible until a broker hung.
+#
+# Three sources, in order:
+#
+#   1. KUBE_APISERVER_CIDR (vars.sh) — an explicit override, comma-separated, used
+#      verbatim. Required for a private cluster whose master range is not derivable
+#      from the kubeconfig, and for any cluster reached through a bastion or a
+#      forwarded endpoint where the address the kubeconfig names is not the address
+#      the pods reach.
+#   2. The live cluster: the `kubernetes` Service ClusterIP, plus the host out of the
+#      current context's `server:` URL. Both become /32s. This is the ordinary GKE
+#      case and it needs no configuration at all — which matters, because a knob that
+#      must be filled in for the broker to work is a knob that will not be filled in.
+#   3. Nothing. Return 1.
+#
+# A hostname in the `server:` URL is DELIBERATELY NOT RESOLVED here. NetworkPolicy
+# takes addresses, resolving one at install time pins whatever the DNS answer was that
+# afternoon, and a policy that silently stops matching after a control-plane IP
+# rotation is worse than one that was never written. Set KUBE_APISERVER_CIDR instead.
+resolve_apiserver_cidrs() {
+  local override="${KUBE_APISERVER_CIDR:-}"
+  local out="" clusterip server host
+
+  if [ -n "$(printf '%s' "${override}" | tr -d '[:space:]')" ]; then
+    printf '%s\n' "${override}"
+    return 0
+  fi
+
+  # An IPv4 dotted quad and nothing else. `_ipv4` is deliberately strict rather than
+  # permissive: a value that is almost an address renders a `cidr:` the API server
+  # rejects, and provision_13 would then fail on the apply instead of here, where the
+  # message can say which of the three sources produced it.
+  _ipv4() { # _ipv4 <candidate>
+    case "$1" in
+      *[!0-9.]* | '' | *..*) return 1 ;;
+      *.*.*.*.*) return 1 ;;
+      *.*.*.*) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  clusterip="$(kubectl get service kubernetes -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")"
+  if _ipv4 "${clusterip}"; then
+    out="${clusterip}/32"
+  fi
+
+  server="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")"
+  host="${server#*://}"
+  host="${host%%:*}"
+  host="${host%%/*}"
+  if _ipv4 "${host}"; then
+    if [ -n "${out}" ]; then
+      out="${out},${host}/32"
+    else
+      out="${host}/32"
+    fi
+  fi
+
+  unset -f _ipv4
+
+  [ -z "${out}" ] && return 1
+  printf '%s\n' "${out}"
+}
+
 # render_egress_policy <netpol-name> <namespace> <tier>
 #
 # Renders k8s-operator/scripts/netpol-agent-egress.yaml.template for one tier and
@@ -629,6 +758,7 @@ render_egress_policy() {
   optional="$(
     render_wi_metadata_block
     render_remote_hub_block
+    render_apiserver_block
   )"
 
   # Command substitution strips every trailing newline, so `printf '%s\n'` leaves

@@ -53,6 +53,32 @@ evidence (09 §6, V-MET-014).
      `limits.*` entries caps nothing and, worse, stops forcing pods to declare
      them, which is the property provision_12 orders itself around.
 
+Covered (P9-T7d-4): the kube-apiserver rule, egress rule 9. It is the only
+destination in this allowlist with no published, stable range — the endpoint is
+per-cluster, and on a public GKE control plane it is a bare IP — so unlike every
+other rule it cannot be pinned in the committed exemplars without stating a
+fiction about somebody's cluster. Enforcement therefore lives in `provision_13`
+as resolve-or-refuse, and these four properties are what make that claim
+checkable at L0 rather than asserted in a comment.
+
+  7. **Rule 9 is absent from the base render**, and that absence is a decision
+     rather than an accident. Same shape as check 4: if a default API-server
+     address ever appears in the base render, it is a fiction shipped to every
+     reader of the exemplars.
+  8. **Given the address, rule 9 renders every CIDR it was handed, bound to 443
+     and nothing else.** The failure guarded is the one check 5 guards: an allow
+     that names the host but omits `ports:` is a whole-host allow, and in a diff
+     it reads exactly like the rule that was asked for.
+  9. **`resolve_apiserver_cidrs` fails closed.** With an override it returns it
+     verbatim; with no override and no reachable cluster it must exit non-zero
+     and print nothing. An empty answer that looked like success would render a
+     policy with no rule 9 — precisely the hole this unit closes — and nothing
+     downstream would notice until a broker hung on TokenReview.
+ 10. **`provision_13` still refuses.** The resolver can fail closed and the step
+     can ignore it; property 9 cannot see that. This one reads the step's source
+     for the arm that exits non-zero, and is labelled a source property because
+     that is what it is.
+
 Usage:
     python3 dev/tests/reference-render.py [REPO_ROOT]
     python3 dev/tests/reference-render.py --self-test
@@ -67,7 +93,37 @@ import difflib
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+# TemporaryDirectory objects clean up when they are collected, and the shims below
+# have to outlive the call that makes them, so the handles are parked here.
+_TMP: list[tempfile.TemporaryDirectory] = []
+
+
+def _shim_dir(name: str, script: str) -> Path:
+    """A throwaway directory holding one executable, for prepending to PATH."""
+    tmp = tempfile.TemporaryDirectory()
+    _TMP.append(tmp)
+    exe = Path(tmp.name) / name
+    exe.write_text(script)
+    exe.chmod(0o755)
+    return Path(tmp.name)
+
+
+def _stub_repo(func_source: str) -> Path:
+    """A fake repo whose common.sh defines only the function under control.
+
+    `check_apiserver_resolution` runs the real shell, so its negative control has
+    to be a different shell rather than a mutated string — this builds the
+    smallest tree that check knows how to source.
+    """
+    tmp = tempfile.TemporaryDirectory()
+    _TMP.append(tmp)
+    scripts = Path(tmp.name) / "k8s-operator" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "common.sh").write_text(func_source + "\n")
+    return Path(tmp.name)
 
 # tier -> (netpol name, namespace, committed exemplar path)
 TIERS = {
@@ -322,10 +378,148 @@ def check_wi_pairs(wi_render: str) -> list[str]:
     return bad
 
 
+def check_apiserver_absent_by_default(rendered: dict[str, str]) -> list[str]:
+    """No API-server rule may appear unless the installer resolved an address.
+
+    The exemplars are a derived artifact that humans read and copy. Any CIDR on
+    :443 that is not one of the two published destinations the base allowlist
+    already argues for (Google's restricted VIP, GitHub's four blocks) is an
+    address somebody's install invented, and it would be copied forward as if it
+    were a fact about every cluster.
+    """
+    known = {
+        "199.36.153.8/30",
+        "192.30.252.0/22",
+        "185.199.108.0/22",
+        "140.82.112.0/20",
+        "143.55.64.0/20",
+    }
+    bad = []
+    for tier, text in rendered.items():
+        for cidr in set(re.findall(r"cidr: (\S+)", body(text))) - known:
+            bad.append(
+                f"{tier}: the base render allows {cidr}, which is not one of the published ranges "
+                f"this allowlist argues for. If that is the API server, it is per-cluster and must "
+                f"come from provision_13, not from a default baked into the exemplars."
+            )
+    return bad
+
+
+def check_apiserver_block(apiserver_render: str) -> list[str]:
+    """Rule 9 must carry every CIDR it was given, on 443 and nothing else."""
+    bad = []
+    given = ("10.96.0.1/32", "34.86.1.2/32")
+    for cidr in given:
+        m = re.search(rf"cidr: {re.escape(cidr)}\n(.*?)(?=\n    - to:|\Z)", apiserver_render, re.S)
+        if not m:
+            bad.append(
+                f"apiserver render: no rule for {cidr} — KUBE_APISERVER_CIDRS was a list and the "
+                f"render dropped an entry, so pods reach the address the installer did not pick"
+            )
+            continue
+        if "ports:" not in m.group(1):
+            bad.append(f"apiserver render: {cidr} has no ports: list — that is a whole-host allow")
+            continue
+        found = set(re.findall(r"port: (\d+)", m.group(1)))
+        if found != {"443"}:
+            bad.append(
+                f"apiserver render: {cidr} allows {sorted(found)} — the API server is reached on "
+                f"443 and the rule may not widen past it"
+            )
+    return bad
+
+
+def check_apiserver_resolution(repo: Path) -> list[str]:
+    """`resolve_apiserver_cidrs` returns the override, and otherwise fails closed.
+
+    The second half is the load-bearing one. `provision_13` branches on this
+    function's exit status, so a resolver that returned 0 with an empty string
+    would take the success arm, render a policy with no rule 9, and print a
+    success line saying so. Nothing downstream looks again — the first symptom is
+    a broker hanging on TokenReview and reporting an authentication error.
+    """
+    scripts = repo / "k8s-operator" / "scripts"
+    prelude = f'SCRIPT_DIR="{scripts}"; source "{scripts}/common.sh" --dry-run >/dev/null 2>&1; '
+    base_path = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
+
+    def run(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", prelude + "resolve_apiserver_cidrs"],
+            capture_output=True,
+            text=True,
+            cwd=str(scripts),
+            env={"PATH": base_path, **env},
+        )
+
+    bad = []
+    override = run({"KUBE_APISERVER_CIDR": "10.96.0.1/32,34.86.1.2/32"})
+    if override.returncode != 0 or override.stdout.strip() != "10.96.0.1/32,34.86.1.2/32":
+        bad.append(
+            f"resolve_apiserver_cidrs: KUBE_APISERVER_CIDR was not returned verbatim "
+            f"(rc={override.returncode}, out={override.stdout.strip()!r}) — the operator's explicit "
+            f"answer must win over anything auto-detected"
+        )
+
+    # No override, and a kubectl that cannot reach anything. Shimmed rather than
+    # removed from PATH: an unrunnable kubectl and an unreachable cluster are
+    # different failures, and the one the installer actually meets is the second.
+    shim = _shim_dir(
+        "kubectl", "#!/bin/sh\necho 'The connection to the server was refused' >&2\nexit 1\n"
+    )
+    closed = run({"PATH": f"{shim}:{base_path}"})
+    if closed.returncode == 0:
+        bad.append(
+            f"resolve_apiserver_cidrs: exited 0 with nothing to resolve (out={closed.stdout.strip()!r}) "
+            f"— provision_13 would take the success arm and apply a policy with no rule 9"
+        )
+    elif closed.stdout.strip():
+        bad.append(
+            f"resolve_apiserver_cidrs: failed but still printed {closed.stdout.strip()!r} — a caller "
+            f"that captures stdout before checking rc would render that as a CIDR"
+        )
+    return bad
+
+
+def check_provision_refuses(source: str) -> list[str]:
+    """provision_13 must end the run when the address cannot be resolved.
+
+    A source property, and named as one: it reads the shell rather than running
+    it, because running it needs a cluster. What it protects is the coupling — a
+    later edit that turns the `else` arm into a warning would leave properties 7-9
+    green and reopen the hole, because each of those is true of a resolver nobody
+    obeys.
+    """
+    m = re.search(
+        r"elif\s+KUBE_APISERVER_CIDRS=\"\$\(resolve_apiserver_cidrs\)\";\s*then(.*?)\nfi\b",
+        source,
+        re.S,
+    )
+    if not m:
+        return [
+            "provision_13: no `elif KUBE_APISERVER_CIDRS=\"$(resolve_apiserver_cidrs)\"; then` arm — "
+            "the step no longer branches on whether the address resolved (or this check's subject "
+            "was refactored away; see LSN-035)"
+        ]
+    else_arm = m.group(1).split("\nelse\n")
+    if len(else_arm) != 2:
+        return ["provision_13: the resolve branch has no else arm — an unresolved address is unhandled"]
+    if not re.search(r"^\s*exit 1\s*$", else_arm[1], re.M):
+        return [
+            "provision_13: the unresolved-address arm does not `exit 1`. Warning and continuing "
+            "applies an egress policy with no rule 9, and the broker's every write then fails as an "
+            "authentication error that never mentions the network."
+        ]
+    return []
+
+
 def run_all(repo: Path) -> list[str]:
     rendered = {t: render(repo, t) for t in TIERS}
     wi = render(repo, "platform", {"WORKLOAD_IDENTITY_ENABLED": "true", "GKE_DATAPLANE": "auto"})
     tenant = {h: render_tenant(repo, h) for h in TENANT}
+    apiserver = render(repo, "platform", {"KUBE_APISERVER_CIDRS": "10.96.0.1/32,34.86.1.2/32"})
+    provision = (
+        repo / "k8s-operator" / "scripts" / "provision_13_apply_network_policies.sh"
+    ).read_text()
     return (
         check_exemplars_match(repo, rendered)
         + check_no_placeholder(rendered)
@@ -335,6 +529,10 @@ def run_all(repo: Path) -> list[str]:
         + check_tenant_exemplars(repo, tenant)
         + check_quota_bounds_compute(tenant["render_tenant_quota"])
         + check_aliases_point_at_the_control_namespace(tenant["render_tenant_service_aliases"])
+        + check_apiserver_absent_by_default(rendered)
+        + check_apiserver_block(apiserver)
+        + check_apiserver_resolution(repo)
+        + check_provision_refuses(provision)
     )
 
 
@@ -403,6 +601,68 @@ def self_test() -> int:
                 '    limits.cpu: "16"\n'
             ),
         ),
+        (
+            "an API-server address baked into the base render rejected",
+            lambda: check_apiserver_absent_by_default(
+                {"platform": "        - ipBlock:\n            cidr: 34.86.1.2/32"}
+            ),
+        ),
+        (
+            "rule 9 dropping one of the CIDRs it was given rejected",
+            lambda: check_apiserver_block(
+                "    - to:\n        - ipBlock:\n            cidr: 10.96.0.1/32\n"
+                "      ports:\n        - protocol: TCP\n          port: 443\n"
+            ),
+        ),
+        (
+            "rule 9 with no ports: list rejected",
+            lambda: check_apiserver_block(
+                "    - to:\n        - ipBlock:\n            cidr: 10.96.0.1/32\n"
+                "        - ipBlock:\n            cidr: 34.86.1.2/32\n"
+            ),
+        ),
+        (
+            "rule 9 widened past 443 rejected",
+            lambda: check_apiserver_block(
+                "    - to:\n        - ipBlock:\n            cidr: 10.96.0.1/32\n"
+                "      ports:\n        - protocol: TCP\n          port: 443\n"
+                "        - protocol: TCP\n          port: 10250\n"
+                "    - to:\n        - ipBlock:\n            cidr: 34.86.1.2/32\n"
+                "      ports:\n        - protocol: TCP\n          port: 443\n"
+            ),
+        ),
+        (
+            "a resolver that succeeds with nothing rejected",
+            lambda: check_apiserver_resolution(_stub_repo("resolve_apiserver_cidrs() { return 0; }")),
+        ),
+        (
+            "a resolver that prints on failure rejected",
+            lambda: check_apiserver_resolution(
+                _stub_repo(
+                    "resolve_apiserver_cidrs() {\n"
+                    '  [ -n "${KUBE_APISERVER_CIDR:-}" ] && { printf %s\\\\n "${KUBE_APISERVER_CIDR}"; return 0; }\n'
+                    "  echo 'error: nothing resolved'\n"
+                    "  return 1\n"
+                    "}"
+                )
+            ),
+        ),
+        (
+            "provision_13 warning instead of exiting rejected",
+            lambda: check_provision_refuses(
+                'elif KUBE_APISERVER_CIDRS="$(resolve_apiserver_cidrs)"; then\n'
+                '  print_success "ok"\n'
+                "else\n"
+                '  print_warning "could not resolve — continuing without rule 9"\n'
+                "fi\n"
+            ),
+        ),
+        (
+            "provision_13 losing the resolve branch entirely rejected",
+            lambda: check_provision_refuses(
+                'export KUBE_APISERVER_CIDRS="${KUBE_APISERVER_CIDR:-}"\n'
+            ),
+        ),
     ]
     failures = 0
     for name, fn in controls:
@@ -431,8 +691,10 @@ def main() -> int:
         return 1
     n = len(TIERS) + len(TENANT)
     print(f"Reference render: OK — all {n} exemplars are the template render, the base allowlist is")
-    print("  placeholder-free and metadata-free, the WI rules are correctly paired, the tenant quota")
-    print("  bounds compute, and the service aliases resolve into the control namespace.")
+    print("  placeholder-free, metadata-free and API-server-free, the WI rules are correctly paired,")
+    print("  rule 9 renders on 443 only when an address is supplied, resolve_apiserver_cidrs fails")
+    print("  closed and provision_13 refuses, the tenant quota bounds compute, and the service")
+    print("  aliases resolve into the control namespace.")
     return 0
 
 

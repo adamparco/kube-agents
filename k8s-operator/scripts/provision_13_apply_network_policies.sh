@@ -29,6 +29,17 @@
 #   WORKLOAD_IDENTITY_ENABLED=true     append the narrow metadata-server allow (see common.sh)
 #   GKE_DATAPLANE=auto|v1|v2           which metadata IP↔port pair to emit
 #   HUB_INFERENCE_CIDR / HUB_MINTY_CIDR / MCP_GROUNDING_CIDRS   remote-hub topology
+#   KUBE_APISERVER_CIDR=<csv>          override the auto-detected API-server address(es)
+#   KUBE_APISERVER_EGRESS_ENABLED=false  omit rule 9 — see below before you do
+#
+# THE API-SERVER RULE IS NOT OPTIONAL IN THE WAY THE OTHERS ARE. Every knob above defaults to the
+# narrow answer, because for those the cost of being wrong in the permissive direction is an open
+# path and the cost of being wrong in the restrictive direction is a feature that does not work.
+# Rule 9 inverts that: without it the BROKER cannot TokenReview, read a FleetFreeze or write an
+# ActionRecord (pipeline steps 1, 5 and 11), so every write in the system fails, and it fails
+# reported as an authentication error that never mentions the network. So this step RESOLVES the
+# address and REFUSES TO APPLY if it cannot — an install that silently shipped a policy without
+# rule 9 is the hole P9-T7d-4 exists to close, and a default of "absent" would rebuild it.
 # ==============================================================================
 
 set -e
@@ -58,6 +69,36 @@ export GKE_DATAPLANE="${GKE_DATAPLANE:-auto}"
 if [ "${EGRESS_POLICIES_ENABLED}" != "true" ]; then
   print_warning "EGRESS_POLICIES_ENABLED=${EGRESS_POLICIES_ENABLED} — skipping. Agent pods will have UNRESTRICTED egress."
   exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Resolve the kube-apiserver address, or refuse
+# ------------------------------------------------------------------------------
+# Before the dataplane report, because this can end the step and the report cannot.
+print_step "Resolving the kube-apiserver address for egress rule 9"
+
+export KUBE_APISERVER_EGRESS_ENABLED="${KUBE_APISERVER_EGRESS_ENABLED:-true}"
+export KUBE_APISERVER_CIDRS=""
+
+if [ "${KUBE_APISERVER_EGRESS_ENABLED}" != "true" ]; then
+  print_warning "KUBE_APISERVER_EGRESS_ENABLED=${KUBE_APISERVER_EGRESS_ENABLED} — rule 9 will be OMITTED."
+  print_warning "The broker cannot TokenReview, read a FleetFreeze or write an ActionRecord without it."
+  print_warning "Every write will fail, and it will be reported as an authentication error."
+elif KUBE_APISERVER_CIDRS="$(resolve_apiserver_cidrs)"; then
+  export KUBE_APISERVER_CIDRS
+  if [ -n "${KUBE_APISERVER_CIDR:-}" ]; then
+    print_success "API-server egress: ${KUBE_APISERVER_CIDRS} (from KUBE_APISERVER_CIDR)"
+  else
+    print_success "API-server egress: ${KUBE_APISERVER_CIDRS} (auto-detected from the cluster)"
+  fi
+else
+  print_error "Could not resolve a kube-apiserver address, and rule 9 cannot be rendered without one."
+  print_error "Neither the 'kubernetes' Service ClusterIP nor the current context's server URL gave an"
+  print_error "IPv4 literal. A hostname is deliberately not resolved here — a policy pinned to whatever"
+  print_error "DNS answered at install time stops matching after a control-plane rotation, silently."
+  print_error "Set KUBE_APISERVER_CIDR in vars.sh to the address (or master range) pods actually reach,"
+  print_error "or set KUBE_APISERVER_EGRESS_ENABLED=false if you have decided the broker may not write."
+  exit 1
 fi
 
 # ------------------------------------------------------------------------------
@@ -162,4 +203,9 @@ if [ "${WORKLOAD_IDENTITY_ENABLED}" = "true" ]; then
   print_info "Workload Identity metadata allow: RENDERED (dataplane=${GKE_DATAPLANE}, ports only)."
 else
   print_info "Workload Identity metadata allow: ABSENT — the raw metadata endpoint is unreachable."
+fi
+if [ -n "${KUBE_APISERVER_CIDRS}" ]; then
+  print_info "kube-apiserver allow (rule 9): RENDERED for ${KUBE_APISERVER_CIDRS} on :443."
+else
+  print_warning "kube-apiserver allow (rule 9): ABSENT. The broker's write path is closed at the network."
 fi

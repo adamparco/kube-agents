@@ -80,6 +80,11 @@ WIDE_ENV = {
     "HUB_INFERENCE_CIDR": "10.10.0.0/28",
     "HUB_MINTY_CIDR": "10.10.0.16/28",
     "MCP_GROUNDING_CIDRS": "10.10.0.32/28,10.10.0.48/28",
+    # Rule 9. The installer resolves this from the cluster; the skill has to be told. Both halves
+    # are exercised here because the skill bundle is a SECOND install path for this tier — the
+    # installer applying rule 9 says nothing about what a tenant provisioned through the F4 cascade
+    # actually gets, and that gap is what P9-T7d-4 was closing.
+    "KUBE_APISERVER_CIDRS": "10.96.0.1/32,34.86.1.2/32",
 }
 WIDE_FLAGS = [
     "--workload-identity",
@@ -87,6 +92,7 @@ WIDE_FLAGS = [
     "--hub-inference-cidr", "10.10.0.0/28",
     "--hub-minty-cidr", "10.10.0.16/28",
     "--mcp-cidrs", "10.10.0.32/28,10.10.0.48/28",
+    "--kube-apiserver-cidrs", "10.96.0.1/32,34.86.1.2/32",
 ]
 
 PLACEHOLDER = re.compile(r"@@[A-Z_]+@@")

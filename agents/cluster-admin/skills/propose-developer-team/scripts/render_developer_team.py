@@ -102,6 +102,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--hub-minty-cidr", help="Hub Minty (token broker) private-endpoint CIDR (comma-separated).")
     p.add_argument("--mcp-cidrs", help="MCP grounding endpoint CIDRs (comma-separated).")
     p.add_argument(
+        "--kube-apiserver-cidrs",
+        help=(
+            "kube-apiserver address(es) the tenant's pods reach, comma-separated (egress rule 9). "
+            "UNLIKE THE WIDENINGS ABOVE, OMITTING THIS IS NOT THE SAFE DEFAULT: without rule 9 the "
+            "tenant agent cannot reach the API server at all, so every kubectl-shaped skill fails "
+            "and the broker can neither TokenReview nor write an ActionRecord for it. It has no "
+            "default because there is nothing to default to — the address is per-cluster and, on a "
+            "public GKE endpoint, a bare IP nobody publishes. The installer resolves it at apply "
+            "time (common.sh:resolve_apiserver_cidrs); this bundle is applied by the customer's "
+            "CI/CD instead, so the Cluster Admin Agent must supply it here or the reviewer must "
+            "add rule 9 by hand before merging."
+        ),
+    )
+    p.add_argument(
         "--workload-identity",
         action="store_true",
         help=(
@@ -194,6 +208,25 @@ def build_optional_egress_block(args: argparse.Namespace) -> str:
         args.mcp_cidrs,
         443,
     )
+    # Rule 9, mirroring common.sh:render_apiserver_block. Emitted last, and only when an address was
+    # given, for the same reason as everything above it — but read the --kube-apiserver-cidrs help
+    # before treating its absence as the conservative choice. It is the one omission here that
+    # breaks the agent rather than merely narrowing it.
+    apiserver = [c.strip() for c in (args.kube_apiserver_cidrs or "").split(",") if c.strip()]
+    if apiserver:
+        lines += [
+            "    # 9) The kube-apiserver. The BROKER cannot work without it — TokenReview (pipeline step 1),",
+            "    #    the FleetFreeze read (step 5) and the ActionRecord write (step 11) all go here — and the",
+            "    #    reader needs it for every kubectl-shaped skill. Reachability, not permission: RBAC and",
+            "    #    vap-agent-readonly still decide what the request is allowed to do.",
+            "    #    Resolved at install time by common.sh:resolve_apiserver_cidrs; both the in-cluster",
+            "    #    Service address and the control-plane endpoint are listed, because which one the",
+            "    #    dataplane sees depends on where it evaluates egress relative to DNAT.",
+            "    - to:",
+        ]
+        for c in apiserver:
+            lines += ["        - ipBlock:", f"            cidr: {c}"]
+        lines += ["      ports:", "        - protocol: TCP", "          port: 443"]
     return "\n".join(lines)
 
 
