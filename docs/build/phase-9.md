@@ -476,6 +476,28 @@ See "Why T7b stops at the render", "Why T7d split in two" and "Why T7d-2 split a
   needs, added to `netpol-agent-egress.yaml.template` as a rendered optional block with the
   control-plane CIDR supplied by `vars.sh`, plus the regenerated exemplars. Verified by
   `dev/tests/reference-render.py` at L0 and by V-ISO at L2 in P9-T9.
+- **P9-T7d-5** — **the install path for the identities T7d-3 just wrote.** Added 2026-07-28, and it
+  **runs before T7d-4**. Render the reader and actor `ServiceAccount`s, Roles and RoleBindings from
+  `common.sh` — the `render_tenant_quota` / `render_wi_metadata_block` idiom, one source and one
+  render with the exemplar derived — and apply them from a numbered provisioning step. Then close the
+  class: extend `dev/tests/install-path-wired.py` with a sixth property requiring every manifest under
+  `examples/gitops-repo/` to be applied by a step, rendered from a template the install path uses, an
+  input to a check or fixture, or **declared** inert with a reason.
+
+  **Why it exists.** T7d-3 shipped the actor identity into `policy/rbac-overlay/` and the per-cluster
+  bundles, and a user question at CHECKPOINT surfaced that **no `provision_NN_*.sh` step creates any
+  agent ServiceAccount, Role or RoleBinding at all** — the live reader SA is
+  `kubeagents-platform-agent` while the exemplar says `platform-agent`. So the actor SA the broker
+  Deployment references does not exist on any cluster, and the pod would not start. That is
+  [[LSN-039]], an escape against the already-closed [[LSN-007]]: `install-path-wired.py` walks the
+  _script_ graph and every one of its five properties passes on a repository whose steps run
+  perfectly and apply none of the security manifests. `common.sh:656` had already found and fixed the
+  same class for the tenant quota and the namespace default-deny without generalizing, so this is the
+  third instance.
+
+  **Deliberately not in scope**, by user decision: the 45 stale `app.kubernetes.io/managed-by: gitops`
+  sites across 24 files, and the 08 §2 / §2.7 / §4 "GitOps-managed" wording that contradicts 05 §C13
+  and 06 §4. Those are documentation and a spec correction; this is a pod that will not start.
 
 **Why T7d split in two.** Two reasons, and the second one changed what T7d-2 is allowed to contain.
 

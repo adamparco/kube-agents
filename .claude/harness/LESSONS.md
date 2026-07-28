@@ -66,6 +66,7 @@ will start selecting.
 | **LSN-035** | checks, mutation, negative-controls | A mutation survives, and the rule it broke turns out to be one no input can reach | **open** | — the ladder's own properties are now held by `TestLadderPropertiesHoldOverEveryAcceptedHistory`; the **general** check is for the next `harness-improve` |
 | **LSN-036** | checks, renderers, allowlists, controller | A uniqueness check goes red on correct code, and the one-line green is an allowlist entry | closed | `pause-is-not-scale-to-zero.py` file-keyed `ALLOWED_REPLICAS_RHS` + `BROKER_REPLICAS_CONST` + stale-owner arm (L0-CHAIN) · `TestPauseDoesNotChangeTheRenderedBroker` in `pause_not_scale_to_zero_test.go` |
 | **LSN-037** | builds, dockerfiles, ci, toolchain | An image build fails on symbols that `go build ./...` resolves fine | closed | `dev/tests/go-build-targets-packages.py` + `--negative-control` (L0-CHAIN) · package-path builds in all 3 Dockerfiles + 2 Makefile recipes |
+| **LSN-039** | wiring, completeness, manifests, install-path | The manifest is correct, the check that reads it is green, and no install path ever applies it | **open** | _planned: P9-T7d-5 — extend `install-path-wired.py` from step→driver reachability to manifest→install-path reachability_ |
 | **LSN-038** | checks, probes, discovery, negative-controls | A guard that fails safe still fails, and a green run is how it tells you | closed | `check_machinery_probes_resolve` + `CLOSED_MARKER` + the Go arm of `_invoked_by` in `invariants-gate.py` (L0-CHAIN) · `dev/test_invariants_gate.py` (19 negative controls) · `dev/tests/golex.py` shared by `scope-label-single-sourced.py` and `api-group-single-sourced.py` |
 
 **Open: 1 of 38** (LSN-035).
@@ -1910,3 +1911,62 @@ predicate that can only ever make the caller stricter — nobody writes a negati
 because the failure mode is not scary until the day it is the only thing standing between a correct
 change and a red build. Related: [[lsn-035]] (unreachable rules), [[lsn-036]] (enumeration goes
 stale), [[lsn-023]] (the prose satisfying the check).
+
+---
+
+## LSN-039 — Reachability was checked one link short
+
+**Tag:** wiring, completeness, manifests, install-path · **Status: open** · Mechanization planned in
+P9-T7d-5.
+
+**Trigger.** A user asked why `examples/gitops-repo/policy/rbac-overlay/developer-team.yaml` says
+`app.kubernetes.io/managed-by: gitops` when the design no longer has a GitOps control path. Chasing
+the label found the label was the smaller half. **No `provision_NN_*.sh` step creates any agent
+ServiceAccount, Role, or RoleBinding.** The live install's platform reader SA is
+`kubeagents-platform-agent` (`common.sh:262`); the exemplar those files describe says
+`platform-agent`. The tree under `examples/gitops-repo/` that six phases of checks have been reading,
+asserting against, and recording green is applied by nothing.
+
+**Why the existing mechanization did not catch it.** This is LSN-007 — "built, tested, and
+unreachable" — and LSN-007 **is closed**, by `dev/tests/install-path-wired.py`. That check is good
+and it is one link short. Its five properties are all about the *script* graph: every
+`provision_NN_*.sh` is invoked by `provision.sh`, every driver line names a script that exists,
+provision and teardown are symmetric and ordered. Every one of them passes on a repository in which
+the steps run perfectly and apply none of the security manifests, because nothing in it walks the
+other edge — **from a manifest to the step that applies it.** Its own docstring says the quiet part:
+_"Deliberately NOT checked: that a step does the right thing. This is reachability only."_ It is
+reachability of scripts. The manifests were never in the graph.
+
+`k8s-operator/scripts/common.sh:656` had already written the finding down, for a different pair of
+files, in 2026: _"Both manifests existed in examples/gitops-repo/ from Phase 3 and NO INSTALL PATH
+APPLIED EITHER — the same defect class as the egress policies (LSN-006/LSN-007)."_ It fixed those two
+by rendering them from `common.sh`, recorded the reasoning, and did not generalize. So the class has
+now been paid for **three times**: the egress policies, the tenant quota and default-deny, and every
+agent identity in the system.
+
+**The shape.** A closed lesson is closed against the instance that produced it. Its mechanization
+encodes the graph the author was looking at, and the next instance arrives one edge over — same
+class, different node type. The tell is a check whose docstring narrows its own claim ("this is
+reachability only", "this is the source half", "the L2 half is elsewhere"): every one of those
+sentences is honest, and collectively they are a map of where the class is still free to recur.
+A closed lesson should be re-read as _"what is the smallest change of node type that would walk past
+this?"_ — and if the answer is easy, the lesson is closed against an instance, not against a class.
+
+**Aggravating factor specific to this instance.** The exemplar tree is not obviously inert. It is
+version-controlled, prettier-formatted, referenced by name from the specs (06 §2 line 455), read by
+five `verify-phase*.sh` suites, applied selectively by `dev/cluster/up.sh` and by
+`provision_03`, and now checked by V-BRK-013. Every one of those makes it look load-bearing. Partial
+application is worse than none: it means "is this tree applied?" has the answer *yes, some of it*,
+and no reader can tell which files are in the some.
+
+**Mechanization (planned, P9-T7d-5).** Extend `install-path-wired.py` with a sixth property: every
+Kubernetes manifest under the exemplar tree is either (a) applied by a provisioning step, (b)
+rendered by `common.sh` from a template the install path uses, (c) an input to a check or fixture, or
+(d) **declared** inert, with a reason, in an explicit table — the declare-or-fail idiom from
+[[lsn-038]], so that "this file is documentation" is a claim someone made rather than a state
+something drifted into. Then create the identities from the install path so the answer for these
+files is (a).
+
+Related: [[lsn-007]] (the closed lesson this walked around), [[lsn-006]] (well-formed is not
+enforced — the same gap between an artifact and its effect), [[lsn-036]] (enumeration goes stale),
+[[lsn-035]] (a check whose subject was refactored away prints PASS forever).

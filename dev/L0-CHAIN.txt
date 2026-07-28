@@ -123,6 +123,20 @@ python3 dev/tests/scope-label-single-sourced.py --negative-control
 python3 dev/tests/one-broker-per-agent.py
 python3 dev/tests/one-broker-per-agent.py --negative-control
 
+# V-BRK-013 (P9-T7d-3): the broker-operations grant is written down once, in 06 §2.2.1, and every
+# copy of it agrees with THAT rather than with a sibling copy. The grant currently exists in six
+# places -- the spec, three copies of `vap-agent-readonly` (canonical, materialized, and the cascade
+# template rendered into clusters that do not exist yet), the tier overlays, and the per-cluster
+# identity bundles. Six copies of an allow-list is five chances for one to gain a verb, and the one
+# that gains it is the one enforced in the cluster nobody is looking at. Nothing else would notice:
+# RBAC is a union, so an extra rule silently grants; an allow-list entry nobody requests silently
+# does nothing; and the only artifact that disagrees is a design document. Checked in BOTH directions
+# -- 06 §2.2.1's point about `fleetfreezes` is that a DROPPED grant does not fail safe, it bricks the
+# tier permanently (06 §4.4). Copies are discovered by glob (LSN-036) and the floors are FAILs rather
+# than vacuous passes (LSN-035). `--negative-control` is the `¬` of 09 §6.
+python3 dev/tests/actor-grant-single-sourced.py
+python3 dev/tests/actor-grant-single-sourced.py --negative-control
+
 # --- builds compile whole packages (LSN-037) -------------------------------------------------
 # `go build cmd/broker/main.go` compiles one file and pretends the rest of the package is absent.
 # It is indistinguishable from the correct spelling until a package gains its second file, and then

@@ -1,0 +1,152 @@
+# VAP negative fixtures — the actor carve-out is an allow-list, not a hole (P9-T7d-3; 03 §4.2,
+# 06 §2.2.1).
+#
+# Every object here MUST be REJECTED at apply time by `kube-agents-agent-readonly`, and each one is a
+# plausible way the carve-out could have been written too wide. 03 §4.2 says the inversion is
+# decidable in CEL "only because the template is compiled into the policy as a literal allow-list";
+# these fixtures are what makes that claim falsifiable. Consumed by the dev verify harness
+# (tests/e2e/vap_negative_test.sh): each doc is applied and the apply is expected to FAIL with the
+# policy's message — a plain apply error (schema, RBAC, missing namespace) does NOT count, the denial
+# must provably come from the policy.
+#
+# kube-agents/expect-denied-by: kube-agents-agent-readonly
+#
+# DO NOT let CI/CD apply this file to a real cluster's policy tree — it lives under policy/tests/ and
+# is excluded from the actuation pipeline's apply paths; it is fixture input for the negative suite.
+#
+# Rule mapping (see vap-agent-readonly.yaml):
+#   docs 1-7 -> validation #3 (the actor allow-list)  message contains "actor RBAC may grant only"
+#   doc 8    -> validation #1 (read-verb allow-list)  message contains "read verbs"
+---
+# DOC 1 — `update` on actionrecords. EXPECT: DENIED by validation #3.
+# The single most important negative in the file. 06 §2.2.1: "the broker appends to the journal and
+# advances `status`; it can never rewrite or remove a record, including its own. Tampering with the
+# journal stays in the forbidden set (§3.3 rule 4) for every identity without exception." An actor
+# that can update an ActionRecord can rewrite the evidence of what it did, which makes invariant 3 —
+# every action is journalled — a claim about a mutable log.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vaptest-actor-journal-update
+  namespace: kubeagents-system
+  labels:
+    kube-agents/role: actor
+rules:
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["get", "list", "watch", "create", "update"] # `update` -> DENIED
+---
+# DOC 2 — `delete` on actionrecords. EXPECT: DENIED by validation #3.
+# The other half of doc 1, and worth its own fixture: an allow-list built by pattern rather than by
+# literal triple could plausibly permit one and not the other.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vaptest-actor-journal-delete
+  namespace: kubeagents-system
+  labels:
+    kube-agents/role: actor
+rules:
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["delete"] # -> DENIED
+---
+# DOC 3 — a tenant resource. EXPECT: DENIED by validation #3.
+# The per-tier tenant templates of 06 §2.2 are P10-T1. Until they land, an actor identity that
+# acquires `create deployments` has escaped the phase order that puts the journal, the classifier and
+# the undo path in front of the first write. This is the fixture that fails if someone lands the
+# tenant template early by editing an RBAC file instead of the policy.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vaptest-actor-tenant-write
+  namespace: team-x
+  labels:
+    kube-agents/tier: developer-team
+    kube-agents/role: actor
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create"] # tenant write -> DENIED
+---
+# DOC 4 — a tenant resource with READ verbs only. EXPECT: DENIED by validation #3.
+# The actor arm is an allow-list over (group, resource, verb) TRIPLES, not a write filter. An actor
+# identity is not a reader with extras: reading is the reader SA's job, and an actor Role that grants
+# `get secrets` widens the blast radius of the one credential in the system that can change things.
+# A carve-out written as "deny non-read verbs outside the grant" would admit this.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vaptest-actor-tenant-read
+  namespace: team-x
+  labels:
+    kube-agents/role: actor
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"] # read, but not in the grant -> DENIED
+---
+# DOC 5 — wildcards. EXPECT: DENIED by validation #3.
+# `*` is absent from the allow-list as a group, a resource and a verb, so the wildcard escape is
+# closed by construction rather than by a separate rule that could be forgotten. RBAC expands `*` at
+# evaluation time, not at admission time, so nothing downstream would have caught this.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vaptest-actor-wildcard
+  labels:
+    kube-agents/role: actor
+rules:
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["*"] # -> DENIED
+    verbs: ["*"] # -> DENIED
+---
+# DOC 6 — nonResourceURLs. EXPECT: DENIED by validation #3.
+# A rule with `nonResourceURLs` has no apiGroups and no resources, so a triple-based allow-list has
+# nothing to test and would vacuously admit it: `r.apiGroups.all(...)` over an empty list is TRUE in
+# CEL. That is why validation 3 leads with `!has(r.nonResourceURLs)` and requires all three lists to
+# be non-empty rather than only checking their contents. Vacuous truth is how an allow-list becomes
+# an allow-everything, and it does not look like a hole in a diff.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vaptest-actor-nonresource
+  labels:
+    kube-agents/role: actor
+rules:
+  - nonResourceURLs: ["/healthz", "/metrics"] # -> DENIED
+    verbs: ["get"]
+---
+# DOC 7 — an empty apiGroups list. EXPECT: DENIED by validation #3.
+# The same vacuity, reached a different way: `apiGroups: []` with a real resource and verb. Without
+# the `size(...) > 0` guards this rule passes every `.all()` in validation 3 while granting nothing
+# today — and grants whatever a later mutation puts in the list, from an object that admission has
+# already blessed once.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vaptest-actor-empty-groups
+  namespace: kubeagents-system
+  labels:
+    kube-agents/role: actor
+rules:
+  - apiGroups: [] # -> DENIED
+    resources: ["actionrecords"]
+    verbs: ["create"]
+---
+# DOC 8 — an UNLABELLED-role object with a write verb. EXPECT: DENIED by validation #1.
+# The asymmetry check, and the reason the read-only arm is written `variables.isActor || …` rather
+# than gated on `role: reader`. An agent RBAC object that forgets its role label must stay under the
+# blanket write denial. If the arms were `role == 'reader'` and `role == 'actor'`, this object would
+# escape both and be governed by neither — a hole opened by an omission rather than by an edit, which
+# is the kind nobody reviews. V-CTN-004 depends on this staying true.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vaptest-unlabelled-role-writer
+  labels:
+    kube-agents/tier: platform # no kube-agents/role at all
+rules:
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["create"] # in the actor grant, but this is not an actor -> DENIED

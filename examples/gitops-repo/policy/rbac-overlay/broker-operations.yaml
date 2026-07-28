@@ -1,0 +1,109 @@
+# Broker operations grant — 06 §2.2.1, shared by every actor identity in the fleet.
+#
+# The three tier files beside this one carry what an agent ACTS ON. This file carries what the
+# broker needs to run its own pipeline: authenticate the calling agent (step 1), append to the
+# journal and advance its status (step 11), read the brake and its own pause state (step 5), and
+# read the classification and approval inputs (steps 4 and 7). Without it the system cannot satisfy
+# invariant 3 at all — the broker would have no permission to write the journal it is required to
+# write, so every action would abort at the last step.
+#
+# 06 §2.2.1 says the grant is "identical across tiers and is not scoped… keeping it uniform means
+# one rule set to review rather than three". This file takes that literally: there is ONE ClusterRole
+# and ONE Role shape, and each tier binds to them. Three copies that must be kept byte-identical is
+# a property a reviewer has to check; one object is a property that cannot break.
+#
+# ── Why the grant is two objects and not one ───────────────────────────────────────────────────
+# 06 §2.2.1 presents the rule set as a single block "appended verbatim to every actor
+# Role/ClusterRole", but three of its resources are CLUSTER-SCOPED and cannot be granted by a
+# namespaced Role at all:
+#
+#   tokenreviews   — authentication.k8s.io, a non-persisted request API (nothing is stored)
+#   fleetfreezes   — kubeagents.x-k8s.io, scope: Cluster (the fleet-wide brake, by definition)
+#   changepolicies — kubeagents.x-k8s.io, scope: Cluster
+#
+# and four are namespaced (actionrecords, actionrecords/status, agents, approvalrosters). So the
+# grant splits along the API's own seam, and the split is chosen to put every write verb on a
+# PERSISTED object in the namespaced half:
+#
+#   ClusterRole (cluster-wide) — `create tokenreviews` plus three READS. The one write verb here
+#                                creates no object; it is the standard authenticating-webhook grant
+#                                (compare the built-in `system:auth-delegator`, which is not used
+#                                because it also confers `subjectaccessreviews` and this grant must
+#                                be EXACTLY 06 §2.2.1 — see V-BRK-013).
+#   Role (per namespace)       — `create actionrecords` and `update/patch actionrecords/status`,
+#                                the only verbs in the grant that change stored state, bound by a
+#                                RoleBinding in each namespace that hosts an agent.
+#
+# That ordering is what 08 §2.7 asks for in its normative paragraph — "the controller holds no
+# cluster-wide write verb on any workload or Secret resource… a ClusterRoleBinding conferring any of
+# those is a conformance failure". That paragraph governs the CONTROLLER's RBAC, not the actor's, so
+# it does not bind here by its own terms; the actor is held to the same standard anyway, because the
+# reason behind it is identical and an actor credential is the more valuable one to steal.
+#
+# ── What is deliberately NOT here ──────────────────────────────────────────────────────────────
+# `update` and `delete` on `actionrecords`. The broker appends to the journal and advances `status`;
+# it can never rewrite or remove a record, including its own. Journal tampering stays in the
+# forbidden set for every identity without exception (06 §2.2.1, 03 §3.3 rule 4). If you are here
+# because something needs to correct a record: it does not. Write a new one.
+#
+# Enforced by `vap-agent-readonly` validation 3, which compiles this exact rule set in as literal
+# (apiGroup, resource, verb) triples, and asserted at L0 by
+# `dev/tests/actor-grant-single-sourced.py` against 06 §2.2.1 itself (V-BRK-013).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeagents-broker-operations
+  labels:
+    # No `kube-agents/tier`: the grant is tier-neutral by specification, and stamping a tier on a
+    # shared object would be a lie the VAP would then enforce. `kube-agents/role: actor` is what
+    # selects it into the policy's actor arm — which is why the policy's match condition tests for
+    # either label rather than for tier alone.
+    kube-agents/role: actor
+    app.kubernetes.io/managed-by: gitops
+rules:
+  # step 1: authenticate the calling agent. Creates nothing; TokenReview is a request object.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # step 5: the brake — MUST be readable by every tier. A tier that cannot read the freeze object
+  # fails closed permanently (06 §4.4), so omitting this does not fail safe, it bricks the tier.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["fleetfreezes"]
+    verbs: ["get", "list", "watch"]
+  # step 4: classification input.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["changepolicies"]
+    verbs: ["get", "list", "watch"]
+---
+# The namespaced half. One instance per namespace that hosts an agent — this one is the
+# `kubeagents-system` instance, which serves the platform and cluster-admin tiers; the team-x
+# instance ships in that namespace's own bundle (clusters/cluster-a/namespaces/team-x/).
+#
+# A Role rather than a ClusterRole because these four resources are namespaced and because the two
+# state-changing verbs in the whole grant live here: an actor can append to the journal in ITS OWN
+# namespace and nowhere else. A ClusterRole would make the journal fleet-wide-writable, which is the
+# fleet-wide-writer shape V-BRK-012 exists to forbid one layer down.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubeagents-broker-operations
+  namespace: kubeagents-system
+  labels:
+    kube-agents/role: actor
+    app.kubernetes.io/managed-by: gitops
+rules:
+  # step 11: journal — the broker owns its own records. `create` but never `update`/`delete`.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords/status"]
+    verbs: ["get", "update", "patch"]
+  # step 5: its own pause state.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["agents"]
+    verbs: ["get", "list", "watch"]
+  # step 7: approval input.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["approvalrosters"]
+    verbs: ["get", "list", "watch"]
