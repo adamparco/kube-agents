@@ -293,8 +293,47 @@ definition site with 16 new corpus cases (§M, three of them negative) and recor
 **T4 claims V-REV-003 and V-REV-004 at L1 only.** V-REV-001 (coverage over executed
 `ActionRecord`s) and V-REV-009 (a destructive undo is itself gated) are listed L2-only in 09 §5 and
 belong to units that do not exist yet — there is nothing executing and no undo controller to gate.
-The L2 instances of 003 and 004 need an envtest round-trip against a real API server, which is
-**P9-T5**'s, since that is where the executor that produces the pre-states first exists.
+
+**A level correction to that sentence, made in T5a rather than inherited.** The paragraph above
+originally said the **L2** instances of V-REV-003/004 "need an envtest round-trip against a real API
+server, which is P9-T5's". Envtest is **L1** by `binding.md` §Targets — a real API server, but
+process-local, no cluster. So the **L2 instances still require `gke-scratch-kube-agents-dev` and
+stay open**, assigned to the `broker-execute-l2.sh` line in P9-T9. T5a does not strengthen them at
+L1 either: nothing in the executor invokes the undo generator, so no round-trip runs at any level
+here — what T5a contributes is the pre-state snapshot those L2 instances will be diffed against.
+Recording the correction because the alternative — letting a unit quietly redefine a level to the
+one it can reach — is how a phase ratchet stops meaning anything.
+
+**P9-T5 ships as two units**, the same seam as T3a/T3b and P8-T8a/b/c. The row is not one
+deliverable: it is the write path and everything that happens after the write, and they fit
+together only in the sense that one runs after the other.
+
+- **P9-T5a** — the write path. `internal/broker/execute/`: the field manager (produced in one place,
+  with its inverse), the one diff used at both ends of the pipeline, snapshot capture with the
+  all-or-nothing rule, the executor's three orderings (dry-run-all-then-mutate, write-ahead journal,
+  integrity-before-apply), and the API-server-backed `Reader`/`Applier`. **Claims exactly one check:
+  V-BRK-020 at L1**, which is the only one of the five whose 09 §6 row lists an L1 instance at all.
+  V-BRK-006 is `L2, L4`; V-BRK-018 and V-BRK-019 are `L2`; V-REV-002 is `L2` and phase 10. The
+  property each names is implemented here and asserted by the suite — the write-ahead ordering as an
+  exact call sequence, all-or-nothing snapshotting including the two-of-three case the check text
+  names, the field-manager string and the dry-run-precedes-apply ordering — but **a property proven
+  at a level the check does not list is not that check passing**, and the honest record is an
+  implementation with its L2 instance still open. All four go to `broker-execute-l2.sh` in P9-T9.
+  This is the same discipline that kept V-GAT-012/022 unclaimed in T3a and the L2 halves of
+  V-REV-003/004 unclaimed in T4; writing it down again because the temptation is strongest exactly
+  when the evidence is good.
+- **P9-T5b** — what happens after the write. `internal/broker/verify/`: the per-kind verification
+  predicates of 04 §5.1 with their settle windows, transient-versus-terminal classification, the
+  recovery ladder in `status.recovery` with no silently skipped rungs, automatic rollback and the
+  cooldown that follows it, rollback-failure paging plus auto-pause, and the selector fan-out
+  expanded once against live state before classification. Covers V-BRK-014, V-REV-005/006.
+
+**Two scope boundaries T5a leaves open, stated rather than left to be discovered.** (1) `Executor`
+has no caller — `broker.Pipeline` is still `UnavailablePipeline`, because the thing that would
+assemble a Request from an envelope needs the brake (T6) and the controller wiring (T7) to exist.
+(2) A `patch` against an API that does not honour dry-run is **refused**, not executed. The broker
+will not model a server-side merge itself, and modelling it is the only other option: a guessed
+merge produces an integrity check that passes on exactly the payload V-BRK-020 exists to catch.
 
 ---
 
