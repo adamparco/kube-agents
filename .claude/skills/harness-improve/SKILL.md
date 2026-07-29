@@ -31,6 +31,9 @@ From the ledger (`binding.md` §State) and `.claude/harness/LESSONS.md`:
 4. **The uncovered-requirements list** (V-MET-009 publishes it; a count is not enough).
 5. **Recent halts**, with what unblocked them.
 6. **The diff of the phase just completed.**
+7. **`## Refused` in `docs/build/BACKLOG.md`** — every item the harness argued its way out of
+   since the last pass. A refusal that keeps recurring is either a real gap the harness cannot
+   see, or an argument that was wrong the first time; both are this pass's business.
 
 Metrics are inputs, never targets. Optimising cycle time directly invites SELF-IMPROVEMENT §4.
 

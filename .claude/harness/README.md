@@ -35,6 +35,7 @@ only the entry point.
 | `../skills/harness-*/SKILL.md`                        | The four skills above                                                                                                                    |
 | `../../docs/build/LEDGER.md`                          | **All state.** Read first, written last, every run                                                                                       |
 | `../../docs/build/phase-<N>.md`                       | The current phase's task breakdown, tasks bound to check IDs                                                                             |
+| `../../docs/build/BACKLOG.md`                         | **The human inbox.** Append findings here any time, even mid-unit; drained at the next ORIENT                                            |
 | `../../docs/design/09-verification-and-validation.md` | The conformance spec: every check ID, level, gate class, and the phase ratchet                                                           |
 
 ## Running it

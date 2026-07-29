@@ -75,6 +75,7 @@ If the task is "advance the build", read `.claude/harness/README.md` and `PROTOC
 
 - **`.claude/harness/binding.md` is the lookup table for every project-specific value** — spec paths, gates, build/test commands, cluster targets, preconditions P1–P10, branching, merge rules, thresholds. If a value there is stale, fix it there; never work around it in a skill or a check.
 - **All state lives in `docs/build/LEDGER.md`** — read first, written last, every session. Phase task breakdowns are `docs/build/phase-<N>.md`.
+- **`docs/build/BACKLOG.md` is the human inbox** — the one harness file a person may append to at any time, including mid-unit, without racing a write. It changes nothing until the next ORIENT, which drains it and schedules each item. Never resolve an item from it in the middle of a unit.
 - **`docs/design/01`–`09`** is the source of truth; `09-verification-and-validation.md` is the conformance spec (check IDs `V-<SUITE>-<nnn>`, never reused or renumbered).
 - **`.claude/harness/LESSONS.md`** records every mistake this repo has already paid for and the mechanized check that now catches it. Read the ones tagged for the area you are touching — most of the surprising rules in this file trace to one.
 - Verdicts are `pass` / `fail` / `deferred`. A check that could not run its property is `deferred` with a named blocker, never `pass`.

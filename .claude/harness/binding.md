@@ -30,6 +30,7 @@ a skill, a task, or a check.
 | Artifact                     | Path                                            | Note                                                              |
 | ---------------------------- | ----------------------------------------------- | ----------------------------------------------------------------- |
 | **Ledger**                   | `docs/build/LEDGER.md`                          | Read first, written last, every invocation                        |
+| **Human backlog**            | `docs/build/BACKLOG.md`                         | Humans append; the harness DRAINS IT AT ORIENT and nowhere else   |
 | **Phase breakdown**          | `docs/build/phase-<N>.md`                       | Written on entering a phase; tasks bound to check IDs             |
 | **Lesson store**             | `.claude/harness/LESSONS.md`                    | Read the lessons tagged for the area you are about to touch       |
 | **Run manifest**             | `verification/manifest-<phase>-<YYYYMMDD>.csv`  | 09 §9.4 schema; created by `harness-verify` on the first full run |
