@@ -93,44 +93,12 @@ type Journal interface {
 	List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error
 }
 
-// Accountant supplies row 7's counters: the 04 §4.2 initiative budget and flap state.
-//
-// A required dependency rather than an optional one, and that is the entire point of its existing
-// at this stage. broker.BrakeBudget is the one brake input whose zero value PERMITS -- by design,
-// because a zero tally means an agent that has done nothing yet rather than a broker that cannot
-// see. The cost of that design is that an unwired accountant is indistinguishable from a quiet
-// agent, and row 7 would be switched off with nothing to show for it.
-//
-// Making the field required means the absence has to be spelled, in code, at the wiring site, as
-// the word Unaccounted. See [[LSN-031]]: "every rule passes its own test and three of them are
-// switched off".
-type Accountant interface {
-	Budget(ctx context.Context, agent *agentv1alpha1.Agent) broker.BrakeBudget
-}
-
-// Unaccounted is the Accountant that counts nothing, for the interval before the real one exists.
-//
-// It returns the zero BrakeBudget, which permits, so a Source wired with this one cannot fire row 7
-// at all. That is a real hole and it is named rather than hidden: a reader of the wiring site sees
-// the word and can grep for it, which is not true of a struct field somebody left at its default.
-//
-// P9-T7c-3d-ii replaces it. Until then, no budget is enforced in production and the L1 coverage of
-// row 7 is coverage of broker.Decide, not of this path.
-type Unaccounted struct{}
-
-// Budget returns the zero budget: nothing spent, nothing flapping, nothing counted.
-func (Unaccounted) Budget(context.Context, *agentv1alpha1.Agent) broker.BrakeBudget {
-	return broker.BrakeBudget{}
-}
-
 // SourceConfig assembles a Source. Every field is required except CacheTTL and Now.
 type SourceConfig struct {
 	// Reader reads the Agent, the FleetFreeze list and the ApprovalRoster.
 	Reader Reader
 	// Journal is probed for reachability (row 3).
 	Journal Journal
-	// Accountant supplies row 7. Pass Unaccounted{} to state explicitly that nothing is counted.
-	Accountant Accountant
 
 	// AgentName and Namespace identify the Agent CR this broker serves. From the broker's own
 	// deployment, never from an envelope -- the same rule pipeline.Config states for its copies.
@@ -153,13 +121,12 @@ type SourceConfig struct {
 // broker that can see some things and not others, and is the situation 06 §4.4's per-row structure
 // is written for.
 type Source struct {
-	reader     Reader
-	journal    Journal
-	accountant Accountant
-	agentName  string
-	namespace  string
-	ttl        time.Duration
-	now        func() time.Time
+	reader    Reader
+	journal   Journal
+	agentName string
+	namespace string
+	ttl       time.Duration
+	now       func() time.Time
 
 	mu sync.Mutex
 	// Each value is paired with when its read last succeeded. A zero time means never.
@@ -185,8 +152,6 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 		return nil, errors.New("brake: a Reader is required; a source that cannot read the Agent CR would report every agent as unreadable and refuse every action (06 §4.4 row 2)")
 	case cfg.Journal == nil:
 		return nil, errors.New("brake: a Journal is required; row 3 is a probe, and a source that never probes would report the journal unobserved, which refuses")
-	case cfg.Accountant == nil:
-		return nil, errors.New("brake: an Accountant is required; pass brake.Unaccounted{} to state explicitly that 04 §4.2 budgets are not yet counted, because the zero BrakeBudget PERMITS and a forgotten field would switch row 7 off silently")
 	case cfg.AgentName == "":
 		return nil, errors.New("brake: an AgentName is required; the brake is about one agent and an empty name would Get the wrong object or none")
 	case cfg.Namespace == "":
@@ -207,13 +172,12 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 		cfg.Now = time.Now
 	}
 	return &Source{
-		reader:     cfg.Reader,
-		journal:    cfg.Journal,
-		accountant: cfg.Accountant,
-		agentName:  cfg.AgentName,
-		namespace:  cfg.Namespace,
-		ttl:        cfg.CacheTTL,
-		now:        cfg.Now,
+		reader:    cfg.Reader,
+		journal:   cfg.Journal,
+		agentName: cfg.AgentName,
+		namespace: cfg.Namespace,
+		ttl:       cfg.CacheTTL,
+		now:       cfg.Now,
 	}, nil
 }
 
@@ -386,7 +350,6 @@ func (s *Source) assemble(ctx context.Context, now time.Time) pipeline.BrakeView
 		Agent:   agent,
 		Freezes: freezes,
 		Roster:  roster,
-		Budget:  s.accountant.Budget(ctx, agent),
 		Journal: signal,
 	}
 }

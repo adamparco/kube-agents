@@ -78,7 +78,9 @@ will start selecting.
 
 | **LSN-047** | mutation, tooling, harness, near-miss | The mutation sweep reports a clean restore and one of the files it restored is now the other one | **open** | — `dev/mutate.sh` already snapshots by **index** and is the fix; nothing makes the harness reach for it. Candidate form is a skill change (`harness-run` VERIFY), scheduled for the next improvement pass |
 
-**Open: 2 of 47** (LSN-040, LSN-047).
+| **LSN-048** | mutation, tooling, checks, vacuity, false-finding | A mutation sweep names a test that does not exist, and reports the mutation as **survived** — a hole that is not there, indistinguishable from one that is | **open** | — `go test -run` with a pattern matching nothing **exits 0**, so `! check` is false and the mutation scores as uncaught. Fix is a `go test -list` guard before every mutation; same home as [[LSN-047]] (`dev/mutate.sh` / `harness-run` §5), scheduled for the next improvement pass so the two land together |
+
+**Open: 3 of 48** (LSN-040, LSN-047, LSN-048).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2597,3 +2599,56 @@ Related: [[lsn-022]] (the original: a git-shaped revert answering "what should t
 instead of "what did it contain a moment ago"), [[lsn-030]] (the same class again, one verb over),
 [[lsn-019]] (a closed lesson whose mechanization is not on any path the work takes), [[lsn-035]] (an
 operation that verifies it ran rather than that it worked).
+
+---
+
+## LSN-048 — The sweep could not find its own test, and called that a hole
+
+**Tag:** mutation, tooling, checks, vacuity, false-finding · **Status: open** (same home and same
+pass as [[lsn-047]]).
+
+**Trigger.** The P9-T7c-3d-ii-a mutation sweep, eight mutations over `broker/brake.go` and
+`pipeline/pipeline.go`. It came back **5/8**, with three lines reading
+`SURVIVED  <-- the check does not detect this`.
+
+**The finding.** All three "survivors" named a test that does not exist. The sweep ran
+`go test ./internal/broker -run 'TestBrakeFailClosed'`; the table test in that package is called
+`TestBrakeEachRuleFiresInIsolation`. A `-run` pattern that matches nothing prints
+`testing: warning: no tests to run` and **exits 0** — so the composing idiom this repo sanctioned in
+[[lsn-047]], `dev/mutate.sh f -- sh -c 'mutate && ! check'`, evaluates `! 0` as false and scores the
+mutation uncaught. Nothing about `dev/mutate.sh` is wrong here; it restored both files byte-perfectly
+every time. The tool cannot see the `-run` pattern, and the pattern is the part that was broken.
+
+**Why the direction of the lie is the whole lesson.** A sweep that falsely reported CAUGHT would be
+a silent false green, and this repository has a well-developed reflex for that shape. This one
+falsely reports a **hole** — which does not read as a malfunction, it reads as a *result*. The
+natural next move on a survivor is to go strengthen the test. That test would pass on the first run,
+because the property was already covered; it would look exactly like the fix; and the three
+mutations would still never have been evaluated even once. The sweep's verdict on them is
+**unknown**, and it is presented as known. A false red that recommends a plausible action is worse
+than a false red that merely wastes time.
+
+Two of the three, once the pattern resolved, were mutations worth catching: `IsUndo() -> true`,
+which exempts **every** action from pause and freeze, and a row 7 that refuses without escalating —
+a refusal nobody is ever told about. Both are caught. Had the three been "fixed" by adding tests for
+the imagined holes, the sweep would have gone green at 8/8 with those two mutations still unmeasured.
+
+**Class.** [[lsn-035]] applied to the harness instead of to a check: an operation that verifies it
+*ran* rather than that it *worked*. It is also a near neighbour of [[lsn-038]] — there, the
+predicate nobody writes a negative control for is the one that can only make its caller *stricter*;
+here it is the one that can only make the sweep look *worse*. Both survive review for the same
+reason: erring in the safe-looking direction is not read as erring.
+
+**Mechanization, and why it is open.** A `go test -list <pattern>` probe before each mutation: if it
+selects zero tests, print `BROKEN SWEEP` and score the mutation as neither caught nor survived, so
+the count cannot silently shrink either. That guard produced this unit's 8/8 and lives in a
+throwaway script, which is precisely the [[lsn-047]] condition. `dev/mutate.sh` is the wrong home —
+it takes `-- COMMAND [ARGS...]` and has no business parsing a `go test` invocation — so the
+enforceable form is the same `harness-run` §5 skill change LSN-047 is waiting on: a sweep should be
+**configured, not authored**, and the sanctioned configuration should carry the guard. The two land
+together or the next unit re-earns whichever one it forgets.
+
+Related: [[lsn-047]] (the sanctioned mutation tool that nothing routes work to), [[lsn-035]] (a
+negative control only proves the suite fails, never which rule), [[lsn-038]] (the input nobody
+validates because it can only fail in the safe direction), [[lsn-019]] (a mechanization off the path
+the work takes).
