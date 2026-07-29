@@ -323,6 +323,7 @@ type rig struct {
 	pauser  *fakePauser
 	records *fakeRecords
 	brake   *fakeBrake
+	budget  *solventLedger
 	classes *fakeClassifierSource
 
 	pipeline *Pipeline
@@ -450,6 +451,7 @@ func newRig(t *testing.T, tweaks ...func(*rig)) *rig {
 			Freezes: &broker.FreezeView{ObservedAt: testClock},
 			Journal: broker.BrakeOK,
 		}},
+		budget:  &solventLedger{},
 		classes: &fakeClassifierSource{c: mustClassifier(t, nil)},
 	}
 	for _, tw := range tweaks {
@@ -476,10 +478,11 @@ func newRig(t *testing.T, tweaks ...func(*rig)) *rig {
 			Sleep:        func(context.Context, time.Duration) error { return nil },
 			PollInterval: time.Millisecond,
 		},
-		Records:   r.records,
-		Brake:     r.brake,
-		Contested: broker.NewContestedIndex(),
-		Now:       func() time.Time { return testClock },
+		Records:    r.records,
+		Brake:      r.brake,
+		Accountant: r.budget,
+		Contested:  broker.NewContestedIndex(),
+		Now:        func() time.Time { return testClock },
 	})
 	if err != nil {
 		t.Fatalf("pipeline.New: %v", err)
@@ -967,6 +970,92 @@ func TestAnUnknownPolicySetRefusesRatherThanFallingBackToTheFloor(t *testing.T) 
 	assertNoStepAfter(t, tr, broker.StepClassify)
 	if r.applier.mutations != 0 || r.applier.dryRuns != 0 {
 		t.Errorf("an unclassified action reached the applier: %d dry runs, %d mutations", r.applier.dryRuns, r.applier.mutations)
+	}
+}
+
+// solventLedger is broker.Accountant for the rig: every action is within budget, so row 7 never
+// fires and the step under test is the one the case is named for.
+//
+// It records what it was asked, because the point of the accountant being a queried dependency
+// rather than an observed value is that it gets the ACTION -- see TestTheAccountantIsAskedAboutThisAction.
+type solventLedger struct{ asked []broker.BudgetQuery }
+
+func (l *solventLedger) Budget(q broker.BudgetQuery) broker.BrakeBudget {
+	l.asked = append(l.asked, q)
+	return broker.BrakeBudget{}
+}
+
+// TestTheAccountantIsAskedAboutThisAction. Row 7 budgets an agent's {origin, class} bucket and
+// flaps per target (04 §4.2, 06 §1.1), so an accountant handed only the agent cannot answer it.
+// This is the assertion that the per-action dimensions actually cross the seam -- the previous
+// shape gathered the budget in pipeline.BrakeView, before the envelope was even classified, and
+// nothing failed.
+func TestTheAccountantIsAskedAboutThisAction(t *testing.T) {
+	r := newRig(t)
+	env := createEnvelope()
+	if _, _, err := r.submit(env); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	if len(r.budget.asked) != 1 {
+		t.Fatalf("the accountant was asked %d times, want exactly once (at the gate)", len(r.budget.asked))
+	}
+	q := r.budget.asked[0]
+	if q.Trigger != agentv1alpha1.ActionTriggerSource(env.Trigger.Source) {
+		t.Errorf("Trigger = %q, want the envelope's %q; the origin partition of 06 §1.1 cannot be applied without it", q.Trigger, env.Trigger.Source)
+	}
+	if q.Class == "" {
+		t.Error("Class is empty; each origin has a per-class bucket and an unclassified query cannot pick one")
+	}
+	if len(q.Targets) == 0 {
+		t.Error("Targets is empty; the flap threshold is counted per target")
+	}
+	if q.Agent == nil {
+		t.Error("Agent is nil; spec.operations.initiativeBudget is the ceiling half of the question")
+	}
+	if !q.Now.Equal(testClock) {
+		t.Errorf("Now = %s, want the decision instant %s, so the accountant and the brake agree which hour this is", q.Now, testClock)
+	}
+}
+
+// TestNewRejectsAPipelineThatCannotCountItsOwnSpend. The other half of row 7, and the half a unit
+// test of broker.Decide cannot reach: a nil Accountant refuses every action at runtime, which is
+// safe but is a broker that 503s in production over a wiring mistake. It has to fail at startup.
+//
+// This is the assertion that would have caught the shape this seam replaced. Before it, the budget
+// was a field on the observed BrakeView, an unwired one was the zero BrakeBudget, and the zero
+// BrakeBudget permits -- so a broker with no accountant was constructible, started clean, and
+// enforced nothing ([[LSN-031]]).
+func TestNewRejectsAPipelineThatCannotCountItsOwnSpend(t *testing.T) {
+	full := func() Config {
+		return Config{
+			AgentName:  testAgent,
+			Namespace:  testNamespace,
+			Classifier: &fakeClassifierSource{c: mustClassifier(t, nil)},
+			Live:       &fakeLive{},
+			Refs:       fakeRefs{},
+			Reader:     &fakeReader{},
+			Executor:   &execute.Executor{Applier: &fakeApplier{}, Journal: fakeWriteAhead{}},
+			Verifier:   &verify.Driver{},
+			Records:    &fakeRecords{},
+			Brake:      &fakeBrake{},
+			Accountant: &solventLedger{},
+			Contested:  broker.NewContestedIndex(),
+		}
+	}
+
+	if _, err := New(full()); err != nil {
+		t.Fatalf("the reference Config was rejected, so the case below proves nothing: %v", err)
+	}
+
+	cfg := full()
+	cfg.Accountant = nil
+	_, err := New(cfg)
+	if err == nil {
+		t.Fatal("New accepted a Config with no Accountant; row 7 would refuse every action at request time instead of failing at boot")
+	}
+	if !strings.Contains(err.Error(), "Accountant") {
+		t.Fatalf("the error must name what is missing: %v", err)
 	}
 }
 

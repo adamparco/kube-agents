@@ -785,11 +785,66 @@ type safety over a value nothing in this process reads. They are rendered as `un
       - **P9-T7c-3d-ii** — the 04 §4.2 budget and flap accountant, which fills the fifth input,
         `BrakeBudget` (row 7). Split out because it is not a read: it is journal-derived
         accounting over windows and thresholds, the same shape and size as the `cooldown` source
-        T7c-3c-iii spent a whole unit on. **Until it lands, row 7 cannot fire in production** —
-        `BrakeBudget`'s zero value permits by deliberate design, and every current construction
-        site of a non-zero one is a test fake. That is a live [[LSN-031]] shape ("every rule passes
-        its own test and three of them are switched off") and i records it as a named residual
-        rather than letting the wiring imply the row works.
+        T7c-3c-iii spent a whole unit on. **Split again, at ORIENT for ii, under the
+        `harness-run` §2 sizing rule** — the seam turned out to be wrong, not merely unfilled, and
+        fixing a cross-package seam plus writing a `cooldown`-sized package plus adding an API
+        defaults helper is three units in a coat.
+        - **P9-T7c-3d-ii-a** ✅ **done 2026-07-29** — **the seam.** `broker.Accountant` +
+          `BudgetQuery{Agent, Trigger, Class, Targets, Now}`, queried from `pipeline.Config` at
+          decision time. T7c-3d-i had put the accountant on `brake.SourceConfig`, reachable only
+          through `pipeline.BrakeSource.Observe` — a **per-agent** observation taken **before**
+          classification — but 04 §4.2 budgets an agent's `{origin, class}` bucket and flaps per
+          target, so that accountant could never answer the question the spec poses. Row 8's
+          `ContestedIndex` already had the right shape. `BrakeView.Budget`, `brake.Accountant`,
+          `brake.Unaccounted` and `brake.SourceConfig.Accountant` are **deleted**. A nil accountant
+          now refuses and escalates; a zero `BrakeBudget` still permits, and those two stopped
+          being the same value. **V-CTR-018**, L1.
+        - **P9-T7c-3d-ii-b** — **the accountant.** `internal/broker/budget.Source`: the
+          journal-derived fold, `EffectiveInitiativeBudget()` over the 06 §1.1 defaults, and the
+          origin partition. **V-PRO-029**, L1, the true sibling of V-PRO-028 (same suite, same
+          source, same level, same phase, same journal-derived-and-refuses-when-blind argument).
+          Until it lands row 7 fires only on the nil-accountant arm — the numbers are not counted
+          yet, but the row can no longer be switched off, which is the part ii-a bought.
+
+          **Recon 2026-07-29 — what ii-b must settle at PLAN, before any code.** The mechanical
+          model is **`policy.Source`, not `cooldown.Source`**: cooldown refreshes lazily from inside
+          a ctx-taking method, which `Accountant.Budget(q) BrakeBudget` cannot do. Copy cooldown's
+          _derivation and test structure_; copy policy's `Refresh(ctx) error` + `Run(ctx)` ticker +
+          ctx-free `Current()` _lifecycle_. Six things the spec does not settle, each to be recorded
+          as a decision or escalated:
+          - **The window model is contradictory and it changes the refusal.** 04 §4.2 and 06 §1.1
+            say "rolling"; but `status.budget` carries `windowStart`/`dayWindowStart` with a
+            clock-aligned example, and 06 requires `retryAfterSeconds` "to the next **window
+            boundary**", which a sliding window does not have. If no reading preserves both, that is
+            PROTOCOL §8.5 and a halt — do not pick a side quietly.
+          - **Flap's `(target, intent)` key is unimplementable as written.** `spec.intent` is
+            free-text model prose, and `internal/broker/idempotency.go` **deliberately excludes** it
+            from the idempotency key for exactly this reason ("a retry that reworded itself would
+            compute a different key"). Keyed literally on intent, flap under-fires against an LLM
+            that rewords. No canonical intent identity exists anywhere in the tree.
+          - `> N` vs `>= N` is undetermined (04 says "more than _N_"; 06 says "repeats", default 3),
+            and **oscillation has no threshold or window at all** despite V-PRO-016 asserting it.
+          - **The 06 §1.1 defaults exist in no Go file** — only the _ceilings_ do, in
+            `internal/webhook/agent_webhook.go`. `EffectiveInitiativeBudget()` introduces the default
+            table to Go for the first time; put defaults **and** ceilings in `api/v1alpha1` and have
+            the webhook import them, or the two copies drift. Follow `ApprovalRoster.EffectiveTTL`,
+            which already documents the right asymmetry: admission **rejects** an over-ceiling leaf,
+            the runtime **clamps** one that got in anyway.
+          - **A cold accountant must report `Exhausted: true`.** `Budget` has no error channel and a
+            zero `BrakeBudget` permits, so "I have not read the journal yet" must be encoded as a
+            refusal with a distinguishable `Detail` — otherwise every broker restart silently
+            disables row 7, which is the hole ii-a just closed. **That clause is the heart of
+            V-PRO-029** and has no V-PRO-028 analogue.
+          - **Out of scope but must not be assumed done:** `AgentStatus` has no `budget` field and
+            the broker has **no write verb on `agents`** (V-BRK-013, BLOCKING-ALWAYS), so 06's "names
+            the empty bucket in `status.budget.exhaustedBuckets`" needs a controller, not the broker.
+            Likewise `retryAfterSeconds` is currently the flat `PausedRetryAfterSeconds` (60), and
+            `BrakeBudget` has no field an accountant could use to supply the real one.
+
+          The journal _can_ answer the partition — `kube-agents/trigger` × `kube-agents/risk-class`
+          are both labels — but there is **no agent-name label** (only tier and a non-injective scope
+          leaf, so filter client-side on `Spec.AgentRef`) and **no time index** (filter client-side,
+          exactly as `cooldown.derive` already does).
       - **P9-T7c-3d-iii** — the two small journal-derived adapters the pipeline needs and nobody
         wrote: `execute.Journal` (`ConfirmDurable`, three test stubs and no implementation — with
         it nil, `Executor.Journal` is nil and **every non-dry-run execution fails the write-ahead
@@ -803,7 +858,43 @@ type safety over a value nothing in this process reads. They are rendered as `un
         "the pipeline is constructed in `main.go`", and `install-path-wired.py` never reads Go.
   - **P9-T7c-4** — **the classify→execute integrity seam for `apply`, `scale` and merge-patch.**
     See LSN-040. Today only `create`, `delete` and JSON-patch `patch` traverse the pipeline; the
-    other three fail closed at step 9.
+    other three fail closed at step 9. **Checks: V-BRK-022** (new, L1) — _every verb in the
+    envelope's closed verb enum executes end to end through the assembled pipeline, with the verb
+    set **discovered from the enum**_, which is LSN-040's own mechanization clause and the reason a
+    hand-written table would have printed green throughout; plus **V-BRK-020** (the diff/integrity
+    property this seam is the missing half of). Recon 2026-07-29 found five things the entry did
+    not say:
+    - **It is two fixes, not one.** `apply` refuses at `execute/integrity.go`'s `checkWholeObject`
+      `default:` arm (`WholeObject=true`, which only `create`/`delete` may be); `scale` and
+      merge-patch refuse at the earlier "shown no changed fields" arm (`WholeObject=false`,
+      `TouchedPaths=nil`). `TestApplyFailsClosedAtTheIntegrityCheck` pins only the first; **nothing
+      pins `scale` or merge-patch.**
+    - **The SSOT is already named and already unwired.** `execute/diff.go`'s own doc says `Diff` is
+      "called twice per action and the two calls are the whole of V-BRK-020" — call #1, before
+      classification, **does not exist**. The fix is a reorder inside `pipeline.stepResolve`:
+      `CaptureAll` already runs four lines later, so `snap.Live` is in hand. No new API read, no new
+      interface, and the import direction already permits it.
+    - **A quieter live hole than the one LSN-040 describes.** `scale` appears nowhere in
+      `classify/resolve.go`, so it classifies with an empty `TouchedPaths` — meaning a
+      `ChangePolicy` with `when.fieldPaths: [spec.replicas]` **can never fire on a scale**, and the
+      policy author gets no error. 06 §4.2 says matching is on the touched set "**across the
+      diff**", not across the submitted patch, which is the spec-level statement of the defect.
+    - **`classify.KnownVerbs()` has zero callers.** Its doc says it exists "for the lint that joins
+      it to the envelope's enum" and asserts "the corpus lint asserts the two agree". There is no
+      such lint. Exporting `broker.validOps` for V-BRK-022 finally gives it one — two lessons closed
+      by one export ([[LSN-041]] shape: prose describing a control that has never existed is worse
+      than no prose, because it retires the question).
+    - **Two false comments to delete while in there**, both asserting controls that do not exist:
+      `pipeline.go`'s "the classifier derives those from Payload instead — so returning nil for them
+      is the correct answer, not a gap" (it does not; `ScanPayload` returns `[]SecretHit`, never
+      paths), and 05 §1.1's "the list is a code constant" about the dry-run carve-outs (there is no
+      such constant; `SupportsDryRun` defaults to `true` and its optional hook is keyed on **ref,
+      not verb**, so a `scale` cannot be recognised as a carve-out at all).
+    - **One finding to file, not a halt:** V-BRK-020's row cites 03 §4.4 as its source, and 03 §4.4
+      ("Reversibility as a security property") contains neither "strategic" nor "expand" nor
+      "integrity". Same shape as the P9-T7c-2b halt, where 09 cites 03 §4.1 for V-BRK-021's "one
+      mutating route" and 03 §4.1 does not contain it. The property is well-defined in 09 itself, so
+      this is a citation defect rather than a spec contradiction.
 
 **Why T7c split into four.** T7c-1 was scoped as "assemble the pipeline and claim the two L1
 checks", and the assembly turned out to be the small part. Three things came out of doing it.
@@ -1230,6 +1321,14 @@ until P9-T9 means shipping them with their only check a shell script that has ne
 deliberate design, and the only thing filling it is `brake.Unaccounted{}`. That is disclosed as a
 required constructor field and a named type rather than a nil default precisely so it is greppable;
 P9-T7c-3d-ii replaces it.
+
+> **Superseded 2026-07-29 by P9-T7c-3d-ii-a.** The residual above was real, and the disclosure was
+> the wrong instrument for it: an exported permissive accountant is a **supported way to switch a
+> fail-closed rule off**, greppable or not. `brake.Unaccounted` is deleted, along with the seam it
+> sat on. Row 7's blindness case now lives one level out — a nil `broker.Accountant` refuses and
+> escalates, `pipeline.New` refuses to construct without one, and the only always-solvent
+> implementations are test doubles in `_test.go` files. What remains for **ii-b** is an accountant
+> that can answer with real numbers, not one that can be omitted.
 
 **Why V-PRO-028 is L1 only.** Phase 9 runs entirely in `PhaseDryRun`, so no record on a real cluster
 reaches `RolledBack` and there is nothing at L2 to recover from. The end-to-end property — a live

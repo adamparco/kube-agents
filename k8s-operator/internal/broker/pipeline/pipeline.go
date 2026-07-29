@@ -56,12 +56,9 @@ import (
 // bound the rejection journal uses, and for the same reason: the intent is model-authored prose.
 const MaxIntentLen = 512
 
-// The two envelope string values this package has to recognize by name. Both are validated by the
-// envelope's own closed enums, so these are reads of a shared vocabulary rather than a second one.
-const (
-	mediaJSONPatch = "application/json-patch+json"
-	triggerUndo    = "undo"
-)
+// The one envelope string value this package has to recognize by name. It is validated by the
+// envelope's own closed enum, so this is a read of a shared vocabulary rather than a second one.
+const mediaJSONPatch = "application/json-patch+json"
 
 // RecordStore is the ActionRecord persistence seam. `*journal.Store` satisfies it.
 type RecordStore interface {
@@ -70,7 +67,15 @@ type RecordStore interface {
 	SetPhase(ctx context.Context, ar *agentv1alpha1.ActionRecord, phase agentv1alpha1.ActionPhase, message string) error
 }
 
-// BrakeView is everything 06 §4.4 needs, gathered in one read so the brake stays a pure function.
+// BrakeView is everything 06 §4.4 needs ABOUT THE AGENT, gathered in one read so the brake stays a
+// pure function.
+//
+// About the agent, not about the action: what an observation taken before classification cannot
+// answer does not belong here. Row 7's budget and row 8's contested lookup both depend on the
+// envelope's class and targets, so both are `Config` dependencies queried at decision time instead
+// (see `broker.Accountant`, `broker.ContestedIndex`). Budget used to live in this struct and the
+// mismatch showed: the accountant could only be handed an agent, so it could not answer the
+// question 04 §4.2 actually asks.
 //
 // The nil-means-unreadable convention is `broker.BrakeInputs`', not this package's invention, and
 // it is why Observe returns no error: a source that returned `(view, err)` would invite a caller to
@@ -80,7 +85,6 @@ type BrakeView struct {
 	Agent   *agentv1alpha1.Agent
 	Freezes *broker.FreezeView
 	Roster  *agentv1alpha1.ApprovalRoster
-	Budget  broker.BrakeBudget
 	Journal broker.BrakeSignal
 }
 
@@ -168,8 +172,11 @@ type Config struct {
 	Verifier  *verify.Driver
 	Records   RecordStore
 	Brake     BrakeSource
-	Contested *broker.ContestedIndex
-	Approvals ApprovalNotifier
+	// Accountant and Contested are the two brake inputs that are queried rather than observed,
+	// because both need the classified envelope. See BrakeView for why they are not in it.
+	Accountant broker.Accountant
+	Contested  *broker.ContestedIndex
+	Approvals  ApprovalNotifier
 
 	// Now is injectable so a test can pin the retention clocks and the plan's GeneratedAt.
 	Now func() time.Time
@@ -208,6 +215,8 @@ func New(cfg Config) (*Pipeline, error) {
 		return nil, errors.New("pipeline: a RecordStore is required; nothing executes unjournaled (03 §4.1 step 11)")
 	case cfg.Brake == nil:
 		return nil, errors.New("pipeline: a BrakeSource is required; a broker that cannot see the brake must not be able to skip it")
+	case cfg.Accountant == nil:
+		return nil, errors.New("pipeline: an Accountant is required; broker.BrakeInputs treats nil as nobody-counting, which refuses every action -- 04 §4.2 budgets are not optional and a broker must not be constructible without row 7")
 	case cfg.Contested == nil:
 		return nil, errors.New("pipeline: a ContestedIndex is required; broker.BrakeInputs treats nil as unavailable, which refuses every action")
 	}
@@ -479,19 +488,19 @@ func (p *Pipeline) stepBrake(ctx context.Context, s *state) (*broker.Result, err
 	err := p.step(tr, broker.StepBrake, func() (string, error) {
 		s.brakeView = p.cfg.Brake.Observe(ctx)
 		d := broker.Decide(broker.BrakeInputs{
-			Stage:     broker.StageGate,
-			Now:       s.at,
-			Agent:     s.brakeView.Agent,
-			Scope:     scopeSpecOf(s.brakeView.Agent),
-			Freezes:   s.brakeView.Freezes,
-			Journal:   s.brakeView.Journal,
-			UndoPlan:  signal(s.plan.Undoable()),
-			Roster:    s.brakeView.Roster,
-			Budget:    s.brakeView.Budget,
-			Contested: p.cfg.Contested,
-			Class:     riskClass(s.class.Class),
-			Targets:   s.targets,
-			IsUndo:    s.env.Trigger.Source == triggerUndo,
+			Stage:      broker.StageGate,
+			Now:        s.at,
+			Agent:      s.brakeView.Agent,
+			Scope:      scopeSpecOf(s.brakeView.Agent),
+			Freezes:    s.brakeView.Freezes,
+			Journal:    s.brakeView.Journal,
+			UndoPlan:   signal(s.plan.Undoable()),
+			Roster:     s.brakeView.Roster,
+			Accountant: p.cfg.Accountant,
+			Contested:  p.cfg.Contested,
+			Class:      riskClass(s.class.Class),
+			Targets:    s.targets,
+			Trigger:    agentv1alpha1.ActionTriggerSource(s.env.Trigger.Source),
 		})
 		effect = d.Effect
 		switch d.Effect {
@@ -618,7 +627,7 @@ func (p *Pipeline) stepSnapshot(ctx context.Context, s *state) (*broker.Result, 
 			Contested: p.cfg.Contested,
 			Class:     riskClass(s.class.Class),
 			Targets:   s.targets,
-			IsUndo:    s.env.Trigger.Source == triggerUndo,
+			Trigger:   agentv1alpha1.ActionTriggerSource(s.env.Trigger.Source),
 		})
 		if !d.Allowed() {
 			if d.Refusal != nil {
@@ -732,7 +741,7 @@ func (p *Pipeline) stepVerify(ctx context.Context, s *state) (*broker.Result, er
 			Contested:  p.cfg.Contested,
 			Class:      riskClass(s.class.Class),
 			Targets:    s.targets,
-			IsUndo:     s.env.Trigger.Source == triggerUndo,
+			Trigger:    agentv1alpha1.ActionTriggerSource(s.env.Trigger.Source),
 		})
 		if d.Effect == broker.BrakeHalt {
 			// Row 9: executed, unverified, unrolled. There is nothing left to refuse -- the write
@@ -1109,7 +1118,7 @@ func agentIdentity(id *broker.Identity) string {
 // carries it in `trigger.ref`, which is free-form for every other source and an action id for this
 // one. Read here rather than at three call sites so the coupling is written down once.
 func undoOf(env *broker.Envelope) string {
-	if env.Trigger.Source == triggerUndo {
+	if env.Trigger.Source == string(agentv1alpha1.ActionTriggerUndo) {
 		return env.Trigger.Ref
 	}
 	return ""

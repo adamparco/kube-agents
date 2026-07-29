@@ -38,21 +38,42 @@ import (
 
 var brakeNow = time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 
+// ledger is a test Accountant. It answers with a fixed BrakeBudget and keeps every query it was
+// asked, so a test can assert not just WHAT row 7 decided but WHAT IT ASKED ABOUT -- an accountant
+// handed the agent and not the action cannot answer the question 04 §4.2 poses, and the answer it
+// gives instead looks identical from the outside.
+//
+// Deliberately test-only. An exported "always solvent" accountant would be a supported way to
+// switch row 7 off, which is the thing a nil Accountant now refuses in order to prevent.
+type ledger struct {
+	answer BrakeBudget
+	asked  []BudgetQuery
+}
+
+func (l *ledger) Budget(q BudgetQuery) BrakeBudget {
+	l.asked = append(l.asked, q)
+	return l.answer
+}
+
+// solvent is the accountant for a baseline that should be allowed: nothing spent, nothing flapping.
+func solvent() *ledger { return &ledger{} }
+
 // healthy is the baseline: everything observed, everything fine. It must be ALLOWED, and every
 // fail-closed case below is this value with one field removed.
 func healthy() BrakeInputs {
 	return BrakeInputs{
-		Stage:     StageGate,
-		Now:       brakeNow,
-		Agent:     agentCR(false, ""),
-		Scope:     &agentv1alpha1.ScopeSpec{ProjectID: "p", ClusterName: "c", Namespace: "n"},
-		Freezes:   &FreezeView{ObservedAt: brakeNow.Add(-time.Second)},
-		Journal:   BrakeOK,
-		UndoPlan:  BrakeOK,
-		Roster:    roster("r", 1, "U1", "U2"),
-		Contested: NewContestedIndex(),
-		Class:     agentv1alpha1.RiskElevated,
-		Targets:   []agentv1alpha1.TargetRef{deploy("web")},
+		Stage:      StageGate,
+		Now:        brakeNow,
+		Agent:      agentCR(false, ""),
+		Scope:      &agentv1alpha1.ScopeSpec{ProjectID: "p", ClusterName: "c", Namespace: "n"},
+		Freezes:    &FreezeView{ObservedAt: brakeNow.Add(-time.Second)},
+		Journal:    BrakeOK,
+		UndoPlan:   BrakeOK,
+		Roster:     roster("r", 1, "U1", "U2"),
+		Accountant: solvent(),
+		Contested:  NewContestedIndex(),
+		Class:      agentv1alpha1.RiskElevated,
+		Targets:    []agentv1alpha1.TargetRef{deploy("web")},
 	}
 }
 
@@ -264,8 +285,10 @@ func TestBrakeEachRuleFiresInIsolation(t *testing.T) {
 			wantEff:  BrakePark,
 		},
 		{
-			name:     "row 7: budget exhausted",
-			mutate:   func(in *BrakeInputs) { in.Budget = BrakeBudget{Exhausted: true, Detail: "3/3 this hour"} },
+			name: "row 7: budget exhausted",
+			mutate: func(in *BrakeInputs) {
+				in.Accountant = &ledger{answer: BrakeBudget{Exhausted: true, Detail: "3/3 this hour"}}
+			},
 			wantRule: BrakeRuleBudgetExhausted,
 			wantEff:  BrakeRefuse,
 			reason:   ReasonBudgetExhausted,
@@ -273,11 +296,24 @@ func TestBrakeEachRuleFiresInIsolation(t *testing.T) {
 			escalate: true,
 		},
 		{
-			name:     "row 7: flap threshold breached",
-			mutate:   func(in *BrakeInputs) { in.Budget = BrakeBudget{FlapBreached: true} },
+			name: "row 7: flap threshold breached",
+			mutate: func(in *BrakeInputs) {
+				in.Accountant = &ledger{answer: BrakeBudget{FlapBreached: true}}
+			},
 			wantRule: BrakeRuleFlapBreached,
 			wantEff:  BrakeRefuse,
 			reason:   ReasonFlapDetected,
+			status:   http.StatusTooManyRequests,
+			escalate: true,
+		},
+		{
+			// The input this row was missing. A zero BrakeBudget means a tally of nothing and
+			// permits; a nil Accountant means nobody is counting and must not.
+			name:     "row 7: no accountant at all",
+			mutate:   func(in *BrakeInputs) { in.Accountant = nil },
+			wantRule: BrakeRuleBudgetExhausted,
+			wantEff:  BrakeRefuse,
+			reason:   ReasonBudgetExhausted,
 			status:   http.StatusTooManyRequests,
 			escalate: true,
 		},
@@ -486,14 +522,14 @@ func TestBrakeRuleOrderIsPinned(t *testing.T) {
 	// order is a property, not an implementation detail. Each step removes the rule that just won
 	// and asserts the next one takes over.
 	in := healthy()
-	in.Freezes = nil                                    // row 1
-	in.Agent = nil                                      // row 2
-	in.Journal = BrakeFailed                            // row 3
-	in.UndoPlan = BrakeFailed                           // row 5
-	in.Class = agentv1alpha1.RiskGated                  // with the roster below, row 6
-	in.Roster = nil                                     // row 6
-	in.Budget = BrakeBudget{Exhausted: true}            // row 7
-	in.Contested.Mark(deploy("web"), "A", brakeNow, "") // row 8
+	in.Freezes = nil                                              // row 1
+	in.Agent = nil                                                // row 2
+	in.Journal = BrakeFailed                                      // row 3
+	in.UndoPlan = BrakeFailed                                     // row 5
+	in.Class = agentv1alpha1.RiskGated                            // with the roster below, row 6
+	in.Roster = nil                                               // row 6
+	in.Accountant = &ledger{answer: BrakeBudget{Exhausted: true}} // row 7
+	in.Contested.Mark(deploy("web"), "A", brakeNow, "")           // row 8
 
 	want := []BrakeRule{
 		BrakeRuleFreezeUnreadable,
@@ -518,7 +554,7 @@ func TestBrakeRuleOrderIsPinned(t *testing.T) {
 		func(in *BrakeInputs) { in.Freezes.Freezes = nil },
 		func(in *BrakeInputs) { in.UndoPlan = BrakeOK },
 		func(in *BrakeInputs) { in.Roster = roster("r", 1, "U1") },
-		func(in *BrakeInputs) { in.Budget = BrakeBudget{} },
+		func(in *BrakeInputs) { in.Accountant = solvent() },
 		func(in *BrakeInputs) { in.Contested = NewContestedIndex() },
 	}
 
@@ -560,7 +596,7 @@ func TestBrakeUndoExemptions(t *testing.T) {
 	for _, tc := range exempt {
 		t.Run("undo runs despite "+tc.name, func(t *testing.T) {
 			in := healthy()
-			in.IsUndo = true
+			in.Trigger = agentv1alpha1.ActionTriggerUndo
 			tc.mutate(&in)
 			if d := Decide(in); !d.Allowed() {
 				t.Fatalf("undo must survive %s; got %s / %s: %s", tc.name, d.Effect, d.Rule, d.Detail)
@@ -577,7 +613,10 @@ func TestBrakeUndoExemptions(t *testing.T) {
 			BrakeRuleJournalUnreachable},
 		{"an unusable undo plan", func(in *BrakeInputs) { in.UndoPlan = BrakeFailed },
 			BrakeRuleUndoPlanUnusable},
-		{"an exhausted budget", func(in *BrakeInputs) { in.Budget = BrakeBudget{Exhausted: true} },
+		{"an exhausted budget", func(in *BrakeInputs) {
+			in.Accountant = &ledger{answer: BrakeBudget{Exhausted: true}}
+		}, BrakeRuleBudgetExhausted},
+		{"an absent accountant", func(in *BrakeInputs) { in.Accountant = nil },
 			BrakeRuleBudgetExhausted},
 		{"an unavailable contested index", func(in *BrakeInputs) { in.Contested = nil },
 			BrakeRuleTargetContested},
@@ -591,7 +630,7 @@ func TestBrakeUndoExemptions(t *testing.T) {
 	for _, tc := range notExempt {
 		t.Run("undo is still stopped by "+tc.name, func(t *testing.T) {
 			in := healthy()
-			in.IsUndo = true
+			in.Trigger = agentv1alpha1.ActionTriggerUndo
 			tc.mutate(&in)
 			d := Decide(in)
 			if d.Allowed() {
@@ -605,7 +644,7 @@ func TestBrakeUndoExemptions(t *testing.T) {
 
 	t.Run("undo is still verified after it executes", func(t *testing.T) {
 		in := healthy()
-		in.IsUndo = true
+		in.Trigger = agentv1alpha1.ActionTriggerUndo
 		in.Stage = StagePostExecute
 		in.Verified = BrakeFailed
 		in.RolledBack = BrakeFailed

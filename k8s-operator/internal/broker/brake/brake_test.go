@@ -141,12 +141,11 @@ func newHarness(t *testing.T, inj errInjector, objs ...client.Object) *harness {
 	clk := &clock{t: fixtureNow}
 
 	src, err := brake.NewSource(brake.SourceConfig{
-		Reader:     reader,
-		Journal:    jrnl,
-		Accountant: brake.Unaccounted{},
-		AgentName:  testAgent,
-		Namespace:  testNS,
-		Now:        clk.now,
+		Reader:    reader,
+		Journal:   jrnl,
+		AgentName: testAgent,
+		Namespace: testNS,
+		Now:       clk.now,
 	})
 	if err != nil {
 		t.Fatalf("NewSource: %v", err)
@@ -161,11 +160,10 @@ func newHarness(t *testing.T, inj errInjector, objs ...client.Object) *harness {
 // row -- which is why they are startup errors rather than defaults.
 func TestNewSourceRefusesEveryUnusableWiring(t *testing.T) {
 	ok := brake.SourceConfig{
-		Reader:     &counting{Client: fake.NewClientBuilder().WithScheme(newScheme(t)).Build()},
-		Journal:    &counting{Client: fake.NewClientBuilder().WithScheme(newScheme(t)).Build()},
-		Accountant: brake.Unaccounted{},
-		AgentName:  testAgent,
-		Namespace:  testNS,
+		Reader:    &counting{Client: fake.NewClientBuilder().WithScheme(newScheme(t)).Build()},
+		Journal:   &counting{Client: fake.NewClientBuilder().WithScheme(newScheme(t)).Build()},
+		AgentName: testAgent,
+		Namespace: testNS,
 	}
 
 	cases := []struct {
@@ -175,7 +173,6 @@ func TestNewSourceRefusesEveryUnusableWiring(t *testing.T) {
 	}{
 		{"nil reader", "a Reader is required", func(c *brake.SourceConfig) { c.Reader = nil }},
 		{"nil journal", "a Journal is required", func(c *brake.SourceConfig) { c.Journal = nil }},
-		{"nil accountant", "an Accountant is required", func(c *brake.SourceConfig) { c.Accountant = nil }},
 		{"empty agent name", "an AgentName is required", func(c *brake.SourceConfig) { c.AgentName = "" }},
 		{"empty namespace", "a Namespace is required", func(c *brake.SourceConfig) { c.Namespace = "" }},
 		{"negative ttl", "is negative", func(c *brake.SourceConfig) { c.CacheTTL = -time.Second }},
@@ -210,30 +207,6 @@ func TestNewSourceRefusesEveryUnusableWiring(t *testing.T) {
 	}
 }
 
-// TestTheAccountantMustBeSpelledNotForgotten is the LSN-031 guard in test form. A nil Accountant is
-// the one omission that would leave row 7 switched off while everything else looked wired, because
-// the zero BrakeBudget permits. Unaccounted{} makes the hole a word in the source.
-func TestTheAccountantMustBeSpelledNotForgotten(t *testing.T) {
-	cfg := brake.SourceConfig{
-		Reader:    &counting{Client: fake.NewClientBuilder().WithScheme(newScheme(t)).Build()},
-		Journal:   &counting{Client: fake.NewClientBuilder().WithScheme(newScheme(t)).Build()},
-		AgentName: testAgent,
-		Namespace: testNS,
-	}
-	if _, err := brake.NewSource(cfg); err == nil {
-		t.Fatal("a Source with no Accountant was accepted; row 7 would be silently unenforceable")
-	}
-
-	cfg.Accountant = brake.Unaccounted{}
-	if _, err := brake.NewSource(cfg); err != nil {
-		t.Fatalf("Unaccounted{} was rejected: %v", err)
-	}
-
-	if got := (brake.Unaccounted{}).Budget(context.Background(), nil); got != (broker.BrakeBudget{}) {
-		t.Fatalf("Unaccounted returned %+v, want the zero budget", got)
-	}
-}
-
 // --- the healthy read ---------------------------------------------------------------------------
 
 // TestObserveGathersAllFourInputs. The baseline: everything readable produces a view in which every
@@ -264,31 +237,41 @@ func TestObserveGathersAllFourInputs(t *testing.T) {
 	if v.Journal != broker.BrakeOK {
 		t.Fatalf("Journal is %s, want ok", v.Journal)
 	}
-	if v.Budget != (broker.BrakeBudget{}) {
-		t.Fatalf("Budget is %+v, want the zero budget from Unaccounted", v.Budget)
-	}
 
 	if d := decideAt(v, fixtureNow); !d.Allowed() {
 		t.Fatalf("a fully readable view refused: %s / %s", d.Rule, d.Detail)
 	}
 }
 
+// solvent is an Accountant that reports every action within budget.
+//
+// A test-only double, and deliberately not an exported production type: an exported "counts
+// nothing" accountant is a supported way to switch row 7 off, which is what a nil Accountant now
+// refuses in order to prevent. A test may say the budget is fine; a wiring site may not.
+type solvent struct{}
+
+func (solvent) Budget(broker.BudgetQuery) broker.BrakeBudget { return broker.BrakeBudget{} }
+
 // decideAt runs the real brake over a view, so these tests assert what the BROKER will do rather
 // than what the struct contains. A view that looks right and decides wrong is the failure mode a
 // field-by-field assertion cannot see.
+//
+// The accountant and the contested index are not part of the view -- they are queried at decision
+// time, because both need the classified envelope (see pipeline.BrakeView). This helper supplies
+// the benign value of each so that what varies between these cases is what the Source observed.
 func decideAt(v pipeline.BrakeView, now time.Time) broker.BrakeDecision {
 	return broker.Decide(broker.BrakeInputs{
-		Stage:     broker.StageGate,
-		Now:       now,
-		Agent:     v.Agent,
-		Scope:     scopeOf(v.Agent),
-		Freezes:   v.Freezes,
-		Journal:   v.Journal,
-		UndoPlan:  broker.BrakeOK,
-		Roster:    v.Roster,
-		Budget:    v.Budget,
-		Contested: broker.NewContestedIndex(),
-		Class:     agentv1alpha1.RiskRoutine,
+		Stage:      broker.StageGate,
+		Now:        now,
+		Agent:      v.Agent,
+		Scope:      scopeOf(v.Agent),
+		Freezes:    v.Freezes,
+		Journal:    v.Journal,
+		UndoPlan:   broker.BrakeOK,
+		Roster:     v.Roster,
+		Accountant: solvent{},
+		Contested:  broker.NewContestedIndex(),
+		Class:      agentv1alpha1.RiskRoutine,
 	})
 }
 

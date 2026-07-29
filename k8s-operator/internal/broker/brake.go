@@ -252,16 +252,19 @@ type BrakeDecision struct {
 // gets from a function that returned early, or from a struct nobody filled in -- answers false.
 func (d BrakeDecision) Allowed() bool { return d.Effect == BrakeAllow }
 
-// BrakeBudget is row 7's input: the initiative budget and flap counters (04 §4.2, 06 §1.1).
+// BrakeBudget is row 7's answer: the initiative budget and flap counters (04 §4.2, 06 §1.1).
 //
-// THIS IS THE ONE INPUT WHOSE ZERO VALUE PERMITS, and the exception is deliberate. Every other
+// THIS IS THE ONE BRAKE VALUE WHOSE ZERO PERMITS, and the exception is deliberate. Every other
 // input models a lookup that can fail, so "not observed" means "the broker is blind" and blindness
 // refuses. Spend counters are not a lookup: they are the broker's own tally, and a zero tally means
 // an agent that has done nothing yet. Refusing on a zero tally would make a freshly started broker
 // refuse everything until something incremented a counter, which is not fail-closed, it is
-// fail-stopped. The blindness case for row 7 is covered upstream: the budget itself lives in
-// `spec.operations.initiativeBudget`, and a broker that cannot read the Agent CR is already refused
-// by row 2 before this field is consulted.
+// fail-stopped.
+//
+// The blindness case is therefore pushed one level out, to [Accountant]: a zero BrakeBudget is a
+// tally, a nil Accountant is a broker with nobody counting, and only the second refuses. Keeping
+// those two as the same value is what made the hole this type used to carry -- an unwired budget
+// and a quiet agent were literally indistinguishable.
 type BrakeBudget struct {
 	// Exhausted means the class budget for this action's origin is spent.
 	Exhausted bool
@@ -269,6 +272,45 @@ type BrakeBudget struct {
 	FlapBreached bool
 	// Detail is a short human-readable summary, e.g. "3/3 elevated self-initiated this hour".
 	Detail string
+}
+
+// BudgetQuery is what row 7 asks the accountant about ONE action.
+//
+// 04 §4.2 does not budget an agent, it budgets an agent's {origin, class} bucket, and the flap
+// threshold is per target. So the question cannot be answered from an agent-level observation taken
+// before the envelope was classified -- it needs the envelope. That is why the accountant is a
+// dependency queried at decision time rather than a value gathered by [pipeline.BrakeSource], and
+// it is the same reason [ContestedIndex] is not gathered there either.
+type BudgetQuery struct {
+	// Agent carries `spec.operations.initiativeBudget`, the ceiling half of the question. Nil is
+	// possible in principle and moot in practice: row 2 has already refused an unreadable Agent
+	// before row 7 is reached.
+	Agent *agentv1alpha1.Agent
+	// Trigger is the action's origin. 06 §1.1 partitions the budget by it -- self-initiated work
+	// gets a fraction of what a human asks for -- and exempts `undo` from the hourly buckets.
+	Trigger agentv1alpha1.ActionTriggerSource
+	// Class is the risk class. Each origin has a per-class bucket.
+	Class agentv1alpha1.ActionRiskClass
+	// Targets are what the flap threshold is counted against.
+	Targets []agentv1alpha1.TargetRef
+	// Now is the evaluation time, so the accountant and the rest of the brake agree on which hour
+	// this is.
+	Now time.Time
+}
+
+// Accountant answers row 7: is this action inside the 04 §4.2 initiative budget, and is it flapping?
+//
+// NO CONTEXT, NO ERROR, NO CLIENT -- and that is a constraint, not an oversight. [Decide] is a pure
+// function of its inputs, which is what makes the brake evaluable when the cluster is the thing
+// that is broken; an implementation that reached out to the API server from inside row 7 would make
+// the brake's own availability depend on the availability it exists to survive. Implementations
+// keep a snapshot refreshed out of band and serve it from memory, the way [ContestedIndex] does.
+//
+// An implementation that cannot answer returns a BrakeBudget saying so -- it does not get to
+// signal absence, because absence is modelled by the interface value itself being nil, which
+// refuses. See [BrakeInputs.Accountant].
+type Accountant interface {
+	Budget(q BudgetQuery) BrakeBudget
 }
 
 // FreezeView is the observed FleetFreeze list, plus WHEN it was observed.
@@ -331,8 +373,10 @@ type BrakeInputs struct {
 	// Roster is the resolved ApprovalRoster for this agent. Nil means the reference dangles or
 	// there is none (row 6).
 	Roster *agentv1alpha1.ApprovalRoster
-	// Budget is the spend and flap state (row 7). See BrakeBudget for why its zero value permits.
-	Budget BrakeBudget
+	// Accountant answers row 7. NIL MEANS NOBODY IS COUNTING, which refuses -- distinct from a
+	// zero BrakeBudget, which means a tally of nothing and permits. See Accountant and BrakeBudget
+	// for why those two had to stop being the same value.
+	Accountant Accountant
 	// Contested is the contested index. NIL MEANS THE INDEX IS UNAVAILABLE, which refuses -- a
 	// broker that cannot tell whether a target is contested is in exactly the position row 1
 	// describes for freezes.
@@ -343,10 +387,20 @@ type BrakeInputs struct {
 	Class agentv1alpha1.ActionRiskClass
 	// Targets are the resolved targets, checked against the contested index.
 	Targets []agentv1alpha1.TargetRef
-	// IsUndo marks an envelope whose trigger is `undo`. See undoExempt for what it exempts and,
-	// more importantly, what it does not.
-	IsUndo bool
+	// Trigger is the envelope's origin. Two rows read it: the undo carve-out (see IsUndo and
+	// undoExempt) and row 7's origin partition (see BudgetQuery). One field rather than a bool per
+	// reader, so the two cannot disagree about the same envelope.
+	Trigger agentv1alpha1.ActionTriggerSource
 }
+
+// IsUndo reports whether this envelope is an undo. See undoExempt for what that exempts and, more
+// importantly, what it does not.
+//
+// Derived rather than stored: it used to be its own bool, which meant a caller could set the
+// trigger and forget the flag, or set the flag on an envelope whose trigger said otherwise. The
+// only honest source is the trigger, so there is only the trigger ([[LSN-031]] -- import the
+// encoding, never restate it).
+func (in BrakeInputs) IsUndo() bool { return in.Trigger == agentv1alpha1.ActionTriggerUndo }
 
 // Decide evaluates 06 §4.4 and returns what the broker must do.
 //
@@ -380,7 +434,7 @@ func Decide(in BrakeInputs) BrakeDecision {
 func decideGate(in BrakeInputs, journalOK bool) BrakeDecision {
 	// --- degraded inputs: rows 1, 2, 3 ---
 
-	if in.Freezes.stale(in.Now) && !in.IsUndo {
+	if in.Freezes.stale(in.Now) && !in.IsUndo() {
 		// Row 1. Undo is exempt BY THE SPEC's own words here ("refuse everything except undo"),
 		// which is also the reading that keeps the fleet recoverable: the state an operator most
 		// needs to reverse is the state where the control plane is unwell.
@@ -445,20 +499,8 @@ func decideGate(in BrakeInputs, journalOK bool) BrakeDecision {
 				"; it stays PendingApproval and expires unapproved -- it is never auto-approved (06 §4.4)",
 		}
 	}
-	if in.Budget.Exhausted || in.Budget.FlapBreached {
-		// Row 7. Both halves escalate; they are separate rules because the remedies differ --
-		// a spent budget waits for the window to roll, a flap means the agent and something else
-		// are fighting over the same object and a human has to break the tie (04 §4.2).
-		rule, reason := BrakeRuleBudgetExhausted, ReasonBudgetExhausted
-		if in.Budget.FlapBreached {
-			rule, reason = BrakeRuleFlapBreached, ReasonFlapDetected
-		}
-		detail := "the initiative budget or flap threshold stopped this action (04 §4.2)"
-		if in.Budget.Detail != "" {
-			detail = in.Budget.Detail
-		}
-		d := refuseBrake(in, rule, reason, http.StatusTooManyRequests, detail, journalOK, PausedRetryAfterSeconds)
-		d.Escalate = true
+	if d, overBudget := budgetRefusal(in, journalOK); overBudget {
+		// Row 7.
 		return d
 	}
 	if d, contested := contestedRefusal(in, journalOK); contested {
@@ -532,7 +574,7 @@ func decidePostExecute(in BrakeInputs, journalOK bool) BrakeDecision {
 // verification (row 9) all apply to an undo exactly as they apply to anything else. An undo is a
 // write. The exemption is from the controls that say "this agent should not be acting right now",
 // never from the machinery that makes any action recoverable.
-func undoExempt(in BrakeInputs) bool { return in.IsUndo }
+func undoExempt(in BrakeInputs) bool { return in.IsUndo() }
 
 // agentPaused reads the brake field, returning the reason alongside it.
 func agentPaused(a *agentv1alpha1.Agent) (bool, string) {
@@ -565,7 +607,7 @@ func blockingFreeze(in BrakeInputs) *agentv1alpha1.FleetFreeze {
 		if !f.Covers(in.Scope) {
 			continue
 		}
-		if in.IsUndo {
+		if in.IsUndo() {
 			// 06 §4.4: `allowUndo` defaults true and keeps undo and rollback working during a
 			// freeze. A freeze that set it false blocks undo too, which is a deliberate and
 			// explicit choice by whoever created the freeze.
@@ -613,6 +655,51 @@ func rosterDetail(r *agentv1alpha1.ApprovalRoster) string {
 	}
 }
 
+// budgetRefusal is row 7: the initiative budget and the flap threshold (04 §4.2, 06 §1.1).
+//
+// Both halves escalate; they are separate rules because the remedies differ -- a spent budget waits
+// for the window to roll, a flap means the agent and something else are fighting over the same
+// object and a human has to break the tie (04 §4.2).
+//
+// Undo is not exempt HERE, and that is not a contradiction of 06 §1.1's "undo is never refused for
+// budget reasons". The row still runs; the accountant is what knows an undo does not draw down an
+// hourly bucket, and it says so by not reporting Exhausted. Flap is a different control (05 §1.5
+// lists them separately) and does apply: an undo that is itself part of an oscillation is exactly
+// the case a human needs to see.
+func budgetRefusal(in BrakeInputs, journalOK bool) (BrakeDecision, bool) {
+	if in.Accountant == nil {
+		// Nobody is counting. Distinct from a tally of zero, which permits -- see BrakeBudget.
+		// Escalating rather than merely refusing, because unlike a spent budget this does not come
+		// right when the hour rolls over; something is miswired and only a human fixes that.
+		d := refuseBrake(in, BrakeRuleBudgetExhausted, ReasonBudgetExhausted, http.StatusTooManyRequests,
+			"the broker cannot count its own initiative spend, so it cannot show this action is within budget (06 §4.4)",
+			journalOK, PausedRetryAfterSeconds)
+		d.Escalate = true
+		return d, true
+	}
+	b := in.Accountant.Budget(BudgetQuery{
+		Agent:   in.Agent,
+		Trigger: in.Trigger,
+		Class:   in.Class,
+		Targets: in.Targets,
+		Now:     in.Now,
+	})
+	if !b.Exhausted && !b.FlapBreached {
+		return BrakeDecision{}, false
+	}
+	rule, reason := BrakeRuleBudgetExhausted, ReasonBudgetExhausted
+	if b.FlapBreached {
+		rule, reason = BrakeRuleFlapBreached, ReasonFlapDetected
+	}
+	detail := "the initiative budget or flap threshold stopped this action (04 §4.2)"
+	if b.Detail != "" {
+		detail = b.Detail
+	}
+	d := refuseBrake(in, rule, reason, http.StatusTooManyRequests, detail, journalOK, PausedRetryAfterSeconds)
+	d.Escalate = true
+	return d, true
+}
+
 // contestedRefusal is row 8: any target carrying a contested marker refuses the whole envelope.
 //
 // The whole envelope, not the contested target: an envelope is one action (06 §4.1), its targets
@@ -627,7 +714,7 @@ func contestedRefusal(in BrakeInputs, journalOK bool) (BrakeDecision, bool) {
 			"the contested index is unavailable, so the broker cannot show that these targets are uncontested (06 §4.4)",
 			journalOK, PausedRetryAfterSeconds), true
 	}
-	if in.IsUndo {
+	if in.IsUndo() {
 		// An undo is the explicit human instruction the row asks for. Refusing it would make a
 		// contested target permanently unrecoverable by the one control designed to recover it.
 		return BrakeDecision{}, false

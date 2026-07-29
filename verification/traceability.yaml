@@ -395,6 +395,9 @@
   checks:
     - V-PRO-003
     - V-PRO-015
+    # V-CTR-018 covers only the seam: row 7 escalates rather than merely refusing, including when
+    # there is no accountant at all. That the CAP is reached correctly is V-PRO-003's.
+    - V-CTR-018
 
 "04§9#11":
   bullet: "**(new) Flap detection fires.** A deliberately oscillating target trips the threshold; the agent stops acting on it and escalates."
@@ -605,6 +608,11 @@
     - V-PRO-020
     - V-PRO-003
     - V-CTR-002
+    # This bullet partitions the budget by class AND by trigger origin, and exempts undo. V-CTR-018
+    # asserts the broker can express that question at all — the accountant is handed the envelope's
+    # class, origin and targets, and undo-ness is derived from the origin rather than stored beside
+    # it. Whether the ten leaves hold their ceilings is V-PRO-020's.
+    - V-CTR-018
 
 "06§10#4":
   bullet: "**No authority fields:** a CR carrying `spec.rbac`, `spec.rules`, `spec.riskClass`, `spec.scopeOverride`, `spec.brokerServiceAccountName`, or `spec.actorServiceAccountName` is pruned/rejected; a test greps the generated CRD schema to assert none of those property names exists and that `spec` sets no `x-kubernetes-preserve-unknown-fields`."
