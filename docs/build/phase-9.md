@@ -1433,6 +1433,151 @@ specified for.
 
 ---
 
+## Recon 2026-07-29 — P9-T8, and the trap that T7c-3d-iv arms
+
+Read before T8's PLAN. Recorded now because the finding is not about T8: it is about what happens to
+**T7c-3d-iv** if T8 is still unbuilt when the pipeline gets wired.
+
+**Shadow mode is declared in the API and implemented nowhere in the enforcement path.** 06 §4.1's
+field table (`06:1322`) says the envelope's `dryRun` is "**Forced `true` when
+`spec.operations.dryRunOnly` is set**". That join does not exist in code. Grep for any non-test
+assignment forcing dry-run true returns **zero hits**. The only read of the CR field anywhere in the
+tree is inside `OperationsSpec.Brake()` itself, and `Brake()`'s `dryRun` return has exactly one
+consumer — `pause_not_scale_to_zero_test.go:200`. Today `dryRun` is purely a property of the
+**action**, set by the caller in the envelope body (`internal/broker/envelope.go:81`), folded into
+the idempotency key, and honoured at `pipeline.go:790`. The spec wants an agent-level lattice ORed
+above it. There isn't one.
+
+**Why that is T7c-3d-iv's problem and not T8's.** Phase 9 is dry-run today for a reason that has
+nothing to do with `dryRunOnly`: `cmd/broker/main.go:212` still wires `broker.UnavailablePipeline{}`
+and returns 503, so no execution path is constructed. That is a _situation_, not a mechanism.
+**T7c-3d-iv replaces that line.** The moment it lands, the broker executes for real for any caller
+that omits `dryRun`, and the operator-side switch that is supposed to prevent it does not exist.
+T8 must therefore either precede T7c-3d-iv or ship with it; the ordering in the task table is not
+safe as written, and this is the sharpest thing PLAN has to settle.
+
+- **Where the OR goes.** `BrakeView` already carries the whole `Agent`
+  (`pipeline/pipeline.go:84-89`), so the value is one field access from `s.brakeView =
+p.cfg.Brake.Observe(ctx)` at `pipeline.go:489`. It must be applied **before** the idempotency key
+  is computed: `06:2723` says reordering operations must not change the key and **changing `dryRun`
+  must**. Forcing it after key verification produces either a key mismatch or, worse, a silent
+  divergence between the caller's key and the broker's.
+- **`agentPaused()` bypasses the guard that was written to protect it.**
+  `internal/broker/brake.go:579-589` reaches into `ops.Paused` directly instead of calling
+  `Brake()` — and `Brake()`'s doc comment (`common_types.go:398-403`) says in as many words that it
+  exists as one function so that "a caller cannot consult `paused` and forget `dryRunOnly`, which is
+  how shadow mode stops shadowing". It is the only place the broker touches `spec.operations`, and
+  it forgets exactly that. [[LSN-041]]'s shape: a comment says a control exists; grep says it never
+  did.
+- **The `brake_controller.go:230` lead was wrong and is worth correcting in place.** `Brake()`
+  returns `(paused, dryRun, reason)`, so `paused, _, _ :=` drops `dryRun` and **`reason`**, not
+  `dryRunOnly`-in-slot-3. And at that site the discard is defensible: C-BR pauses a rung-5 escalation
+  whether or not the agent is also shadowed, and dropping `reason` is deliberate and documented at
+  `:223-227` (overwriting a human's pause reason with an automated string deletes the more
+  informative of the two). The smell is real; it is just not located there.
+- **No admission rule enforces stricter-only.** `dryRunOnly` appears in no webhook, no VAP, no CEL.
+  The "cannot be cleared by the agent" claim rests entirely on `Agent` being absent from the actor
+  templates — it is nowhere asserted as a monotonicity rule the way `ChangePolicy` and
+  `requireApproval` are.
+- **`status.operations.dryRunOnly` has no writer.** The observed-state mirror is dead.
+- **[[LSN-040]] is literally this shape.** `execute.Request.DryRunOnly` and
+  `OperationsSpec.DryRunOnly` are two fields with the same name meaning different things, joined by
+  nothing — the lesson is already open and already scheduled as P9-T7c-4.
+
+**Two stale cells in the T8 row, and two missing artifacts.** `deploy/*/scripts/` does not exist
+(the MCP servers live at `agents/*/scripts/`); `internal/broker/server.go` contains no occurrence of
+`DryRun` at all (the terminal path is `pipeline/pipeline.go` + `execute/apply.go`). And the unit's
+premise is unbuilt: **`agents/*/skills/apply-change` exists in no tier** — all three still ship
+`submit-suggestion`, which 06 §9 says is deleted — and neither `submit_action` nor `plan_action`
+exists as an MCP tool.
+
+**Check IDs.** No check in 09 mentions shadow mode or `dryRunOnly`; V-BRK-019's "dry-run" is the
+server-side-apply preflight (L2, phase 10) and is a different thing. **V-GAT-019's phase in 09 §6.14
+is 10, not 9** — T8 should not claim it without saying so. V-REV-001 is the reformulated-over-`DryRun`
+instance already argued in planning defect 2. One genuine spec gap for PLAN: **notification under
+dry-run is unspecified** — `notifyOn` is class-keyed and never mentions `dryRun`.
+
+**Next free IDs, cross-checked against 09, `traceability.yaml` and the whole repo:** V-BRK-**023**
+(022 is pre-allocated to P9-T7c-4 by this file), V-CTR-**019**, V-PRO-**030** (029 pre-allocated to
+ii-b), V-RUN-**015**, V-CMP-**025**. V-CMP 009 and 012–019 exist nowhere and were never allocated —
+they are gaps, not retirements (no `RETIRED` row, which §9.6 requires), so take max+1.
+
+---
+
+## Recon 2026-07-29 — P9-T9, and the real size of the gate
+
+**The Phase-9 gap, derived rather than remembered.** Parsing every row of 09 §6.1–§6.14 with
+`Phase == 9` gives **50 checks**. Cross-joined against the 108 data rows of `verification/results.csv`,
+counting a pass only at a level the catalog lists for that check (this file's own rule: "a property
+proven at a level the check does not list is not that check passing") and retracting on a later
+`**correction**` at the same level:
+
+|                                                      |                                                |
+| ---------------------------------------------------- | ---------------------------------------------- |
+| Phase-9 checks in 09 §6                              | **50**                                         |
+| Closed (every listed level has an un-retracted pass) | **15**                                         |
+| **Open**                                             | **35** — 20 BLOCKING-ALWAYS, 15 BLOCKING-PHASE |
+| Of those, zero `results.csv` rows of any kind        | **13**                                         |
+
+**This supersedes the "22 open / 9 BLOCKING-ALWAYS" figure used earlier in this session, which does
+not reproduce under any reading.** One judgement call is flagged: `results.csv` row 62 is a
+`correction` on V-GAT-001 at L1 but is a re-record over a _larger_ corpus (181 cases, was 165), so it
+is counted as a pass; counting it as a retraction gives 36 / 20 / 16.
+
+**33 of the 35 gaps are the L2 level — but three are not, and those are the surprise:**
+
+- **V-CTR-005 and V-CTR-006 are L1-only and have never been recorded.** Envelope schema round-trip;
+  `ActionRecord` lifecycle transitions. This is L1 work that slipped past T1 and T2, and it needs no
+  cluster.
+- **V-RUN-010 is L0-only and unrecorded** — broker supply-chain minimality (no LLM SDK, no
+  `/bin/sh`, one listening socket, mounts exactly {cert Secret, projected token}). An L0 lint nobody
+  has written.
+- **V-BRK-021 needs both L0 and L2**; its only evidence is L1. Its L0 half is a lint over the shipped
+  image, and it is entangled with the unresolved P9-T7c-2b halt.
+
+**Two of planning defect 2's three guards are not in the state that paragraph assumes.**
+
+1. **Guard 1 does not exist.** `invariants-gate.py` has 18 `check_*` functions and none mentions the
+   test-only overlay. The lint that refuses an overlay reference under `k8s-operator/scripts/`,
+   `deploy/` or `config/` still has to be written — and it is the one guard the paragraph itself
+   calls "the single worst outcome of this decision".
+2. **Guard 3 collides with [[LSN-045]], which was learned after it was written.** "The L2 script
+   asserts the namespace is empty of `ActionRecord`s at teardown" cannot be satisfied by deleting the
+   namespace — `kube-agents-journal-retention` denies DELETE and strands it `Terminating` permanently
+   — nor by deleting the records, which is denied until `status.exported.confirmed` is true, and
+   fabricating that field was **declined as a standing rule**. Guard 3 needs re-stating as an
+   assertion over labels within a reused namespace, in the `brake-fanout-l2.sh` idiom.
+
+**`verify-phase8.sh` is the template, and five of its properties are load-bearing.** Lettered
+sections bound to Accept bullets. Section A runs `dev/L0-CHAIN.txt` **as a file**, never as a copied
+list, with a shrink guard (`< 13` lines ⇒ fail) so a chain that lost lines cannot read as green.
+`run_l2` is the single place a sub-suite's rc is interpreted — `0` pass · `3` defer (never a pass) ·
+`2` could-not-run · `*` fail. Section E detects the phase's own unfinished work **by artifact rather
+than by memory**, so it flips green when the work lands and cannot be talked into it — that is the
+mechanism P9-T9 should reuse for its own open items. Section F regresses through the predecessor
+gate; section G prints deferrals and never asserts them green. There is **no default target** and
+**no per-check-ID machine-readable output anywhere in any phase gate** — section E's hard-coded
+per-ID arm is the closest thing, and `results.csv` is written by the harness agent, not by any
+script.
+
+**`dev/L2-CHAIN.txt` decision T9 owes.** Twelve executable lines, each carrying its own `--context`
+even though all twelve now carry the same one (the argument against a run-loop default is written
+into the file). **`verify-phase8.sh` is absent from the chain** — it runs `verify-phase7.sh` and then
+the individual P8 suites. T9 must decide whether `verify-phase9.sh` becomes a line or replaces the
+standing-regression line. The P1 narrowing at `L2-CHAIN:38-51` exempts the four Phase-9 client-side
+probes in writing, each naming **`broker-execute-l2.sh` as the successor that needs P1 in full**.
+
+**None of the five deliverables exist**, and `dev/verify/fixtures/` does not exist as a directory.
+
+**Split this off early: the review-gate path filter is self-contained and needs no cluster.**
+`.github/workflows/review-gate.yml:11-20` still matches nothing under `k8s-operator/internal/**`. It
+is V-MET-007 — the one check ID the T9 row names explicitly — it does not depend on the gate work,
+and it is the reason the security gate never ran on the broker. Doing it inside the gate unit means
+doing it late; doing it in its own unit means it stops being true sooner. It still must not be done
+in a unit that would be reviewing itself.
+
+---
+
 ## Deferrals opened by this phase (each with a named external blocker)
 
 Recorded at PLAN time so they are visible from the start rather than discovered at the gate. **No
