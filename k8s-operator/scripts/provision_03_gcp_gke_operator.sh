@@ -140,6 +140,11 @@ execute_operator() {
   [ "$_deploy_rc" -eq 0 ] || return 1
 
   wait_for_k8s_resource "deployment/kubeagents-controller-manager" "${NAMESPACE:-kubeagents-system}" "Available" "180s" || return 1
+  # C-BR, the brake surface (05 §1.5). `make deploy` renders it from the same base and the same
+  # image as the controller-manager, under its own ServiceAccount. It is waited on for the same
+  # reason the controller-manager is: this step's postcondition is "the operator is installed", and
+  # an install whose brake never came up is a fleet with no way to be stopped.
+  wait_for_k8s_resource "deployment/kubeagents-brake-controller" "${NAMESPACE:-kubeagents-system}" "Available" "180s" || return 1
 }
 
 # The control namespace's blast-radius bound. Runs HERE — after `make deploy` has created

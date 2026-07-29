@@ -63,7 +63,11 @@ const (
 	brokerUser  = "system:serviceaccount:" + testNS + ":" + brokerSA
 	otherBroker = "system:serviceaccount:" + testNS + ":cluster-admin-cluster-b-actor"
 	undoUser    = "system:serviceaccount:kubeagents-system:kube-agents-undo-controller"
-	brakeUser   = "system:serviceaccount:kubeagents-system:kube-agents-brake-controller"
+	// The one principal in this list that the install actually creates:
+	// `config/rbac/brake_service_account.yaml` plus `namePrefix: kubeagents-`. The others are
+	// identities 06 §4.3 names and nothing yet mints, which is why they keep the spec's
+	// `kube-agents-` spelling and this one does not.
+	brakeUser   = "system:serviceaccount:kubeagents-system:kubeagents-brake-controller"
 	chatOpsUser = "system:serviceaccount:kubeagents-system:kube-agents-chatops-gateway"
 	exportUser  = "system:serviceaccount:kubeagents-system:kubeagents-controller"
 	retainUser  = "system:serviceaccount:kubeagents-system:kube-agents-retention-controller"

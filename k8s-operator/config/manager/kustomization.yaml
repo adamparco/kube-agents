@@ -1,5 +1,8 @@
 resources:
   - manager.yaml
+  # C-BR runs the same binary from the same image under a different identity, so it belongs to the
+  # base that owns that image -- the `images:` transformer below is what repoints both.
+  - brake_deployment.yaml
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:

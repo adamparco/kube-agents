@@ -1,0 +1,97 @@
+# C-BR, the brake surface (05 §1.5). Same image and same binary as the controller-manager, a
+# different `--controllers` selection and a different ServiceAccount.
+#
+# WHY IT LIVES IN config/manager AND NOT A BASE OF ITS OWN. The `images:` transformer that repoints
+# `controller` is declared in this directory's kustomization, and a kustomize transformer reaches
+# only what is beneath the kustomization that declares it. A sibling base -- the shape config/router
+# uses, because the router is a different image from a different Dockerfile -- would have been
+# invisible to `kustomize edit set image controller=...`, so `make deploy` and
+# `dev/cluster/reload-images.sh` would have rolled the operator and silently left the brake on
+# whatever tag was baked in. Same image means same base.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: brake-controller
+  namespace: system
+  labels:
+    control-plane: brake-controller
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/component: brake-controller
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  # Single replica plus leader election, the same shape as the controller-manager. Leader election
+  # is what makes a rollout safe rather than the replica count: two C-BRs racing the same escalation
+  # would both patch `spec.operations.paused` and both emit a page, and a duplicated page during an
+  # incident is noise at the worst moment.
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: brake-controller
+      app.kubernetes.io/name: kube-agents-operator
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        control-plane: brake-controller
+        app.kubernetes.io/name: kube-agents-operator
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - command:
+            - /manager
+          args:
+            - --leader-elect
+            - --controllers=brake
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=0
+          # Pinned to an immutable version tag (not :latest), and repointed to a digest by
+          # `kustomize edit set image controller=...` in `make deploy`. Identical to the
+          # controller-manager's image on purpose: one build, one signature, one thing to roll.
+          image: controller:v0.1.0
+          name: manager
+          env:
+            # Not a preference and not decoration. `cmd/main.go` EXITS if the brake selection is
+            # combined with webhooks: a brake pod serving admission would need the serving-cert
+            # Secret and would answer for the operator's webhook Service. Making it explicit here
+            # means the manifest says what the process will do, rather than the process quietly
+            # doing something the manifest does not mention.
+            - name: ENABLE_WEBHOOKS
+              value: "false"
+          ports:
+            - containerPort: 8081
+              name: health
+              protocol: TCP
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - "ALL"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 500m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 64Mi
+      # No webhook cert volume, because no webhook server. The controller-manager mounts
+      # `kubeagents-webhook-certs`; a brake pod that mounted it would hold a private key it has no
+      # use for.
+      serviceAccountName: brake-controller
+      terminationGracePeriodSeconds: 10

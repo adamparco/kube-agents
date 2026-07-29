@@ -197,6 +197,11 @@ if [ -z "$KUSTOMIZATION_WAS_DIRTY" ]; then
 fi
 
 $K -n kubeagents-system rollout status deploy/kubeagents-controller-manager --timeout=300s
+# C-BR, the brake surface (05 §1.5): the same image with `--controllers=brake` under its own
+# ServiceAccount. Waited on here and not left to the first L2 suite that needs it, because a brake
+# that never became Ready is exactly the failure a bring-up should surface -- the fleet has no way
+# to be stopped, and every downstream check runs against a cluster that cannot brake.
+$K -n kubeagents-system rollout status deploy/kubeagents-brake-controller --timeout=300s
 
 # No `rollout restart` here, and its absence is the point. The Kind version needed one because
 # side-loading a fixed `:dev` tag left the Deployment spec unchanged, so the kubelet kept the copy
