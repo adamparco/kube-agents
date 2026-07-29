@@ -197,6 +197,59 @@ func TestJournalStatusPolicy(t *testing.T) {
 		})
 	}
 
+	// --- rung 5 (04 §5.1): who may ask for a page and a pause, and who may say they happened -----
+	//
+	// `status.escalation` is the seam between the broker and C-BR, and it is the only surface on
+	// which the broker can escalate at all: 06 §2.2.1 gives it no verb on `events` and no write on
+	// `agents`, so it cannot page and cannot pause. It records the REQUEST; C-BR performs it.
+	//
+	// This is also the row that exposed how this policy fails. Its allow-list is an enumeration of
+	// status fields, and validation 1 admits any write for which `nothingChanged` holds -- so before
+	// `escalationChanged` was added to that conjunction, an UPDATE touching only `status.escalation`
+	// was invisible to it and admitted from EVERY principal, human cluster-admin included. Delete
+	// `!variables.escalationChanged` from `nothingChanged` and the two denial cases below go green
+	// in the wrong direction; dev/tests/journal-status-vap-parity.py is what stops the next status
+	// field arriving with the same hole.
+
+	t.Run("broker may request a page and a pause", func(t *testing.T) {
+		err := statusUpdate(t, brokerUser, func(ar *agentv1alpha1.ActionRecord) {
+			ar.Status.Escalation = &agentv1alpha1.ActionEscalation{
+				PageRequested:  true,
+				PauseRequested: true,
+				Reason:         "rollback failed after the deployment never converged",
+				RequestedAt:    ptrTime(now),
+			}
+		})
+		if err != nil {
+			t.Fatalf("the owning broker was denied rung 5: a failed rollback would then reach nobody (04 §5.1): %v", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agentv1alpha1.ActionEscalation)
+	}{
+		{"pagedAt", func(e *agentv1alpha1.ActionEscalation) { e.PagedAt = ptrTime(now) }},
+		{"pausedAt", func(e *agentv1alpha1.ActionEscalation) { e.PausedAt = ptrTime(now) }},
+		{"failure", func(e *agentv1alpha1.ActionEscalation) { e.Failure = "C-BR could not reach the Agent" }},
+	} {
+		t.Run("broker may not record escalation."+tc.name, func(t *testing.T) {
+			err := statusUpdate(t, brokerUser, func(ar *agentv1alpha1.ActionRecord) {
+				ar.Status.Escalation = &agentv1alpha1.ActionEscalation{
+					PageRequested: true, PauseRequested: true, RequestedAt: ptrTime(now),
+				}
+				tc.mutate(ar.Status.Escalation)
+			})
+			if err == nil {
+				t.Fatalf("the broker recorded escalation.%s -- an outcome it has no verb to produce. "+
+					"A self-attested page is worse than no record: the audit trail then asserts the "+
+					"promise was kept (04 §5.1, 05 §1.7)", tc.name)
+			} else if !apierrors.IsForbidden(err) {
+				t.Fatalf("expected Forbidden writing escalation.%s, got: %v", tc.name, err)
+			}
+		})
+	}
+
 	t.Run("a different broker may not write this record", func(t *testing.T) {
 		err := statusUpdate(t, otherBroker, func(ar *agentv1alpha1.ActionRecord) {
 			ar.Status.Phase = agentv1alpha1.PhaseVerified
@@ -308,6 +361,31 @@ func TestJournalStatusPolicy(t *testing.T) {
 		}
 	})
 
+	// --- everyone else is out of the escalation row ---------------------------------------------
+	//
+	// Only the owning broker asks for rung 5. The exporter is listed because it is the same service
+	// account C-BR will run under (both live in the operator manager) and is therefore the row most
+	// likely to be widened by accident when C-BR lands -- and the exporter is the one principal
+	// whose write unlocks deletion, so anything it can reach is a field that can be rewritten
+	// immediately before the record is destroyed.
+	for _, user := range []struct{ label, name string }{
+		{"the undo controller", undoUser},
+		{"the ChatOps gateway", chatOpsUser},
+		{"the exporter", exportUser},
+	} {
+		t.Run(user.label+" may not write escalation", func(t *testing.T) {
+			err := statusUpdate(t, user.name, func(ar *agentv1alpha1.ActionRecord) {
+				ar.Status.Escalation = &agentv1alpha1.ActionEscalation{
+					PauseRequested: true, Reason: "because I said so", RequestedAt: ptrTime(now),
+				}
+			})
+			if err == nil {
+				t.Fatalf("%s requested an auto-pause; once C-BR fans this out that is a stop button "+
+					"for any agent, held by a principal 06 §4.3 never gave it to", user.label)
+			}
+		})
+	}
+
 	// --- the human -----------------------------------------------------------------------------
 
 	t.Run("a human may not write any status field", func(t *testing.T) {
@@ -316,6 +394,14 @@ func TestJournalStatusPolicy(t *testing.T) {
 			mutate func(*agentv1alpha1.ActionRecord)
 		}{
 			{"phase", func(ar *agentv1alpha1.ActionRecord) { ar.Status.Phase = agentv1alpha1.PhaseVerified }},
+			// The field that was writable by ANYONE until `escalationChanged` joined the
+			// `nothingChanged` conjunction. A human who can request a pause can stop any agent in
+			// the namespace without going through /kage, which is the whole shape 06 §4.3 forbids.
+			{"escalation", func(ar *agentv1alpha1.ActionRecord) {
+				ar.Status.Escalation = &agentv1alpha1.ActionEscalation{
+					PauseRequested: true, Reason: "stop", RequestedAt: ptrTime(now),
+				}
+			}},
 			{"approvals", func(ar *agentv1alpha1.ActionRecord) {
 				ar.Status.Approvals = &agentv1alpha1.ActionApprovals{
 					Required: 1,

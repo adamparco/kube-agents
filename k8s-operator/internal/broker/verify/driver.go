@@ -60,8 +60,26 @@ type PageRequest struct {
 
 // Pauser auto-pauses an agent (03 §6). Pausing is a brake control owned by the operator's Agent CR;
 // this interface is the seam the broker reaches it through.
+//
+// It takes the whole request rather than `(agentIdentity, reason)` because the broker cannot pause
+// anything itself. 06 §2.2.1 gives it `get, list, watch` on `agents` and nothing more, so the only
+// pause it can perform is a RECORDED REQUEST on the action's own journal entry, which C-BR fans out
+// (05 §1.5, §1.7). A pause that does not name the record it belongs to cannot be written down at
+// all, and an implementation handed only an identity would have to go looking for the record --
+// re-deriving, from an index, a fact its caller already had.
 type Pauser interface {
-	Pause(ctx context.Context, agentIdentity, reason string) error
+	Pause(ctx context.Context, p PauseRequest) error
+}
+
+// PauseRequest is the brake, asked for. Symmetric with PageRequest on purpose: 05 §1.5's auto-brake
+// table treats page and pause as separate responses that happen to coincide at rung 5, and a shared
+// struct would quietly encourage a caller to send one when it meant the other.
+type PauseRequest struct {
+	ActionID      string
+	AgentIdentity string
+	// Reason is carried through to `Agent.spec.operations.pauseReason`, so it is what a human sees
+	// when they ask why the agent stopped.
+	Reason string
 }
 
 // CooldownRegistry is the per-target quiet period of 04 §4.2. The driver only ever ENTERS cooldown;
@@ -369,7 +387,11 @@ func (d *Driver) rollBack(ctx context.Context, req Request, ladder *Ladder, res 
 	}
 
 	if d.Pauser != nil {
-		if err := d.Pauser.Pause(ctx, req.AgentIdentity, pageReason); err != nil {
+		if err := d.Pauser.Pause(ctx, PauseRequest{
+			ActionID:      req.ActionID,
+			AgentIdentity: req.AgentIdentity,
+			Reason:        pageReason,
+		}); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("auto-pausing the agent failed after a failed rollback: %w", err)
 			}

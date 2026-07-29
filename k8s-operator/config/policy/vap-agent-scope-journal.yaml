@@ -66,10 +66,22 @@ spec:
     # --- per-field change detection ----------------------------------------------------------
     #
     # Enumerated one field at a time rather than looped, because Kubernetes' CEL types an
-    # OpenAPI object as a struct and a struct cannot be indexed by a runtime string. The verbosity
-    # buys a real property: a field ADDED to the status schema later is not silently permitted —
-    # it appears in no changed-variable, so no principal's allow-list covers it, and the catch-all
-    # `unknownStatusFieldChanged` check below denies it until someone comes back here and decides.
+    # OpenAPI object as a struct and a struct cannot be indexed by a runtime string.
+    #
+    # THE ENUMERATION IS THE ALLOW-LIST, AND IT FAILS OPEN. This is the opposite of what an earlier
+    # version of this comment claimed, and the correction is the point: a field added to
+    # `ActionRecordStatus` and NOT added below appears in no changed-variable, so `nothingChanged`
+    # stays true when only that field changes — and validation 1 then admits the write from ANY
+    # principal, including the human cluster-admin this policy exists to stop. There is no catch-all
+    # that could close it here, because CEL cannot enumerate a struct's keys at runtime; the closest
+    # expressible thing, comparing `object.status != oldObject.status`, would deny the no-op
+    # re-Update that controllers do on every conflict retry.
+    #
+    # So the property is enforced OUTSIDE admission, by `dev/tests/journal-status-vap-parity.py` in
+    # the L0 chain: every json field of `ActionRecordStatus` must have a `<field>Changed` variable
+    # here, and that variable must appear in `nothingChanged`. A new status field fails the build
+    # until somebody comes back here and decides who may write it. That check has a negative control
+    # for exactly the mutation described above.
     - name: hasOld
       expression: "has(oldObject.status)"
     - name: hasNew
@@ -138,6 +150,21 @@ spec:
         (variables.hasOld && has(oldObject.status.exported)) != (variables.hasNew && has(object.status.exported)) ||
         (variables.hasOld && has(oldObject.status.exported) && variables.hasNew && has(object.status.exported) &&
          oldObject.status.exported != object.status.exported)
+    - name: escalationChanged
+      expression: >-
+        (variables.hasOld && has(oldObject.status.escalation)) != (variables.hasNew && has(object.status.escalation)) ||
+        (variables.hasOld && has(oldObject.status.escalation) && variables.hasNew && has(object.status.escalation) &&
+         oldObject.status.escalation != object.status.escalation)
+    # The FULFILMENT half of the escalation, split out because it has a different writer from the
+    # request half sitting in the same struct (04 §5.1, rung 5). The broker asks; C-BR does it and
+    # timestamps what it did. A broker that could write these could record that the agent was paged
+    # and paused without either having happened — which is worse than not recording it at all,
+    # because the audit trail would then actively assert the promise was kept.
+    - name: escalationFulfilmentSet
+      expression: >-
+        variables.hasNew && has(object.status.escalation) &&
+        (has(object.status.escalation.pagedAt) || has(object.status.escalation.pausedAt) ||
+         has(object.status.escalation.failure))
 
     # Nothing at all changed. A no-op status write is harmless and must not be denied — controllers
     # re-Update on conflict retries and a denial there would look like a permission bug.
@@ -146,7 +173,8 @@ spec:
         !variables.phaseChanged && !variables.observedGenerationChanged && !variables.appliedChanged &&
         !variables.verificationChanged && !variables.recoveryChanged && !variables.reportChanged &&
         !variables.timestampsChanged && !variables.messageChanged && !variables.approvalsChanged &&
-        !variables.contestedChanged && !variables.undoneByChanged && !variables.exportedChanged
+        !variables.contestedChanged && !variables.undoneByChanged && !variables.exportedChanged &&
+        !variables.escalationChanged
 
   validations:
     # 1) The principal must be in the table at all. This is the row for every reader SA, every other
@@ -165,17 +193,32 @@ spec:
       reason: Forbidden
 
     # 2) The owning broker: phase, observedGeneration, applied, verification, recovery, report,
-    #    timestamps, message. NEVER approvals, contested, undoneBy — those three are the record of
-    #    what OTHERS thought of the action, and an actor that could write them could approve itself,
-    #    un-contest a change a human objected to, and claim its own action was already undone.
-    #    NEVER exported either: confirming your own export is confirming your own evidence.
+    #    timestamps, message, and the REQUEST half of escalation. NEVER approvals, contested,
+    #    undoneBy — those three are the record of what OTHERS thought of the action, and an actor
+    #    that could write them could approve itself, un-contest a change a human objected to, and
+    #    claim its own action was already undone. NEVER exported either: confirming your own export
+    #    is confirming your own evidence.
     - expression: >-
         !variables.isOwningBroker ||
         (!variables.approvalsChanged && !variables.contestedChanged &&
          !variables.undoneByChanged && !variables.exportedChanged)
       message: >-
         the owning broker may write phase, observedGeneration, applied, verification, recovery, report,
-        timestamps and message — never approvals, contested, undoneBy or exported (06 §4.3)
+        timestamps, message and the request half of escalation — never approvals, contested, undoneBy
+        or exported (06 §4.3)
+      reason: Forbidden
+
+    # 2b) The broker asks for rung 5; it does not carry it out (04 §5.1, 05 §1.7). It has no verb that
+    #     could pause an agent or emit an Event — 06 §2.2.1 gives it `get, list, watch` on `agents` and
+    #     nothing on `events` — so writing `pagedAt`, `pausedAt` or `failure` would be recording an
+    #     outcome it is structurally incapable of producing. Those belong to C-BR, which does the
+    #     fan-out from the operator's identity. Without this row the two-writer split in
+    #     `ActionEscalation` would be a convention, and the auditable half of "a failed rollback pages
+    #     AND auto-pauses" (V-REV-006) would be self-attested by the party with the motive.
+    - expression: "!variables.isOwningBroker || !variables.escalationFulfilmentSet"
+      message: >-
+        the owning broker may request a page and a pause, never record that they happened —
+        pagedAt, pausedAt and failure are written by C-BR, which performs them (04 §5.1, 05 §1.7)
       reason: Forbidden
 
     # 3) The undo controller: phase (to Undone only), undoneBy, contested, message. Any record in
@@ -184,7 +227,7 @@ spec:
         !variables.isUndoController ||
         (!variables.observedGenerationChanged && !variables.appliedChanged && !variables.verificationChanged &&
          !variables.recoveryChanged && !variables.reportChanged && !variables.timestampsChanged &&
-         !variables.approvalsChanged && !variables.exportedChanged)
+         !variables.approvalsChanged && !variables.exportedChanged && !variables.escalationChanged)
       message: >-
         the undo controller may write only phase, undoneBy, contested and message (06 §4.3)
       reason: Forbidden
@@ -201,7 +244,7 @@ spec:
         !variables.isChatOpsGateway ||
         (!variables.observedGenerationChanged && !variables.appliedChanged && !variables.verificationChanged &&
          !variables.recoveryChanged && !variables.reportChanged && !variables.timestampsChanged &&
-         !variables.undoneByChanged && !variables.exportedChanged)
+         !variables.undoneByChanged && !variables.exportedChanged && !variables.escalationChanged)
       message: >-
         the ChatOps gateway may write only approvals, phase and contested (06 §4.3);
         it may not touch applied or verification
@@ -224,12 +267,20 @@ spec:
     # 5) The journal exporter writes status.exported and nothing else. Narrow on purpose: it is the
     #    only principal whose write unlocks deletion, so any additional field it could reach would
     #    be a field that could be rewritten immediately before the record is destroyed.
+    #
+    #    `escalation` is denied here too, and it is the row a future change is most likely to want to
+    #    loosen: C-BR — which fans a recorded escalation out into a pause and a page — runs inside the
+    #    same operator manager and therefore arrives as the same service account. That does not make
+    #    it the same principal. Widening this row would hand the escalation field to the exporter as
+    #    a side effect, and the exporter is the one principal that can then delete the record. If
+    #    C-BR needs to write the fulfilment half, it needs its OWN identity, the way 06 §4.3 already
+    #    contemplates for the retention controller in the note further down this file.
     - expression: >-
         !variables.isExporter ||
         (!variables.phaseChanged && !variables.observedGenerationChanged && !variables.appliedChanged &&
          !variables.verificationChanged && !variables.recoveryChanged && !variables.reportChanged &&
          !variables.timestampsChanged && !variables.messageChanged && !variables.approvalsChanged &&
-         !variables.contestedChanged && !variables.undoneByChanged)
+         !variables.contestedChanged && !variables.undoneByChanged && !variables.escalationChanged)
       message: >-
         the journal exporter may write only status.exported (06 §4.3, 05 §1.2)
       reason: Forbidden

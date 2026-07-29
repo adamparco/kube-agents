@@ -248,7 +248,7 @@ func (f *fakePager) Page(context.Context, verify.PageRequest) error { f.pages++;
 
 type fakePauser struct{ pauses int }
 
-func (f *fakePauser) Pause(context.Context, string, string) error { f.pauses++; return nil }
+func (f *fakePauser) Pause(context.Context, verify.PauseRequest) error { f.pauses++; return nil }
 
 type fakeCooldown struct{}
 

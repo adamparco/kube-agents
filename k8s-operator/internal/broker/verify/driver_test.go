@@ -75,15 +75,14 @@ func (f *fakePager) Page(_ context.Context, p PageRequest) error {
 }
 
 type fakePauser struct {
-	calls  int
-	err    error
-	agent  string
-	reason string
+	calls int
+	err   error
+	last  PauseRequest
 }
 
-func (f *fakePauser) Pause(_ context.Context, agent, reason string) error {
+func (f *fakePauser) Pause(_ context.Context, p PauseRequest) error {
 	f.calls++
-	f.agent, f.reason = agent, reason
+	f.last = p
 	return f.err
 }
 
@@ -440,8 +439,19 @@ func TestDriverPagesAndPausesWhenTheRollbackFails(t *testing.T) {
 	if pauser.calls != 1 || !res.Paused {
 		t.Errorf("pauses = %d, res.Paused = %v", pauser.calls, res.Paused)
 	}
-	if pauser.agent != "developer-team/prod" {
-		t.Errorf("paused %q, want the acting agent", pauser.agent)
+	if pauser.last.AgentIdentity != "developer-team/prod" {
+		t.Errorf("paused %q, want the acting agent", pauser.last.AgentIdentity)
+	}
+	// The pause has to name the record it belongs to. The broker cannot pause anything itself
+	// (06 §2.2.1 gives it no write on `agents`), so the only pause it can perform is one recorded on
+	// this action's journal entry -- and a request that arrives without an actionId has nowhere to be
+	// written down. A driver that dropped it would leave the recorder to go looking for the record
+	// its caller already had, and the failure would be a silent no-pause.
+	if pauser.last.ActionID != "a-5" {
+		t.Errorf("the pause names action %q, want a-5: an unaddressed pause cannot be recorded", pauser.last.ActionID)
+	}
+	if pauser.last.Reason == "" {
+		t.Error("the pause carries no reason: this is what a human sees when they ask why the agent stopped")
 	}
 	if !strings.Contains(pager.last.RollbackError, "rejected the restore") {
 		t.Errorf("the page does not carry the rollback error: %+v", pager.last)
