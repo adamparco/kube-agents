@@ -754,7 +754,11 @@ type safety over a value nothing in this process reads. They are rendered as `un
       - **P9-T7c-3c-iii** — a durable `CooldownRegistry`. `verify.MemoryCooldown` says in its own
         doc comment that it is "deliberately not the production store: a cooldown that dies with
         the broker process is a cooldown an operator can clear by deleting a pod, and 04 §4.2
-        controls must survive that."
+        controls must survive that." **Allocates and claims V-PRO-028 at L1. Done 2026-07-29** —
+        `internal/broker/cooldown`, derived from the `ActionRecord` journal, sharing the backoff
+        fold (`verify.CooldownSeries`) with the reference implementation so the two agreeing is a
+        property a test asserts rather than two transcriptions somebody keeps in step. See "What
+        T7c-3c-iii asserts" below.
     - **P9-T7c-3d** — `pipeline.BrakeSource`, `broker.ContestedIndex`, and the `pipeline.New` call
       in `cmd/broker/main.go` that replaces `broker.UnavailablePipeline{}`, plus `policy.Source`
       construction with a synchronous startup `Refresh`. **Closes LSN-007.** Necessarily last: it
@@ -1074,6 +1078,67 @@ to talk to, so any pre-state over 1 MiB refuses its action outright. That is 03 
 direction and not a hole, but it is an availability cost invisible until someone patches a large
 ConfigMap, and a real sink needs a bucket, a GSA through Workload Identity and a lifecycle policy
 matching 06 §4.3's TTLs — a provisioning unit, not an adapter unit.
+
+**What T7c-3c-iii asserts.** V-PRO-028, newly allocated in 09 §6.6. Four things came out of building
+it, and the first two changed an interface.
+
+The first is that **the durable store had nowhere to live, and two of the three candidates were
+unavailable rather than unattractive.** `verify.MemoryCooldown`'s doc comment pointed at
+`Agent.status.operations`, which the broker cannot write: 06 §2.2.1 grants it `get, list, watch` on
+`agents` and no write verb, and V-BRK-013 asserts that grant _exactly_ and is BLOCKING-ALWAYS, so
+widening it is not a move an implementation gets to make. A new CRD would be a 06 §1 amendment,
+which PROTOCOL §10.5 keeps out of an implementation unit. The comment was wrong on the only point
+that mattered and now says so. What is left is the journal — and the journal is not a fallback: the
+cooldown is **already** a function of it, because "after a failed or rolled-back remediation of a
+target" is a query over `status.phase` and `spec.targets`. Storing a counter beside the records
+would be a second copy of a fact they already hold, and the two would eventually disagree. This is
+06 §4.4's contested-index shape and its argument — "the index is authoritative because a deleted
+object cannot hold an annotation" — one control over.
+
+The second is **the window between the rollback and the status write**, which is what put an action
+ID in `verify.CooldownRegistry.Enter`. `enterCooldown` runs inside `rollBack`, before its caller
+writes `status.phase`, so a purely derived registry reports "no cooldown" for exactly the interval
+in which the next action arrives — whatever is driving the flap is still driving it. So `Source` is
+a composition: journal plus an in-process overlay of the failures it has been told about and cannot
+yet see. The union is **by action ID**, and the ID is why. Handed only a target key the store would
+have to guess whether an event it sees is new, and both guesses are wrong — count it twice and one
+rollback buys a doubled quiet period, count it never and the cooldown does not exist until the write
+lands. A no-interface-change alternative was worked through and rejected: `max(journal, overlay)`
+computed separately undercounts `consecutive` during the catch-up window (a journal holding two
+prior failures plus a fresh overlay event yields 5 minutes where the correct answer is 20), and the
+error is in the **loosening** direction at the moment the cooldown matters most.
+
+The third is that **agreement with the reference implementation had to be a property, not a
+convention.** A durable store that reconstructs a _different_ quiet period from the same history is
+worse than no durable store, because it looks authoritative and answers differently. So the backoff
+moved into `verify.CooldownSeries`, one fold with two consumers arriving from opposite directions:
+`MemoryCooldown` folds events live, one per rollback; `cooldown.Source` folds a sorted slice
+recovered all at once after a restart. `TestSourceAgreesWithMemoryCooldown` runs one history through
+both and compares, and it guards itself — a history that left no cooldown active would make the
+comparison vacuous, so the test fails on that too. The fold's two rules stopped being edge cases the
+moment it had a second consumer: the sort in `seriesLocked` exists because a Go map iterates in a new
+order every time and an unsorted fold would apply the decay against the wrong previous event,
+answering differently on two consecutive reads of an unchanged journal.
+
+The fourth is **the read**, which deviates from 05 §1 step 5's literal word. Step 5 says
+"informer-cached"; this is a TTL-bounded snapshot over a List, for the reason `broker.MaxFreezeStaleness`
+already spells out in this repo's own words — "a watch that silently stopped delivering is not an
+error at all — the informer's List succeeds, the cache answers instantly, and every answer is from
+before the incident started". `livestate` and `policy.Source` made the same call, and
+`cmd/broker/main.go` builds a **direct** client on the same argument. Recorded as a ledger decision
+rather than left as an unremarked divergence. Past `MaxJournalStaleness` the registry **refuses**
+rather than reporting the target quiet, matching `broker.contestedRefusal`; inside the bound a
+single dropped read ages the snapshot rather than discarding it, matching `policy.Source`. **The
+residual, named because it loosens:** a rollback whose `status.phase` write never lands — the broker
+is killed between the two — is a failure event no later process can recover, because nothing durable
+records it. That is one action's tail against a whole process's worth of cooldowns, and closing it
+would need the rollback and the phase write in one transaction, which the API server does not offer.
+
+**Why V-PRO-028 is L1 only.** Phase 9 runs entirely in `PhaseDryRun`, so no record on a real cluster
+reaches `RolledBack` and there is nothing at L2 to recover from. The end-to-end property — a live
+agent actually refused, and the refusals lengthening — is V-PRO-005 and V-PRO-017, both already L2
+in phase 13. The distinction is written into 09 §6.6 beside the new row: those two pass perfectly
+against a cooldown held only in broker memory, which is cleared by `kubectl delete pod`.
 
 **The split is driven by level as much as by size.** Of T7's fifteen listed check IDs only five are
 reachable without a cluster — V-RUN-011 (L0, L1), V-RUN-003 (L0), V-BRK-012 (L0), V-BRK-011 (L1) and

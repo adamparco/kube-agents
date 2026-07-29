@@ -252,7 +252,7 @@ func (f *fakePauser) Pause(context.Context, verify.PauseRequest) error { f.pause
 
 type fakeCooldown struct{}
 
-func (fakeCooldown) Enter(_ context.Context, _ string, now time.Time) (time.Time, error) {
+func (fakeCooldown) Enter(_ context.Context, _, _ string, now time.Time) (time.Time, error) {
 	return now.Add(time.Hour), nil
 }
 

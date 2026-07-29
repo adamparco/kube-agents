@@ -92,7 +92,17 @@ type PauseRequest struct {
 // can stop that one.
 type CooldownRegistry interface {
 	// Enter starts or extends the cooldown for a target and returns when it expires.
-	Enter(ctx context.Context, targetKey string, now time.Time) (time.Time, error)
+	//
+	// actionID names the ActionRecord whose remediation failed, and it is here for the same reason
+	// Pauser.Pause takes a whole PauseRequest: the durable implementation
+	// (internal/broker/cooldown) recovers the series from the journal, so it has to be able to tell
+	// "this failure, which I am being told about now" from "this failure, which I have already read
+	// back out of the journal". Handed only a target key it would have to guess, and both guesses
+	// are wrong -- count it twice and one rollback buys a doubled quiet period, count it never and
+	// the cooldown does not exist until the status write lands. The caller has the ID in its hand;
+	// passing it costs nothing and makes Enter IDEMPOTENT PER ACTION, which is a promise callers may
+	// rely on: entering twice for one action is exactly entering once.
+	Enter(ctx context.Context, actionID, targetKey string, now time.Time) (time.Time, error)
 	// Active reports whether a target is in cooldown, and until when.
 	Active(ctx context.Context, targetKey string, now time.Time) (bool, time.Time, error)
 }
@@ -430,7 +440,7 @@ func (d *Driver) enterCooldown(ctx context.Context, req Request) time.Time {
 	}
 	var latest time.Time
 	for _, t := range req.Targets {
-		until, err := d.Cooldown.Enter(ctx, TargetKey(t.Ref), d.now())
+		until, err := d.Cooldown.Enter(ctx, req.ActionID, TargetKey(t.Ref), d.now())
 		if err != nil {
 			continue
 		}
