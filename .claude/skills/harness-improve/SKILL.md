@@ -77,7 +77,15 @@ Record both the original check ID and what changed about it.
 - Blocker cleared → the check is runnable now. Schedule it via `harness-verify`.
 - Blocker stale or vague → re-examine. A deferral with no live external blocker is a failure wearing
   a different label.
-- Any BLOCKING-ALWAYS check appearing in the deferral list → **halt**. That may not exist.
+- Any BLOCKING-ALWAYS check appearing in the deferral list → **halt**. That may not exist. The
+  exact rule has one definition site and it is executable: `check_deferrals_name_blockers` in
+  `dev/tests/invariants-gate.py`. Read it rather than this sentence — it is strictly finer, and
+  applying the coarse form literally halts on rows that are legitimate (a _level_ of a check that
+  is green at another level; a check whose 09 §6 phase has not arrived yet). Deferrals are also
+  recorded **by check ID**, never by category: an arm that hunts BLOCKING-ALWAYS checks by ID
+  matches nothing against a row naming a set, which is how V-CTN-021 sat deferred and unasked for
+  three phases ([[lsn-046]]). If the gate and this bullet ever disagree, the gate is right and
+  this bullet is the bug.
 - Deferrals blocked on a 09 §12 tightening: decide whether this pass can resolve the tightening
   (spec work, §3.6) and unblock the `†` check.
 

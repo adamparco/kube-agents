@@ -232,6 +232,10 @@ def negative_control() -> int:
     def edit(s: dict[str, str], rel: str, old: str, new: str) -> dict[str, str]:
         return {**s, rel: s[rel].replace(old, new, 1)}
 
+    # (label, mutate, signal). The signal names the property, not merely the fact of a failure.
+    # Parity, wiring and expression-identity all read the same two files and all report on
+    # `<field>Changed`, so "the check went red" is satisfied by whichever notices first and says
+    # nothing about the other two ([[LSN-035]]).
     mutations = [
         (
             # The defect this check was written for: a status field lands, and nobody teaches the
@@ -244,6 +248,7 @@ def negative_control() -> int:
                 "\tEscalation *ActionEscalation `json:\"escalation,omitempty\"`\n"
                 "\t// +optional\n\tQuarantined bool `json:\"quarantined,omitempty\"`",
             ),
+            "status.quarantined has no `quarantinedChanged` variable",
         ),
         (
             "a `<field>Changed` variable is deleted from the policy",
@@ -253,12 +258,14 @@ def negative_control() -> int:
                 "    - name: messageChanged\n      expression: >-\n",
                 "    - name: unusedChanged\n      expression: >-\n",
             ),
+            "status.message has no `messageChanged` variable",
         ),
         (
             # The subtlest one: the variable is still computed, so a reader scanning the variables
             # block sees full coverage. Only the conjunction knows.
             "a variable is computed but dropped from the `nothingChanged` conjunction",
             lambda s: edit(s, POLICY, "!variables.contestedChanged && ", ""),
+            "`contestedChanged` exists but is not part of the `nothingChanged` conjunction",
         ),
         (
             # Copy-paste: right name, wrong field. Both the parity and the wiring checks pass.
@@ -271,19 +278,25 @@ def negative_control() -> int:
                 "    - name: reportChanged\n      expression: >-\n"
                 "        (variables.hasOld && has(oldObject.status.recovery))",
             ),
+            # Parity and wiring both pass on this mutation by construction, so this signal is the
+            # only evidence the third property -- expression identity -- runs at all.
+            "`reportChanged` reads status.['recovery', 'report'], not exactly status.report",
         ),
         (
             "a status field is renamed, orphaning its variable",
             lambda s: edit(s, TYPES, 'json:"undoneBy,omitempty"', 'json:"revertedBy,omitempty"'),
+            "status.revertedBy has no `revertedByChanged` variable",
         ),
         (
             # LSN-035: the check runs, prints PASS, and its subject was never in scope.
             "the policy's variables block stops parsing",
             lambda s: {**s, POLICY: s[POLICY].replace("    - name: ", "    -  name: ")},
+            "no `- name:` variables parsed",
         ),
         (
             "the status struct is renamed out from under the check",
             lambda s: edit(s, TYPES, f"type {STRUCT} struct {{", f"type {STRUCT}V2 struct {{"),
+            f"`type {STRUCT} struct` not found",
         ),
     ]
 
@@ -295,13 +308,19 @@ def negative_control() -> int:
         return 1
 
     survivors: list[str] = []
-    for label, mutate in mutations:
+    for label, mutate, signal in mutations:
         mutated = mutate(dict(sources))
         if mutated == sources:
             survivors.append(f"{label} (the mutation did not apply -- its anchor text has moved)")
             continue
-        if not check(mutated):
-            survivors.append(label)
+        found = check(mutated)
+        if not found:
+            survivors.append(f"{label} (not caught at all)")
+        elif not any(signal in f for f in found):
+            survivors.append(
+                f"{label} (caught, but not by the property it targets -- no finding mentions "
+                f"{signal!r}; first finding was: {found[0][:120]}...)"
+            )
 
     if survivors:
         print("FAIL: the negative control found regressions this check does not detect:", file=sys.stderr)
@@ -309,7 +328,10 @@ def negative_control() -> int:
             print(f"  - {s}", file=sys.stderr)
         return 1
 
-    print(f"PASS: negative control -- all {len(mutations)} injected regressions were detected")
+    print(
+        f"PASS: negative control -- all {len(mutations)} injected regressions were detected, each "
+        f"by the property it targets"
+    )
     return 0
 
 

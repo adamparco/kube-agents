@@ -63,19 +63,21 @@ will start selecting.
 | **LSN-032** | security, codegen, corpus | A deny-list names a group nobody serves, and the corpus that checks it agrees | closed | `api-group-single-sourced.py` (L0-CHAIN) · `TestForbiddenSetNamesTheLiveAPIGroup` in `classify_test.go` |
 | **LSN-033** | security, scope, corpus | A safety list is complete for the domain its author had in mind, and empty for the one where the damage is | closed | `TestNonRecreatableKindsAreGatedByTheClassifier` in `internal/broker/undo/` · `undo-corpus-lint.py` (L0-CHAIN) · corpus §M |
 | **LSN-034** | security, gating, api-design | A value compared against itself will never tell you it is the wrong shape | closed | `assertLeafOps` + `TestDiffEmitsOnlyLeafOps` / `TestDiffKeepsAnEmptyMapVisible` in `k8s-operator/internal/broker/execute/diff_test.go`, run on every PR by `k8s-operator-test.yml` · `subtreeOps` doc at the definition site |
-| **LSN-035** | checks, mutation, negative-controls | A mutation survives, and the rule it broke turns out to be one no input can reach | **open** | — the ladder's own properties are now held by `TestLadderPropertiesHoldOverEveryAcceptedHistory`; the **general** check is for the next `harness-improve` |
+| **LSN-035** | checks, mutation, negative-controls | A mutation survives, and the rule it broke turns out to be one no input can reach | closed | `dev/tests/negative-controls-name-their-rule.py` (L0, in `dev/L0-CHAIN.txt`) — blinds each control's probe with a shape-preserving constant that names no property; a control that still passes was only asserting that *something* failed. All 10 controls in `dev/tests/` converted to per-mutation signals · the ladder's own properties are held by `TestLadderPropertiesHoldOverEveryAcceptedHistory` |
 | **LSN-036** | checks, renderers, allowlists, controller | A uniqueness check goes red on correct code, and the one-line green is an allowlist entry | closed | `pause-is-not-scale-to-zero.py` file-keyed `ALLOWED_REPLICAS_RHS` + `BROKER_REPLICAS_CONST` + stale-owner arm (L0-CHAIN) · `TestPauseDoesNotChangeTheRenderedBroker` in `pause_not_scale_to_zero_test.go` |
 | **LSN-037** | builds, dockerfiles, ci, toolchain | An image build fails on symbols that `go build ./...` resolves fine | closed | `dev/tests/go-build-targets-packages.py` + `--negative-control` (L0-CHAIN) · package-path builds in all 3 Dockerfiles + 2 Makefile recipes |
 | **LSN-039** | wiring, completeness, manifests, install-path | The manifest is correct, the check that reads it is green, and no install path ever applies it | closed | `dev/tests/identity-has-install-path.py` (**V-CMP-007**, L0-CHAIN) — manifest→step reachability over `k8s-operator/scripts/`, 7 properties, 8 negative controls including a reproduction of the original defect · the install path itself in `common.sh` (`render_agent_identity`, `apply_agent_identity`, `delete_agent_identity`) + `agent-identity.yaml.template` + `broker-operations-grant.yaml.template`, applied from `provision_08` and `provision_12` |
 | **LSN-038** | checks, probes, discovery, negative-controls | A guard that fails safe still fails, and a green run is how it tells you | closed | `check_machinery_probes_resolve` + `CLOSED_MARKER` + the Go arm of `_invoked_by` in `invariants-gate.py` (L0-CHAIN) · `dev/test_invariants_gate.py` (19 negative controls) · `dev/tests/golex.py` shared by `scope-label-single-sourced.py` and `api-group-single-sourced.py` |
 | **LSN-040** | seams, integration, assembly, broker | Two packages, each right, mean different things by the same field, and the first caller is the only thing that can tell | **open** | — fix scheduled as **P9-T7c-4**; the gap itself is pinned by `TestApplyFailsClosedAtTheIntegrityCheck` in `internal/broker/pipeline/pipeline_test.go` |
 | **LSN-041** | admission, CEL, policy, security, fail-open, checks | A security artifact's comment says a control exists; grep says it never did, and the hole it described is live | **closed** | `dev/tests/journal-status-vap-parity.py` + `--negative-control` in `dev/L0-CHAIN.txt` — derives the required CEL variable set from the Go type, so a status field with no policy row fails the build |
-| **LSN-042** | build, ci, deploy, kustomize, install-path, checks | Nothing in the repository ever built the thing the repository installs | **open** | — `make render` (a prerequisite of `build`/`test`) and `dev/tests/install-render-is-faithful.py` (**V-CMP-008**) cover the overlay; the **general** property — every artifact an install path applies is built by something CI runs — is for the next `harness-improve` |
-| **LSN-043** | harness, orient, durability, git | The ORIENT drain was done, verified green, and then silently reverted by a branch switch | **open** | — recovered only from a stray `/tmp` copy; mechanization is a `harness-run` §1 step 6 change (commit the drain before SELECT) at the next `harness-improve` |
-| **LSN-044** | rbac, checks, vacuity, kubectl, L2 | `kubectl auth can-i patch foo/status` asks about a **name**, not a subresource, so the denial it reports is about an object that does not exist | **open** | — the local fix is the `can()`/`subj()` guard in `dev/verify/brake-fanout-l2.sh`, which refuses a `TYPE/…` argument outright; the repo-wide L0 grep is for the next `harness-improve` |
-| **LSN-045** | checks, L2, fixtures, journal, append-only | An L2 suite that writes to an append-only journal can never delete its own namespace, and finds out on the second run | **open** | — `brake-fanout-l2.sh` is redesigned to reuse namespaces, mint IDs per run and match Events by UID; the general rule for `dev/verify/*.sh` is for the next `harness-improve` |
+| **LSN-042** | build, ci, deploy, kustomize, install-path, checks | Nothing in the repository ever built the thing the repository installs | closed | `make render` (a prerequisite of `build`/`test`) + `dev/tests/install-render-is-faithful.py` (**V-CMP-008**) for the overlay; `dev/tests/install-artifacts-are-rendered.py` (L0, in `dev/L0-CHAIN.txt`) for the general property — every kustomize directory an install path applies is one `render` builds, both sets derived, and `render` must stay a prerequisite of a CI-invoked target |
+| **LSN-043** | harness, orient, durability, git | The ORIENT drain was done, verified green, and then silently reverted by a branch switch | closed | `.claude/skills/harness-run/SKILL.md` §1 step 6 (commit the drain before SELECT) + `dev/tests/invariants-gate.py` `_drain_is_committed` (L0) — fails on an uncommitted drain, i.e. one that removes inbox items or advances `Last drained`, while an uncommitted human *append* still passes |
+| **LSN-044** | rbac, checks, vacuity, kubectl, L2 | `kubectl auth can-i patch foo/status` asks about a **name**, not a subresource, so the denial it reports is about an object that does not exist | closed | `dev/tests/cluster-check-hygiene.py` property 1 (L0, in `dev/L0-CHAIN.txt`) — no positional word of any `auth can-i` may contain `/`, `for`-lists resolved and expanded, and a resource the scanner cannot resolve obliges the script to carry a `*/*)` guard; local fix is `can()`/`subj()` in `dev/verify/brake-fanout-l2.sh` |
+| **LSN-045** | checks, L2, fixtures, journal, append-only | An L2 suite that writes to an append-only journal can never delete its own namespace, and finds out on the second run | closed | `dev/tests/cluster-check-hygiene.py` property 2 (L0, in `dev/L0-CHAIN.txt`) — no script that creates a DELETE-protected object may delete a namespace, with the protected set derived from the VAPs' own `DELETE` matchConstraints and the CRDs' `spec.names.kind`; `brake-fanout-l2.sh` reuses namespaces, mints IDs per run and matches Events by UID |
 
-**Open: 6 of 45** (LSN-035, LSN-040, LSN-042, LSN-043, LSN-044, LSN-045).
+| **LSN-046** | checks, deferrals, record-keeping, false-green, blocking-always, append-only | The deferral row named the category instead of its members, so the one gate arm that hunts deferred BLOCKING-ALWAYS checks matched nothing — and the false pass hiding behind it silenced that arm a second way | closed | `dev/tests/invariants-gate.py` `check_dagger_checks_are_deferred_by_id` (L0, in `dev/L0-CHAIN.txt`) — derives the † set from 09 §6.14 and requires every member to be named **by ID** in the Deferrals table and to hold no uncorrected pass; `_verification_evidence_rows` now emits one line per check ID and honours `**correction**` supersession; the BLOCKING-ALWAYS arm gained a not-yet-due clause keyed to the phase in 09 §6 that expires by itself and fails closed on an unparseable phase |
+
+**Open: 1 of 46** (LSN-040).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -1657,7 +1659,8 @@ assertion could not have held in either direction and proved nothing about the p
 
 ## LSN-035 — A redundant guard and an unenforced guard look identical from a green suite
 
-**Tags:** checks, mutation, negative-controls · **Phase:** 9 (P9-T5b) · **Status:** open
+**Tags:** checks, mutation, negative-controls · **Phase:** 9 (P9-T5b) · **Status:** closed —
+`dev/tests/negative-controls-name-their-rule.py`, in `dev/L0-CHAIN.txt`
 
 **What happened.** V-PRO-021 is a `¬` check, so P9-T5b mutation-tested the recovery ladder: neuter
 each of `ladder.go`'s eleven invariants in turn, confirm the suite goes red, restore. Nine died. The
@@ -1709,14 +1712,44 @@ runs one way: if a future revision relaxes monotonicity they stop being derived 
 thing enforcing the bound, and a rule deleted for being redundant is a rule nobody restores when the
 premise changes.
 
-That fixes one ladder. **It does not mechanize the lesson**, which is why this is open. Exhaustive
-enumeration worked here only because the state space is tiny (six rungs, four steps); it is not a
-general technique. The candidate mechanizations, for the next `harness-improve` to choose between:
-require every `¬` check to record *which* rule its negative control exercised and assert the error
-identifies that rule; or add reachability as an explicit question a mutation survivor must answer in
-writing before the survivor is allowed onto an allowlist. Whatever is chosen has to survive the
-LSN-019 bar — an artifact on disk, invoked by a chain or a workflow — and note that this lesson's
-own evidence came from a Go test, which is the gap [[lsn-034]] already handed to the same pass.
+That fixed one ladder. Exhaustive enumeration worked there only because the state space is tiny (six
+rungs, four steps); it is not a general technique.
+
+**Closed by `dev/tests/negative-controls-name-their-rule.py`.** The first of the two candidate
+mechanizations, taken: every `¬` check must assert *which* rule its control exercised.
+
+The check is **behavioural**, not structural. The obvious version greps for a three-element mutation
+tuple, which is a check on today's code shape, is defeated by a control written in another style,
+and would have scored `install-render-is-faithful.py` — the one file in the tree that already did
+this properly — as a violation, because its breakages are numbered rather than signalled. Instead:
+load each check advertising `--negative-control`, blind the probe its control actually calls, and
+re-run. A control that asserts a per-mutation signal now fails; one that only asks "is the failure
+list non-empty" still passes, and **that pass is the finding**. The instrument is the defect itself,
+injected on purpose.
+
+Three details are load-bearing, and each was a wrong first draft:
+
+- **The blinding preserves emptiness.** A non-empty result becomes one constant; an empty result
+  stays empty. Substituting unconditionally also changes *whether* the probe fired, so any control
+  with a false-positive arm ("this correct spelling must NOT be flagged") went red on that arm and
+  scored as discriminating without distinguishing anything. Preserving emptiness leaves the boolean
+  signal intact and destroys only the identity — which is the property under test, stated exactly.
+- **The probe is read off the control's own bytecode**, not off the module.
+  `go-build-targets-packages.py` defines both `check` and `scan_text`; `check` walks the repository
+  and its control never calls it, so blinding by module order was a silent no-op.
+- **The sentinel preserves shape.** `scan_text` returns `(line, invocation, operand)` triples;
+  handing that control a bare string is a crash, and a crash scores as *unscoreable* per
+  [[LSN-038]], never as a pass. Strings become the sentinel, numbers become zero, in place.
+
+Converting the corpus found what the lesson predicts. `cluster-check-hygiene.py`'s comment-stripping
+control turned out to exercise property **2** (the DELETE-protected kinds), not property 1 (the
+`auth can-i` slot) as its label claimed — the prose spelling of the can-i trap is in backticks, a
+backtick means command substitution, and the tokenizer correctly declines to resolve it. Under a
+non-emptiness assertion that control read as covering both. That is this lesson in one line, found
+by its own mechanization on the day it landed.
+
+Ten controls now discriminate. The check itself carries a `¬` scoring six controls of known
+quality, including one whose module defines a decoy probe and one whose findings are tuples.
 
 **Related.** [[lsn-032]] is this one's sibling and the reason it was recognized: there, a corpus
 derived from the rule table agreed with the table's defects for three phases. Here, a negative
@@ -2163,8 +2196,8 @@ a disagreement between two).
 ## LSN-042 — Nothing in the repository ever built the thing the repository installs
 
 **Tags:** build, ci, deploy, kustomize, install-path, checks · **Phase:** 9 (P9-T7d-6) ·
-**Status:** open — the specific case is mechanized (`make render` + **V-CMP-008**); the general
-property is for the next `harness-improve`
+**Status:** closed — `make render` + **V-CMP-008** for the overlay,
+`dev/tests/install-artifacts-are-rendered.py` for the general property
 
 **What happened.** Surveying for P9-T7c-3c-ii-b-2-b, `kustomize build config/default` failed:
 `multiple matches for selector Certificate.v1.cert-manager.io/[noName].[noNs]:metadata.name`. Not
@@ -2212,12 +2245,29 @@ rather than the output — no transforming kustomization may reach `config/mesh-
 inclusion graph — so re-nesting the CA under some *new* transforming layer fails too. A check that
 only knew about `config/default` would have passed the same bug with a different diff.
 
-**Still open, and this is the part that matters.** Both of those are about this overlay. The general
-property is: **every artifact an install path applies is built by something CI runs.** `config/`
-was one; the LiteLLM, inference-replay and GitHub integration overlays are five more
-`$(KUSTOMIZE) build` calls that nothing renders either, and the same argument applies to every
-`.template` the provisioning scripts `envsubst`. Deriving that set from the install path instead of
-listing it is [[lsn-036]]'s rule, and it is the next `harness-improve`'s.
+**The general property**, which is the part that mattered, is
+`dev/tests/install-artifacts-are-rendered.py`, landed in the 2026-07-29 improvement pass: every
+kustomize directory an install path **applies** must be one `make render` **builds**. Both sides are
+read out of the Makefiles and scripts, so a sixth integration is enforced the day its `apply` line
+lands rather than the day someone remembers ([[lsn-036]]).
+
+It found four on its first run — LiteLLM base, the ChatGPT overlay, inference-replay and the GitHub
+integration, all applied by `deploy-*` targets and rendered by nothing. All four rendered cleanly
+once asked, so this was luck rather than a second outage, and luck is the reading that should worry
+someone: the gap was identical to the one that cost a month, and the only difference was which
+overlay happened to be broken.
+
+The check has a second half that is not obvious and is the one most likely to be needed: `render`
+must remain a **prerequisite of `build` and `test`**. `k8s-operator-test.yml` runs
+`make -C k8s-operator test`, and that prerequisite is the entire route from CI to a rendered
+install. Extending the recipe while dropping that word restores the original blind spot exactly,
+looks like a cleanup in review, and is one of the seven negative-control mutations.
+
+**Scoped out, with the argument.** `envsubst < x.yaml.template | kubectl apply` is an install path
+with no builder, so there is no render to demand of it. Reachability of those is [[lsn-039]]'s
+`identity-has-install-path.py`; structural validity of the substituted output needs the variables
+and therefore a cluster. The failure this lesson is about needs a *build* to be silently broken, and
+envsubst has no merge semantics, no selectors and no inclusion graph to be wrong about.
 
 Related: [[lsn-007]] (built, tested, unreachable), [[lsn-039]] (the manifest is correct and no
 install path applies it), [[lsn-036]] (a headcount goes stale when the population grows),
@@ -2228,7 +2278,7 @@ install path applies it), [[lsn-036]] (a headcount goes stale when the populatio
 ## LSN-043 — The drain was done, verified green, and then quietly reverted
 
 **Tags:** harness, orient, durability, git · **Phase:** 9 (P9-T7d-6) ·
-**Status:** open — mechanization is a `harness-run` §1 change at the next `harness-improve`
+**Status:** closed — `harness-run` §1 step 6 + `_drain_is_committed` in `dev/tests/invariants-gate.py`
 
 **What happened.** A human appended an item to `BACKLOG.md`'s inbox while PR #60's merge was in
 flight. `gh pr merge --squash --delete-branch` refused to switch branches over the dirty file, so
@@ -2251,16 +2301,24 @@ gets committed; the drain is the one thing ORIENT is required to *write*, and th
 uncommitted until the end of a unit that may take hours and will certainly touch git. The window is
 structural, not accidental.
 
-**The mechanization.** A `harness-run` §1 step 6 change: the drain is committed as its own commit
-before SELECT, not carried to CHECKPOINT. It is a one-line procedural edit, it makes the drain
-durable by construction rather than by vigilance, and it has the side benefit that the drain lands
-on the branch it was reasoned on. Deferred to `harness-improve` under PROTOCOL §10.1 — the skill
-change belongs to a pass, not to the unit that tripped over it.
+**The mechanization**, landed in the 2026-07-29 improvement pass, is two halves that have to move
+together — the procedure and the thing that enforces it:
 
-**What to do next time, until then.** After any `gh pr merge`, `git stash pop`, or branch switch
-during a session that has drained the backlog, diff `docs/build/BACKLOG.md` against `origin/main`
-before trusting it. A green `invariants-gate.py` does not distinguish "drained" from "never had
-anything in it".
+- `.claude/skills/harness-run/SKILL.md` §1 step 6: the drain is committed as its own commit **before
+  SELECT**, not carried to CHECKPOINT. Durable by construction rather than by vigilance, and it
+  lands the drain on the branch it was reasoned on.
+- `_drain_is_committed` in `dev/tests/invariants-gate.py`: fails when `BACKLOG.md` is dirty **in the
+  direction a drain moves it** — inbox items removed, or `Last drained` advanced past HEAD's.
+
+That direction test is the whole design. `BACKLOG.md` exists so a human can append to it mid-unit,
+which means "dirty" is the normal, sanctioned state and cannot itself be the finding. An append adds
+items and leaves the date alone; a drain removes items or advances the date. Only the second shape
+is uncommitted-and-lossy. The check also asserts the skill still carries the sentence, because a
+gate enforcing a rule the documentation no longer states is a rule nobody can follow on purpose.
+
+Note what is *not* claimed: this cannot make the drain survive a `git checkout` of an uncommitted
+file. Nothing can. It makes the window observable — the next gate run says so — where before, the
+reverted file and the drained file were byte-identical to every check in the repository.
 
 Related: [[lsn-038]] (a green run is how a guard tells you it failed safe), [[lsn-012]] (repository
 mechanics resolved by content, never by name).
@@ -2315,10 +2373,26 @@ A grep of `dev/` and `k8s-operator/scripts/` confirms this was the only site —
 vacuously green on it. That is luck, not structure: nothing stops the next L2 suite from writing it
 the same way.
 
-**Still open.** The general property is an L0 grep: no `auth can-i` anywhere in the tree may take a
-positional argument containing `/`. It is three lines and it belongs in `dev/L0-CHAIN.txt`, but it
-is a new check motivated by a defect this unit found, so it goes to the improvement pass under
-PROTOCOL §10.1 rather than riding along here.
+**Closed** by `dev/tests/cluster-check-hygiene.py` property 1, wired into `dev/L0-CHAIN.txt` in the
+2026-07-29 improvement pass. It turned out not to be a three-line grep. `auth can-i` has three
+argument shapes in this tree, and a grep sees only the first:
+
+- **literal** — `auth can-i get nodes`. A slash here is the bug verbatim.
+- **`for`-list** — `for pair in "impersonate users" …; do auth can-i $pair`, the idiom in
+  `verify-phase2.sh` and `verify-phase3.sh`. The check enumerates the list and expands each item
+  into the positional slots, so these sites get the strict treatment rather than a weaker one.
+- **computed** — `can()` above, where the resource is `"$2"`. Statically unresolvable, so the
+  obligation shifts: the script must carry the `*/*)` arm itself. That is strictly stronger than the
+  static ban where it applies, because it also catches a slash that only appears at runtime.
+
+Without the third clause the whole property is evaded by the most ordinary refactor there is —
+hoisting a repeated query into a helper. Which is precisely how it was evaded here.
+
+The first draft also demanded a runtime guard from `verify-phase2/3/4.sh`, none of which compute a
+resource: it read `-n $NSX` as a positional, because it had no model of which flags take a separate
+value. A check whose parser is wrong in the *strict* direction is merely noisy; the same parser
+wrong in the other direction is a blind spot, which is why the tokenizer now consumes flag values
+explicitly and one of the twelve negative-control mutations hides a slash behind a flag.
 
 Related: [[lsn-034]] (a value compared against itself), [[lsn-035]] (a redundant guard and an
 unenforced guard look identical from a green suite), [[lsn-038]] (a guard that fails safe still
@@ -2329,8 +2403,7 @@ fails).
 ## LSN-045 — The suite wrote to an append-only journal, then tried to delete the namespace
 
 **Tags:** checks, L2, fixtures, journal, append-only · **Phase:** 9 (P9-T7c-3c-ii-b-2-b) ·
-**Status:** open — this suite is redesigned; the general rule for `dev/verify/*.sh` is for the next
-`harness-improve`
+**Status:** closed — `dev/tests/cluster-check-hygiene.py` property 2, in `dev/L0-CHAIN.txt`
 
 **What happened.** `brake-fanout-l2.sh` created a namespace, created `Agent`s and `ActionRecord`s
 in it, and deleted the namespace on exit — the shape every other L2 suite in `dev/verify/` uses.
@@ -2379,9 +2452,96 @@ or removing the finalizer out from under the policy — **a human call, not the 
 policy may not delete the namespace containing it. `brake-fanout-l2.sh` is today the only script in
 `dev/verify/` or `dev/tests/` that creates an `ActionRecord` at all — so the sweep found one site
 and it is fixed — but P9-T9's consolidated gate and the broker L2 suites are all going to create
-them. The check is an L0 grep pairing "creates an ActionRecord" against "deletes a namespace", and
-it goes to the improvement pass under PROTOCOL §10.1.
+them.
+
+**Closed** by `dev/tests/cluster-check-hygiene.py` property 2, wired into `dev/L0-CHAIN.txt` in the
+2026-07-29 improvement pass: no script that creates a DELETE-protected object may also delete a
+namespace. Ten of the tree's shell scripts delete a namespace and that is fine — the pairing is what
+is forbidden, so the check costs nothing until the two meet.
+
+The set of protected kinds is **derived, not listed** ([[lsn-036]]). It is read out of the
+`ValidatingAdmissionPolicy`s themselves — every resource any policy matches for `DELETE` — and the
+plural is then resolved to a Kind through the CRD that declares it. Hardcoding `ActionRecord` would
+have been one line and would have made the check a headcount of today's policies; as written, a
+second retention policy over a second resource starts being enforced the day it lands, and a policy
+naming a resource no CRD declares is itself a finding. Both directions of that derivation carry a
+non-vacuity floor, because a property asserted over a set that quietly emptied reports success.
 
 Related: [[lsn-037]] (the build that ships is not the build you tested — residue is the same class
 of stale input), [[lsn-036]] (a single-site check is a headcount, and this sweep found exactly one
 site).
+
+---
+
+## LSN-046 — The deferral named the category, so the gate had nothing to match
+
+**Tags:** checks, deferrals, record-keeping, false-green, blocking-always, append-only ·
+**Phase:** 9 (improvement pass, 2026-07-29) · **Status:** closed —
+`check_dagger_checks_are_deferred_by_id` in `dev/tests/invariants-gate.py`, in `dev/L0-CHAIN.txt`
+
+**What happened.** The ledger's Deferrals table carried one row reading `09 §6.14 checks marked
+**†**` — the set of checks blocked on an unresolved 09 §12 specification tightening. Accurate,
+readable, and the kind of row a human resolves in a minute by opening §6.14.
+
+`check_deferrals_name_blockers` has an arm for the rule that matters most in that table: **a
+BLOCKING-ALWAYS check may not be deferred** (09 §9.6). It finds them by running a check-ID regex
+over the row's subject cell. Against `09 §6.14 checks marked **†**` it matches nothing and reports
+clean. Four checks were inside that row. One of them, **V-CTN-021**, is a V-CTN check.
+
+So the arm had been silent about a deferred BLOCKING-ALWAYS check since the row was written — not
+because anyone concealed anything, but because **the arm could be satisfied by naming a set instead
+of its members**, and a silence that can be bought that cheaply is not evidence. That is [[lsn-035]]
+one level up from the checks that lesson was about: an assertion passing for a reason unrelated to
+its property.
+
+**Then the second one.** Writing the fix, I gave the arm a narrow exemption — a BLOCKING-ALWAYS
+check whose 09 §6 phase has not arrived is unstarted, not deferred, which is the ordinary condition
+of all future work. V-CTN-021 is required at phase 11 and the build is at 9. An exemption is only
+safe if it expires, so I tested it at phases 9, 10, 11, 12 and unknown, expecting three failures.
+
+All five came back exempt. The exemption was never firing at all: the arm short-circuits on "green
+somewhere", and `verification/results.csv` row 47 (2026-07-27, P8-T9) recorded
+`"V-CTR-002, V-CTN-021"` as **pass**. The evidence on that row is `webhook-negatives-l2.sh` proving
+V-CTR-002 — each of 06 §1.2's V-1…V-10 negatively tested, naming its field path — which is real
+evidence for V-CTR-002 and says nothing whatever about conformance of the 39 cells of the 02 §7
+boundary matrix. There is no V-CTR-021, so it is not a one-letter slip from the neighbour. A
+BLOCKING-ALWAYS check that had never been run, and currently **cannot** be run, was green for two
+days.
+
+**The lesson is the interaction, not either half.** A false pass is not inert. It is an input to
+every check that asks "has this ever been green", and each of those goes quiet in a way that looks
+exactly like the property holding. The category row hid V-CTN-021 from the arm; the false pass
+would have kept hiding it even after the row was fixed. Two independent defects, each sufficient,
+found in one sitting only because testing the exemption meant watching it fail — and it didn't.
+**A carve-out you cannot watch expire is a carve-out you have only asserted.**
+
+**The third one, found by the fix.** Appending the correction row did not clear it either. The
+record is append-only and `_verification_evidence_rows` grepped it for the word: row 47 still
+contains `V-CTN-021` and `**pass**` and always will. The `**correction**` convention the record has
+followed since V-MET-014 (rows 18–19) was **decorative to every reader of the record** — a retracted
+claim went on vouching for itself forever. Fixed by emitting passes per check ID and dropping any a
+later correction retracts. Per-ID matters as much as supersession: row 47 is one cell naming two
+checks, of which exactly one was really run, and emitting the row whole makes the honest half vouch
+for the other half indefinitely.
+
+**Closed by** three changes in `dev/tests/invariants-gate.py`, all on the L0 chain:
+
+1. `check_dagger_checks_are_deferred_by_id` — the † set is **derived** from 09 §6.14 ([[lsn-036]]),
+   never listed, and an empty derived set is a FAIL rather than a clean run. Arm one: every member
+   must be named by ID in the Deferrals table. Arm two: no member may hold a pass that no later
+   correction retracts, because "blocked on a tightening" and "passed" cannot both be true.
+2. `_verification_evidence_rows` — per-check-ID emission with correction supersession, so the
+   append-only record can express a retraction to a machine and not just to a reader. The last
+   correction wins, so a check that was corrected and later genuinely re-passed still counts.
+3. The not-yet-due clause on the BLOCKING-ALWAYS arm — granted only while the required phase has
+   not arrived, only when both phase numbers parse, and lapsing with no edit to anything. An
+   unparseable phase is the unknown case and the unknown case fails ([[lsn-038]]). At phase 11 the
+   row goes red on its own, which is what makes T-6 a deadline rather than a note.
+
+Verified by reproducing all three: 4 failures before the row was fixed, 1 more for the false green,
+0 after the correction landed, and the exemption now failing at phases 11, 12 and unknown while
+staying granted at 9 and 10.
+
+Related: [[lsn-035]] (a control that proves only that *something* failed — the same shape, applied
+to a gate arm instead of a negative control), [[lsn-036]] (derive the subject set, never enumerate
+it), [[lsn-038]] (a guard that cannot run must not score as a pass).
