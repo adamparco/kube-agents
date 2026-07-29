@@ -30,7 +30,7 @@ The render produces the complete tree a fresh spoke needs — and nothing that g
 clusters/<cluster>/
   bootstrap/                       # ordered control-plane waves (05 §7) — resolves the chicken-and-egg
     00-cert-manager/               #   cert-manager (webhook serving cert); pipeline waits for Ready
-    10-controller/                 #   CRD + controller + webhooks + kage-router (config/default)
+    10-controller/                 #   CRD + controller + webhooks + kage-router + mesh CA (config/install)
     20-policy/                     #   the agent-read-only VAP — ENFORCING before any identity applies
   agents/
     identity/cluster-admin-identity.yaml   # pre-created read-only KSA + ClusterRole/Binding + WI
@@ -109,7 +109,7 @@ bundle.
 2. **Least privilege in the cloud too** — for a project with more than one cluster-admin agent, give
    each a per-cluster viewer GSA (or an IAM Condition) so "reads only its own cluster" holds in the
    cloud, not just in RBAC (flagged in the rendered identity file).
-3. **Keep pins immutable** — repin the bootstrap bases (cert-manager, `config/default`) to a
+3. **Keep pins immutable** — repin the bootstrap bases (cert-manager, `config/install`) to a
    content-addressable ref/digest for production.
 4. **One agent per cluster** — if the cluster already has a cluster-admin agent, edit its CR; don't
    propose a duplicate (the webhook will reject it anyway).

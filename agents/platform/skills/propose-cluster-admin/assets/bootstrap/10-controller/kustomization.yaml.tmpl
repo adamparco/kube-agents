@@ -1,10 +1,14 @@
 # Bootstrap wave 10 — the kube-agents per-cluster control plane (PINNED to a release ref). Rendered
 # for @@CLUSTER@@.
 #
-# Pulls the operator's full install overlay (config/default): the Agent CRD, the controller-manager
-# (RBAC + Deployment + cert-manager-issued webhook cert), the validating/mutating webhooks, and the
-# read-only kage-router (the ChatOps front door). Each cluster — hub or spoke — runs its own controller
-# and router (05 §7: the controller reconciles ONLY its own cluster's Agent CRs).
+# Pulls the operator's full install overlay (config/install): the Agent CRD, the controller-manager
+# (RBAC + Deployment + cert-manager-issued webhook cert), the validating/mutating webhooks, the
+# read-only kage-router (the ChatOps front door), and the mesh CA. Each cluster — hub or spoke — runs
+# its own controller and router (05 §7: the controller reconciles ONLY its own cluster's Agent CRs).
+#
+# `config/install`, NOT `config/default`. `default` is the transformed half and omits the mesh CA,
+# which cannot survive its `namePrefix`/`namespace` transformers. A cluster bootstrapped from
+# `default` comes up with no trust root and every broker stuck waiting on an unsignable Certificate.
 #
 # Depends on wave 00 (cert-manager) for the webhook serving cert; the pipeline waits for the controller
 # Deployment (kubeagents-controller-manager) to roll out before wave 20.
@@ -16,4 +20,4 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - github.com/gke-labs/kube-agents/k8s-operator/config/default?ref=v0.1.0
+  - github.com/gke-labs/kube-agents/k8s-operator/config/install?ref=v0.1.0

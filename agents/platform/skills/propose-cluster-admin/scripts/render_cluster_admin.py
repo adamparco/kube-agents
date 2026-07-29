@@ -11,7 +11,7 @@ The bundle is EVERYTHING a fresh spoke needs, and nothing that mints privilege a
   clusters/<cluster>/
     bootstrap/                      # ordered control-plane waves (05 §7) — resolves chicken-and-egg
       00-cert-manager/              # cert-manager (webhook serving cert)
-      10-controller/                # CRD + controller + webhooks + kage-router (config/default)
+      10-controller/                # CRD + controller + webhooks + kage-router + mesh CA (config/install)
       20-policy/                    # the agent-read-only VAP, enforcing BEFORE the identity applies
     agents/
       identity/cluster-admin-identity.yaml   # pre-created read-only KSA + ClusterRole/Binding + WI

@@ -215,6 +215,24 @@ check that proves they left the critical path.
   **fail**, never partial — the symptom is a policy that matches nothing, which reports the same
   green as a policy that passes. Negative control: stop applying one tier's identity and confirm the
   check goes red while the other two tiers still install. `L0`
+- **V-CMP-008** — the install overlay **renders**, and what it renders is **the install**. Two
+  properties, separately provable. That it renders is `make render`, a prerequisite of
+  `make build` and `make test`; a `kustomize build` of the full overlay must succeed, and the
+  absence of that build is how `make deploy` — and therefore
+  `provision_03_gcp_gke_operator.sh` — stayed broken for a month with every check green. That what
+  it renders is faithful is a structural assertion over the reference graph: **no transforming
+  kustomization may reach `config/mesh-ca`**, over the whole inclusion graph rather than the one
+  edge that broke it, and the trust root's three couplings must hold — `meshCAIssuerName` in
+  `internal/controller/mesh_trust.go` names a `ClusterIssuer` that exists, the CA `Certificate`
+  stays in `cert-manager` (the only namespace a ClusterIssuer resolves `ca.secretName` from), and
+  that Secret is one a `Certificate` in-tree creates. Every path that pulls the overlay — the two
+  cluster-facing Makefile targets, GitOps bootstrap wave 10, and the `propose-cluster-admin`
+  template — must name `config/install` and not `config/default`, the transformed half that omits
+  the CA. Reports **fail**, never partial, and an empty result set is a fail rather than a vacuous
+  pass: a `namePrefix` applied to the CA does not error, does not fail to apply, and surfaces only
+  as brokers that never become Ready behind agent `Certificate`s that sit `Pending` forever.
+  Negative control: nine mutations, one of which reintroduces the original defect verbatim by
+  moving `../mesh-ca` back under `config/default`. `L0` ¬
 
 ### 5.2 Contract inventory (from [06](06-api-and-data-contracts.md))
 

@@ -1,0 +1,28 @@
+# The whole install, and the only thing `make deploy` applies.
+#
+# This layer exists to hold ONE property: it applies no transformers. `../default` carries
+# `namePrefix: kubeagents-` and `namespace: kubeagents-system`, which are right for everything the
+# operator owns and wrong for the mesh CA, and a transformer in kustomize applies to every resource
+# beneath it with no per-resource opt-out. Nesting the two here rather than nesting mesh-ca inside
+# default is how each gets the treatment it needs: `../default` builds with its transformers, this
+# layer adds `../mesh-ca` verbatim, and neither can reach the other.
+#
+# Why the mesh CA cannot be prefixed or moved (08 §2.3):
+#
+#   - `internal/controller/mesh_trust.go` signs every agent leaf against
+#     `ClusterIssuer/kubeagents-mesh-ca` by name. `namePrefix` rewrote that object to
+#     `kubeagents-kubeagents-mesh-ca`, so every agent Certificate in the fleet would reference an
+#     issuer that does not exist -- and a Certificate whose issuerRef does not resolve does not
+#     fail loudly, it just never becomes Ready.
+#   - the CA Certificate must live in `cert-manager`, because a ClusterIssuer resolves its
+#     `ca.secretName` from the cluster resource namespace and nowhere else. `namespace:` moved it
+#     to `kubeagents-system`, which puts the key where the issuer will not look for it.
+#
+# None of this was visible until 2026-07-28, because `kustomize build config/default` had been
+# failing outright since the mesh CA landed and nothing in CI rendered it. The render is now a
+# prerequisite of `make build` and `make test`, and the reference graph is asserted at L0 by
+# `dev/tests/install-render-is-faithful.py` -- a render that succeeds is not a render that is
+# correct, and that check is what tells the two apart.
+resources:
+  - ../default
+  - ../mesh-ca

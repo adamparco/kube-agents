@@ -14,12 +14,13 @@ resources:
   - ../manager
   - ../webhook
   - ../certmanager
-  # The mesh CA (08 §2.3). Separate from ../certmanager, which is the webhook's own self-signed
-  # serving cert: that issuer is namespaced and signs one certificate for one Service, while this
-  # one is cluster-scoped and signs a leaf for every agent in the fleet. Folding them together
-  # would put the mesh root in the operator's namespace under a name that reads like a webhook
-  # detail.
-  - ../mesh-ca
+  # The mesh CA (08 §2.3) is NOT here. It used to be, and it could not survive the two transformers
+  # above it: `namePrefix: kubeagents-` renamed a ClusterIssuer that is already spelled
+  # `kubeagents-mesh-ca` into `kubeagents-kubeagents-mesh-ca`, which is not the name
+  # `meshCAIssuerName` in internal/controller/mesh_trust.go asks every agent Certificate to be
+  # signed by; and `namespace: kubeagents-system` moved the CA Certificate out of `cert-manager`,
+  # which is the one namespace a ClusterIssuer resolves its CA Secret from. It is applied
+  # untransformed from `config/install` instead. See dev/tests/install-render-is-faithful.py.
   - ../router
 
 patches:
@@ -30,6 +31,7 @@ replacements:
       kind: Certificate
       group: cert-manager.io
       version: v1
+      name: serving-cert
       fieldPath: metadata.name
     targets:
       - select:
@@ -50,6 +52,7 @@ replacements:
       kind: Certificate
       group: cert-manager.io
       version: v1
+      name: serving-cert
       fieldPath: metadata.namespace
     targets:
       - select:
@@ -76,6 +79,7 @@ replacements:
           kind: Certificate
           group: cert-manager.io
           version: v1
+          name: serving-cert
         fieldPaths:
           - spec.dnsNames.0
         options:
@@ -85,6 +89,7 @@ replacements:
           kind: Certificate
           group: cert-manager.io
           version: v1
+          name: serving-cert
         fieldPaths:
           - spec.dnsNames.1
         options:
@@ -100,6 +105,7 @@ replacements:
           kind: Certificate
           group: cert-manager.io
           version: v1
+          name: serving-cert
         fieldPaths:
           - spec.dnsNames.0
         options:
@@ -109,6 +115,7 @@ replacements:
           kind: Certificate
           group: cert-manager.io
           version: v1
+          name: serving-cert
         fieldPaths:
           - spec.dnsNames.1
         options:

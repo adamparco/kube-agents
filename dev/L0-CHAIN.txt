@@ -171,6 +171,25 @@ python3 dev/tests/journal-status-vap-parity.py --negative-control
 python3 dev/tests/identity-has-install-path.py
 python3 dev/tests/identity-has-install-path.py --negative-control
 
+# --- the install overlay renders, and renders faithfully (P9-T7d-6) --------------------------
+# Two different properties, and only one of them is L0. That it BUILDS is `make render`, now a
+# prerequisite of `make build` and `make test`; it needs the kustomize binary, so it cannot live
+# here. That what it builds is the install anyone wants is this, and it needs nothing but the files.
+# The distinction is the whole lesson: `config/default` was unrenderable for a month — an ambiguous
+# replacement selector, introduced by the mesh CA itself — and `make deploy` was broken that entire
+# time with every check green, because nothing in the repo ever rendered it. Pinning the selector
+# then exposed the worse half: `namePrefix`/`namespace` had been silently rewriting the CA into
+# `kubeagents-kubeagents-mesh-ca` in the wrong namespace, which is not the name `meshCAIssuerName`
+# hardcodes and not a namespace a ClusterIssuer reads its Secret from. Neither rewrite errors. Both
+# leave every agent Certificate Pending forever. So this asserts the reference graph instead of the
+# output: no transforming kustomization can REACH config/mesh-ca (over the whole graph, not the one
+# edge that broke), the Go constant and the ClusterIssuer name agree, the CA stays in cert-manager,
+# and every remote pull — GitOps wave 10, the propose-cluster-admin template — names config/install.
+# Empty result sets are FAILs (LSN-035). `--negative-control` is the `¬`; one of its nine mutations
+# is the original bug verbatim.
+python3 dev/tests/install-render-is-faithful.py
+python3 dev/tests/install-render-is-faithful.py --negative-control
+
 # --- builds compile whole packages (LSN-037) -------------------------------------------------
 # `go build cmd/broker/main.go` compiles one file and pretends the rest of the package is absent.
 # It is indistinguishable from the correct spelling until a package gains its second file, and then
