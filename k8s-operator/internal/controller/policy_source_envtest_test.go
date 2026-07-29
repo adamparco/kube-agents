@@ -110,8 +110,10 @@ func (alwaysSeen) Seen(string, string, classify.KindRef, string) bool { return t
 func newPolicySource(t *testing.T, k8s client.Client) *policy.Source {
 	t.Helper()
 	src, err := policy.NewSource(policy.SourceConfig{
-		Reader:  k8s,
-		Agent:   policy.Agent{Tier: agentv1alpha1.TierPlatform, Scope: scope.Scope{ProjectID: "adamparco-kage"}},
+		Reader: k8s,
+		Identity: func() (policy.Agent, error) {
+			return policy.Agent{Tier: agentv1alpha1.TierPlatform, Scope: scope.Scope{ProjectID: "adamparco-kage"}}, nil
+		},
 		History: alwaysSeen{},
 	})
 	if err != nil {
@@ -290,10 +292,10 @@ func TestTheLoaderAssertionsCanFail(t *testing.T) {
 	//    a policy set that was fine when it was fetched and is not fine now.
 	clk := &jumpingClock{at: time.Now()}
 	jumped, err := policy.NewSource(policy.SourceConfig{
-		Reader:  k8s,
-		Agent:   policy.Agent{Tier: agentv1alpha1.TierPlatform},
-		History: alwaysSeen{},
-		Now:     clk.now,
+		Reader:   k8s,
+		Identity: func() (policy.Agent, error) { return policy.Agent{Tier: agentv1alpha1.TierPlatform}, nil },
+		History:  alwaysSeen{},
+		Now:      clk.now,
 	})
 	if err != nil {
 		t.Fatalf("NewSource: %v", err)

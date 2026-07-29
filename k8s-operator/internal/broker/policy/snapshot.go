@@ -81,6 +81,32 @@ func (s *Snapshot) ObservedAt() time.Time {
 // `policySources` list that does not mention the policy, in a record that looks entirely normal.
 // There is no failure of this function whose safe handling is "carry on with the rest".
 func Build(policies []*agentv1alpha1.ChangePolicy, a Agent, history classify.ActionHistory, at time.Time) (*Snapshot, error) {
+	// The agent's OWN scope gets the same well-formedness refusal the policies get, and for the
+	// mirror-image reason. There the hole was in the outer scope and read as a wildcard that binds
+	// too much; here it is in the inner one, and `scope.Contains` walks the outer's narrowed levels
+	// against an inner that has nothing at that level -- so a policy scoped to project `p` does not
+	// bind an agent whose scope is `{namespace: n}` with the project missing. That is a binding
+	// LOST, and since a ChangePolicy can only tighten, a lost binding is the loosening direction:
+	// the broker classifies lower than the operator wrote, and the record's `policySources` omits
+	// the policy without a word.
+	//
+	// The ZERO scope is deliberately allowed through. A platform Agent may legally carry no scope
+	// at all -- the webhook's validateScopeAndParent returns early for that tier, "projectId is
+	// conventional but scope may be nil here" -- so `Scope{}` is a real identity meaning "narrows
+	// nothing", and it is well-formed. It binds only the policies that themselves narrow nothing,
+	// which is the correct answer for a fleet-wide agent and the wrong one for an agent whose CR
+	// could not be read. Those two are the same VALUE and different FACTS, and it is the identity
+	// resolver's job to tell them apart by returning an error rather than a zero Agent; see
+	// SourceConfig.Identity. Refusing the zero scope here instead would make the platform tier
+	// unserviceable in order to catch a case this function cannot see.
+	if !a.Scope.IsWellFormed() {
+		return nil, fmt.Errorf(
+			"this broker's own agent scope %+v is not a prefix narrowing (an empty level above a non-empty one). "+
+				"scope.Contains stops at the first level a scope does not narrow, so a policy naming the missing level would not bind this agent at all. "+
+				"A ChangePolicy only tightens, so a policy that fails to bind is a classification lower than the operator wrote -- refusing to classify is the only safe answer",
+			a.Scope)
+	}
+
 	bound := make([]*agentv1alpha1.ChangePolicy, 0, len(policies))
 	for _, cp := range policies {
 		if cp == nil {

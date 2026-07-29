@@ -1037,6 +1037,7 @@ readAt.IsZero()` is subsumed by the staleness ceiling (a zero read time is stale
         backgrounded `Run`, `cooldown.NewSource`, and `broker.NewContestedIndex`. **Closes
         LSN-007**, which needs a new L0 source assertion to close honestly: no 09 §6 check asserts
         "the pipeline is constructed in `main.go`", and `install-path-wired.py` never reads Go.
+        **Split into iv-a and iv-b during survey — see the section below.**
   - **P9-T7c-4** — **the classify→execute integrity seam for `apply`, `scale` and merge-patch.**
     See LSN-040. Today only `create`, `delete` and JSON-patch `patch` traverse the pipeline; the
     other three fail closed at step 9. **Checks: V-BRK-022** (new, L1) — _every verb in the
@@ -1767,6 +1768,83 @@ is nowhere asserted as monotonic the way `ChangePolicy` and `requireApproval` ar
 `status.operations.dryRunOnly` still has no writer; and notification under dry-run remains
 unspecified in 06 §4.1 (`notifyOn` is class-keyed and never mentions `dryRun`). None of the three
 are execution-path holes — the join is what T7c-3d-iv needs, and the join is what shipped.
+
+---
+
+## P9-T7c-3d-iv splits — iv-a (the identity seam) and iv-b (the wiring)
+
+Surveying iv found every production adapter already exists, so the unit looked like pure
+construction. One seam was not ready to be constructed against.
+
+**What the survey found.** `policy.SourceConfig` took `Agent Agent` — a **value**, captured in
+`NewSource` and passed to `Build` on every poll for the rest of the process's life. Wiring it
+requires answering "where does this broker's own `(tier, scope)` come from", and the honest answer
+turns out not to be a startup read:
+
+- `--scope` carries only `scope.Of(agent).Leaf()`, a single string. `policy.Agent` needs the whole
+  triple, so the value has to come from the Agent CR either way.
+- `spec.tier` is immutable (webhook + CEL). **`spec.scope` is not** — `agent_webhook.go:181` says so
+  in as many words: "spec.tier is immutable under V-1, and so scope is the only half of the key the
+  operator can actually edit."
+- A scope edit does **not** reliably roll the pod. `broker_manifests.go:368` renders
+  `"--scope=" + scope.Of(agent).Leaf()`, and `Leaf()` is the deepest **set** level. Edit a
+  cluster-admin's `projectId` and the leaf is still its `clusterName`: no rendered argument changes,
+  no rollout happens, and a pinned identity is stale for the life of the pod. Only the platform
+  tier — whose leaf _is_ its `projectId` — would be rescued by the rollout.
+
+**Why that is not a small staleness.** `Binds` ANDs the tier clause with
+`scope.Contains(policyScope, agentScope)`, and a ChangePolicy can only **tighten**. So a binding
+that is _lost_ is the loosening direction: the broker classifies lower than the operator wrote, and
+the record's `policySources` omits the policy without an error anywhere. Three separate inputs lose
+bindings the same silent way — a stale scope, an ill-formed scope, and the zero Agent.
+
+**And the codebase had already answered this question the other way.** `pipeline.callerScope` reads
+`scope.Of(p.cfg.Brake.Observe(ctx).Agent)` on **every submission**. Pinning in `policy.Source` would
+have made it the one place the broker's own identity was frozen — an inconsistency neither side
+reveals when read alone. Wiring the pinned field would have been the second half of the trap
+[[LSN-041]] describes: a seam that looks wired, is wired, and is wired to the wrong thing.
+
+| Unit               | Scope                                                                                                                                                                 | Checks                                 | Blocks on |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- | --------- |
+| **P9-T7c-3d-iv-a** | `SourceConfig.Agent` → `Identity func() (Agent, error)`, resolved once per poll; `Build` refuses an ill-formed own scope; nil `Identity` refused at construction. L1. | **V-BRK-026** (new)                    | nothing   |
+| **P9-T7c-3d-iv-b** | The wiring: discovery client, `pipeline.New`, the remaining sources, and the reflection-over-`pipeline.Config` assertion that closes [[LSN-007]].                     | V-BRK-022's sibling (new, TBA at iv-b) | **iv-a**  |
+
+### The distinction iv-a is built on
+
+`Scope{}` is a **legal identity**, not an error value. `validateScopeAndParent` returns early for the
+platform tier — "projectId is conventional but scope may be nil here" — so a scopeless platform
+agent genuinely narrows nothing, and `Scope{}.IsWellFormed()` is true. "Fleet-wide" and "the Agent CR
+could not be read" are therefore **the same value and different facts**, which is why `Identity`
+returns an `error` rather than a zero `Agent`: collapsing them would make an unreadable CR classify
+as the widest agent in the fleet. It is the same shape as T8a's `shadowed()` — an unobservable Agent
+must not read as the permissive answer — and the negative control is the same kind too: the zero
+scope must still classify, which is what stops the other assertions from being satisfied by
+"refuse anything not fully narrowed".
+
+The two failure classes stay apart on the axis the package already uses. An **unreadable** Agent CR
+is transient (usually it _is_ an unreadable API server), so it is **retained** and aged out on
+`MaxPolicyStaleness` — same clock, no second timer. An **ill-formed** scope was read successfully
+and is unusable until a human edits it, so it is **discarded** and refuses immediately.
+
+### What iv-a left for iv-b
+
+- The `Identity` closure itself. iv-a defines the seam; nothing constructs one outside a test yet,
+  so `main.go` still holds `broker.UnavailablePipeline{}`. The intended closure reads through the
+  brake — `func() (policy.Agent, error) { v := brakeSrc.Observe(ctx); if v.Agent == nil { return
+policy.Agent{}, errors.New(...) }; return policy.Agent{Tier: ..., Scope: scope.Of(v.Agent)}, nil }`
+  — which reuses the TTL'd read the brake already performs rather than adding a second watcher.
+- **A finding, not a fix.** `pipeline.go:412` guards `callerScope` with `IsWellFormed()` only, and
+  `Scope{}` passes it. A nil `BrakeView.Agent` therefore yields the fleet-wide caller scope at
+  step 3 — the permissive direction — and is caught downstream only because the brake's
+  `agent-unreadable` row (`brake.go:203`) refuses at step 5. Composition saves it; the classification
+  and the record written before that point are still built against an identity nobody read. Recorded
+  rather than fixed here, because changing classification inside a wiring unit is exactly the mixing
+  the protocol forbids. Sweep it with the V-BRK-020/021 and V-REV-002 citation defects.
+- **A second finding.** No production `journal.BlobSink` exists — only the interface, plus
+  `WriterSink`/`MemorySink`, which implement the _different_ `AuditSink`. The >1 MiB `objectRef`
+  path (06 §4.3) has no implementation, so `BodyStore` and the rollback `Sink` must stay nil at
+  iv-b. That is documented-legal ("a step that needs it then refuses by name rather than by nil
+  dereference") and it is why those two fields need allowlist entries in iv-b's reflection check.
 
 ---
 
