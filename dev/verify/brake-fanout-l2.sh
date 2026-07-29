@@ -54,9 +54,10 @@
 # two, "these two are untouched" is a statement about a controller that has run, not one that might
 # still be starting. The negatives are then re-read once more after that point.
 #
-# DESTRUCTIVE-TEST GUARD: scratch-GKE contexts only, anchored. This creates a namespace, Agent CRs,
-# ActionRecords and RBAC, and it PAUSES an agent — which on the live cluster would be an outage
-# caused by a test. The guard is the most load-bearing one in this directory.
+# DESTRUCTIVE-TEST GUARD: scratch-GKE contexts only, anchored. This creates namespaces, Agent CRs,
+# ActionRecords and RBAC, it re-seeds the fleet's parent chain, and it PAUSES an agent — which on
+# the live cluster would be an outage caused by a test. The guard is the most load-bearing one in
+# this directory.
 # Exit: 0 = PROVEN · 1 = FAILED · 2 = refused target · 3 = DEFERRED (P1/P10 unverifiable).
 # Usage: dev/verify/brake-fanout-l2.sh [kube-context]
 #
@@ -68,11 +69,28 @@
 #      before this unit, so a stale digest here does not weaken the evidence, it inverts it. The
 #      operator pod is checked too (L2-1), because the two Deployments share one image and a reload
 #      that repointed only one of them is exactly the trap `reload-images.sh` was extended to close.
-#   P3 admission-recreate: the Agent CRs, the ActionRecords and the broker RBAC — every one is
-#      created fresh in a per-run namespace that this script deletes on entry via `delete ns`, so
-#      nothing here was admitted under an earlier generation of the webhook or the VAP. That
-#      matters more than usual: L2-5 is an assertion ABOUT admission, and a grandfathered object
-#      would be evidence about the rules in force the day it was created.
+#   P3 admission-recreate: every SUBJECT is created fresh on every run — the Agent CRs are deleted
+#      and re-applied, the broker RBAC is re-applied, the parent chain is re-seeded
+#      (`seed_parent_agent` deletes before it applies), and each run mints its own ActionRecord IDs
+#      so no record is ever reused. Nothing asserted below was admitted under an earlier generation
+#      of the webhook or the VAP, which matters more than usual here: L2-5 is an assertion ABOUT
+#      admission, and a grandfathered object would be evidence about rules that are no longer there.
+#      Events are matched on `involvedObject.uid`, not name, so a page from a previous run against a
+#      same-named Agent cannot be read as this run's — that direction is a FALSE GREEN on L2-3.
+#
+#      WHAT IS *NOT* DELETED, AND WHY THAT IS THE JOURNAL WORKING. The two namespaces are reused,
+#      not recreated, because a namespace holding an ActionRecord CANNOT BE DELETED — and must not
+#      be. `kube-agents-journal-retention` denies DELETE to every principal but the retention path,
+#      and denies it even to them until `status.exported.confirmed` is true; the namespace
+#      controller is not on that list, so `kubectl delete ns` strands the namespace in Terminating
+#      permanently. On a cluster with no audit sink nothing is ever confirmed, which the operator
+#      says out loud ("the record will be retained indefinitely because the export is the durable
+#      record", journal_reconciler.go), so these records are undeletable by design. The suite
+#      therefore leaves them, names them uniquely per run so they can never be mistaken for this
+#      run's, and reports what it left at the end rather than pretending the cluster is clean. It
+#      does NOT fabricate an export confirmation to get its namespace back: writing
+#      `exported.confirmed` for an export that never happened is forging the audit trail 05 §1.2
+#      makes the durable record, and no test's tidiness is worth teaching that idiom to the repo.
 #   P6 runtime-authoritative: the live `spec.operations.paused` and `pauseReason` on the Agent
 #      object, the live `status.escalation` subtree on the ActionRecord, and the live
 #      ValidatingAdmissionPolicy the API server compiled — never config/policy/*.yaml, which is the
@@ -84,9 +102,28 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 K="kubectl --context $CTX"
 
 SYS=kubeagents-system
-NS=brake-fanout-l2
+# `-braked` rather than the bare suite name: the original `brake-fanout-l2` namespace is wedged in
+# Terminating on the dev cluster forever, because the first version of this script called
+# `delete ns` on a namespace holding ActionRecords before anyone had worked out that the journal
+# forbids exactly that. It is not recoverable without forging an export. Reusing these two from
+# here on means it cannot happen again.
+NS=brake-fanout-l2-braked
+# WHY THE QUIET AGENT NEEDS A NAMESPACE OF ITS OWN. This suite needs two developer-team Agents that
+# differ only in whether their record owes a fan-out. It cannot have them in one namespace: 06 §1.2
+# V-5 makes (tier, scope) unique across the fleet, and a developer-team agent's scope is
+# (projectId, clusterName, namespace) — so two of them in `$NS` are the SAME scope identity and the
+# webhook rejects the second. The placement clause then forces the rest: `metadata.namespace` must
+# equal `spec.scope.namespace`, so a distinct scope is a distinct namespace, not just a distinct
+# name. Both records still live in `$NS` under one broker identity; only `agentRef` crosses.
+NS_QUIET=brake-fanout-l2-quiet
 AGENT=braked-agent
 QUIET_AGENT=unbraked-agent
+# The scope both fixtures sit under. Not arbitrary: 06 §1.2 V-6 requires the child's scope to be
+# within its parent's, and the parent here is the SHIPPED cluster-admin manifest seeded below, whose
+# scope is exactly this project and cluster. Inventing a project id makes the fixture unadmittable.
+PROJECT_ID=your-gcp-project-id
+CLUSTER_NAME=cluster-a
+PARENT_AGENT=cluster-admin-cluster-a
 BROKER_SA=developer-team-brake-fanout-l2-actor
 BRAKE_SA="system:serviceaccount:$SYS:kubeagents-brake-controller"
 REASON='rollback failed: replay refused, cluster state is not what the record describes'
@@ -104,6 +141,18 @@ esac
 fail=0
 pass() { echo "PASS: $1"; }
 bad()  { echo "FAIL: $1"; fail=1; }
+
+# apply_fixture <what> <<stdin: manifest>  -- applies and, on refusal, prints why.
+# The API server's own message is the diagnosis; without it a failed fixture costs an entire L2 run
+# (and a cluster round trip) just to learn which validation rejected it.
+apply_fixture() { # <what>
+  local what="$1" out
+  if out="$($K apply -f - 2>&1)"; then
+    return 0
+  fi
+  bad "could not create $what: $out"
+  return 1
+}
 cd "$REPO_ROOT" || exit 1
 
 echo "===================================================================="
@@ -114,10 +163,22 @@ $K version >/dev/null 2>&1 || { echo "FAIL: context '$CTX' is not reachable." >&
 
 # shellcheck disable=SC1091
 . "$REPO_ROOT/dev/lib/preconditions.sh"
+# shellcheck disable=SC1091
+. "$REPO_ROOT/dev/lib/parent-chain.sh"
 p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
 
+seeded=()
 cleanup() {
-  $K delete ns "$NS" --wait=false --ignore-not-found >/dev/null 2>&1
+  # The Agents and the seeded parents go; the namespaces and their ActionRecords stay, for the
+  # reason in the P3 note above. Saying so is part of the cleanup: whoever finds these later should
+  # not have to work out whether a run died halfway.
+  $K -n "$NS" delete agent "$AGENT" --ignore-not-found --wait=false >/dev/null 2>&1
+  $K -n "$NS_QUIET" delete agent "$QUIET_AGENT" --ignore-not-found --wait=false >/dev/null 2>&1
+  unseed_parent_agents "$K" "${seeded[@]:-}"
+  echo
+  echo "LEFT BEHIND (by design): ActionRecords ${REC_QUIET_NONE:-<none created>} ${REC_QUIET_IDLE:-} ${REC_LOUD:-} in $NS."
+  echo "  The journal is append-only and this cluster has no audit sink, so nothing is permitted to"
+  echo "  delete them (kube-agents-journal-retention). They are inert; each run mints new IDs."
 }
 trap cleanup EXIT
 
@@ -181,29 +242,57 @@ esac
 # ------------------------------------------------------------------------------------------------
 echo; echo "== L2-2: C-BR's live grant is the narrow one (08 §2.7) =="
 
+# A SUBRESOURCE IS NOT A PATH SEGMENT HERE. `kubectl auth can-i <verb> <type>/<thing>` parses the
+# slash as TYPE/**NAME**, not TYPE/SUBRESOURCE — so `can-i patch actionrecords/status` asks "may I
+# patch the ActionRecord *named* status", which is a different question with a different answer.
+# Both directions of the mistake are wrong and one of them is silent: a `want_yes` on the positional
+# form reads as a missing verb against a grant that actually holds it (this check's first red, and
+# the RBAC was fine), while a `want_no` on it is VACUOUSLY GREEN — it passes because no object of
+# that name exists, not because the authority is absent, and it would keep passing after someone
+# widened the role. Subresources go through `--subresource=`. The guard below makes the wrong form
+# impossible to write rather than merely discouraged, because the failure mode is a check that
+# reports on something other than what it claims.
 can() { # <verb> <resource> [extra args...] -> echoes yes|no
+  case "$2" in
+    */*)
+      bad "check bug: can() was passed '$2'. kubectl parses TYPE/NAME, not TYPE/SUBRESOURCE — pass --subresource= instead"
+      echo "malformed"
+      return
+      ;;
+  esac
   $K auth can-i "$1" "$2" --as="$BRAKE_SA" "${@:3}" 2>/dev/null
 }
 
+# subj renders what was actually asked, so the message names the subresource even though the
+# argument does not: "patch actionrecords.../status", not a bare "patch actionrecords...".
+subj() { # <resource> [extra...] -> resource[/subresource]
+  local res="$1" a
+  shift
+  for a in "$@"; do
+    case "$a" in --subresource=*) res="$res/${a#--subresource=}" ;; esac
+  done
+  printf '%s' "$res"
+}
+
 want_yes() { # <verb> <resource> <why> [extra...]
-  local got; got="$(can "$1" "$2" "${@:4}")"
+  local got what; got="$(can "$1" "$2" "${@:4}")"; what="$(subj "$2" "${@:4}")"
   if [ "$got" = "yes" ]; then
-    pass "C-BR may $1 $2 — $3"
+    pass "C-BR may $1 $what — $3"
   else
-    bad "C-BR may NOT $1 $2 (can-i said '${got:-<empty>}'). $3. brake_role.yaml is hand-written, so no \`make manifests\` run can notice a missing verb"
+    bad "C-BR may NOT $1 $what (can-i said '${got:-<empty>}'). $3. brake_role.yaml is hand-written, so no \`make manifests\` run can notice a missing verb"
   fi
 }
 
 want_no() { # <verb> <resource> <why> [extra...]
-  local got; got="$(can "$1" "$2" "${@:4}")"
+  local got what; got="$(can "$1" "$2" "${@:4}")"; what="$(subj "$2" "${@:4}")"
   if [ "$got" = "no" ]; then
-    pass "C-BR may not $1 $2 — $3"
+    pass "C-BR may not $1 $what — $3"
   else
-    bad "C-BR CAN $1 $2 (can-i said '${got:-<empty>}'). $3"
+    bad "C-BR CAN $1 $what (can-i said '${got:-<empty>}'). $3"
   fi
 }
 
-want_yes patch actionrecords.kubeagents.x-k8s.io/status "the fulfilment receipt is the whole seam"
+want_yes patch actionrecords.kubeagents.x-k8s.io "the fulfilment receipt is the whole seam" --subresource=status
 want_yes get   actionrecords.kubeagents.x-k8s.io        "it reads the escalation it fans out"
 want_yes patch agents.kubeagents.x-k8s.io               "the pause is a merge patch on spec.operations"
 want_yes create events                                  "the page is emitted as an Event" --namespace "$NS"
@@ -239,24 +328,57 @@ echo; echo "== fixtures: a namespace, two Agents, a broker identity =="
 # P3: a fresh namespace per run, deleted first. Every object below is therefore admitted by the
 # webhook and the VAPs currently installed — which is the subject of L2-5, so a grandfathered
 # fixture would make that section evidence about a policy that is no longer there.
-$K delete ns "$NS" --ignore-not-found --wait=true --timeout=120s >/dev/null 2>&1
-$K create ns "$NS" >/dev/null 2>&1 || { bad "could not create namespace $NS"; exit 1; }
+# Reused if present, created if not. Then every SUBJECT inside them is removed, so that what this
+# run asserts about was admitted by the rules in force right now (P3).
+for n in "$NS" "$NS_QUIET"; do
+  if ! $K get ns "$n" >/dev/null 2>&1; then
+    if ! out="$($K create ns "$n" 2>&1)"; then
+      bad "could not create namespace $n: $out"
+      exit 1
+    fi
+  fi
+done
+$K -n "$NS"       delete agent "$AGENT"       --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1
+$K -n "$NS_QUIET" delete agent "$QUIET_AGENT" --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1
 
-agent_yaml() { # <name>
+# The tier above, as SETUP and never as a subject (see dev/lib/parent-chain.sh). 06 §1.2 V-6 refuses
+# a child whose `parentRef` names an Agent that does not exist, because the authority ceiling is
+# then unverifiable — so without this the two fixtures below are unadmittable and the suite fails
+# for a reason it is not about. Seeded from the shipped manifests so the chain cannot drift from
+# what the repo actually ships.
+for pf in examples/gitops-repo/fleet/platform-agent.yaml \
+          examples/gitops-repo/clusters/cluster-a/agents/agent.yaml; do
+  if ref="$(seed_parent_agent "$K" "$pf")"; then
+    seeded+=("$ref")
+  else
+    bad "could not seed the parent chain from $pf: $ref"
+    exit 1
+  fi
+done
+pass "parent chain seeded: ${seeded[*]}"
+
+agent_yaml() { # <name> <namespace>
   cat <<YAML
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: Agent
 metadata:
   name: $1
-  namespace: $NS
+  namespace: $2
 spec:
   tier: developer-team
+  # Required for every non-platform tier (06 §1.2 V-3), and the scope below must sit within this
+  # parent's (V-6) — which is why the project and cluster are the shipped manifest's, not this
+  # suite's. metadata.namespace equals spec.scope.namespace because the placement clause makes a
+  # developer-team agent live in the namespace it is scoped to. (No backticks in this heredoc: it
+  # is unquoted so the shell would run them.)
+  parentRef:
+    name: $PARENT_AGENT
   scope:
-    projectId: brake-fanout-l2-project
-    clusterName: cluster-a
-    namespace: $NS
+    projectId: $PROJECT_ID
+    clusterName: $CLUSTER_NAME
+    namespace: $2
   harness:
-    clusterName: cluster-a
+    clusterName: $CLUSTER_NAME
     location: us-central1
     hermes:
       agentHome: /opt/data
@@ -277,10 +399,16 @@ spec:
 YAML
 }
 
-for a in "$AGENT" "$QUIET_AGENT"; do
-  agent_yaml "$a" | $K apply -f - >/dev/null 2>&1 || { bad "could not create Agent $a"; exit 1; }
-done
-pass "two Agent CRs admitted into $NS"
+agent_yaml "$AGENT"       "$NS"       | apply_fixture "Agent $NS/$AGENT" || exit 1
+agent_yaml "$QUIET_AGENT" "$NS_QUIET" | apply_fixture "Agent $NS_QUIET/$QUIET_AGENT" || exit 1
+# Captured now and used in every Event field-selector below. A name is not an identity across runs
+# in a namespace that outlives them: an `AgentEscalated` Event left by a previous run against a
+# previous `braked-agent` would satisfy L2-3 without C-BR doing anything at all.
+AGENT_UID="$($K -n "$NS" get agent "$AGENT" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
+QUIET_UID="$($K -n "$NS_QUIET" get agent "$QUIET_AGENT" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
+[ -n "$AGENT_UID" ] && [ -n "$QUIET_UID" ] \
+  || { bad "could not read the fixtures' UIDs; Event assertions would fall back to matching by name"; exit 1; }
+pass "two Agent CRs admitted: $NS/$AGENT and $NS_QUIET/$QUIET_AGENT"
 
 # The broker identity. 06 §4.3 binds the right to write `status.escalation` to the record's own
 # declared `spec.actorServiceAccount`, in the record's own namespace — so the escalation cannot be
@@ -313,34 +441,101 @@ pass "broker ServiceAccount $BROKER_SA created with the 06 §4.3 namespace-scope
 
 AS_BROKER="--as=system:serviceaccount:$NS:$BROKER_SA"
 
-record_yaml() { # <name> <action-id> <agent>
+# ------------------------------------------------------------------------------------------------
+# What a record has to be before the API server will keep it
+# ------------------------------------------------------------------------------------------------
+# The ActionRecord CRD is heavily validated (06 §4.3) and none of it is negotiable from here: the
+# actionId must be a real Crockford ULID, the idempotency key a real SHA-256, the chain id present,
+# and both retention clocks set with `undoWindowExpiresAt <= expiresAt`. Building these properly
+# rather than with plausible-looking strings is the point — a fixture the schema would reject is a
+# fixture the broker could never have written, and this suite's whole claim is about what happens to
+# records the system really produces.
+
+# The `ar-<lowercase actionId>` naming convention, in one place. Derived rather than passed so the
+# name and the actionId cannot drift into naming different actions.
+rec_name() { printf 'ar-%s' "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; }
+
+# A real digest, because the schema demands ^sha256:[0-9a-f]{64}$ and a made-up 64 characters would
+# be a lie the pattern happens not to catch. Both tool names, because this runs on a developer's
+# macOS laptop and on a Linux runner.
+sha256_hex() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | cut -d' ' -f1
+  else
+    printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+  fi
+}
+
+# Retention clocks, computed rather than hardcoded. A pinned future date rots into the past and then
+# the RETENTION controller deletes these records mid-run, which would read as C-BR having done
+# something to them -- a negative control failing for the one reason it must never fail for.
+rfc3339_in() { # <hours>
+  if date -u -d "+$1 hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; then :
+  else date -u -v"+$1"H +%Y-%m-%dT%H:%M:%SZ; fi
+}
+
+EXPIRES_AT="$(rfc3339_in 720)"
+UNDO_EXPIRES_AT="$(rfc3339_in 24)"
+[ -n "$EXPIRES_AT" ] && [ -n "$UNDO_EXPIRES_AT" ] \
+  || { bad "could not compute retention timestamps (neither GNU nor BSD date worked)"; exit 1; }
+
+# MINTED PER RUN, not constants. The records of previous runs cannot be deleted (see the P3 note),
+# so a fixed id would collide with a leftover -- and `ActionRecord.spec` is immutable, so the apply
+# would be REFUSED rather than refreshed and the suite would assert against a record admitted under
+# whatever rules were in force weeks ago. The epoch makes each run's records traceable to when they
+# ran; 26 digits is a valid actionId, since the schema's alphabet (Crockford base32, no I/L/O/U)
+# contains all ten.
+RUN_EPOCH="$(date -u +%s)"
+mk_action_id() { printf '%026d' "$RUN_EPOCH$1"; }
+REC_QUIET_NONE_ID="$(mk_action_id 1)"
+REC_QUIET_IDLE_ID="$(mk_action_id 2)"
+REC_LOUD_ID="$(mk_action_id 3)"
+CHAIN_ID="$(mk_action_id 9)"
+
+REC_QUIET_NONE="$(rec_name "$REC_QUIET_NONE_ID")"
+REC_QUIET_IDLE="$(rec_name "$REC_QUIET_IDLE_ID")"
+REC_LOUD="$(rec_name "$REC_LOUD_ID")"
+
+# The record lives in `$NS` whatever its agent's namespace is: 06 §4.3 binds the right to write
+# `status.escalation` to the record's own `spec.actorServiceAccount` in the record's own namespace,
+# so keeping all four records under the one broker identity created above is what keeps that write
+# the real one. `agentRef` is the thing that crosses — `BrakeReconciler.resolveAgent` looks the
+# Agent up by `ref.Namespace`/`ref.Name`, so the quiet agent being elsewhere is exactly as visible
+# to C-BR as the loud one.
+record_yaml() { # <action-id> <agent> <agent-namespace>
   cat <<YAML
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: ActionRecord
 metadata:
-  name: $1
+  name: $(rec_name "$1")
   namespace: $NS
 spec:
-  actionId: "$2"
-  agentRef: { name: $3, namespace: $NS }
-  agentIdentity: developer-team/brake-fanout-l2-project/cluster-a/$NS
+  actionId: "$1"
+  agentRef: { name: $2, namespace: $3 }
+  agentIdentity: developer-team/$PROJECT_ID/$CLUSTER_NAME/$3
   actorServiceAccount: $BROKER_SA
-  requester: { kind: agent, id: $3 }
+  requester: { kind: agent, id: $2 }
   attributionUnverified: false
-  trigger: { source: watch, ref: deployment/api-gateway, detail: "brake-fanout-l2" }
+  trigger:
+    source: watch
+    ref: deployment/api-gateway
+    detail: "brake-fanout-l2"
+    chainId: "$CHAIN_ID"
   intent: "scale api-gateway to 3 replicas"
-  idempotencyKey: "sha256:$1"
+  idempotencyKey: "sha256:$(sha256_hex "$1")"
   dryRun: false
   classification:
     class: elevated
-    blastRadius: { objects: 1, fractionOfScope: 0.02, cap: 25 }
+    blastRadius: { objects: 1, fractionOfScope: "0.02", cap: 25 }
     undoable: true
   targets:
-    - { group: apps, version: v1, kind: Deployment, namespace: $NS, name: api-gateway }
+    - { group: apps, version: v1, kind: Deployment, namespace: $3, name: api-gateway }
   retention:
     class: elevated
     ttl: 720h
+    expiresAt: "$EXPIRES_AT"
     undoWindow: 24h
+    undoWindowExpiresAt: "$UNDO_EXPIRES_AT"
 YAML
 }
 
@@ -351,15 +546,15 @@ YAML
 # controller demonstrably having processed something enqueued LATER, not a sleep.
 echo; echo "== ¬ fixtures: two records that owe no fan-out, enqueued before the loud one =="
 
-record_yaml quiet-no-escalation 01J0000000000000000000QUI0 "$QUIET_AGENT" | $K apply -f - >/dev/null 2>&1 \
-  || { bad "could not create quiet-no-escalation"; exit 1; }
-record_yaml quiet-owes-nothing  01J0000000000000000000QUI1 "$QUIET_AGENT" | $K apply -f - >/dev/null 2>&1 \
-  || { bad "could not create quiet-owes-nothing"; exit 1; }
+record_yaml "$REC_QUIET_NONE_ID" "$QUIET_AGENT" "$NS_QUIET" \
+  | apply_fixture "$REC_QUIET_NONE (no escalation at all)" || exit 1
+record_yaml "$REC_QUIET_IDLE_ID" "$QUIET_AGENT" "$NS_QUIET" \
+  | apply_fixture "$REC_QUIET_IDLE (escalation requesting neither effect)" || exit 1
 
 # An escalation that asks for NEITHER effect. `fanoutPending` must reject it on the flags alone —
 # this is the shape that distinguishes "C-BR reads the request" from "C-BR reacts to the field
 # existing", and the second one pauses an agent on any record that mentions an escalation.
-$K -n "$NS" patch actionrecord quiet-owes-nothing $AS_BROKER --subresource=status --type=merge \
+$K -n "$NS" patch actionrecord "$REC_QUIET_IDLE" $AS_BROKER --subresource=status --type=merge \
   -p '{"status":{"escalation":{"pageRequested":false,"pauseRequested":false,"reason":"recorded, but nothing was asked for","requestedAt":"2026-07-28T00:00:00Z"}}}' >/dev/null 2>&1 \
   || { bad "the broker could not write the ¬ escalation — check the VAP's isOwningBroker row"; exit 1; }
 pass "two silent records in place (no escalation / escalation requesting neither effect)"
@@ -369,8 +564,8 @@ pass "two silent records in place (no escalation / escalation requesting neither
 # ------------------------------------------------------------------------------------------------
 echo; echo "== L2-3: a recorded rung-5 escalation fans out into a real pause and a real page =="
 
-record_yaml loud-escalation 01J0000000000000000000LOUD "$AGENT" | $K apply -f - >/dev/null 2>&1 \
-  || { bad "could not create loud-escalation"; exit 1; }
+record_yaml "$REC_LOUD_ID" "$AGENT" "$NS" \
+  | apply_fixture "$REC_LOUD (the rung-5 escalation)" || exit 1
 
 paused_before="$($K -n "$NS" get agent "$AGENT" -o jsonpath='{.spec.operations.paused}' 2>/dev/null)"
 if [ "$paused_before" = "true" ]; then
@@ -379,7 +574,7 @@ if [ "$paused_before" = "true" ]; then
 fi
 pass "$AGENT starts unpaused"
 
-$K -n "$NS" patch actionrecord loud-escalation $AS_BROKER --subresource=status --type=merge \
+$K -n "$NS" patch actionrecord "$REC_LOUD" $AS_BROKER --subresource=status --type=merge \
   -p "{\"status\":{\"escalation\":{\"pageRequested\":true,\"pauseRequested\":true,\"reason\":\"$REASON\",\"requestedAt\":\"2026-07-28T00:00:00Z\"}}}" >/dev/null 2>&1 \
   || { bad "the broker could not record the escalation"; exit 1; }
 pass "the broker recorded a rung-5 escalation requesting both effects"
@@ -395,7 +590,7 @@ pass "the broker recorded a rung-5 escalation requesting both effects"
 fanned=0
 receipt=""
 for _ in $(seq 1 60); do
-  receipt="$($K -n "$NS" get actionrecord loud-escalation \
+  receipt="$($K -n "$NS" get actionrecord "$REC_LOUD" \
     -o jsonpath='{.status.escalation.pausedAt}|{.status.escalation.pagedAt}|{.status.escalation.failure}' 2>/dev/null)"
   if [ -n "${receipt%%|*}" ]; then fanned=1; break; fi
   sleep 2
@@ -448,7 +643,7 @@ fi
 # object an operator is already looking at, with the stable reason a check can grep for.
 ev=""
 for _ in $(seq 1 30); do
-  ev="$($K -n "$NS" get events --field-selector "reason=AgentEscalated,involvedObject.name=$AGENT" -o jsonpath='{.items[*].message}' 2>/dev/null)"
+  ev="$($K -n "$NS" get events --field-selector "reason=AgentEscalated,involvedObject.uid=$AGENT_UID" -o jsonpath='{.items[*].message}' 2>/dev/null)"
   [ -n "$ev" ] && break
   sleep 2
 done
@@ -493,11 +688,11 @@ else
 
   # The REQUEST half is the attack the row exists to stop: the party that fans an escalation out
   # must not be the party that can declare one.
-  denied_write "the request half of status.escalation" quiet-no-escalation \
+  denied_write "the request half of status.escalation" "$REC_QUIET_NONE" \
     '{"status":{"escalation":{"pageRequested":true,"pauseRequested":true,"reason":"self-authored"}}}' \
     "'A failed rollback pages AND auto-pauses' would be self-attested by the party with the motive (vap-agent-scope-journal, validation 5)"
 
-  denied_write "status.phase" loud-escalation \
+  denied_write "status.phase" "$REC_LOUD" \
     '{"status":{"phase":"Verified"}}' \
     "Its grant is the fulfilment half of status.escalation and nothing else"
 fi
@@ -510,7 +705,7 @@ echo; echo "== L2-4 (¬): the records that owe nothing were left alone =="
 if [ "$fanned" -eq 0 ]; then
   bad "the ¬ section cannot be evidence: C-BR never processed the loud record, so 'it did not touch these two' is indistinguishable from 'it is not running'"
 else
-  for rec in quiet-no-escalation quiet-owes-nothing; do
+  for rec in "$REC_QUIET_NONE" "$REC_QUIET_IDLE"; do
     touched=""
     for f in pagedAt pausedAt failure; do
       v="$($K -n "$NS" get actionrecord "$rec" -o jsonpath="{.status.escalation.$f}" 2>/dev/null)"
@@ -523,14 +718,14 @@ else
     fi
   done
 
-  qp="$($K -n "$NS" get agent "$QUIET_AGENT" -o jsonpath='{.spec.operations.paused}' 2>/dev/null)"
+  qp="$($K -n "$NS_QUIET" get agent "$QUIET_AGENT" -o jsonpath='{.spec.operations.paused}' 2>/dev/null)"
   if [ "$qp" != "true" ]; then
     pass "$QUIET_AGENT is still unpaused"
   else
     bad "$QUIET_AGENT was paused by a record that asked for nothing"
   fi
 
-  qev="$($K -n "$NS" get events --field-selector "reason=AgentEscalated,involvedObject.name=$QUIET_AGENT" -o jsonpath='{.items[*].message}' 2>/dev/null)"
+  qev="$($K -n "$NS_QUIET" get events --field-selector "reason=AgentEscalated,involvedObject.uid=$QUIET_UID" -o jsonpath='{.items[*].message}' 2>/dev/null)"
   if [ -z "$qev" ]; then
     pass "no AgentEscalated Event on $QUIET_AGENT — nothing paged a human about a non-incident"
   else

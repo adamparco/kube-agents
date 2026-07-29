@@ -742,7 +742,15 @@ type safety over a value nothing in this process reads. They are rendered as `un
               — the fan-out half, completing the L1 story ii-b-1 opened. **Done 2026-07-28.**
             - **P9-T7c-3c-ii-b-2-b** — C-BR's own ServiceAccount, RBAC, Deployment and kustomize
               wiring, the `--controllers` selector in the manager binary, `make cloud-build-push`,
-              a roll by digest, and **V-REV-006 at L2 with P1 in full**.
+              a roll by digest, and **V-REV-006 at L2 with P1 in full**. **Done 2026-07-29** — 39
+              assertions, exit 0, twice. The `ClusterRole` is hand-written and carries no
+              `+kubebuilder:rbac` markers, because a marker on `BrakeReconciler` composes into the
+              operator's `manager-role`; the `Deployment` lives in `config/manager` and not a base
+              of its own, because the `images:` transformer reaches only what is beneath the
+              kustomization declaring it; and `parseControllers` refuses to combine `brake` with
+              any other controller, because a process runs as one ServiceAccount and 06 §4.3 keeps
+              C-BR's and the exporter's authority over `ActionRecord.status` disjoint. Opened
+              [[LSN-044]] and [[LSN-045]], both defects in the check this unit authored.
       - **P9-T7c-3c-iii** — a durable `CooldownRegistry`. `verify.MemoryCooldown` says in its own
         doc comment that it is "deliberately not the production store: a cooldown that dies with
         the broker process is a cooldown an operator can clear by deleting a pod, and 04 §4.2
