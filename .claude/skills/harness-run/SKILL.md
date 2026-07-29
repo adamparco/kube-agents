@@ -27,6 +27,15 @@ Context does not survive; files do. "I remember where I was" is false.
    the harness repeating itself. Skipping it is how a fixed problem comes back.
 5. **Halts and blockers.** If either is set: summarize and stop. The harness never self-clears a
    halt (PROTOCOL §8).
+6. **Drain the human backlog** (`binding.md` §State) — the one moment it is read. Its `## Inbox`
+   holds what a human dropped in while the last unit was running. Resolve **every** item here,
+   before SELECT: schedule it into a task, a lesson, the improvement queue or a later phase; refuse
+   it with an argument; or escalate it. Then move it out of the inbox with an ID and its
+   destination, per that file's own rules, and stamp **`Last drained`** with today's date. **An item
+   left in the inbox at the end of ORIENT is a defect** — it means the next ORIENT re-reads it with
+   less context than this one had, and an inbox that accumulates is a second ledger nobody reads.
+   `dev/tests/invariants-gate.py` fails the build on exactly that: an item added before
+   `Last drained` and still sitting in the inbox.
 
 **Resuming a killed session.** If the ledger shows a unit `in-progress` with uncommitted work,
 first establish whether that work is sound (build clean + its claimed checks green). Then either
@@ -36,13 +45,15 @@ finish it or revert it cleanly. Never build on top of an unverified partial unit
 
 ## 2. SELECT — one unit
 
-| Situation                                                        | Unit                                                   |
-| ---------------------------------------------------------------- | ------------------------------------------------------ |
-| Phase has no breakdown file                                      | **Break down the phase** (§3). That is the whole unit. |
-| A unit is `in-progress`                                          | Finish it. Prefer this over starting anything new.     |
-| Open lessons over the `binding.md` threshold, or cadence reached | Invoke `harness-improve`. Nothing else this run.       |
-| Phase acceptance appears met                                     | Invoke `harness-milestone`.                            |
-| Otherwise                                                        | The first `todo` task in the breakdown.                |
+| Situation                                                        | Unit                                                                |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------- |
+| A drained backlog item names a **live security regression**      | Fix it — that is the unit. A halt if it needs a human ruling first. |
+| Phase has no breakdown file                                      | **Break down the phase** (§3). That is the whole unit.              |
+| A unit is `in-progress`                                          | Finish it. Prefer this over starting anything new.                  |
+| A drained backlog item is `Priority: now`                        | It is the unit. Say in the ledger which planned task it displaced.  |
+| Open lessons over the `binding.md` threshold, or cadence reached | Invoke `harness-improve`. Nothing else this run.                    |
+| Phase acceptance appears met                                     | Invoke `harness-milestone`.                                         |
+| Otherwise                                                        | The first `todo` task in the breakdown.                             |
 
 **Sizing.** A unit must be implementable, verifiable, and checkpointable in this session with
 margin. If it turns out oversized: split it in the breakdown, record the split in the ledger, and
@@ -111,6 +122,8 @@ A unit is done only when all four hold (PROTOCOL §3):
 1. Build, format, and lint pass.
 2. Every claimed check ID ran and is green, each with an `evidence_ref`.
 3. The ledger is updated: task status, verification log rows, decisions, any lesson opened.
+   If this unit closed a scheduled backlog item, that item moves to `## Done` in
+   `docs/build/BACKLOG.md` with what it landed as.
 4. Work is committed on the phase branch, Conventional Commits, scoped staging.
 
 Then stop. If the phase is now complete, hand to **`harness-milestone`** — do not merge from here.
