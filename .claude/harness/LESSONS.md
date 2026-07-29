@@ -74,10 +74,11 @@ will start selecting.
 | **LSN-043** | harness, orient, durability, git | The ORIENT drain was done, verified green, and then silently reverted by a branch switch | closed | `.claude/skills/harness-run/SKILL.md` §1 step 6 (commit the drain before SELECT) + `dev/tests/invariants-gate.py` `_drain_is_committed` (L0) — fails on an uncommitted drain, i.e. one that removes inbox items or advances `Last drained`, while an uncommitted human *append* still passes |
 | **LSN-044** | rbac, checks, vacuity, kubectl, L2 | `kubectl auth can-i patch foo/status` asks about a **name**, not a subresource, so the denial it reports is about an object that does not exist | closed | `dev/tests/cluster-check-hygiene.py` property 1 (L0, in `dev/L0-CHAIN.txt`) — no positional word of any `auth can-i` may contain `/`, `for`-lists resolved and expanded, and a resource the scanner cannot resolve obliges the script to carry a `*/*)` guard; local fix is `can()`/`subj()` in `dev/verify/brake-fanout-l2.sh` |
 | **LSN-045** | checks, L2, fixtures, journal, append-only | An L2 suite that writes to an append-only journal can never delete its own namespace, and finds out on the second run | closed | `dev/tests/cluster-check-hygiene.py` property 2 (L0, in `dev/L0-CHAIN.txt`) — no script that creates a DELETE-protected object may delete a namespace, with the protected set derived from the VAPs' own `DELETE` matchConstraints and the CRDs' `spec.names.kind`; `brake-fanout-l2.sh` reuses namespaces, mints IDs per run and matches Events by UID |
-
 | **LSN-046** | checks, deferrals, record-keeping, false-green, blocking-always, append-only | The deferral row named the category instead of its members, so the one gate arm that hunts deferred BLOCKING-ALWAYS checks matched nothing — and the false pass hiding behind it silenced that arm a second way | closed | `dev/tests/invariants-gate.py` `check_dagger_checks_are_deferred_by_id` (L0, in `dev/L0-CHAIN.txt`) — derives the † set from 09 §6.14 and requires every member to be named **by ID** in the Deferrals table and to hold no uncorrected pass; `_verification_evidence_rows` now emits one line per check ID and honours `**correction**` supersession; the BLOCKING-ALWAYS arm gained a not-yet-due clause keyed to the phase in 09 §6 that expires by itself and fails closed on an unparseable phase |
 
-**Open: 1 of 46** (LSN-040).
+| **LSN-047** | mutation, tooling, harness, near-miss | The mutation sweep reports a clean restore and one of the files it restored is now the other one | **open** | — `dev/mutate.sh` already snapshots by **index** and is the fix; nothing makes the harness reach for it. Candidate form is a skill change (`harness-run` VERIFY), scheduled for the next improvement pass |
+
+**Open: 2 of 47** (LSN-040, LSN-047).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2545,3 +2546,54 @@ staying granted at 9 and 10.
 Related: [[lsn-035]] (a control that proves only that *something* failed — the same shape, applied
 to a gate arm instead of a negative control), [[lsn-036]] (derive the subject set, never enumerate
 it), [[lsn-038]] (a guard that cannot run must not score as a pass).
+
+---
+
+## LSN-047 — The mutation sweep backed up two files under one name and restored the wrong one over the other
+
+**Tags:** mutation, tooling, harness, near-miss · **Phase:** 9 (P9-T7c-3c-iii, 2026-07-29) ·
+**Status:** open — the mechanization exists and nothing routes work to it; see "What the fix is"
+
+**What happened.** P9-T7c-3c-iii added `internal/broker/cooldown/cooldown.go` and changed
+`internal/broker/verify/cooldown.go`. The unit's mutation sweep was a throwaway Python driver that
+snapshotted both files into one directory keyed by **basename**. Both files are called
+`cooldown.go`. The second `cp` overwrote the first, and the `finally` block then restored the
+`verify` copy over **both** paths.
+
+The sweep's own output said `12/13 caught`, exit 0. It was correct — the sweep had run against
+intact sources and only clobbered them on the way out. The damage surfaced on the next run, which
+reported `2/13 caught` with eleven `anchor not found` lines: the anchors were missing because the
+file was no longer the file.
+
+**Why it is worth an ID even though nothing was lost.** The clobbered file was untracked and less
+than an hour old, so `git` could not have restored it and it was rewritten from the session's own
+transcript in two minutes. Change one variable — an hour of reasoning instead of ten minutes, or a
+session boundary between writing and sweeping — and this is [[lsn-022]] verbatim, which is the
+lesson that cost this repo two hours of finished work. **A near-miss that only missed because of a
+property of this particular file is not a near-miss, it is the same defect with a lucky input.**
+
+There is a second failure inside the first. The restore reported nothing. It could not: `cp
+BAK/cooldown.go a/cooldown.go` succeeds whatever `BAK/cooldown.go` contains. A restore that cannot
+distinguish "put back what was there" from "put back something else that was there" is a restore
+that verifies its own mechanics and not its property — [[lsn-035]] applied to tooling instead of to
+a check.
+
+**What the fix is, and why the lesson is open anyway.** `dev/mutate.sh` — written to close
+[[lsn-022]] — already does the right thing: it snapshots into `$snap/$n` keyed by **position**, not
+by name, restores on success, failure and signal, and refuses upfront if any named file is missing.
+It has a test suite. Nothing about it is inadequate.
+
+The gap is that **nothing routed this unit's sweep to it.** `harness-run` names mutation testing
+nowhere; the sweep is a habit the units have, carried in prose in `results.csv` rows, and a habit
+reimplements its tool each time it is exercised. That is the [[lsn-019]] shape — a lesson marked
+closed, with a real and working mechanization, whose defect recurs because the mechanization is a
+thing you have to remember to pick up. An L0 lint cannot see a script in `/tmp`, so the enforceable
+form here is a **skill change** (SELF-IMPROVEMENT §3.1): `harness-run` §5 should say that a mutation
+sweep runs through `dev/mutate.sh`, which makes the tool the default path rather than the one you
+reach for after remembering LSN-022. Left open and scheduled for the next improvement pass, because
+a skill edit is a mechanization and mechanizations are that pass's work, not a unit's.
+
+Related: [[lsn-022]] (the original: a git-shaped revert answering "what should this file contain"
+instead of "what did it contain a moment ago"), [[lsn-030]] (the same class again, one verb over),
+[[lsn-019]] (a closed lesson whose mechanization is not on any path the work takes), [[lsn-035]] (an
+operation that verifies it ran rather than that it worked).

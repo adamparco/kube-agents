@@ -406,6 +406,10 @@
   checks:
     - V-PRO-005
     - V-PRO-017
+    # V-PRO-005 and V-PRO-017 both watch a live agent get refused, which a cooldown held only in
+    # broker memory does perfectly — right up until somebody restarts the pod that is refusing them.
+    # V-PRO-028 asks where the quiet period lives.
+    - V-PRO-028
 
 "04§9#13":
   bullet: "**(new) `contested` holds.** A human-undone change is not re-applied."

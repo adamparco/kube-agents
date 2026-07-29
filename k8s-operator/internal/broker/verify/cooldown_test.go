@@ -18,6 +18,7 @@ package verify
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -81,7 +82,7 @@ func TestMemoryCooldownEntersAndExpires(t *testing.T) {
 		t.Fatal("a target nobody rolled back is in cooldown")
 	}
 
-	until, err := m.Enter(ctx, key, base)
+	until, err := m.Enter(ctx, "A1", key, base)
 	if err != nil {
 		t.Fatalf("Enter: %v", err)
 	}
@@ -108,7 +109,7 @@ func TestMemoryCooldownEntersAndExpires(t *testing.T) {
 func TestMemoryCooldownIsPerTarget(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemoryCooldown()
-	if _, err := m.Enter(ctx, "apps/Deployment/prod/web", base); err != nil {
+	if _, err := m.Enter(ctx, "A1", "apps/Deployment/prod/web", base); err != nil {
 		t.Fatalf("Enter: %v", err)
 	}
 	active, _, _ := m.Active(ctx, "apps/Deployment/prod/api", base.Add(time.Minute))
@@ -122,18 +123,24 @@ func TestMemoryCooldownExtendsNeverShortens(t *testing.T) {
 	m := NewMemoryCooldown()
 	key := "apps/Deployment/prod/web"
 
-	first, _ := m.Enter(ctx, key, base)
+	first, _ := m.Enter(ctx, "A1", key, base)
 	// A second rollback four minutes in. Its own window (10m from now) is longer, so it extends.
-	second, _ := m.Enter(ctx, key, base.Add(4*time.Minute))
+	second, _ := m.Enter(ctx, "A2", key, base.Add(4*time.Minute))
 	if !second.After(first) {
 		t.Fatalf("second cooldown ends %s, not after the first at %s", second, first)
 	}
 
 	// A third rollback one second later. The arithmetic gives 20m from then, still longer -- so
 	// construct the shortening case directly: a fresh registry whose entry is already far out.
+	//
+	// The backward jump has to CLEAR the next step of the curve, or the test is vacuous. A second
+	// failure is charged 2*BaseCooldown, so a reading only four minutes early still lands at
+	// base+6m and an implementation that assigned `Until` unconditionally would pass -- which is
+	// exactly what it did until a mutation sweep said so. Ten minutes early puts the naive answer
+	// at base+0m, behind the base+5m already on the books.
 	m2 := NewMemoryCooldown()
-	long, _ := m2.Enter(ctx, key, base)                      // 5m from base
-	short, _ := m2.Enter(ctx, key, base.Add(-4*time.Minute)) // an out-of-order clock reading
+	long, _ := m2.Enter(ctx, "A1", key, base)                       // 5m from base
+	short, _ := m2.Enter(ctx, "A2", key, base.Add(-10*time.Minute)) // an out-of-order clock reading
 	if short.Before(long) {
 		t.Fatalf("an out-of-order Enter shortened the cooldown from %s to %s", long, short)
 	}
@@ -144,17 +151,17 @@ func TestMemoryCooldownDecays(t *testing.T) {
 	m := NewMemoryCooldown()
 	key := "apps/Deployment/prod/web"
 
-	if _, err := m.Enter(ctx, key, base); err != nil {
+	if _, err := m.Enter(ctx, "A1", key, base); err != nil {
 		t.Fatalf("Enter: %v", err)
 	}
-	if _, err := m.Enter(ctx, key, base.Add(time.Minute)); err != nil {
+	if _, err := m.Enter(ctx, "A2", key, base.Add(time.Minute)); err != nil {
 		t.Fatalf("Enter: %v", err)
 	}
 	// Two consecutive rollbacks, then a long quiet stretch. The count resets, so the next rollback
 	// is charged the base rate again -- a count that never decays turns one bad week into a
 	// permanently untouchable target.
 	quiet := base.Add(CooldownDecay + time.Hour)
-	until, _ := m.Enter(ctx, key, quiet)
+	until, _ := m.Enter(ctx, "A3", key, quiet)
 	if want := quiet.Add(BaseCooldown); !until.Equal(want) {
 		t.Errorf("after %s of quiet the cooldown is %s, want a reset to %s",
 			CooldownDecay, until.Sub(quiet), BaseCooldown)
@@ -162,13 +169,35 @@ func TestMemoryCooldownDecays(t *testing.T) {
 
 	// Negative control: without the decay window the count keeps climbing.
 	m2 := NewMemoryCooldown()
-	if _, err := m2.Enter(ctx, key, base); err != nil {
+	if _, err := m2.Enter(ctx, "A1", key, base); err != nil {
 		t.Fatalf("Enter: %v", err)
 	}
 	soon := base.Add(CooldownDecay - time.Hour)
-	until2, _ := m2.Enter(ctx, key, soon)
+	until2, _ := m2.Enter(ctx, "A2", key, soon)
 	if got := until2.Sub(soon); got != 2*BaseCooldown {
 		t.Errorf("inside the decay window the second cooldown is %s, want %s", got, 2*BaseCooldown)
+	}
+}
+
+// TestMemoryCooldownIsIdempotentPerAction pins the promise CooldownRegistry.Enter makes in its own
+// doc comment. It is not a defensive nicety: internal/broker/cooldown recovers failures from the
+// journal AND holds an overlay of the ones it entered before the status write landed, so the same
+// action reaches the fold twice by design. If entering twice were entering two failures, one
+// rollback would buy a doubled quiet period on every restart.
+func TestMemoryCooldownIsIdempotentPerAction(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryCooldown()
+	key := "apps/Deployment/prod/web"
+
+	once, _ := m.Enter(ctx, "A1", key, base)
+	twice, _ := m.Enter(ctx, "A1", key, base)
+	if !twice.Equal(once) {
+		t.Errorf("entering action A1 twice moved the expiry from %s to %s", once, twice)
+	}
+	// And the count did not move either: a genuinely second action must still be charged 2x, not 4x.
+	third, _ := m.Enter(ctx, "A2", key, base)
+	if want := base.Add(2 * BaseCooldown); !third.Equal(want) {
+		t.Errorf("the second distinct action expires at %s, want %s -- the repeat was counted", third, want)
 	}
 }
 
@@ -177,13 +206,15 @@ func TestMemoryCooldownIsConcurrencySafe(t *testing.T) {
 	m := NewMemoryCooldown()
 	done := make(chan struct{})
 	for i := 0; i < 8; i++ {
-		go func() {
+		go func(worker int) {
 			defer func() { done <- struct{}{} }()
 			for j := 0; j < 50; j++ {
-				_, _ = m.Enter(ctx, "apps/Deployment/prod/web", base)
+				// Distinct IDs per iteration, or the per-action dedup would make 399 of these 400
+				// calls an early return and the test would exercise the lock and nothing under it.
+				_, _ = m.Enter(ctx, fmt.Sprintf("A%d-%d", worker, j), "apps/Deployment/prod/web", base)
 				_, _, _ = m.Active(ctx, "apps/Deployment/prod/web", base)
 			}
-		}()
+		}(i)
 	}
 	for i := 0; i < 8; i++ {
 		<-done
@@ -200,7 +231,7 @@ func TestCooldownStopsTheNextActionRestarting(t *testing.T) {
 		Namespace: "prod", Name: "web"}
 
 	// Action 1 rolls back.
-	if _, err := m.Enter(ctx, TargetKey(ref), base); err != nil {
+	if _, err := m.Enter(ctx, "A1", TargetKey(ref), base); err != nil {
 		t.Fatalf("Enter: %v", err)
 	}
 
