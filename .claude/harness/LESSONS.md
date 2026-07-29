@@ -75,12 +75,11 @@ will start selecting.
 | **LSN-044** | rbac, checks, vacuity, kubectl, L2 | `kubectl auth can-i patch foo/status` asks about a **name**, not a subresource, so the denial it reports is about an object that does not exist | closed | `dev/tests/cluster-check-hygiene.py` property 1 (L0, in `dev/L0-CHAIN.txt`) — no positional word of any `auth can-i` may contain `/`, `for`-lists resolved and expanded, and a resource the scanner cannot resolve obliges the script to carry a `*/*)` guard; local fix is `can()`/`subj()` in `dev/verify/brake-fanout-l2.sh` |
 | **LSN-045** | checks, L2, fixtures, journal, append-only | An L2 suite that writes to an append-only journal can never delete its own namespace, and finds out on the second run | closed | `dev/tests/cluster-check-hygiene.py` property 2 (L0, in `dev/L0-CHAIN.txt`) — no script that creates a DELETE-protected object may delete a namespace, with the protected set derived from the VAPs' own `DELETE` matchConstraints and the CRDs' `spec.names.kind`; `brake-fanout-l2.sh` reuses namespaces, mints IDs per run and matches Events by UID |
 | **LSN-046** | checks, deferrals, record-keeping, false-green, blocking-always, append-only | The deferral row named the category instead of its members, so the one gate arm that hunts deferred BLOCKING-ALWAYS checks matched nothing — and the false pass hiding behind it silenced that arm a second way | closed | `dev/tests/invariants-gate.py` `check_dagger_checks_are_deferred_by_id` (L0, in `dev/L0-CHAIN.txt`) — derives the † set from 09 §6.14 and requires every member to be named **by ID** in the Deferrals table and to hold no uncorrected pass; `_verification_evidence_rows` now emits one line per check ID and honours `**correction**` supersession; the BLOCKING-ALWAYS arm gained a not-yet-due clause keyed to the phase in 09 §6 that expires by itself and fails closed on an unparseable phase |
-
 | **LSN-047** | mutation, tooling, harness, near-miss | The mutation sweep reports a clean restore and one of the files it restored is now the other one | **open** | — `dev/mutate.sh` already snapshots by **index** and is the fix; nothing makes the harness reach for it. Candidate form is a skill change (`harness-run` VERIFY), scheduled for the next improvement pass |
-
 | **LSN-048** | mutation, tooling, checks, vacuity, false-finding | A mutation sweep names a test that does not exist, and reports the mutation as **survived** — a hole that is not there, indistinguishable from one that is | **open** | — `go test -run` with a pattern matching nothing **exits 0**, so `! check` is false and the mutation scores as uncaught. Fix is a `go test -list` guard before every mutation; same home as [[LSN-047]] (`dev/mutate.sh` / `harness-run` §5), scheduled for the next improvement pass so the two land together |
+| **LSN-049** | mutation, tooling, checks, vacuity, false-finding | The sweep's own shell quoting kept a mutation from ever being applied, and `rc == 0` was scored as "the suite passed with it in place" — an invented hole, reported twice | **open** | — A needle containing `""` closed the double-quoted `bash -c` argument early; the applier died, `&&` short-circuited, the run still exited 0. [[LSN-048]] with the sign flipped, same root: **scoring an exit code never established to be the test suite's**. Fix is the sanctioned-sweep change LSN-047/048 already wait on — mutation text never crosses a shell parse, the applier refuses unless the target appears exactly once, and each row names the test that must fail. Caught only because rows name their catching test |
 
-**Open: 3 of 48** (LSN-040, LSN-047, LSN-048).
+**Open: 4 of 49** (LSN-040, LSN-047, LSN-048, LSN-049).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2652,3 +2651,60 @@ Related: [[lsn-047]] (the sanctioned mutation tool that nothing routes work to),
 negative control only proves the suite fails, never which rule), [[lsn-038]] (the input nobody
 validates because it can only fail in the safe direction), [[lsn-019]] (a mechanization off the path
 the work takes).
+
+---
+
+## LSN-049 — The sweep's own shell quoting invented a hole, and rc==0 called it a result
+
+**Tag:** mutation, tooling, checks, vacuity, false-finding · **Status: open** (same home and same
+pass as [[lsn-047]] and [[lsn-048]]).
+
+**Trigger.** The P9-T8a sweep, 15 mutations over `pipeline/pipeline.go` and `common_types.go`. Row
+14 — a nil `OperationsSpec` reading as shadowed — came back `ESCAPED <- nothing failed`, twice, on
+a property the suite catches cleanly.
+
+**The finding.** The needle for row 14 contains `""`, Go's empty string literal, because the line
+being mutated is `return false, false, ""`. The sweep interpolated needles and replacements into a
+**double-quoted `bash -c` argument**. The embedded quote closed the string early, the applier died
+before touching the file, the `&&` short-circuited — and the surrounding `dev/mutate.sh` invocation
+still exited **0**, because nothing in the chain reported the applier's death upward. The sweep read
+that 0 as "the whole test suite passed with the mutation in place" and printed an escape for a
+mutation that had never been applied.
+
+**Why this is [[lsn-048]] with the sign flipped, and why the flip does not help.** There the tool
+hid a hole (a `-run` pattern matching nothing exits 0). Here it invented one. Both reduce to the same
+root: **the sweep scored an exit code it had not established was the test suite's.** `rc == 0` is
+load-bearing in a mutation sweep and it is produced by a pipeline of things that are not the test
+suite — a `-run` filter, a shell parse, an applier, a `&&`. Any of them can hand back a 0 that means
+"I did nothing".
+
+The invented-hole direction is not the safe one. It costs a real investigation (this one cost two
+passes, the first of which "fixed" the wrong thing by re-attributing the row), and if the
+investigation is lazy it terminates in a *weakened property* — the natural move on a mutation that
+allegedly survives is to relax what you thought you were asserting.
+
+**What actually caught it.** Requiring the sweep row to name the **specific test** that must appear
+in the failing set, rather than accepting "something went red". That requirement had already caught a
+mis-attribution on row 14's first pass (the intuitive guess was
+`TestNothingComposesBackToExecuting`; the real catcher is `TestAnUnobservableAgentIsShadowed`), and
+it is the reason the second defect was visible at all. A sweep that scores on `rc != 0` would have
+gone green on both.
+
+**Mechanization, and why it is open.** Three properties, all belonging to the same sanctioned-sweep
+change that [[lsn-047]] and [[lsn-048]] are already waiting on, so that a sweep is **configured, not
+authored**:
+
+1. Mutation text never crosses a shell parse. Needle and replacement travel by environment or file
+   to an applier that **refuses unless the target appears exactly once** — which is also the guard
+   that turns a stale needle into `BROKEN`, not into a silent escape.
+2. The applier's failure must be distinguishable from the suite's success. `&&` is not enough; the
+   sweep must observe that the mutation landed before it scores anything.
+3. Each row declares the test that must fail. `rc != 0` is not a catch.
+
+Nothing here is `dev/mutate.sh`'s fault — it snapshotted and restored byte-perfectly through all 15
+rows, as it did through LSN-048's eight. All three lessons are about the layer above it, which every
+unit keeps re-authoring from scratch. Three re-earnings is the argument.
+
+Related: [[lsn-048]] (the sweep that could not find its own test), [[lsn-047]] (the sanctioned tool
+nothing routes work to), [[lsn-035]] (verifying that an operation ran, not that it worked),
+[[lsn-019]] (a mechanization off the path the work takes).
