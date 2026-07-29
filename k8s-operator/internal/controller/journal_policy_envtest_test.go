@@ -63,6 +63,7 @@ const (
 	brokerUser  = "system:serviceaccount:" + testNS + ":" + brokerSA
 	otherBroker = "system:serviceaccount:" + testNS + ":cluster-admin-cluster-b-actor"
 	undoUser    = "system:serviceaccount:kubeagents-system:kube-agents-undo-controller"
+	brakeUser   = "system:serviceaccount:kubeagents-system:kube-agents-brake-controller"
 	chatOpsUser = "system:serviceaccount:kubeagents-system:kube-agents-chatops-gateway"
 	exportUser  = "system:serviceaccount:kubeagents-system:kubeagents-controller"
 	retainUser  = "system:serviceaccount:kubeagents-system:kube-agents-retention-controller"
@@ -249,6 +250,121 @@ func TestJournalStatusPolicy(t *testing.T) {
 			}
 		})
 	}
+
+	// --- C-BR, the other half of rung 5 --------------------------------------------------------
+	//
+	// The broker's denial above is only half a seam. If C-BR could write the request it fulfils, one
+	// compromised controller could author an escalation and act on it, and the two-writer split would
+	// buy nothing; if the broker could ERASE C-BR's receipt, a failed pause could be laundered back
+	// into a pending one. Both directions are exercised here.
+
+	// escalated returns a record already carrying a broker-written request, which is the only state
+	// in which C-BR is allowed to write anything at all.
+	escalated := func(t *testing.T) *agentv1alpha1.ActionRecord {
+		t.Helper()
+		ar := mkRecord(t)
+		ar.Status.Escalation = &agentv1alpha1.ActionEscalation{
+			PageRequested:  true,
+			PauseRequested: true,
+			Reason:         "rollback failed after the deployment never converged",
+			RequestedAt:    ptrTime(now),
+		}
+		if err := as(brokerUser).Status().Update(ctx, ar); err != nil {
+			t.Fatalf("broker could not request rung 5: %v", err)
+		}
+		return ar
+	}
+
+	t.Run("C-BR may record that the page and the pause happened", func(t *testing.T) {
+		ar := escalated(t)
+		ar.Status.Escalation.PagedAt = ptrTime(now)
+		ar.Status.Escalation.PausedAt = ptrTime(now)
+		if err := as(brakeUser).Status().Update(ctx, ar); err != nil {
+			t.Fatalf("C-BR was denied its own fields; the fan-out would then be unauditable (04 §5.1): %v", err)
+		}
+	})
+
+	t.Run("C-BR may record a fan-out failure", func(t *testing.T) {
+		ar := escalated(t)
+		ar.Status.Escalation.Failure = "agent not found"
+		if err := as(brakeUser).Status().Update(ctx, ar); err != nil {
+			t.Fatalf("C-BR was denied escalation.failure; a fan-out that could not be recorded as failed "+
+				"is indistinguishable from one still pending: %v", err)
+		}
+	})
+
+	t.Run("C-BR may not create the escalation it fulfils", func(t *testing.T) {
+		err := statusUpdate(t, brakeUser, func(ar *agentv1alpha1.ActionRecord) {
+			ar.Status.Escalation = &agentv1alpha1.ActionEscalation{
+				PauseRequested: true,
+				Reason:         "because I said so",
+				RequestedAt:    ptrTime(now),
+				PausedAt:       ptrTime(now),
+			}
+		})
+		if err == nil {
+			t.Fatal("C-BR wrote itself an escalation and fulfilled it in the same breath; the controller " +
+				"that holds the pause verb must never author the justification for using it (05 §1.7)")
+		} else if !apierrors.IsForbidden(err) {
+			t.Fatalf("expected Forbidden creating an escalation as C-BR, got: %v", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agentv1alpha1.ActionEscalation)
+	}{
+		{"reason", func(e *agentv1alpha1.ActionEscalation) { e.Reason = "a reason the pause looks warranted by" }},
+		{"requestedAt", func(e *agentv1alpha1.ActionEscalation) { e.RequestedAt = ptrTime(now.Add(-time.Hour)) }},
+		{"pauseRequested", func(e *agentv1alpha1.ActionEscalation) { e.PauseRequested = false }},
+	} {
+		t.Run("C-BR may not rewrite escalation."+tc.name, func(t *testing.T) {
+			ar := escalated(t)
+			tc.mutate(ar.Status.Escalation)
+			ar.Status.Escalation.PagedAt = ptrTime(now)
+			err := as(brakeUser).Status().Update(ctx, ar)
+			if err == nil {
+				t.Fatalf("C-BR rewrote escalation.%s -- the request is the broker's observation of a "+
+					"failure C-BR never saw (04 §5.1)", tc.name)
+			} else if !apierrors.IsForbidden(err) {
+				t.Fatalf("expected Forbidden rewriting escalation.%s, got: %v", tc.name, err)
+			}
+		})
+	}
+
+	t.Run("C-BR may not write any other status field", func(t *testing.T) {
+		ar := escalated(t)
+		ar.Status.Escalation.PausedAt = ptrTime(now)
+		ar.Status.Phase = agentv1alpha1.PhaseUndone
+		err := as(brakeUser).Status().Update(ctx, ar)
+		if err == nil {
+			t.Fatal("C-BR moved the record's phase; it fans out an escalation and describes nothing else (06 §4.3)")
+		} else if !apierrors.IsForbidden(err) {
+			t.Fatalf("expected Forbidden writing status.phase as C-BR, got: %v", err)
+		}
+	})
+
+	// The mirror of the fail-open this policy already paid for once: asking whether the NEW object
+	// carries a fulfilment field answers "no" when the field is being deleted. Deletion is the
+	// interesting direction -- an erased pausedAt reads as a fan-out still in flight rather than one
+	// that happened, so the broker would be able to retract C-BR's receipt.
+	t.Run("broker may not erase C-BR's receipt", func(t *testing.T) {
+		ar := escalated(t)
+		ar.Status.Escalation.PagedAt = ptrTime(now)
+		ar.Status.Escalation.PausedAt = ptrTime(now)
+		if err := as(brakeUser).Status().Update(ctx, ar); err != nil {
+			t.Fatalf("C-BR could not record the fan-out: %v", err)
+		}
+		ar.Status.Escalation.PagedAt = nil
+		ar.Status.Escalation.PausedAt = nil
+		err := as(brokerUser).Status().Update(ctx, ar)
+		if err == nil {
+			t.Fatal("the broker deleted escalation.pagedAt and pausedAt; a receipt that the party being " +
+				"audited can retract is not a receipt (04 §5.1)")
+		} else if !apierrors.IsForbidden(err) {
+			t.Fatalf("expected Forbidden erasing the fulfilment half, got: %v", err)
+		}
+	})
 
 	t.Run("a different broker may not write this record", func(t *testing.T) {
 		err := statusUpdate(t, otherBroker, func(ar *agentv1alpha1.ActionRecord) {

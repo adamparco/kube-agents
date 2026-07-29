@@ -691,7 +691,16 @@ type safety over a value nothing in this process reads. They are rendered as `un
           - **P9-T7c-3c-ii-b-2** — the **fan-out** side: the controller-side C-BR reconciler that
             turns a recorded escalation into `spec.operations.paused` and a page. **Claims V-REV-006
             at L2**, which needs the operator image rolled by digest — **P1 in full**, for the first
-            time in this task chain.
+            time in this task chain. **Split again at IMPLEMENT** under the `harness-run` §2 sizing
+            rule, because the deploy half is a different kind of work from the code half and
+            carrying an oversized unit forward is what the rule forbids:
+            - **P9-T7c-3c-ii-b-2-a** — the reconciler, its two rows in
+              `vap-agent-scope-journal`, and the L1 suites. No deploy, no cluster, no new identity;
+              the controller is deliberately wired into no manager yet. **Claims V-REV-006 at L1**
+              — the fan-out half, completing the L1 story ii-b-1 opened. **Done 2026-07-28.**
+            - **P9-T7c-3c-ii-b-2-b** — C-BR's own ServiceAccount, RBAC, Deployment and kustomize
+              wiring, the `--controllers` selector in the manager binary, `make cloud-build-push`,
+              a roll by digest, and **V-REV-006 at L2 with P1 in full**.
       - **P9-T7c-3c-iii** — a durable `CooldownRegistry`. `verify.MemoryCooldown` says in its own
         doc comment that it is "deliberately not the production store: a cooldown that dies with
         the broker process is a cooldown an operator can clear by deleting a pod, and 04 §4.2
@@ -885,6 +894,27 @@ an escalation that cannot be written surfaced as an error rather than swallowed.
 control is the direction that matters: a rung the driver never reached must leave `status.escalation`
 absent, because a record that claims an escalation nobody requested is how a `C-BR` reconciler pauses
 a healthy agent.
+
+**Why T7c-3c-ii-b-2 split again, into 2-a and 2-b.** The same argument one level down, and the
+sizing rule made the call: the reconciler is Go plus two CEL rows plus two L1 suites, and the deploy
+is a new ServiceAccount, a new grant, a new Deployment, a manager selector, an image build and a roll
+by digest. Bundling them means the code half cannot checkpoint until a cluster is reachable, and a
+unit that cannot checkpoint is one killed session away from being redone.
+
+The split is only honest because the code half claims something real on its own. It does: the L1 half
+of V-REV-006 was opened by ii-b-1 with the **request** and left explicitly incomplete, and 2-a closes
+it with the **fan-out** — a recorded escalation becomes a patched `spec.operations.paused`, a page,
+and a receipt, with the `¬` proving the converse (a record that owes nothing must leave the agent
+running and emit nothing). 2-b then claims the L2 half, which is the part that needs a cluster to
+mean anything: at L1 the pause is a patch against a fake API server, and "the agent actually stopped"
+is not something L1 can observe.
+
+**What T7c-3c-ii-b-2-a asserts, beyond the reconciler.** Two rows in `vap-agent-scope-journal` that
+turn the broker/C-BR seam from a convention into an admission decision — C-BR may write only the
+fulfilment half, and may neither create the escalation nor edit what was requested. Without the
+second row the controller holding the pause verb could author the justification for using it, which
+is the concentration of authority the split exists to prevent. Both rows and the broker's mirror
+denial are exercised against a real API server, in both directions, and mutation-tested.
 
 **What T7c-3a asserts.** `livestate.Source` is the adapter behind every rung of 06 §4.2's
 ladder: object labels and annotations, namespace labels, the blast-radius denominator, the secret

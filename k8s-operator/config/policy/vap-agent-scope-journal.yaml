@@ -62,6 +62,12 @@ spec:
     # exporter is — so this row is the table's missing entry, added with the field it governs.
     - name: isExporter
       expression: "variables.user == 'system:serviceaccount:kubeagents-system:kubeagents-controller'"
+    # C-BR, the brake surface (05 §1.5). It reads a recorded escalation and fans it out into
+    # `Agent.spec.operations.paused` and a page, then timestamps what it did. Its OWN service
+    # account, deliberately not the operator's, even though the reconciler is a controller like the
+    # exporter is: see validation 5 below for why sharing that identity would be a downgrade.
+    - name: isBrakeController
+      expression: "variables.user == 'system:serviceaccount:kubeagents-system:kube-agents-brake-controller'"
 
     # --- per-field change detection ----------------------------------------------------------
     #
@@ -155,16 +161,82 @@ spec:
         (variables.hasOld && has(oldObject.status.escalation)) != (variables.hasNew && has(object.status.escalation)) ||
         (variables.hasOld && has(oldObject.status.escalation) && variables.hasNew && has(object.status.escalation) &&
          oldObject.status.escalation != object.status.escalation)
-    # The FULFILMENT half of the escalation, split out because it has a different writer from the
-    # request half sitting in the same struct (04 §5.1, rung 5). The broker asks; C-BR does it and
-    # timestamps what it did. A broker that could write these could record that the agent was paged
-    # and paused without either having happened — which is worse than not recording it at all,
-    # because the audit trail would then actively assert the promise was kept.
-    - name: escalationFulfilmentSet
+    # `escalation` has TWO writers in ONE struct (04 §5.1, rung 5), so `escalationChanged` above is
+    # too coarse to authorise on: the broker asks, C-BR does it and timestamps what it did, and each
+    # must be denied the other's fields. The two groupings below split the struct along that seam:
+    # `escalationFulfilmentTouched` (the broker's denial) and `escalationRequestTouched` (C-BR's).
+    #
+    # Both are named `...Touched`, not `...Changed`, and that is load-bearing rather than stylistic:
+    # `dev/tests/journal-status-vap-parity.py` treats every `<field>Changed` variable as a claim that
+    # `ActionRecordStatus` has a json field `<field>`, and fails the build on a phantom. These are
+    # sub-field groupings, not status fields.
+    #
+    # `hasOldEsc`/`hasNewEsc` exist so the per-field expressions do not repeat the two-level presence
+    # guard six times. The guards are still required — CEL errors on `has(a.b.c)` when `a.b` is
+    # absent, and only `&&`'s short-circuit keeps that from happening.
+    - name: hasOldEsc
+      expression: "variables.hasOld && has(oldObject.status.escalation)"
+    - name: hasNewEsc
+      expression: "variables.hasNew && has(object.status.escalation)"
+
+    # The FULFILMENT half. A broker that could write these could record that the agent was paged and
+    # paused without either having happened — worse than not recording it at all, because the audit
+    # trail would then actively assert the promise was kept.
+    #
+    # CHANGED, not SET. An earlier version asked only whether the new object carries a fulfilment
+    # field, which answers "no" when a field is being DELETED — so the broker could erase C-BR's
+    # receipt and leave a request that looks like it was never fanned out. Now that C-BR exists and
+    # writes those fields, that is a reachable way to launder a failed pause into a pending one.
+    - name: escPagedAtTouched
       expression: >-
-        variables.hasNew && has(object.status.escalation) &&
-        (has(object.status.escalation.pagedAt) || has(object.status.escalation.pausedAt) ||
-         has(object.status.escalation.failure))
+        (variables.hasOldEsc && has(oldObject.status.escalation.pagedAt)) !=
+        (variables.hasNewEsc && has(object.status.escalation.pagedAt)) ||
+        (variables.hasOldEsc && has(oldObject.status.escalation.pagedAt) &&
+         variables.hasNewEsc && has(object.status.escalation.pagedAt) &&
+         oldObject.status.escalation.pagedAt != object.status.escalation.pagedAt)
+    - name: escPausedAtTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.pausedAt)) !=
+        (variables.hasNewEsc && has(object.status.escalation.pausedAt)) ||
+        (variables.hasOldEsc && has(oldObject.status.escalation.pausedAt) &&
+         variables.hasNewEsc && has(object.status.escalation.pausedAt) &&
+         oldObject.status.escalation.pausedAt != object.status.escalation.pausedAt)
+    - name: escFailureTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.failure) ? oldObject.status.escalation.failure : '') !=
+        (variables.hasNewEsc && has(object.status.escalation.failure) ? object.status.escalation.failure : '')
+    - name: escalationFulfilmentTouched
+      expression: >-
+        variables.escPagedAtTouched || variables.escPausedAtTouched || variables.escFailureTouched
+
+    # The REQUEST half, the mirror denial: C-BR may write its receipt and may not edit the thing it
+    # is a receipt FOR. Without this, the controller that performs the pause could also author the
+    # justification for it after the fact — rewrite `reason` to something the pause looks warranted
+    # by, or backdate `requestedAt` — and the journal would agree with it. The broker is the only
+    # writer of these four, and it is the only party that observed the failure they describe.
+    - name: escPageRequestedTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.pageRequested) ? oldObject.status.escalation.pageRequested : false) !=
+        (variables.hasNewEsc && has(object.status.escalation.pageRequested) ? object.status.escalation.pageRequested : false)
+    - name: escPauseRequestedTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.pauseRequested) ? oldObject.status.escalation.pauseRequested : false) !=
+        (variables.hasNewEsc && has(object.status.escalation.pauseRequested) ? object.status.escalation.pauseRequested : false)
+    - name: escReasonTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.reason) ? oldObject.status.escalation.reason : '') !=
+        (variables.hasNewEsc && has(object.status.escalation.reason) ? object.status.escalation.reason : '')
+    - name: escRequestedAtTouched
+      expression: >-
+        (variables.hasOldEsc && has(oldObject.status.escalation.requestedAt)) !=
+        (variables.hasNewEsc && has(object.status.escalation.requestedAt)) ||
+        (variables.hasOldEsc && has(oldObject.status.escalation.requestedAt) &&
+         variables.hasNewEsc && has(object.status.escalation.requestedAt) &&
+         oldObject.status.escalation.requestedAt != object.status.escalation.requestedAt)
+    - name: escalationRequestTouched
+      expression: >-
+        variables.escPageRequestedTouched || variables.escPauseRequestedTouched ||
+        variables.escReasonTouched || variables.escRequestedAtTouched
 
     # Nothing at all changed. A no-op status write is harmless and must not be denied — controllers
     # re-Update on conflict retries and a denial there would look like a permission bug.
@@ -184,10 +256,10 @@ spec:
     - expression: >-
         variables.nothingChanged ||
         variables.isOwningBroker || variables.isUndoController ||
-        variables.isChatOpsGateway || variables.isExporter
+        variables.isChatOpsGateway || variables.isExporter || variables.isBrakeController
       messageExpression: >-
         '"' + variables.user + '" may not write ActionRecord.status. Only the owning broker, the undo controller, ' +
-        'the ChatOps gateway and the journal exporter may, each on a fixed field set (06 §4.3). ' +
+        'the ChatOps gateway, the journal exporter and the brake controller may, each on a fixed field set (06 §4.3). ' +
         'A human cluster-admin is explicitly denied — use /kage approve, /kage reject or /kage uncontest, ' +
         'which check the roster and leave an audit trail'
       reason: Forbidden
@@ -215,7 +287,7 @@ spec:
     #     fan-out from the operator's identity. Without this row the two-writer split in
     #     `ActionEscalation` would be a convention, and the auditable half of "a failed rollback pages
     #     AND auto-pauses" (V-REV-006) would be self-attested by the party with the motive.
-    - expression: "!variables.isOwningBroker || !variables.escalationFulfilmentSet"
+    - expression: "!variables.isOwningBroker || !variables.escalationFulfilmentTouched"
       message: >-
         the owning broker may request a page and a pause, never record that they happened —
         pagedAt, pausedAt and failure are written by C-BR, which performs them (04 §5.1, 05 §1.7)
@@ -268,13 +340,17 @@ spec:
     #    only principal whose write unlocks deletion, so any additional field it could reach would
     #    be a field that could be rewritten immediately before the record is destroyed.
     #
-    #    `escalation` is denied here too, and it is the row a future change is most likely to want to
-    #    loosen: C-BR — which fans a recorded escalation out into a pause and a page — runs inside the
-    #    same operator manager and therefore arrives as the same service account. That does not make
-    #    it the same principal. Widening this row would hand the escalation field to the exporter as
-    #    a side effect, and the exporter is the one principal that can then delete the record. If
-    #    C-BR needs to write the fulfilment half, it needs its OWN identity, the way 06 §4.3 already
-    #    contemplates for the retention controller in the note further down this file.
+    #    `escalation` is denied here too, and this is the row a change was most likely to want to
+    #    loosen: C-BR — which fans a recorded escalation out into a pause and a page — is a
+    #    controller, and the cheap way to ship it was inside the operator manager, arriving as the
+    #    same service account. That would not have made it the same principal. Widening this row
+    #    would have handed the escalation field to the exporter as a side effect, and the exporter is
+    #    the one principal that can then delete the record — so the receipt and the deletion of the
+    #    thing it is a receipt for would be reachable from one token.
+    #
+    #    That was refused, and validation 6 below is what the refusal cost: C-BR has its OWN service
+    #    account and its own deployment, the way 06 §4.3 already contemplates for the retention
+    #    controller in the note further down this file. This row stays exactly as narrow as it was.
     - expression: >-
         !variables.isExporter ||
         (!variables.phaseChanged && !variables.observedGenerationChanged && !variables.appliedChanged &&
@@ -283,6 +359,34 @@ spec:
          !variables.contestedChanged && !variables.undoneByChanged && !variables.escalationChanged)
       message: >-
         the journal exporter may write only status.exported (06 §4.3, 05 §1.2)
+      reason: Forbidden
+
+    # 6) C-BR, the brake controller: the FULFILMENT half of escalation and nothing else. It is the
+    #    mirror of row 2b — the broker asks, C-BR answers, and neither can write the other's half.
+    #    Together the two rows make `status.escalation` a two-party record: the request is attested
+    #    by the principal that decided rung 5 was warranted, the outcome by the principal that holds
+    #    the verbs to produce it. That is what makes V-REV-006 checkable from the record alone.
+    - expression: >-
+        !variables.isBrakeController ||
+        (!variables.phaseChanged && !variables.observedGenerationChanged && !variables.appliedChanged &&
+         !variables.verificationChanged && !variables.recoveryChanged && !variables.reportChanged &&
+         !variables.timestampsChanged && !variables.messageChanged && !variables.approvalsChanged &&
+         !variables.contestedChanged && !variables.undoneByChanged && !variables.exportedChanged)
+      message: >-
+        the brake controller may write only status.escalation — never phase, applied, verification,
+        recovery, report, timestamps, message, approvals, contested, undoneBy or exported (06 §4.3)
+      reason: Forbidden
+    # 6b) …and only the fulfilment half of it. C-BR may not manufacture the request it then fulfils:
+    #     `hasOldEsc` requires the struct to already exist, so C-BR cannot create the escalation, and
+    #     `escalationRequestTouched` denies any edit to pageRequested, pauseRequested, reason or
+    #     requestedAt. Without this row a compromised C-BR could write itself an escalation and pause
+    #     the fleet — the exact concentration of authority the broker/C-BR split exists to prevent.
+    - expression: >-
+        !variables.isBrakeController ||
+        (variables.hasOldEsc && !variables.escalationRequestTouched)
+      message: >-
+        the brake controller may record that a page and a pause happened; it may not create the
+        escalation or change what was requested (04 §5.1, 05 §1.7)
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

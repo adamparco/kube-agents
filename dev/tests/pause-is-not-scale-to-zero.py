@@ -153,6 +153,11 @@ EXEMPT = {
     "brake to REPORT it is the field's purpose",
     "journal_reconciler.go": "reconciles the append-only journal; brake state is journalled context",
     "retention_controller.go": "prunes journal records; unrelated to the brake but must stay classified",
+    "brake_controller.go": "C-BR, the one controller whose job is to SET the brake (05 §1.7). It "
+    "patches spec.operations.paused and pauseReason -- the same two fields a human writes -- and "
+    "reads them only to avoid overwriting a human's reason. It renders no workload, which is the "
+    "whole point: 05 §1.7 makes this the single stop path precisely so that pausing stays one field "
+    "and never becomes a second, workload-shaped way to stop an agent",
     "undo_controller.go": "reverses an executed action (05 §1.3) -- it reads the brake's own objects "
     "(UndoRequest, ActionRecord) and writes only their status plus an advisory annotation on the "
     "target; it renders no workload, so property 3 has nothing to bite on here",
