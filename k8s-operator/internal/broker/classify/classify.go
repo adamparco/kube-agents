@@ -1,6 +1,7 @@
 package classify
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 
@@ -42,8 +43,28 @@ type ActionHistory interface {
 	Seen(agentName, verb string, kind KindRef, namespace string) bool
 }
 
+// AlwaysNovel is the explicit "there is no history here" value, for a caller that has no journal to
+// read -- a corpus fixture, a unit test, a broker running before the journal exists.
+//
+// It is a TYPE and not a nil because the two answers are not the same and the nil used to give the
+// wrong one. Nothing is familiar, so the `+1` fires on everything: strictly stricter, visible in the
+// reasons on every record, and impossible to reach by forgetting.
+type AlwaysNovel struct{}
+
+// Seen always reports false.
+func (AlwaysNovel) Seen(string, string, KindRef, string) bool { return false }
+
 // New builds a classifier over the code floor and zero or more ChangePolicy rule sets.
+//
+// history is REQUIRED. It was optional until P9-T7c-3d-iii-b, and optional meant that a broker
+// nobody had wired one into ran with 06 §4.2's `novel-action` escalation off -- a risk class lowered
+// by an omission, which invariant 4 does not permit. A caller that genuinely has no history has
+// AlwaysNovel, which is the same behaviour a nil used to produce read the other way round: not
+// "nothing is novel", but "everything is".
 func New(policies []RuleSet, history ActionHistory) (*Classifier, error) {
+	if history == nil {
+		return nil, errors.New("an ActionHistory is required: a classifier without one cannot evaluate the 06 §4.2 novel-action escalation, and omitting it silently would lower the class of every unfamiliar action; pass classify.AlwaysNovel{} to say so deliberately")
+	}
 	floor := CodeFloor()
 	if err := floor.Validate(true); err != nil {
 		// The floor failing its own validation is a build-time bug that reached runtime. Refusing to
@@ -260,7 +281,11 @@ func (c *Classifier) classifyOne(in *Input, op *ResolvedOp) (opResult, error) {
 			Detail: fmt.Sprintf("the target is production, per its %s", src),
 		})
 	}
-	if c.knownActions != nil && !c.knownActions.Seen(in.Caller.Name, op.Verb, op.Kind, op.Namespace) {
+	// `nil ||` and not `!= nil &&`. A broker that was never handed a history had the whole
+	// novel-action escalation switched off, silently and in the loosening direction; New now refuses
+	// a nil, and this arm is what makes the refusal unnecessary rather than load-bearing. Unknown
+	// history means novel, which is the escalating answer -- see internal/broker/history.
+	if c.knownActions == nil || !c.knownActions.Seen(in.Caller.Name, op.Verb, op.Kind, op.Namespace) {
 		escalations++
 		reasons = append(reasons, Reason{
 			Rule:   RuleNovelAction,

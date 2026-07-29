@@ -242,14 +242,20 @@ func TestABadPolicyDiscardsTheSnapshotWhereADroppedReadDoesNot(t *testing.T) {
 }
 
 func TestNewSourceRejectsAnIntervalThatCannotBeatStaleness(t *testing.T) {
-	_, err := NewSource(SourceConfig{Reader: &fakeLister{}, RefreshInterval: MaxPolicyStaleness})
+	_, err := NewSource(SourceConfig{Reader: &fakeLister{}, History: nothingSeen{}, RefreshInterval: MaxPolicyStaleness})
 	if err == nil {
 		t.Fatal("a refresh interval at or above MaxPolicyStaleness must be rejected: the source would refuse between successful reads")
 	}
-	if _, err := NewSource(SourceConfig{Reader: nil}); err == nil {
+	if _, err := NewSource(SourceConfig{Reader: nil, History: nothingSeen{}}); err == nil {
 		t.Fatal("a nil Reader must be rejected")
 	}
-	s, err := NewSource(SourceConfig{Reader: &fakeLister{}})
+	// A nil History is refused at construction and not at the first poll. Left optional, it switched
+	// the 06 §4.2 novel-action escalation off for any broker nobody remembered to wire one into --
+	// see internal/broker/history and classify.AlwaysNovel.
+	if _, err := NewSource(SourceConfig{Reader: &fakeLister{}}); err == nil {
+		t.Fatal("a nil History must be rejected")
+	}
+	s, err := NewSource(SourceConfig{Reader: &fakeLister{}, History: nothingSeen{}})
 	if err != nil {
 		t.Fatalf("the default interval must be accepted: %v", err)
 	}

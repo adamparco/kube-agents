@@ -130,6 +130,12 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 	if cfg.Reader == nil {
 		return nil, errors.New("policy: a Reader is required; a source that cannot list ChangePolicy objects would report every agent as unpoliced")
 	}
+	if cfg.History == nil {
+		// Refused HERE and not left to the first Build. classify.New rejects a nil history too, but
+		// a Source only calls Build inside Refresh, so a nil would otherwise surface as a failing
+		// poll several seconds after startup rather than as a broker that would not start.
+		return nil, errors.New("policy: a History is required; classify.New refuses a nil one because it would switch the 06 §4.2 novel-action escalation off silently -- pass internal/broker/history.Source in production, or classify.AlwaysNovel{} to say deliberately that there is none")
+	}
 	if cfg.RefreshInterval < 0 {
 		return nil, fmt.Errorf("policy: RefreshInterval %s is negative", cfg.RefreshInterval)
 	}
