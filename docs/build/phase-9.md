@@ -1685,6 +1685,91 @@ they are gaps, not retirements (no `RETIRED` row, which §9.6 requires), so take
 
 ---
 
+## P9-T8 ships as two units — T8a (the mechanism) and T8b (the surface)
+
+The precedent is T3a/T3b, T5a/T5b and P8-T8a/b/c. The row is not one deliverable: it is a **join in
+the enforcement path** and a **skill plus an L2 soak that exercises it**, and only the first is
+buildable today.
+
+| Unit       | What                                                                                                                                                                         | Checks                    | Blocked on                                                                                        |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------- |
+| **P9-T8a** | The forcing join itself: `spec.operations.dryRunOnly` → the effective dry-run decision, in `pipeline.Submit`. Hermetic, L1.                                                  | **V-BRK-025** (new)       | nothing — **and it must precede T7c-3d-iv**                                                       |
+| **P9-T8b** | The `apply-change` skill in all three tiers, the `submit_action`/`plan_action` MCP tools, `submit-suggestion`'s deletion (06 §9), and the L2 shadow soak with journal mining | V-REV-001 (L2), V-GAT-019 | **T7c-3d-iv.** Nothing executes and nothing journals in a real broker until the pipeline is wired |
+
+**The ordering is the point, and it is the thing the recon above said PLAN had to settle.** T8b is
+what the T8 row is mostly _about_, and it is the half that cannot be done. T8a is the half that the
+recon showed T7c-3d-iv arms a trap for: the moment `UnavailablePipeline{}` is replaced, the broker
+executes for real for any caller that omits `dryRun`, and the operator-side switch meant to prevent
+that has to already exist. Shipping T8a now inverts the task table's ordering deliberately. **T8b
+carries no BLOCKING-ALWAYS check**, so waiting on it costs nothing the gate will notice; V-GAT-019's
+phase in 09 §6.14 is 10 regardless.
+
+### What T8a found
+
+**Nothing in the broker read `spec.operations.dryRunOnly`.** Second instance of [[LSN-007]] in this
+phase: a documented field, a printer column, and a `status.operations.dryRunOnly` mirror — and an
+operator who set it got an agent that executed. The field's own guard predicted it.
+`OperationsSpec.Brake()` exists as one function returning all three brake values precisely so that
+"a caller cannot consult `paused` and forget `dryRunOnly`, which is how shadow mode stops
+shadowing" (`common_types.go:398-403`). `brake.go`'s local `agentPaused()` reached into `ops.Paused`
+directly and forgot exactly that. Until this unit, **nothing in the tree called `Brake()` outside a
+test.**
+
+Four decisions, each of which had a plausible wrong answer:
+
+- **Scoped to execution; classification is a deliberate exception.** The forced value reaches the
+  executor, `stepVerify`, the terminal phase, the caller-facing message and the journaled record's
+  `spec.dryRun`. It must **not** reach step 4: `classify.go:166` reads `if !in.DryRun &&
+!hasUndoPlan(in)`, so feeding it the forced value suppresses the no-undo-plan escalation and the
+  shadow record under-reports its class. That is both the permissive direction under invariant 4 and
+  a defeat of shadow mode's purpose — a shadow is read as evidence, and one that under-reports is
+  worse than no shadow at all. The sweep mutates this exception in both directions.
+- **Derived, never written onto the envelope.** The obvious implementation — `env.DryRun = true` —
+  works inside the package and breaks two packages away: `CompareIdempotencyKey` (`server.go:306`)
+  recomputes the key over `dryRun` **before** `Pipeline.Submit` at `:344`, so every shadowed
+  submission would return `400 idempotency-key-mismatch`. The recon anticipated the ordering
+  constraint and got the direction backwards: the forcing must land after key verification, not
+  before, and must not mutate the input it verified against. That mutation is row 15 of the sweep.
+- **The field is `mayExecute`, not `dryRun`, and the polarity is the safety property.** Stored as
+  permission-to-execute, the zero value — what the struct holds before anything computed the answer,
+  and what a step inserted above the computation would read — is `false`, which reads back as "this
+  is a dry run". A field spelled `dryRun bool` fails open on exactly the same mistake.
+- **Unobservable means shadowed.** A nil `BrakeView.Agent` returns `true`. Asserted **directly on
+  the predicate**, because the composed submission is over-determined: the brake's
+  `agent-unreadable` row refuses a nil Agent at step 5 anyway, so a composed-only assertion would
+  stay green with the predicate inverted. The over-determined claim is kept and labelled as such.
+
+Two over-determinations surfaced this way and both were re-pointed at an assertion that can fail.
+The other was the classification test: brake row 5 (`undo-plan-unusable → RaiseToGated`) gates all
+three lattice rows independently, so `class` is identical whatever step 4 sees. The property lives
+in `spec.classification.reasons`, and the test asserts it as an **equality against the real run**
+(`reasons(shadowed) == reasons(real)`) with a third row as the non-vacuity control, rather than
+against a hardcoded class that the brake would have satisfied on its own.
+
+**Evidence.** 5 test functions / 11 cases in `internal/broker/pipeline/shadow_test.go`; `dryRun()`
+and `shadowed()` at 100.0% statement coverage, `Submit` at 83.3%, package 77.0%, all under `-race`;
+mutation sweep **15/15 caught, 0 escaped, 0 broken**, each row naming the specific test that catches
+it and no `-run` pattern anywhere ([[LSN-048]]).
+
+**The sweep mis-scored itself first, and that is [[LSN-049]].** Row 14's needle contains `""` (Go's
+empty string literal). The sweep interpolated needles into a double-quoted `bash -c` argument, so
+the quote closed early, the mutation was never applied, the python died, `&&` short-circuited — and
+the run still exited 0, which the sweep printed as "ESCAPED, nothing failed" for a mutation the
+suite catches cleanly. [[LSN-048]] with the sign flipped: there the tool hid a hole, here it
+invented one. Needle and replacement now travel by environment variable to a helper that refuses
+unless the target appears exactly once. Row 14 also caught a **mis-attribution** on the first pass —
+the intuitive guess named `TestNothingComposesBackToExecuting`; the actual catcher is
+`TestAnUnobservableAgentIsShadowed`. Requiring the _named_ test rather than "something went red" is
+the only reason either defect was visible.
+
+**Left for T8b or later, deliberately:** no admission rule enforces `dryRunOnly` stricter-only (it
+is nowhere asserted as monotonic the way `ChangePolicy` and `requireApproval` are);
+`status.operations.dryRunOnly` still has no writer; and notification under dry-run remains
+unspecified in 06 §4.1 (`notifyOn` is class-keyed and never mentions `dryRun`). None of the three
+are execution-path holes — the join is what T7c-3d-iv needs, and the join is what shipped.
+
+---
+
 ## Recon 2026-07-29 — P9-T9, and the real size of the gate
 
 **The Phase-9 gap, derived rather than remembered.** Parsing every row of 09 §6.1–§6.14 with

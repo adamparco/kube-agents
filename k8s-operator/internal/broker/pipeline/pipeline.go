@@ -251,10 +251,54 @@ type state struct {
 	plan      *undo.Result
 	brakeView BrakeView
 
+	// mayExecute is the effective execution decision, and its POLARITY IS THE POINT.
+	//
+	// It is stored as permission-to-execute rather than as a dry-run flag so that the zero value --
+	// what this struct holds before anything computed the answer, and what a future step added
+	// above the computation would see -- is `false`, which `dryRun` reads back as "this is a dry
+	// run". A field spelled `dryRun bool` has the opposite zero value: forgetting to set it means
+	// executing for real, which is the one direction 06 §1.1 cannot tolerate. Nothing outside
+	// Submit writes it, and `dryRun()` is the only reader.
+	mayExecute bool
+
 	record   *agentv1alpha1.ActionRecord
 	exec     *execute.Result
 	execFail *verify.Failure
 	verify   verify.Result
+}
+
+// dryRun is the EFFECTIVE dry-run decision: the caller asked for one, or the agent is in shadow
+// mode, or nobody has decided yet.
+//
+// Every step from 9 onwards asks this and never `s.env.DryRun`, because the envelope field is only
+// half the answer. 06 §4.1's field table says `dryRun` is "forced `true` when
+// `spec.operations.dryRunOnly` is set", and an agent cannot clear `dryRunOnly` -- `Agent` is a
+// control-plane object no agent identity may write -- so the composition is one-way: a caller's dry
+// run OR shadow mode is a dry run, and nothing anywhere composes back to executing.
+//
+// STEP 4 IS THE DELIBERATE EXCEPTION and still reads `s.env.DryRun`. See stepClassify.
+func (s *state) dryRun() bool { return !s.mayExecute }
+
+// shadowed reports whether `spec.operations.dryRunOnly` forces this submission to a dry run.
+//
+// UNREADABLE MEANS SHADOWED. A nil Agent is `BrakeView`'s "could not read" convention, and reading a
+// blind broker as "not in shadow mode" is the fail-open direction 06 §4.4 exists to refuse. In the
+// composed pipeline the brake's row 2 refuses an unreadable Agent at step 5, four steps before
+// anything executes, so this arm is unreachable *there* -- but "unreachable given the brake" and
+// "cannot execute unobserved" are different claims, and only the second one survives someone
+// reordering the steps.
+//
+// `OperationsSpec.Brake` does the reading rather than a local nil-check on `DryRunOnly`, because
+// that helper exists for exactly this call site: its doc says it keeps the three brake fields
+// together so "a caller cannot consult `paused` and forget `dryRunOnly`, which is how shadow mode
+// stops shadowing". Until this function, nothing in the broker called it, and shadow mode had
+// indeed stopped shadowing.
+func shadowed(v BrakeView) bool {
+	if v.Agent == nil {
+		return true
+	}
+	_, dryRunOnly, _ := v.Agent.Spec.Operations.Brake()
+	return dryRunOnly
 }
 
 // Submit runs steps 3 through 11. Steps 1 and 2 are already on the trace when it is called.
@@ -283,6 +327,21 @@ func (p *Pipeline) Submit(
 		return nil, fmt.Errorf("pipeline: minting an action id: %w", err)
 	}
 	s.actionID = actionID
+
+	// SHADOW MODE, resolved once, here, before any step can read it (06 §1.1, 06 §4.1).
+	//
+	// Before the loop rather than inside a step, because it is a property of the submission and not
+	// of a stage: there is exactly one write, it happens on the only path that reaches any read, and
+	// a step inserted anywhere in the list below therefore cannot find it uncomputed. Putting it in
+	// a step would mean the steps before that one see the zero value, and the zero value is a
+	// decision too.
+	//
+	// Its own `Observe` rather than a share of step 5's, for a reason that is easy to invert: this
+	// read is EARLIER, so a `dryRunOnly` cleared between here and step 5 leaves the submission in
+	// shadow mode, and one set between here and step 5 is caught by step 5 refusing anyway. Both
+	// races resolve toward not executing. Sharing step 5's observation would put the decision after
+	// classification and reverse the first of those.
+	s.mayExecute = !env.DryRun && !shadowed(p.cfg.Brake.Observe(ctx))
 
 	// Steps 3-6 and 8-11 all abort the whole submission on error, and every one of them returns
 	// through the trace, so a single error check per step is the entire control flow.
@@ -423,8 +482,25 @@ func (p *Pipeline) stepClassify(ctx context.Context, s *state) (*broker.Result, 
 		s.plan = plan
 
 		in := &classify.Input{
-			Caller:          s.caller,
-			Operations:      s.resolved,
+			Caller:     s.caller,
+			Operations: s.resolved,
+			// THE ENVELOPE'S VALUE, DELIBERATELY -- not `s.dryRun()`, and this is the one place in
+			// the pipeline where that is correct.
+			//
+			// `classify` reads DryRun in exactly one rule: step 6's "no undo plan raises to at
+			// least gated" is suppressed for a dry run. Feeding shadow mode's forced `true` in here
+			// would therefore make a shadowed agent classify an un-undoable action as `routine`
+			// where the same envelope from an unshadowed agent classifies `gated`.
+			//
+			// That is backwards twice over. It is the permissive direction, which invariant 4
+			// forbids on its own. And it defeats the point: shadow mode exists so an operator can
+			// see "what an agent WOULD do before granting it the authority to do it"
+			// (`OperationsSpec.DryRunOnly`), so the classification in a shadow record has to be the
+			// classification the real action would get. A shadow that under-reports the class is
+			// worse than no shadow, because it is read as evidence.
+			//
+			// So the forcing is scoped to execution, and classification stays a function of the
+			// request. The envelope field keeps its 06 §4.1 meaning here and only here.
 			DryRun:          s.env.DryRun,
 			RequireApproval: s.env.RequireApproval,
 			MaxObjects:      s.env.EffectiveMaxObjects(),
@@ -660,7 +736,7 @@ func (p *Pipeline) stepExecute(ctx context.Context, s *state) (*broker.Result, e
 			AgentIdentity: agentIdentity(s.id),
 			Ops:           ops,
 			Snapshots:     s.snaps,
-			DryRunOnly:    s.env.DryRun,
+			DryRunOnly:    s.dryRun(),
 		})
 		// The Result is kept even on error: it carries Mutated, which is the recovery ladder's
 		// only input on whether there is anything to roll back. Discarding it here is the bug
@@ -690,7 +766,7 @@ func (p *Pipeline) stepExecute(ctx context.Context, s *state) (*broker.Result, e
 			return "partially applied, handing the failure to the recovery ladder: " + execErr.Error(), nil
 		}
 
-		if s.env.DryRun {
+		if s.dryRun() {
 			return fmt.Sprintf("dry run only, %d operations checked", len(res.Outcomes)), nil
 		}
 		return fmt.Sprintf("%d operations applied as %s", len(res.Outcomes), res.FieldManager), nil
@@ -706,7 +782,7 @@ func (p *Pipeline) stepExecute(ctx context.Context, s *state) (*broker.Result, e
 func (p *Pipeline) stepVerify(ctx context.Context, s *state) (*broker.Result, error) {
 	tr := s.tr
 
-	if s.env.DryRun {
+	if s.dryRun() {
 		// A dry run mutated nothing, so there is nothing to verify: the predicates would evaluate
 		// the pre-action cluster and report the action as having failed. Skipped WITH a reason
 		// rather than quietly passed over -- see broker.StepTrace.Skip.
@@ -786,7 +862,7 @@ func (p *Pipeline) stepJournal(ctx context.Context, s *state) (*broker.Result, e
 
 // terminal maps the verification outcome onto the record phase.
 func terminal(s *state) (agentv1alpha1.ActionPhase, string) {
-	if s.env.DryRun {
+	if s.dryRun() {
 		return agentv1alpha1.PhaseDryRun, "dry run: every check ran and nothing was mutated"
 	}
 	if s.verify.Phase != "" {
@@ -829,7 +905,11 @@ func (p *Pipeline) buildRecord(s *state) *agentv1alpha1.ActionRecord {
 			Intent:         truncate(s.env.Intent, MaxIntentLen),
 			Rationale:      truncate(s.env.Rationale, MaxIntentLen),
 			IdempotencyKey: s.env.IdempotencyKey,
-			DryRun:         s.env.DryRun,
+			// The EFFECTIVE value, not the envelope's. `spec.dryRun` on the record is the field
+			// V-BRK-024's history source filters on to decide what an agent has actually done, and
+			// the whole point of shadow mode is that it has done nothing. A shadow record carrying
+			// `dryRun: false` would teach the classifier familiarity with an action that never ran.
+			DryRun: s.dryRun(),
 			Classification: agentv1alpha1.ActionClassification{
 				Class:         riskClass(s.class.Class),
 				Reasons:       append(recordReasons(s.class), undoReason(s.plan)...),
@@ -1173,8 +1253,11 @@ func truncate(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
+// trace annotates the caller-facing message. The EFFECTIVE value: an agent that asked to execute
+// and was shadowed has to be told that nothing happened, or its next decision is made on the belief
+// that something did.
 func trace(s *state, msg string) string {
-	if s.env.DryRun {
+	if s.dryRun() {
 		return msg + " (dry run: nothing was mutated)"
 	}
 	return msg
