@@ -762,7 +762,45 @@ type safety over a value nothing in this process reads. They are rendered as `un
     - **P9-T7c-3d** — `pipeline.BrakeSource`, `broker.ContestedIndex`, and the `pipeline.New` call
       in `cmd/broker/main.go` that replaces `broker.UnavailablePipeline{}`, plus `policy.Source`
       construction with a synchronous startup `Refresh`. **Closes LSN-007.** Necessarily last: it
-      is the only sub-unit that needs every other adapter to exist.
+      is the only sub-unit that needs every other adapter to exist. **Split four ways at ORIENT**
+      under the `harness-run` §2 sizing rule. The task text assumed the wiring was the work and
+      that "every other adapter" already existed. It does not: reading the seams found **three
+      production implementations missing outright**, two of which the pipeline refuses to start
+      without and one of which no code has ever constructed. Wiring `pipeline.New` on top of them
+      would either not compile or would compile into a broker that fails every non-dry-run
+      execution at the write-ahead check — so the wiring is genuinely last, and there are three
+      units in front of it rather than none.
+      - **P9-T7c-3d-i** — `internal/broker/brake`, the production `pipeline.BrakeSource`. Gathers
+        the four inputs 06 §4.4 needs that are reads: the broker's own `Agent` CR (row 2), the
+        cluster-scoped `FleetFreeze` list stamped with `ObservedAt` (row 1), the resolved
+        `ApprovalRoster` (row 6), and journal reachability (row 3). `Observe` returns no error by
+        the interface's own design — an observer that could not read says so IN the view.
+        **Allocates and claims V-CTR-017 at L1. Done 2026-07-29** — `internal/broker/brake`, direct
+        reads on a 5s TTL, where `FreezeView.ObservedAt` is the instant of the **read** so the cache
+        degrades into row 1 on `Decide`'s own arithmetic with no liveness tracking in the source.
+        `refresh` attempts every read even after an earlier one fails, so the reported row is the
+        one whose input actually failed. 20/20 mutations caught through `dev/mutate.sh` — **14/20
+        on the first pass**; see "What T7c-3d-i asserts" below for the two real survivors, both of
+        which were [[LSN-035]] in miniature.
+      - **P9-T7c-3d-ii** — the 04 §4.2 budget and flap accountant, which fills the fifth input,
+        `BrakeBudget` (row 7). Split out because it is not a read: it is journal-derived
+        accounting over windows and thresholds, the same shape and size as the `cooldown` source
+        T7c-3c-iii spent a whole unit on. **Until it lands, row 7 cannot fire in production** —
+        `BrakeBudget`'s zero value permits by deliberate design, and every current construction
+        site of a non-zero one is a test fake. That is a live [[LSN-031]] shape ("every rule passes
+        its own test and three of them are switched off") and i records it as a named residual
+        rather than letting the wiring imply the row works.
+      - **P9-T7c-3d-iii** — the two small journal-derived adapters the pipeline needs and nobody
+        wrote: `execute.Journal` (`ConfirmDurable`, three test stubs and no implementation — with
+        it nil, `Executor.Journal` is nil and **every non-dry-run execution fails the write-ahead
+        check**) and `classify.ActionHistory` (the novel-action question; `policy.SourceConfig`
+        takes one and no production value exists).
+      - **P9-T7c-3d-iv** — the wiring itself: a discovery client (constructed nowhere today, and
+        `refindex.Source` requires it non-nil), `pipeline.New` replacing
+        `broker.UnavailablePipeline{}`, `policy.Source` with a synchronous startup `Refresh` and a
+        backgrounded `Run`, `cooldown.NewSource`, and `broker.NewContestedIndex`. **Closes
+        LSN-007**, which needs a new L0 source assertion to close honestly: no 09 §6 check asserts
+        "the pipeline is constructed in `main.go`", and `install-path-wired.py` never reads Go.
   - **P9-T7c-4** — **the classify→execute integrity seam for `apply`, `scale` and merge-patch.**
     See LSN-040. Today only `create`, `delete` and JSON-patch `patch` traverse the pipeline; the
     other three fail closed at step 9.
@@ -1133,6 +1171,65 @@ residual, named because it loosens:** a rollback whose `status.phase` write neve
 is killed between the two — is a failure event no later process can recover, because nothing durable
 records it. That is one action's tail against a whole process's worth of cooldowns, and closing it
 would need the rollback and the phase write in one transaction, which the API server does not offer.
+
+**What T7c-3d-i asserts.** V-CTR-017, newly allocated in 09 §6.9. Three things came out of building
+it, and two of them came out of the mutation sweep rather than out of the design.
+
+The first is that **`Observe` returning no error is not laxity, it is where the fail-closed table
+lives.** `pipeline.BrakeSource` gives the observer no way to report failure out-of-band, and that is
+correct: 06 §4.4 does not have a row for "the source errored", it has rows for _which input_ is
+missing. So an unreadable Agent must arrive at `Decide` as a **nil Agent in the view**, not as a
+returned error the caller has to remember to map back onto row 2. The consequence runs through the
+whole file — `refresh` attempts all four reads even after the first one fails and `errors.Join`s the
+results, because a source that short-circuits reports the row of whichever read it happened to try
+first, which is a **misattributed refusal**: correct verdict, wrong reason, and the reason is what a
+human reads at 3am. The same argument makes `readRoster` return three states rather than two — no
+ref configured, a ref that resolves to nothing, and "I could not look" — where only the third
+retains the previous answer.
+
+The second is that **the cache degrades into row 1 by itself, and that is the reason the TTL is
+bounded by a constant rather than chosen.** `FreezeView.ObservedAt` is stamped with the instant of
+the **read**, never the instant of the serve, so a source whose refresh has been failing for 31
+seconds hands `Decide` a view that `Decide` refuses on its own `MaxFreezeStaleness` arithmetic —
+there is no liveness tracking anywhere in the source, and nothing to keep in step. `NewSource`
+therefore refuses a `CacheTTL ≥ MaxFreezeStaleness` outright: a view served from cache could
+otherwise already be too old for row 1 at the moment it is handed over, which would make the cache
+itself the thing that freezes the fleet.
+
+The third came out of the sweep, and it is the useful one. **The first pass was 14/20, and two of
+the six survivors were real gaps rather than redundancy.** Survivor one: the only aging test in the
+file failed _every_ read at once, so the freeze list went stale along with everything else and
+`Decide` fired **row 1** first — the test was named for the Agent and was measuring the freeze
+ceiling, which is [[LSN-035]] verbatim ("a negative control only proves the _suite_ fails; it never
+proves _which rule_ made it fail"). Rewritten into three subtests that each fail exactly one read
+and assert the other inputs are still present in the view, so the refusal is attributable to the
+input under test. Survivor two was worse and is a security property: `readRoster`'s answered /
+unanswered bool is **unobservable** until a roster that _did_ resolve goes away, because both nil
+branches look identical on a source that never had one. Mutating it to `false` means a deleted
+`ApprovalRoster` keeps approving gated actions from the retained copy until the staleness ceiling
+catches up — **thirty seconds of approving against a roster that no longer exists.** Now covered by
+`TestARosterThatDisappearsIsGoneAtOnce`, which advances the clock by only one cache TTL so aging
+cannot be the cause of what it observes. Both tests were strengthened because the **sweep** found
+them vacuous, not because an implementation was failing, so this is not the `harness-run` §4
+coupling.
+
+**Why V-CTR-017 rather than V-CTR-007, and why a new ID at all.** V-CTR-007 is the check whose _text_
+names this property — "brake objects behave per contract, including fail-closed on unreadable
+`FleetFreeze`" — and it is **L2**, because its property is a real API server refusing a real read,
+which no fake client can produce. It is routed to P9-T9 with V-BRK-006 and it stays there;
+`verification/results.csv` row 73 already says so in its own notes. V-CTR-015 is L1 and covers
+`broker.Decide`, but it feeds the decision function inputs built by hand, so it is structurally blind
+to whether the thing that builds them in production tells the truth. Neither covers this, so the
+choice was a new ID or nothing — and allocating one for genuinely new coverage is a tightening,
+which PROTOCOL §10 permits. Precedents: V-CTR-014 (P8), V-CTR-015 (T6b), V-CTR-016 (T6c), each on
+T6b's written argument that leaving the broker's most safety-critical functions uncovered at L1
+until P9-T9 means shipping them with their only check a shell script that has never run.
+
+**The residual, named because it loosens.** Row 7 — the 04 §4.2 initiative budget and flap counters —
+**cannot fire in production** after this unit. `broker.BrakeBudget`'s zero value permits by
+deliberate design, and the only thing filling it is `brake.Unaccounted{}`. That is disclosed as a
+required constructor field and a named type rather than a nil default precisely so it is greppable;
+P9-T7c-3d-ii replaces it.
 
 **Why V-PRO-028 is L1 only.** Phase 9 runs entirely in `PhaseDryRun`, so no record on a real cluster
 reaches `RolledBack` and there is nothing at L2 to recover from. The end-to-end property — a live
