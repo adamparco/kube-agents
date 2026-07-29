@@ -275,6 +275,12 @@
   bullet: "**(new) Fail-closed:** with the journal store unavailable, the broker refuses to execute rather than executing unjournaled."
   checks:
     - V-BRK-005
+    # V-BRK-005 takes the journal store away and watches a live broker refuse. V-BRK-023 is the same
+    # refusal asserted where it is decided: "unavailable" is not one state but four -- absent,
+    # unreadable, answering with an object that was never stored, and answering with the wrong
+    # object -- and a confirmer that only handled the first would satisfy V-BRK-005 and still let an
+    # action execute against a journal entry that is on its way out or belongs to somebody else.
+    - V-BRK-023
 
 "03§11#15":
   bullet: "**(new) Undo coverage:** 100% of executed non-gated `ActionRecord`s carry a validated undo plan."
@@ -547,6 +553,11 @@
   checks:
     - V-ISO-005
     - V-BRK-006
+    # V-BRK-006 kills a broker mid-action and looks for an unjournaled write; it can only run once
+    # there is a broker to kill. V-BRK-023 asserts the property the crash test depends on -- that
+    # "the record is durable" is answered by a read of the server rather than by a flag the dying
+    # process set -- which is what makes the L2/L4 result mean something when it is finally green.
+    - V-BRK-023
 
 "05§8#11":
   bullet: "**`C-JR` catches what admission cannot.** With a broker's actor credential, perform three writes that pass admission: (a) a `delete` of an in-scope object with no `ActionRecord`; (b) a cloud mutation with the actor GSA and no record; (c) a `patch` stamped with the `action-id` of a real record whose `spec.targets[]` does **not** contain that object. Assert each is reported within `C-JR`'s SLO with the correct metric (`unjournaled_mutation`, `cloud_mutation_unmatched`, `action_id_reused`) and that the agent is auto-paused. Check (c) is the one that fails if matching is on `action-id` alone — implement it first."

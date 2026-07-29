@@ -900,7 +900,70 @@ type safety over a value nothing in this process reads. They are rendered as `un
         wrote: `execute.Journal` (`ConfirmDurable`, three test stubs and no implementation — with
         it nil, `Executor.Journal` is nil and **every non-dry-run execution fails the write-ahead
         check**) and `classify.ActionHistory` (the novel-action question; `policy.SourceConfig`
-        takes one and no production value exists).
+        takes one and no production value exists). **Split at SELECT on 2026-07-29** under
+        `harness-run` §2 sizing: the two adapters share only the phrase "journal-derived". One is a
+        confirmation on the write path with its own envtest harness; the other is a lifecycle
+        question about refresh and staleness on the classify path. Sized together they were one
+        unit with two PLANs.
+        - **P9-T7c-3d-iii-a — the write-ahead confirmer** ✅ (2026-07-29)
+          New package `internal/broker/writeahead`: `Confirmer` is the production `execute.Journal`.
+          It lives in its own package rather than in `internal/journal` because
+          `internal/broker/execute` already imports `internal/journal`, so a journal-side adapter
+          could not hold the `var _ execute.Journal` assertion without a cycle — the
+          `internal/broker/bodystore` precedent, followed deliberately.
+          **Check: V-BRK-023** (new, L1). The gap to **V-BRK-022** is not an error: that ID is
+          reserved above by T7c-4 and IDs are never renumbered (09 §4).
+          **What the check is actually about.** `ConfirmDurable` receives only `(ctx, actionID)`, so
+          it cannot compare the stored record against caller intent. What it can check is the thing
+          an in-process buffer cannot fake: **server-assigned `uid` and `resourceVersion`**. That is
+          [[LSN-034]] applied to durability — a store that reported its own success would be
+          comparing a value against itself. Four more arms follow from the same argument: a record
+          on its way out (`deletionTimestamp`) is not durable; a record whose `spec.actionId`
+          disagrees with the name it was derived from is somebody else's journal entry; an
+          unreadable journal is refused rather than scored durable; and a misconfigured confirmer
+          refuses **before reading**, the same direction as the nil accountant in ii-a.
+          **The phase arm, and the measurement under it.** A record whose status label names a phase
+          other than `Executing` is refused. It reads the **metadata label**, not `status.phase`,
+          and the envtest half proves why: `ActionRecord` carries a status subresource, so
+          `client.Create` drops `status` entirely, while `journal.Labels` reads the caller's phase at
+          Create time and writes it into metadata, which survives. Reading `status.phase` here would
+          have looked more correct and would have been vacuous — it is empty for every record this
+          function will ever see.
+          **The future the phase arm is for, recorded rather than hand-waved.**
+          `journal.Store.Create` folds `AlreadyExists` into a nil return — correctly, since the
+          record name is derived from the action id, which is what makes the broker's retry safe
+          without a lock. But it means a nil from `Create` does not prove that _this_ call wrote what
+          is now on the server. Today the two writers cannot collide: step 7 parks a gated action as
+          `PendingApproval` and returns, step 8 is only reached by an action that was never parked,
+          and no `/approve` handler exists. The moment an approval path re-enters the pipeline for an
+          already-parked action, step 8's `Create` returns nil against the parked record, the
+          pre-state it just set never reaches the server, and the executor would mutate live objects
+          against a journal entry carrying no snapshot and therefore no undo plan. That is the
+          write-ahead rule failing in the only direction that matters, and it now fails closed.
+          `TestAParkedRecordDoesNotConfirmEvenThoughCreateSucceeded` reproduces the whole sequence
+          against a real API server.
+          **Evidence.** 17 test functions / 30 cases with subtests (10 hermetic, 7 envtest), 100.0% statement coverage on
+          `writeahead.go`, and a **19/19 mutation sweep** with zero escaped and zero broken. The
+          sweep names the test that must fail for each mutation rather than accepting "the package
+          went red", and runs the whole package instead of a `-run` pattern — which sidesteps
+          [[LSN-048]] by construction, since a pattern that matched nothing cannot score CAUGHT if
+          there is no pattern. Two of the nineteen mutate `internal/journal/store.go` rather than the
+          confirmer: they are what keeps the envtest half non-vacuous, because if journal stopped
+          carrying the phase into metadata or stopped folding `AlreadyExists`, the phase arm would be
+          reasoning about a world that no longer exists and nothing in `writeahead.go` would have
+          changed.
+          **One finding filed, not a halt:** `execute/apply.go` cites **(V-REV-002)** for the
+          write-ahead rule, but 09's V-REV-002 is "undo `<id>` restores prior state, verified by diff
+          against the snapshot". The write-ahead check is **V-BRK-006** (05 §1.2, L2/L4, phase 9).
+          Same shape as the V-BRK-020/V-BRK-021 citation defects already recorded — a comment
+          pointing at a check that does not assert the property it claims. To be swept with those.
+        - **P9-T7c-3d-iii-b — `classify.ActionHistory`**, the journal-derived novel-action source.
+          `policy.SourceConfig.History` takes one and no production value exists. Shape follows
+          `policy.Source`: a refresh lifecycle, and blind ⇒ `false` ⇒ escalate, which is the safe
+          direction. **The dangerous direction is a nil history**, and it is currently accepted:
+          `classify.Classifier` guards its novel-action escalation with `c.knownActions != nil &&`,
+          so a nil silently switches the escalation off, and `policy.NewSource` does not refuse one.
+          That is the same hole ii-a closed for the accountant, one package over.
       - **P9-T7c-3d-iv** — the wiring itself: a discovery client (constructed nowhere today, and
         `refindex.Source` requires it non-nil), `pipeline.New` replacing
         `broker.UnavailablePipeline{}`, `policy.Source` with a synchronous startup `Refresh` and a
