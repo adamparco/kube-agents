@@ -666,6 +666,108 @@ def check_every_lesson_has_an_index_row() -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------
+# The human backlog is drained, not accumulated
+# ---------------------------------------------------------------------------------------------
+
+BACKLOG = REPO / "docs/build/BACKLOG.md"
+
+BACKLOG_SECTIONS = ("Inbox", "Scheduled", "Refused", "Done")
+LAST_DRAINED = re.compile(r"^\*\*Last drained:\*\*\s*(\d{4}-\d{2}-\d{2})\s*$", re.M)
+INBOX_ITEM = re.compile(r"^### (?P<title>.+?)\s*$", re.M)
+ADDED = re.compile(r"^-\s+\*\*Added:\*\*\s*(\d{4}-\d{2}-\d{2})\s*$", re.M)
+BACKLOG_ID = re.compile(r"^\|\s*(B-\d{3})\s*\|", re.M)
+
+
+def _backlog_section(text: str, name: str) -> str | None:
+    """The body of one `## <name>` section, up to the next `## ` heading."""
+    m = re.search(rf"^## {name}\s*$\n(?P<body>(?:(?!^## ).*\n)*)", text, re.M)
+    return m.group("body") if m else None
+
+
+def check_backlog_is_drained() -> list[str]:
+    """A human backlog the harness reads and walks past is worse than no backlog at all.
+
+    `docs/build/BACKLOG.md` is the one file a human may append to while the harness is mid-unit. The
+    protocol that makes it safe is that it is drained at ORIENT and only at ORIENT, and that EVERY
+    item is resolved in the ORIENT that reads it — scheduled, refused, or escalated. That protocol
+    is prose, and prose is what the harness is most likely to skip when the inbox holds something
+    inconvenient and there is a unit waiting.
+
+    So the property is mechanized here, and it is a single comparison: an item whose `Added` date is
+    strictly before `Last drained` was in the inbox when the harness last looked, and is still in the
+    inbox. There is no reading of that which is not "read and ignored".
+
+    The rest of the check is anti-vacuity. It fails if a section heading vanished (the drain would
+    have nowhere to move things to), if `Last drained` is gone (the comparison above silently stops
+    happening), if an inbox item has no `Added` (same — an undated item can never be found stale),
+    or if a `B-nnn` id appears twice across the tables (a reused id makes the trail ambiguous about
+    which item actually landed).
+    """
+    if not BACKLOG.exists():
+        return [
+            f"{BACKLOG.relative_to(REPO)} not found. It is the only place a human can add work "
+            f"mid-run without racing the ledger; without it there is no such place."
+        ]
+
+    text = BACKLOG.read_text()
+    failures = []
+
+    bodies = {}
+    for name in BACKLOG_SECTIONS:
+        body = _backlog_section(text, name)
+        if body is None:
+            failures.append(
+                f"the `## {name}` section is gone from {BACKLOG.relative_to(REPO)}. The drain "
+                f"protocol moves items between these four sections; a missing one is a drain step "
+                f"with nowhere to put its result."
+            )
+        else:
+            bodies[name] = body
+    if failures:
+        return failures
+
+    drained = LAST_DRAINED.search(bodies["Inbox"])
+    if not drained:
+        return [
+            f"{BACKLOG.relative_to(REPO)}: the `**Last drained:** YYYY-MM-DD` line is gone from "
+            f"`## Inbox`. It is the left-hand side of the only comparison that can tell a stale "
+            f"item from a fresh one, so removing it does not relax this check — it disables it."
+        ]
+    drained_on = drained.group(1)
+
+    # Split the inbox into per-item blocks so an `Added` line is attributed to its own item.
+    starts = [m.start() for m in INBOX_ITEM.finditer(bodies["Inbox"])]
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(bodies["Inbox"])
+        block = bodies["Inbox"][start:end]
+        title = INBOX_ITEM.match(block).group("title")
+        added = ADDED.search(block)
+        if not added:
+            failures.append(
+                f'inbox item "{title}" has no `**Added:** YYYY-MM-DD`. An undated item can never '
+                f"be found stale by this check, so it can sit in the inbox forever."
+            )
+        elif added.group(1) < drained_on:
+            failures.append(
+                f'inbox item "{title}" was added {added.group(1)} and the inbox was drained '
+                f"{drained_on} — so ORIENT read it and left it. Every item is resolved in the "
+                f"ORIENT that reads it: schedule it, refuse it with an argument, or escalate it."
+            )
+
+    seen = {}
+    for name in ("Scheduled", "Refused", "Done"):
+        for bid in BACKLOG_ID.findall(bodies[name]):
+            if bid in seen:
+                failures.append(
+                    f"{bid} appears in both `## {seen[bid]}` and `## {name}`. Backlog ids are "
+                    f"never reused; two rows with one id make it unanswerable which item landed."
+                )
+            seen[bid] = name
+
+    return failures
+
+
+# ---------------------------------------------------------------------------------------------
 # The chain itself must be real
 # ---------------------------------------------------------------------------------------------
 
@@ -1880,6 +1982,7 @@ CHECKS = [
         "LSN-029 — BSD/GNU flag collisions are written GNU-first",
         check_platform_idioms_are_gnu_first,
     ),
+    ("the human backlog is drained, not accumulated", check_backlog_is_drained),
     ("L0 chain is runnable and wired to CI", check_l0_chain_is_runnable),
 ]
 
