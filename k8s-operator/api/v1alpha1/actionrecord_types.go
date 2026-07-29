@@ -785,6 +785,10 @@ type ActionRecordStatus struct {
 	// +optional
 	Report *ActionReport `json:"report,omitempty"`
 
+	// Escalation is rung 5: what the broker asked for, and what C-BR did about it.
+	// +optional
+	Escalation *ActionEscalation `json:"escalation,omitempty"`
+
 	// Approvals is present only for gated actions.
 	// +optional
 	Approvals *ActionApprovals `json:"approvals,omitempty"`
@@ -829,6 +833,69 @@ type ExportStatus struct {
 	// Sink names the destination, e.g. cloud-logging or the journal repository.
 	// +optional
 	Sink string `json:"sink,omitempty"`
+}
+
+// ActionEscalation is rung 5 of the 04 §5.1 ladder, written down where somebody who can act on it
+// will see it. It has TWO writers and they are deliberately in the same struct.
+//
+// The broker writes the REQUEST half (`pageRequested`, `pauseRequested`, `reason`, `requestedAt`)
+// and can do nothing else about it. 06 §2.2.1 gives the broker's operations grant `get, list, watch`
+// on `agents` and no verb at all on `events`: it cannot pause an agent, because that is a write to
+// an `Agent`, and it cannot page, because that is an Event. V-BRK-013 asserts that grant exactly and
+// is BLOCKING-ALWAYS, so the shape where the broker pauses directly is not one an implementation may
+// reach for. What the broker CAN write is `actionrecords/status`, which it already must — so the
+// escalation is recorded in the journal, and the brake surface (`C-BR`, 05 §1.5) fans it out from
+// the operator's identity through the single stop path 05 §1.7 already names: "exactly one code path
+// that stops an agent".
+//
+// The controller writes the FULFILMENT half (`pagedAt`, `pausedAt`, `failure`), which is what makes
+// the promise auditable rather than aspirational. A request with no fulfilment after the fact is a
+// visible, queryable defect; a page that was attempted and failed says so in `failure` instead of
+// disappearing. Same two-writer shape as `exported`, and for the same reason: the receipt belongs
+// next to the thing it is a receipt for.
+//
+// Requests are idempotent and monotone. A rung can only be climbed once per action (04 §5's ladder
+// is non-decreasing), so a second escalation on the same record is a bug in the caller, not a
+// retry — the fields are set, never accumulated.
+type ActionEscalation struct {
+	// PageRequested records that rung 5 asked for a human. It is separate from PauseRequested
+	// because 05 §1.5's auto-brake table is explicit that the two are different responses to
+	// different classes of trouble: a budget exhaustion escalates WITHOUT pausing, and conflating
+	// them gives you an agent that stops working every busy afternoon.
+	// +optional
+	PageRequested bool `json:"pageRequested,omitempty"`
+
+	// PauseRequested records that rung 5 asked for the brake.
+	// +optional
+	PauseRequested bool `json:"pauseRequested,omitempty"`
+
+	// Reason is the one-line cause, carried through to `Agent.spec.operations.pauseReason` so the
+	// human running `resume` can see what stopped it. Bounded because it is echoed into a spec
+	// field with its own length limit; the broker truncates rather than failing the escalation,
+	// since a pause that does not happen because its reason was long is the wrong trade.
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// RequestedAt is when the broker recorded the escalation.
+	// +optional
+	RequestedAt *metav1.Time `json:"requestedAt,omitempty"`
+
+	// PagedAt is when C-BR delivered the page. Written by the controller.
+	// +optional
+	PagedAt *metav1.Time `json:"pagedAt,omitempty"`
+
+	// PausedAt is when C-BR set `spec.operations.paused` on the agent. Written by the controller.
+	// +optional
+	PausedAt *metav1.Time `json:"pausedAt,omitempty"`
+
+	// Failure is what went wrong in the fan-out, if anything. Written by the controller. An empty
+	// Failure alongside a request with no timestamps means the fan-out has not run yet, which is a
+	// different state from one that ran and failed — and telling them apart is the whole reason
+	// this is a string rather than a boolean.
+	// +kubebuilder:validation:MaxLength=1024
+	// +optional
+	Failure string `json:"failure,omitempty"`
 }
 
 // +kubebuilder:object:root=true

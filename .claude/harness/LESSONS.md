@@ -69,8 +69,9 @@ will start selecting.
 | **LSN-039** | wiring, completeness, manifests, install-path | The manifest is correct, the check that reads it is green, and no install path ever applies it | closed | `dev/tests/identity-has-install-path.py` (**V-CMP-007**, L0-CHAIN) — manifest→step reachability over `k8s-operator/scripts/`, 7 properties, 8 negative controls including a reproduction of the original defect · the install path itself in `common.sh` (`render_agent_identity`, `apply_agent_identity`, `delete_agent_identity`) + `agent-identity.yaml.template` + `broker-operations-grant.yaml.template`, applied from `provision_08` and `provision_12` |
 | **LSN-038** | checks, probes, discovery, negative-controls | A guard that fails safe still fails, and a green run is how it tells you | closed | `check_machinery_probes_resolve` + `CLOSED_MARKER` + the Go arm of `_invoked_by` in `invariants-gate.py` (L0-CHAIN) · `dev/test_invariants_gate.py` (19 negative controls) · `dev/tests/golex.py` shared by `scope-label-single-sourced.py` and `api-group-single-sourced.py` |
 | **LSN-040** | seams, integration, assembly, broker | Two packages, each right, mean different things by the same field, and the first caller is the only thing that can tell | **open** | — fix scheduled as **P9-T7c-4**; the gap itself is pinned by `TestApplyFailsClosedAtTheIntegrityCheck` in `internal/broker/pipeline/pipeline_test.go` |
+| **LSN-041** | admission, CEL, policy, security, fail-open, checks | A security artifact's comment says a control exists; grep says it never did, and the hole it described is live | **closed** | `dev/tests/journal-status-vap-parity.py` + `--negative-control` in `dev/L0-CHAIN.txt` — derives the required CEL variable set from the Go type, so a status field with no policy row fails the build |
 
-**Open: 2 of 40** (LSN-035, LSN-040).
+**Open: 2 of 41** (LSN-035, LSN-040).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2087,3 +2088,68 @@ feeding a computed diff straight into `classify.PatchOp.Value` is lossy for the 
 
 Related: [[lsn-007]] (unreachable code), [[lsn-036]] (a list of verbs is a headcount),
 [[lsn-015]] (one fixture cannot find a disagreement between two).
+
+---
+
+## LSN-041 — The comment claiming the hole was closed was the reason nobody looked
+
+**Tags:** admission, CEL, policy, security, fail-open, checks · **Phase:** 9 (P9-T7c-3c-ii-b-1) ·
+**Status:** closed — mechanized by `dev/tests/journal-status-vap-parity.py` (L0)
+
+**What happened.** Adding one field to `ActionRecordStatus` meant adding a row to
+`config/policy/vap-agent-scope-journal.yaml`, the ValidatingAdmissionPolicy that decides who may
+write which part of the journal. The policy's own header comment said an unenumerated status field
+was caught by a catch-all variable, `unknownStatusFieldChanged`. Grepping for that variable to see
+what shape to follow returned nothing. It had never existed.
+
+**What that cost.** Validation 1 admits any UPDATE for which `nothingChanged` holds, and
+`nothingChanged` is a conjunction over the **enumerated** fields only. So the policy failed open on
+every field it did not know about — not for one principal, for all of them, including the human
+cluster-admin the policy exists to stop and every agent identity in the namespace. The field about
+to be added is `status.escalation`, which `C-BR` fans out into `spec.operations.paused`. Shipping it
+under that policy would have been an unauthenticated stop button for any agent in the namespace,
+with an audit trail saying the stop was deserved.
+
+**Why CEL could not close it where the comment said it was closed.** There is no catch-all to write.
+CEL cannot enumerate a struct's keys at runtime, so the nearest expressible thing —
+`oldObject.status != object.status` — denies the no-op re-Update every controller performs on a
+conflict retry. The property is real, it is just not expressible at the site where the reader
+expects it. That is exactly the situation in which a comment gets written instead of a check.
+
+**The failure class.** Not "somebody wrote a wrong comment". The comment was the previous attempt at
+this fix: someone identified the hazard, could not express the control, and wrote down the control
+they wished existed. It then survived several reviews **because it read as protection** — a reviewer
+scanning the policy for a fail-open found a sentence saying there wasn't one. Prose that describes a
+control is worse than no prose, because it retires the question.
+
+**The mechanization.** `dev/tests/journal-status-vap-parity.py`, two lines in `dev/L0-CHAIN.txt`
+(the check and its negative control). It reads the **Go type** — `api/v1alpha1/actionrecord_types.go`,
+the definition site — rather than the generated CRD, because the generated artifact is stale for the
+entire duration of the edit that adds a field, which is the only moment this check matters. Five
+properties: every status field has a CEL variable; every variable is conjoined into
+`nothingChanged`; each variable reads its own field and **only** its own field (set-equality over
+known field names, evaluated on every branch of the expression); no phantom variables naming fields
+that do not exist; and non-vacuity floors so a refactor that empties either side is not silently
+green.
+
+**The negative control found a hole in the check itself.** Seven mutations; one survived — a
+variable renamed onto another field's expression. The mutation rewrote only the first of four CEL
+branches, so the field name still appeared elsewhere and a "mentions the field" test passed. Fixed
+by strengthening the check to set-equality, **not** by strengthening the mutation. A negative
+control you adjust until it fails is a second comment.
+
+**The second control, which is a different property.** `escalation` has two writers by design: the
+broker requests, `C-BR` fulfils. A new variable `escalationFulfilmentSet` plus validation 2b forbids
+the **owning** broker from writing `pagedAt`, `pausedAt` or `failure`. A self-attested page is worse
+than no record: the audit trail then asserts the promise was kept. And the exporter's row was
+deliberately **not** widened to let `C-BR` through, even though `C-BR` will arrive on the same
+service account — the exporter is the one principal whose write unlocks deletion, so `C-BR` gets its
+own identity or nothing.
+
+**What to do next time.** When a comment in a security artifact asserts that a control exists, the
+first move is `grep` for the control, not a nod. If it is missing, the hole is live and the comment
+is evidence that at least one person already talked themselves out of closing it.
+
+Related: [[lsn-038]] (a guard that fails safe still fails, and a green run is how it tells you),
+[[lsn-036]] (a headcount goes stale when the population grows), [[lsn-015]] (one fixture cannot find
+a disagreement between two).

@@ -330,7 +330,9 @@ together only in the sense that one runs after the other.
   L1.** The row's original "covers V-BRK-014, V-REV-005/006" was wrong in both directions and is
   corrected here rather than inherited. V-REV-005 and V-REV-006 are `L2`, phase 10 — the same shape
   as T5a's four, implemented and asserted here and deliberately not recorded, and both go to
-  `broker-execute-l2.sh` in P9-T9. **V-BRK-014 is not merely a level mismatch: it is structurally
+  `broker-execute-l2.sh` in P9-T9. (V-REV-006's level list was later widened to `L1, L2` by
+  **T7c-3c-ii-b-1**, which supplied the missing L1 half — a real recorder writing to a real API
+  server, which T5b did not have. V-REV-005 is still `L2` and still owed.) **V-BRK-014 is not merely a level mismatch: it is structurally
   unreachable from this unit.** It fault-injects at each of steps 1–10 and asserts the trace shows
   steps 1…k and nothing after; T5b owns step 10 alone, and there is no assembled pipeline to inject
   into until the brake (T6) supplies step 5 and the controller (T7) wires the pair. It is reassigned
@@ -679,7 +681,17 @@ type safety over a value nothing in this process reads. They are rendered as `un
           replay itself. **Allocates and claims V-REV-011 at L1 and L2. Done 2026-07-28.**
         - **P9-T7c-3c-ii-b** — `Pager` and `Pauser`, rung 5, **plus the controller-side C-BR
           reconciler they both have to go through.** Blocked on a component that does not exist,
-          which is why they are not in ii-a.
+          which is why they are not in ii-a. **Split into two at IMPLEMENT**, see "Why T7c-3c-ii-b
+          split into two" below.
+          - **P9-T7c-3c-ii-b-1** — the **request** side: `status.escalation` on the `ActionRecord`,
+            `internal/broker/escalate` behind `verify.Pager` and `verify.Pauser`, and the
+            `Pauser` interface change that lets a pause name the record it belongs to. **Claims
+            V-REV-006 at L1**, whose level list is widened from `L2` to `L1, L2` — a strengthening,
+            nothing removed.
+          - **P9-T7c-3c-ii-b-2** — the **fan-out** side: the controller-side C-BR reconciler that
+            turns a recorded escalation into `spec.operations.paused` and a page. **Claims V-REV-006
+            at L2**, which needs the operator image rolled by digest — **P1 in full**, for the first
+            time in this task chain.
       - **P9-T7c-3c-iii** — a durable `CooldownRegistry`. `verify.MemoryCooldown` says in its own
         doc comment that it is "deliberately not the production store: a cooldown that dies with
         the broker process is a cooldown an operator can clear by deleting a pod, and 04 §4.2
@@ -845,6 +857,34 @@ allocating a new check rather than extending V-REV-004 is "**replays the pre-sta
 successful replay means a field changed, and the pre-state of a scaled-down Deployment is running
 pods. That distinction is only assertable where controllers run, so the check is L1+L2 from
 allocation and its L2 half shipped in the same unit.
+
+**Why T7c-3c-ii-b split into two.** The two halves have different provable properties, different
+verification levels, and — the part that actually forced it — different **preconditions**.
+
+The request half is "a rung-5 escalation is durably recorded where `C-BR` can see it". Nothing under
+test runs from a deployed image, so P1 is waived by construction exactly as it was for ii-a, and the
+property is provable at L1 against a real API server in envtest.
+
+The fan-out half is "an escalation reaches the agent and the agent stops". That is a claim about the
+**operator**, which means the evidence needs the operator image rebuilt, pushed and rolled **by
+digest** — P1 in full, for the first time in this task chain, and the first time in Phase 9 that a
+unit's verification depends on a deploy rather than on a client connection. Bundling the two would
+mean either the request half waits on an image roll it does not need, or the fan-out half ships with
+P1 waived, which is [[LSN-001]] with extra steps.
+
+The seam between them is a field, not a function call, and that is the point: the broker cannot call
+the controller, because 06 §2.2.1 gives it no verb that would let it. What it can do is write
+`actionrecords/status`, which it already must.
+
+**What T7c-3c-ii-b-1 asserts.** V-REV-006 at L1 — "a failed rollback pages **and** auto-pauses the
+agent", 04 §5.1, `¬`, BLOCKING-ALWAYS. Its 09 §6.3 level list is widened from `L2` to `L1, L2`:
+nothing is removed, relaxed or narrowed, so §10.2 is satisfied, and the L2 half stays owed by
+ii-b-2. The L1 half is not the whole check and the ledger row says so — what it proves is that the
+**request** is durable and complete: both halves recorded, the reason carried, the record named, and
+an escalation that cannot be written surfaced as an error rather than swallowed. The negative
+control is the direction that matters: a rung the driver never reached must leave `status.escalation`
+absent, because a record that claims an escalation nobody requested is how a `C-BR` reconciler pauses
+a healthy agent.
 
 **What T7c-3a asserts.** `livestate.Source` is the adapter behind every rung of 06 §4.2's
 ladder: object labels and annotations, namespace labels, the blast-radius denominator, the secret

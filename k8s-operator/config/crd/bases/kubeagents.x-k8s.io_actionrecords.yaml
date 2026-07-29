@@ -790,6 +790,56 @@ spec:
                     Contested is set true when a human undoes or manually reverts this change (06 §4.4). It is the
                     signal that the agent and a human disagreed, and it is an input to the trust metrics.
                   type: boolean
+                escalation:
+                  description:
+                    "Escalation is rung 5: what the broker asked for, and
+                    what C-BR did about it."
+                  properties:
+                    failure:
+                      description: |-
+                        Failure is what went wrong in the fan-out, if anything. Written by the controller. An empty
+                        Failure alongside a request with no timestamps means the fan-out has not run yet, which is a
+                        different state from one that ran and failed — and telling them apart is the whole reason
+                        this is a string rather than a boolean.
+                      maxLength: 1024
+                      type: string
+                    pageRequested:
+                      description: |-
+                        PageRequested records that rung 5 asked for a human. It is separate from PauseRequested
+                        because 05 §1.5's auto-brake table is explicit that the two are different responses to
+                        different classes of trouble: a budget exhaustion escalates WITHOUT pausing, and conflating
+                        them gives you an agent that stops working every busy afternoon.
+                      type: boolean
+                    pagedAt:
+                      description:
+                        PagedAt is when C-BR delivered the page. Written
+                        by the controller.
+                      format: date-time
+                      type: string
+                    pauseRequested:
+                      description:
+                        PauseRequested records that rung 5 asked for the
+                        brake.
+                      type: boolean
+                    pausedAt:
+                      description:
+                        PausedAt is when C-BR set `spec.operations.paused`
+                        on the agent. Written by the controller.
+                      format: date-time
+                      type: string
+                    reason:
+                      description: |-
+                        Reason is the one-line cause, carried through to `Agent.spec.operations.pauseReason` so the
+                        human running `resume` can see what stopped it. Bounded because it is echoed into a spec
+                        field with its own length limit; the broker truncates rather than failing the escalation,
+                        since a pause that does not happen because its reason was long is the wrong trade.
+                      maxLength: 512
+                      type: string
+                    requestedAt:
+                      description: RequestedAt is when the broker recorded the escalation.
+                      format: date-time
+                      type: string
+                  type: object
                 exported:
                   description: |-
                     Exported records that the audit exporter has confirmed this record landed in the durable sink.
