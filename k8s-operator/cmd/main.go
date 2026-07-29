@@ -65,6 +65,7 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var auditSink string
+	var controllersFlag string
 	var exportBudget, retentionInterval time.Duration
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -92,6 +93,11 @@ func main() {
 		"The freshness target for exporting a terminal ActionRecord. Exceeding it is logged, not enforced.")
 	flag.DurationVar(&retentionInterval, "retention-sweep-interval", time.Hour,
 		"How often each ActionRecord is re-checked for expiry. TTLs are measured in days.")
+	flag.StringVar(&controllersFlag, "controllers", defaultControllers,
+		"Comma-separated list of the controllers this process runs: "+
+			"agent, journal, retention, brake. `brake` may not be combined with any other name -- "+
+			"C-BR has its own ServiceAccount and a process runs as exactly one identity. "+
+			"An unknown name is fatal. See cmd/controllers.go.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -99,6 +105,26 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	controllers, err := parseControllers(controllersFlag)
+	if err != nil {
+		setupLog.Error(err, "Invalid --controllers")
+		os.Exit(1)
+	}
+	setupLog.Info("controller selection", "controllers", controllers.names())
+
+	// Webhooks are the operator's, not the brake's, and the refusal is loud rather than silent.
+	//
+	// A brake pod serving admission would need the serving-cert Secret and would answer for the
+	// operator's webhook Service, so `ENABLE_WEBHOOKS=true` on a brake Deployment is a
+	// misconfiguration, not a preference. Ignoring it quietly would leave a manifest that says one
+	// thing and a process that does another -- and the manifest is what a reviewer reads.
+	webhooksRequested := os.Getenv("ENABLE_WEBHOOKS") != "false"
+	if controllers.has(ctlBrake) && webhooksRequested {
+		setupLog.Error(nil, "the brake controller does not serve webhooks: set ENABLE_WEBHOOKS=false on this Deployment",
+			"controllers", controllers.names())
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -116,7 +142,7 @@ func main() {
 	}
 
 	var webhookServer webhook.Server
-	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+	if webhooksRequested {
 		// Initial webhook TLS options
 		webhookTLSOpts := tlsOpts
 		webhookServerOptions := webhook.Options{
@@ -170,25 +196,52 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
+	// Each selection elects its own leader. Two Deployments sharing one LeaderElectionID means one
+	// Lease and one winner, so whichever pod lost would sit idle holding no controllers at all --
+	// an operator or a brake that is silently not running while its Deployment reports Ready. The
+	// ID is derived from the selection rather than hardcoded per Deployment so a future split
+	// cannot forget it.
+	leaderElectionID := "c5a0294c.kubeagents.x-k8s.io"
+	if controllers.has(ctlBrake) {
+		leaderElectionID = "brake.c5a0294c.kubeagents.x-k8s.io"
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "c5a0294c.kubeagents.x-k8s.io",
+		LeaderElectionID:       leaderElectionID,
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
 		os.Exit(1)
 	}
 
-	if err := (&controller.AgentReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "agent")
-		os.Exit(1)
+	if controllers.has(ctlAgent) {
+		if err := (&controller.AgentReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "agent")
+			os.Exit(1)
+		}
+	}
+
+	// C-BR, the brake surface (05 §1.5): it reads a recorded escalation out of
+	// `ActionRecord.status.escalation` and fans it out into `Agent.spec.operations.paused` and a
+	// page. It runs ALONE, under `kubeagents-brake-controller`, which is why parseControllers
+	// refuses to combine it -- see the argument there.
+	if controllers.has(ctlBrake) {
+		if err := (&controller.BrakeReconciler{
+			Client:   mgr.GetClient(),
+			Scheme:   mgr.GetScheme(),
+			Recorder: mgr.GetEventRecorderFor("brake-controller"),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "brake")
+			os.Exit(1)
+		}
 	}
 
 	// The journal's durability path (05 §1.2). The default sink is this process's stdout: on GKE the
@@ -199,6 +252,9 @@ func main() {
 	// `--audit-sink=none` is a real choice and not a way to silence a warning: with no sink nothing
 	// is ever confirmed exported, and the retention controller therefore never deletes anything.
 	// Records accumulate. That is the correct degradation -- visible, and recoverable.
+	// The sink NAME is validated unconditionally, even by a process that runs no journal exporter:
+	// a typo'd flag that is only rejected on the Deployment that happens to use it is a typo that
+	// survives until the day someone changes --controllers.
 	var journalSink journal.AuditSink
 	switch auditSink {
 	case "stdout":
@@ -210,26 +266,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.JournalReconciler{
-		Client:       mgr.GetClient(),
-		Scheme:       mgr.GetScheme(),
-		Sink:         journalSink,
-		ExportBudget: exportBudget,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "journal")
-		os.Exit(1)
+	if controllers.has(ctlJournal) {
+		if err := (&controller.JournalReconciler{
+			Client:       mgr.GetClient(),
+			Scheme:       mgr.GetScheme(),
+			Sink:         journalSink,
+			ExportBudget: exportBudget,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "journal")
+			os.Exit(1)
+		}
 	}
 
-	if err := (&controller.RetentionReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Interval: retentionInterval,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "retention")
-		os.Exit(1)
+	if controllers.has(ctlRetention) {
+		if err := (&controller.RetentionReconciler{
+			Client:   mgr.GetClient(),
+			Scheme:   mgr.GetScheme(),
+			Interval: retentionInterval,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "retention")
+			os.Exit(1)
+		}
 	}
 
-	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+	if webhooksRequested {
 		webhooks := []struct {
 			name      string
 			setupFunc func(ctrl.Manager) error

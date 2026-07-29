@@ -72,8 +72,10 @@ will start selecting.
 | **LSN-041** | admission, CEL, policy, security, fail-open, checks | A security artifact's comment says a control exists; grep says it never did, and the hole it described is live | **closed** | `dev/tests/journal-status-vap-parity.py` + `--negative-control` in `dev/L0-CHAIN.txt` — derives the required CEL variable set from the Go type, so a status field with no policy row fails the build |
 | **LSN-042** | build, ci, deploy, kustomize, install-path, checks | Nothing in the repository ever built the thing the repository installs | **open** | — `make render` (a prerequisite of `build`/`test`) and `dev/tests/install-render-is-faithful.py` (**V-CMP-008**) cover the overlay; the **general** property — every artifact an install path applies is built by something CI runs — is for the next `harness-improve` |
 | **LSN-043** | harness, orient, durability, git | The ORIENT drain was done, verified green, and then silently reverted by a branch switch | **open** | — recovered only from a stray `/tmp` copy; mechanization is a `harness-run` §1 step 6 change (commit the drain before SELECT) at the next `harness-improve` |
+| **LSN-044** | rbac, checks, vacuity, kubectl, L2 | `kubectl auth can-i patch foo/status` asks about a **name**, not a subresource, so the denial it reports is about an object that does not exist | **open** | — the local fix is the `can()`/`subj()` guard in `dev/verify/brake-fanout-l2.sh`, which refuses a `TYPE/…` argument outright; the repo-wide L0 grep is for the next `harness-improve` |
+| **LSN-045** | checks, L2, fixtures, journal, append-only | An L2 suite that writes to an append-only journal can never delete its own namespace, and finds out on the second run | **open** | — `brake-fanout-l2.sh` is redesigned to reuse namespaces, mint IDs per run and match Events by UID; the general rule for `dev/verify/*.sh` is for the next `harness-improve` |
 
-**Open: 4 of 43** (LSN-035, LSN-040, LSN-042, LSN-043).
+**Open: 6 of 45** (LSN-035, LSN-040, LSN-042, LSN-043, LSN-044, LSN-045).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2262,3 +2264,124 @@ anything in it".
 
 Related: [[lsn-038]] (a green run is how a guard tells you it failed safe), [[lsn-012]] (repository
 mechanics resolved by content, never by name).
+
+---
+
+## LSN-044 — `auth can-i patch foo/status` asks about a name, not a subresource
+
+**Tags:** rbac, checks, vacuity, kubectl, L2 · **Phase:** 9 (P9-T7c-3c-ii-b-2-b) ·
+**Status:** open — the local guard shipped with the check; the repo-wide grep is for the next
+`harness-improve`
+
+**What happened.** `brake-fanout-l2.sh` asserts C-BR's grant against the live API server by
+impersonating its ServiceAccount. The `actionrecords/status` row was written the way the RBAC rule
+itself is written:
+
+```
+kubectl auth can-i patch actionrecords.kubeagents.x-k8s.io/status --as=...
+```
+
+`kubectl` parses a positional `TYPE/NAME`, not `TYPE/SUBRESOURCE`. That command asks whether the
+subject may patch **an ActionRecord literally named `status`** — and the answer is `no`, because
+`brake-controller-role` grants `patch` on `actionrecords/status` and nothing on `actionrecords`.
+The subresource has to be `--subresource=status`.
+
+**What that would have cost.** The row was written as a `want_yes`, so it failed loudly and got
+fixed in minutes. The dangerous direction is the other one. Every `want_no` in that section —
+`may not delete actionrecords`, `may not create agents`, `may not get secrets` — is a denial
+assertion, and a `want_no` written in the positional-subresource form is **vacuously green**: it
+gets its `no` from a resource name that was never granted to anybody, not from the policy under
+test. It would pass on a ClusterRole with `verbs: ["*"]` on the subresource. A whole seam of the
+08 §2.7 authority boundary can be "proven" by a check that never asked the question.
+
+**The failure class.** A CLI whose argument grammar collides with the notation of the thing being
+tested. `actionrecords/status` is exactly how RBAC, the VAP, the ClusterRole YAML and every
+comment in the tree spell that subresource, so transcribing it into `auth can-i` is the natural
+motion and the resulting command is well-formed, exits 0, and prints a plausible answer. Nothing
+about it looks wrong. This is [[lsn-034]]'s shape — a value compared against itself — in a
+different costume: the check and the defect share a spelling.
+
+**The mechanization, so far.** The check can no longer express the bug. `can()` refuses any
+resource argument containing `/` with a message naming the fix, and `subj()` reconstructs the
+`resource/subresource` label for the report from the actual `--subresource=` flag, so the printed
+line and the executed query cannot drift:
+
+```bash
+can() { case "$2" in */*) bad "check bug: can() was passed '$2'..."; echo "malformed"; return ;; esac
+        $K auth can-i "$1" "$2" --as="$BRAKE_SA" "${@:3}" 2>/dev/null; }
+```
+
+A grep of `dev/` and `k8s-operator/scripts/` confirms this was the only site — no other check was
+vacuously green on it. That is luck, not structure: nothing stops the next L2 suite from writing it
+the same way.
+
+**Still open.** The general property is an L0 grep: no `auth can-i` anywhere in the tree may take a
+positional argument containing `/`. It is three lines and it belongs in `dev/L0-CHAIN.txt`, but it
+is a new check motivated by a defect this unit found, so it goes to the improvement pass under
+PROTOCOL §10.1 rather than riding along here.
+
+Related: [[lsn-034]] (a value compared against itself), [[lsn-035]] (a redundant guard and an
+unenforced guard look identical from a green suite), [[lsn-038]] (a guard that fails safe still
+fails).
+
+---
+
+## LSN-045 — The suite wrote to an append-only journal, then tried to delete the namespace
+
+**Tags:** checks, L2, fixtures, journal, append-only · **Phase:** 9 (P9-T7c-3c-ii-b-2-b) ·
+**Status:** open — this suite is redesigned; the general rule for `dev/verify/*.sh` is for the next
+`harness-improve`
+
+**What happened.** `brake-fanout-l2.sh` created a namespace, created `Agent`s and `ActionRecord`s
+in it, and deleted the namespace on exit — the shape every other L2 suite in `dev/verify/` uses.
+The first run passed and cleaned up. The second run could not create its namespace: the first one
+had been `Terminating` for the entire interval and will be forever.
+
+`kube-agents-journal-retention` denies DELETE of an `ActionRecord` to every principal except the
+retention controller and the operator, **and denies it even to them unless
+`status.exported.confirmed` is true**. The namespace controller is not on that list. The scratch
+cluster has no audit sink, so `journal_reconciler.go` takes the branch that logs _"the record will
+be retained indefinitely because the export is the durable record (05 §1.2)"_ and nothing ever sets
+`exported.confirmed`. The namespace therefore cannot finish terminating, and its name cannot be
+reused.
+
+**This is the journal working.** Not a bug in the VAP, not a bug in the reconciler — an
+append-only guarantee is supposed to outlive the convenience of whoever wrote the fixture. The
+defect is entirely in the check's assumption that a namespace it created is a namespace it owns.
+
+**The tempting fix is the one to name.** Patching `status.exported.confirmed: true` on the
+suite's own records makes the namespace deletable in one line. It is also **writing an export
+confirmation for an export that never happened** — forging the exact field 05 §1.2 makes the
+durable record, in shipped tooling, where it becomes the idiom the next suite copies. It was
+proposed during this unit and declined. No test's tidiness is worth teaching the repository that
+the audit trail is editable when it is in the way.
+
+**The redesign, and why each part is load-bearing.** The suite now never deletes a namespace:
+
+- **Reuse, do not create.** `if ! kubectl get ns "$n"; then create; fi`. Namespaces are durable
+  fixtures now, and the entry path deletes only the `Agent`s inside them, `--wait=true`.
+- **Mint action IDs per run** from the run's epoch (`mk_action_id`), because leftover records from
+  the previous run share the namespace and a fixed ULID would collide on create — or worse, be
+  silently satisfied by the residue.
+- **Select Events by `involvedObject.uid`**, not by name. `unbraked-agent` is recreated with the
+  same name every run; an `AgentEscalated` Event from three runs ago would satisfy a name-scoped
+  negative control and turn L2-4 — the whole "a quiet agent is not paged" half — vacuous. The
+  suite reads both UIDs at fixture time and **exits** if either is empty rather than falling back.
+- **Say what is left behind.** The exit banner names the records and explains why nothing may
+  delete them, so the residue reads as design rather than as a failed cleanup.
+
+**Residue to disclose.** Namespace `brake-fanout-l2` on `gke-scratch-kube-agents-dev` is
+permanently `Terminating`, holding three `ActionRecord`s. It is inert and the suite no longer uses
+that name (`brake-fanout-l2-braked` now). Clearing it means either forging an export confirmation
+or removing the finalizer out from under the policy — **a human call, not the harness's.**
+
+**Still open.** The general rule: an L2 suite that creates a resource governed by a retention
+policy may not delete the namespace containing it. `brake-fanout-l2.sh` is today the only script in
+`dev/verify/` or `dev/tests/` that creates an `ActionRecord` at all — so the sweep found one site
+and it is fixed — but P9-T9's consolidated gate and the broker L2 suites are all going to create
+them. The check is an L0 grep pairing "creates an ActionRecord" against "deletes a namespace", and
+it goes to the improvement pass under PROTOCOL §10.1.
+
+Related: [[lsn-037]] (the build that ships is not the build you tested — residue is the same class
+of stale input), [[lsn-036]] (a single-site check is a headcount, and this sweep found exactly one
+site).

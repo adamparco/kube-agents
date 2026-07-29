@@ -169,13 +169,32 @@ ROUTER_SPEC='kage-router:_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfi
 BROKER_SPEC='kage-broker:_CONTEXT=k8s-operator,_DOCKERFILE=k8s-operator/Dockerfile.broker'
 agent_spec() { echo "$1-agent:_TARGET=$1,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG"; }
 
+# The operator image runs in TWO Deployments, and both are repointed here.
+#
+# `kubeagents-brake-controller` is the same binary from the same image with `--controllers=brake`
+# and its own ServiceAccount (05 §1.5, 06 §4.3). Repointing only the controller-manager would leave
+# C-BR running the previous build while `reload-images.sh` reported OK -- which is LSN-001's
+# stale-image trap surviving in the one component whose job is to stop the fleet. It is not
+# optional and there is no flag for it: if the operator rolls, the brake rolls.
+#
+# Missing is fatal, not skipped. A cluster installed before this Deployment existed answers
+# `NotFound`, and treating that as "nothing to do" would silently certify a cluster with no brake at
+# all. Re-apply the install (`make deploy`) and reload again.
+OPERATOR_DEPLOYS='kubeagents-controller-manager kubeagents-brake-controller'
+
 deploy_operator() {
-  local ref="$1"
+  local ref="$1" d
   [ -n "$ref" ] || return 4
-  echo "-> repointing the controller at $ref"
-  $K -n "$NS" set image deploy/kubeagents-controller-manager "manager=$ref" || return 4
-  $K -n "$NS" rollout status deploy/kubeagents-controller-manager --timeout=180s || return 4
-  echo "OK: controller now running $ref"
+  for d in $OPERATOR_DEPLOYS; do
+    echo "-> repointing $d at $ref"
+    $K -n "$NS" set image "deploy/$d" "manager=$ref" || return 4
+  done
+  # Rollouts are started for both above and WAITED on here, so the two roll concurrently rather
+  # than one 180s window after the other.
+  for d in $OPERATOR_DEPLOYS; do
+    $K -n "$NS" rollout status "deploy/$d" --timeout=180s || return 4
+  done
+  echo "OK: operator and brake now running $ref"
 }
 
 reload_operator() {

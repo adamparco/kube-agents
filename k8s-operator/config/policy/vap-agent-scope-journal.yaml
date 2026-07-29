@@ -66,8 +66,16 @@ spec:
     # `Agent.spec.operations.paused` and a page, then timestamps what it did. Its OWN service
     # account, deliberately not the operator's, even though the reconciler is a controller like the
     # exporter is: see validation 5 below for why sharing that identity would be a downgrade.
+    #
+    # `kubeagents-brake-controller`, with the same one-word prefix as `kubeagents-controller` above
+    # and not the `kube-agents-` spelling the undo controller and the ChatOps gateway carry. Those
+    # two are identities the spec names and nothing yet creates; this one exists. It is
+    # `config/rbac/brake_service_account.yaml` -- declared as `brake-controller` and rendered by
+    # `namePrefix: kubeagents-` in config/default -- and a CEL literal naming a principal the
+    # install does not produce is a policy row that can never match, which is to say no policy at
+    # all. The name follows what kustomize emits because kustomize is what mints the token.
     - name: isBrakeController
-      expression: "variables.user == 'system:serviceaccount:kubeagents-system:kube-agents-brake-controller'"
+      expression: "variables.user == 'system:serviceaccount:kubeagents-system:kubeagents-brake-controller'"
 
     # --- per-field change detection ----------------------------------------------------------
     #

@@ -4,3 +4,8 @@ resources:
   - role_binding.yaml
   - leader_election_role.yaml
   - leader_election_role_binding.yaml
+  # C-BR's own identity (05 §1.5). Separate files, not extra rules on `manager-role`: see the
+  # header of brake_role.yaml for why a kubebuilder marker would have been the wrong mechanism.
+  - brake_service_account.yaml
+  - brake_role.yaml
+  - brake_role_binding.yaml

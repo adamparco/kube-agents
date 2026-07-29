@@ -118,3 +118,18 @@ bash dev/verify/verify-prober-l2.sh gke-scratch-kube-agents-dev
 # that L1's fake writer cannot answer — after a redacted Secret snapshot is refused, does the live
 # Secret still hold its password, at an unchanged resourceVersion?
 bash dev/verify/rollback-replayer-l2.sh gke-scratch-kube-agents-dev
+
+# V-REV-006: a failed rollback PAGES AND AUTO-PAUSES, carried out by a deployed process. The first
+# Phase 9 L2 line that is NOT a client-side probe, and therefore the first that needs P1 in full —
+# twice over, because C-BR and the operator share one image and a reload that repointed only the
+# controller-manager would leave the two halves of this seam on different builds. Its L1 half is
+# complete and green (the broker records the escalation against a real CRD; the reconciler fans it
+# out) and covers the logic exhaustively; every remaining way for rung 5 to be a no-op lives in the
+# five things only a real install has. The load-bearing one is the ServiceAccount NAME: the VAP
+# allows the fulfilment write to a CEL string literal, and at L1 the test supplies that same string
+# as a fake username, so the policy and the test agree with each other by construction. Here the
+# name is whatever kustomize minted, one character of drift makes the ladder silently terminate at
+# rung 4, and nothing at L1 can see it. Also only here: 08 §2.7 asked of the live authorizer rather
+# than of brake_role.yaml, which is hand-written and so has no `make manifests` run to catch a verb
+# it forgot.
+bash dev/verify/brake-fanout-l2.sh gke-scratch-kube-agents-dev
