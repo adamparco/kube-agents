@@ -780,6 +780,12 @@
   checks:
     - V-GAT-009
     - V-GAT-010
+    # V-GAT-009/010 both watch a POLICY try to lower a class and fail. The other way to lower one is
+    # to leave an input unwired: classify.Classifier guarded its novel-action `+1` with
+    # `knownActions != nil &&`, so a broker nobody handed an ActionHistory classified strictly lower
+    # than the floor, and no ChangePolicy was involved. V-BRK-024 is stricter-only asserted against
+    # the implementation's own omissions rather than against a policy author's.
+    - V-BRK-024
 
 "06§10#30":
   bullet: "No actor SA can create, update, or delete a `ChangePolicy`."
@@ -828,6 +834,13 @@
     # V-REV-010 decides recreatability. Neither runs a replayer, because until P9-T7c-3c-ii-a there
     # was not one. V-REV-011 covers the replay itself, in both directions.
     - V-REV-011
+    # This table is also read BACKWARDS by one consumer, and that makes its per-verb distinctness a
+    # load-bearing property rather than a documentation nicety. The ActionRecord does not record the
+    # envelope's `op` anywhere (06 §4.3), so the production ActionHistory recovers the verb from
+    # `undo.strategy` + `undo.steps[].op` — which works only while `delete` and `scale` each map to
+    # a class no other verb reaches. V-BRK-024 asserts that inverse; a future row that collapsed two
+    # verbs into one plan would break it here rather than silently widen who counts as familiar.
+    - V-BRK-024
 
 "06§10#37":
   bullet: "**Unrevertible ⇒ gated:** deleting a bound PVC, deleting a namespace, and rotating a credential each produce `undoable: false` and park as `PendingApproval` — never execute."

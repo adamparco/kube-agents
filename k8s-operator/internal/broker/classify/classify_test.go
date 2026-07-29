@@ -188,6 +188,32 @@ func TestNovelActionEscalates(t *testing.T) {
 	wantReason(t, got, RuleNovelAction)
 }
 
+// New refuses a nil history, so a Classifier with a nil knownActions cannot be built through the
+// exported door. This test builds one anyway -- it is in-package, and a struct literal is one line
+// away from any future refactor that adds a second constructor -- and pins that the arm behind the
+// refusal escalates rather than skips.
+//
+// The direction is the whole point. Until this unit the guard read `!= nil &&`, so the one caller
+// who had never wired a history ran with 06 §4.2 switched off entirely: an omission that LOWERED a
+// risk class, which invariant 4 forbids. `nil ||` makes the same omission escalate instead.
+func TestANilHistoryEscalatesRatherThanSkipping(t *testing.T) {
+	if _, err := New(nil, nil); err == nil {
+		t.Fatal("New must refuse a nil history; pass AlwaysNovel{} to say 'no journal' deliberately")
+	}
+	c := &Classifier{floor: CodeFloor(), knownActions: nil}
+	got := classify(t, c, input(op("patch", "apps", "Deployment", "team-a", "web")))
+	wantReason(t, got, RuleNovelAction)
+	wantClass(t, got, ClassElevated)
+}
+
+// AlwaysNovel is the deliberate spelling of the same answer, and must agree with it exactly.
+func TestAlwaysNovelIsTheDeliberateSpelling(t *testing.T) {
+	c := mustClassifier(t, nil, AlwaysNovel{})
+	got := classify(t, c, input(op("patch", "apps", "Deployment", "team-a", "web")))
+	wantReason(t, got, RuleNovelAction)
+	wantClass(t, got, ClassElevated)
+}
+
 // TestTwoEscalationsAreNotPlusTwo pins the "applied once" decision. Two `+1` inputs on a routine
 // action give elevated, not gated: the count of escalations is not a meaningful quantity and must
 // not be visible in the result.

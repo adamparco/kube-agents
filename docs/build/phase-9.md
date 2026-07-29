@@ -957,13 +957,80 @@ type safety over a value nothing in this process reads. They are rendered as `un
           against the snapshot". The write-ahead check is **V-BRK-006** (05 §1.2, L2/L4, phase 9).
           Same shape as the V-BRK-020/V-BRK-021 citation defects already recorded — a comment
           pointing at a check that does not assert the property it claims. To be swept with those.
-        - **P9-T7c-3d-iii-b — `classify.ActionHistory`**, the journal-derived novel-action source.
-          `policy.SourceConfig.History` takes one and no production value exists. Shape follows
-          `policy.Source`: a refresh lifecycle, and blind ⇒ `false` ⇒ escalate, which is the safe
-          direction. **The dangerous direction is a nil history**, and it is currently accepted:
-          `classify.Classifier` guards its novel-action escalation with `c.knownActions != nil &&`,
-          so a nil silently switches the escalation off, and `policy.NewSource` does not refuse one.
-          That is the same hole ii-a closed for the accountant, one package over.
+        - **P9-T7c-3d-iii-b — `classify.ActionHistory`** ✅ (2026-07-29) — the journal-derived
+          novel-action source, and the two ways 06 §4.2's escalation could be switched off.
+          `internal/broker/history` (new package), `classify.New`/`classify.go`,
+          `policy.NewSource`. **V-BRK-024** (new, L1, BLOCKING-ALWAYS) in 09 §6.14, bound in
+          `traceability.yaml` under `06§10#29` and `06§10#36`. Evidence: **100.0% statement
+          coverage** under `-race`, 17 hermetic functions / 58 cases plus 6 envtest functions,
+          and a **35/37 mutation sweep, 0 escaped, 0 broken**.
+
+          **The finding that shaped the whole task: the `ActionRecord` CRD records no verb.**
+          Checked against both `api/v1alpha1/actionrecord_types.go` and 06 §4.3's canonical yaml.
+          So a journal-derived history cannot read `patch` or `delete` off a record, and 06 §4.2's
+          "has this agent done this before" has no field to answer from. Three obvious ways out,
+          all rejected with the argument recorded in the package doc:
+
+          - **Ignore the verb** — an agent that had patched Deployments would be familiar with
+            _deleting_ one. That LOWERS a risk class, which invariant 4 forbids outright.
+          - **Never answer true** — strictly stricter, and vacuous: the `+1` fires on 100% of
+            traffic forever, whose end state is approval fatigue. A gate everyone rubber-stamps is
+            less safe than no gate, so "safe direction" is not by itself a defence.
+          - **Add a CRD field** — a 06 §4.3 spec amendment, which PROTOCOL §10.5 forbids. The same
+            argument `cooldown` recorded for not inventing a CRD.
+
+          **The resolution: 06 §4.3.1's undo-strategy table read BACKWARDS.** The verb is recovered
+          up to an equivalence from two durable, enum'd fields — `spec.undo.strategy` and
+          `spec.undo.steps[].op` — and the equivalence is the point rather than a compromise. Every
+          collapse is between operations that are **the same mutation**: `delete/delete` is the
+          plan for a `create` and for an `apply` over an absent object, which is the same write.
+          The pairs that must NOT collapse do not: `recreate/create` is reachable only from
+          `delete`, `restore/scale` only from `scale`, and `apply` requires **both** its classes,
+          so an agent that has only ever created is still novel the first time it updates.
+          `TestTheUndoPlanRecoversTheVerbClass` is that table with a `familiar` and a `novel` list
+          per row — it is what stops the coarsening becoming a loosening, and mutating any row is
+          CAUGHT.
+
+          **Two spec silences resolved as Decisions, not §8.5 halts.** 06 §4.2 names a
+          "trust-building window" and defines none: it is **the journal's own retention window**,
+          because the evidence and the window are then the same object — nothing separate expires
+          and the two cannot drift. And a **dry run builds no trust**: the whole of Phase 9 is dry
+          runs, so counting them would have every agent arrive at Phase 10 familiar with everything
+          it had never actually done. `Undone` is excluded for the sharper version of the same
+          reason — the write stood and a human reversed it, so counting it would suppress the
+          escalation on exactly the repeat a human just said no to.
+
+          **The other half of the task was the nil.** `classify.Classifier` guarded the escalation
+          with `c.knownActions != nil &&`, so a broker nobody had wired a history into ran with 06
+          §4.2 **off** — a risk class lowered by an omission. Four changes close it: `classify.New`
+          refuses a nil; the consumption guard is inverted to `nil ||` so unknown ⇒ novel ⇒
+          escalate; `classify.AlwaysNovel{}` is the deliberate spelling of "no journal"; and
+          `policy.NewSource` refuses a nil at **construction** rather than letting it surface as a
+          failing poll seconds after startup. Same hole ii-a closed for the accountant, one package
+          over.
+
+          **The envtest half is what makes the design a measurement.** `ActionRecord` carries a
+          status subresource, so `client.Create` **drops `status` entirely** — a record created
+          with `Verified` comes back with an empty phase and confers nothing until
+          `Status().Update()` writes it. Every hermetic test sets that field on a struct and
+          "works"; only a real server shows that the filter reads the field the server actually
+          stores. This is the mirror of iii-a's finding. Two of the sweep's mutations are on the
+          **CRD yaml, not the Go** — dropping the status subresource, and widening the strategy
+          enum — and both are CAUGHT only by envtest tests, which is what keeps that half from
+          being decoration.
+
+          **Two mutations are recorded REDUNDANT rather than deleted.** `seen == nil ||
+readAt.IsZero()` is subsumed by the staleness ceiling (a zero read time is stale against
+          any real clock), so no single mutation can make an unrefreshed source vouch — it takes
+          two. And teaching `class` to emit `none/<op>` changes no answer, because `verbEvidence` is
+          a closed vocabulary and nothing looks that class up. Both escapes are the design working;
+          recording them beats deleting the rows, since a coverage claim nobody can audit is worse
+          than an honest gap. **`classify.KnownVerbs()` finally has a caller** — the lint its own
+          doc claimed existed (see T7c-4) — though only a partial one: `TestEveryKnownVerbHasEvidenceDefined`
+          joins it to `verbEvidence`, not yet to the envelope's enum.
+
+          **Nothing constructs a `history.Source` yet.** Wiring is T7c-3d-iv, which must not land
+          before or without T8.
       - **P9-T7c-3d-iv** — the wiring itself: a discovery client (constructed nowhere today, and
         `refindex.Source` requires it non-nil), `pipeline.New` replacing
         `broker.UnavailablePipeline{}`, `policy.Source` with a synchronous startup `Refresh` and a
