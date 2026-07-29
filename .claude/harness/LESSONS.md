@@ -78,8 +78,9 @@ will start selecting.
 | **LSN-047** | mutation, tooling, harness, near-miss | The mutation sweep reports a clean restore and one of the files it restored is now the other one | **open** | — `dev/mutate.sh` already snapshots by **index** and is the fix; nothing makes the harness reach for it. Candidate form is a skill change (`harness-run` VERIFY), scheduled for the next improvement pass |
 | **LSN-048** | mutation, tooling, checks, vacuity, false-finding | A mutation sweep names a test that does not exist, and reports the mutation as **survived** — a hole that is not there, indistinguishable from one that is | **open** | — `go test -run` with a pattern matching nothing **exits 0**, so `! check` is false and the mutation scores as uncaught. Fix is a `go test -list` guard before every mutation; same home as [[LSN-047]] (`dev/mutate.sh` / `harness-run` §5), scheduled for the next improvement pass so the two land together |
 | **LSN-049** | mutation, tooling, checks, vacuity, false-finding | The sweep's own shell quoting kept a mutation from ever being applied, and `rc == 0` was scored as "the suite passed with it in place" — an invented hole, reported twice | **open** | — A needle containing `""` closed the double-quoted `bash -c` argument early; the applier died, `&&` short-circuited, the run still exited 0. [[LSN-048]] with the sign flipped, same root: **scoring an exit code never established to be the test suite's**. Fix is the sanctioned-sweep change LSN-047/048 already wait on — mutation text never crosses a shell parse, the applier refuses unless the target appears exactly once, and each row names the test that must fail. Caught only because rows name their catching test |
+| **LSN-050** | harness, checks, coverage, false-green, pre-commit | Seven L0 checks discover files with `git ls-files` and no `--others`, so the chain is blind to any file not yet `git add`ed — which is every brand-new file at the one moment the chain is documented to run | **open** | — A new test file's fake error string named the wrong API group. The full L0 chain, run before staging, printed nothing; CI caught it a push later. `dev/tests/api-group-single-sourced.py`, `cli-contract.py`, `install-artifacts-are-rendered.py`, `install-render-is-faithful.py`, `one-broker-per-agent.py`, `invariants-gate.py` and `scope-label-single-sourced.py` all share the defect. Fix is one shared discovery helper using `ls-files --others --exclude-standard --cached`, plus a gate check that no L0 script calls `ls-files` without it |
 
-**Open: 4 of 49** (LSN-040, LSN-047, LSN-048, LSN-049).
+**Open: 5 of 50** (LSN-040, LSN-047, LSN-048, LSN-049, LSN-050).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2708,3 +2709,65 @@ unit keeps re-authoring from scratch. Three re-earnings is the argument.
 Related: [[lsn-048]] (the sweep that could not find its own test), [[lsn-047]] (the sanctioned tool
 nothing routes work to), [[lsn-035]] (verifying that an operation ran, not that it worked),
 [[lsn-019]] (a mechanization off the path the work takes).
+
+---
+
+## LSN-050 — The pre-commit gate cannot see a file that has not been committed
+
+**Area:** harness, checks, coverage, false-green, pre-commit
+**Status:** open
+**Earned:** 2026-07-29, P9-T7c-3d-iv-a
+
+**What happened.** A new test file, `internal/broker/policy/identity_test.go`, contained a fake
+API-server error string naming `agents.kubeagents.io`. The operator serves
+`kubeagents.x-k8s.io`. `dev/tests/api-group-single-sourced.py` exists for exactly this — [[LSN-032]]
+— and it is on the L0 chain, and the L0 chain was run in full before the push.
+
+It printed nothing. CI failed a push later.
+
+**Why.** `api-group-single-sourced.py` discovers its inputs with `git ls-files -z`. At the moment
+the chain ran, the file was untracked: `?? k8s-operator/internal/broker/policy/identity_test.go`.
+`ls-files` without `--others` lists the index, and an unstaged new file is not in the index. The
+check ran, scanned 115 files, found no disagreement, and passed — correctly, over a corpus that did
+not contain the defect.
+
+**It is not one check.** Seven L0 scripts each carry their own `git ls-files` discovery with no
+`--others`:
+
+`api-group-single-sourced.py` · `cli-contract.py` · `install-artifacts-are-rendered.py` ·
+`install-render-is-faithful.py` · `one-broker-per-agent.py` · `invariants-gate.py` ·
+`scope-label-single-sourced.py`
+
+**Why this is worse than an ordinary gap.** The blindness is perfectly correlated with novelty. A
+file that has existed for a while is tracked and fully scanned; a file created in the current unit
+is invisible until it is staged. So the checks are weakest on exactly the code that has never been
+reviewed by anything, and they are silent about it — a pass over a corpus missing the file under
+test is indistinguishable, in the output, from a pass over one containing it. This is [[LSN-035]]'s
+shape at the harness layer: verifying that an operation *ran*, not that it ran over the thing you
+meant.
+
+And it is self-concealing in the ordinary workflow. The habit that hides it is the correct habit:
+run the chain, then stage, then commit. Staging between the run and the commit is what makes the
+next run see the file — so the check appears to work on every unit where the chain happens to be
+re-run after `git add`, and fails silently on every unit where it does not.
+
+**Mechanization.**
+
+1. One shared discovery helper — `ls-files -z --cached --others --exclude-standard` — used by all
+   seven scripts. `--exclude-standard` keeps `.gitignore`d build output out, so the corpus grows by
+   exactly the new source files and nothing else.
+2. A gate check in `invariants-gate.py`: no script on the L0 chain may call `git ls-files` without
+   `--others`. Without this the helper is a convention, and the eighth script written next month
+   copies the seventh.
+
+Expect the first run of (1) to surface real findings in files that have been untracked across
+several units.
+
+**Why it is not fixed in the unit that found it.** Seven call sites, plus a corpus change that will
+surface unrelated findings — a verification surface of its own, and PROTOCOL §10's rule that a check
+change is never the same unit as the work that motivated it. Scheduled for the next improvement
+pass. The immediate defect (the wrong group in one string) is fixed; the blindness is not.
+
+Related: [[lsn-032]] (the check that was blind here), [[lsn-035]] (verifying the operation ran, not
+that it worked), [[lsn-019]] (a mechanization off the path the work takes), [[lsn-041]] (a control
+that is asserted to exist and does not).

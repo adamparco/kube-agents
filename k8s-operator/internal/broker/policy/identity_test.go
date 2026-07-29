@@ -154,7 +154,7 @@ func TestAnUnreadableIdentityRetainsAndThenRefuses(t *testing.T) {
 		t.Fatalf("Refresh: %v", err)
 	}
 
-	id.err = errors.New("agents.kubeagents.io \"dev-team-a\" is forbidden")
+	id.err = errors.New("agents.kubeagents.x-k8s.io \"dev-team-a\" is forbidden")
 	before := l.calls
 	if err := s.Refresh(context.Background()); err == nil {
 		t.Fatal("Refresh must report an unreadable identity")
