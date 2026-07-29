@@ -398,6 +398,11 @@
     # V-CTR-018 covers only the seam: row 7 escalates rather than merely refusing, including when
     # there is no accountant at all. That the CAP is reached correctly is V-PRO-003's.
     - V-CTR-018
+    # "At the cap" presumes a cap that is still there. V-PRO-003 watches a live agent reach it, which
+    # a budget held in broker memory does perfectly — and that budget is refilled by `kubectl delete
+    # pod`, so the agent stops, somebody restarts the component that stopped it, and it does not stop
+    # again. V-PRO-029 asks where the spend is counted.
+    - V-PRO-029
 
 "04§9#11":
   bullet: "**(new) Flap detection fires.** A deliberately oscillating target trips the threshold; the agent stops acting on it and escalates."
@@ -613,6 +618,12 @@
     # class, origin and targets, and undo-ness is derived from the origin rather than stored beside
     # it. Whether the ten leaves hold their ceilings is V-PRO-020's.
     - V-CTR-018
+    # And V-PRO-029 is the same partition asserted one level down, where it is actually computed: a
+    # routine spend charges no elevated bucket, `chat` and `delegation` land on opposite sides of the
+    # origin split, and `undo` is exempt. V-PRO-020 and V-PRO-003 read those properties off a live
+    # fleet in phase 13; this one reads them off the fold, which is the only place they can be wrong
+    # before there is a fleet to read.
+    - V-PRO-029
 
 "06§10#4":
   bullet: "**No authority fields:** a CR carrying `spec.rbac`, `spec.rules`, `spec.riskClass`, `spec.scopeOverride`, `spec.brokerServiceAccountName`, or `spec.actorServiceAccountName` is pruned/rejected; a test greps the generated CRD schema to assert none of those property names exists and that `spec` sets no `x-kubernetes-preserve-unknown-fields`."
