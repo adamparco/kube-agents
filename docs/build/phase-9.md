@@ -559,6 +559,48 @@ split in two" and "Why T7d-2 split again" below.)
   files in the exemplar tree are inert. That property belongs to the queued sweep unit, which is the
   unit that touches that tree.
 
+- **P9-T7d-6** — **make the install overlay render, and render faithfully.** Added 2026-07-28, run
+  before T7c-3c-ii-b-2-b, **done 2026-07-28**. Pins six ambiguous `Certificate` replacement
+  selectors to `name: serving-cert`; lifts `../mesh-ca` out of `config/default` into a new
+  transformer-free `config/install`; repoints `deploy`, `undeploy`, GitOps bootstrap wave 10 and the
+  `propose-cluster-admin` template at `config/install`; adds a `render` target wired into `build` and
+  `test`. **Claims V-CMP-008 at L0** as `dev/tests/install-render-is-faithful.py`.
+
+  **Why it exists, and why it is not part of 2-b.** Surveying for T7c-3c-ii-b-2-b — which gives C-BR
+  its own ServiceAccount, RBAC and Deployment, and therefore has to render and apply them — found
+  that `kustomize build config/default` exits non-zero and has done since PR #44 (`1385649`,
+  2026-06-28) landed the mesh CA. `make deploy` is the sanctioned install path and
+  `provision_03_gcp_gke_operator.sh` goes through it, so for a month the install did not work at all
+  and nothing said so: no L0 line, no L2 line, and no CI workflow renders the overlay. 2-b is
+  unachievable on top of it, so this is sequenced ahead, on the same precedent as T7d-5.
+
+  **Two defects, one root cause, and they must ship together.** The visible one is the render error:
+  the mesh CA added a second and third `Certificate`, which made two `replacements` selectors written
+  as bare `kind: Certificate` match three objects. The one it was hiding is worse. `config/default`
+  carries `namePrefix: kubeagents-` and `namespace: kubeagents-system`, a kustomize transformer
+  reaches every resource beneath it with no per-resource opt-out, and the CA cannot survive either:
+  the prefix renames `ClusterIssuer/kubeagents-mesh-ca` — the one string `meshCAIssuerName` in
+  `mesh_trust.go` hardcodes — into `kubeagents-kubeagents-mesh-ca`, and the namespace moves the CA
+  `Certificate` out of `cert-manager`, which is the only namespace a `ClusterIssuer` resolves
+  `ca.secretName` from. Neither rewrite errors and both apply. **Pinning the selectors alone is
+  strictly worse than the status quo**: today nothing installs; with only the pin, a broken trust
+  root installs silently and surfaces days later as brokers that never become Ready behind agent
+  `Certificate`s stuck `Pending`. That coupling is why this is one unit and not two.
+
+  **Beyond the local fix, because the local fix does not reach a real cluster.** GitOps bootstrap
+  wave 10 and the `propose-cluster-admin` skill's `10-controller` template both pull the overlay by
+  URL, both were pinned to `config/default`, and that is the path a cluster actually takes. Left
+  alone they would bootstrap a control plane with no trust root even after `make deploy` was correct.
+
+  **The mechanization is deliberately split across two levels**, because "it renders" and "what it
+  renders is the install" are different properties with different costs. The first is `make render`,
+  a prerequisite of `build` and `test` — it needs the kustomize binary, so it cannot be an L0 line
+  (`.github/workflows/l0-checks.yml` installs no dependencies on purpose; a check that needs a
+  package is not L0), and CI reaches it because `k8s-operator-test.yml` runs `make -C k8s-operator
+test`. The second is the L0 check, which asserts the **reference graph** rather than the output:
+  no transforming kustomization may reach `config/mesh-ca` over the whole inclusion graph, not just
+  the edge that broke, so re-nesting the CA under a new transforming layer next year fails too.
+
 **Why T7d split in two.** Two reasons, and the second one changed what T7d-2 is allowed to contain.
 
 The first is the level seam, which is the same one that produced T7b/T7d: T7d-1's properties are

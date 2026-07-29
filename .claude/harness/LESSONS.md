@@ -70,8 +70,10 @@ will start selecting.
 | **LSN-038** | checks, probes, discovery, negative-controls | A guard that fails safe still fails, and a green run is how it tells you | closed | `check_machinery_probes_resolve` + `CLOSED_MARKER` + the Go arm of `_invoked_by` in `invariants-gate.py` (L0-CHAIN) · `dev/test_invariants_gate.py` (19 negative controls) · `dev/tests/golex.py` shared by `scope-label-single-sourced.py` and `api-group-single-sourced.py` |
 | **LSN-040** | seams, integration, assembly, broker | Two packages, each right, mean different things by the same field, and the first caller is the only thing that can tell | **open** | — fix scheduled as **P9-T7c-4**; the gap itself is pinned by `TestApplyFailsClosedAtTheIntegrityCheck` in `internal/broker/pipeline/pipeline_test.go` |
 | **LSN-041** | admission, CEL, policy, security, fail-open, checks | A security artifact's comment says a control exists; grep says it never did, and the hole it described is live | **closed** | `dev/tests/journal-status-vap-parity.py` + `--negative-control` in `dev/L0-CHAIN.txt` — derives the required CEL variable set from the Go type, so a status field with no policy row fails the build |
+| **LSN-042** | build, ci, deploy, kustomize, install-path, checks | Nothing in the repository ever built the thing the repository installs | **open** | — `make render` (a prerequisite of `build`/`test`) and `dev/tests/install-render-is-faithful.py` (**V-CMP-008**) cover the overlay; the **general** property — every artifact an install path applies is built by something CI runs — is for the next `harness-improve` |
+| **LSN-043** | harness, orient, durability, git | The ORIENT drain was done, verified green, and then silently reverted by a branch switch | **open** | — recovered only from a stray `/tmp` copy; mechanization is a `harness-run` §1 step 6 change (commit the drain before SELECT) at the next `harness-improve` |
 
-**Open: 2 of 41** (LSN-035, LSN-040).
+**Open: 4 of 43** (LSN-035, LSN-040, LSN-042, LSN-043).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2153,3 +2155,110 @@ is evidence that at least one person already talked themselves out of closing it
 Related: [[lsn-038]] (a guard that fails safe still fails, and a green run is how it tells you),
 [[lsn-036]] (a headcount goes stale when the population grows), [[lsn-015]] (one fixture cannot find
 a disagreement between two).
+
+---
+
+## LSN-042 — Nothing in the repository ever built the thing the repository installs
+
+**Tags:** build, ci, deploy, kustomize, install-path, checks · **Phase:** 9 (P9-T7d-6) ·
+**Status:** open — the specific case is mechanized (`make render` + **V-CMP-008**); the general
+property is for the next `harness-improve`
+
+**What happened.** Surveying for P9-T7c-3c-ii-b-2-b, `kustomize build config/default` failed:
+`multiple matches for selector Certificate.v1.cert-manager.io/[noName].[noNs]:metadata.name`. Not
+intermittent, not environmental — deterministic, and true of every commit since PR #44 landed the
+mesh CA a month earlier. `config/default` is what `make deploy` renders, and
+`provision_03_gcp_gke_operator.sh` goes through `make deploy`. The sanctioned install path had been
+broken for a month.
+
+**Why nothing said so.** Because nothing rendered it. `make build` and `make test` are Go targets.
+`l0-checks.yml` cannot render — it installs no dependencies by design and kustomize is a downloaded
+binary. `docker-build.yml` builds images. `k8s-operator-test.yml` runs envtest. The L2 chain
+deploys, but the L2 chain does not run in PR CI. Every one of the eight required checks was green on
+every commit in that window, and each of them was telling the truth about a different thing.
+
+**What it was hiding, which is the worse half.** With the selectors pinned, the render succeeded —
+and produced `ClusterIssuer/kubeagents-kubeagents-mesh-ca` and a CA `Certificate` in
+`kubeagents-system`. `config/default` carries `namePrefix: kubeagents-` and
+`namespace: kubeagents-system`; a kustomize transformer reaches every resource beneath it with no
+per-resource opt-out; and the mesh CA is three objects whose name and namespace are both
+load-bearing — the name because `meshCAIssuerName` in `mesh_trust.go` hardcodes it into every agent
+`Certificate`'s `issuerRef`, the namespace because a `ClusterIssuer` resolves `ca.secretName` from
+the cluster resource namespace and nowhere else. Neither rewrite is an error. Both apply cleanly.
+The result is a control plane with no working trust root, reported as brokers that never become
+Ready, hours and several layers from the cause.
+
+**So the tempting fix was the dangerous one.** Pinning the selectors is a six-line diff that turns a
+red render green. It is strictly worse than leaving it broken: today nothing installs, and nobody is
+misled; with only the pin, a broken trust root installs silently. The failing render was the only
+thing standing between the repository and a plausible-looking bad install. **A red that has been red
+for a month is not a nuisance to clear — it is the last remaining report from a check that stopped
+running.**
+
+**The failure class.** Not "a selector was ambiguous". It is [[lsn-007]] ("built, tested, and
+unreachable") one level up: not a component nothing wires, but an **artifact nothing builds**.
+`install-path-wired.py` proves the scripts reach each other and `identity-has-install-path.py`
+proves the manifests reach a script — and both are green on a repository whose overlay does not
+render. Reachability of the applier says nothing about buildability of the applied.
+
+**The mechanization, and why it is split across two levels.** "It renders" and "what it renders is
+the install" are different properties. The first is `make render`, now a prerequisite of `build` and
+`test`, which is how CI reaches it (`k8s-operator-test.yml` runs `make -C k8s-operator test`); it
+needs the kustomize binary, so it is not L0. The second is
+`dev/tests/install-render-is-faithful.py` (**V-CMP-008**), which asserts the **reference graph**
+rather than the output — no transforming kustomization may reach `config/mesh-ca` anywhere in the
+inclusion graph — so re-nesting the CA under some *new* transforming layer fails too. A check that
+only knew about `config/default` would have passed the same bug with a different diff.
+
+**Still open, and this is the part that matters.** Both of those are about this overlay. The general
+property is: **every artifact an install path applies is built by something CI runs.** `config/`
+was one; the LiteLLM, inference-replay and GitHub integration overlays are five more
+`$(KUSTOMIZE) build` calls that nothing renders either, and the same argument applies to every
+`.template` the provisioning scripts `envsubst`. Deriving that set from the install path instead of
+listing it is [[lsn-036]]'s rule, and it is the next `harness-improve`'s.
+
+Related: [[lsn-007]] (built, tested, unreachable), [[lsn-039]] (the manifest is correct and no
+install path applies it), [[lsn-036]] (a headcount goes stale when the population grows),
+[[lsn-038]] (a guard that fails safe still fails, and a green run is how it tells you).
+
+---
+
+## LSN-043 — The drain was done, verified green, and then quietly reverted
+
+**Tags:** harness, orient, durability, git · **Phase:** 9 (P9-T7d-6) ·
+**Status:** open — mechanization is a `harness-run` §1 change at the next `harness-improve`
+
+**What happened.** A human appended an item to `BACKLOG.md`'s inbox while PR #60's merge was in
+flight. `gh pr merge --squash --delete-branch` refused to switch branches over the dirty file, so
+the file was parked with `git stash push -- docs/build/BACKLOG.md`, the merge completed, and
+`git stash pop` restored it. ORIENT then drained it properly: two IDs, a written ruling, the prose
+preserved, `Last drained` stamped, and `invariants-gate.py` green 17/17 with the drain check
+passing. Some steps later — a branch creation and a survey — `git status` showed `BACKLOG.md`
+unmodified and identical to `origin/main`. The entire drain was gone.
+
+**What that would have cost.** Silence. The inbox was empty and `Last drained` was today's date, so
+`check_backlog_is_drained` passes on the reverted file exactly as it passes on the drained one — the
+check asks whether anything is *sitting* in the inbox, which is the right question for the failure
+it was built for and the wrong one here. B-001 and B-002 would simply have ceased to exist, with
+every gate green. The only reason they were recovered is that a `cp` to `/tmp`, made for an
+unrelated reason during the stash dance, happened to still be there.
+
+**The failure class.** An ORIENT-mandated artifact lived only in the working tree across operations
+that move `HEAD`. Every other ORIENT output is either read-only or written at CHECKPOINT, where it
+gets committed; the drain is the one thing ORIENT is required to *write*, and the protocol leaves it
+uncommitted until the end of a unit that may take hours and will certainly touch git. The window is
+structural, not accidental.
+
+**The mechanization.** A `harness-run` §1 step 6 change: the drain is committed as its own commit
+before SELECT, not carried to CHECKPOINT. It is a one-line procedural edit, it makes the drain
+durable by construction rather than by vigilance, and it has the side benefit that the drain lands
+on the branch it was reasoned on. Deferred to `harness-improve` under PROTOCOL §10.1 — the skill
+change belongs to a pass, not to the unit that tripped over it.
+
+**What to do next time, until then.** After any `gh pr merge`, `git stash pop`, or branch switch
+during a session that has drained the backlog, diff `docs/build/BACKLOG.md` against `origin/main`
+before trusting it. A green `invariants-gate.py` does not distinguish "drained" from "never had
+anything in it".
+
+Related: [[lsn-038]] (a green run is how a guard tells you it failed safe), [[lsn-012]] (repository
+mechanics resolved by content, never by name).

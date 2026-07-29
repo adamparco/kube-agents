@@ -102,14 +102,25 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet setup-envtest ## Run tests.
+test: manifests generate fmt vet render setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 ##@ Build
 
 .PHONY: build
-build: manifests generate fmt vet ## Build manager binary.
+build: manifests generate fmt vet render ## Build manager binary.
 	go build -o bin/manager ./cmd
+
+# The install overlay has to RENDER before anyone can claim it deploys. `config/default` was
+# unrenderable for a month -- an ambiguous replacement selector matched three Certificates and
+# kustomize exited non-zero -- and no build, no test and no CI job noticed, because nothing in the
+# repo ever built it. `make deploy` was broken that whole time and the only way to find out was to
+# run it against a cluster. A prerequisite of `build` and `test` is the cheapest place this becomes
+# impossible to miss again. Rendering successfully is not the same as rendering CORRECTLY; that
+# second property is `dev/tests/install-render-is-faithful.py` at L0.
+.PHONY: render
+render: manifests kustomize ## Render the full install overlay; fails the build if it does not build.
+	@$(KUSTOMIZE) build config/install > /dev/null
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -172,14 +183,19 @@ uninstall: ctx-guard manifests kustomize ## Uninstall CRDs from $(KUBE_CONTEXT).
 	@out="$$( $(KUSTOMIZE) build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
+# `config/install`, not `config/default`. `default` is the transformed half -- everything the
+# operator owns, under `namePrefix: kubeagents-` in `kubeagents-system`. `install` is that plus the
+# mesh CA, which must be neither prefixed nor moved. Deploying `default` installs a control plane
+# with no trust root, and every broker then waits forever on a Certificate that will never be
+# signed. See config/install/kustomization.yaml.
 .PHONY: deploy
 deploy: ctx-guard manifests kustomize ## Deploy controller to $(KUBE_CONTEXT), or the ambient context if it is gke-scratch-*.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
+	$(KUSTOMIZE) build config/install | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
 undeploy: ctx-guard kustomize ## Undeploy controller from $(KUBE_CONTEXT). Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
+	$(KUSTOMIZE) build config/install | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
 .PHONY: deploy-litellm
 deploy-litellm: ctx-guard kustomize ## Deploy LiteLLM integration.
