@@ -696,7 +696,16 @@ type safety over a value nothing in this process reads. They are rendered as `un
       `pipeline.Config.Classifier` seam. **Re-records V-GAT-009 at L1 over the live loader. Done
       2026-07-28.** V-GAT-009's L2 instance stays open.
     - **P9-T7c-2b** — the `POST /v1alpha1/actions/{actionId}/replay` route plus the HTTP
-      `Replayer` (from T6c). **HALTED** — see the ledger's Blockers table.
+      `Replayer` (from T6c). **DEFERRED out of Phase 9, 2026-07-29, by human ruling** on the halt
+      recorded below. Blocker: **a human decision on which of 05 §1.3 and 03 §4.1 is authoritative
+      about the `/replay` route** — the two specs disagree and PROTOCOL §8.5 forbids the harness
+      picking a side. Nothing else in Phase 9 depends on the route, so the phase closes without it
+      and it is rescheduled to the phase that resolves the spec.
+
+      **V-BRK-021 is _not_ deferred and stays green.** It is BLOCKING-ALWAYS, and a BLOCKING-ALWAYS
+      check may never be deferred. What is deferred is the _task_; the check continues to assert what
+      it asserts over the routes that exist. This distinction is the whole reason the ruling was
+      safe to take.
   - **P9-T7c-3** — **the runtime wiring.** Real client-backed adapters for the twelve seams
     `pipeline.Config` takes — `LiveState`, `Applier`, `Reader`, `BodyStore`, `Prober`,
     `Rollbacker`, `Pager`, `Pauser`, the cooldown registry, `ActionHistory`, `ReferenceIndex`,
@@ -799,12 +808,11 @@ type safety over a value nothing in this process reads. They are rendered as `un
           `brake.Unaccounted` and `brake.SourceConfig.Accountant` are **deleted**. A nil accountant
           now refuses and escalates; a zero `BrakeBudget` still permits, and those two stopped
           being the same value. **V-CTR-018**, L1.
-        - **P9-T7c-3d-ii-b** — **the accountant.** `internal/broker/budget.Source`: the
-          journal-derived fold, `EffectiveInitiativeBudget()` over the 06 §1.1 defaults, and the
-          origin partition. **V-PRO-029**, L1, the true sibling of V-PRO-028 (same suite, same
-          source, same level, same phase, same journal-derived-and-refuses-when-blind argument).
-          Until it lands row 7 fires only on the nil-accountant arm — the numbers are not counted
-          yet, but the row can no longer be switched off, which is the part ii-a bought.
+        - **P9-T7c-3d-ii-b** ✅ **done 2026-07-29** — **the accountant.**
+          `internal/broker/budget.Source`: the journal-derived fold, `EffectiveInitiativeBudget()`
+          over the 06 §1.1 defaults, and the origin partition. **V-PRO-029**, L1, newly allocated in
+          09 §6.6 — the true sibling of V-PRO-028 (same suite, same source, same level, same phase,
+          same journal-derived-and-refuses-when-blind argument). Row 7 now counts.
 
           **Recon 2026-07-29 — what ii-b must settle at PLAN, before any code.** The mechanical
           model is **`policy.Source`, not `cooldown.Source`**: cooldown refreshes lazily from inside
@@ -845,6 +853,49 @@ type safety over a value nothing in this process reads. They are rendered as `un
           are both labels — but there is **no agent-name label** (only tier and a non-injective scope
           leaf, so filter client-side on `Spec.AgentRef`) and **no time index** (filter client-side,
           exactly as `cooldown.derive` already does).
+
+          **How the six were settled at PLAN, 2026-07-29 — no halt.** Each is a decision in the
+          ledger; the argument lives beside the code it governs.
+
+          1. **The window is rolling, and the two sentences do not contradict.** A sliding window
+             _does_ have a next boundary: the instant its **oldest counted charge ages out**, which
+             is exactly when capacity returns. That reading satisfies "rolling" _and_
+             `retryAfterSeconds` to "the next window boundary", so this is not PROTOCOL §8.5.
+             "Rolling" is normative three times across two documents; the clock-aligned reading
+             appears once, in a YAML comment on a status field that has no writer. Direction matters
+             too — a tumbling hour lets an agent spend a full allowance at 16:59 and another at
+             17:01. Recorded at `budget.Window`; the boundary is computed by `snapshot.retryAt`.
+          2. **Flap keys on the target alone**, which is **strictly stricter** than
+             `(target, intent)`: every literal breach is also a target breach, so nothing the spec
+             would catch is missed. Keying on prose would under-fire against an LLM that rewords,
+             which is precisely why `idempotency.go` excludes intent. The residual runs the other
+             way and is named rather than implied: three legitimately-different actions on one object
+             inside the window now trip a brake the literal spec would not. Tolerable because 04
+             §4.2's own remedy is "stop, mark, escalate" — a human looks — and both threshold and
+             window are operator-tunable. Recorded at `budget.flapKey`.
+          3. **`applied = prior + 1`, breach iff `applied > threshold`** — 04 §4.2's "more than _N_
+             times" counts the action being decided. With the default 3, three priors are allowed and
+             the fourth is refused.
+          4. **Oscillation is out of scope.** V-PRO-016 is **phase 13, L2/L4** — it needs a live
+             fleet, not a fold. Nothing in Phase 9 binds it.
+          5. **`api/v1alpha1/budget.go` is the one Go definition site** for the whole 06 §1.1 table,
+             defaults _and_ ceilings; `internal/webhook/agent_webhook.go` now imports the ceilings
+             from it instead of transcribing them. `EffectiveInitiativeBudget` follows
+             `ApprovalRoster.EffectiveTTL`'s asymmetry — admission rejects, runtime clamps — with one
+             deliberate divergence: an **explicit `0` is honoured**, because a zero allowance is a
+             real configuration and a zero TTL is not.
+          6. **A cold or stale source returns `Exhausted: true`** with a `Detail` naming the
+             blindness, distinct from the "you spent it" refusals. As predicted, this is the heart of
+             V-PRO-029.
+
+          **Two consequences worth stating rather than discovering.** Charging follows 06 §1.1
+          exactly: `Rejected`, `forbidden` and dry-run charge nothing; `RolledBack` charges because it
+          ran; `PendingApproval` and `Expired` charge because `gatedPerHour` counts **submissions**;
+          `undo` is exempt from every hourly bucket and is never refused for budget, but flap still
+          applies to it. And because `applied` excludes dry runs while the whole of Phase 9 is
+          dry-run, **the flap brake cannot fire until T7c-3d-iv wires execution.** That is correct — a
+          rehearsal did not touch the object — and `TestFlapCannotFireDuringPhaseNine` will start
+          failing on the day it stops being true.
       - **P9-T7c-3d-iii** — the two small journal-derived adapters the pipeline needs and nobody
         wrote: `execute.Journal` (`ConfirmDurable`, three test stubs and no implementation — with
         it nil, `Executor.Journal` is nil and **every non-dry-run execution fails the write-ahead

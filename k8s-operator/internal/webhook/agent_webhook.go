@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -520,20 +519,24 @@ type budgetCeiling struct {
 
 // initiativeBudgetCeilings flattens the 06 §1.1 table into one slice, so the rule is checked
 // leaf-by-leaf as V-8 requires and adding a leaf to the table means adding a row here rather than
-// editing a condition. Ceilings are transcribed from 06 §1.1 and the unit test pins every one of
-// them against the spec values, so a typo here is a red test rather than a quietly looser cap.
+// editing a condition.
+//
+// The ceiling VALUES are no longer transcribed here. They come from `api/v1alpha1`, which is now the
+// one Go definition site for the whole 06 §1.1 table — defaults included — because the broker's
+// accountant needs the defaults and a second copy of the ceilings beside them would be two
+// transcriptions of one spec table, edited on different days. Admission rejects an over-ceiling
+// leaf; `Agent.EffectiveInitiativeBudget` clamps one that got in anyway. The unit test still pins
+// every value against 06 §1.1, so a typo at the definition site is a red test rather than a quietly
+// looser cap.
 func initiativeBudgetCeilings(b *agentv1alpha1.InitiativeBudgetSpec, base *field.Path) []budgetCeiling {
 	var out []budgetCeiling
 	classes := []struct {
-		name     string
-		spec     *agentv1alpha1.BudgetClassSpec
-		routine  int32
-		elevated int32
-		gated    int32
-		perDay   int32
+		name    string
+		spec    *agentv1alpha1.BudgetClassSpec
+		ceiling agentv1alpha1.BudgetClassLimits
 	}{
-		{"selfInitiated", b.SelfInitiated, 50, 10, 5, 500},
-		{"humanRequested", b.HumanRequested, 200, 60, 30, 2000},
+		{"selfInitiated", b.SelfInitiated, agentv1alpha1.CeilingSelfInitiatedBudget},
+		{"humanRequested", b.HumanRequested, agentv1alpha1.CeilingHumanRequestedBudget},
 	}
 	for _, c := range classes {
 		if c.spec == nil {
@@ -541,24 +544,24 @@ func initiativeBudgetCeilings(b *agentv1alpha1.InitiativeBudgetSpec, base *field
 		}
 		p := base.Child(c.name)
 		out = append(out,
-			budgetCeiling{p.Child("routinePerHour"), c.spec.RoutinePerHour, c.routine},
-			budgetCeiling{p.Child("elevatedPerHour"), c.spec.ElevatedPerHour, c.elevated},
-			budgetCeiling{p.Child("gatedPerHour"), c.spec.GatedPerHour, c.gated},
-			budgetCeiling{p.Child("actionsPerDay"), c.spec.ActionsPerDay, c.perDay},
+			budgetCeiling{p.Child("routinePerHour"), c.spec.RoutinePerHour, c.ceiling.RoutinePerHour},
+			budgetCeiling{p.Child("elevatedPerHour"), c.spec.ElevatedPerHour, c.ceiling.ElevatedPerHour},
+			budgetCeiling{p.Child("gatedPerHour"), c.spec.GatedPerHour, c.ceiling.GatedPerHour},
+			budgetCeiling{p.Child("actionsPerDay"), c.spec.ActionsPerDay, c.ceiling.ActionsPerDay},
 		)
 	}
 	out = append(out,
-		budgetCeiling{base.Child("maxObjectsPerAction"), b.MaxObjectsPerAction, 50},
-		budgetCeiling{base.Child("flapThreshold"), b.FlapThreshold, 5},
+		budgetCeiling{base.Child("maxObjectsPerAction"), b.MaxObjectsPerAction, agentv1alpha1.CeilingMaxObjectsPerAction},
+		budgetCeiling{base.Child("flapThreshold"), b.FlapThreshold, agentv1alpha1.CeilingFlapThreshold},
 	)
 	return out
 }
 
 // flapWindowFloor is the 06 §1.1 code floor for spec.operations.initiativeBudget.flapWindow. It is
 // the one leaf where SMALLER is the dangerous direction: the flap brake counts repeats of the same
-// (target, intent) within the window, so a short window lets a flapping agent reset its own counter
-// and escape the brake entirely.
-const flapWindowFloor = 5 * time.Minute
+// target within the window, so a short window lets a flapping agent reset its own counter and escape
+// the brake entirely. Aliased from the definition site rather than restated.
+const flapWindowFloor = agentv1alpha1.FloorFlapWindow
 
 // validateInitiativeBudget enforces 06 §1.2 V-8 — the budget clamp, per class.
 //
