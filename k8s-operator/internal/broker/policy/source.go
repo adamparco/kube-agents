@@ -56,9 +56,29 @@ type SourceConfig struct {
 	// Reader lists ChangePolicy objects. Cluster-scoped, so no namespace option is ever set.
 	Reader Lister
 
-	// Agent is the identity the selector is evaluated against: this broker's own agent, from its own
-	// deployment, never from an envelope.
-	Agent Agent
+	// Identity resolves the agent the selector is evaluated against: this broker's own agent, from
+	// its own Agent CR, never from an envelope (03 §4.1 step 1).
+	//
+	// A FUNCTION and not a value, called once per poll, because the identity is not constant for
+	// the life of the process. `spec.tier` is immutable -- the webhook and a CEL rule both say so --
+	// but `spec.scope` is not, and it is the half the selector's `scopes` clause reads. An operator
+	// editing a non-leaf level of a non-platform agent's scope (a cluster-admin's projectId, say)
+	// changes nothing the operator renders into this Deployment: the rendered `--scope` carries only
+	// `scope.Of(agent).Leaf()`, which does not move. So no argument changes, no rollout happens, and
+	// a pinned identity would go quietly stale for as long as the pod lives. Stale in the direction
+	// that matters: the selector would miss policies an operator wrote for where the agent now is.
+	//
+	// The rest of the broker already answers this question live -- `pipeline.callerScope` reads
+	// `scope.Of(Brake.Observe(ctx).Agent)` on every submission -- so a pinned value here would be
+	// the one place the broker's own identity was frozen, which is the sort of single inconsistency
+	// nobody finds by reading either side alone.
+	//
+	// It returns an ERROR rather than a zero Agent when the CR cannot be read, and the distinction
+	// is load-bearing: `Scope{}` is a legal identity meaning "narrows nothing", which is what a
+	// platform Agent with no `spec.scope` genuinely has. Collapsing "fleet-wide" and "unknown" into
+	// the same value would make an unreadable Agent CR classify as the widest legal agent in the
+	// fleet. See Build, which allows the zero scope and refuses a malformed one.
+	Identity func() (Agent, error)
 
 	// History is passed through to classify.New on every rebuild.
 	History classify.ActionHistory
@@ -115,7 +135,7 @@ type SourceConfig struct {
 // are exactly the circumstances in which the conservative answer is the right one.
 type Source struct {
 	reader   Lister
-	agent    Agent
+	identity func() (Agent, error)
 	history  classify.ActionHistory
 	interval time.Duration
 	now      func() time.Time
@@ -136,6 +156,11 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 		// poll several seconds after startup rather than as a broker that would not start.
 		return nil, errors.New("policy: a History is required; classify.New refuses a nil one because it would switch the 06 §4.2 novel-action escalation off silently -- pass internal/broker/history.Source in production, or classify.AlwaysNovel{} to say deliberately that there is none")
 	}
+	if cfg.Identity == nil {
+		// No default. The tempting one -- a zero Agent -- is the widest identity there is, and it
+		// would bind only the unscoped, untiered policies while looking like a source that works.
+		return nil, errors.New("policy: an Identity is required; without it the selector would be evaluated against the zero Agent, which is the fleet-wide identity, so every scoped or tiered ChangePolicy would silently fail to bind -- and a policy that does not bind is a classification LOWER than the operator wrote")
+	}
 	if cfg.RefreshInterval < 0 {
 		return nil, fmt.Errorf("policy: RefreshInterval %s is negative", cfg.RefreshInterval)
 	}
@@ -152,7 +177,7 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 	}
 	return &Source{
 		reader:   cfg.Reader,
-		agent:    cfg.Agent,
+		identity: cfg.Identity,
 		history:  cfg.History,
 		interval: cfg.RefreshInterval,
 		now:      cfg.Now,
@@ -165,6 +190,18 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 // should fail to start, loudly, rather than come up healthy and refuse every action for reasons a
 // reader of the logs has to reconstruct.
 func (s *Source) Refresh(ctx context.Context) error {
+	// Identity first, before spending a List on a poll that cannot be scored. RETAINED on failure,
+	// like a read failure and unlike a load failure: an unreadable Agent CR is the same transient
+	// shape as an unreadable API server -- usually it IS an unreadable API server -- and the
+	// snapshot we are holding was built against the last identity we genuinely saw. Aged out by
+	// MaxPolicyStaleness on exactly the same clock, so an Agent CR that stays unreadable stops the
+	// broker classifying within thirty seconds rather than never.
+	agent, err := s.identity()
+	if err != nil {
+		s.fail(fmt.Errorf("resolving this broker's own agent identity: %w", err), false)
+		return fmt.Errorf("policy: resolving this broker's own agent identity: %w", err)
+	}
+
 	var list agentv1alpha1.ChangePolicyList
 	if err := s.reader.List(ctx, &list); err != nil {
 		// Read failure: retain. See the type comment.
@@ -176,7 +213,7 @@ func (s *Source) Refresh(ctx context.Context) error {
 		policies = append(policies, &list.Items[i])
 	}
 
-	snap, err := Build(policies, s.agent, s.history, s.now())
+	snap, err := Build(policies, agent, s.history, s.now())
 	if err != nil {
 		// Load failure: discard. The policy set was read successfully and is unusable, and it will
 		// stay unusable until someone edits the object -- so there is nothing to wait out.

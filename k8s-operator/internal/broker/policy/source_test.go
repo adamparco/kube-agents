@@ -53,9 +53,26 @@ type fakeClock struct{ t time.Time }
 func (c *fakeClock) now() time.Time          { return c.t }
 func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
+// fakeIdentity is a SETTABLE identity resolver, because the property most of these tests need is
+// that the source asks again. A constant would pass whether the source called it once at
+// construction or once per poll, which is precisely the distinction this type exists to expose.
+type fakeIdentity struct {
+	agent Agent
+	err   error
+	calls int
+}
+
+func (f *fakeIdentity) resolve() (Agent, error) {
+	f.calls++
+	if f.err != nil {
+		return Agent{}, f.err
+	}
+	return f.agent, nil
+}
+
 func newTestSource(t *testing.T, l *fakeLister, clk *fakeClock) *Source {
 	t.Helper()
-	s, err := NewSource(SourceConfig{Reader: l, Agent: devTeamAgent(), History: nothingSeen{}, Now: clk.now})
+	s, err := NewSource(SourceConfig{Reader: l, Identity: (&fakeIdentity{agent: devTeamAgent()}).resolve, History: nothingSeen{}, Now: clk.now})
 	if err != nil {
 		t.Fatalf("NewSource: %v", err)
 	}
@@ -242,20 +259,37 @@ func TestABadPolicyDiscardsTheSnapshotWhereADroppedReadDoesNot(t *testing.T) {
 }
 
 func TestNewSourceRejectsAnIntervalThatCannotBeatStaleness(t *testing.T) {
-	_, err := NewSource(SourceConfig{Reader: &fakeLister{}, History: nothingSeen{}, RefreshInterval: MaxPolicyStaleness})
-	if err == nil {
-		t.Fatal("a refresh interval at or above MaxPolicyStaleness must be rejected: the source would refuse between successful reads")
+	// Every case below names WHICH field it is testing and asserts on the error text, because these
+	// are all one-field-omitted configs against a validator that returns on the first problem it
+	// finds. Adding the Identity check ahead of the interval check turned the interval case green
+	// for the wrong reason -- it was being rejected for the missing Identity -- and only the text
+	// assertion makes that visible. A negative test that cannot say why it went red is not one.
+	id := (&fakeIdentity{agent: devTeamAgent()}).resolve
+
+	_, err := NewSource(SourceConfig{Reader: &fakeLister{}, Identity: id, History: nothingSeen{}, RefreshInterval: MaxPolicyStaleness})
+	if err == nil || !strings.Contains(err.Error(), "MaxPolicyStaleness") {
+		t.Fatalf("a refresh interval at or above MaxPolicyStaleness must be rejected as such: %v", err)
 	}
-	if _, err := NewSource(SourceConfig{Reader: nil, History: nothingSeen{}}); err == nil {
-		t.Fatal("a nil Reader must be rejected")
+	if _, err := NewSource(SourceConfig{Reader: nil, Identity: id, History: nothingSeen{}}); err == nil ||
+		!strings.Contains(err.Error(), "Reader is required") {
+		t.Fatalf("a nil Reader must be rejected as such: %v", err)
 	}
 	// A nil History is refused at construction and not at the first poll. Left optional, it switched
 	// the 06 §4.2 novel-action escalation off for any broker nobody remembered to wire one into --
 	// see internal/broker/history and classify.AlwaysNovel.
-	if _, err := NewSource(SourceConfig{Reader: &fakeLister{}}); err == nil {
-		t.Fatal("a nil History must be rejected")
+	if _, err := NewSource(SourceConfig{Reader: &fakeLister{}, Identity: id}); err == nil ||
+		!strings.Contains(err.Error(), "History is required") {
+		t.Fatalf("a nil History must be rejected as such: %v", err)
 	}
-	s, err := NewSource(SourceConfig{Reader: &fakeLister{}, History: nothingSeen{}})
+	// And a nil Identity, for the same reason and with a worse failure mode: the zero Agent is a
+	// LEGAL identity (the fleet-wide one a scopeless platform agent holds), so a defaulted nil would
+	// build a working source that binds only the unscoped, untiered policies.
+	if _, err := NewSource(SourceConfig{Reader: &fakeLister{}, History: nothingSeen{}}); err == nil ||
+		!strings.Contains(err.Error(), "Identity is required") {
+		t.Fatalf("a nil Identity must be rejected as such: %v", err)
+	}
+
+	s, err := NewSource(SourceConfig{Reader: &fakeLister{}, Identity: id, History: nothingSeen{}})
 	if err != nil {
 		t.Fatalf("the default interval must be accepted: %v", err)
 	}
@@ -272,7 +306,7 @@ func TestRunRefreshesUntilCancelled(t *testing.T) {
 	clk := &fakeClock{t: testAt}
 	l := &fakeLister{}
 	s, err := NewSource(SourceConfig{
-		Reader: l, Agent: devTeamAgent(), History: nothingSeen{},
+		Reader: l, Identity: (&fakeIdentity{agent: devTeamAgent()}).resolve, History: nothingSeen{},
 		RefreshInterval: time.Millisecond, Now: clk.now,
 	})
 	if err != nil {
