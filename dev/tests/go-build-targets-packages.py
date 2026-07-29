@@ -152,21 +152,35 @@ def check(root: str) -> tuple[list[str], list[str], int]:
 # --- negative control -------------------------------------------------------------------------
 # `¬` in 09 §6. Each mutation is a spelling someone would plausibly write, and the check must reject
 # every one of them. Without this, a regex that silently stopped matching would report a clean tree.
+#
+# (label, snippet, operands) -- the third element is every offending operand the scan must NAME, not
+# merely the fact that it found something ([[LSN-035]]). It is what separates "this snippet contains
+# a file build" from "the scan located the file build I planted, all of it". The two-file mutation
+# is the one that makes the difference: a scan that stops at the first operand would report a hit
+# and pass a non-emptiness assertion while missing `waitforbroker.go` -- the exact file whose
+# omission from the Dockerfile build is what LSN-037 is about.
 MUTATIONS = [
     ("the kubebuilder scaffold's default, restored",
-     "RUN CGO_ENABLED=0 go build -a -o manager cmd/main.go"),
+     "RUN CGO_ENABLED=0 go build -a -o manager cmd/main.go",
+     ["cmd/main.go"]),
     ("a nested main package built by file",
-     "RUN go build -o broker cmd/broker/main.go"),
+     "RUN go build -o broker cmd/broker/main.go",
+     ["cmd/broker/main.go"]),
     ("a Makefile recipe built by file",
-     "\tgo build -o bin/router cmd/router/main.go"),
+     "\tgo build -o bin/router cmd/router/main.go",
+     ["cmd/router/main.go"]),
     ("two files listed explicitly, which looks like it fixes the problem",
-     "RUN go build -o broker cmd/broker/main.go cmd/broker/waitforbroker.go"),
+     "RUN go build -o broker cmd/broker/main.go cmd/broker/waitforbroker.go",
+     ["cmd/broker/main.go", "cmd/broker/waitforbroker.go"]),
     ("a file-list build with flags in front of it",
-     'RUN go build -ldflags="-w -s" -tags netgo -o /workspace/x ./cmd/x/main.go'),
+     'RUN go build -ldflags="-w -s" -tags netgo -o /workspace/x ./cmd/x/main.go',
+     ["./cmd/x/main.go"]),
     ("a bare file target with no -o at all",
-     "RUN go build cmd/main.go"),
+     "RUN go build cmd/main.go",
+     ["cmd/main.go"]),
     ("a continuation-split build whose target is on the second line",
-     "RUN CGO_ENABLED=0 \\\n      go build -a -o broker \\\n      cmd/broker/main.go"),
+     "RUN CGO_ENABLED=0 \\\n      go build -a -o broker \\\n      cmd/broker/main.go",
+     ["cmd/broker/main.go"]),
 ]
 
 # Spellings that are CORRECT and must not be flagged. A check that rejects the fix as well as the
@@ -185,12 +199,18 @@ def negative_control() -> int:
     print("go-build-targets-packages: negative control")
     failures = 0
 
-    for label, snippet in MUTATIONS:
-        if scan_text(snippet):
-            print(f"  PASS  rejected: {label}")
-        else:
+    for label, snippet, operands in MUTATIONS:
+        named = [operand for _, _, operand in scan_text(snippet)]
+        missed = [o for o in operands if o not in named]
+        if not named:
             print(f"  FAIL  NOT rejected: {label}\n          {snippet!r}", file=sys.stderr)
             failures += 1
+        elif missed:
+            print(f"  FAIL  rejected, but not for the operand(s) it was about: {label}\n"
+                  f"          missed {missed!r}; named {named!r}", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"  PASS  rejected, naming {', '.join(operands)}: {label}")
 
     for label, snippet in NON_MUTATIONS:
         hits = scan_text(snippet)

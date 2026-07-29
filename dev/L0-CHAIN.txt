@@ -202,6 +202,45 @@ python3 dev/tests/install-render-is-faithful.py --negative-control
 python3 dev/tests/go-build-targets-packages.py
 python3 dev/tests/go-build-targets-packages.py --negative-control
 
+# --- every overlay an install path applies is rendered by something CI runs (LSN-042) --------
+# The general form of the `config/default` outage. `make render` closed it for ONE overlay; four
+# more -- LiteLLM base, the ChatGPT overlay, inference-replay, the GitHub integration -- were applied
+# by `deploy-*` targets and rendered by nothing, for exactly the reason the first one was: nobody was
+# looking at the list. Both sides are derived, so a sixth integration is enforced the day its
+# `apply` line lands (LSN-036). Also asserts `render` is still a prerequisite of `build` and `test`:
+# extending the recipe while unhooking it from CI restores the blind spot in one word.
+# `--negative-control` is the `¬` of 09 §6; one of its seven mutations is that one word.
+python3 dev/tests/install-artifacts-are-rendered.py
+python3 dev/tests/install-artifacts-are-rendered.py --negative-control
+
+# --- cluster-facing checks are not silently wrong about the cluster (LSN-044, LSN-045) -------
+# Two ways an L2 suite passes while asserting something other than what it claims. (1) `auth can-i
+# patch actionrecords/status` parses the slash as an object NAME, so it asks whether the subject may
+# patch an ActionRecord called `status`. Every ClusterRole and VAP in the tree spells the subresource
+# that way, so transcribing it is the natural motion -- and on a `want_no` the form is vacuously
+# green, since the `no` comes from a name nobody was granted rather than from the policy under test.
+# (2) The journal-retention VAP denies DELETE of an ActionRecord to the namespace controller and,
+# absent an audit sink, to everyone else too: a suite that writes a record and then deletes its
+# namespace passes once and can never create that namespace again. The protected set is DERIVED from
+# the policies' own DELETE matchConstraints and the CRDs' `spec.names.kind`, so a second retention
+# policy is enforced the day it lands (LSN-036). `--negative-control` is the `¬` of 09 §6.
+python3 dev/tests/cluster-check-hygiene.py
+python3 dev/tests/cluster-check-hygiene.py --negative-control
+
+# --- every negative control names the rule it exercises (LSN-035) ----------------------------
+# The `¬` of every other `¬` above. A control that asserts only "the suite went red" cannot tell
+# you WHICH property caught the mutation, and when several properties overlap -- as they do in
+# nearly every check in this list -- each mutation lands on whichever fires first and the narrow
+# ones underneath accumulate controls that have never once executed them. The ladder paid for this:
+# eleven invariants, mutation-tested one at a time, nine died and two survived; both survivors had
+# passing tests whose fixtures some broader rule rejected first, so the rule under test never ran.
+# Three phases of green over dead code. This runs each control with its probe blinded -- findings
+# replaced by one shape-preserving constant that names nothing -- and a control that still passes
+# is the finding. The corpus is discovered by scanning for `--negative-control` (LSN-036) and an
+# empty corpus is a FAIL. Its own `--negative-control` scores six controls of known quality.
+python3 dev/tests/negative-controls-name-their-rule.py
+python3 dev/tests/negative-controls-name-their-rule.py --negative-control
+
 # --- repository mechanics (LSN-012) ---------------------------------------------------------
 # Which remote carries the work, and does `main` point at it? Local main tracked `upstream/main`
 # (gke-labs) for the whole of phases 2-8: a bare `git pull` would have fetched a tree with none of

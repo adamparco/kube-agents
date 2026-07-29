@@ -317,6 +317,31 @@ predicate appropriate to the target and waits a bounded settle window:
 | RBAC                        | A `SubjectAccessReview` returns the intended answer                                                      |
 | Custom resource             | The owning controller's `Ready` condition where one exists; otherwise object presence only               |
 
+**The settle window is per-kind, published, and capped.** "Bounded" on its own is unfalsifiable —
+any number satisfies it — so the windows are stated here rather than left to the implementation.
+They differ per kind because a `ResourceQuota` is enforced the moment admission sees it while a
+cloud provider registering nodes is minutes of someone else's work; a single global number is either
+too short for the slowest row or a stall for the fastest.
+
+| Kind                        | Settle window                                                         |
+| --------------------------- | --------------------------------------------------------------------- |
+| Deployment / StatefulSet    | 5m / 10m — a StatefulSet rolls one pod at a time                      |
+| DaemonSet                   | 5m                                                                    |
+| Service / Ingress / Gateway | 90s / 5m / 5m — the two 5m rows are LB programming, not the API write |
+| NetworkPolicy               | 30s                                                                   |
+| ResourceQuota / LimitRange  | 15s                                                                   |
+| Node pool / cluster (cloud) | 20m / 30m                                                             |
+| RBAC                        | 15s                                                                   |
+| Custom resource             | 2m — the default for any kind with no row of its own                  |
+
+**No target waits longer than 30 minutes**, whatever the table says and whatever a caller overrides
+it to. The ceiling is a constant in the broker, applied to the table's own values as well as to
+overrides, so an edit that types an extra zero is clamped rather than honoured. It exists because an
+unbounded settle window makes "the broker verifies" indistinguishable from "the broker eventually
+gives up", and because it holds the undo plan's snapshot open past the point where replaying it
+still restores the world that existed. A non-positive window falls back to the 2m default: a window
+of zero verifies nothing while looking like a policy.
+
 **Transient vs terminal.** Transient failures (conflicts, throttling, a dependency still converging,
 a scheduler waiting on capacity that is arriving) go to rung 1. Terminal failures — schema or policy
 rejection, admission denial, quota exhaustion with no pending capacity, a nonexistent image,

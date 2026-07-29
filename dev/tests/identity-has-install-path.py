@@ -582,37 +582,77 @@ def _no_templates(sources: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in sources.items() if not k.endswith(".yaml.template")}
 
 
-CONTROLS: list[tuple[str, object]] = [
-    ("a reader ServiceAccount loses kube-agents/role", _drop_label),
-    ("a RoleBinding names a ServiceAccount nobody creates", _dangling_subject),
-    ("a roleRef names a Role nobody creates", _dangling_role_ref),
-    ("the grant template is still there and nothing renders it", _orphan_template),
-    ("no step calls apply_agent_identity any more", _orphan_emitter),
-    ("one tier's identity stops being applied and the others keep working", _tier_without_identity),
-    ("the bash actor name drifts from the Go one", _actor_name_drift),
-    ("every template disappears (no vacuous pass)", _no_templates),
+# (label, mutate, signals). Each signal is a substring the findings must contain; one prefixed `!`
+# is a substring they must NOT contain. Seven properties overlap here — a dangling subject, a
+# dangling roleRef, a missing label, an unrendered template, an unreachable emitter, an unserved
+# tier, a name that drifts — and several of them fire on the same manifest, so "the check went red"
+# is satisfied by whichever is evaluated first and establishes nothing about the other six
+# ([[LSN-035]]). The `!` form is what makes the two apply_agent_identity controls distinguishable:
+# dropping ALL the calls must name all three tiers, dropping ONE must name only that tier, and
+# without the negative arm the narrower mutation is fully satisfied by the broader one's output.
+CONTROLS: list[tuple[str, object, list[str]]] = [
+    ("a reader ServiceAccount loses kube-agents/role", _drop_label,
+     ["is missing kube-agents/role"]),
+    ("a RoleBinding names a ServiceAccount nobody creates", _dangling_subject,
+     ["binds ServiceAccount 'some-actor-nobody-creates', which no install-path manifest creates"]),
+    ("a roleRef names a Role nobody creates", _dangling_role_ref,
+     ["has roleRef ClusterRole/kubeagents-legacy-broker, which no install-path manifest creates"]),
+    ("the grant template is still there and nothing renders it", _orphan_template,
+     ["broker-operations-grant.yaml.template is never named by a numbered provisioning step"]),
+    ("no step calls apply_agent_identity any more", _orphan_emitter,
+     ["`apply_agent_identity platform ...`",
+      "`apply_agent_identity cluster-admin ...`",
+      "`apply_agent_identity developer-team ...`"]),
+    ("one tier's identity stops being applied and the others keep working", _tier_without_identity,
+     ["`apply_agent_identity platform ...`",
+      "!`apply_agent_identity cluster-admin ...`",
+      "!`apply_agent_identity developer-team ...`"]),
+    ("the bash actor name drifts from the Go one", _actor_name_drift,
+     ["Actor ServiceAccount name derived two different ways",
+      "Go renders '%s-%s-actor'", "common.sh renders '%s-%s-writer'"]),
+    ("every template disappears (no vacuous pass)", _no_templates,
+     ["VACUOUS: found 0 templates under"]),
 ]
 
 
-def negative_control(sources: dict[str, str]) -> int:
+def negative_control(sources: dict[str, str] | None = None) -> int:
+    """Run every control. `sources` is optional so this is invocable as `negative_control()`."""
+    if sources is None:
+        sources = read_sources()
+
     if check(sources):
         print("  control DEAD: the real tree does not pass — the controls below prove nothing")
         return 1
     print("  baseline OK  (the real tree passes)")
 
     failures = 0
-    for label, mutate in CONTROLS:
+    for label, mutate, signals in CONTROLS:
         try:
-            fired = bool(check(mutate(sources)))  # type: ignore[operator]
-        except ManifestSyntaxError:
-            fired = True
-        if fired:
-            print(f"  control OK   (fires): {label}")
-        else:
+            found = check(mutate(sources))  # type: ignore[operator]
+        except ManifestSyntaxError as exc:
+            # A manifest this cannot parse IS a detection — but it is not necessarily a detection of
+            # the property the mutation was about, so it goes through the same signal test as any
+            # other finding rather than counting as a free pass ([[LSN-038]]).
+            found = [f"ManifestSyntaxError: {exc}"]
+
+        if not found:
             print(f"  control DEAD (silent): {label}")
             failures += 1
+            continue
 
-    print(f"\n{len(CONTROLS) - failures}/{len(CONTROLS)} negative controls fire.")
+        missing = [s for s in signals if not s.startswith("!") and not any(s in f for f in found)]
+        leaked = [s[1:] for s in signals if s.startswith("!") and any(s[1:] in f for f in found)]
+        if missing or leaked:
+            print(f"  control DEAD (fires, but not for its property): {label}")
+            if missing:
+                print(f"      no finding mentions {missing!r}")
+            if leaked:
+                print(f"      a finding mentions {leaked!r}, which this mutation did not break")
+            failures += 1
+        else:
+            print(f"  control OK   (fires, naming its property): {label}")
+
+    print(f"\n{len(CONTROLS) - failures}/{len(CONTROLS)} negative controls fire for their own property.")
     return 1 if failures else 0
 
 

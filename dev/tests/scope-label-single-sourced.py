@@ -242,10 +242,16 @@ def read_sources() -> dict[str, str]:
 def negative_control() -> int:
     """Break each property in memory and confirm this check notices."""
     sources = read_sources()
+    # (label, mutate, signal). The signal names the property, not merely the fact of a failure.
+    # Key-spelling, value-construction and the two encoding properties all report on the same two
+    # files, so a non-emptiness assertion cannot distinguish "the scanner found the literal" from
+    # "some other rule fired first" -- and the URL mutation exists precisely because the scanner
+    # once stopped reading at `//` and went silent ([[LSN-035]], [[LSN-038]]).
     mutations = [
         (
             "a caller respells a key instead of importing the constant",
             lambda s: {**s, "some_renderer.go": 'package controller\n\nvar l = map[string]string{"kube-agents/tier": t}\n'},
+            "some_renderer.go:3 spells 'kube-agents/tier' as a literal",
         ),
         (
             # The harder version: the key comes from the package, so the import is right there in
@@ -255,6 +261,7 @@ def negative_control() -> int:
                 **s,
                 "some_renderer.go": "package controller\n\nvar l = map[string]string{agentlabels.Scope: agent.Spec.Scope.Namespace}\n",
             },
+            "references the 'kube-agents/scope' key but never calls agentlabels.For",
         ),
         (
             # The same respelling, hidden behind a URL on the same line. This is the mutation that
@@ -267,6 +274,7 @@ def negative_control() -> int:
                 **s,
                 "some_renderer.go": 'package controller\n\nvar u, l = "https://kubernetes.default.svc", map[string]string{"kube-agents/tier": t}\n',
             },
+            "some_renderer.go:3 spells 'kube-agents/tier' as a literal",
         ),
         (
             "the renderer hashes the readable join instead of the canonical encoding",
@@ -276,6 +284,7 @@ def negative_control() -> int:
                     "sha256.Sum256([]byte(canonical(s)))", "sha256.Sum256([]byte(key))", 1
                 ),
             },
+            "the digest is no longer taken over `canonical(s)`",
         ),
         (
             "canonical stops length-prefixing",
@@ -285,6 +294,7 @@ def negative_control() -> int:
                     "len(s.ProjectID), s.ProjectID", "s.ProjectID", 1
                 ),
             },
+            "`canonical` no longer length-prefixes all three levels",
         ),
         (
             "a key is dropped from the definition site",
@@ -292,6 +302,7 @@ def negative_control() -> int:
                 **s,
                 DEFINITION_SITE.name: s[DEFINITION_SITE.name].replace('"kube-agents/parent"', '"kube-agents/owner"'),
             },
+            "does not define 'kube-agents/parent'",
         ),
     ]
 
@@ -303,13 +314,19 @@ def negative_control() -> int:
         return 1
 
     survivors: list[str] = []
-    for label, mutate in mutations:
+    for label, mutate, signal in mutations:
         mutated = mutate(dict(sources))
         if mutated == sources:
             survivors.append(f"{label} (the mutation did not apply -- its anchor text has moved)")
             continue
-        if not check(mutated):
-            survivors.append(label)
+        found = check(mutated)
+        if not found:
+            survivors.append(f"{label} (not caught at all)")
+        elif not any(signal in f for f in found):
+            survivors.append(
+                f"{label} (caught, but not by the property it targets -- no finding mentions "
+                f"{signal!r}; first finding was: {found[0][:120]}...)"
+            )
 
     if survivors:
         print("FAIL: the negative control found regressions this check does not detect:", file=sys.stderr)
@@ -317,7 +334,10 @@ def negative_control() -> int:
             print(f"  - {s}", file=sys.stderr)
         return 1
 
-    print(f"PASS: negative control -- all {len(mutations)} injected regressions were detected")
+    print(
+        f"PASS: negative control -- all {len(mutations)} injected regressions were detected, each "
+        f"by the property it targets"
+    )
     return 0
 
 

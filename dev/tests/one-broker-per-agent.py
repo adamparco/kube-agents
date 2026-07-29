@@ -294,10 +294,15 @@ def negative_control() -> int:
     def edit(name: str, old: str, new: str):
         return lambda s: {**s, name: s[name].replace(old, new, 1)}
 
+    # (label, mutate, signal). The signal names the property, not merely the fact of a failure. Six
+    # properties read `broker_manifests.go` and two read `pod_launcher.go`; several would fire on
+    # the same edit, so a non-emptiness assertion cannot tell which one is doing the work and a
+    # property that stopped executing would go on reporting green ([[LSN-035]]).
     mutations = [
         (
             "brokerName returns a constant",
             edit(DEFINITION_SITE.name, 'return agent.Name + "-broker"', 'return "kage-broker"'),
+            "brokerName does not reach agent.Name",
         ),
         (
             "the actor SA stops depending on the scope",
@@ -306,18 +311,22 @@ def negative_control() -> int:
                 "leaf := scope.Of(agent).Leaf()",
                 'leaf := "shared"',
             ),
+            "actorServiceAccountName does not reach scope.Of(agent).Leaf()",
         ),
         (
             "a second file spells the broker name inline",
             lambda s: {**s, "some_caller.go": 'package controller\n\nvar n = agent.Name + "-broker"\n'},
+            "some_caller.go:3 builds a broker object name from a literal",
         ),
         (
             "the broker scales to two replicas",
             edit(DEFINITION_SITE.name, "Replicas: ptr.To(brokerReplicas)", "Replicas: ptr.To(int32(2))"),
+            "buildBrokerDeployment is no longer pinned to one replica",
         ),
         (
             "the replica count stops being a const and becomes derivable",
             edit(DEFINITION_SITE.name, "brokerReplicas int32 = 1", "brokerReplicas = replicasFor(agent)"),
+            "`brokerReplicas` is no longer a `const int32 = 1`",
         ),
         (
             "the Service selector drops the agent label",
@@ -326,6 +335,7 @@ def negative_control() -> int:
                 "Selector: map[string]string{\n\t\t\t\tagentlabels.Role:  agentlabels.RoleActor,\n\t\t\t\tagentlabels.Agent: agent.Name,\n\t\t\t}",
                 "Selector: map[string]string{\n\t\t\t\tagentlabels.Role: agentlabels.RoleActor,\n\t\t\t}",
             ),
+            "the broker Service selector does not pin the agent label",
         ),
         (
             "the launcher offers a single-Deployment method again",
@@ -334,10 +344,12 @@ def negative_control() -> int:
                 "BuildPair(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) WorkloadPair",
                 "BuildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment",
             ),
+            "a method returning a single *appsv1.Deployment is back",
         ),
         (
             "the pair constructor stops rejecting a nil half",
             edit(LAUNCHER_SITE.name, "if broker == nil || agent == nil {", "if false {"),
+            "newWorkloadPair no longer rejects a nil half",
         ),
     ]
 
@@ -352,9 +364,19 @@ def negative_control() -> int:
         return 1
 
     survivors: list[str] = []
-    for label, mutate in mutations:
-        if not check(mutate(sources)):
-            survivors.append(label)
+    for label, mutate, signal in mutations:
+        mutated = mutate(sources)
+        if mutated == sources:
+            survivors.append(f"{label} (the mutation did not apply -- its anchor text has moved)")
+            continue
+        found = check(mutated)
+        if not found:
+            survivors.append(f"{label} (not caught at all)")
+        elif not any(signal in f for f in found):
+            survivors.append(
+                f"{label} (caught, but not by the property it targets -- no finding mentions "
+                f"{signal!r}; first finding was: {found[0][:120]}...)"
+            )
 
     if survivors:
         print("FAIL: the check did not notice these regressions:", file=sys.stderr)
@@ -362,7 +384,10 @@ def negative_control() -> int:
             print(f"  - {s}", file=sys.stderr)
         return 1
 
-    print(f"PASS: negative control -- all {len(mutations)} injected regressions were caught")
+    print(
+        f"PASS: negative control -- all {len(mutations)} injected regressions were caught, each by "
+        f"the property it targets"
+    )
     return 0
 
 

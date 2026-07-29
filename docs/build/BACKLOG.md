@@ -89,10 +89,28 @@ _(empty — append new items here, below this line)_
 
 ## Scheduled
 
-| ID    | Title                                                    | Kind    | Scheduled into                                                                                         | On         |
-| ----- | -------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------ | ---------- |
-| B-001 | Name the broker as the renderer in P11-T4                | finding | **The next improvement pass** (Phase 9 milestone) — a 07 §2 spec clarification, `harness-improve` §3.6 | 2026-07-28 |
-| B-002 | One definition site for the tier template, as **P10-T0** | finding | **The next improvement pass** (Phase 9 milestone), which adds P10-T0 to 07 §2 ahead of P10-T1          | 2026-07-28 |
+| ID  | Title | Kind | Scheduled into | On  |
+| --- | ----- | ---- | -------------- | --- |
+
+_(empty — B-001 and B-002 landed 2026-07-29; see `## Done`.)_
+
+---
+
+## Refused
+
+| ID  | Title | Why not | On  |
+| --- | ----- | ------- | --- |
+
+_(empty)_
+
+---
+
+## Done
+
+| ID    | Title                                                    | Landed as                                                                                                                                                                                                                                                                                      | On         |
+| ----- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| B-001 | Name the broker as the renderer in P11-T4                | 07 §2 **P11-T4** rewritten: the skill gathers intent and calls the broker, the broker renders. States why the cheapest reading of "convert the skills" moves a grant-minting renderer into the pod's blast radius and collapses the first of 03 §4.2's two layers. Improvement pass 2026-07-29 | 2026-07-29 |
+| B-002 | One definition site for the tier template, as **P10-T0** | 07 §2 gains **P10-T0**, load-bearing, immediately ahead of P10-T1 — one renderer for the child CR, both identities, RBAC and the literal allow-list `vap-agent-scope` compiles, in broker code. Improvement pass 2026-07-29                                                                    | 2026-07-29 |
 
 **The ruling.** Both citations hold. 03 §4.2 does draw "cannot express" and "cannot cause" as two
 layers, and P11-T4 does say "convert the cascade skills" without naming a renderer — and the skills
@@ -175,21 +193,3 @@ of P11 — the install path needs the same template now, and doing it early is w
 `examples/gitops-repo/` copies rather than carrying them another two phases. Nothing here is a live
 regression: the `propose-*` skills are read-only today and no broker-side child provisioning exists,
 so this is a planning correction, not a fix.
-
----
-
-## Refused
-
-| ID  | Title | Why not | On  |
-| --- | ----- | ------- | --- |
-
-_(empty)_
-
----
-
-## Done
-
-| ID  | Title | Landed as | On  |
-| --- | ----- | --------- | --- |
-
-_(empty)_

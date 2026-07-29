@@ -295,6 +295,10 @@ def read_sources() -> tuple[dict[str, str], str]:
 def negative_control() -> int:
     """Break each property in memory and confirm this check notices."""
     sources, test_src = read_sources()
+    # (label, mutate, signal). The signal names the property, not merely the fact of a failure. The
+    # two "reads the brake" mutations and the two "second replica decision" mutations differ only in
+    # which file they land in, and both pairs are reported by the same rule, so an assertion that
+    # only asks "did anything fail" cannot tell whether the broker arm executes at all ([[LSN-035]]).
     mutations = [
         (
             "the replica decider is handed the whole Agent",
@@ -309,6 +313,7 @@ def negative_control() -> int:
                 },
                 t,
             ),
+            f"{DECIDER} takes 2 parameters",
         ),
         (
             "a second replica decision appears in the renderer",
@@ -321,6 +326,7 @@ def negative_control() -> int:
                 },
                 t,
             ),
+            "`Replicas: &pausedReplicas` is not a replica decision this file is allowed to make",
         ),
         (
             "the renderer reads the brake",
@@ -335,6 +341,7 @@ def negative_control() -> int:
                 },
                 t,
             ),
+            "agent_manifests.go: reads `.Spec.Operations` while rendering",
         ),
         (
             "the broker's replica count stops being a const",
@@ -347,6 +354,7 @@ def negative_control() -> int:
                 },
                 t,
             ),
+            "`brokerReplicas` is not declared as `brokerReplicas int32 = 1` in a const block",
         ),
         (
             "pause is implemented by scaling the broker to zero",
@@ -361,6 +369,7 @@ def negative_control() -> int:
                 },
                 t,
             ),
+            "`Replicas: ptr.To(pausedBrokerReplicas(agent))` is not a replica decision",
         ),
         (
             "the broker renderer reads the brake",
@@ -375,14 +384,17 @@ def negative_control() -> int:
                 },
                 t,
             ),
+            "broker_manifests.go: reads `.Spec.Operations` while rendering",
         ),
         (
             "the L1 property test is deleted",
             lambda s, t: (s, t.replace(f"func {REQUIRED_TESTS[0]}(", "func disabled(", 1)),
+            f"`{REQUIRED_TESTS[0]}` is missing",
         ),
         (
             "the renderer moves to a file this check does not know about",
             lambda s, t: ({**s, "workload_renderer.go": "package controller\n"}, t),
+            "workload_renderer.go: is neither a declared rendering source nor a declared exemption",
         ),
     ]
 
@@ -397,13 +409,19 @@ def negative_control() -> int:
         return 1
 
     survivors = []
-    for label, mutate in mutations:
+    for label, mutate, signal in mutations:
         ms, mt = mutate(dict(sources), test_src)
         if ms == sources and mt == test_src:
             survivors.append(f"{label} (the mutation did not apply -- its anchor text has moved)")
             continue
-        if not check(ms, mt):
-            survivors.append(label)
+        found = check(ms, mt)
+        if not found:
+            survivors.append(f"{label} (not caught at all)")
+        elif not any(signal in f for f in found):
+            survivors.append(
+                f"{label} (caught, but not by the property it targets -- no finding mentions "
+                f"{signal!r}; first finding was: {found[0][:120]}...)"
+            )
 
     if survivors:
         print("FAIL: V-RUN-012 negative control -- these breakages were NOT caught:", file=sys.stderr)
@@ -411,7 +429,10 @@ def negative_control() -> int:
             print(f"  - {s}", file=sys.stderr)
         return 1
 
-    print(f"PASS: V-RUN-012 negative control -- all {len(mutations)} breakages caught")
+    print(
+        f"PASS: V-RUN-012 negative control -- all {len(mutations)} breakages caught, each by the "
+        f"property it targets"
+    )
     return 0
 
 

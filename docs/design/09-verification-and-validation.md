@@ -877,7 +877,6 @@ proposed defaults below are starting points for that decision, not values a harn
 | T-6  | 02 §7               | Matrix cells are prose capability names, not resource sets                                                       | Bind each cell to a tier-template rule id in 06 §2.2 — without ground truth the matrix is unverifiable by construction                                     | **V-CTN-021** |
 | T-7  | 03 §5.1 / 02 §6     | `elevated` ⇒ "notify the owning humans at once" — no bound                                                       | State a notification latency SLO (proposed p95 ≤ 60s)                                                                                                      | V-GAT-014     |
 | T-8  | 04 §4.2 convergence | "The same class of fix keeps being needed" — no threshold, no definition of "class"                              | Define class as the classifier rule id or `(kind, intent-template)`, and state a count/window (proposed ≥4 in 24h within one scope)                        | V-PRO-015     |
-| T-9  | 04 §5.1             | "A bounded settle window" — no per-kind default                                                                  | Publish per-kind settle defaults and a code ceiling; "bounded" is otherwise unfalsifiable                                                                  | V-PRO-013     |
 | T-10 | 04 §5.1             | Terminal "quota exhaustion with no pending capacity" vs transient "capacity that is arriving" — no discriminator | Name the signal (a pending node-pool scale operation, or Cluster Autoscaler `TriggeredScaleUp`). Otherwise this is a coin flip in production               | **V-PRO-022** |
 | T-11 | 04 §2.2             | "Two defensible remediations with materially different consequences" — "materially" undefined                    | Define as differing risk class, or blast radius differing beyond a stated factor. Otherwise every uncertainty becomes a licensed pause                     | V-CHR-014     |
 | T-12 | 04 §4.1             | Per-trigger latency targets are adjectives ("seconds", "immediate")                                              | State numeric p95 targets per trigger class                                                                                                                | V-PRO-026     |
@@ -891,6 +890,16 @@ proposed defaults below are starting points for that decision, not values a harn
   contradiction that would have widened precisely the window 04 claimed to close. Resolved in
   06 §3.1: `batchWindow` applies to **`log` mode only**; `state` commits are synchronous within the
   action. `V-PRO-014` now has a pass criterion.
+- **The settle window (T-9 as was).** 04 §5.1 said "a bounded settle window" and named no number,
+  so every implementation satisfied it and no test could fail it. Resolved in 04 §5.1 on 2026-07-29
+  by publishing the per-kind windows and a 30-minute ceiling. This is a **ratification, not an
+  invention**: Phase 9 built the settle machinery and had to pick numbers to run at all, so the
+  values were already load-bearing in `verify/predicate.go` and were recorded in the ledger
+  (2026-07-27) as "for ratification, not treated as settled", with V-PRO-013 deliberately unclaimed
+  in the meantime. Publishing them moves a decision from one implementation's source file — where
+  the only way to disagree with it is to read Go — into the document a reviewer argues with. Note
+  that this does **not** by itself make V-PRO-013 green: that check wants all eight rows of the
+  §5.1 predicate table exercised, and the connectivity row has no prober (see the deferral register).
 - **Report and recovery structure (T-15, T-16 as was).** `status.report{noticed,did,verified,undo}`
   and `status.recovery{rung,transitions[]}` are now mandated structured fields in 06 §4.3. This one
   schema change converts roughly ten rubric-grade character checks into mechanical ones and makes

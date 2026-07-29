@@ -401,6 +401,11 @@ def negative_control() -> int:
     canon_rbac = "examples/gitops-repo/policy/rbac-overlay/broker-operations.yaml"
     boot_vap = "examples/gitops-repo/clusters/cluster-a/bootstrap/20-policy/vap-agent-readonly.yaml"
 
+    # (label, mutate, signal). The signal is a substring that only the property this mutation is
+    # about would produce, and the loop below asserts it appears. Six properties overlap in this
+    # check -- widening, narrowing, the missing bound, the missing grant, the fixture escape -- so
+    # "the check went red" is satisfied by whichever fires first and says nothing about the rest
+    # ([[LSN-035]]).
     mutations = [
         (
             # The defect 06 §2.2.1 names first. `update` on actionrecords lets the broker rewrite the
@@ -412,6 +417,7 @@ def negative_control() -> int:
                 'resources: ["actionrecords"]\n    verbs: ["get", "list", "watch", "create"]',
                 'resources: ["actionrecords"]\n    verbs: ["get", "list", "watch", "create", "update"]',
             ),
+            "grants 'kubeagents.x-k8s.io/actionrecords:update'",
         ),
         (
             # The tenant template landing early, by way of an RBAC file rather than the policy.
@@ -422,6 +428,7 @@ def negative_control() -> int:
                 'rules:\n  # step 1',
                 'rules:\n  - apiGroups: ["apps"]\n    resources: ["deployments"]\n    verbs: ["create"]\n  # step 1',
             ),
+            "grants 'apps/deployments:create'",
         ),
         (
             # 06 §2.2.1: a tier that cannot read the freeze object fails closed permanently. The
@@ -433,6 +440,7 @@ def negative_control() -> int:
                 )
                 for rel, text in s.items()
             },
+            "no actor RBAC object in the tree grants 'kubeagents.x-k8s.io/fleetfreezes:",
         ),
         (
             "a VAP copy's allow-list gains a triple the spec does not grant",
@@ -442,18 +450,21 @@ def negative_control() -> int:
                 "'kubeagents.x-k8s.io/actionrecords:create',",
                 "'kubeagents.x-k8s.io/actionrecords:create',\n                  'kubeagents.x-k8s.io/actionrecords:update',",
             ),
+            "allow-list admits 'kubeagents.x-k8s.io/actionrecords:update'",
         ),
         (
             # The copy that drifts is the one enforced in the cluster nobody is looking at, so the
             # mutation is applied to the bootstrap copy rather than the canonical one.
             "a VAP copy's allow-list loses a triple the spec grants",
             lambda s: edit(s, boot_vap, "'kubeagents.x-k8s.io/fleetfreezes:watch',", ""),
+            "allow-list omits 'kubeagents.x-k8s.io/fleetfreezes:watch'",
         ),
         (
             # Not a narrowing and not a widening: the bound disappears. Every negative fixture aimed
             # at validation 3 would be admitted, and the suite would still be green without this.
             "a VAP copy loses its actor validation entirely",
             lambda s: edit(s, canon_vap, "(g + '/' + res + ':' + v)", "(g + '/' + res)"),
+            "no actor allow-list found",
         ),
         (
             "the spec's own grant is widened",
@@ -463,11 +474,16 @@ def negative_control() -> int:
                 "  resources: [actionrecords]\n  verbs: [get, list, watch, create]",
                 "  resources: [actionrecords]\n  verbs: [get, list, watch, create, delete]",
             ),
+            # Naming the triple, not just "omits". A check with 06 §2.2.1's grant hardcoded rather
+            # than parsed would still say "omits" about something; only a check that actually read
+            # `delete` out of the mutated spec can name `actionrecords:delete`.
+            "allow-list omits 'kubeagents.x-k8s.io/actionrecords:delete'",
         ),
         (
             # The fixture escape, used from the other side: a real grant wearing a fixture's name.
             "a real actor object hides behind the fixture prefix",
             lambda s: edit(s, canon_rbac, "name: kubeagents-broker-operations", "name: vaptest-broker-operations"),
+            "uses the 'vaptest-' fixture prefix outside",
         ),
     ]
 
@@ -479,13 +495,19 @@ def negative_control() -> int:
         return 1
 
     survivors: list[str] = []
-    for label, mutate in mutations:
+    for label, mutate, signal in mutations:
         mutated = mutate(dict(sources))
         if mutated == sources:
             survivors.append(f"{label} (the mutation did not apply -- its anchor text has moved)")
             continue
-        if not check(mutated):
-            survivors.append(label)
+        found = check(mutated)
+        if not found:
+            survivors.append(f"{label} (not caught at all)")
+        elif not any(signal in f for f in found):
+            survivors.append(
+                f"{label} (caught, but not by the property it targets -- no finding mentions "
+                f"{signal!r}; first finding was: {found[0][:120]}...)"
+            )
 
     if survivors:
         print("FAIL: the negative control found regressions this check does not detect:", file=sys.stderr)
@@ -493,7 +515,10 @@ def negative_control() -> int:
             print(f"  - {s}", file=sys.stderr)
         return 1
 
-    print(f"PASS: negative control -- all {len(mutations)} injected regressions were detected")
+    print(
+        f"PASS: negative control -- all {len(mutations)} injected regressions were detected, each "
+        f"by the property it targets"
+    )
     return 0
 
 

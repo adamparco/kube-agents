@@ -51,6 +51,8 @@ L0_CHAIN = REPO / "dev/L0-CHAIN.txt"
 L2_CHAIN = REPO / "dev/L2-CHAIN.txt"
 WORKFLOWS = REPO / ".github/workflows"
 BASELINE = REPO / "dev/assertion-baseline.json"
+# The conformance spec. Check IDs, their levels, and the phase each is required by all live here.
+SPEC = REPO / "docs/design/09-verification-and-validation.md"
 
 # ---------------------------------------------------------------------------------------------
 # Invariant 7 — authority never precedes machinery
@@ -684,6 +686,87 @@ def _backlog_section(text: str, name: str) -> str | None:
     return m.group("body") if m else None
 
 
+HARNESS_RUN_SKILL = REPO / ".claude/skills/harness-run/SKILL.md"
+
+
+def _drain_is_committed(text: str, inbox: str, drained_on: str) -> list[str]:
+    """A drain that exists only in the working tree has not happened yet (LSN-043).
+
+    ORIENT is required to WRITE exactly one artifact — the drain — and everything that follows it
+    moves `HEAD`: the phase branch gets created, a stash gets popped, a PR gets merged. One of those
+    reverted a completed drain, and `check_backlog_is_drained` above passed on the reverted file
+    exactly as it passed on the drained one: an empty inbox stamped with today's date is what a
+    correct drain looks like. The two backlog items in it were recovered only because an unrelated
+    `cp` to `/tmp` happened to still be there.
+
+    So the property is not "the inbox is empty" — that one is already asserted and it is the wrong
+    question here. It is that the drain is DURABLE: whatever ORIENT removed from the inbox is in a
+    commit, not in the editor.
+
+    The distinction that makes this safe to enforce is the one thing `BACKLOG.md` exists for. A human
+    may append to the inbox at any time, including mid-unit — that is the whole affordance, and it
+    leaves the file dirty on purpose. So an uncommitted change is only a finding when it *removes*
+    items or *advances* `Last drained`, which no human append does and every drain does.
+
+    Also asserts that `harness-run` §1 step 6 still tells the harness to commit before SELECT. The
+    procedural instruction and the gate that enforces it have to move together, or the next person
+    to read the skill learns a workflow the gate rejects.
+    """
+    failures = []
+
+    skill = HARNESS_RUN_SKILL.read_text() if HARNESS_RUN_SKILL.exists() else ""
+    if not re.search(r"commit the drain,?\s*before SELECT", skill, re.I):
+        failures.append(
+            f"{HARNESS_RUN_SKILL.relative_to(REPO)} §1 step 6 no longer tells ORIENT to commit the "
+            f"drain before SELECT. That sentence is the procedure this check enforces; without it "
+            f"the gate below reads as an unexplained rule, and LSN-043's window reopens."
+        )
+
+    try:
+        head = subprocess.run(
+            ["git", "show", f"HEAD:{BACKLOG.relative_to(REPO)}"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        # Reported, never skipped. "git was unavailable" is how this half of the check would go
+        # quiet, and a quiet half reads identically to a passing one (LSN-035, LSN-038).
+        return failures + [
+            f"VACUOUS: could not read {BACKLOG.relative_to(REPO)} from HEAD ({exc}), so the "
+            f"drain-is-committed half of this check did not run. The file is tracked and git is "
+            f"present in every environment that runs the L0 chain; if that changed, this check "
+            f"needs a new way to see the last committed state, not a pass."
+        ]
+
+    if head == text:
+        return failures
+
+    head_inbox = _backlog_section(head, "Inbox") or ""
+    head_drained = LAST_DRAINED.search(head_inbox)
+    if head_drained and drained_on > head_drained.group(1):
+        failures.append(
+            f"{BACKLOG.relative_to(REPO)}: `Last drained` advanced to {drained_on} (HEAD says "
+            f"{head_drained.group(1)}) and the change is not committed. Commit the drain now, "
+            f"before SELECT — a branch switch, a stash pop or a `gh pr merge` reverts it silently, "
+            f"and the reverted file passes every gate in this file (LSN-043)."
+        )
+
+    gone = {t.strip() for t in INBOX_ITEM.findall(head_inbox)} - {
+        t.strip() for t in INBOX_ITEM.findall(inbox)
+    }
+    if gone:
+        failures.append(
+            f"{BACKLOG.relative_to(REPO)}: inbox item(s) {sorted(gone)} were resolved out of the "
+            f"inbox and the change is not committed. A resolved item that exists only in the "
+            f"working tree is one `git checkout` from never having existed, with every gate green "
+            f"(LSN-043). Commit the drain as its own commit before SELECT."
+        )
+
+    return failures
+
+
 def check_backlog_is_drained() -> list[str]:
     """A human backlog the harness reads and walks past is worse than no backlog at all.
 
@@ -753,6 +836,8 @@ def check_backlog_is_drained() -> list[str]:
                 f"{drained_on} — so ORIENT read it and left it. Every item is resolved in the "
                 f"ORIENT that reads it: schedule it, refuse it with an argument, or escalate it."
             )
+
+    failures.extend(_drain_is_committed(text, bodies["Inbox"], drained_on))
 
     seen = {}
     for name in ("Scheduled", "Refused", "Done"):
@@ -1074,6 +1159,8 @@ def _verification_evidence_rows() -> list[str]:
     field, so the word "passes" inside some other check's evidence paragraph cannot vouch for a
     check that never ran. The rows are re-emitted in the pipe-delimited shape the caller expects,
     with everything but those two fields dropped, so nothing else in the row can match either.
+    Stricter again since 2026-07-29: one line **per check ID**, and a pass a later `**correction**`
+    row retracts is not emitted at all. See the comment on that loop for the two live defects.
 
     Rows are filtered to those that actually name a check. That is behaviour-preserving for the
     caller, which only ever matched a row containing the ID it was asking about, and it is what
@@ -1089,13 +1176,31 @@ def _verification_evidence_rows() -> list[str]:
                 for ln in path.read_text().splitlines()
                 if ln.startswith("|") and CHECK_ID.search(ln)
             ]
-    if RESULTS_CSV.exists():
-        with RESULTS_CSV.open(newline="") as fh:
-            for rec in csv.DictReader(fh):
-                cid = (rec.get("check_id") or "").strip()
-                result = (rec.get("result") or "").strip()
-                if cid and "pass" in result.lower():
-                    rows.append(f"| {cid} | **pass** |")
+    records = _results_rows()
+    # The record is APPEND-ONLY, so a pass that was wrong is never removed -- it is retracted by a
+    # later `**correction**` row naming the same check (the convention V-MET-014 rows 18-19 set).
+    # A reader that greps for "pass" therefore keeps vouching for a claim the record itself has
+    # withdrawn, permanently and by construction. That is not hypothetical: V-CTN-021 was falsely
+    # passed on row 47, and appending the correction did not stop the BLOCKING-ALWAYS arm reading
+    # it as green, because the retracted row is still sitting there with the word in it. A check
+    # that cannot see a retraction cannot see a correction, and the whole convention is decorative.
+    #
+    # So passes are emitted PER CHECK ID and dropped when a later correction names that ID. Per-ID
+    # matters as much as the supersession: row 47 is `"V-CTR-002, V-CTN-021"`, one cell naming two
+    # checks, of which exactly one was really run. Emitting the row whole makes the honest half
+    # vouch for the other half forever.
+    retracted_at: dict[str, int] = {}
+    for i, rec in enumerate(records):
+        if "correction" in (rec.get("result") or "").lower():
+            for cid in CHECK_ID.findall(rec.get("check_id") or ""):
+                retracted_at[cid] = i  # last correction wins; a later re-pass still counts
+    for i, rec in enumerate(records):
+        if "pass" not in (rec.get("result") or "").lower():
+            continue
+        for cid in CHECK_ID.findall(rec.get("check_id") or ""):
+            if retracted_at.get(cid, -1) > i:
+                continue
+            rows.append(f"| {cid} | **pass** |")
     return rows
 
 
@@ -1134,6 +1239,156 @@ def _closed_deferral_failures(
             f"changed that."
         ]
     return []
+
+
+# ---------------------------------------------------------------------------------------------
+# The † set — checks 09 §6.14 marks as blocked on an unresolved §12 tightening
+# ---------------------------------------------------------------------------------------------
+
+CATALOG_ID = re.compile(r"^\*{0,2}(V-[A-Z]{3}-\d{3})\*{0,2}$")
+
+
+def _catalog_rows() -> list[list[str]]:
+    """Every row of every §6 catalog table, as cells, keyed by a check ID in column 1."""
+    rows = []
+    for line in SPEC.read_text().splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if cells and CATALOG_ID.match(cells[0]):
+            rows.append(cells)
+    return rows
+
+
+def _catalog_phases() -> dict[str, int]:
+    """{check id: the phase 09 §6 requires it by}, for every catalogued check.
+
+    Derived from the tables, never listed here (LSN-036). Every §6 catalog table ends in a Phase
+    column, so the phase is the last cell whenever it is a bare integer. A row whose last cell is
+    not a bare integer is simply ABSENT from this map rather than defaulted -- callers must treat
+    a missing phase as unknown, never as "not yet due" (LSN-038).
+    """
+    phases = {}
+    for cells in _catalog_rows():
+        if cells[-1].isdigit():
+            phases[CATALOG_ID.match(cells[0]).group(1)] = int(cells[-1])
+    return phases
+
+
+def _dagger_checks() -> dict[str, int | None]:
+    """{check id: required phase, or None if unknown} for every check marked **†**."""
+    phases = _catalog_phases()
+    out: dict[str, int | None] = {}
+    for cells in _catalog_rows():
+        if "†" not in " ".join(cells):
+            continue
+        cid = CATALOG_ID.match(cells[0]).group(1)
+        out[cid] = phases.get(cid)
+    return out
+
+
+def check_dagger_checks_are_deferred_by_id() -> list[str]:
+    """09 §12: a check blocked on an unresolved tightening must be **recorded as deferred**.
+
+    By ID, and that is the whole of this check. Until 2026-07-29 the ledger deferred the whole set
+    as a category -- one row reading "09 §6.14 checks marked †" -- which is accurate prose and
+    invisible to every check that works on IDs. `check_deferrals_name_blockers` below asks whether
+    a deferred check is BLOCKING-ALWAYS by running CHECK_ID over the row's subject cell; against a
+    category name it matches nothing and reports clean. **V-CTN-021 is a V-CTN check** and sat
+    inside that row, unasked, from the day the row was written to the day this check was.
+
+    The failure is not that someone hid it. The row is honest and a human reading it would find
+    V-CTN-021 in a minute. The failure is that the gate's one arm for "is a BLOCKING-ALWAYS check
+    being deferred" could be satisfied by naming a set instead of its members, which makes the
+    arm's silence mean nothing -- the LSN-035 shape, one level up from the checks it was written
+    about: an assertion that passes for a reason unrelated to the property.
+
+    So: the † set is derived from 09 §6.14, and every member must appear literally in the
+    Deferrals table. An empty derived set is a FAIL, not a clean run -- if the daggers are ever
+    restyled or the section renamed, this check must say so rather than congratulate the tree.
+    """
+    if not SPEC.exists():
+        return [f"{SPEC.relative_to(REPO)} not found"]
+    if not LEDGER.exists():
+        return [f"{LEDGER.relative_to(REPO)} not found"]
+    dagger = _dagger_checks()
+    if not dagger:
+        return [
+            "VACUOUS: no check in 09 §6.14 parses as marked †; there were 4 when this was "
+            "written (V-CTN-021, V-PRO-022, V-PRO-026, V-CHR-014). Either every tightening was "
+            "resolved — in which case delete this check and the deferral row together — or the "
+            "marker changed and the derivation broke. An empty † set must never read as clean."
+        ]
+    deferred = "\n".join(c[1] for c in _deferral_rows())
+    failures = []
+    for cid in sorted(dagger):
+        if cid not in deferred:
+            failures.append(
+                f"{cid} is marked † in 09 §6.14 — blocked on an unresolved §12 tightening — but "
+                f"no row of the ledger's Deferrals table names it. 09 §12: such a check 'must be "
+                f"recorded as deferred with this row as the blocker', never quietly skipped. "
+                f"Naming the category it belongs to is not naming it: the BLOCKING-ALWAYS arm "
+                f"reads check IDs out of the subject cell and a category name matches none."
+            )
+    failures += _dagger_pass_failures(sorted(dagger))
+    return failures
+
+
+def _results_rows() -> list[dict[str, str]]:
+    """`verification/results.csv` as dicts, in append order. Index order IS chronological order."""
+    if not RESULTS_CSV.exists():
+        return []
+    with RESULTS_CSV.open(newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _dagger_pass_failures(dagger: list[str]) -> list[str]:
+    """The other half: a † check may not be recorded as **passing**.
+
+    "Blocked on a §12 tightening" and "passed" cannot both be true -- 09 §6.14 says a † check "is
+    not runnable until the named ambiguity is resolved", so a pass row naming one is a false green
+    by construction, provable from two text files with no cluster and no judgement call.
+
+    This arm exists because the tree had one. `results.csv` row 47 (2026-07-27, P8-T9) recorded
+    `"V-CTR-002, V-CTN-021"` as **pass** at L2, on evidence -- `webhook-negatives-l2.sh` -- that
+    proves V-CTR-002's property exactly and says nothing whatever about V-CTN-021's, which is
+    conformance of all 39 cells of the 02 §7 boundary matrix. There is no V-CTR-021, so it is not
+    a one-letter slip from the neighbouring ID; the ID that got recorded exists, is BLOCKING-ALWAYS,
+    and was not run. It went unnoticed for two days and it was **masking a second defect**: the
+    BLOCKING-ALWAYS arm of `check_deferrals_name_blockers` short-circuits on "green somewhere", so
+    the phase-expiry clause written in the same sitting as this one could never fire, and testing
+    that clause is what surfaced the false green. A false pass does not sit still -- it silences
+    the checks downstream of it.
+
+    **Corrections are honoured, history is not rewritten.** `results.csv` is append-only, so the
+    fix for a bad pass row is a later `**correction**` row naming the same check, which is the
+    convention the record already follows (see V-MET-014, rows 18-19). A pass superseded that way
+    is satisfied here; an uncorrected one is not.
+    """
+    rows = _results_rows()
+    if not rows:
+        return [
+            f"VACUOUS: {RESULTS_CSV.relative_to(REPO)} parsed to zero rows. This arm asks whether "
+            f"any † check was recorded green, and against an empty corpus the answer is always no."
+        ]
+    failures = []
+    for cid in dagger:
+        hits = [
+            (i, r["result"]) for i, r in enumerate(rows) if cid in (r.get("check_id") or "")
+        ]
+        first_pass = next((i for i, res in hits if "pass" in res), None)
+        if first_pass is None:
+            continue
+        if any(i > first_pass and "correction" in res for i, res in hits):
+            continue
+        failures.append(
+            f"{cid} is marked † in 09 §6.14 — not runnable until its §12 tightening is resolved — "
+            f"yet {RESULTS_CSV.relative_to(REPO)} row {first_pass + 2} records it **pass** with no "
+            f"later **correction** row retracting it. A blocked check cannot have passed; the "
+            f"evidence on that row belongs to some other check sharing the cell. Append a "
+            f"correction row (the record is append-only), do not edit the pass away."
+        )
+    return failures
 
 
 def check_deferrals_name_blockers() -> list[str]:
@@ -1208,12 +1463,36 @@ def check_deferrals_name_blockers() -> list[str]:
             # A level of a BLOCKING-ALWAYS check may be deferred only if the check is green
             # somewhere. Search the verification record for a pass row naming the same ID.
             green = any(cid in ln and "**pass**" in ln for ln in evidence)
-            if not green:
-                failures.append(
-                    f"deferral {subject!r} defers {cid}, a BLOCKING-ALWAYS check, and no row of "
-                    f"the verification log records it passing at any level. 09 §9.6: if it "
-                    f"cannot run, the build is not verifiable and that is a halt, not a row."
-                )
+            if green:
+                continue
+            # ...unless the check is not required yet. 09 §10 ratchets suites in by phase, and a
+            # check whose phase has not arrived is not "deferred" in the §9.6 sense -- it is
+            # unstarted, which is the normal state of all future work and not a defect. V-CTN-021
+            # is required at phase 11; refusing it at phase 9 would make every build red for as
+            # long as it takes to get there, and a check that is red for two phases straight is
+            # one somebody routes around.
+            #
+            # The carve-out is narrow and it EXPIRES BY ITSELF. Both numbers must be known -- an
+            # unparseable phase on either side is not a grant, it is the unknown case, and the
+            # unknown case fails (LSN-038: a guard that cannot run must not score as a pass). And
+            # it lapses the moment the phase arrives: at phase 11 this row starts failing with no
+            # edit to anything, which is the property that makes it safe to grant at all. The
+            # alternative -- a human remembering, at the phase 11 milestone, that a row written in
+            # phase 9 was conditional -- is not a mechanism.
+            required, current = _catalog_phases().get(cid), _current_phase()
+            if required is not None and current is not None and current < required:
+                continue
+            due = (
+                f"is required at phase {required} and the build is at phase {current}"
+                if required is not None and current is not None
+                else f"has no parseable phase in 09 §6 (required={required}, current={current}), "
+                f"so it cannot be excused as not-yet-due"
+            )
+            failures.append(
+                f"deferral {subject!r} defers {cid}, a BLOCKING-ALWAYS check; no row of the "
+                f"verification log records it passing at any level, and it {due}. 09 §9.6: if it "
+                f"cannot run, the build is not verifiable and that is a halt, not a row."
+            )
     return failures
 
 
@@ -1962,6 +2241,7 @@ CHECKS = [
     ("LSN-005 — destructive-test guards stay anchored", check_destructive_guards_are_anchored),
     ("LSN-018 — build targets name their cluster", check_make_targets_are_context_explicit),
     ("V-MET-006 / LSN-008 — deferrals name a blocker", check_deferrals_name_blockers),
+    ("09 §12 / LSN-046 — † checks are deferred by ID", check_dagger_checks_are_deferred_by_id),
     (
         "LSN-001/002/003 — L2 scripts declare and back their preconditions",
         check_l2_scripts_declare_preconditions,

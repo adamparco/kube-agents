@@ -37,6 +37,14 @@ Context does not survive; files do. "I remember where I was" is false.
    `dev/tests/invariants-gate.py` fails the build on exactly that: an item added before
    `Last drained` and still sitting in the inbox.
 
+   **Then commit the drain, before SELECT — its own commit, on the phase branch.** Not at
+   CHECKPOINT. The drain is the one artifact ORIENT is required to _write_, and everything after it
+   moves `HEAD`: a branch creation, a `git stash pop`, a `gh pr merge`. An uncommitted drain has
+   already been silently reverted once ([[LSN-043]]), and the reverted file passes every gate,
+   because an empty inbox with today's date is exactly what a correct drain looks like. Committing
+   it here also lands it on the branch it was reasoned on. `invariants-gate.py` fails on a drain
+   that is still only in the working tree.
+
 **Resuming a killed session.** If the ledger shows a unit `in-progress` with uncommitted work,
 first establish whether that work is sound (build clean + its claimed checks green). Then either
 finish it or revert it cleanly. Never build on top of an unverified partial unit.

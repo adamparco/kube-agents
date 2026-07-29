@@ -118,9 +118,20 @@ build: manifests generate fmt vet render ## Build manager binary.
 # run it against a cluster. A prerequisite of `build` and `test` is the cheapest place this becomes
 # impossible to miss again. Rendering successfully is not the same as rendering CORRECTLY; that
 # second property is `dev/tests/install-render-is-faithful.py` at L0.
+#
+# EVERY overlay an install path applies, not just the main one. The integrations below are applied
+# by the `deploy-*` targets a few lines down and went unrendered for the same reason `config/default`
+# did -- nobody was looking at the list. They all rendered cleanly when the gap was found, which is
+# luck, not a reason to leave it. `dev/tests/install-artifacts-are-rendered.py` derives the applied
+# set from the `apply` lines themselves and fails if a sixth overlay ever lands without a line here,
+# so this list cannot go stale the way an enumerated one would.
 .PHONY: render
-render: manifests kustomize ## Render the full install overlay; fails the build if it does not build.
+render: manifests kustomize ## Render every install overlay; fails the build if one does not build.
 	@$(KUSTOMIZE) build config/install > /dev/null
+	@$(KUSTOMIZE) build config/integrations/litellm/base > /dev/null
+	@$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt > /dev/null
+	@$(KUSTOMIZE) build config/integrations/inference-replay/base > /dev/null
+	@$(KUSTOMIZE) build config/integrations/github > /dev/null
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
