@@ -2372,6 +2372,32 @@ rather than beside it.
 
 **The denominator moves by four**, not by five: T9b was already counted once.
 
+#### T9b-5 splits again into three: T9b-5a … T9b-5c
+
+**Recorded 2026-07-30, at SELECT, under `harness-run` §2 sizing.** The row above bundles three
+things that are separable, have different subjects, and — the deciding argument — have a strict
+dependency order that the bundle hides. `broker-execute-l2.sh` cannot reach step 8 without a write
+authority the actor does not have: `execute/client.go` issues real API calls with
+`client.DryRunAll`, and a server-side dry-run is **authorized normally** before it is dry-run, so
+the API server refuses `patch deployments` for the phase-9 actor exactly as it refuses a live one.
+Every envelope in P9-T8b-4b-ii-1 died at step 3 for the read half of that same reason. Writing the
+suite first and the overlay second would mean writing 700 lines that cannot run.
+
+| Unit       | What it is                                                                                              | Checks                                           | Level |
+| ---------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------ | ----- |
+| **T9b-5a** | The tenant overlay's **write** half, and the admission ruling it needs — executed, not read off the CEL | (enabling; V-CTN-037 stays green)                | L2    |
+| **T9b-5b** | `broker-execute-l2.sh` — Accept (a) end to end, Accept (d)'s journal half, and V-BRK-021's L2 half      | V-BRK-006/018/019/021, V-REV-002, V-REV-003 (L2) | L2    |
+| **T9b-5c** | `actor-grant-sweep-l2.sh` — Accept (e)'s two-sided `auth can-i` sweep over every agent identity         | V-BRK-013 (L2 half)                              | L2    |
+
+**5a claims no check ID, deliberately.** It is enabling work, in the same sense T9b-4 was: the
+breakdown row names the checks that the thing it enables will carry, and inventing an ID for the
+enabler would put a row in `results.csv` for a property nothing measured. What it does instead is
+_execute the three premises the ruling rests on_, which until now existed only as a paragraph in
+`dev/verify/fixtures/actor-tenant-grant.yaml`'s header reading CEL and predicting what the API
+server would do with it.
+
+**The denominator moves by two more.**
+
 ---
 
 ### P9-T9b-1 — outcome, 2026-07-30
@@ -3571,3 +3597,92 @@ BLOCKING-ALWAYS rule is about a check having no evidence at all, not about its d
 - **`ChangePolicy` cannot loosen, and that is structural, not validated-then-trusted**: there is no
   `allow`, no `maxClass`, no `exempt`, no downgrade path in the schema, _and_ the broker takes the
   maximum over all sources regardless. Both halves get a test; either alone is a convention.
+
+### P9-T9b-5a — outcome, 2026-07-30
+
+The unit was scoped as "the tenant overlay's write half, and the admission ruling it needs". Both
+landed. The ruling is the interesting half, and it is the first thing this phase has decided that no
+check ID covers.
+
+**The question, restated.** `dev/verify/fixtures/actor-tenant-grant.yaml` — the READ overlay, written
+in P9-T7d-3 — ends its header by handing T9b something it could not answer at the time: a write
+grant for the actor identity is denied by `vap-agent-readonly` validation 1 if it wears
+`kube-agents/tier`, denied by validation 3 if it wears `kube-agents/role: actor` (tenant resources
+are absent from the twenty-triple 06 §2.2.1 allow-list), and governed by nothing at all if it wears
+neither. Three doors, two locked and one that is not a door.
+
+**The ruling: step outside the population, do not bend the policy.** The tempting move is a
+carve-out — an exempt label, a namespace exclusion, a `!has(object.metadata.labels['test-only'])`
+clause in the match condition. Every form of it is a hole in the one runtime backstop that rejects
+bad agent RBAC _after_ human review has already passed it, and the hole is shaped exactly like the
+thing an attacker wants: a label that turns the policy off. It is also, mechanically, a weakening of
+a BLOCKING-ALWAYS surface, which PROTOCOL §10.2 makes a halt rather than a judgement call — so the
+question was never actually open. The fixture wears neither label and is outside `is-agent-rbac` on
+purpose.
+
+**The cost is conceded in writing, in the fixture's own header.** The read overlay is bounded by
+V-CTN-037, by the two library functions that apply and revoke it, _and_ by the cluster's admission
+policy. The write overlay is bounded by the first three and not the fourth. That is a genuinely
+weaker position and the header says so in those words rather than presenting the ruling as free.
+P10-T1's `vap-agent-scope` is named as what closes it: once an actor's tenant template is a compiled
+allow-list, this fixture can wear `kube-agents/role: actor`, be selected by validation 3, and be
+bounded by the cluster again. The header is the thing to re-read on the day that lands.
+
+**What makes it a fact rather than a reading.** Until this unit every clause above was a prediction
+about what an API server would do, made by reading CEL in a file. `actor-overlay-admission-l2.sh`
+submits all three label variants to a real one and records the answers. The three variants are
+**derived from the shipped fixture**, not re-typed: the Role document is rendered exactly as
+`actor_overlay_apply_write` renders it and each variant is that document with one label line spliced
+in. A hand-written stand-in would make all three arms true of a rule set nobody grants, and would
+keep passing on the day the fixture grew a fourth resource.
+
+**P2 finally has a function, and the reason it did not is the interesting part.** P2
+(policies-are-live) was the only entry in `binding.md` §Preconditions with no `p*_` helper and no
+lesson behind it. That was not an oversight: every admission claim this repository had ever made was
+a claim that something was **DENIED**, and a denial is self-witnessing — an absent policy, an
+unactivated binding and a deleted policy all fail to produce one. This suite's core arm asserts an
+object **IS ADMITTED**, which reads exactly the same green against all three of those. That is the
+shape of [[LSN-006]] aimed at admission instead of at the dataplane. `p2_assert_policy_live` makes
+liveness an experiment — a server-side dry-run of a manifest the policy must reject, polled to the
+timeout — rather than a `kubectl get` of stored YAML, and it probes **validation 2** so that
+establishing the precondition does not quietly pre-establish either of the arms that follow.
+
+**The first run was red, for a reason nothing in the tree could have found.** L2-1 (P6) reported the
+deployed `kube-agents-agent-readonly` carrying **2** validations against the tree's **3** — the actor
+carve-out landed in P9-T7d-3 and the scratch cluster's policy was four days stale. L2-3 then failed
+as a direct consequence: validation 3 was not there to deny anything. That pairing is the best
+evidence the suite is non-vacuous that this unit could have produced, because it was not
+constructed — the arm that measures the artifact and the arm that depends on it went red together,
+in the right causal order. After `kubectl apply -f examples/gitops-repo/policy/vap-agent-readonly.yaml`
+the same run is 7/7 green. **The P6 arm defers with the remediation named rather than re-applying the
+policy itself**, deliberately: a suite that silently repairs its own environment is a suite that can
+never tell anyone the environment had drifted.
+
+**The library half.** `actor_overlay_can`, `actor_overlay_apply_write` and `actor_overlay_revoke_write`
+in `dev/lib/actor-overlay.sh`. The write half asserts considerably more than the read half, and the
+asymmetry is the ruling's: two of the three things bounding this grant _are these functions_, so
+they ask the authorizer rather than trusting `kubectl apply`'s exit code. `apply_write` checks four
+positives and four negatives (no `secrets`, no other namespace, no RBAC group, no cluster scope) and
+**revokes rather than returning** on any mismatch, because handing a wider-than-advertised authority
+to the suite that called you is worse than failing. `revoke_write` proves the authority is _gone_ by
+asking again — the read half does not, and does not need to: a leaked read on a scratch cluster is a
+nuisance, a leaked write is what V-CTN-037 exists to prevent. `actor_overlay_can`'s `*/*)` guard is
+[[LSN-044]] property 1b and is load-bearing rather than decorative here: this helper takes its
+resource as a variable, which is precisely the refactor that makes the static half of that rule
+unenforceable, and half its questions are negative — `auth can-i update deployments/scale` asks
+about a Deployment _named_ `scale` and answers `no` for a reason that has nothing to do with the
+policy under test.
+
+**The suite claims no check ID, and that is not an omission.** There is no row in 09 §6 for "the
+ruling this phase made is still true", and minting one would put a line in
+`verification/results.csv` for a property no spec states. Same shape as `verify-phase9.sh`, same
+argument. It is listed in `dev/L2-CHAIN.txt` all the same — what it protects is a decision, and a
+decision nobody re-executes is a decision that was right on the day it was written.
+
+**Carried out, not fixed:** the scratch cluster's `kube-agents-agent-readonly` was four days stale
+and **nothing in the tree detected it** — this suite found it only because it happened to need that
+exact policy. A general "the deployed policies are the tree's policies" line is a candidate for the
+next improvement pass. Separately, `kubeagents-router` is in `CrashLoopBackOff` on the scratch
+cluster with 466 restarts over 39 hours, unrelated to this unit and unexamined.
+
+**The denominator moves by one.** T9b-5a is closed; 5b and 5c remain.

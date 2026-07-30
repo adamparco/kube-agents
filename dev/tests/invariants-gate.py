@@ -1551,7 +1551,10 @@ CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
 # floor sat at 6 against a 14-line chain, so eight lines could have left without a word. Phase 9's
 # milestone will collapse its seven lines into verify-phase9.sh and this number must come down in
 # THAT commit, deliberately, which is the whole point of it being here.
-L2_CHAIN_FLOOR = 16
+# Raised 16 -> 17 on 2026-07-30 (P9-T9b-5a): actor-overlay-admission-l2.sh, the line that executes
+# the phase's admission ruling. Moved in the same commit as the line it counts, which is the only
+# way this ratchet is ever allowed to move upward.
+L2_CHAIN_FLOOR = 17
 # How many scripts the TRANSITIVE scope held when it was widened (2026-07-25, P8-T8). A separate
 # ratchet from the one above because the two guard different things: L2_CHAIN_FLOOR notices a line
 # leaving L2-CHAIN.txt, this one notices a claim-making script leaving the closure — including one
@@ -1561,7 +1564,10 @@ L2_CHAIN_FLOOR = 16
 # joined the closure that day are verify-phase8.sh and verify-phase9.sh — the Phase 8 gate had been
 # outside it for three phases because the standing chain line was a phase behind, so the one script
 # that renders Phase 8's verdict was never asked which artifact it was judging.
-L2_SCOPE_FLOOR = 25
+# Raised 25 -> 26 on 2026-07-30 (P9-T9b-5a): actor-overlay-admission-l2.sh. It joins by being named
+# on a chain line rather than by being reached from one, so both floors move together this time —
+# they will not always, and the day they diverge is the day one of the two is doing work.
+L2_SCOPE_FLOOR = 26
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:

@@ -210,6 +210,33 @@ bash dev/verify/broker-per-agent-l2.sh gke-scratch-kube-agents-dev
 # scratch cluster and nowhere else. Its own anchored guard is what keeps that true.
 bash dev/verify/broker-auth-l2.sh gke-scratch-kube-agents-dev
 
+# NO CHECK ID, deliberately: this line protects a DECISION, the P9-T9b-5a ruling that the test-only
+# tenant write overlay steps outside `vap-agent-readonly`'s population rather than the policy being
+# taught a carve-out for it. There is no row in 09 §6 for "the ruling this phase made is still true",
+# and inventing one would put a line in verification/results.csv for a property no spec states.
+#
+# What it executes is the three premises the ruling rests on, which until this unit existed only as a
+# paragraph in a fixture header reading CEL and predicting an API server: that the shipped write
+# rules wearing `kube-agents/tier` are denied by validation 1, that the same rules wearing
+# `kube-agents/role: actor` are denied by validation 3, and that wearing neither they are admitted.
+# The three variants are DERIVED from `actor-tenant-write-grant.yaml` rather than re-typed, so all
+# three arms are about the rule set that actually gets granted.
+#
+# It is the first line in the repository to assert P2. Every prior admission claim in this tree was a
+# claim that something was DENIED, and a denial is self-witnessing — it cannot be produced by an
+# absent policy. This suite's core arm asserts an object IS ADMITTED, which reads exactly the same
+# green against a policy nobody installed, a binding that never activated, or a policy someone
+# deleted. `p2_assert_policy_live` makes liveness an experiment (a server dry-run of something the
+# policy must reject, polled) instead of a `kubectl get`, and it probes validation 2 so that
+# establishing the precondition does not pre-establish either of the arms.
+#
+# It runs in the terminal group with broker-per-agent-l2.sh and broker-auth-l2.sh, for the same
+# reason: it deletes and re-applies an Agent CR in kubeagents-system. When broker-execute-l2.sh
+# (P9-T9b-5b) lands it goes AFTER this line and not before — that suite cannot reach step 8 without
+# the write authority proved here, because execute/client.go issues real API calls with
+# client.DryRunAll and a server-side dry-run is authorized before it is dry-run.
+bash dev/verify/actor-overlay-admission-l2.sh gke-scratch-kube-agents-dev
+
 # --- Phase 9's gate ------------------------------------------------------------------------------
 # verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the
 # two suites P9-T9b-5 still owes, the L0 chain run as a file, and the whole prior ratchet through the

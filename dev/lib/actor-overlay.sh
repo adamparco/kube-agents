@@ -45,6 +45,9 @@
 # The rendered fixture. Resolved from this file's own location so a caller in dev/verify/ and a
 # caller in dev/tests/ find the same one.
 ACTOR_OVERLAY_FIXTURE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../verify/fixtures" && pwd)/actor-tenant-grant.yaml"
+# The WRITE half (P9-T9b-5a). Layers on top of the read fixture above; read that file's header for
+# the ruling on why it wears neither `kube-agents/tier` nor `kube-agents/role`.
+ACTOR_OVERLAY_WRITE_FIXTURE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../verify/fixtures" && pwd)/actor-tenant-write-grant.yaml"
 # How long RBAC may take to become visible to the authorizer after the RoleBinding is accepted.
 # The API server's RBAC cache is informer-driven, so this is normally sub-second; the wait exists
 # because "normally" is not a property, and a suite that races the cache fails as a 403 that looks
@@ -124,4 +127,158 @@ actor_overlay_revoke() {
     --ignore-not-found >/dev/null 2>&1
   echo "  overlay: revoked the tenant grant in $tenant_ns (namespace left standing)"
   return 0
+}
+
+# --- the WRITE half (P9-T9b-5a) -------------------------------------------------------------------
+#
+# Everything above grants reads and is bounded by the cluster's own admission policy. Everything
+# below grants writes and is not — `dev/verify/fixtures/actor-tenant-write-grant.yaml`'s header
+# carries the ruling and names the three things that bound it instead. Two of those three are the
+# functions here, which is why they assert considerably more than the read half does.
+
+# actor_overlay_can <kubectl-cmd> <subject> <verb> <resource> <want yes|no> <where...>
+#   One authorizer question, with the answer required up front. `<where...>` is passed through to
+#   kubectl verbatim (`-n <ns>`, or `--subresource=scale`, or both). Prints nothing on the expected
+#   answer; prints what it asked and what it got on the unexpected one. rc 0 = as expected.
+#
+#   The `*/*)` arm is [[LSN-044]] property 1b, and it is load-bearing rather than decorative here:
+#   this helper takes its resource as a variable, which is precisely the refactor that makes the
+#   static half of that rule (no `/` in an `auth can-i` positional) unenforceable. Half of the
+#   questions below are negative, and `auth can-i update deployments/scale` asks whether the subject
+#   may update a Deployment NAMED `scale` — a question nobody was ever granted, which answers `no`
+#   for a reason that has nothing to do with the policy under test.
+actor_overlay_can() {
+  local K="$1" subject="$2" verb="$3" resource="$4" want="$5"
+  shift 5
+  local got
+  case "$resource" in
+    */*)
+      # The message deliberately does not SPELL the bad form. `cluster-check-hygiene.py` scans shell
+      # source for a slashed word in a positional slot and cannot tell an invocation from a sentence
+      # describing one, so a guard that quoted the shape it rejects would trip the lint it enforces.
+      echo "  overlay: REFUSING — '$resource' contains a slash. Positionally, kubectl reads that as a" >&2
+      echo "           resource type and an OBJECT NAME, so the question asked is not the one meant." >&2
+      echo "           Pass the subresource as --subresource=<name> instead ([[LSN-044]])." >&2
+      return 2
+      ;;
+  esac
+  got="$($K auth can-i "$verb" "$resource" --as="$subject" "$@" 2>/dev/null)"
+  if [ "$got" != "$want" ]; then
+    echo "  overlay: FAILED — can-i $verb $resource $* --as=$subject => '${got:-<no answer>}', want '$want'" >&2
+    return 1
+  fi
+  return 0
+}
+
+# actor_overlay_apply_write <kubectl-cmd> <agent-namespace> <agent> <tenant-namespace>
+#   Grant the actor the write authority the executor's dry-run apply needs, and do not return until
+#   the authorizer agrees the grant is EXACTLY what the fixture says.
+#   rc 0 = the authority is live and correctly bounded · rc 1 = could not resolve the actor, or the
+#   read half failed · rc 2 = applied but never became effective, or became effective and is WIDER
+#   than the fixture claims.
+#
+#   The read half is applied first and its failure is fatal. That is not convenience: the write
+#   fixture deliberately grants no read verb, so an actor holding only the write Role can `patch` a
+#   Deployment it cannot `get` — and the executor's step-3 pre-state read would fail in a way that
+#   looks exactly like the 403 this whole overlay exists to eliminate.
+actor_overlay_apply_write() {
+  local K="$1" ns="$2" agent="$3" tenant_ns="$4"
+  local sa subject waited rc=0
+
+  actor_overlay_apply "$K" "$ns" "$agent" "$tenant_ns" || return $?
+
+  sa="$(actor_overlay_actor_sa "$K" "$ns" "$agent")" || return 1
+  subject="system:serviceaccount:${ns}:${sa}"
+
+  KAGE_TENANT_NS="$tenant_ns" KAGE_ACTOR_NS="$ns" KAGE_ACTOR_SA="$sa" \
+    envsubst '${KAGE_TENANT_NS} ${KAGE_ACTOR_NS} ${KAGE_ACTOR_SA}' <"$ACTOR_OVERLAY_WRITE_FIXTURE" |
+    $K apply -f - >/dev/null || return 1
+  echo "  overlay: granted $subject WRITE on namespace $tenant_ns (configmaps · deployments · scale)"
+
+  waited=0
+  while [ "$waited" -lt "$ACTOR_OVERLAY_PROPAGATION_TIMEOUT" ]; do
+    if [ "$($K auth can-i patch configmaps -n "$tenant_ns" --as="$subject" 2>/dev/null)" = "yes" ]; then
+      break
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if [ "$waited" -ge "$ACTOR_OVERLAY_PROPAGATION_TIMEOUT" ]; then
+    echo "  overlay: FAILED — $subject still cannot patch configmaps in $tenant_ns after ${waited}s" >&2
+    return 2
+  fi
+
+  # THE POSITIVE HALF — every verb a caller is entitled to rely on. A grant that applied cleanly and
+  # conferred three of its four verbs would otherwise be discovered as a 403 inside the broker,
+  # attributed to the broker.
+  actor_overlay_can "$K" "$subject" create configmaps  yes -n "$tenant_ns" || rc=2
+  actor_overlay_can "$K" "$subject" delete configmaps  yes -n "$tenant_ns" || rc=2
+  actor_overlay_can "$K" "$subject" patch  deployments yes -n "$tenant_ns" || rc=2
+  actor_overlay_can "$K" "$subject" update deployments yes -n "$tenant_ns" --subresource=scale || rc=2
+
+  # THE NEGATIVE HALF — the four ways this fixture could widen without anyone editing its rules
+  # block, each asked of the authorizer rather than inferred from the YAML.
+  #   secrets:          the kind deliberately left out (see the fixture's header)
+  #   kube-system:      namespaced containment, the property the Role kind is supposed to give
+  #   roles:            V-CTN-037 P5 as a runtime fact — authority over RBAC is authority to widen
+  #   nodes:            cluster scope, which no Role can confer and a stray ClusterRoleBinding can
+  actor_overlay_can "$K" "$subject" patch  secrets     no -n "$tenant_ns" || rc=2
+  actor_overlay_can "$K" "$subject" patch  configmaps  no -n kube-system  || rc=2
+  actor_overlay_can "$K" "$subject" create roles       no -n "$tenant_ns" || rc=2
+  actor_overlay_can "$K" "$subject" patch  nodes       no                 || rc=2
+
+  if [ "$rc" -ne 0 ]; then
+    echo "  overlay: the write grant is not what actor-tenant-write-grant.yaml says it is." >&2
+    echo "           Revoking it rather than handing a wider authority to the suite." >&2
+    actor_overlay_revoke_write "$K" "$tenant_ns" >/dev/null 2>&1
+    return 2
+  fi
+
+  echo "  overlay: authorizer agrees after ${waited}s (4 granted verbs yes · secrets, kube-system, RBAC, cluster-scope no)"
+  return 0
+}
+
+# actor_overlay_revoke_write <kubectl-cmd> <tenant-namespace>
+#   Take the write authority back, and PROVE it is gone. Role and RoleBinding only — never the
+#   namespace, and never anything the run wrote into it ([[LSN-045]]).
+#
+#   The read half's revoke asserts nothing and is right not to: a read grant that outlived its suite
+#   on a scratch cluster is untidy. A WRITE grant that outlived its suite is a real over-grant
+#   sitting on a cluster with a filename that says it is only for tests — the exact outcome
+#   V-CTN-037 exists to prevent, one layer down from the file system where V-CTN-037 can see. So
+#   this one asks the authorizer whether the deletion took effect, and returns non-zero if it did
+#   not. Idempotent: a second call on an already-revoked namespace is rc 0, because `no` is `no`.
+#   rc 0 = the authority is gone · rc 2 = it is still there after the timeout.
+actor_overlay_revoke_write() {
+  local K="$1" tenant_ns="$2" waited=0
+  $K -n "$tenant_ns" delete rolebinding kubeagents-actor-tenant-write \
+    --ignore-not-found >/dev/null 2>&1
+  $K -n "$tenant_ns" delete role kubeagents-actor-tenant-write \
+    --ignore-not-found >/dev/null 2>&1
+
+  # The subject is re-derived from the binding we just deleted, so it cannot be asked for directly.
+  # It is instead asked of every subject the write Role could have bound: `auth can-i --as` needs a
+  # name, so the caller's actor is recovered from the READ binding, which revoke leaves for its own
+  # call. When the read half is already gone there is nothing left to prove and rc 0 is honest.
+  local subject
+  subject="$($K -n "$tenant_ns" get rolebinding kubeagents-actor-tenant-readonly \
+    -o jsonpath='{range .subjects[0]}system:serviceaccount:{.namespace}:{.name}{end}' 2>/dev/null)"
+  if [ -z "$subject" ]; then
+    echo "  overlay: revoked the WRITE grant in $tenant_ns (no read binding left to name a subject against)"
+    return 0
+  fi
+
+  while [ "$waited" -lt "$ACTOR_OVERLAY_PROPAGATION_TIMEOUT" ]; do
+    if [ "$($K auth can-i patch configmaps -n "$tenant_ns" --as="$subject" 2>/dev/null)" = "no" ]; then
+      echo "  overlay: revoked the WRITE grant in $tenant_ns — authorizer says no after ${waited}s (namespace left standing)"
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  echo "  overlay: FAILED — $subject can STILL patch configmaps in $tenant_ns ${waited}s after revoke." >&2
+  echo "           A write authority that outlived its suite is on this cluster right now. Look for" >&2
+  echo "           a second RoleBinding naming that subject: kubectl -n $tenant_ns get rolebindings" >&2
+  return 2
 }

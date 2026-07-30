@@ -244,6 +244,20 @@ if p1_gated B "an operator build nobody can name"; then
   run_l2 rollback-replayer dev/verify/rollback-replayer-l2.sh "$DEV_CTX" \
     "a recorded undo plan replays against a live API server and restores the prior state (V-REV-011)"
 fi
+# The write authority the end-to-end arm stands on, and the ruling that grants it. Listed inside B
+# rather than in a section of its own because it is not an acceptance bullet — it is the reason the
+# next arm can exist at all. `execute/client.go` issues real API calls with `client.DryRunAll`, and a
+# server-side dry-run is AUTHORIZED before it is dry-run, so an actor holding only the 06 §2.2.1
+# broker-operations grant gets a 403 at step 8 exactly as a live write would. The overlay supplies
+# that authority; this suite proves the overlay is bounded to what its fixture says, and that the
+# admission ruling behind it — the fixture wears neither agent label, so `vap-agent-readonly` does
+# not select it, so nothing was carved out of a BLOCKING-ALWAYS policy for a test — still holds
+# against the deployed policy rather than against a paragraph someone wrote about the CEL.
+if p1_gated B "an operator build nobody can name"; then
+  run_l2 actor-overlay-admission dev/verify/actor-overlay-admission-l2.sh "$DEV_CTX" \
+    "the test-only tenant write overlay is admitted only because it is outside the policy's population, and grants exactly its four verbs in one namespace (P9-T9b-5a ruling; no check ID)"
+fi
+
 # The bullet's own verb is "flows end-to-end", and none of the four above is that. Detected by
 # artifact so it flips green when T9b-5 lands and not when someone edits this comment.
 EXEC="dev/verify/broker-execute-l2.sh"

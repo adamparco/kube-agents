@@ -1,0 +1,146 @@
+# actor-tenant-write-grant.yaml — a WRITE tenant authority for the phase-9 actor identity, and the
+# object the P9-T9b-5a admission ruling is about.
+#
+# WHY THIS EXISTS
+#   `execute/client.go` issues real API calls with `client.DryRunAll`. A server-side dry-run is
+#   AUTHORIZED FIRST and dry-run second: the API server answers `patch deployments` for the phase-9
+#   actor exactly as it would for a live write, which is 403, because 06 §2.2.1's broker-operations
+#   grant confers no tenant authority. So steps 4 through 9 of the pipeline — the classifier, the
+#   undo-plan generator, the executor, the journal's second write — have never run against a live
+#   API server, and V-REV-001's "shadow mode never mutates" has L1 evidence and nothing above it.
+#
+#   Proving a system does not mutate requires first giving it the authority to. This file is that
+#   authority and nothing else: four write verbs on two workload kinds and one subresource, in one
+#   namespace that exists only for the test.
+#
+# ── THE RULING (P9-T9b-5a, 2026-07-30) ────────────────────────────────────────────────────────────
+#
+#   `actor-tenant-grant.yaml`'s header ends by handing T9b a question it could not answer: a write
+#   grant wearing `kube-agents/tier` is denied by `vap-agent-readonly` validation 1, and one without
+#   it is governed by no admission rule at all. Here is the answer, in three parts.
+#
+#   1. THIS FILE WEARS NEITHER `kube-agents/tier` NOR `kube-agents/role`, and is therefore outside
+#      `kube-agents-agent-readonly`'s `is-agent-rbac` match condition on purpose.
+#
+#      The alternative was to teach the shipped policy about a test fixture — a carve-out, an
+#      exempt-label, a namespace exclusion. Every form of that is a hole in the one runtime backstop
+#      that rejects bad agent RBAC after human review has already passed it, and the hole would be
+#      shaped exactly like the thing an attacker wants: a label that turns the policy off. A policy
+#      weakened to admit a test is not the policy that was reviewed. It is also, mechanically, a
+#      weakening of a BLOCKING-ALWAYS surface, which PROTOCOL §10.2 makes a halt rather than a
+#      judgement call.
+#
+#      So the fixture steps outside the population instead of bending it. The cost is stated in
+#      part 3 and it is real.
+#
+#   2. THE PREMISES ARE EXECUTED, NOT READ OFF THE CEL. Until this unit, "validation 1 denies a
+#      tier-labelled write Role" and "validation 3 denies an actor-labelled tenant Role" were
+#      predictions about what an API server would do, made by reading a CEL expression in a file.
+#      `dev/verify/actor-overlay-admission-l2.sh` submits all three variants — tier-labelled,
+#      actor-labelled, and this one — to a real API server behind a policy proved live by P2, and
+#      records what came back. If a future edit to `vap-agent-readonly` makes this fixture DENIED,
+#      that suite goes red at the point of the change rather than as a confusing 403 three suites
+#      downstream.
+#
+#   3. WHAT ACTUALLY BOUNDS THIS GRANT, since admission does not. Named here in full, because an
+#      unlisted compensating control is the same as none:
+#
+#        · V-CTN-037 (`check_test_only_grants_are_confined`, L0, BLOCKING-ALWAYS) — discovers this
+#          file by the `kube-agents/test-only-grant` marker below and proves the marker never leaves
+#          `dev/`, that nothing outside `dev/` names this file, that no document here is
+#          cluster-scoped, and that no rule reaches `escalate`/`bind`/`impersonate`, `*`, or the
+#          RBAC API group. That is the blast-radius bound: a namespaced Role over two workload
+#          kinds, even if it escaped.
+#        · `actor_overlay_apply_write` in `dev/lib/actor-overlay.sh` — asks the AUTHORIZER, after
+#          applying, whether the grant is what this file says: yes on the granted verbs in this
+#          namespace, no on `secrets`, no on the same verb one namespace over, no on the RBAC group,
+#          no on `impersonate`. A fixture that quietly widened is caught by the function that
+#          applies it rather than by a surprising pass three steps downstream.
+#        · `actor_overlay_revoke_write` — asserts the authority is GONE, by asking the authorizer
+#          again. The read overlay does not assert its own revoke and does not need to: a leaked
+#          read on a scratch cluster is a nuisance. A leaked write is the thing V-CTN-037 exists to
+#          prevent, so the write half's teardown is a claim and not a hope.
+#
+#      The honest summary is that this grant is bounded by a lint, a library and a suite, where the
+#      read grant is bounded by all three PLUS the cluster's own admission policy. That is a
+#      genuinely weaker position and it is the price of not putting a hole in the policy.
+#      `vap-agent-scope` (P10-T1) is what closes it: once an actor's tenant template is compiled in
+#      as a literal allow-list, a write overlay can wear `kube-agents/role: actor`, be selected by
+#      validation 3, and be bounded by the cluster again. This file's header is the thing that
+#      should be re-read on the day that lands.
+#
+# WHY THE BINDING IS UNGOVERNED TOO, AND WHY THAT IS NOT AN EXTRA HOLE
+#   `vap-agent-readonly`'s `matchConstraints` cover `roles` and `clusterroles` and not
+#   `rolebindings`, so the RoleBinding below would be admitted even if it wore every label in the
+#   vocabulary. That is not a second decision — a binding confers exactly the authority of the Role
+#   it names, so a policy that bounds every Role bounds every binding transitively. It is recorded
+#   because a reader checking whether admission governs this file should not have to rediscover it,
+#   and because it is the reason part 1 is about labels and not about resource kinds.
+#
+# WHY THE VERBS ARE THESE AND NOT MORE
+#   Each one is traceable to a call site in `execute/client.go`, and a verb no call site needs is a
+#   verb this fixture must not grant:
+#     create  — `Create`, and `rollback.PlanDryRunner`'s dry-run of a `recreate` undo step
+#     update  — `Scale`, via `SubResource("scale").Update`
+#     patch   — `Apply` (server-side apply is a PATCH) and `Patch`
+#     delete  — `Delete`
+#   `deployments/scale` is a separate rule because a subresource is a separate RBAC object. Note for
+#   anyone asserting against it: `auth can-i` spells that `--subresource=scale`, never
+#   `deployments/scale`, which asks about a Deployment NAMED scale ([[LSN-044]]).
+#
+#   Read verbs are ABSENT. This overlay layers on top of `actor-tenant-grant.yaml`, which grants
+#   them; `actor_overlay_apply_write` applies the read half first and fails if it cannot. Restating
+#   them here would give the write fixture a second, drifting copy of the read fixture's kind list.
+#
+#   `secrets` is absent and is the one omission worth stating, because `developer-team.apply-secret`
+#   is in the envelope corpus and a suite driving it will get a 403 from this grant. That is the
+#   correct answer for a fixture, not a gap to fill: a test-only grant over Secrets on a shared
+#   scratch cluster is the one thing here that would be worth stealing.
+#
+# WHY THE NAMESPACE IS NOT CREATED HERE
+#   `actor-tenant-grant.yaml` creates it, this file layers onto it, and neither deletes it
+#   ([[LSN-045]] — the namespace holds the run's ActionRecords, and an append-only journal a
+#   teardown erases is the lesson). Creating it in both places would mean two definitions of the
+#   test namespace's labels.
+#
+# Rendered by `dev/lib/actor-overlay.sh` via envsubst. Not directly appliable, deliberately:
+#   ${KAGE_TENANT_NS}   the tenant namespace, created by the READ fixture
+#   ${KAGE_ACTOR_NS}    where the actor ServiceAccount lives (the agent's namespace)
+#   ${KAGE_ACTOR_SA}    read from `status.broker.actorServiceAccount`, never recomputed
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubeagents-actor-tenant-write
+  namespace: ${KAGE_TENANT_NS}
+  labels:
+    # NO `kube-agents/tier`, NO `kube-agents/role`. See THE RULING, part 1. Adding either one is not
+    # a label change: it moves this object into `vap-agent-readonly`'s population, where validation
+    # 1 (tier) or validation 3 (actor) denies it, and the apply below starts failing.
+    kube-agents/test-only-grant: "true"
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubeagents-actor-tenant-write
+  namespace: ${KAGE_TENANT_NS}
+  labels:
+    kube-agents/test-only-grant: "true"
+subjects:
+  - kind: ServiceAccount
+    name: ${KAGE_ACTOR_SA}
+    namespace: ${KAGE_ACTOR_NS}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeagents-actor-tenant-write
