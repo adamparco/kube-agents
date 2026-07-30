@@ -64,8 +64,10 @@ from __future__ import annotations
 
 import pathlib
 import re
-import subprocess
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from gitcorpus import repo_files  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
@@ -267,21 +269,11 @@ def read_sources() -> dict[str, str]:
     is enormous, and `k8s-operator/scripts/vars.sh` is gitignored precisely because it holds live
     secrets. Whatever this check reads, it may print in a failure message.
     """
-    listing = subprocess.run(
-        ["git", "-C", str(REPO), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
     sources: dict[str, str] = {}
-    for rel in listing.split("\0"):
-        if not rel:
-            continue
+    for rel in repo_files(REPO):
         if rel != SPEC and not (rel.endswith(".yaml") or rel.endswith(".yaml.tmpl")):
             continue
         path = REPO / rel
-        if not path.is_file():
-            continue
         try:
             sources[rel] = path.read_text()
         except (UnicodeDecodeError, OSError):

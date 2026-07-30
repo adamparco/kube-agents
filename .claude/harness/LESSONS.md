@@ -68,19 +68,19 @@ will start selecting.
 | **LSN-037** | builds, dockerfiles, ci, toolchain | An image build fails on symbols that `go build ./...` resolves fine | closed | `dev/tests/go-build-targets-packages.py` + `--negative-control` (L0-CHAIN) · package-path builds in all 3 Dockerfiles + 2 Makefile recipes |
 | **LSN-039** | wiring, completeness, manifests, install-path | The manifest is correct, the check that reads it is green, and no install path ever applies it | closed | `dev/tests/identity-has-install-path.py` (**V-CMP-007**, L0-CHAIN) — manifest→step reachability over `k8s-operator/scripts/`, 7 properties, 8 negative controls including a reproduction of the original defect · the install path itself in `common.sh` (`render_agent_identity`, `apply_agent_identity`, `delete_agent_identity`) + `agent-identity.yaml.template` + `broker-operations-grant.yaml.template`, applied from `provision_08` and `provision_12` |
 | **LSN-038** | checks, probes, discovery, negative-controls | A guard that fails safe still fails, and a green run is how it tells you | closed | `check_machinery_probes_resolve` + `CLOSED_MARKER` + the Go arm of `_invoked_by` in `invariants-gate.py` (L0-CHAIN) · `dev/test_invariants_gate.py` (19 negative controls) · `dev/tests/golex.py` shared by `scope-label-single-sourced.py` and `api-group-single-sourced.py` |
-| **LSN-040** | seams, integration, assembly, broker | Two packages, each right, mean different things by the same field, and the first caller is the only thing that can tell | **open** | — fix scheduled as **P9-T7c-4**; the gap itself is pinned by `TestApplyFailsClosedAtTheIntegrityCheck` in `internal/broker/pipeline/pipeline_test.go` |
+| **LSN-040** | seams, integration, assembly, broker | Two packages, each right, mean different things by the same field, and the first caller is the only thing that can tell | **open** | — fix scheduled as **P9-T7c-4b** (**V-BRK-022**); the gap itself is pinned by `TestApplyFailsClosedAtTheIntegrityCheck` in `internal/broker/pipeline/pipeline_test.go` |
 | **LSN-041** | admission, CEL, policy, security, fail-open, checks | A security artifact's comment says a control exists; grep says it never did, and the hole it described is live | **closed** | `dev/tests/journal-status-vap-parity.py` + `--negative-control` in `dev/L0-CHAIN.txt` — derives the required CEL variable set from the Go type, so a status field with no policy row fails the build |
 | **LSN-042** | build, ci, deploy, kustomize, install-path, checks | Nothing in the repository ever built the thing the repository installs | closed | `make render` (a prerequisite of `build`/`test`) + `dev/tests/install-render-is-faithful.py` (**V-CMP-008**) for the overlay; `dev/tests/install-artifacts-are-rendered.py` (L0, in `dev/L0-CHAIN.txt`) for the general property — every kustomize directory an install path applies is one `render` builds, both sets derived, and `render` must stay a prerequisite of a CI-invoked target |
 | **LSN-043** | harness, orient, durability, git | The ORIENT drain was done, verified green, and then silently reverted by a branch switch | closed | `.claude/skills/harness-run/SKILL.md` §1 step 6 (commit the drain before SELECT) + `dev/tests/invariants-gate.py` `_drain_is_committed` (L0) — fails on an uncommitted drain, i.e. one that removes inbox items or advances `Last drained`, while an uncommitted human *append* still passes |
 | **LSN-044** | rbac, checks, vacuity, kubectl, L2 | `kubectl auth can-i patch foo/status` asks about a **name**, not a subresource, so the denial it reports is about an object that does not exist | closed | `dev/tests/cluster-check-hygiene.py` property 1 (L0, in `dev/L0-CHAIN.txt`) — no positional word of any `auth can-i` may contain `/`, `for`-lists resolved and expanded, and a resource the scanner cannot resolve obliges the script to carry a `*/*)` guard; local fix is `can()`/`subj()` in `dev/verify/brake-fanout-l2.sh` |
 | **LSN-045** | checks, L2, fixtures, journal, append-only | An L2 suite that writes to an append-only journal can never delete its own namespace, and finds out on the second run | closed | `dev/tests/cluster-check-hygiene.py` property 2 (L0, in `dev/L0-CHAIN.txt`) — no script that creates a DELETE-protected object may delete a namespace, with the protected set derived from the VAPs' own `DELETE` matchConstraints and the CRDs' `spec.names.kind`; `brake-fanout-l2.sh` reuses namespaces, mints IDs per run and matches Events by UID |
 | **LSN-046** | checks, deferrals, record-keeping, false-green, blocking-always, append-only | The deferral row named the category instead of its members, so the one gate arm that hunts deferred BLOCKING-ALWAYS checks matched nothing — and the false pass hiding behind it silenced that arm a second way | closed | `dev/tests/invariants-gate.py` `check_dagger_checks_are_deferred_by_id` (L0, in `dev/L0-CHAIN.txt`) — derives the † set from 09 §6.14 and requires every member to be named **by ID** in the Deferrals table and to hold no uncorrected pass; `_verification_evidence_rows` now emits one line per check ID and honours `**correction**` supersession; the BLOCKING-ALWAYS arm gained a not-yet-due clause keyed to the phase in 09 §6 that expires by itself and fails closed on an unparseable phase |
-| **LSN-047** | mutation, tooling, harness, near-miss | The mutation sweep reports a clean restore and one of the files it restored is now the other one | **open** | — `dev/mutate.sh` already snapshots by **index** and is the fix; nothing makes the harness reach for it. Candidate form is a skill change (`harness-run` VERIFY), scheduled for the next improvement pass |
-| **LSN-048** | mutation, tooling, checks, vacuity, false-finding | A mutation sweep names a test that does not exist, and reports the mutation as **survived** — a hole that is not there, indistinguishable from one that is | **open** | — `go test -run` with a pattern matching nothing **exits 0**, so `! check` is false and the mutation scores as uncaught. Fix is a `go test -list` guard before every mutation; same home as [[LSN-047]] (`dev/mutate.sh` / `harness-run` §5), scheduled for the next improvement pass so the two land together |
-| **LSN-049** | mutation, tooling, checks, vacuity, false-finding | The sweep's own shell quoting kept a mutation from ever being applied, and `rc == 0` was scored as "the suite passed with it in place" — an invented hole, reported twice | **open** | — A needle containing `""` closed the double-quoted `bash -c` argument early; the applier died, `&&` short-circuited, the run still exited 0. [[LSN-048]] with the sign flipped, same root: **scoring an exit code never established to be the test suite's**. Fix is the sanctioned-sweep change LSN-047/048 already wait on — mutation text never crosses a shell parse, the applier refuses unless the target appears exactly once, and each row names the test that must fail. Caught only because rows name their catching test |
-| **LSN-050** | harness, checks, coverage, false-green, pre-commit | Seven L0 checks discover files with `git ls-files` and no `--others`, so the chain is blind to any file not yet `git add`ed — which is every brand-new file at the one moment the chain is documented to run | **open** | — A new test file's fake error string named the wrong API group. The full L0 chain, run before staging, printed nothing; CI caught it a push later. `dev/tests/api-group-single-sourced.py`, `cli-contract.py`, `install-artifacts-are-rendered.py`, `install-render-is-faithful.py`, `one-broker-per-agent.py`, `invariants-gate.py` and `scope-label-single-sourced.py` all share the defect. Fix is one shared discovery helper using `ls-files --others --exclude-standard --cached`, plus a gate check that no L0 script calls `ls-files` without it |
+| **LSN-047** | mutation, tooling, harness, near-miss | The mutation sweep reports a clean restore and one of the files it restored is now the other one | closed | `dev/mutate.py` + `dev/test_mutate_sweep.py` (L0, in `dev/L0-CHAIN.txt` via `unittest discover dev`) — the sweep is **configured, not authored**: a spec under `verification/mutants/<CHECK-ID>.json` drives a runner that snapshots by **position**, and `.claude/skills/harness-run/SKILL.md` §5 + `harness-verify` §3 route every non-vacuity sweep to it, which is the half `dev/mutate.sh` could never supply |
+| **LSN-048** | mutation, tooling, checks, vacuity, false-finding | A mutation sweep names a test that does not exist, and reports the mutation as **survived** — a hole that is not there, indistinguishable from one that is | closed | `dev/mutate.py` + `dev/test_mutate_sweep.py` (L0, in `dev/L0-CHAIN.txt` via `unittest discover dev`) — a spec carrying `-run` is refused outright, every catcher is checked against `go test -list` **before the first mutation**, and a mutant the sweep could not evaluate scores `BROKEN` rather than joining the survivor count |
+| **LSN-049** | mutation, tooling, checks, vacuity, false-finding | The sweep's own shell quoting kept a mutation from ever being applied, and `rc == 0` was scored as "the suite passed with it in place" — an invented hole, reported twice | closed | `dev/mutate.py` + `dev/test_mutate_sweep.py` (L0, in `dev/L0-CHAIN.txt` via `unittest discover dev`) — needles and replacements live in JSON and are applied by `str.replace` in-process, so nothing crosses a shell parse; the applier refuses unless the needle appears exactly once, which is also how the sweep observes that the mutation LANDED; and `rc != 0` is not a catch, every row naming the test that must be in the failing set |
+| **LSN-050** | harness, checks, coverage, false-green, pre-commit | Seven L0 checks discover files with `git ls-files` and no `--others`, so the chain is blind to any file not yet `git add`ed — which is every brand-new file at the one moment the chain is documented to run | closed | `dev/tests/gitcorpus.py` + `check_l0_corpus_is_not_index_only` in `dev/tests/invariants-gate.py` (L0, in `dev/L0-CHAIN.txt`) — one `--cached --others --exclude-standard` enumerator, now used by all ten call sites, and a gate arm that AST-parses every `.py` and `.sh` under `dev/` and fails any `ls-files` argv without `--others`. The gate covers the whole tree rather than just the chain, because the failure mode is the eighth script copying the seventh |
 
-**Open: 5 of 50** (LSN-040, LSN-047, LSN-048, LSN-049, LSN-050).
+**Open: 1 of 50** (LSN-040 — mechanization scheduled as **P9-T7c-4b** / **V-BRK-022**).
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2072,7 +2072,9 @@ enforced — the same gap between an artifact and its effect), [[lsn-036]] (enum
 
 ## LSN-040 — Two packages, each right, about the same word
 
-**Tag:** seams, integration, assembly, broker · **Status: open** (fix scheduled as **P9-T7c-4**).
+**Tag:** seams, integration, assembly, broker · **Status: open** (fix scheduled as **P9-T7c-4b**,
+which adds **V-BRK-022**: every verb in the envelope's closed enum executes end to end through the
+assembled pipeline, the verb set discovered from the enum rather than restated).
 
 **Trigger.** Assembling steps 3–11 into a working pipeline (P9-T7c-1) and driving one real envelope
 through it end to end. The very first happy-path fixture — `apply` a ConfigMap — was refused at step
@@ -2331,8 +2333,12 @@ mechanics resolved by content, never by name).
 ## LSN-044 — `auth can-i patch foo/status` asks about a name, not a subresource
 
 **Tags:** rbac, checks, vacuity, kubectl, L2 · **Phase:** 9 (P9-T7c-3c-ii-b-2-b) ·
-**Status:** open — the local guard shipped with the check; the repo-wide grep is for the next
-`harness-improve`
+**Status:** closed — `dev/tests/cluster-check-hygiene.py` property 1, in `dev/L0-CHAIN.txt`
+
+This header said `open` for one improvement pass after the index row said `closed`, which is its own
+small defect: the count that decides whether the next invocation is an improvement pass is kept in
+two places, and one of them was stale. `check_lesson_status_matches_its_index_row` in
+`dev/tests/invariants-gate.py` now fails on the disagreement.
 
 **What happened.** `brake-fanout-l2.sh` asserts C-BR's grant against the live API server by
 impersonating its ServiceAccount. The `actionrecords/status` row was written the way the RBAC rule
@@ -2554,7 +2560,9 @@ it), [[lsn-038]] (a guard that cannot run must not score as a pass).
 ## LSN-047 — The mutation sweep backed up two files under one name and restored the wrong one over the other
 
 **Tags:** mutation, tooling, harness, near-miss · **Phase:** 9 (P9-T7c-3c-iii, 2026-07-29) ·
-**Status:** open — the mechanization exists and nothing routes work to it; see "What the fix is"
+**Status:** closed — `dev/mutate.py` (the sweep is configured, not authored) + `harness-run` §5 and
+`harness-verify` §3, which route every non-vacuity sweep to it. Tested by `dev/test_mutate_sweep.py`,
+whose first case is this one: two files called `cooldown.go`, snapshotted and both restored.
 
 **What happened.** P9-T7c-3c-iii added `internal/broker/cooldown/cooldown.go` and changed
 `internal/broker/verify/cooldown.go`. The unit's mutation sweep was a throwaway Python driver that
@@ -2604,8 +2612,10 @@ operation that verifies it ran rather than that it worked).
 
 ## LSN-048 — The sweep could not find its own test, and called that a hole
 
-**Tag:** mutation, tooling, checks, vacuity, false-finding · **Status: open** (same home and same
-pass as [[lsn-047]]).
+**Tag:** mutation, tooling, checks, vacuity, false-finding · **Status: closed** — `dev/mutate.py`
+refuses a spec carrying `-run`, verifies every declared catcher against `go test -list` before the
+first mutation, and scores an unevaluatable mutant `BROKEN` rather than counting it as a survivor.
+`dev/test_mutate_sweep.py::TheCatcherMustExist` is this trigger, run for run.
 
 **Trigger.** The P9-T7c-3d-ii-a mutation sweep, eight mutations over `broker/brake.go` and
 `pipeline/pipeline.go`. It came back **5/8**, with three lines reading
@@ -2657,8 +2667,10 @@ the work takes).
 
 ## LSN-049 — The sweep's own shell quoting invented a hole, and rc==0 called it a result
 
-**Tag:** mutation, tooling, checks, vacuity, false-finding · **Status: open** (same home and same
-pass as [[lsn-047]] and [[lsn-048]]).
+**Tag:** mutation, tooling, checks, vacuity, false-finding · **Status: closed** — `dev/mutate.py`
+keeps mutation text out of every shell parse (JSON in, `str.replace` in-process), refuses a needle
+it cannot find exactly once, and scores on the failing-test SET rather than on `rc`.
+`dev/test_mutate_sweep.py::MutationTextNeverCrossesAShellParse` replays row 14's `""` needle.
 
 **Trigger.** The P9-T8a sweep, 15 mutations over `pipeline/pipeline.go` and `common_types.go`. Row
 14 — a nil `OperationsSpec` reading as shadowed — came back `ESCAPED <- nothing failed`, twice, on
@@ -2715,7 +2727,8 @@ nothing routes work to), [[lsn-035]] (verifying that an operation ran, not that 
 ## LSN-050 — The pre-commit gate cannot see a file that has not been committed
 
 **Area:** harness, checks, coverage, false-green, pre-commit
-**Status:** open
+**Status:** closed — `dev/tests/gitcorpus.py` (one enumerator, ten call sites) +
+`check_l0_corpus_is_not_index_only` in `dev/tests/invariants-gate.py`, both on `dev/L0-CHAIN.txt`
 **Earned:** 2026-07-29, P9-T7c-3d-iv-a
 
 **What happened.** A new test file, `internal/broker/policy/identity_test.go`, contained a fake

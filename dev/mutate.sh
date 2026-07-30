@@ -17,6 +17,17 @@
 #
 # Restores on success, on failure, and on SIGINT/SIGTERM. The command's exit code is passed
 # through, so this composes: `dev/mutate.sh f -- sh -c 'mutate && ! check'`.
+#
+# THIS IS THE LAYER BELOW A SWEEP, and it cannot see any of LSN-047/048/049. It does not know what
+# your mutation was, whether it landed, or which test was supposed to catch it — it only guarantees
+# the files come back. A sweep that scores mutants belongs in `dev/mutate.py`, driven by a spec
+# under `verification/mutants/<CHECK-ID>.json`; `harness-run` §5 requires it.
+#
+# Even for a one-off, keep the mutation out of the shell. On 2026-07-29 a needle containing
+# backticks was pasted into an unquoted heredoc inside `-- sh -c '...'`; the backticks ran as
+# command substitution, the needle never matched, and the check under test reported ✓ — a
+# fabricated ESCAPE from a mutation that was never applied. Write the mutator to a file, and have
+# it assert the edit landed before running anything.
 set -uo pipefail
 
 usage() {

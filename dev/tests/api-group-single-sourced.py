@@ -34,10 +34,10 @@ from __future__ import annotations
 
 import pathlib
 import re
-import subprocess
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from gitcorpus import repo_files  # noqa: E402
 from golex import strip_go_comments  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -77,13 +77,10 @@ MIN_FILES_NAMING_THE_GROUP = 5
 
 
 def tracked_files() -> list[pathlib.Path]:
-    out = subprocess.run(
-        ["git", "-C", str(REPO), "ls-files", "-z"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    return [REPO / p for p in out.split("\0") if p]
+    """Tracked AND new-but-not-ignored. See `gitcorpus`, and [[LSN-050]] for what tracked-only cost:
+    this check ran over 115 files and passed, and the file with the unserved group in it was the one
+    the unit had just written and not yet staged."""
+    return [REPO / p for p in repo_files(REPO)]
 
 
 def strip_comments(path: pathlib.Path, text: str) -> str:
