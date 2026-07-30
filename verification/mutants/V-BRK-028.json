@@ -1,0 +1,352 @@
+{
+  "_comment": "V-BRK-028 -- the agent-side envelope builder computes the broker's idempotency key. Every mutant edits ALL THREE tier copies, not just platform's, so that the tier-parity arm stays green and the conformance arms are forced to be the catcher. M16 is the exception and the control for that arm: it drifts exactly one tier. Run with `python3 dev/mutate.py verification/mutants/V-BRK-028.json`.",
+  "suite": {
+    "kind": "unittest",
+    "dir": ".",
+    "packages": ["discover", "-p", "test_action_envelope.py", "dev"]
+  },
+  "mutants": [
+    {
+      "id": "M1-secret-material-is-hashed-raw",
+      "why": "The redaction stops running, so the key is computed over the Secret's real base64 material -- both a wrong key and credential bytes in the hash input. This is the single most consequential divergence the module can have.",
+      "catcher": "test_every_tier_reproduces_every_fixture_key",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "if out.get(\"kind\") == \"Secret\":",
+          "replace": "if False and out.get(\"kind\") == \"Secret\":"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "if out.get(\"kind\") == \"Secret\":",
+          "replace": "if False and out.get(\"kind\") == \"Secret\":"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "if out.get(\"kind\") == \"Secret\":",
+          "replace": "if False and out.get(\"kind\") == \"Secret\":"
+        }
+      ]
+    },
+    {
+      "id": "M2-operations-are-not-sorted",
+      "why": "The key starts depending on the order the caller happened to list the operations in, so an LLM retry that reorders them executes the same write a second time.",
+      "catcher": "test_reordering_operations_does_not_change_the_key",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "reduced.sort(key=operation_sort_key)",
+          "replace": "pass  # mutant"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "reduced.sort(key=operation_sort_key)",
+          "replace": "pass  # mutant"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "reduced.sort(key=operation_sort_key)",
+          "replace": "pass  # mutant"
+        }
+      ]
+    },
+    {
+      "id": "M3-kind-is-not-injected-into-a-bare-payload",
+      "why": "A merge-patch body is `{\"data\": {...}}` with no kind, so without the injection every Secret patch reaches the hash undigested. The fixture corpus cannot see this: its Secret payloads all declare their own kind.",
+      "catcher": "test_a_kindless_secret_payload_is_digested_via_the_target_kind",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "if not payload.get(\"kind\") and kind:",
+          "replace": "if False:"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "if not payload.get(\"kind\") and kind:",
+          "replace": "if False:"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "if not payload.get(\"kind\") and kind:",
+          "replace": "if False:"
+        }
+      ]
+    },
+    {
+      "id": "M4-the-injected-kind-stays-in-the-payload",
+      "why": "A payload that declared its kind and one that relied on the target's stop producing the same key for the same write, so half of an agent's patches are refused depending on how it spelled them.",
+      "catcher": "test_the_injected_kind_does_not_become_part_of_the_key",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "clean.pop(\"kind\", None)",
+          "replace": "pass  # mutant"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "clean.pop(\"kind\", None)",
+          "replace": "pass  # mutant"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "clean.pop(\"kind\", None)",
+          "replace": "pass  # mutant"
+        }
+      ]
+    },
+    {
+      "id": "M5-a-json-patch-value-is-not-digested-by-path",
+      "why": "In a JSON Patch the field name lives in `path` and nowhere else, so this is the one redaction the field-based sanitizer cannot do. Losing it puts plaintext credential material into the key input for every `replace /data/...` an agent sends.",
+      "catcher": "test_a_shape_no_fixture_covers",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "path.startswith(\"/data/\") or path.startswith(\"/stringData/\")",
+          "replace": "path.startswith(\"/dataXX/\")"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "path.startswith(\"/data/\") or path.startswith(\"/stringData/\")",
+          "replace": "path.startswith(\"/dataXX/\")"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "path.startswith(\"/data/\") or path.startswith(\"/stringData/\")",
+          "replace": "path.startswith(\"/dataXX/\")"
+        }
+      ]
+    },
+    {
+      "id": "M6-object-keys-sort-by-code-point",
+      "why": "Python's default sort disagrees with UTF-16 for supplementary-plane characters, which is a silent key divergence on exactly the inputs nobody writes a fixture for.",
+      "catcher": "test_keys_sort_by_utf16_code_unit_not_code_point",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "sorted(v, key=_utf16_key)",
+          "replace": "sorted(v)"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "sorted(v, key=_utf16_key)",
+          "replace": "sorted(v)"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "sorted(v, key=_utf16_key)",
+          "replace": "sorted(v)"
+        }
+      ]
+    },
+    {
+      "id": "M7-small-magnitudes-render-as-decimals",
+      "why": "`1e-7` becomes `0.0000001`, so any payload carrying a small float hashes differently in Python than in Go.",
+      "catcher": "test_number_rendering_follows_ecmascript",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "elif -6 < pos <= 0:",
+          "replace": "elif -7 < pos <= 0:"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "elif -6 < pos <= 0:",
+          "replace": "elif -7 < pos <= 0:"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "elif -6 < pos <= 0:",
+          "replace": "elif -7 < pos <= 0:"
+        }
+      ]
+    },
+    {
+      "id": "M8-large-magnitudes-render-as-integers",
+      "why": "`1e21` becomes a 22-digit integer literal. Same divergence at the other end of the range.",
+      "catcher": "test_number_rendering_follows_ecmascript",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "if k <= pos <= 21:",
+          "replace": "if k <= pos <= 22:"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "if k <= pos <= 21:",
+          "replace": "if k <= pos <= 22:"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "if k <= pos <= 21:",
+          "replace": "if k <= pos <= 22:"
+        }
+      ]
+    },
+    {
+      "id": "M9-omitempty-is-ignored",
+      "why": "An absent `group` or `namespace` is emitted as JSON null instead of being omitted, which is what Go's struct tags do. Every core-group target -- ConfigMap, Secret, Pod -- gets the wrong key.",
+      "catcher": "test_every_tier_reproduces_every_fixture_key",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "if omitempty and _omitempty(value):",
+          "replace": "if False and omitempty and _omitempty(value):"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "if omitempty and _omitempty(value):",
+          "replace": "if False and omitempty and _omitempty(value):"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "if omitempty and _omitempty(value):",
+          "replace": "if False and omitempty and _omitempty(value):"
+        }
+      ]
+    },
+    {
+      "id": "M10-the-caller-dict-is-hashed-verbatim",
+      "why": "The Go side decodes into a struct and drops fields it has no name for. A Python side that hashes the caller's dict computes a key the broker never reproduces the moment anything adds a field -- including a future envelope version this image predates.",
+      "catcher": "test_an_unknown_field_is_dropped_before_hashing",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "out: dict[str, Any] = {\"op\": op.get(\"op\") or \"\"}",
+          "replace": "out: dict[str, Any] = dict(op)"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "out: dict[str, Any] = {\"op\": op.get(\"op\") or \"\"}",
+          "replace": "out: dict[str, Any] = dict(op)"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "out: dict[str, Any] = {\"op\": op.get(\"op\") or \"\"}",
+          "replace": "out: dict[str, Any] = dict(op)"
+        }
+      ]
+    },
+    {
+      "id": "M11-dry-run-is-not-part-of-the-key",
+      "why": "A `plan_action` and the `submit_action` that follows it become one submission, so the real write returns the plan's outcome and never executes.",
+      "catcher": "test_dry_run_changes_the_key",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "\"dryRun\": bool(dry_run), \"operations\": reduced",
+          "replace": "\"dryRun\": False, \"operations\": reduced"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "\"dryRun\": bool(dry_run), \"operations\": reduced",
+          "replace": "\"dryRun\": False, \"operations\": reduced"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "\"dryRun\": bool(dry_run), \"operations\": reduced",
+          "replace": "\"dryRun\": False, \"operations\": reduced"
+        }
+      ]
+    },
+    {
+      "id": "M12-identity-is-not-part-of-the-key",
+      "why": "Two agents submitting the same operations collide, so one tier's submission dedups another tier's away.",
+      "catcher": "test_identity_changes_the_key",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "{\"agentIdentity\": agent_identity, \"dryRun\"",
+          "replace": "{\"agentIdentity\": \"\", \"dryRun\""
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "{\"agentIdentity\": agent_identity, \"dryRun\"",
+          "replace": "{\"agentIdentity\": \"\", \"dryRun\""
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "{\"agentIdentity\": agent_identity, \"dryRun\"",
+          "replace": "{\"agentIdentity\": \"\", \"dryRun\""
+        }
+      ]
+    },
+    {
+      "id": "M13-an-empty-identity-is-accepted",
+      "why": "A key computed over an empty identity collides across every agent in the cluster, and the caller is never told the config that carries the scope identity failed to load.",
+      "catcher": "test_an_empty_identity_is_refused_not_defaulted",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "if not agent_identity:",
+          "replace": "if False:"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "if not agent_identity:",
+          "replace": "if False:"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "if not agent_identity:",
+          "replace": "if False:"
+        }
+      ]
+    },
+    {
+      "id": "M14-control-characters-are-emitted-raw",
+      "why": "The canonical form stops being valid JSON, and a payload carrying one byte below 0x20 hashes differently from the Go.",
+      "catcher": "test_control_characters_escape_as_lowercase_hex",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "elif ch < \"\\x20\":",
+          "replace": "elif False:"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "elif ch < \"\\x20\":",
+          "replace": "elif False:"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "elif ch < \"\\x20\":",
+          "replace": "elif False:"
+        }
+      ]
+    },
+    {
+      "id": "M15-two-target-shapes-are-accepted",
+      "why": "An operation carrying both a `target` and a `targetSelector` has two readings, and picking one silently is how a single-object patch becomes a fan-out.",
+      "catcher": "test_two_target_shapes_are_refused",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "if len(shapes) != 1:",
+          "replace": "if len(shapes) > 2:"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "if len(shapes) != 1:",
+          "replace": "if len(shapes) > 2:"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "if len(shapes) != 1:",
+          "replace": "if len(shapes) > 2:"
+        }
+      ]
+    },
+    {
+      "id": "M16-one-tier-drifts",
+      "why": "The three copies are identical by convention, and nothing outside this check compares them. A drift in one tier means the same operations hash to different keys depending on which image the agent happens to run -- and two thirds of the fleet keeps working, which is the hardest version of this to notice.",
+      "catcher": "test_the_copies_are_byte_identical",
+      "edits": [
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "KEY_PREFIX = \"sha256:\"",
+          "replace": "KEY_PREFIX = \"sha256:\"  # mutant"
+        }
+      ]
+    }
+  ]
+}

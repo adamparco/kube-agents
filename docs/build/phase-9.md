@@ -911,7 +911,7 @@ type safety over a value nothing in this process reads. They are rendered as `un
           `internal/broker/execute` already imports `internal/journal`, so a journal-side adapter
           could not hold the `var _ execute.Journal` assertion without a cycle — the
           `internal/broker/bodystore` precedent, followed deliberately.
-          **Check: V-BRK-023** (new, L1). The gap to **V-BRK-022** is not an error: that ID is
+          **Check: V-BRK-028** (new, L1). The gap to **V-BRK-022** is not an error: that ID is
           reserved above by T7c-4 and IDs are never renumbered (09 §4).
           **What the check is actually about.** `ConfirmDurable` receives only `(ctx, actionID)`, so
           it cannot compare the stored record against caller intent. What it can check is the thing
@@ -960,7 +960,7 @@ type safety over a value nothing in this process reads. They are rendered as `un
         - **P9-T7c-3d-iii-b — `classify.ActionHistory`** ✅ (2026-07-29) — the journal-derived
           novel-action source, and the two ways 06 §4.2's escalation could be switched off.
           `internal/broker/history` (new package), `classify.New`/`classify.go`,
-          `policy.NewSource`. **V-BRK-024** (new, L1, BLOCKING-ALWAYS) in 09 §6.14, bound in
+          `policy.NewSource`. **V-BRK-029** (new, L1, BLOCKING-ALWAYS) in 09 §6.14, bound in
           `traceability.yaml` under `06§10#29` and `06§10#36`. Evidence: **100.0% statement
           coverage** under `-race`, 17 hermetic functions / 58 cases plus 6 envtest functions,
           and a **35/37 mutation sweep, 0 escaped, 0 broken**.
@@ -1796,6 +1796,14 @@ dry-run is unspecified** — `notifyOn` is class-keyed and never mentions `dryRu
 ii-b), V-RUN-**015**, V-CMP-**025**. V-CMP 009 and 012–019 exist nowhere and were never allocated —
 they are gaps, not retirements (no `RETIRED` row, which §9.6 requires), so take max+1.
 
+> **Stale as of 2026-07-30 — do not read the V-BRK number off this line.** P9-T8b-1 allocated
+> V-BRK-023 from it and `dev/tests/spec-ids.py` refused the commit: 023 through **027** were taken
+> between the recon and the unit (023 write-ahead confirmation, 024–027 the pipeline units), so the
+> new check became **V-BRK-028**. The list was correct when written and is a snapshot, not a
+> reservation. **The gate caught it, so nothing shipped wrong** — which is the argument for
+> `grep -rho "V-BRK-[0-9]\{3\}" docs/ verification/ dev/ k8s-operator/ .claude/ | sort -u | tail -1`
+> at allocation time rather than trusting any written-down "next free".
+
 ---
 
 ## P9-T8 ships as two units — T8a (the mechanism) and T8b (the surface)
@@ -1816,6 +1824,9 @@ executes for real for any caller that omits `dryRun`, and the operator-side swit
 that has to already exist. Shipping T8a now inverts the task table's ordering deliberately. **T8b
 carries no BLOCKING-ALWAYS check**, so waiting on it costs nothing the gate will notice; V-GAT-019's
 phase in 09 §6.14 is 10 regardless.
+
+> **T8b was unblocked on 2026-07-30 and split again, into T8b-1…4.** See
+> "P9-T8b splits into four" below; the row above is superseded by that table.
 
 ### What T8a found
 
@@ -1993,6 +2004,67 @@ first form was caught — `Contested: nil` orphans the `broker` import, so it ne
 and known to be — rebuilding it from `ActionRecord.status.contested` is P9-T6c's, which is still not
 scheduled anywhere. Empty answers "not contested" for everything, which is the loosening direction;
 the only alternative available today is nil, and nil makes the brake refuse every action.
+
+---
+
+## P9-T8b splits into four — the survey that forced it
+
+T8b was unblocked by T7c-3d-iv-b. Surveying its surface before starting it showed the row is four
+deliverables wearing one name, and two of them cannot be checkpointed in a session:
+
+- **`submit-suggestion`'s retirement** touches **~110 files** — all three tiers' `SKILL.md` and
+  `scripts/submit_suggestion.py`, `dev/test_submit_suggestion.py`, `examples/gitops-repo/`,
+  `agent_manifests.go`, `internal/testing/`, `verification/traceability.yaml`, `INSTALL.md`,
+  `deploy/shared/defaults/config.yaml`, the design docs and the site. And 07 §2 phases the per-tier
+  replacement as **P10-T3**, so doing it here is pulling Phase 10 work into Phase 9.
+- **The L2 shadow soak** needs a live scratch cluster, rebuilt agent images through Cloud Build, and
+  journal mining over real records. That is its own session and its own preconditions (P1, P3, P4).
+
+The remaining two halves are hermetic and each is a unit. The split:
+
+| Unit         | What                                                                                                                                                                                | Checks                   | Blocked on                     |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ | ------------------------------ |
+| **P9-T8b-1** | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic   | **V-BRK-028** (new)      | nothing                        |
+| **P9-T8b-2** | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029** (new)      | T8b-1                          |
+| **P9-T8b-3** | The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)                                                                                      | V-GAT-019 (phase **10**) | T8b-2 — **and it is P10 work** |
+| **P9-T8b-4** | The L2 shadow soak with journal mining                                                                                                                                              | V-REV-001 (L2)           | T8b-3, a live scratch cluster  |
+
+**Why T8b-1 is the first half and not an arbitrary slice.** Everything downstream is transport and
+prose; this is the only part with a _correctness_ obligation the broker will enforce. The broker
+**recomputes** `idempotencyKey` and `CompareIdempotencyKey` refuses a mismatch — so an agent-side
+builder that diverges by one byte does not degrade, it makes **every write in the fleet refused**,
+with a message about a key rather than about the divergence. And the divergence is not hypothetical:
+the key is computed over the operations _after_ `journal.Sanitize`, so a Python side that forgets to
+digest a Secret's `data` gets a different key **and** has credential material in the hash input.
+
+**This is a second definition site, deliberately, and the join is the check.** [[LSN-040]] and
+[[LSN-041]] both say a second copy of a rule is only allowed when something mechanically compares it
+to the first. There is no way to avoid the copy — the agent image is Python, the broker is Go, and
+06 §9 puts the key computation in the MCP tool. So the copy is made and joined:
+`verification/fixtures/envelopes/valid/` already carries **six envelopes, each with the key its own
+operations hash to** plus `identities.json`, and `TestValidFixtureIdempotencyKeys` pins the Go side
+against exactly that corpus. **V-BRK-028 runs the Python builder over the same six files and asserts
+the same six keys.** No golden file, no second corpus, nothing to drift: the two implementations are
+compared through an artifact that already exists and that the Go test already depends on. The corpus
+is not incidental to this choice — it covers a Secret `apply` (the sanitizer), a selector fan-out
+delete and a three-operation envelope with mixed verbs (the sort order), which are the three places
+a re-implementation actually goes wrong.
+
+**Where it lives.** `agents/<tier>/scripts/action_envelope.py`, byte-identical across the three
+tiers — the shape `platform_mcp_server.py` and `agent_common_server.py` already have. The tests go
+in **`dev/test_action_envelope.py`**, one copy, parameterised over all three tiers, rather than
+three copies under `agents/*/scripts/`: that placement makes the tier-parity assertion free and
+picked up by `python3 -m unittest discover dev`, which is already an L0 chain line — so no
+`L0-CHAIN.txt` edit is owed. Nothing about tier parity is currently enforced for `agents/*/scripts/`
+at all; the three copies of `platform_mcp_server.py` are identical by luck. That is a finding, filed
+below, not fixed here.
+
+**`agentIdentity` is the scope string, not the SA username.** `identities.json` reads
+`platform/adamparco-kage` and `developer-team/adamparco-kage/gke-scratch-kube-agents-dev/checkout` —
+the agent's own scope identity, which the pod knows from its rendered config. The broker's
+`Identity.Username` (`system:serviceaccount:…`) is the _authentication_ subject and is a different
+string; a builder that used it would compute keys nothing accepts. This is the sort of thing that is
+obvious once seen and invisible from the spec text, so it is written down here.
 
 ---
 
