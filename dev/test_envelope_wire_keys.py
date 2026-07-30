@@ -138,6 +138,7 @@ class TestEveryEmittedKeyIsDecodable(unittest.TestCase):
     #: builder function -> the Go struct its return value is decoded into.
     BUILDERS = (
         ("broker_client", "session_trace", "Trace"),
+        ("broker_client", "submit_action", "Trigger"),
         ("action_envelope", "build_envelope", "Envelope"),
     )
 

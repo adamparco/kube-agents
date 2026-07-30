@@ -529,7 +529,15 @@ def send_notification(message: str, session_id: str = "") -> str:
 
 
 @mcp.tool()
-def submit_action(intent: str, operations: list[dict], rationale: str = "", require_approval: bool = False) -> str:
+def submit_action(
+    intent: str,
+    operations: list[dict],
+    trigger_source: str,
+    trigger_ref: str = "",
+    trigger_detail: str = "",
+    rationale: str = "",
+    require_approval: bool = False,
+) -> str:
     """
     Perform a change to the cluster or cloud. This is the ONLY way to write anything.
 
@@ -542,14 +550,40 @@ def submit_action(intent: str, operations: list[dict], rationale: str = "", requ
         intent: One sentence, for a human, saying what this change is for.
         operations: The 06 §4.1 operations. Each has an `op` (create|apply|patch|delete|scale) and
             exactly one of `target`, `targetSelector` or `cloudTarget`.
+        trigger_source: What caused you to act. Required, and one of exactly seven words:
+            `chat` (a human asked you, in conversation), `undo` (a human asked you to reverse
+            something), `watch` (you saw an object change), `alert` (an alert fired), `cron` (a
+            schedule), `delegation` (another agent asked you), `escalation` (you were escalated
+            to). The first two mean a human asked; the other five mean you decided -- that split
+            is what the autonomy reporting counts, so say which one is true rather than the one
+            that sounds safest.
+        trigger_ref: Optional. What to look at: the alert name, the object, the action id you were
+            delegated.
+        trigger_detail: Optional. One line of corroboration for the trigger itself, not for the
+            change -- the change's reason is `intent`.
         rationale: Optional reasoning. Recorded and never treated as a risk signal.
         require_approval: Ask for human approval even if the classifier would not require it.
     """
-    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)
+    return broker_client.submit_action(
+        intent,
+        operations,
+        trigger_source=trigger_source,
+        trigger_ref=trigger_ref,
+        trigger_detail=trigger_detail,
+        rationale=rationale,
+        require_approval=require_approval,
+    )
 
 
 @mcp.tool()
-def plan_action(intent: str, operations: list[dict], rationale: str = "") -> str:
+def plan_action(
+    intent: str,
+    operations: list[dict],
+    trigger_source: str,
+    trigger_ref: str = "",
+    trigger_detail: str = "",
+    rationale: str = "",
+) -> str:
     """
     Preview a change without making it: the risk classification, the blast radius and the undo plan.
 
@@ -559,9 +593,21 @@ def plan_action(intent: str, operations: list[dict], rationale: str = "") -> str
     Args:
         intent: One sentence, for a human, saying what the change would be for.
         operations: The same operations you would pass to `submit_action`.
+        trigger_source: The same seven words `submit_action` takes, and the same one you will pass
+            when you submit -- a plan filed under a different origin than the write it previews
+            makes the pair unreadable afterwards.
+        trigger_ref: Optional. The same value you would pass to `submit_action`.
+        trigger_detail: Optional. The same value you would pass to `submit_action`.
         rationale: Optional reasoning. Recorded and never treated as a risk signal.
     """
-    return broker_client.plan_action(intent, operations, rationale=rationale)
+    return broker_client.plan_action(
+        intent,
+        operations,
+        trigger_source=trigger_source,
+        trigger_ref=trigger_ref,
+        trigger_detail=trigger_detail,
+        rationale=rationale,
+    )
 
 
 def start_session_kv_server() -> None:

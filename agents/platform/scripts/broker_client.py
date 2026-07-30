@@ -274,7 +274,9 @@ def submit_action(
     intent: str,
     operations: list[dict[str, Any]],
     *,
-    trigger: dict[str, Any] | None = None,
+    trigger_source: str,
+    trigger_ref: str = "",
+    trigger_detail: str = "",
     requester: dict[str, Any] | None = None,
     trace: dict[str, Any] | None = None,
     rationale: str = "",
@@ -291,33 +293,39 @@ def submit_action(
     influence. `requireApproval` is the one direction a caller may push: it can ask for *more*
     gating than the classifier decided, never less.
 
-    **The default trigger is `chat`, and until P9-T8b-4c it was `agent`, which is not a member of
-    anything.** 06 §4.1 closes `trigger.source` over seven values and `envelope.go`'s
-    `validTriggerSources` enforces it, so the old default made *every* MCP submission a
-    `400 invalid-envelope` -- not a degraded field, the whole write path, for every agent, on the
-    default call. It was invisible because nothing had yet driven the MCP tool against a broker
-    (T8b-4b-i's driver builds envelopes directly) and because no agent-side check knew the enum was
-    closed; `action_envelope.VALID_TRIGGER_SOURCES` now refuses a bad one locally, with the seven
-    named, before a nonce is spent.
+    **`trigger_source` is required and has no default**, which is the whole of P9-T8b-4d. 06 §9 says
+    this tool *takes* `trigger`; until T8b-4c it silently supplied `{"source": "agent"}`, a value
+    that is not a member of anything, so `envelope.go`'s `validTriggerSources` made *every* MCP
+    submission a `400 invalid-envelope` -- not a degraded field, the whole write path, for every
+    agent, on the default call. T8b-4c fixed the value to `chat` and mirrored the enum agent-side
+    (`action_envelope.VALID_TRIGGER_SOURCES` now refuses a bad one locally, with the seven named,
+    before a nonce is spent). But a correct default is still the wrong shape here, because the field
+    it fills in is the one 01 §7 counts: `trigger.source` is what splits 06 §4.1's two autonomy
+    buckets (`humanRequested ∈ {chat, undo}`,
+    `selfInitiated ∈ {watch, alert, cron, delegation, escalation}`). A default cannot be right for
+    both, and the direction it is wrong in is the expensive one -- an autonomous caller that forgets
+    to say so gets its work filed under "a human asked for this", and the resulting quarter's answer
+    to "how much of this did the agents decide on their own?" is quietly too low, with nothing
+    anywhere reading as an error. Required means the caller states the origin or the call does not
+    compile; the enum is named in the MCP tool's docstring, which is where the model reads it.
 
-    `chat` rather than one of the five self-initiated values, because this function's only caller
-    today is the MCP tool, which is reachable only from an interactive session -- and 06 §4.1's two
-    autonomy buckets split precisely there (`humanRequested ∈ {chat, undo}`,
-    `selfInitiated ∈ {watch, alert, cron, delegation, escalation}`), so a default that guessed
-    `watch` would file human-requested work under autonomy in the metrics 01 §7 counts. Every
-    autonomous origin arrives through a caller that knows which one it is and passes it explicitly.
-    That said, a default is still a default: 06 §9 says `submit_action` *takes* `trigger`, and
-    making it a parameter of the tool -- across three tiers and the `apply-change` skill that
-    teaches it -- is **P9-T8b-4d**, not this unit.
+    `ref` and `detail` are the corroboration: the alert name, the watch's object, the delegating
+    action's id. Both are `omitempty` on `broker.Trigger`, so an empty one is left off the wire
+    rather than sent blank.
     """
     c = client or BrokerClient()
+    trigger: dict[str, Any] = {"source": trigger_source}
+    if trigger_ref:
+        trigger["ref"] = trigger_ref
+    if trigger_detail:
+        trigger["detail"] = trigger_detail
     try:
         envelope = action_envelope.build_envelope(
             agent_identity=c.cfg.identity,
             intent=intent,
             operations=operations,
             requester=requester or session_requester(),
-            trigger=trigger or {"source": "chat"},
+            trigger=trigger,
             trace=trace or session_trace(),
             nonce=c.fetch_nonce(),
             rationale=rationale,
@@ -338,7 +346,9 @@ def plan_action(
     intent: str,
     operations: list[dict[str, Any]],
     *,
-    trigger: dict[str, Any] | None = None,
+    trigger_source: str,
+    trigger_ref: str = "",
+    trigger_detail: str = "",
     requester: dict[str, Any] | None = None,
     trace: dict[str, Any] | None = None,
     rationale: str = "",
@@ -356,7 +366,9 @@ def plan_action(
     return submit_action(
         intent,
         operations,
-        trigger=trigger,
+        trigger_source=trigger_source,
+        trigger_ref=trigger_ref,
+        trigger_detail=trigger_detail,
         requester=requester,
         trace=trace,
         rationale=rationale,

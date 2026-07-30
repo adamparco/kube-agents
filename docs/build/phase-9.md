@@ -2037,7 +2037,7 @@ The remaining two halves are hermetic and each is a unit. The split:
 | **P9-T8b-4b-ii-1** | Step 3's live reads answer a typed refusal, split by whether retrying can help                                                                                                                                                                                        | V-BRK-031 (L1, L2)                                                           | T8b-4b-i               |
 | **P9-T8b-4b-ii-2** | The L2 shadow soak with journal mining, over the read-only tenant overlay                                                                                                                                                                                             | V-REV-001 (L2)                                                               | T8b-4b-ii-1            |
 | **P9-T8b-4c**      | `session_trace()` emits `parentSpanId`, which the broker's closed schema refuses; fix the shipped client across all three tiers and add the assertion that would have caught it — **done 2026-07-30**                                                                 | **V-BRK-032** (new, 09 §6.14) + **V-BRK-028** and **V-BRK-029** strengthened | —                      |
-| **P9-T8b-4d**      | `trigger` becomes a parameter of `submit_action`/`plan_action` per 06 §9, across the three tiers' MCP tools and the `apply-change` skill that teaches them — the default `chat` T8b-4c installed is correct for the interactive path and silent about every other one | **V-CTR-020** (the skill) + **V-BRK-029** (the tool surface)                 | T8b-4c                 |
+| **P9-T8b-4d**      | `trigger` becomes a parameter of `submit_action`/`plan_action` per 06 §9, across the three tiers' MCP tools and the `apply-change` skill that teaches them — **done 2026-07-30**                                                                                      | **V-CTR-020** and **V-BRK-029** strengthened; **V-BRK-032** extended         | T8b-4c                 |
 
 **Why T8b-1 is the first half and not an arbitrary slice.** Everything downstream is transport and
 prose; this is the only part with a _correctness_ obligation the broker will enforce. The broker
@@ -2832,6 +2832,62 @@ defect could only be discovered by a live 400, one value at a time. That is now 
 three enforcements, and the general question for the improvement pass is whether the remaining
 `envelope.go` validations (`hex32Re` on `traceId`, the required-field set, the per-op target
 exclusivity) deserve the same treatment or whether the line is drawn correctly where it is.
+
+### P9-T8b-4d — outcome, 2026-07-30
+
+**`trigger` is a parameter now, and the argument for that is not tidiness.** 06 §9's tool table says
+`submit_action` "takes `intent` + `operations` + `trigger`, fills `trace`/`requester` from the
+session", and the tool took two of the three. T8b-4c could only replace a wrong default with a right
+one, which fixes the 400 and leaves the actual problem: **`trigger.source` is the field 01 §7
+counts.** It is what splits 06 §4.1's two autonomy buckets, so whatever a default says, it says it
+for every caller that did not think about the question — and the direction it is wrong in is the
+flattering one. An autonomous action filed as `chat` is a false statement about a human, the
+quarter's answer to "how much of this did the agents decide on their own?" comes out too low, and
+nothing anywhere reads as an error, because a defaulted enum member is a perfectly legal envelope.
+The parameter is **required**, in the client and in both MCP tools: the caller states the origin or
+there is no call.
+
+**Flat strings, not a dict, and the reason is two constraints meeting.** V-BRK-029 requires each
+`@mcp.tool()` body to be exactly one `return broker_client.<name>(…)` statement — logic in that
+module is logic no L0 check can execute ([[LSN-007]]) — so a `{source, ref, detail}` dict cannot be
+assembled inside the tool. And the schema the model reads is generated from the signature, so three
+flat parameters (`trigger_source`, `trigger_ref`, `trigger_detail`) put the closed enum in the place
+the model actually looks. `broker_client` assembles the dict, dropping `ref` and `detail` when empty
+because both are `omitempty` on `broker.Trigger` and a blank string is a claim that there was
+nothing to look at. The old `trigger: dict | None = None` was **removed** rather than kept beside
+the new parameters — two ways to say the same thing is [[LSN-041]], and one of them would have gone
+untested.
+
+**Four arms added to V-BRK-029, and one of them exists because the unit deleted the surface the last
+one watched.** T8b-4c's scan was pinned to `build_envelope`'s keyword defaults, which is where that
+defect happened to live; T8b-4d removed the default, so the scan would have walked zero literals and
+gone on reporting green. It now walks **every dict literal in the module** — the property was always
+"no closed-enum value originates in this file unless it is a member", and `session_requester`'s two
+`kind`s are inside it for the same reason the trigger was. Beside it: the origin is read back **off
+the wire** for both tools in all three tiers (the first assertion anywhere that `trigger` survives
+the trip), `trigger_source` is asserted to be in the no-default set of all four functions, and each
+MCP tool's declared parameters are compared against what its one statement forwards — **by name**,
+so `trigger_ref=trigger_detail` is caught too. Sweep grown 18 → 22, **22/22 caught**, with M16
+rewritten to re-add a default whose value is _correct_, because the shape is the defect.
+
+**V-CTR-020's two new mutants escaped on the first sweep, and this unit's own prose is why.** The arm
+that guards required parameters asserted only that the backticked name appeared _somewhere_ in the
+skill. The mutants delete a parameter's **definition** — and the paragraphs T8b-4d added to the
+worked example mention both `intent` and `trigger_source` in passing, which kept the arm green over
+a skill that no longer explains a required parameter. Being mentioned is not being documented; it is
+[[LSN-023]] at one remove, a check satisfied by prose about the thing rather than by the thing. The
+arm now requires the definitional bullet the file already uses for all three (`- **`name`** — …`),
+which a cross-reference does not have. The second new mutant, M14, drops `escalation` out of the
+seven-row table: every other arm passes on it, and an agent that was escalated to would pick the
+nearest word it can see.
+
+**Findings filed, not fixed.** The forwarding arm covers the MCP tools only; `plan_action` in
+`broker_client.py` delegates in exactly the same shape and is covered only behaviourally (M21).
+Generalizing "a single-statement delegation forwards every parameter it declares, under its own
+name" to the whole write path is an improvement-pass item. And three needles in V-CTR-020 and two in
+V-BRK-029 went `BROKEN` when the signatures and the skill text moved — not findings ([[LSN-048]]),
+but five in one unit is the first time a spec's needles have been this brittle, and needles anchored
+on a signature line are the pattern.
 
 ---
 
