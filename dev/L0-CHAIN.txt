@@ -241,6 +241,17 @@ python3 dev/tests/cluster-check-hygiene.py --negative-control
 python3 dev/tests/negative-controls-name-their-rule.py
 python3 dev/tests/negative-controls-name-their-rule.py --negative-control
 
+# --- the L2 auth suite's own negative control (P9-T8b-4b-i) ---------------------------------
+# The `¬` arm of V-BRK-007/008/009/010/017. It is here, in the chain that needs no cluster, because
+# it deliberately addresses none: the only way to inject "a broker that accepts a credential it must
+# refuse" would be to build and deploy a broker that does, so the injection point moves out to the
+# transcript. Three hand-written transcripts of a misbehaving broker are replayed through the same
+# assertion block the live run uses, and every one of the eight credential arms must go red on all
+# three. The sharpest is `wrong-reason`: every negative IS refused, each with another arm's reason,
+# which is exactly what a suite asserting "not 200" would pass. The live half of these five rows is
+# in dev/L2-CHAIN.txt and needs the scratch cluster.
+bash dev/verify/broker-auth-l2.sh --negative-control
+
 # --- repository mechanics (LSN-012) ---------------------------------------------------------
 # Which remote carries the work, and does `main` point at it? Local main tracked `upstream/main`
 # (gke-labs) for the whole of phases 2-8: a bare `git pull` would have fetched a tree with none of

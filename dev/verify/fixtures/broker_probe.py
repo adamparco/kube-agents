@@ -86,6 +86,31 @@ def context_for(tls_dir: str | None, *, ca_dir: str) -> ssl.SSLContext:
     return ctx
 
 
+def _body_of(reader: object) -> tuple[dict[str, object], str]:
+    """Whatever the peer sent, as (parsed-broker-reply, raw-text).
+
+    Both, because a non-JSON body is itself a result here: Go's TLS listener answers a plaintext
+    request on an HTTPS port with `400 Bad Request` and the bare sentence "Client sent an HTTP
+    request to an HTTPS server." — an HTTP status the BROKER never produced. A reader that only
+    parsed JSON would report that as `{}` and it would be indistinguishable from a broker refusal
+    with an empty reason.
+
+    Reading it can also fail outright: the same listener resets the connection immediately after
+    writing that line, so `exc.read()` raises `ConnectionResetError` from inside the HTTPError
+    handler. That escaped the first time this ran and killed the probe four scenarios early.
+    """
+    try:
+        raw = reader.read() or b""  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"<body unreadable: {type(exc).__name__}: {exc}>"
+    text = raw.decode("utf-8", "replace").strip()
+    try:
+        parsed = json.loads(raw or b"{}")
+    except ValueError:
+        return {}, text
+    return (parsed, text) if isinstance(parsed, dict) else ({}, text)
+
+
 def raw_get(scenario: str, url: str, *, ctx: ssl.SSLContext | None, token: str | None) -> None:
     """One GET, with exactly the credentials named, and every failure mode reported as itself."""
     req = urllib.request.Request(url, method="GET")
@@ -94,16 +119,13 @@ def raw_get(scenario: str, url: str, *, ctx: ssl.SSLContext | None, token: str |
         req.add_header("Authorization", "Bearer " + token)
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as resp:
-            body = json.loads(resp.read() or b"{}")
-            emit(scenario, outcome="http", status=resp.status, reason=body.get("reason", ""), detail=body.get("message", "")[:400])
+            body, text = _body_of(resp)
+            emit(scenario, outcome="http", status=resp.status, reason=str(body.get("reason", "")), detail=(str(body.get("message", "")) or text)[:400])
     except urllib.error.HTTPError as exc:
         # A refusal is an answer, and the broker returns the same JSON shape for one. Decoded, not
         # raised: the reason string is the whole point of these scenarios.
-        try:
-            body = json.loads(exc.read() or b"{}")
-        except ValueError:
-            body = {}
-        emit(scenario, outcome="http", status=exc.code, reason=body.get("reason", ""), detail=body.get("message", "")[:400])
+        body, text = _body_of(exc)
+        emit(scenario, outcome="http", status=exc.code, reason=str(body.get("reason", "")), detail=(str(body.get("message", "")) or text)[:400])
     except Exception as exc:  # noqa: BLE001 — the class name IS the evidence for a transport negative
         emit(scenario, outcome="transport-error", detail=f"{type(exc).__name__}: {exc}"[:400])
 
@@ -180,7 +202,14 @@ def main() -> int:
             intent="broker-auth-l2 transport probe",
             operations=probe_target_operation(),
             requester={"kind": "system", "id": "broker-auth-l2"},
-            trigger={"source": "verification"},
+            # `cron` because 06 §4.1's trigger sources are a CLOSED set of seven — chat, watch,
+            # alert, cron, delegation, escalation, undo — and an unattended automated submission is
+            # the one this is. The first run of this probe used "verification" and came back 400
+            # `invalid-envelope`, which is a second instance of the `parentSpanId` finding:
+            # `action_envelope.py` mirrors the operation verbs and the patch media types from the Go
+            # side but not the trigger sources, so the client-side courtesy check passes anything
+            # non-empty and the caller learns the real set from a refusal. Folded into P9-T8b-4c.
+            trigger={"source": "cron"},
             # The shipped trace builder, with SPAN_ID deliberately unset in the driver pod. When it
             # IS set, `session_trace()` emits `parentSpanId` and the broker's `Trace` struct has no
             # such field — `DisallowUnknownFields` turns the whole envelope into a 400

@@ -2033,7 +2033,7 @@ The remaining two halves are hermetic and each is a unit. The split:
 | ~~**P9-T8b-4**~~  | ~~The L2 shadow soak with journal mining~~ — **split, see below**: the broker has no deployment path, so there is nothing to soak yet                                               | ~~V-REV-001 (L2)~~                                                                                                                   | —                      |
 | **P9-T8b-4a**     | The broker's deployment path, and the L2 claim it makes checkable                                                                                                                   | **V-BRK-012 (L2)**                                                                                                                   | a live scratch cluster |
 | ~~**P9-T8b-4b**~~ | ~~The L2 shadow soak with journal mining~~ — **split again, see below**: nothing in `dev/` can present a credential to a broker, so there is no caller to soak with                 | ~~V-REV-001 (L2)~~                                                                                                                   | —                      |
-| **P9-T8b-4b-i**   | The in-cluster envelope driver, and the five transport checks it makes answerable                                                                                                   | **V-BRK-007/008/009/010/017 (L2)**                                                                                                   | T8b-4a                 |
+| **P9-T8b-4b-i**   | The in-cluster envelope driver, and the five transport checks it makes answerable — **done 2026-07-30**                                                                             | **V-BRK-007/008/009/010/017 (L2)**                                                                                                   | T8b-4a                 |
 | **P9-T8b-4b-ii**  | The L2 shadow soak with journal mining                                                                                                                                              | V-REV-001 (L2)                                                                                                                       | T8b-4b-i               |
 | **P9-T8b-4c**     | `session_trace()` emits `parentSpanId`, which the broker's closed schema refuses; fix the shipped client across all three tiers and add the assertion that would have caught it     | a NEW 09 §6.2 row — ID assigned by that unit, not guessed here (four wrong `V-*` bindings are already on this phase's findings list) | —                      |
 
@@ -2444,6 +2444,68 @@ reply, which is a check that exists in one direction only and is why this was ne
 than guessed here. The driver pod leaves
 `SPAN_ID` unset and says so in a comment, because setting it would be measuring the bug from the
 fixture that discovered it.
+
+### P9-T8b-4b-i — outcome, 2026-07-30
+
+**Green: 14 PASS / 0 FAIL, rc 0, three consecutive runs.** All five rows now have their first
+`verification/results.csv` entry. The `¬` is `broker-auth-l2.sh --negative-control` — three
+transcripts of a misbehaving broker replayed through the identical assertion block, 8 of 8
+credential arms red on all three — and it addresses no cluster, so it is a line in `dev/L0-CHAIN.txt`
+rather than an L2-only ceremony.
+
+**Five things the first run found, all of them in the fixture or in the spec, none in the broker.**
+The broker was correct on every scenario from the first request it ever served.
+
+1. The probe died at the plaintext scenario. `exc.read()` inside the `HTTPError` handler raised
+   `ConnectionResetError`, which escaped and took four scenarios with it. Bodies are now read
+   through a helper that cannot raise and reports the unreadable body as itself.
+2. `trigger.source: "verification"` is not in the Go closed set of seven, so the baseline envelope
+   was a 400. Fixed to `cron`; the 400 arm is now a loud failure rather than something tolerated,
+   because it means the envelope never reached the pipeline and 4b-ii's soak would be built on the
+   assumption that it did.
+3. Plaintext is not a transport error. `net/http`'s TLS listener answers with a bare `400` before any
+   handler — so the arm asserts _no handler answered_ (no `reason` field), not _no answer_.
+4. The audience arm was red for 200 characters of display truncation. See the V-BRK-008 row.
+5. `V-BRK-017`'s stated mechanism does not happen against a real API server. See the V-BRK-017 row.
+
+**Findings filed, not fixed — none of them this unit's.**
+
+- **An RBAC denial inside the pipeline surfaces as a 500 `internal-error` with a stack trace.** The
+  baseline envelope is authenticated, decoded and classified, and then step 3 fails:
+  `configmaps "..." is forbidden: User "system:serviceaccount:kubeagents-system:platform-<scope>-actor"
+cannot get resource "configmaps"`. That is an entirely expected, caller-visible condition in dark
+  mode — the actor is bound to no tenant authority by design — and `server.go`'s `refuse`/`write`
+  have no typed `*Refusal` for it, so it falls through to the unclassified arm. A caller cannot tell
+  a permission boundary from a broker bug. **P9-T8b-4b-ii cannot be built on this** and it is that
+  unit's first order of business: either the pre-state snapshot's `Forbidden` becomes a typed
+  refusal, or the soak fixture grants the platform actor read on its own namespace, and the
+  distinction between those two is a real design question rather than a fixture detail.
+- **`invariants-gate.py`'s LSN-005 check reads the FIRST `case "$CTX" in` in a file, including one
+  inside a comment.** Found by walking into it: this suite briefly wrote its guard as
+  `case "$MODE:$CTX"`, which is equally correct and which the gate cannot parse, and the comment
+  explaining the fix then contained the literal idiom and shadowed the real guard below it. The
+  false-positive direction cost ten minutes. The **false-negative** direction is the one that
+  matters and it is live: a script whose comment shows a well-formed anchored guard and whose actual
+  guard is a substring match would pass, which is LSN-005 itself, wearing a comment. For
+  `harness-improve`.
+- **Three `V-*` rows overlap and none of them says so.** `V-BRK-008` and `V-BRK-017` state the same
+  property under two IDs; 09 §6 gives the plaintext arm to **both** `V-BRK-007` ("a plaintext or
+  wrong-CA client is refused") and `V-BRK-009` ("valid token over plaintext"). Shared evidence is
+  recorded as shared in the results rows rather than double-counted. Retire-never-delete applies, so
+  this is §3.4 pruning work, not something to act on mid-unit.
+- **`V-BRK-017`'s 09 §6 wording needs to say which level owns which clause** — the mechanism it
+  names is unreachable at L2 by construction. Written out in full in its results row.
+
+**One defect this unit introduced and then mechanized.** Extracting the eight credential assertions
+into a function left the call site unwritten for exactly one commit. The suite ran, printed six green
+lines, printed `PROVEN: V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 at L2`, and exited
+0 — having asserted none of them. Nothing could have caught it: `fail` stays 0 when no assertion
+runs, and the `¬` mode calls the extracted function directly, so it was green too. The suite now
+counts its own arms and fails the run if the count disagrees with `EXPECTED_ASSERTIONS`; that guard
+was itself verified by temporarily setting it to 15 and watching the run go red. **A suite that
+reports a verdict it did not compute is worse than a suite that fails**, and this is a general shape
+— worth taking to `harness-improve` as a candidate rule for every `dev/verify/*.sh`, not just this
+one.
 
 ---
 
