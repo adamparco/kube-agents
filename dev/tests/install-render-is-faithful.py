@@ -91,10 +91,12 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gitcorpus import repo_files  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -493,10 +495,8 @@ def run(root: Path, tracked: list[str], quiet: bool = False) -> list[str]:
 
 
 def tracked_paths() -> list[str]:
-    out = subprocess.run(
-        ["git", "-C", str(REPO), "ls-files"], capture_output=True, text=True, check=True
-    ).stdout
-    return out.splitlines()
+    """Tracked AND new-but-not-ignored -- see `gitcorpus` and [[LSN-050]]."""
+    return repo_files(REPO)
 
 
 def materialize(tracked: list[str], dest: Path) -> None:

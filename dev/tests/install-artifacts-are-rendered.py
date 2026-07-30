@@ -51,8 +51,10 @@ from __future__ import annotations
 
 import pathlib
 import re
-import subprocess
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from gitcorpus import read_repo_files  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 OPERATOR_MAKEFILE = "k8s-operator/Makefile"
@@ -88,20 +90,12 @@ def _makefile_targets(text: str) -> dict[str, tuple[list[str], str]]:
 def _sources() -> dict[str, str]:
     """Every tracked Makefile and shell script -- anything that could apply an overlay.
 
-    `git ls-files` rather than a directory walk, for the reason `invariants-gate.py` gives: the
-    corpus and the publishable set should be the same set, and `k8s-operator/scripts/vars.sh` is
-    gitignored and holds live secrets.
+    git rather than a directory walk, for the reason `invariants-gate.py` gives: the corpus and
+    the publishable set should be the same set, and `k8s-operator/scripts/vars.sh` is gitignored
+    and holds live secrets. Tracked AND new-but-not-ignored, per `gitcorpus` and [[LSN-050]] -- a
+    Makefile target added by the current unit is the one nothing has ever scanned.
     """
-    listing = subprocess.run(
-        ["git", "ls-files", "-z", "*Makefile", "*.mk", "*.sh"],
-        cwd=REPO, capture_output=True, text=True, check=True,
-    ).stdout
-    out: dict[str, str] = {}
-    for rel in listing.split("\0"):
-        p = REPO / rel
-        if rel and p.is_file():
-            out[rel] = p.read_text()
-    return out
+    return read_repo_files(REPO, "*Makefile", "*.mk", "*.sh")
 
 
 def applied_dirs(sources: dict[str, str]) -> dict[str, str]:

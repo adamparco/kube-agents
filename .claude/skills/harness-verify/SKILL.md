@@ -72,6 +72,13 @@ a NetworkPolicy file exists is not evidence egress is denied; asserting the clas
 For checks that "passed" negatively, confirm the denial was the expected one. A malformed manifest
 also fails to apply.
 
+**Non-vacuity goes through `dev/mutate.py`**, against a spec committed as
+`verification/mutants/<CHECK-ID>.json` — not a driver written for the occasion. The runner refuses
+to produce a number it cannot back: no `-run` filter, every row naming the test that must fail, an
+applier that refuses a needle it does not find exactly once, and a third verdict (`BROKEN`) for a
+mutant it could not evaluate, so the denominator cannot silently shrink. See `harness-run` §5 and
+[[LSN-047]]/[[LSN-048]]/[[LSN-049]] for the three ways a hand-rolled sweep lies.
+
 Independent suites may be dispatched in parallel; each returns its own evidence.
 
 ---

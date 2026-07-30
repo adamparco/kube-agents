@@ -51,10 +51,10 @@ from __future__ import annotations
 
 import pathlib
 import re
-import subprocess
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from gitcorpus import repo_files  # noqa: E402
 from golex import strip_go_comments  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -133,13 +133,9 @@ RENDERER_CALLS = ("agentlabels.For(", "agentlabels.RenderScope(", "RenderScope("
 
 
 def tracked_go_files() -> list[pathlib.Path]:
-    out = subprocess.run(
-        ["git", "-C", str(REPO), "ls-files", "-z", "--", "k8s-operator"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    return [REPO / p for p in out.split("\0") if p.endswith(".go")]
+    """Tracked AND new-but-not-ignored -- see `gitcorpus` and [[LSN-050]]. A `.go` file written by
+    the current unit and not yet staged is precisely the one no reviewer and no check has read."""
+    return [REPO / p for p in repo_files(REPO, "k8s-operator") if p.endswith(".go")]
 
 
 def check(sources: dict[str, str]) -> list[str]:

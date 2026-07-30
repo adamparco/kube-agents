@@ -71,8 +71,10 @@ from __future__ import annotations
 
 import pathlib
 import re
-import subprocess
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from gitcorpus import repo_files  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
@@ -148,17 +150,8 @@ def read_sources() -> dict[str, str]:
     holds live secrets in plaintext, and whatever this check reads it may print in a failure
     message.
     """
-    listing = subprocess.run(
-        ["git", "-C", str(REPO), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-
     wanted = {}
-    for rel in listing.split("\0"):
-        if not rel:
-            continue
+    for rel in repo_files(REPO):
         if (
             rel == GO_ACTOR_NAME
             or (rel.startswith(f"{SCRIPTS}/") and (rel.endswith(".sh") or rel.endswith(".yaml.template")))

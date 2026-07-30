@@ -68,6 +68,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gitcorpus import repo_files  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[2]
 
 # Directories whose text is a historical record, not an instruction to a machine.
@@ -255,10 +258,10 @@ def caller_files(repo: Path, tracked: list[str], cli_paths: set[str]) -> list[st
 # --------------------------------------------------------------------------------------------
 def run(repo: Path) -> tuple[list[str], list[str], int]:
     """(findings, notes, scanned invocation count)."""
+    # Tracked AND new-but-not-ignored -- a CLI added by the current unit is the one whose contract
+    # has never been checked by anything. See `gitcorpus` and [[LSN-050]].
     try:
-        tracked = subprocess.run(
-            ["git", "ls-files"], cwd=repo, capture_output=True, text=True, check=True
-        ).stdout.splitlines()
+        tracked = repo_files(repo)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise SystemExit(f"could not run: git ls-files failed ({exc})")
 

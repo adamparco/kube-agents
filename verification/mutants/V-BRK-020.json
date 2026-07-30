@@ -1,0 +1,178 @@
+{
+  "_comment": "Mutation sweep for V-BRK-020 -- the classifier and the integrity check see the same fields. Run: python3 dev/mutate.py verification/mutants/V-BRK-020.json. Every row names the test that must fail; see dev/mutate.py for why rc != 0 is not a catch.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./internal/broker/..."]
+  },
+  "mutants": [
+    {
+      "id": "M1-apply-is-whole-object-again",
+      "why": "THE regression this unit exists to prevent: apply back in the whole-object set, which execute.CheckIntegrity refuses outright.",
+      "catcher": "TestAnApplyIsClassifiedFieldByFieldAndExecutes",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/resolve.go",
+          "find": "\t\tcase \"create\", \"delete\":\n\t\t\top.WholeObject = true",
+          "replace": "\t\tcase \"create\", \"apply\", \"delete\":\n\t\t\top.WholeObject = true"
+        }
+      ]
+    },
+    {
+      "id": "M2-apply-gets-no-paths",
+      "why": "The verb falling through to the default arm is the pre-fix behaviour with the WholeObject half already fixed: a fieldPaths rule is inert and nobody is refused.",
+      "catcher": "TestFillTouchedPathsGivesEachVerbItsOwnFieldSet",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\tcase op.Op == \"apply\":\n\t\t\tops, err = diffPatchOps(i, live[i], op.DesiredState)",
+          "replace": "\t\tcase op.Op == \"apply\" && false:\n\t\t\tops, err = diffPatchOps(i, live[i], op.DesiredState)"
+        }
+      ]
+    },
+    {
+      "id": "M3-diffed-against-nothing",
+      "why": "Diffing against no live state reports every field as added -- the OTHER way to make a fieldPaths rule fire, and exactly as wrong as reporting none.",
+      "catcher": "TestAFieldPathsRuleFiresOnAnApply",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\tif err := fillTouchedPaths(s.env, raws, snaps); err != nil {",
+          "replace": "\t\tif err := fillTouchedPaths(s.env, raws, nil); err != nil {"
+        }
+      ]
+    },
+    {
+      "id": "M4-classify-runs-before-the-fill",
+      "why": "The reorder is the whole mechanism. Resolve reading raws before they carry paths is a silent revert of it.",
+      "catcher": "TestAFieldPathsRuleFiresOnAnApply",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\tif err := fillTouchedPaths(s.env, raws, snaps); err != nil {\n\t\t\treturn \"\", err\n\t\t}\n\n\t\tresolved, err := classify.Resolve(ctx, p.cfg.Live, s.caller, raws)\n\t\tif err != nil {\n\t\t\treturn \"\", fmt.Errorf(\"step 3: resolving %d operations against live state: %w\", len(raws), err)\n\t\t}\n\t\ts.resolved = resolved",
+          "replace": "\t\tresolved, err := classify.Resolve(ctx, p.cfg.Live, s.caller, raws)\n\t\tif err != nil {\n\t\t\treturn \"\", fmt.Errorf(\"step 3: resolving %d operations against live state: %w\", len(raws), err)\n\t\t}\n\t\ts.resolved = resolved\n\n\t\tif err := fillTouchedPaths(s.env, raws, snaps); err != nil {\n\t\t\treturn \"\", err\n\t\t}"
+        }
+      ]
+    },
+    {
+      "id": "M5-value-comes-from-the-rendering",
+      "why": "LSN-040 itself: the diff's Value is a string, and a string is not scanned as a payload nor read as a bool.",
+      "catcher": "TestTheClassifierSeesTheVALUEAndNotItsRendering",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\tif v, found := valueAtPointer(desired, d.Path); found {\n\t\t\tp.Value = v\n\t\t}",
+          "replace": "\t\tp.Value = d.Value"
+        }
+      ]
+    },
+    {
+      "id": "M6-second-unescaper-at-the-seam",
+      "why": "A local pointer splitter agrees with classify's until the first annotation key containing a slash, then hands the classifier nil for a field being set.",
+      "catcher": "TestAKeyContainingASlashSurvivesTheRoundTrip",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\tfor _, tok := range classify.SplitPointer(ptr) {",
+          "replace": "\tfor _, tok := range strings.Split(strings.TrimPrefix(ptr, \"/\"), \"/\") {"
+        }
+      ]
+    },
+    {
+      "id": "M7-truncation-is-tolerated",
+      "why": "Classifying a prefix of the change understates it, and the rule that would have fired on the dropped field silently does not.",
+      "catcher": "TestAChangeTooLargeToClassifyIsRefusedRatherThanTruncated",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\tif res.Truncated {",
+          "replace": "\tif res.TotalOps < 0 {"
+        }
+      ]
+    },
+    {
+      "id": "M8-scale-names-the-wrong-pointer",
+      "why": "A pointer that is close but not the one rules name is worse than none: it reads as covered and matches nothing.",
+      "catcher": "TestFillTouchedPathsGivesEachVerbItsOwnFieldSet",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\tscaleReplicasPointer = \"/spec/replicas\"",
+          "replace": "\tscaleReplicasPointer = \"/spec/replica\""
+        }
+      ]
+    },
+    {
+      "id": "M9-merge-patch-null-is-not-a-removal",
+      "why": "A merge patch that strips a securityContext must read as a removal, or DirectionOfPatch scores the loosening as a change of unknown direction.",
+      "catcher": "TestFillTouchedPathsGivesEachVerbItsOwnFieldSet",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\tout = append(out, classify.PatchOp{Op: \"remove\", Path: classify.JoinPointer(path...)})",
+          "replace": "\t\t\tout = append(out, classify.PatchOp{Op: \"replace\", Path: classify.JoinPointer(path...)})"
+        }
+      ]
+    },
+    {
+      "id": "M10-merge-patch-does-not-recurse",
+      "why": "Stopping at the top-level key reports /data where the change is at /data/log-level, which no leaf-naming rule matches.",
+      "catcher": "TestFillTouchedPathsGivesEachVerbItsOwnFieldSet",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\tout = append(out, mergePatchOps(path, obj[k])...)",
+          "replace": "\t\tout = append(out, classify.PatchOp{Op: \"replace\", Path: classify.JoinPointer(path...), Value: obj[k]})"
+        }
+      ]
+    },
+    {
+      "id": "M11-a-json-patch-is-overwritten",
+      "why": "The submitted operations are the only record of a move's `from` end; replacing them with a body walk loses it.",
+      "catcher": "TestAJSONPatchIsLeftAlone",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\tcase op.Op == \"patch\" && op.Patch != nil && op.Patch.Type != mediaJSONPatch:\n\t\t\tops = mergePatchOps(nil, op.Patch.Body)",
+          "replace": "\t\tcase op.Op == \"patch\" && op.Patch != nil:\n\t\t\tops = mergePatchOps(nil, op.Patch.Body)"
+        }
+      ]
+    },
+    {
+      "id": "M12-apply-patch-is-treated-as-a-merge-patch",
+      "why": "The same change spelled two ways must get the same field set, or an agent picks its classification by choosing a media type.",
+      "catcher": "TestFillTouchedPathsGivesEachVerbItsOwnFieldSet",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\tcase op.Op == \"patch\" && op.Patch != nil && op.Patch.Type == mediaApplyPatch:",
+          "replace": "\t\tcase op.Op == \"patch\" && op.Patch != nil && op.Patch.Type == mediaApplyPatch && false:"
+        }
+      ]
+    },
+    {
+      "id": "M13-integrity-check-sees-no-paths",
+      "why": "The classified paths reaching step 9 are the other half of V-BRK-020; an empty set there makes the comparison vacuous in one direction and fail-closed in the other.",
+      "catcher": "TestAnApplyIsClassifiedFieldByFieldAndExecutes",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\t\tTouchedPaths: resolved[i].TouchedPaths,",
+          "replace": "\t\t\t\tTouchedPaths: nil,"
+        }
+      ]
+    },
+    {
+      "id": "M14-the-server-answer-is-not-compared",
+      "why": "The enforcing direction. Without the comparison an admission webhook can add anything and the action proceeds.",
+      "catcher": "TestTheServersExtraFieldIsCaughtByTheIntegrityCheck",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/execute/apply.go",
+          "find": "\tif err := CheckIntegrity(op.Classified, diff); err != nil {",
+          "replace": "\t\tif err := error(nil); err != nil {"
+        }
+      ]
+    }
+  ]
+}

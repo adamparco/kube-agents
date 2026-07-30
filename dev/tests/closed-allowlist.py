@@ -59,9 +59,11 @@ violations (prints them). Stdlib only, no network, no cluster.
 from __future__ import annotations
 
 import re
-import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gitcorpus import repo_files  # noqa: E402
 
 # The retired escape hatch. Matching on the bare identifier rather than on the
 # two fully-qualified names is deliberate: a third integration would otherwise
@@ -220,13 +222,8 @@ def tracked_files(root: Path) -> list[str]:
     """
     seen: dict[str, None] = {}
 
-    for args in (["ls-files"], ["ls-files", "--others", "--exclude-standard"]):
-        out = subprocess.run(
-            ["git", "-C", str(root), *args], capture_output=True, text=True, check=True
-        )
-        for line in out.stdout.splitlines():
-            if line:
-                seen.setdefault(line, None)
+    for rel in repo_files(root):
+        seen.setdefault(rel, None)
 
     for base in FORCE_ADDED_ROOTS:
         for path in (root / base).rglob("*"):

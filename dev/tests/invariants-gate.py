@@ -30,12 +30,16 @@ Run: python3 dev/tests/invariants-gate.py [--update-baseline]
 
 from __future__ import annotations
 
+import ast
 import csv
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gitcorpus import repo_files  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 LESSONS = REPO / ".claude/harness/LESSONS.md"
@@ -2185,21 +2189,15 @@ def check_platform_idioms_are_gnu_first() -> list[str]:
     # inside the containers, where a BSD-first idiom gets no second chance. A lint whose scope is
     # enumerated goes quietly partial the first time a script lands somewhere new.
     #
-    # `git ls-files` rather than rglob, for one specific reason: `k8s-operator/scripts/vars.sh` is
-    # gitignored and holds live secrets in plaintext. This check prints the offending LINE in its
-    # failure message, so a bare rglob would put a lint one bad line away from printing a token
-    # into CI logs. Tracked-only means the corpus and the publishable set are the same set.
+    # git rather than rglob, for one specific reason: `k8s-operator/scripts/vars.sh` is gitignored
+    # and holds live secrets in plaintext. This check prints the offending LINE in its failure
+    # message, so a bare rglob would put a lint one bad line away from printing a token into CI
+    # logs. `gitcorpus` adds the new-but-not-ignored half ([[LSN-050]]): a script written by the
+    # current unit is the one whose BSD-vs-GNU idioms nothing has ever run.
     try:
-        listing = subprocess.run(
-            ["git", "ls-files", "-z", "*.sh"],
-            cwd=REPO,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
+        scripts = [REPO / p for p in repo_files(REPO, "*.sh")]
     except (OSError, subprocess.CalledProcessError) as exc:
-        return [f"VACUOUS: could not enumerate tracked shell scripts ({exc}); nothing was scanned."]
-    scripts = sorted(REPO / p for p in listing.split("\0") if p and (REPO / p).is_file())
+        return [f"VACUOUS: could not enumerate shell scripts ({exc}); nothing was scanned."]
     if len(scripts) < 60:
         return [
             f"VACUOUS: found {len(scripts)} tracked shell scripts to scan; this tree had 73 when "
@@ -2230,6 +2228,272 @@ def check_platform_idioms_are_gnu_first() -> list[str]:
                     f"the caller gets a plausible wrong answer rather than an error:\n"
                     f"        {line.strip()}"
                 )
+    return failures
+
+
+# ---------------------------------------------------------------------------------------------
+# LSN-050 — a pre-commit check may not enumerate its corpus from the index alone
+# ---------------------------------------------------------------------------------------------
+
+# Every `.py` and `.sh` under `dev/`, not just the ones currently wired into the chain. The lesson
+# is that "the eighth script written next month copies the seventh": a rule that only binds once a
+# script reaches L0-CHAIN.txt lets the defect be written, reviewed and merged first, and catches it
+# at the moment it is least convenient to fix. Scanning the whole tree is strictly stronger and
+# costs nothing, because `dev/` is exactly the L0 check tree.
+LS_FILES_ROOT = "dev"
+
+
+def _ls_files_lists(src: str) -> list[list[str]]:
+    """Every list/tuple literal in a Python source that spells `ls-files`, as its string elements.
+
+    Parsed with `ast` rather than grepped, for [[LSN-023]]: this file, `gitcorpus.py` and every
+    docstring in the seven converted checks discuss `git ls-files --others` at length in prose, and
+    a grep cannot tell the sentence from the argv. An AST sees only real string literals, so a
+    comment explaining the rule can never satisfy or break it.
+
+    Non-constant elements (`*pathspecs`, `str(root)`) are dropped rather than failing the parse:
+    they cannot be `--others`, and their presence says nothing either way.
+    """
+    out: list[list[str]] = []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            continue
+        strings = [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        if any("ls-files" in s for s in strings):
+            out.append(strings)
+    return out
+
+
+def check_l0_corpus_is_not_index_only() -> list[str]:
+    """LSN-050. No check under `dev/` may enumerate its inputs with `git ls-files` and no `--others`.
+
+    `ls-files` without `--others` lists the INDEX. A file created by the current unit is not in the
+    index until it is staged, so a check written that way is blind to exactly the code nothing has
+    ever reviewed — and silent about it, because a pass over a corpus missing the file under test
+    prints the same thing as a pass over one containing it. `api-group-single-sourced.py` scanned
+    115 files and passed while the defect it exists to catch sat in an untracked file two
+    directories away.
+
+    The sanctioned form is `gitcorpus.repo_files`, which is also the only place in the tree allowed
+    to spell the flags. This check does not require that helper by name — requiring a call site to
+    use one function is a shape a refactor breaks for good reasons — it requires the property the
+    helper has.
+    """
+    failures: list[str] = []
+    root = REPO / LS_FILES_ROOT
+    scanned = 0
+    seen_calls = 0
+
+    for path in sorted(root.rglob("*")):
+        if path.suffix not in (".py", ".sh") or not path.is_file():
+            continue
+        rel = path.relative_to(REPO)
+        try:
+            src = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "ls-files" not in src:
+            continue
+        scanned += 1
+
+        if path.suffix == ".py":
+            try:
+                lists = _ls_files_lists(src)
+            except SyntaxError as exc:
+                failures.append(f"{rel}: could not parse to check its corpus enumeration ({exc})")
+                continue
+            for argv in lists:
+                seen_calls += 1
+                if "--others" not in argv:
+                    failures.append(
+                        f"{rel} builds `git {' '.join(a for a in argv if a != 'git')}` — "
+                        f"`ls-files` with no `--others` lists the index, so this check is blind to "
+                        f"any file the current unit has written and not yet staged (LSN-050). Use "
+                        f"`gitcorpus.repo_files`, or add `--others --exclude-standard`."
+                    )
+        else:
+            for n, line in enumerate(src.splitlines(), 1):
+                if "ls-files" not in line or line.lstrip().startswith("#"):
+                    continue
+                seen_calls += 1
+                if "--others" not in line:
+                    failures.append(
+                        f"{rel}:{n} runs `ls-files` with no `--others`, which lists the index and "
+                        f"not the working tree (LSN-050):\n        {line.strip()}"
+                    )
+
+    if scanned == 0 or seen_calls == 0:
+        return [
+            f"VACUOUS: found {scanned} file(s) under {LS_FILES_ROOT}/ mentioning ls-files and "
+            f"{seen_calls} enumeration(s) in them; this tree had 10 when the rule was written, so "
+            f"the parser has stopped seeing the call sites rather than the tree having lost them"
+        ]
+    return failures
+
+
+# ---------------------------------------------------------------------------------------------
+# The open count has three copies, and only one of them is read by SELECT
+# ---------------------------------------------------------------------------------------------
+
+# `**Status:** closed` and `**Status: closed**` are both in use in the bodies; the bold falls in a
+# different place and the word is the same. Anchored to the literal `**Status:` so a sentence about
+# status cannot match.
+BODY_STATUS = re.compile(r"\*\*Status:(?:\*\*)?\s*([A-Za-z]+)")
+TALLY = re.compile(r"^\*\*Open:\s*(\d+)\s+of\s+(\d+)\*\*(.*)$", re.MULTILINE)
+
+
+def _lesson_bodies(text: str) -> list[tuple[str, str]]:
+    """Each `## LSN-nnn` heading paired with the text up to the next heading."""
+    marks = [(m.group(1), m.start()) for m in LESSON_BODY.finditer(text)]
+    out = []
+    for i, (lid, start) in enumerate(marks):
+        end = marks[i + 1][1] if i + 1 < len(marks) else len(text)
+        out.append((lid, text[start:end]))
+    return out
+
+
+def check_lesson_status_matches_its_index_row() -> list[str]:
+    """LSN-044's own tail: the open count lives in three places and two of them go stale.
+
+    `harness-run` §2 sends the next invocation to `harness-improve` and nothing else when open
+    lessons exceed the `binding.md` threshold, so the count is a control-flow input, not
+    bookkeeping. It is written down three times in this one file — the index table's Status column,
+    each body's `**Status:**` header, and the `**Open: N of M**` tally — and the three are edited by
+    hand at different moments. On 2026-07-29 they disagreed: LSN-044's index row said `closed` and
+    its body header still said `open`, and the improvement pass that read the bodies counted 6 open
+    against a real 5, tripped a threshold that had not been crossed, and had to record the miscount
+    in the ledger.
+
+    The index table is the definition site — every other check in this file reads it. This check
+    makes the other two copies agree with it:
+
+    - a body that restates its status must restate the SAME status;
+    - the tally's N must equal the number of `open` rows, its M the number of rows, and the IDs it
+      names in parentheses must be exactly the open ones.
+
+    A body with no `**Status:**` header at all passes. That is deliberate and it is the honest
+    scope: 32 of the 50 bodies have never carried one, the index is where a reader is sent, and a
+    body that says nothing cannot say something false. Requiring the header everywhere would be a
+    different change, and it would add 32 more hand-maintained copies of the value this check
+    exists to stop duplicating.
+    """
+    if not LESSONS.exists():
+        return [f"{LESSONS.relative_to(REPO)} not found"]
+
+    text = LESSONS.read_text()
+    rows = {lid: status.strip().lower() for lid, _t, _s, status, _c in LESSON_ROW.findall(text)}
+    bodies = _lesson_bodies(text)
+    if len(rows) < 15 or len(bodies) < 15:
+        return [
+            f"VACUOUS: parsed {len(rows)} index row(s) and {len(bodies)} body/bodies; this file "
+            f"had 50 of each when the rule was written, so the parser stopped seeing the table "
+            f"rather than the table having emptied. Fix the parser, not the file."
+        ]
+
+    failures = []
+    restated = 0
+    for lid, body in bodies:
+        m = BODY_STATUS.search(body)
+        if not m:
+            continue
+        restated += 1
+        said = m.group(1).strip().lower()
+        want = rows.get(lid)
+        if want is None:
+            continue  # check_every_lesson_has_an_index_row owns this one
+        if said != want:
+            failures.append(
+                f"{lid}: the index row says `{want}` and the body header says `{said}`. The index "
+                f"is the definition site and the count derived from it decides whether the next "
+                f"invocation is an improvement pass — a stale body header has already produced one "
+                f"miscounted threshold trip."
+            )
+
+    if restated == 0:
+        return failures + [
+            "VACUOUS: not one lesson body carries a `**Status:**` header, so the body arm of this "
+            "check compared nothing. 18 did when the rule was written; the header format changed."
+        ]
+
+    open_ids = sorted(lid for lid, st in rows.items() if st == "open")
+    tally = TALLY.search(text)
+    if not tally:
+        failures.append(
+            "no `**Open: N of M**` tally line found. It is what an orientation reads before "
+            "deciding whether the threshold is crossed; without it the count is recomputed by "
+            "hand, which is how it went wrong."
+        )
+        return failures
+
+    n, m, rest = int(tally.group(1)), int(tally.group(2)), tally.group(3)
+    if n != len(open_ids) or m != len(rows):
+        failures.append(
+            f"the tally says `Open: {n} of {m}` and the index table holds {len(open_ids)} open of "
+            f"{len(rows)}. Open rows: {open_ids or '(none)'}."
+        )
+    named = set(re.findall(r"LSN-\d+", rest))
+    if named and named != set(open_ids):
+        failures.append(
+            f"the tally names {sorted(named)} as the open lessons and the index table's open rows "
+            f"are {open_ids or '(none)'}."
+        )
+    return failures
+
+
+METRICS_HEADER = "| Date | Phase | Escape rate |"
+
+# A `\|` inside a cell is a literal pipe, not a column break — the rows quote shell pipelines. This
+# is how the P9-T7d-5 row lost a column for a day: `envsubst | kubectl apply -f -` inside a code
+# span, which markdown splits and a code span does not protect.
+CELL_BREAK = re.compile(r"(?<!\\)\|")
+
+
+def check_metrics_rows_are_complete() -> list[str]:
+    """A metrics row short of columns drops a value silently, and the pass reads the gap as absence.
+
+    `SELF-IMPROVEMENT` §6 names the metrics table as the improvement pass's input set, and open
+    lessons is one of its columns. The rows are long — several run past 2 000 characters — and a
+    checkpoint interrupted partway through writes a row that renders perfectly in markdown with its
+    last six cells simply gone. That is what happened to the P9-T7c-4a row: escape rate present,
+    rework / halts / open lessons / deferrals / coverage / cycle time all missing, and nothing said
+    so, because a short markdown row is legal markdown.
+
+    Every data row must carry exactly as many cells as the header. Nothing here reads the values;
+    the property is that they exist to be read.
+    """
+    if not LEDGER.exists():
+        return [f"{LEDGER.relative_to(REPO)} not found"]
+
+    lines = LEDGER.read_text().splitlines()
+    header = next((n for n, l in enumerate(lines) if l.startswith(METRICS_HEADER)), None)
+    if header is None:
+        return [
+            f"VACUOUS: no metrics table header starting {METRICS_HEADER!r} in "
+            f"{LEDGER.relative_to(REPO)}; the table moved or was renamed and this check stopped "
+            f"checking."
+        ]
+
+    want = len(CELL_BREAK.findall(lines[header]))
+    failures, rows = [], 0
+    for n in range(header + 2, len(lines)):  # +2 skips the |---| separator
+        line = lines[n]
+        if not line.startswith("|"):
+            if line.strip():
+                break  # the table ended at a non-blank, non-row line
+            continue  # a blank line inside the table; the ledger has one
+        rows += 1
+        got = len(CELL_BREAK.findall(line))
+        if got != want:
+            failures.append(
+                f"{LEDGER.relative_to(REPO)}:{n + 1} is a metrics row with {got - 1} cell(s) and "
+                f"the header declares {want - 1}. The missing cells render as empty and read as "
+                f"'not measured': {line[:90]}…"
+            )
+    if rows < 5:
+        return [
+            f"VACUOUS: found {rows} metrics row(s) under the header; there were 22 when the rule "
+            f"was written, so the row scan stopped seeing the table."
+        ]
     return failures
 
 
@@ -2264,6 +2528,15 @@ CHECKS = [
     ),
     ("the human backlog is drained, not accumulated", check_backlog_is_drained),
     ("L0 chain is runnable and wired to CI", check_l0_chain_is_runnable),
+    (
+        "LSN-050 — L0 checks enumerate the working tree, not the index",
+        check_l0_corpus_is_not_index_only,
+    ),
+    (
+        "LSN-044 — a lesson's status agrees with its index row and the tally",
+        check_lesson_status_matches_its_index_row,
+    ),
+    ("the metrics table's rows carry every column", check_metrics_rows_are_complete),
 ]
 
 

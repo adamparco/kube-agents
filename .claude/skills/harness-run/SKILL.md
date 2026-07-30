@@ -121,6 +121,21 @@ On failure: fix and re-run. Do not advance, and do not record a partial result a
 failures on the same unit with no new information is a halt** (PROTOCOL §8.7) — grinding past that
 point means the diagnosis is wrong.
 
+**A mutation sweep is configured, not authored.** When a unit demonstrates that its new check is
+non-vacuous, the sweep runs through **`dev/mutate.py`** against a spec committed under
+`verification/mutants/<CHECK-ID>.json`. Never a throwaway driver in `/tmp`, and never a hand-rolled
+shell loop. Three lessons in four units came from re-authoring that layer each time — a snapshot
+keyed by basename that restored the wrong file over the other ([[LSN-047]]), a `-run` pattern that
+matched nothing and scored three unevaluated mutants as survivors ([[LSN-048]]), and a needle
+containing `""` that closed a `bash -c` string so the applier died and its 0 was read as the suite
+passing ([[LSN-049]]). `dev/mutate.sh` is still the right tool for a one-off "break this, run that,
+put it back"; it is the layer below, and it cannot see any of the three.
+
+Each row names the test that must fail, and `rc != 0` is not a catch. Three verdicts: `caught`,
+`ESCAPED`, `BROKEN`. **A `BROKEN` row is not a finding** — it is the sweep saying it could not
+evaluate the mutant. Strengthening a test against one produces a test that passes on the first run,
+looks exactly like the fix, and leaves the mutant unmeasured.
+
 ---
 
 ## 6. CHECKPOINT
