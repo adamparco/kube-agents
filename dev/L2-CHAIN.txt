@@ -51,13 +51,51 @@
 # P1 in full, and the header names that successor.
 
 # --- the standing regression suite ----------------------------------------------------------
-# verify-phase7.sh is the whole prior build in one command: it runs verify-phase{2,3,4,5,6}.sh,
-# chaos C1-C4, 03 §11 negative attenuation, the goldens and `go test ./...`. It is listed FIRST
-# because a phase's new L2 evidence is worth nothing if it was gathered on a cluster where the
-# previous phases had already broken.
+# The standing line is the LAST CLOSED PHASE'S GATE, and nothing else. Phase 8 closed on 2026-07-27
+# and this line still said verify-phase7.sh until 2026-07-30, which cost two things that are worth
+# naming because neither is visible from the chain file.
+#
+# The first is coverage: verify-phase7.sh reaches phases 2-6, so for three phases the standing
+# regression did not include the six Phase-8 suites at all. They were still run — they are listed
+# individually below — but they were run as Phase 8's own evidence rather than as the floor every
+# later phase has to clear, which is a different claim about the same commands.
+#
+# The second is subtler and is the reason this comment is this long. invariants-gate.py derives the
+# set of scripts it lints for declared preconditions from the TRANSITIVE CLOSURE OF THIS FILE
+# (_l2_scripts_in_scope). A phase gate that is in no chain line and that nothing else calls is
+# therefore outside that closure: verify-phase8.sh, the single script that renders Phase 8's verdict,
+# was never once asked which artifact it was judging. The lint was not broken and the script happens
+# to declare its preconditions properly; the point is that nothing checked, for three phases, and the
+# only way to find that out was to ask why the standing line was a phase behind.
+#
+# So: verify-phase8.sh is the whole prior build in one command. It runs verify-phase7.sh (=> phases
+# 2-6, chaos C1-C4, 03 §11 negative attenuation, the goldens and `go test ./...`) and all six Phase-8
+# suites. It is listed FIRST because a phase's new L2 evidence is worth nothing if it was gathered on
+# a cluster where the previous phases had already broken.
+bash dev/verify/verify-phase8.sh gke-scratch-kube-agents-dev
+
+# verify-phase7.sh stays a line of its own even though the line above reaches it, and the reason is
+# not sentiment. invariants-gate.py's check_closed_lessons_are_executable resolves chain lines
+# LITERALLY — it does not follow delegation, unlike _l2_scripts_in_scope four hundred lines away in
+# the same file — and dropping this line turned LSN-013 and LSN-028 red within one run, both of them
+# closed years of build-time ago against verify-phase7.sh as their mechanizing artifact.
+#
+# The first instinct was that the check is coarse and should follow delegation. It should not, and
+# the argument is the same one written under the Phase 8 heading below: verify-phase8.sh runs
+# verify-phase7.sh only when P1 resolves, so a delegated call is a CONDITIONAL one. "Named by a chain
+# line" means "runs every time the chain runs", and that is a stronger and more useful property than
+# "is reachable". A lesson mechanized by an artifact that runs only when a precondition happens to
+# hold is a lesson that can silently stop being mechanized on a cluster with a stale image.
 bash dev/verify/verify-phase7.sh gke-scratch-kube-agents-dev
 
 # --- Phase 8 L2 checks ------------------------------------------------------------------------
+# These five and webhook-negatives-l2.sh below are now ALSO reached through the standing line, and
+# they stay listed anyway. verify-phase8.sh runs each of them CONDITIONALLY — egress-enforcement only
+# on a dataplane P4 recognises, webhook-negatives only once it covers all ten of 06 §1.2's rules —
+# and a conditional caller is not a substitute for a line that always runs. Collapsing them into the
+# standing line would silently convert "this suite ran" into "this suite ran unless the gate decided
+# otherwise", which is exactly the distinction the gate's deferral arms exist to keep visible.
+#
 # Two kinds of claim, one cluster that can host both: the first three need a dataplane that actually
 # enforces NetworkPolicy (P4's allow-list of known-enforcing dataplanes — this target runs anetd,
 # GKE's Dataplane V2), the last two need the operator and its webhook. The target below satisfies
@@ -171,3 +209,23 @@ bash dev/verify/broker-per-agent-l2.sh gke-scratch-kube-agents-dev
 # agent's reader ServiceAccount so the broker can be asked to refuse it, which is a thing to do on a
 # scratch cluster and nowhere else. Its own anchored guard is what keeps that true.
 bash dev/verify/broker-auth-l2.sh gke-scratch-kube-agents-dev
+
+# --- Phase 9's gate ------------------------------------------------------------------------------
+# verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the
+# two suites P9-T9b-5 still owes, the L0 chain run as a file, and the whole prior ratchet through the
+# standing line.
+#
+# IT IS RED TODAY, ON PURPOSE, and that is the reason it is listed rather than held back until it
+# passes. Sections B, E, F and G detect broker-execute-l2.sh, actor-grant-sweep-l2.sh, V-BRK-021's L2
+# claimant and planning defect 2's guard 1 BY ARTIFACT and fail while each is absent. A gate that is
+# only added once it is green is a gate that has never once told anyone something they did not
+# already know; the whole value of the artifact arms is that they are visible in an L2 run now,
+# months before anybody would otherwise notice that Accept (a) has never been executed against a
+# cluster. verify-phase8.sh spent three phases outside this file for want of that argument, which is
+# written out in full above the standing line.
+#
+# It is listed LAST and it duplicates work — it re-runs the standing line and every Phase-9 line
+# above it. That is accepted for as long as Phase 9 is open. At Phase 9's milestone it BECOMES the
+# standing line, at which point the seven Phase-9 lines above collapse into it the way the Phase-8
+# five should have, and L2_CHAIN_FLOOR in invariants-gate.py moves in that same commit.
+bash dev/verify/verify-phase9.sh gke-scratch-kube-agents-dev

@@ -2234,12 +2234,36 @@ is counted as a pass; counting it as a retraction gives 36 / 20 / 16.
 - **V-BRK-021 needs both L0 and L2**; its only evidence is L1. Its L0 half is a lint over the shipped
   image, and it is entangled with the unresolved P9-T7c-2b halt.
 
+> **Superseded 2026-07-30 by P9-T9b-4** — the V-BRK-021 bullet only. It was accurate on 2026-07-29
+> and both halves of it are now wrong, which is the reconciliation T9b-4 owed; the full argument is
+> in "P9-T9b-4 — outcome" below. Short form: the L0 half went green that morning under P9-T7c-2c
+> (`results.csv` row 138) after the row was reshaped away from a route count, so "its only evidence
+> is L1" describes a file that no longer exists. And the L1 row (row 54) was never one of the
+> required levels — 09 §6 lists V-BRK-021 as **L0, L2** — so it neither discharged anything nor
+> constituted the gap. The real gap is the **L2** half and only that, and it is not "a lint over the
+> shipped image": a lint is what the L0 half already is. The L2 half is a probe of a **running**
+> broker, which is the only thing that can distinguish what the tree says from what was shipped.
+> The other two bullets stand as written and both were closed by T9b-1/2/3.
+
 **Two of planning defect 2's three guards are not in the state that paragraph assumes.**
 
 1. **Guard 1 does not exist.** `invariants-gate.py` has 18 `check_*` functions and none mentions the
    test-only overlay. The lint that refuses an overlay reference under `k8s-operator/scripts/`,
    `deploy/` or `config/` still has to be written — and it is the one guard the paragraph itself
    calls "the single worst outcome of this decision".
+
+   > **Closed 2026-07-30 by P9-T8b-4b-ii-2a**, and confirmed by T9b-4's gate arm.
+   > `check_test_only_grants_are_confined` (**V-CTN-037**) exists, is registered, and runs on every
+   > PR through `dev/L0-CHAIN.txt`. It is also stronger than the bullet asked for: rather than
+   > refusing an overlay reference under three named install-path roots, it discovers **by the
+   > marker** `kube-agents/test-only-grant` and asserts five properties — the marker appears only
+   > under `dev/` or in prose, every RBAC document under `dev/` carries it, nothing outside `dev/`
+   > names a file containing one, no marked document is cluster-scoped, and no marked Role reaches
+   > `escalate`/`bind`/`impersonate`/`*` or the RBAC API group. Discovery by marker rather than by
+   > path is what keeps it from being a headcount of the one fixture anybody remembers ([[LSN-036]]).
+   > Its stated non-claim stands: RBAC written as a heredoc inside a `dev/**.sh` is out of scope,
+   > because a heredoc's disposition is not statically derivable.
+
 2. **Guard 3 collides with [[LSN-045]], which was learned after it was written.** "The L2 script
    asserts the namespace is empty of `ActionRecord`s at teardown" cannot be satisfied by deleting the
    namespace — `kube-agents-journal-retention` denies DELETE and strands it `Terminating` permanently
@@ -2597,6 +2621,134 @@ Evidence: **V-RUN-010 (L0) pass** — `verification/results.csv`; the check repl
 `git show HEAD:` content for `cmd/broker/main.go` and `internal/journal/auditsource.go` with the new
 `cloudaudit` package removed reports all three shipped defects, which is the evidence that it would
 have caught them.
+
+---
+
+### P9-T9b-4 — outcome, 2026-07-30
+
+Three deliverables: `dev/verify/verify-phase9.sh`, its chain lines, and the V-BRK-021 L0-vs-L2
+reconciliation. All three landed. Two of them turned up something the unit was not looking for.
+
+**The gate itself.** `verify-phase9.sh` follows `verify-phase8.sh` exactly where the template is
+load-bearing — no default target, an anchored `gke-scratch-*` `case`, P10 first as a hard `exit 2`
+(could-not-run, never 1), P1 with the three-state `dev_ok`, section A running `dev/L0-CHAIN.txt` **as
+a file** with a shrink guard, one `run_l2` as the only place a sub-suite's rc is interpreted
+(`0` pass · `3` defer, never a pass · `2` could-not-run · `*` fail), and a final section that prints
+deferrals without asserting them. Sections A–I bind to Accept (a)–(e), the ratchet and the
+deferrals. Two departures, both argued in the file: the three-state P1 read is a function
+(`p1_gated`) rather than a block copied into each section, because Phase 9 has six cluster-bound
+sections to Phase 8's four and the copies had already drifted in wording; and `cd "$REPO_ROOT"`
+carries `|| exit 2`, because section A runs 43 commands relative to it and a failed `cd` would
+produce 43 wrong answers rather than one.
+
+**Five artifact arms, four of them red today, and that is the deliverable.** Accept (a)
+(`broker-execute-l2.sh`),
+Accept (d)'s journal half (same artifact), Accept (e) (`actor-grant-sweep-l2.sh`), V-BRK-021's L2
+claimant, and planning defect 2's guard 1 are all detected **by artifact** — a file that must exist,
+a check function that must be registered, an ID that must be claimed by a script that is in the
+chain. None of them is a comment saying "T9b-5 pending". The gate therefore goes green on its own
+when the work lands and cannot be talked into it before, which is the one property of
+`verify-phase8.sh` section E worth copying. The shape is worth stating once: **Accept (a) — "an
+envelope flows end-to-end in shadow mode and produces a well-formed `ActionRecord` with a valid undo
+plan" — has never been executed once against a cluster.** Four suites prove the undo machinery (the
+index resolves, the prober reads back, the replayer restores) and not one of them submits an
+envelope.
+
+**The fifth artifact arm went green, and the first version of it was right by accident.** Section G
+also looks for planning defect 2's guard 1, which the 2026-07-29 recon recorded as not existing. It
+does now — `check_test_only_grants_are_confined` (V-CTN-037) landed the same day under
+P9-T8b-4b-ii-2a — so the recon bullet is annotated closed above. The detector, though, was written to
+match a **function name** containing `test_only` or `overlay`, and it passed on the first run because
+the name and the truth happened to coincide. Telling those two apart is the entire job of section G,
+so the arm was rewritten to assert the property: a check whose body references the marker
+`kube-agents/test-only-grant` — **resolved through the constant, not accepting its spelling** — that
+is registered in the gate's `CHECKS` table, in a gate that is a live line of `L0-CHAIN.txt`. Six
+mutants against it: de-register the check, delete it, hollow the marker constant's value, drop the
+gate from the chain, comment the gate's chain line out — all five caught. The sixth ("the body stops
+using the marker") scored **BROKEN**, not escaped: five other references to the constant survived the
+edit, so the mutant never made the change it claimed to (LSN-048). The intermediate version, which
+also accepted the bare identifier `TEST_ONLY_MARKER`, let the hollowed-constant mutant through — a
+name match one level up from the one it replaced.
+
+**The L2-CHAIN decision, and the drift it exposed.** The standing regression line said
+`verify-phase7.sh`. Phase 8 closed on 2026-07-27. So for three phases the standing baseline was a
+phase behind, and the six Phase-8 suites were run as Phase 8's own evidence rather than as the floor
+every later phase clears — the same commands, a different claim. That is the visible half. The
+invisible half is why this is recorded rather than just fixed: `invariants-gate.py` derives the set
+of scripts it lints for declared preconditions from the **transitive closure of `L2-CHAIN.txt`**
+(`_l2_scripts_in_scope`). A phase gate in no chain line, called by nothing, is outside that closure.
+**`verify-phase8.sh` — the single script that renders Phase 8's verdict — was never once asked which
+artifact it was judging.** It happens to declare its preconditions correctly; nothing checked, and
+the only way to discover that was to ask why the standing line was stale.
+
+Resolution: the standing line advances to `verify-phase8.sh`, and `verify-phase9.sh` is added under
+its own heading **while the phase is open and while it is red**. The argument for listing a red gate
+is that a gate added only once it passes has never told anyone something they did not already know;
+the artifact arms are worth having in an L2 run now, not at the milestone. At Phase 9's milestone it
+becomes the standing line and the seven Phase-9 lines collapse into it.
+
+**The correction that came from running the gate: a check I was about to call coarse was right.**
+Advancing the standing line and dropping the `verify-phase7.sh` line turned
+`check_closed_lessons_are_executable` red within one run — LSN-013 and LSN-028 are both closed
+naming `verify-phase7.sh` as their mechanizing artifact, and that check resolves chain lines
+**literally**, unlike `_l2_scripts_in_scope` four hundred lines away in the same file. The first
+instinct was that the two resolvers should agree and that this one should follow delegation. It
+should not. `verify-phase8.sh` runs `verify-phase7.sh` only when P1 resolves, so a delegated call is
+a **conditional** one; "named by a chain line" means "runs every time the chain runs", which is
+strictly stronger than "is reachable". A lesson mechanized by an artifact that runs only when a
+precondition happens to hold is a lesson that can stop being mechanized on a cluster with a stale
+image, silently. So `verify-phase7.sh` keeps its own line, and the same argument is now written
+above the Phase-8 block, which is also conditionally reached and also stays listed.
+
+**Two floors raised, in the commit that moved the chain, because their own docstrings say to.**
+`L2_CHAIN_FLOOR` sat at **6** against a 14-line chain and `L2_SCOPE_FLOOR` at **16** against a
+23-script closure. Both comments say in as many words that a floor below the real count tolerates
+exactly the change it exists to notice; neither had been moved since it was written. Now 16 and 25.
+This is a strengthening, not a check edit motivated by a failing implementation — the checks were
+green before and after — and the milestone that collapses Phase 9's lines will have to lower
+`L2_CHAIN_FLOOR` deliberately, which is the point of the number being there.
+
+**The V-BRK-021 reconciliation.** The 2026-07-29 recon bullet read "V-BRK-021 needs both L0 and L2;
+its only evidence is L1". Both halves are now false and the bullet is annotated superseded in place
+rather than rewritten, because it was accurate when written.
+
+| Level | 09 §6 requires it | Evidence on file                                                     |
+| ----- | ----------------- | -------------------------------------------------------------------- |
+| L0    | **yes**           | `results.csv` row 138, 2026-07-30, P9-T7c-2c — **pass**, sweep 10/10 |
+| L1    | no                | `results.csv` row 54, 2026-07-27, P9-T2 — pass                       |
+| L2    | **yes**           | **none**                                                             |
+
+So the L1 row was never load-bearing: it neither discharged the requirement nor constituted the gap,
+and reading it as "the only evidence" made an unrequired level look like partial credit toward two
+required ones. The gap is the **L2 half and only that**. It is also not, as the bullet said, "a lint
+over the shipped image" — a lint is what the L0 half already is, and the L0 half is a source
+derivation (`MutatingRoutes()` equals `Registered()` less a declared allowlist, one registration call
+site, every mutating route reaching the authenticator and the pipeline over the call graph). The L2
+half is the clause a source scan cannot reach: debug routes, override query params and the ten
+`X-Kube-Agents-*` bypass headers all 404/405 against a **running** broker, exactly one listening port
+on the pod, and no build-tag-guarded skip path in the image the controller actually handed out. A
+lint proves what the tree says; only a probe proves what was shipped. V-BRK is BLOCKING-ALWAYS, so
+this may not be deferred — section G of the gate is red until an `*-l2.sh` claims the ID **and** that
+script is a live line of `L2-CHAIN.txt`. Both conjuncts matter: a script claiming the ID from outside
+the chain is evidence nobody gathers.
+
+**Filed, not fixed.**
+
+1. `check_closed_lessons_are_executable` and `_l2_scripts_in_scope` both answer "is this script run
+   by the chain" and give different answers. Both are right for their own purpose, and nothing says
+   so — a future reader will reasonably conclude one is a bug. Candidate: name the two properties
+   apart in the source (`run_unconditionally` vs `reachable`) so the divergence is a decision rather
+   than an accident.
+2. The Phase-8 suites are now run twice per L2 chain pass — once through the standing line
+   conditionally, once as their own unconditional lines. Accepted deliberately (the conditional
+   caller argument above), but it is real cluster time, and the same duplication is about to double
+   for Phase 9. Candidate for the milestone: a gate that takes `--already-regressed` rather than a
+   chain that runs the same suite twice.
+3. **The candidate gate rule this unit most wants mechanized:** _the standing regression line of
+   `dev/L2-CHAIN.txt` names the most recently closed phase's gate._ It is derivable — the ledger
+   knows the last closed phase, `dev/verify/verify-phase<N>.sh` is a naming convention the repo
+   already relies on, and the drift went three phases unnoticed. This is `harness-improve`'s, not
+   this unit's.
 
 ---
 

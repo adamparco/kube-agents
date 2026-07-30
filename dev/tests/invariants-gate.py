@@ -1546,13 +1546,22 @@ CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
 # here because the first version's floor was 5 against a 6-line chain, so deleting a line from the
 # chain left the check green over the remaining five. A floor below the real count is a check that
 # tolerates exactly the change it exists to notice.
-L2_CHAIN_FLOOR = 6
+# Raised 6 -> 16 on 2026-07-30 (P9-T9b-4), in the same commit that grew the chain, because the
+# docstring above is an instruction and it had not been followed since the check was written: the
+# floor sat at 6 against a 14-line chain, so eight lines could have left without a word. Phase 9's
+# milestone will collapse its seven lines into verify-phase9.sh and this number must come down in
+# THAT commit, deliberately, which is the whole point of it being here.
+L2_CHAIN_FLOOR = 16
 # How many scripts the TRANSITIVE scope held when it was widened (2026-07-25, P8-T8). A separate
 # ratchet from the one above because the two guard different things: L2_CHAIN_FLOOR notices a line
 # leaving L2-CHAIN.txt, this one notices a claim-making script leaving the closure — including one
 # that leaves by being un-called, or by renaming its verdict functions, neither of which touches the
 # chain file at all.
-L2_SCOPE_FLOOR = 16
+# Raised 16 -> 25 on 2026-07-30 (P9-T9b-4), same argument as the line above. The two scripts that
+# joined the closure that day are verify-phase8.sh and verify-phase9.sh — the Phase 8 gate had been
+# outside it for three phases because the standing chain line was a phase behind, so the one script
+# that renders Phase 8's verdict was never asked which artifact it was judging.
+L2_SCOPE_FLOOR = 25
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:
