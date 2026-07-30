@@ -2023,19 +2023,20 @@ deliverables wearing one name, and two of them cannot be checkpointed in a sessi
 
 The remaining two halves are hermetic and each is a unit. The split:
 
-| Unit              | What                                                                                                                                                                                | Checks                                                                                                                               | Blocked on             |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ---------------------- |
-| **P9-T8b-1**      | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic   | **V-BRK-028** (new)                                                                                                                  | nothing                |
-| **P9-T8b-2**      | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029** (new)                                                                                                                  | T8b-1                  |
-| ~~**P9-T8b-3**~~  | ~~The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)~~ — **split, see below**: the skill is Phase 9's, the retirement is Phase 10's     | ~~V-GAT-019 (phase **10**)~~ — mis-bound                                                                                             | —                      |
-| **P9-T8b-3a**     | The `apply-change` skill in all three tiers, alongside `submit-suggestion` — **done 2026-07-30**                                                                                    | **V-CTR-020** (new)                                                                                                                  | T8b-2b                 |
-| **P9-T8b-3b**     | `submit-suggestion`'s retirement — **deferred into Phase 10 as P10-T3**                                                                                                             | —                                                                                                                                    | Phase 10               |
-| ~~**P9-T8b-4**~~  | ~~The L2 shadow soak with journal mining~~ — **split, see below**: the broker has no deployment path, so there is nothing to soak yet                                               | ~~V-REV-001 (L2)~~                                                                                                                   | —                      |
-| **P9-T8b-4a**     | The broker's deployment path, and the L2 claim it makes checkable                                                                                                                   | **V-BRK-012 (L2)**                                                                                                                   | a live scratch cluster |
-| ~~**P9-T8b-4b**~~ | ~~The L2 shadow soak with journal mining~~ — **split again, see below**: nothing in `dev/` can present a credential to a broker, so there is no caller to soak with                 | ~~V-REV-001 (L2)~~                                                                                                                   | —                      |
-| **P9-T8b-4b-i**   | The in-cluster envelope driver, and the five transport checks it makes answerable — **done 2026-07-30**                                                                             | **V-BRK-007/008/009/010/017 (L2)**                                                                                                   | T8b-4a                 |
-| **P9-T8b-4b-ii**  | The L2 shadow soak with journal mining                                                                                                                                              | V-REV-001 (L2)                                                                                                                       | T8b-4b-i               |
-| **P9-T8b-4c**     | `session_trace()` emits `parentSpanId`, which the broker's closed schema refuses; fix the shipped client across all three tiers and add the assertion that would have caught it     | a NEW 09 §6.2 row — ID assigned by that unit, not guessed here (four wrong `V-*` bindings are already on this phase's findings list) | —                      |
+| Unit               | What                                                                                                                                                                                | Checks                                                                                                                               | Blocked on             |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ---------------------- |
+| **P9-T8b-1**       | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic   | **V-BRK-028** (new)                                                                                                                  | nothing                |
+| **P9-T8b-2**       | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029** (new)                                                                                                                  | T8b-1                  |
+| ~~**P9-T8b-3**~~   | ~~The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)~~ — **split, see below**: the skill is Phase 9's, the retirement is Phase 10's     | ~~V-GAT-019 (phase **10**)~~ — mis-bound                                                                                             | —                      |
+| **P9-T8b-3a**      | The `apply-change` skill in all three tiers, alongside `submit-suggestion` — **done 2026-07-30**                                                                                    | **V-CTR-020** (new)                                                                                                                  | T8b-2b                 |
+| **P9-T8b-3b**      | `submit-suggestion`'s retirement — **deferred into Phase 10 as P10-T3**                                                                                                             | —                                                                                                                                    | Phase 10               |
+| ~~**P9-T8b-4**~~   | ~~The L2 shadow soak with journal mining~~ — **split, see below**: the broker has no deployment path, so there is nothing to soak yet                                               | ~~V-REV-001 (L2)~~                                                                                                                   | —                      |
+| **P9-T8b-4a**      | The broker's deployment path, and the L2 claim it makes checkable                                                                                                                   | **V-BRK-012 (L2)**                                                                                                                   | a live scratch cluster |
+| ~~**P9-T8b-4b**~~  | ~~The L2 shadow soak with journal mining~~ — **split again, see below**: nothing in `dev/` can present a credential to a broker, so there is no caller to soak with                 | ~~V-REV-001 (L2)~~                                                                                                                   | —                      |
+| **P9-T8b-4b-i**    | The in-cluster envelope driver, and the five transport checks it makes answerable — **done 2026-07-30**                                                                             | **V-BRK-007/008/009/010/017 (L2)**                                                                                                   | T8b-4a                 |
+| **P9-T8b-4b-ii-1** | Step 3's live reads answer a typed refusal, split by whether retrying can help                                                                                                      | V-BRK-031 (L1, L2)                                                                                                                   | T8b-4b-i               |
+| **P9-T8b-4b-ii-2** | The L2 shadow soak with journal mining, over the read-only tenant overlay                                                                                                           | V-REV-001 (L2)                                                                                                                       | T8b-4b-ii-1            |
+| **P9-T8b-4c**      | `session_trace()` emits `parentSpanId`, which the broker's closed schema refuses; fix the shipped client across all three tiers and add the assertion that would have caught it     | a NEW 09 §6.2 row — ID assigned by that unit, not guessed here (four wrong `V-*` bindings are already on this phase's findings list) | —                      |
 
 **Why T8b-1 is the first half and not an arbitrary slice.** Everything downstream is transport and
 prose; this is the only part with a _correctness_ obligation the broker will enforce. The broker
@@ -2409,6 +2410,9 @@ A driver that can present one answers all five; the soak needs the same driver a
 | **P9-T8b-4b-i**  | The in-cluster envelope driver — a real reader identity at the broker's door — and `dev/verify/broker-auth-l2.sh`  | **V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017**, all L2 | T8b-4a     |
 | **P9-T8b-4b-ii** | The shadow soak proper: a corpus of envelopes through the driver, then journal mining over the `DryRun` population | **V-REV-001 (L2)**                                                    | 4b-i       |
 
+> **Split again — see "P9-T8b-4b-ii splits" below.** 4b-ii-1 types step 3's refusals (V-BRK-031);
+> 4b-ii-2 is the soak, which needs the read-only tenant overlay before its population is non-empty.
+
 **Why the driver is a pod and what that costs.** The three agent images in Artifact Registry are
 stale (2026-07-24 to 2026-07-27) and build `FROM nousresearch/hermes-agent`, so rebuilding them to
 get a Python interpreter next to the shipped scripts is a slow build for a fixture. Instead the pod
@@ -2506,6 +2510,113 @@ was itself verified by temporarily setting it to 15 and watching the run go red.
 reports a verdict it did not compute is worse than a suite that fails**, and this is a general shape
 — worth taking to `harness-improve` as a candidate rule for every `dev/verify/*.sh`, not just this
 one.
+
+### P9-T8b-4b-ii splits: 4b-ii-1 is a typed refusal, 4b-ii-2 is the soak
+
+4b-i's first filed finding said the 500-on-RBAC-denial was 4b-ii's **first order of business, and
+that the choice between typing the refusal and granting the actor a read was a real design question
+rather than a fixture detail**. Investigating it answered the question and also showed that 4b-ii
+was two units, not one.
+
+**The design ruling: type the refusal. Both, in fact, but this one first and on its own.**
+
+`k8s-operator/scripts/agent-identity.yaml.template` is unambiguous — _"Phase 9's actor authority is
+the broker-operations grant and nothing else, and binding a cloud-write credential to it now would
+hand the actor months of authority ahead of the controls that are supposed to bound it (P10-T1 owns
+that)."_ So the shipped actor genuinely cannot read a tenant ConfigMap, and 06 §4.4's fail-closed
+table already has the row: **cannot persist a pre-state snapshot → refuse that envelope.** What the
+table does not say is _which_ refusal, and there turn out to be two, distinguished by whether
+retrying could ever help. That is the whole of V-BRK-031.
+
+Three things made it worse than a cosmetic status code, and the third is the one that decided it:
+
+1. `ReasonSnapshotFailed` already existed and was wired only for the **persist** half at brake row
+   4, never for the **capture** half at step 3. Half a reason code, in production, for a phase.
+2. `Refusal.RetryAfterSeconds`'s own comment says _"zero means do not retry, which is the right
+   answer for every schema and authorization refusal"_ — and this was the site not honouring it. A
+   fleet told to wait sixty seconds and try again spends the rest of the phase retrying a permission
+   boundary.
+3. **`Journal` and `SecurityEvent` are fields ON the `Refusal`.** With no `Refusal`, there is no
+   journal entry and no event: the envelope's disposition was recorded **nowhere**. An agent
+   enumerating what it may touch left no trace at all, which is the exact opposite of what 06 §4.1's
+   per-reason table exists to guarantee, and it is what makes a probing pattern findable afterwards.
+
+The forbidden arm therefore journals and deliberately does **not** alarm. 03 §6's security events
+are for identity violations — a caller that is not who it says it is — and `forbidden-caller`
+(V-BRK-010) remains that case. This is an authorization outcome for a correctly authenticated
+caller, and in shadow mode it fires on **every single action**, so an alarm here is an alarm that
+gets muted, at a cost paid by the events that do matter.
+
+**Why the soak could not simply follow in the same unit.** Because the same reading kills the naive
+soak too. With the shipped grant, no envelope targeting a tenant resource reaches step 4 — so the
+`DryRun` population is **empty**, and this file's own argument against a vacuous V-REV-001 (_"a check
+over an empty population is a check that cannot fail (V-MET-014), and shipping one is worse than
+shipping none"_) applies to the shadow instance exactly as it does to the executed one. The soak
+needs planning defect 2's **read-only** tenant overlay, which does not exist yet. That overlay is
+not a security weakening — invariant 7's mechanized allow-list is `get`/`list`/`watch`, and read
+verbs are explicitly _not_ authority; it is the **write** half, owned by P9-T9b, that needs all
+three guards.
+
+| Unit               | What                                                                                                                                         | Checks                | Blocked on |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- | ---------- |
+| **P9-T8b-4b-ii-1** | Step 3's three live reads answer a typed `*Refusal`, split by whether retrying can help                                                      | **V-BRK-031** (L1+L2) | 4b-i       |
+| **P9-T8b-4b-ii-2** | The read-only tenant overlay `dev/verify/fixtures/actor-tenant-grant.yaml`, planning defect 2's guard 1, the envelope corpus, journal mining | **V-REV-001** (L2)    | 4b-ii-1    |
+
+4b-ii-1's L2 evidence is free: `broker-auth-l2.sh` already drives an envelope past authentication
+into step 3 with the shipped actor, which _is_ the condition. Its 5xx arm was already reporting it.
+
+### P9-T8b-4b-ii-1 — outcome, 2026-07-30
+
+**Green at both levels.** L1: the 3 × 3 table over `{pre-state snapshot, restart baseline,
+live-state resolve} × {Forbidden, Unauthorized, transient}` plus the negative control, in
+`internal/broker/pipeline/pipeline_test.go`. L2: `broker-auth-l2.sh` at 14 PASS / 0 FAIL, rc 0,
+where the **real** API server denied the **real** actor and the broker answered
+`403 target-forbidden`, `retryAfterSeconds: 0` — where the run three days ago answered
+`500 internal-error`.
+
+**The `¬` is on the discrimination, not on the happy arm**, and that is the point. A check asserting
+only "step 3 produces a refusal" passes on an implementation that answers 403 for everything, which
+is precisely how this gets written wrong — the RBAC denial is what anyone debugging it sees. So
+`TestLiveReadRefusalDiscriminatesRatherThanDefaulting` asserts against `liveReadRefusal` directly
+that the two classes differ in reason, differ in status, and that exactly one is retryable.
+`verification/mutants/V-BRK-031.json` scores **8/8 caught**, and its rows are chosen so that six of
+the eight produce a perfectly well-formed `*Refusal` that says the wrong thing — a check that only
+looked for "not a 500" would be green on every one of them.
+
+**A `NotFound` is not in the table on purpose.** `CaptureAll` swallows it as a create's legal empty
+pre-state and `CaptureRestartBaselines` baselines it at zero; the rig's default reader is
+`absent: true`, so every other test in that file already runs that path. Restating it here would be
+a case this helper does not own.
+
+**The L2-0 arm now discriminates on the reason, not the status.** It read
+`401 | 403) bad "refused at the AUTH layer"`, which was correct while `forbidden-caller` was the only
+403 the actions route could produce. There are now two, and they are opposites: one is the
+authenticator saying _this caller is not this broker's agent_, the other is the broker's own actor
+identity hitting its ceiling. Leaving the arm alone would have turned a green suite red on a broker
+doing exactly the right thing (halt condition 2). Guardrail 9 does not bite — the arm was
+**passing** the 500 with a NOTE, so this is not a check edited to let a failing implementation
+through — and the amendment is a strict **narrowing**: every reason that failed before still fails,
+one previously-impossible reason is now named, and five new `¬` rows in the L0-runnable
+`--negative-control` mode pin it, including _"a genuine auth refusal is still a failure"_ so the
+narrowing cannot swallow the case the arm originally existed for. Its 5xx arm also stops
+passing-with-a-note: the defect it was tolerating is closed, and tolerating it again would mean the
+arm can no longer tell the tracked defect from a new one.
+
+**Findings filed, not fixed.**
+
+- **The scratch cluster's actor is `platform-your-gcp-project-id-actor`.** The scope leaf is the
+  literal placeholder string from `vars.sh`, and it has been baked into a real ServiceAccount name,
+  a real RoleBinding, and every RBAC denial message the broker logs. Harmless on scratch and wrong
+  everywhere: the identity a write is attributed to is derived from it, so an install that never
+  edited `vars.sh` would attribute every action to `your-gcp-project-id`. Nothing validates that a
+  scope leaf is not a template default. A candidate gate rule for `harness-improve`, and it belongs
+  with the existing `<scope>`-segment ambiguity already open in the ledger.
+- **The probe's 400-character detail cap truncated the denial mid-namespace-name.** This is the same
+  shape as 4b-i's finding 4, where a 200-character display cap cut the substring an assertion was
+  reading. It is not load-bearing _yet_ — V-BRK-031's assertions read the reason, the status and the
+  retry, none of which are in the detail — but the projector already caps at 1000 and the probe caps
+  again at 400, so there are two caps and only one of them is documented as dangerous. For
+  `harness-improve`, with 4b-i's finding.
 
 ---
 

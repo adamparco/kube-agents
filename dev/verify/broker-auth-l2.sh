@@ -150,7 +150,7 @@ bad() {
   fail=1
 }
 
-# 2 x P1 + broker Available + L2-0 nonce + L2-0 envelope + 8 credential arms + V-BRK-010b.
+# 2 x P1 + broker Available + L2-0 nonce + L2-0 envelope (V-BRK-031) + 8 credential arms + V-BRK-010b.
 EXPECTED_ASSERTIONS=14
 
 field() { # <scenario> <1=outcome 2=status 3=reason 4=detail 5=retryAfterSeconds>
@@ -822,7 +822,7 @@ fi
 echo
 echo "===================================================================="
 if [ "$fail" -eq 0 ]; then
-  echo " PROVEN: V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 at L2"
+  echo " PROVEN: V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 · V-BRK-031 at L2"
   echo " A real reader identity reached a deployed broker; eight other credentials did not."
   echo "===================================================================="
   exit 0
