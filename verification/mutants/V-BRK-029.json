@@ -1,0 +1,345 @@
+{
+  "_comment": "V-BRK-029 -- the agent's write path reaches the broker, over mTLS, and nowhere else. Every mutant edits ALL THREE tier copies, so the tier-parity arm can never be the catcher for a conformance defect and each conformance arm has to earn its own verdict. M15 is the single exception and the control for that arm: it drifts exactly one tier. Four mutants (M5, M6, M9, M14) express defects that are invisible to Python alone -- they are only defects relative to Go source or to a module this environment cannot import, which is the whole argument for the check existing at L0. Run with `python3 dev/mutate.py verification/mutants/V-BRK-029.json`.",
+  "suite": {
+    "kind": "unittest",
+    "dir": ".",
+    "packages": ["discover", "-p", "test_broker_client.py", "dev"]
+  },
+  "mutants": [
+    {
+      "id": "M1-hostname-is-not-checked",
+      "why": "The certificate is still verified against the CA, but nobody checks it was issued for the host we dialled. Any workload holding a CA-signed certificate can now stand in for the broker, and the write path talks to it. This is the classic half-configured mTLS: it looks verified in every log line.",
+      "catcher": "test_the_context_verifies_explicitly",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "ctx.check_hostname = True",
+          "replace": "ctx.check_hostname = False"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "ctx.check_hostname = True",
+          "replace": "ctx.check_hostname = False"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "ctx.check_hostname = True",
+          "replace": "ctx.check_hostname = False"
+        }
+      ]
+    },
+    {
+      "id": "M2-the-peer-certificate-is-optional",
+      "why": "`CERT_NONE` turns the CA into decoration -- the handshake succeeds against anything presenting anything. mTLS becomes a claim in the design doc.",
+      "catcher": "test_nothing_weakens_verification_anywhere_in_the_module",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "ctx.verify_mode = ssl.CERT_REQUIRED",
+          "replace": "ctx.verify_mode = ssl.CERT_NONE"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "ctx.verify_mode = ssl.CERT_REQUIRED",
+          "replace": "ctx.verify_mode = ssl.CERT_NONE"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "ctx.verify_mode = ssl.CERT_REQUIRED",
+          "replace": "ctx.verify_mode = ssl.CERT_NONE"
+        }
+      ]
+    },
+    {
+      "id": "M3-the-client-presents-no-certificate",
+      "why": "The server half of mTLS survives and the client half vanishes, so the broker cannot authenticate the pod. 08 \u00a72.3 requires both directions, always.",
+      "catcher": "test_the_context_loads_a_ca_and_a_client_keypair",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "ctx.load_cert_chain(certfile=cfg.cert_path(CLIENT_CERT), keyfile=cfg.cert_path(CLIENT_KEY))",
+          "replace": "pass  # mutant"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "ctx.load_cert_chain(certfile=cfg.cert_path(CLIENT_CERT), keyfile=cfg.cert_path(CLIENT_KEY))",
+          "replace": "pass  # mutant"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "ctx.load_cert_chain(certfile=cfg.cert_path(CLIENT_CERT), keyfile=cfg.cert_path(CLIENT_KEY))",
+          "replace": "pass  # mutant"
+        }
+      ]
+    },
+    {
+      "id": "M4-a-failed-handshake-is-retried-unverified",
+      "why": "The exact shape a debugging session leaves behind: verification is configured, and one arm quietly falls back when it fails. Every normal run looks correct; the only run that exercises the fallback is the one where a certificate is wrong -- which is the run that matters.",
+      "catcher": "test_a_handshake_failure_is_not_retried",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "raise BrokerError(f\"TLS handshake with the broker failed: {exc}. Not retrying without verification.\") from exc",
+          "replace": "return _decode(urllib.request.urlopen(req, timeout=timeout).read(), 200)  # mutant"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "raise BrokerError(f\"TLS handshake with the broker failed: {exc}. Not retrying without verification.\") from exc",
+          "replace": "return _decode(urllib.request.urlopen(req, timeout=timeout).read(), 200)  # mutant"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "raise BrokerError(f\"TLS handshake with the broker failed: {exc}. Not retrying without verification.\") from exc",
+          "replace": "return _decode(urllib.request.urlopen(req, timeout=timeout).read(), 200)  # mutant"
+        }
+      ]
+    },
+    {
+      "id": "M5-the-endpoint-variable-is-renamed",
+      "why": "The agent reads a variable the operator does not render, so the endpoint is empty and every write refuses locally. Nothing in Python notices: the constant is internally consistent. The write path is simply gone, and it reports itself as a wiring fault the operator did not commit.",
+      "catcher": "test_the_env_var_names_are_the_ones_the_operator_renders",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "ENV_ENDPOINT = \"KUBEAGENTS_BROKER_ENDPOINT\"",
+          "replace": "ENV_ENDPOINT = \"KUBEAGENTS_BROKER_URL\""
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "ENV_ENDPOINT = \"KUBEAGENTS_BROKER_ENDPOINT\"",
+          "replace": "ENV_ENDPOINT = \"KUBEAGENTS_BROKER_URL\""
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "ENV_ENDPOINT = \"KUBEAGENTS_BROKER_ENDPOINT\"",
+          "replace": "ENV_ENDPOINT = \"KUBEAGENTS_BROKER_URL\""
+        }
+      ]
+    },
+    {
+      "id": "M6-the-actions-route-drifts",
+      "why": "A plausible API-version edit made on one side. The broker 404s every submission, and a 404 body is not the Response shape, so it surfaces as an opaque transport error rather than as a route mismatch.",
+      "catcher": "test_the_routes_are_the_brokers_routes",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "ACTIONS_PATH = \"/v1alpha1/actions\"",
+          "replace": "ACTIONS_PATH = \"/v1/actions\""
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "ACTIONS_PATH = \"/v1alpha1/actions\"",
+          "replace": "ACTIONS_PATH = \"/v1/actions\""
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "ACTIONS_PATH = \"/v1alpha1/actions\"",
+          "replace": "ACTIONS_PATH = \"/v1/actions\""
+        }
+      ]
+    },
+    {
+      "id": "M7-the-nonce-is-cached-across-submissions",
+      "why": "A defensible-looking optimisation: one round trip saved per write. The broker's replay guard retires a nonce on use, so the second write of every session is refused as a replay -- and a journal full of replay detections caused by the client is worse than the round trip.",
+      "catcher": "test_a_nonce_is_fetched_for_every_submission",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "        reply = self._open(self._request(NONCE_PATH, method=\"GET\", body=None), NONCE_TIMEOUT_SECONDS)",
+          "replace": "        if getattr(self, \"_mutant_nonce\", None):\n            return self._mutant_nonce\n        reply = self._open(self._request(NONCE_PATH, method=\"GET\", body=None), NONCE_TIMEOUT_SECONDS)"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "        reply = self._open(self._request(NONCE_PATH, method=\"GET\", body=None), NONCE_TIMEOUT_SECONDS)",
+          "replace": "        if getattr(self, \"_mutant_nonce\", None):\n            return self._mutant_nonce\n        reply = self._open(self._request(NONCE_PATH, method=\"GET\", body=None), NONCE_TIMEOUT_SECONDS)"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "        reply = self._open(self._request(NONCE_PATH, method=\"GET\", body=None), NONCE_TIMEOUT_SECONDS)",
+          "replace": "        if getattr(self, \"_mutant_nonce\", None):\n            return self._mutant_nonce\n        reply = self._open(self._request(NONCE_PATH, method=\"GET\", body=None), NONCE_TIMEOUT_SECONDS)"
+        },
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "        return nonce",
+          "replace": "        self._mutant_nonce = nonce\n        return nonce"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "        return nonce",
+          "replace": "        self._mutant_nonce = nonce\n        return nonce"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "        return nonce",
+          "replace": "        self._mutant_nonce = nonce\n        return nonce"
+        }
+      ]
+    },
+    {
+      "id": "M8-the-client-sets-a-bypass-header",
+      "why": "The ten `X-Kube-Agents-*` headers are the broker's tripwire: it refuses the request, journals it, and raises a security event. A client that sets one turns every legitimate write into a recorded attack.",
+      "catcher": "test_no_request_carries_a_bypass_header",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "req.add_header(\"Accept\", \"application/json\")",
+          "replace": "req.add_header(\"Accept\", \"application/json\")\n        req.add_header(\"X-Kube-Agents-Bypass\", \"1\")  # mutant"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "req.add_header(\"Accept\", \"application/json\")",
+          "replace": "req.add_header(\"Accept\", \"application/json\")\n        req.add_header(\"X-Kube-Agents-Bypass\", \"1\")  # mutant"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "req.add_header(\"Accept\", \"application/json\")",
+          "replace": "req.add_header(\"Accept\", \"application/json\")\n        req.add_header(\"X-Kube-Agents-Bypass\", \"1\")  # mutant"
+        }
+      ]
+    },
+    {
+      "id": "M9-the-projected-token-is-not-sent",
+      "why": "mTLS still succeeds, so the connection is encrypted and mutually authenticated -- and the broker's bearer-token arm has nothing to check. 08 \u00a72.3 requires both, always, because each covers a failure the other does not.",
+      "catcher": "test_every_request_carries_the_projected_token",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "req.add_header(\"Authorization\", \"Bearer \" + self.cfg.read_token())",
+          "replace": "pass  # mutant"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "req.add_header(\"Authorization\", \"Bearer \" + self.cfg.read_token())",
+          "replace": "pass  # mutant"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "req.add_header(\"Authorization\", \"Bearer \" + self.cfg.read_token())",
+          "replace": "pass  # mutant"
+        }
+      ]
+    },
+    {
+      "id": "M10-a-plan-is-a-real-write",
+      "why": "`plan_action` executes. An agent told to preview before committing makes the change instead, and reports it as a preview. There is no worse single-word edit in this module.",
+      "catcher": "test_a_plan_and_the_write_it_previews_have_different_keys",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "        client=client,\n        dry_run=True,\n    )",
+          "replace": "        client=client,\n        dry_run=False,\n    )"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "        client=client,\n        dry_run=True,\n    )",
+          "replace": "        client=client,\n        dry_run=False,\n    )"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "        client=client,\n        dry_run=True,\n    )",
+          "replace": "        client=client,\n        dry_run=False,\n    )"
+        }
+      ]
+    },
+    {
+      "id": "M11-a-missing-identity-is-defaulted",
+      "why": "The key is computed over an empty identity: well-formed, and identical for every agent in the cluster. The broker derives the identity itself and refuses the mismatch, so the symptom is `idempotency-key-mismatch` on a correctly-formed request -- a wiring fault wearing a tamper-detection label.",
+      "catcher": "test_a_missing_identity_is_refused_not_defaulted",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "        if not self.identity:",
+          "replace": "        if False:  # mutant"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "        if not self.identity:",
+          "replace": "        if False:  # mutant"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "        if not self.identity:",
+          "replace": "        if False:  # mutant"
+        }
+      ]
+    },
+    {
+      "id": "M12-a-rejected-envelope-is-posted-anyway",
+      "why": "The builder's local refusal becomes advisory. Envelopes the builder knows are malformed reach the broker, where they are refused with less context, after a nonce is spent and a journal line is written.",
+      "catcher": "test_a_malformed_envelope_is_refused_locally_and_nothing_is_posted",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "        return f\"REFUSED (not sent): {exc}\"",
+          "replace": "        envelope = {\"intent\": intent, \"operations\": operations}  # mutant"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "        return f\"REFUSED (not sent): {exc}\"",
+          "replace": "        envelope = {\"intent\": intent, \"operations\": operations}  # mutant"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "        return f\"REFUSED (not sent): {exc}\"",
+          "replace": "        envelope = {\"intent\": intent, \"operations\": operations}  # mutant"
+        }
+      ]
+    },
+    {
+      "id": "M13-a-refusal-renders-as-a-success",
+      "why": "A 403 has no actionId, so the success branch renders `SUBMITTED: decision=accepted` with no detail. The agent then tells a human the cluster changed when it did not. This is the failure the module's docstring names as the only one worse than an error.",
+      "catcher": "test_a_refusal_is_never_rendered_as_a_completed_action",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "    if reason or decision == \"rejected\" or status >= 400:",
+          "replace": "    if False:  # mutant"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "    if reason or decision == \"rejected\" or status >= 400:",
+          "replace": "    if False:  # mutant"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "    if reason or decision == \"rejected\" or status >= 400:",
+          "replace": "    if False:  # mutant"
+        }
+      ]
+    },
+    {
+      "id": "M14-the-mcp-tool-grows-logic",
+      "why": "One statement in the wrapper, and it is a statement no L0 check can execute -- `platform_mcp_server.py` imports `mcp` and `pydantic`, neither of which exists in the check environment. This is LSN-007 reproduced exactly: built, tested-looking, and unreachable. The catcher is structural for that reason; there is no way to test the statement itself.",
+      "catcher": "test_each_tool_delegates_to_the_client_and_does_nothing_else",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/platform_mcp_server.py",
+          "find": "    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)",
+          "replace": "    if \"delete\" in intent.lower():\n        require_approval = True  # mutant\n    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/platform_mcp_server.py",
+          "find": "    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)",
+          "replace": "    if \"delete\" in intent.lower():\n        require_approval = True  # mutant\n    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)"
+        },
+        {
+          "file": "agents/developer-team/scripts/platform_mcp_server.py",
+          "find": "    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)",
+          "replace": "    if \"delete\" in intent.lower():\n        require_approval = True  # mutant\n    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)"
+        }
+      ]
+    },
+    {
+      "id": "M15-one-tier-drifts",
+      "why": "The control for the parity arm, and the only mutant that edits a single tier. Every other mutant here edits all three deliberately, so that byte-parity cannot be the catcher for a conformance defect and the conformance arms have to earn their verdicts. This one proves the parity arm is not itself vacuous.",
+      "catcher": "test_the_copies_are_byte_identical",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "TIMEOUT_SECONDS = 120",
+          "replace": "TIMEOUT_SECONDS = 121"
+        }
+      ]
+    }
+  ]
+}

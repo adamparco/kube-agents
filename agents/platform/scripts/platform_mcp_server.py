@@ -16,6 +16,7 @@ from pathlib import Path
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 from agent_common_server import _run_env, CONFIG_PATH
+import broker_client
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
@@ -515,6 +516,52 @@ def send_notification(message: str, session_id: str = "") -> str:
         return f"ERROR: Failed to send notification: {e.stderr.strip()}"
     except Exception as e:
         return f"ERROR: {e}"
+
+
+# --- the write path (06 §9) ---------------------------------------------------------------------
+#
+# These two are wrappers and nothing else. Every decision -- the envelope, the idempotency key, the
+# nonce, mTLS, the refusal rendering -- is in `broker_client.py`, which imports only the standard
+# library and is therefore reachable by `dev/test_broker_client.py`. This module imports `mcp` and
+# `pydantic`, which the check environment does not have; logic left here would be logic no L0 check
+# can execute (LSN-007). If either of these grows a second statement, that statement is in the
+# wrong file.
+
+
+@mcp.tool()
+def submit_action(intent: str, operations: list[dict], rationale: str = "", require_approval: bool = False) -> str:
+    """
+    Perform a change to the cluster or cloud. This is the ONLY way to write anything.
+
+    The broker classifies the change, plans an undo, journals it, executes it and verifies it. It
+    derives your tier and scope from your identity -- you cannot name either, and you cannot ask
+    for less gating than the classifier decides. Call `plan_action` first if you want to see the
+    classification and the blast radius before committing.
+
+    Args:
+        intent: One sentence, for a human, saying what this change is for.
+        operations: The 06 §4.1 operations. Each has an `op` (create|apply|patch|delete|scale) and
+            exactly one of `target`, `targetSelector` or `cloudTarget`.
+        rationale: Optional reasoning. Recorded and never treated as a risk signal.
+        require_approval: Ask for human approval even if the classifier would not require it.
+    """
+    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)
+
+
+@mcp.tool()
+def plan_action(intent: str, operations: list[dict], rationale: str = "") -> str:
+    """
+    Preview a change without making it: the risk classification, the blast radius and the undo plan.
+
+    Identical to `submit_action` except that nothing is executed. Use it before anything you are
+    not certain about, and show the classification to the human before you submit.
+
+    Args:
+        intent: One sentence, for a human, saying what the change would be for.
+        operations: The same operations you would pass to `submit_action`.
+        rationale: Optional reasoning. Recorded and never treated as a risk signal.
+    """
+    return broker_client.plan_action(intent, operations, rationale=rationale)
 
 
 def start_session_kv_server() -> None:
