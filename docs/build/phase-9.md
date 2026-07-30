@@ -2022,12 +2022,14 @@ deliverables wearing one name, and two of them cannot be checkpointed in a sessi
 
 The remaining two halves are hermetic and each is a unit. The split:
 
-| Unit         | What                                                                                                                                                                                | Checks                   | Blocked on                     |
-| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ | ------------------------------ |
-| **P9-T8b-1** | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic   | **V-BRK-028** (new)      | nothing                        |
-| **P9-T8b-2** | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029** (new)      | T8b-1                          |
-| **P9-T8b-3** | The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)                                                                                      | V-GAT-019 (phase **10**) | T8b-2 — **and it is P10 work** |
-| **P9-T8b-4** | The L2 shadow soak with journal mining                                                                                                                                              | V-REV-001 (L2)           | T8b-3, a live scratch cluster  |
+| Unit             | What                                                                                                                                                                                | Checks                                   | Blocked on                     |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ------------------------------ |
+| **P9-T8b-1**     | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic   | **V-BRK-028** (new)                      | nothing                        |
+| **P9-T8b-2**     | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029** (new)                      | T8b-1                          |
+| ~~**P9-T8b-3**~~ | ~~The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)~~ — **split, see below**: the skill is Phase 9's, the retirement is Phase 10's     | ~~V-GAT-019 (phase **10**)~~ — mis-bound | —                              |
+| **P9-T8b-3a**    | The `apply-change` skill in all three tiers, alongside `submit-suggestion` — **done 2026-07-30**                                                                                    | **V-CTR-020** (new)                      | T8b-2b                         |
+| **P9-T8b-3b**    | `submit-suggestion`'s retirement — **deferred into Phase 10 as P10-T3**                                                                                                             | —                                        | Phase 10                       |
+| **P9-T8b-4**     | The L2 shadow soak with journal mining                                                                                                                                              | V-REV-001 (L2)                           | T8b-3a, a live scratch cluster |
 
 **Why T8b-1 is the first half and not an arbitrary slice.** Everything downstream is transport and
 prose; this is the only part with a _correctness_ obligation the broker will enforce. The broker
@@ -2106,6 +2108,69 @@ are appended _after_ `mergeEnvVars` specifically so `spec.deployment.env` cannot
 and the identity belongs to the same class: a CR author who could set it could not forge an identity
 — the broker derives its own and refuses a mismatch — but they could make **every write from that
 agent refused**, which is a denial of service authored in a field that looks like configuration.
+
+---
+
+### P9-T8b-3 splits in two — the skill is Phase 9's, the retirement is Phase 10's
+
+**Recorded 2026-07-30, at SELECT for T8b-3.** The row above says "the `apply-change` skill in all
+three tiers, and `submit-suggestion`'s retirement" and flags the whole thing as P10 work. Sizing it
+showed the row is two units with opposite phase homes, and that the flag is right about one half and
+wrong about the other.
+
+**The skill belongs to Phase 9, because Phase 9's own task list asks for it.** P9-T8 is "the agent's
+`apply-change` path submits real envelopes", and acceptance **(a)** is "an envelope flows end-to-end
+in shadow mode". T8b-2b shipped the two tools; nothing yet tells an agent they exist, what an
+operation looks like, or that it may not claim its own risk class. The soak in T8b-4 has nothing to
+soak until that prose exists.
+
+**The retirement belongs to Phase 10, and not for bookkeeping reasons.** 07 §2 phases it as P10-T3,
+per tier — "turn shadow mode off for this tier and let the broker execute; wire the `apply-change`
+skill (replacing `submit-suggestion` for this tier)". Retiring it in Phase 9 would delete the only
+working write path in the product during the one phase whose defining property is that **no agent
+holds write authority anywhere**. The replacement runs in dry-run by construction, so the fleet
+would be left with a retired GitOps path and a no-op imperative one — every tier unable to change
+anything, in a phase 07 §2 requires to be "independently shippable and leaves the system working".
+07 §5's rule is the same rule in test form: replaced, never deleted, and swapped for its counterpart
+**in the same phase that removes it**. Phase 9 cannot supply the counterpart; that is what Phase 9
+_is_.
+
+So `submit-suggestion` stays, and `apply-change` lands beside it. The two coexist for exactly one
+phase, which is what a conversion looks like when the ordering rule is obeyed.
+
+| Unit          | What                                                                                                                       | Checks              |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| **P9-T8b-3a** | The `apply-change` skill in all three tiers, alongside `submit-suggestion`, over the tools T8b-2b shipped                  | **V-CTR-020** (new) |
+| **P9-T8b-3b** | `submit-suggestion`'s retirement — **deferred to Phase 10 as part of P10-T3**, per tier, as each tier's shadow mode is off | V-GAT-019 is not it |
+
+**The row's check binding was wrong, and that is a finding rather than a renumbering.** T8b-3 cites
+**V-GAT-019**, which is _parked-record completeness_ — intent, targets, rendered diff, class, the
+gating rule id, and an undo plan or an explicit `undoable: false`. That is a property of a gated
+`ActionRecord`, which is why its phase is 10: Phase 9 parks nothing. It says nothing about a skill,
+and no skill can make it pass or fail. Nothing in 09 §6 covered the agent's own instructions for
+using the write path at all, so **V-CTR-020** is allocated rather than reused — V-CTR is contract
+conformance, which is where V-CTR-011's "no brake tool in any agent tool registry or skill manifest"
+already lives.
+
+**What is actually checkable about prose, and what is not.** A skill is instructions for an LLM, so
+most of it cannot be asserted. Three things can, and each is a join rather than a reading:
+
+- **The tools it tells the agent to call are tools that exist** — the names are read out of
+  `platform_mcp_server.py`'s `@mcp.tool()` functions by AST, not listed in the test. A skill naming
+  a tool the server does not register sends the agent to a dead call, and the symptom is an agent
+  reporting that it cannot act, in prose, with no error anywhere.
+- **The parameters it promises are the parameters the tool takes** — read from the same AST. This is
+  the drift that actually happens: the signature changes and the prose does not.
+- **What it says the agent cannot influence is genuinely absent from the signature** — tier, scope,
+  risk class, approval. 02 §2.2 puts this in the persona's own voice ("the agent does not decide its
+  own risk level and must never claim to"), and the reason it is worth checking is that the sentence
+  is only true while the parameter is missing.
+
+The rest — no `kubectl`/`gcloud`/`git push`/`gh pr create` anywhere in the body — is a grep, and a
+weak one on its own. It is included because it is the one property the conversion is _about_: the
+old skill's entire body is git and `gh` commands, and a copy-paste that left one behind would be a
+mutating shell-out sitting in the instructions of an agent that holds no credential to run it, which
+fails confusingly rather than safely.
 
 ---
 
