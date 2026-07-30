@@ -250,6 +250,60 @@ class TestTheGoSideIsTheDefinition(unittest.TestCase):
             "RESPONSE_FIELDS and render_response disagree, so the join above checks the wrong set",
         )
 
+    # Every closed-enum field a `build_envelope` default can populate, mapped to the mirror that
+    # closes it. `kind` is unambiguous inside this scan because the only `kind` a build_envelope
+    # keyword carries is the requester's -- a target's Kubernetes kind arrives inside `operations`,
+    # which is a caller argument and never a literal here.
+    ENUM_BY_FIELD = {
+        "source": "VALID_TRIGGER_SOURCES",
+        "kind": "VALID_REQUESTER_KINDS",
+        "platform": "VALID_PLATFORMS",
+        "op": "VALID_OPS",
+    }
+
+    def test_every_default_the_client_hands_the_builder_is_inside_the_closed_enum(self):
+        """A default is a value nobody reviews, and this one had been wrong since the file was written.
+
+        `submit_action` passed `trigger or {"source": "agent"}` and `agent` is not one of 06 §4.1's
+        seven sources. Because `envelope.go` validates the enum, that made **every** MCP submission
+        a `400 invalid-envelope` -- not a degraded field, the entire write path, for every agent, on
+        the default call. Nothing caught it: the enum mirror agrees with Go (V-BRK-028), the wire
+        keys are all decodable (V-BRK-032), the transport is correct (the rest of this file), and a
+        default is none of those things. It is a *value*, and until this test the only assertion
+        about a value was made against values the tests themselves supplied.
+
+        Scoped to literals handed to `build_envelope`, unwrapping the `x or {...}` idiom the
+        defaults are written in, so it reads the shipped default and not a caller's argument.
+        """
+        tree = ast.parse((tier_dir("platform") / MODULE).read_text())
+        envelope_mod = self.mod.action_envelope  # the same copy the shipped client validates against
+        checked = 0
+        for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
+            name = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", "")
+            if name != "build_envelope":
+                continue
+            for kw in call.keywords:
+                value = kw.value
+                if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or):
+                    value = value.values[-1]  # `caller_arg or {the default}`
+                if not isinstance(value, ast.Dict):
+                    continue
+                for key, val in zip(value.keys, value.values):
+                    if not (isinstance(key, ast.Constant) and isinstance(val, ast.Constant) and isinstance(val.value, str)):
+                        continue
+                    enum_name = self.ENUM_BY_FIELD.get(key.value)
+                    if enum_name is None:
+                        continue
+                    checked += 1
+                    with self.subTest(keyword=kw.arg, field=key.value):
+                        self.assertIn(
+                            val.value,
+                            getattr(envelope_mod, enum_name),
+                            f"{MODULE} defaults {kw.arg}.{key.value} to {val.value!r}, which is not in {enum_name}. "
+                            "The broker validates this enum, so the default makes every envelope a 400.",
+                        )
+        self.assertTrue(checked, "no enum-typed default was found at all, so this scan proves nothing")
+
 
 # --- 2. mTLS has no off switch ------------------------------------------------------------------------
 

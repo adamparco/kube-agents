@@ -41,6 +41,7 @@ not a shape this check can pass in.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
@@ -378,7 +379,25 @@ class TestEnumsMatchTheBroker(unittest.TestCase):
     Go source rather than restated here, so this file is a comparison and not a third copy
     ([[LSN-036]]): a verb added to the broker and not to the agent is a verb the agent cannot spell,
     and the failure mode is a local refusal with a message about an unknown op.
+
+    **Strengthened in P9-T8b-4c, because this class had the hole it exists to prevent.** It was
+    three tests -- `validOps`, `validPatchTypes`, `validRequesterKinds` -- naming the three enums
+    Python mirrored. `envelope.go` declared six. The three nobody named were exactly the three
+    nobody mirrored, so the check was a comparison of the set that agreed with itself, and it was
+    green for every day the other three did not exist on the Python side. It cost a live 400 on the
+    first in-cluster probe (`trigger.source: "verification"`, a word that is not one of the seven).
+    The enums are now **discovered** from the Go source and each one demands a Python counterpart
+    by derived name, so a seventh enum is a failing build rather than a silent omission -- which is
+    the difference between a join and a list of joins somebody remembered to write.
     """
+
+    #: `validTriggerSources` -> `VALID_TRIGGER_SOURCES`. A derivation, not a table: a table is the
+    #: same enumeration this class was just cured of, one indirection further away.
+    #: `[^}]*` rather than a DOTALL `.*?` because two of the six literals are written on one line
+    #: and four are spread over several; a lazy dot run to the next `^\t}` swallows the one-liner's
+    #: successor whole and reports five enums where there are six -- which is how this regex was
+    #: wrong the first time it ran, and it reported the miscount as a member mismatch.
+    GO_ENUM = re.compile(r"\bvalid([A-Za-z]+)\s*=\s*map\[string\]bool\{([^}]*)\}")
 
     def setUp(self):
         self.module = load("platform")
@@ -389,14 +408,63 @@ class TestEnumsMatchTheBroker(unittest.TestCase):
         self.assertIsNotNone(match, f"{name} is no longer a map[string]bool literal in {ENVELOPE_GO.name}")
         return set(re.findall(r'"([^"]+)"\s*:\s*true', match.group(1)))
 
-    def test_valid_ops(self):
-        self.assertEqual(self.go_set("validOps"), set(self.module.VALID_OPS))
+    @staticmethod
+    def python_name(go_suffix: str) -> str:
+        """`TriggerSources` -> `VALID_TRIGGER_SOURCES`."""
+        return "VALID_" + re.sub(r"(?<!^)(?=[A-Z])", "_", go_suffix).upper()
 
-    def test_valid_patch_types(self):
-        self.assertEqual(self.go_set("validPatchTypes"), set(self.module.VALID_PATCH_TYPES))
+    def go_enums(self) -> dict[str, set[str]]:
+        """`{VALID_OPS: {...}}` -- keyed by the Python name the Go name derives to."""
+        return {self.python_name(suffix): set(re.findall(r'"([^"]*)"\s*:\s*true', body)) for suffix, body in self.GO_ENUM.findall(self.source)}
 
-    def test_valid_requester_kinds(self):
-        self.assertEqual(self.go_set("validRequesterKinds"), set(self.module.VALID_REQUESTER_KINDS))
+    def python_enums(self) -> set[str]:
+        return {n for n in dir(self.module) if n.startswith("VALID_")}
+
+    def test_the_two_sides_declare_the_same_closed_enums(self):
+        """Both directions, which is also this class's vacuity guard.
+
+        A regex that stops matching yields `{}`, and a per-enum loop over `{}` passes by never
+        running -- the precise shape of green that let three unmirrored enums sit here. Comparing
+        the two NAME sets cannot pass vacuously: zero on the Go side is six unexplained constants
+        on the Python side. It needs no floor constant, and it fails in the other direction too, on
+        a Python `VALID_*` naming a closed set the broker does not have.
+        """
+        self.assertEqual(
+            set(self.go_enums()),
+            self.python_enums(),
+            f"{ENVELOPE_GO.name} and {MODULE} do not declare the same closed enums. An enum on only one side "
+            "means the agent can build an envelope carrying a value the broker refuses, and finds out over HTTP.",
+        )
+
+    def test_every_closed_enum_in_the_broker_is_mirrored_by_the_agent(self):
+        """Discovered, so the set under test cannot quietly become the set that agrees."""
+        for py_name, members in sorted(self.go_enums().items()):
+            with self.subTest(enum=py_name):
+                self.assertTrue(hasattr(self.module, py_name), f"{ENVELOPE_GO.name} declares it and {MODULE} has no {py_name}")
+                self.assertEqual(members, set(getattr(self.module, py_name)), f"{py_name} and its Go original disagree")
+
+    def test_every_mirrored_enum_is_actually_consulted_by_the_validator(self):
+        """A frozenset nobody reads is decoration, and reads as coverage ([[LSN-041]]).
+
+        Scoped to the names that appear as an operand of a **comparison**, not to the names that
+        appear in the function's text. Every one of these enums is also interpolated into the
+        `EnvelopeError` it raises, so a substring search is satisfied by the error message alone —
+        which means the check passes for a validator that inlines the members and mentions the
+        constant only when explaining the refusal. That drift is not hypothetical; it is what the
+        mutant `M19-a-mirrored-enum-is-never-consulted` does, and it escaped the first draft of
+        this test. Mentioning a rule is not applying it ([[LSN-023]]).
+        """
+        fn = next(n for n in ast.walk(ast.parse(tier_path("platform").read_text())) if isinstance(n, ast.FunctionDef) and n.name == "_check_client_side")
+        compared = {
+            node.id for cmp in ast.walk(fn) if isinstance(cmp, ast.Compare) for node in ast.walk(cmp) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        }
+        for py_name in sorted(self.go_enums()):
+            with self.subTest(enum=py_name):
+                self.assertIn(
+                    py_name,
+                    compared,
+                    f"{py_name} exists and `_check_client_side` never compares anything against it, so nothing local enforces it",
+                )
 
     def test_limits(self):
         for go_name, py_name in (

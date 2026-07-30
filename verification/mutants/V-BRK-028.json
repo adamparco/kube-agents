@@ -347,6 +347,84 @@
           "replace": "KEY_PREFIX = \"sha256:\"  # mutant"
         }
       ]
+    },
+    {
+      "id": "M17-a-closed-enum-is-not-mirrored-at-all",
+      "why": "THE hole this class had for three phases. envelope.go declared six closed enums, this module mirrored three, and the join was three hand-written tests naming the same three -- so the set under test was the set that agreed. It cost a live 400 on the first in-cluster probe.",
+      "catcher": "test_the_two_sides_declare_the_same_closed_enums",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "VALID_TRIGGER_SOURCES = frozenset({\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\", \"undo\"})\n",
+          "replace": ""
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "VALID_TRIGGER_SOURCES = frozenset({\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\", \"undo\"})\n",
+          "replace": ""
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "VALID_TRIGGER_SOURCES = frozenset({\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\", \"undo\"})\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M18-a-mirrored-enum-drops-a-member",
+      "why": "The narrower miss: the constant exists, so the name sets agree, and one value the broker accepts is one the agent refuses locally with a message about an unknown source.",
+      "catcher": "test_every_closed_enum_in_the_broker_is_mirrored_by_the_agent",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\", \"undo\"",
+          "replace": "\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\""
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\", \"undo\"",
+          "replace": "\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\""
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\", \"undo\"",
+          "replace": "\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\""
+        }
+      ]
+    },
+    {
+      "id": "M19-a-mirrored-enum-is-never-consulted",
+      "why": "A frozenset nobody reads is decoration that reads as coverage (LSN-041). The members are inlined at the comparison and the constant survives only inside the error message, so behaviour is IDENTICAL and every other test stays green -- which is the point: this escaped the first draft of the catcher, whose substring search the error message satisfied.",
+      "catcher": "test_every_mirrored_enum_is_actually_consulted_by_the_validator",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "    if trigger.get(\"source\") not in VALID_TRIGGER_SOURCES:",
+          "replace": "    if trigger.get(\"source\") not in frozenset({\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\", \"undo\"}):"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/action_envelope.py",
+          "find": "    if trigger.get(\"source\") not in VALID_TRIGGER_SOURCES:",
+          "replace": "    if trigger.get(\"source\") not in frozenset({\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\", \"undo\"}):"
+        },
+        {
+          "file": "agents/developer-team/scripts/action_envelope.py",
+          "find": "    if trigger.get(\"source\") not in VALID_TRIGGER_SOURCES:",
+          "replace": "    if trigger.get(\"source\") not in frozenset({\"chat\", \"watch\", \"alert\", \"cron\", \"delegation\", \"escalation\", \"undo\"}):"
+        }
+      ]
+    },
+    {
+      "id": "M20-the-enum-discovery-regex-stops-matching",
+      "why": "The vacuity control, and it mutates the CHECK rather than the code. A per-enum loop over an empty discovery passes by never running, which is precisely the green this class used to give. Comparing the two name sets is what makes that impossible.",
+      "catcher": "test_the_two_sides_declare_the_same_closed_enums",
+      "edits": [
+        {
+          "file": "dev/test_action_envelope.py",
+          "find": "GO_ENUM = re.compile(r\"\\bvalid([A-Za-z]+)\\s*=\\s*map\\[string\\]bool\\{([^}]*)\\}\")",
+          "replace": "GO_ENUM = re.compile(r\"\\bvalid([A-Za-z]+)\\s*=\\s*map\\[string\\]boolean\\{([^}]*)\\}\")"
+        }
+      ]
     }
   ]
 }

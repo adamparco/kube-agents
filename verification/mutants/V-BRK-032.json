@@ -1,0 +1,82 @@
+{
+  "_comment": "Mutation sweep for V-BRK-032 -- every key the agent puts on the wire is a key the broker's decoder accepts. Run: python3 dev/mutate.py verification/mutants/V-BRK-032.json. Every row names the test that must fail; see dev/mutate.py for why rc != 0 is not a catch. Only the platform tier is mutated: the three copies are byte-identical and each is read separately, so a mutation in one is a mutation the check must see.",
+  "suite": {
+    "kind": "unittest",
+    "dir": ".",
+    "packages": ["discover", "-p", "test_envelope_wire_keys.py", "dev"]
+  },
+  "mutants": [
+    {
+      "id": "M1-parent-span-id-is-back",
+      "why": "THE defect this check exists for. `broker.Trace` has no parent, DecodeEnvelope disallows unknown fields, and every action in a traced session comes back 400 naming a trace key.",
+      "catcher": "test_no_builder_emits_a_key_the_decoder_would_refuse",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "        out[\"spanId\"] = span",
+          "replace": "        out[\"parentSpanId\"] = span"
+        }
+      ]
+    },
+    {
+      "id": "M2-the-required-trace-key-is-misspelled",
+      "why": "A capital D. Unknown on the way in and absent on the way out, so it must trip the unknown-key property AND the required-field one -- a misspelling is not a rename.",
+      "catcher": "test_no_builder_emits_a_key_the_decoder_would_refuse",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "    out: dict[str, Any] = {\"traceId\": trace_id}",
+          "replace": "    out: dict[str, Any] = {\"traceID\": trace_id}"
+        }
+      ]
+    },
+    {
+      "id": "M3-a-required-envelope-field-is-never-emitted",
+      "why": "`nonce` carries no omitempty, so the broker expects it on every envelope. Dropping it is the other direction, and it is invisible to an unknown-key check.",
+      "catcher": "test_every_field_the_broker_requires_is_one_a_builder_emits",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "        \"issuedAt\": issued_at or utc_now(),\n        \"nonce\": nonce,",
+          "replace": "        \"issuedAt\": issued_at or utc_now(),"
+        }
+      ]
+    },
+    {
+      "id": "M4-an-optional-envelope-key-is-misspelled",
+      "why": "`requireApproval` sits in a conditional branch, which is where parentSpanId hid. A key only some envelopes carry is a key only some envelopes are refused for.",
+      "catcher": "test_no_builder_emits_a_key_the_decoder_would_refuse",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/action_envelope.py",
+          "find": "        envelope[\"requireApproval\"] = True",
+          "replace": "        envelope[\"requiresApproval\"] = True"
+        }
+      ]
+    },
+    {
+      "id": "M5-the-decoder-stops-being-strict",
+      "why": "Not a defect in the agent: a defect in this check's premise. With DisallowUnknownFields gone every decode below passes for a reason unrelated to the agent being right, and the sweep must notice that the measurement died rather than that the code got better.",
+      "catcher": "test_the_decoder_is_the_strict_one_this_check_assumes",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\tdec.DisallowUnknownFields()",
+          "replace": "\t_ = dec"
+        }
+      ]
+    },
+    {
+      "id": "M6-the-named-regression-is-reintroduced-in-code",
+      "why": "The same string, but reached through a variable so a text grep for it in the assignment would miss. The AST-scoped literal check is what has to see this.",
+      "catcher": "test_the_trace_key_the_defect_was_is_not_back",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "        out[\"spanId\"] = span",
+          "replace": "        _k = \"parentSpanId\"\n        out[_k] = span"
+        }
+      ]
+    }
+  ]
+}

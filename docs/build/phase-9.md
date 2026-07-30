@@ -2023,20 +2023,21 @@ deliverables wearing one name, and two of them cannot be checkpointed in a sessi
 
 The remaining two halves are hermetic and each is a unit. The split:
 
-| Unit               | What                                                                                                                                                                                | Checks                                                                                                                               | Blocked on             |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ---------------------- |
-| **P9-T8b-1**       | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic   | **V-BRK-028** (new)                                                                                                                  | nothing                |
-| **P9-T8b-2**       | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029** (new)                                                                                                                  | T8b-1                  |
-| ~~**P9-T8b-3**~~   | ~~The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)~~ — **split, see below**: the skill is Phase 9's, the retirement is Phase 10's     | ~~V-GAT-019 (phase **10**)~~ — mis-bound                                                                                             | —                      |
-| **P9-T8b-3a**      | The `apply-change` skill in all three tiers, alongside `submit-suggestion` — **done 2026-07-30**                                                                                    | **V-CTR-020** (new)                                                                                                                  | T8b-2b                 |
-| **P9-T8b-3b**      | `submit-suggestion`'s retirement — **deferred into Phase 10 as P10-T3**                                                                                                             | —                                                                                                                                    | Phase 10               |
-| ~~**P9-T8b-4**~~   | ~~The L2 shadow soak with journal mining~~ — **split, see below**: the broker has no deployment path, so there is nothing to soak yet                                               | ~~V-REV-001 (L2)~~                                                                                                                   | —                      |
-| **P9-T8b-4a**      | The broker's deployment path, and the L2 claim it makes checkable                                                                                                                   | **V-BRK-012 (L2)**                                                                                                                   | a live scratch cluster |
-| ~~**P9-T8b-4b**~~  | ~~The L2 shadow soak with journal mining~~ — **split again, see below**: nothing in `dev/` can present a credential to a broker, so there is no caller to soak with                 | ~~V-REV-001 (L2)~~                                                                                                                   | —                      |
-| **P9-T8b-4b-i**    | The in-cluster envelope driver, and the five transport checks it makes answerable — **done 2026-07-30**                                                                             | **V-BRK-007/008/009/010/017 (L2)**                                                                                                   | T8b-4a                 |
-| **P9-T8b-4b-ii-1** | Step 3's live reads answer a typed refusal, split by whether retrying can help                                                                                                      | V-BRK-031 (L1, L2)                                                                                                                   | T8b-4b-i               |
-| **P9-T8b-4b-ii-2** | The L2 shadow soak with journal mining, over the read-only tenant overlay                                                                                                           | V-REV-001 (L2)                                                                                                                       | T8b-4b-ii-1            |
-| **P9-T8b-4c**      | `session_trace()` emits `parentSpanId`, which the broker's closed schema refuses; fix the shipped client across all three tiers and add the assertion that would have caught it     | a NEW 09 §6.2 row — ID assigned by that unit, not guessed here (four wrong `V-*` bindings are already on this phase's findings list) | —                      |
+| Unit               | What                                                                                                                                                                                                                                                                  | Checks                                                                       | Blocked on             |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ---------------------- |
+| **P9-T8b-1**       | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic                                                                                     | **V-BRK-028** (new)                                                          | nothing                |
+| **P9-T8b-2**       | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering                                                                                   | **V-BRK-029** (new)                                                          | T8b-1                  |
+| ~~**P9-T8b-3**~~   | ~~The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)~~ — **split, see below**: the skill is Phase 9's, the retirement is Phase 10's                                                                                       | ~~V-GAT-019 (phase **10**)~~ — mis-bound                                     | —                      |
+| **P9-T8b-3a**      | The `apply-change` skill in all three tiers, alongside `submit-suggestion` — **done 2026-07-30**                                                                                                                                                                      | **V-CTR-020** (new)                                                          | T8b-2b                 |
+| **P9-T8b-3b**      | `submit-suggestion`'s retirement — **deferred into Phase 10 as P10-T3**                                                                                                                                                                                               | —                                                                            | Phase 10               |
+| ~~**P9-T8b-4**~~   | ~~The L2 shadow soak with journal mining~~ — **split, see below**: the broker has no deployment path, so there is nothing to soak yet                                                                                                                                 | ~~V-REV-001 (L2)~~                                                           | —                      |
+| **P9-T8b-4a**      | The broker's deployment path, and the L2 claim it makes checkable                                                                                                                                                                                                     | **V-BRK-012 (L2)**                                                           | a live scratch cluster |
+| ~~**P9-T8b-4b**~~  | ~~The L2 shadow soak with journal mining~~ — **split again, see below**: nothing in `dev/` can present a credential to a broker, so there is no caller to soak with                                                                                                   | ~~V-REV-001 (L2)~~                                                           | —                      |
+| **P9-T8b-4b-i**    | The in-cluster envelope driver, and the five transport checks it makes answerable — **done 2026-07-30**                                                                                                                                                               | **V-BRK-007/008/009/010/017 (L2)**                                           | T8b-4a                 |
+| **P9-T8b-4b-ii-1** | Step 3's live reads answer a typed refusal, split by whether retrying can help                                                                                                                                                                                        | V-BRK-031 (L1, L2)                                                           | T8b-4b-i               |
+| **P9-T8b-4b-ii-2** | The L2 shadow soak with journal mining, over the read-only tenant overlay                                                                                                                                                                                             | V-REV-001 (L2)                                                               | T8b-4b-ii-1            |
+| **P9-T8b-4c**      | `session_trace()` emits `parentSpanId`, which the broker's closed schema refuses; fix the shipped client across all three tiers and add the assertion that would have caught it — **done 2026-07-30**                                                                 | **V-BRK-032** (new, 09 §6.14) + **V-BRK-028** and **V-BRK-029** strengthened | —                      |
+| **P9-T8b-4d**      | `trigger` becomes a parameter of `submit_action`/`plan_action` per 06 §9, across the three tiers' MCP tools and the `apply-change` skill that teaches them — the default `chat` T8b-4c installed is correct for the interactive path and silent about every other one | **V-CTR-020** (the skill) + **V-BRK-029** (the tool surface)                 | T8b-4c                 |
 
 **Why T8b-1 is the first half and not an arbitrary slice.** Everything downstream is transport and
 prose; this is the only part with a _correctness_ obligation the broker will enforce. The broker
@@ -2710,6 +2711,127 @@ and the check enforces that for free.
   `on.pull_request.paths`) rather than by the linter CLAUDE.md names. The edit is one entry appended
   to an existing list. A candidate precondition for `binding.md`: a workflow edit with no actionlint
   available is a stated gap, not a silent one.
+
+### P9-T8b-4c — outcome, 2026-07-30
+
+**Green: `dev.test_action_envelope` 44 tests, `dev.test_envelope_wire_keys` 6 tests, both exit 0;
+full `dev/L0-CHAIN.txt` clean; `invariants-gate.py` 22/22; `spec-ids.py` OK at 251 IDs. Mutation:
+V-BRK-028 20/20 caught (grown from 16), V-BRK-032 6/6 caught.**
+
+The scheduled finding was one word: `session_trace()` put `parentSpanId` on the wire and
+`broker.Trace` has no parent. The fix is `spanId`, which **preserves the information rather than
+dropping it** — `ActionRecord.SpanID`'s own doc comment reads "the originating span", which is
+exactly what the agent runtime's `SPAN_ID` is, and 06 §4.1's "a genuine retry necessarily carries a
+fresh nonce and a fresh `spanId`" reads the same way. Discarding the value would have been the
+cheaper diff and the wrong one.
+
+**The defect had a parent, and the parent is a hole in a check.** `envelope.go` declares **six**
+closed enums. `action_envelope.py` mirrored **three**. And `TestEnumsMatchTheBroker` — the class
+whose entire job is "the two sides agree on the closed sets" — was three hand-written tests naming
+those same three. **The set under test was the set that agreed.** The class could not have failed on
+the three missing mirrors, because it did not know they existed.
+
+That same hole had already fired live and been misread. `trigger.source: "verification"` came back
+`400` during P9-T8b-4b-i and was written up as a fixture typo. It was not: nothing agent-side knew
+`trigger.source` was closed, so nothing agent-side could refuse it, and because `DecodeEnvelope`
+runs `DisallowUnknownFields` the broker's answer is total rather than field-scoped. Two symptoms,
+one structure.
+
+**So the response is `harness-improve` §3.2: strengthen the check that should have caught it.**
+`TestEnumsMatchTheBroker` no longer names anything. It discovers every `valid<Name> =
+map[string]bool{…}` in the Go source, maps each to its Python mirror by name, and asserts the two
+**name sets** are equal in both directions before comparing members. Adding a fourth hand-written
+test beside the other three would have closed today's gap and left the seventh enum exactly as
+invisible as the fourth, fifth and sixth were this morning — and it would have read as progress.
+
+**The vacuity guard is the equality, not a count.** The first draft asserted
+`len(found) >= 6`, which is an enumeration of a number and goes stale the moment a seventh enum
+lands. Two-directional name-set equality cannot pass vacuously: zero discovered enums is six
+unexplained `VALID_*` constants on the Python side, and it also fails on a Python constant naming an
+enum the broker does not have. It earned its keep immediately — the first discovery regex found five
+of six, because `validRequesterKinds` is a one-line literal whose lazy DOTALL body ran past its own
+closing brace and swallowed `validPlatforms` whole. That surfaced as a vacuity trip, **not** as a
+member mismatch. A check whose failure mode is "I found fewer things than exist" is a check that
+needs an arm looking at the count of things it found.
+
+**The empty string is a member, not a falsy value.** `validPlatforms` and `validPropagation` both
+carry `""`. A mirror that filtered on truthiness would reject every envelope omitting an optional
+field — so the derivation copies members verbatim and never interprets them.
+
+**V-BRK-032 is a second ID because it is a second property, and the split is declared.** The enum
+join stays under V-BRK-028, whose file owns it. V-BRK-032 is the direction nothing covered: _every
+key the agent builds is a key the decoder accepts_, and every key the decoder requires is one some
+builder emits. It is asserted structurally over the builders' ASTs and then **measured against the
+real `broker.DecodeEnvelope`**, compiled once and run on a maximal envelope from each tier. This
+phase's findings list already carries three `V-*` rows that overlap without saying so; that is why
+the split is written down rather than assumed.
+
+**Two of this unit's own mistakes, both about the harness voting.** An unused `encoding/json` import
+made the first decode program fail to compile — `rc 1`, indistinguishable from "the broker refused",
+and green for the wrong reason. It was caught only because
+`test_the_decoder_is_the_strict_one_this_check_assumes` demands the refusal **name** `parentSpanId`.
+The build now happens once in `setUpClass` behind a loud assert, so a harness that does not compile
+cannot produce a verdict at all ([[LSN-048]], [[LSN-049]]). And
+`test_the_trace_key_the_defect_was_is_not_back` went red on the docstring explaining why
+`parentSpanId` is gone — [[LSN-023]] in miniature — now scoped to AST string literals minus
+docstrings: prose may discuss it, nothing may build it.
+
+**M19 escaped the first sweep and the escape was real.** The consulted-ness test was a substring
+search over `_check_client_side`, and every one of these constants is also interpolated into the
+`EnvelopeError` it raises — so the check passed for a validator that inlines the members and
+mentions the constant only when explaining the refusal. Rewritten to walk `ast.Compare` operands.
+The mutant was rewritten to match: it swaps the comparison's operand for an inline `frozenset`
+literal and leaves the error message referencing the constant, so behaviour is identical, every
+other test stays green, and only the consulted-ness arm can catch it.
+
+**Then the new enforcement found a third instance, and it was the worst one.** With
+`VALID_TRIGGER_SOURCES` enforced client-side, `dev/test_broker_client.py` went red — eleven arms,
+all reporting "nothing was POSTed". The cause is one line of shipped code:
+`submit_action` passed `trigger or {"source": "agent"}`, and **`agent` is not one of the seven.**
+Not a latent defect like `parentSpanId`, which needed `SPAN_ID` set, and not a fixture typo like
+`trigger.source: "verification"`. This is the **default**, on the one mutation tool, reachable only
+through an MCP server whose `submit_action` has no `trigger` parameter at all — so **every write
+every agent could make was a `400 invalid-envelope`**, and had been since the file was written. It
+survived because nothing has yet driven the MCP tool against a live broker: T8b-4b-i's driver builds
+envelopes directly, and it uses `cron`.
+
+A red sibling suite is halt condition 2, and this one is not a halt: the suite went red because the
+implementation is wrong, the diagnosis is complete, and the fix is in the implementation. Nothing
+about the check moved.
+
+**The default is now `chat`, and the choice is not arbitrary.** 06 §4.1 splits the autonomy buckets
+exactly at the interactive line — `humanRequested ∈ {chat, undo}`,
+`selfInitiated ∈ {watch, alert, cron, delegation, escalation}` — and this function's only caller is
+the MCP tool, which is reachable only from an interactive session. Defaulting to `watch` would file
+human-requested work under autonomy in the metrics 01 §7 counts. Every autonomous origin arrives
+through a caller that knows which one it is.
+
+**But a default is still a default, and 06 §9 says the tool _takes_ `trigger`.** Making it a real
+parameter touches three tiers' MCP tools and the `apply-change` skill that teaches them, which is
+its own unit: **scheduled as P9-T8b-4d**.
+
+**V-BRK-029 gains the arm that would have caught it**, in
+`TestTheGoSideIsTheDefinition` — the class whose stated job is "every value Python restates is read
+back out of Go and compared". It walks the `build_envelope` call, unwraps the `x or {…}` idiom the
+defaults are written in, and asserts every literal landing in a closed-enum field is a member.
+Nothing else could have: the enum mirror agrees with Go (V-BRK-028), every wire key is decodable
+(V-BRK-032), the transport is correct (the rest of that file) — and a default is none of those
+things. It is a **value**, and until this arm the only values under assertion were the ones the
+tests themselves supplied. Sweep grown 15 → 18, **18/18 caught**: M16 restores `agent`, M17 does the
+same to `requester.kind` so the scan is not a special case for one field, and M18 renames the call
+target so the AST walk finds nothing — caught by the `checked` floor, not by any subTest.
+
+**Findings filed, not fixed.** The escape itself — three hand-written tests where the source had six
+enums — belongs on the next improvement pass as an escape, alongside the substring-search shape that
+its own error messages satisfied. Both are instances of a check reading a name rather than a
+structure. A third, sharper one joins them: **three defects of one class in three units**
+(`trigger.source: "verification"`, `parentSpanId`, the `agent` default), and the class is _an
+agent-side value the broker's closed schema refuses_. What they have in common is not the enum — it
+is that the agent side had **no** local enforcement of anything the broker validates, so every such
+defect could only be discovered by a live 400, one value at a time. That is now three mirrors and
+three enforcements, and the general question for the improvement pass is whether the remaining
+`envelope.go` validations (`hex32Re` on `traceId`, the required-field set, the per-op target
+exclusivity) deserve the same treatment or whether the line is drawn correctly where it is.
 
 ---
 

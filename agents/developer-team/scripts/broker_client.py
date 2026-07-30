@@ -290,6 +290,25 @@ def submit_action(
     so the absence of those parameters is the API telling the caller the truth about what it can
     influence. `requireApproval` is the one direction a caller may push: it can ask for *more*
     gating than the classifier decided, never less.
+
+    **The default trigger is `chat`, and until P9-T8b-4c it was `agent`, which is not a member of
+    anything.** 06 §4.1 closes `trigger.source` over seven values and `envelope.go`'s
+    `validTriggerSources` enforces it, so the old default made *every* MCP submission a
+    `400 invalid-envelope` -- not a degraded field, the whole write path, for every agent, on the
+    default call. It was invisible because nothing had yet driven the MCP tool against a broker
+    (T8b-4b-i's driver builds envelopes directly) and because no agent-side check knew the enum was
+    closed; `action_envelope.VALID_TRIGGER_SOURCES` now refuses a bad one locally, with the seven
+    named, before a nonce is spent.
+
+    `chat` rather than one of the five self-initiated values, because this function's only caller
+    today is the MCP tool, which is reachable only from an interactive session -- and 06 §4.1's two
+    autonomy buckets split precisely there (`humanRequested ∈ {chat, undo}`,
+    `selfInitiated ∈ {watch, alert, cron, delegation, escalation}`), so a default that guessed
+    `watch` would file human-requested work under autonomy in the metrics 01 §7 counts. Every
+    autonomous origin arrives through a caller that knows which one it is and passes it explicitly.
+    That said, a default is still a default: 06 §9 says `submit_action` *takes* `trigger`, and
+    making it a parameter of the tool -- across three tiers and the `apply-change` skill that
+    teaches it -- is **P9-T8b-4d**, not this unit.
     """
     c = client or BrokerClient()
     try:
@@ -298,7 +317,7 @@ def submit_action(
             intent=intent,
             operations=operations,
             requester=requester or session_requester(),
-            trigger=trigger or {"source": "agent"},
+            trigger=trigger or {"source": "chat"},
             trace=trace or session_trace(),
             nonce=c.fetch_nonce(),
             rationale=rationale,
@@ -357,6 +376,16 @@ def session_trace() -> dict[str, Any]:
     absent rather than refusing, because a missing trace degrades an incident timeline and a
     refused action degrades the product -- and unlike the identity, nothing downstream is made
     *wrong* by a trace that only covers the broker leg.
+
+    `SPAN_ID` goes on the wire as `spanId`, which is the name `broker.Trace` carries and the name
+    06 §4.1's schema prints. It was `parentSpanId` until P9-T8b-4c, and that spelling was not a
+    cosmetic difference: `DecodeEnvelope` runs with `DisallowUnknownFields`, so an agent in a
+    traced session had EVERY action refused `400 unknown-field`, naming a trace key rather than
+    anything the agent did. Nothing sets `SPAN_ID` today, which is the only reason it was latent
+    -- the bug would have arrived on the day tracing was wired and read as the broker refusing
+    everything. `spanId` is documented as "the originating span" on `ActionRecord.trace`, which is
+    what the runtime's `SPAN_ID` is; V-BRK-032 holds every key this function can emit to
+    `broker.Trace`'s json tags so the next one is a build failure rather than an outage.
     """
     trace_id = (os.environ.get("TRACE_ID") or "").strip().lower()
     if not action_envelope._HEX32.match(trace_id):
@@ -364,7 +393,7 @@ def session_trace() -> dict[str, Any]:
     out: dict[str, Any] = {"traceId": trace_id}
     span = (os.environ.get("SPAN_ID") or "").strip()
     if span:
-        out["parentSpanId"] = span
+        out["spanId"] = span
     return out
 
 

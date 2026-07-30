@@ -66,6 +66,15 @@ VALID_PATCH_TYPES = frozenset(
     }
 )
 VALID_REQUESTER_KINDS = frozenset({"human", "agent", "system"})
+# The three below arrived in P9-T8b-4c. `envelope.go` had six closed enums and this file mirrored
+# three; the join in `dev/test_action_envelope.py` was three hand-written tests naming those same
+# three, so the set it could not see was exactly the set it did not check. It cost a live 400: the
+# first in-cluster probe sent `trigger.source: "verification"`, which reads as a perfectly good
+# word and is not one of the seven. The empty string is a MEMBER of two of these, not an oversight
+# -- `platform` and `propagationPolicy` are both optional, and Go spells "absent" as `""`.
+VALID_TRIGGER_SOURCES = frozenset({"chat", "watch", "alert", "cron", "delegation", "escalation", "undo"})
+VALID_PLATFORMS = frozenset({"", "slack", "googlechat", "kubectl", "mesh"})
+VALID_PROPAGATION = frozenset({"", "Foreground", "Background", "Orphan"})
 
 MAX_INTENT_LEN = 512
 MAX_RATIONALE_LEN = 4096
@@ -607,13 +616,27 @@ def _check_client_side(
         patch = op.get("patch")
         if isinstance(patch, dict) and patch.get("type") not in VALID_PATCH_TYPES:
             raise EnvelopeError(f"operation {i}: patch type {patch.get('type')!r} is not one of {sorted(VALID_PATCH_TYPES)}")
+        # `delete`, not `deleteOptions` -- the json tag on `broker.Operation`, which is the name
+        # that has to be right for the field to arrive at all.
+        delete = op.get("delete")
+        if isinstance(delete, dict) and (delete.get("propagationPolicy") or "") not in VALID_PROPAGATION:
+            raise EnvelopeError(
+                f"operation {i}: propagationPolicy {delete.get('propagationPolicy')!r} is not one of {sorted(VALID_PROPAGATION)}"
+            )
 
     if requester.get("kind") not in VALID_REQUESTER_KINDS:
         raise EnvelopeError(f"requester.kind must be one of {sorted(VALID_REQUESTER_KINDS)}")
     if not requester.get("id"):
         raise EnvelopeError("requester.id is required")
+    if (requester.get("platform") or "") not in VALID_PLATFORMS:
+        raise EnvelopeError(f"requester.platform must be one of {sorted(VALID_PLATFORMS)}")
     if not trigger.get("source"):
         raise EnvelopeError("trigger.source is required")
+    if trigger.get("source") not in VALID_TRIGGER_SOURCES:
+        # Kept separate from the required-ness check above so the message says which of the two
+        # went wrong. 01 §7's autonomy metrics are computed by grouping on this field, so a source
+        # outside the seven is not a typo the broker can absorb -- it is a row nothing counts.
+        raise EnvelopeError(f"trigger.source {trigger.get('source')!r} is not one of {sorted(VALID_TRIGGER_SOURCES)}")
     if not _HEX32.match(trace.get("traceId") or ""):
         raise EnvelopeError("trace.traceId must be 32 lowercase hex characters")
     if not _HEX32.match(nonce or ""):
