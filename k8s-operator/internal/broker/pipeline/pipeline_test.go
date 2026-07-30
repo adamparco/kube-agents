@@ -405,8 +405,51 @@ func testIdentity() *broker.Identity {
 	}
 }
 
+// applyEnvelope applies liveConfigMap's shape with `data.log-level` set to v. Paired with a
+// fakeReader over liveConfigMap it is a one-field change, which is what makes it useful: the field
+// set the classifier is shown must be that one field and not the whole object.
+func applyEnvelope(v string) *broker.Envelope {
+	return applyEnvelopeSetting("log-level", v)
+}
+
+// applyEnvelopeSetting is applyEnvelope with the changed key as a parameter, for asserting that a
+// fieldPaths rule does NOT fire on a change to a field it does not name.
+func applyEnvelopeSetting(key, v string) *broker.Envelope {
+	env := createEnvelope()
+	env.Intent = "apply the application config map"
+	env.Operations[0].Op = "apply"
+	env.Operations[0].DesiredState = map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": "app-config", "namespace": testTenantNS},
+		"data":       map[string]any{"log-level": "info", key: v},
+	}
+	return env
+}
+
+// gateFieldPath is gateCreates' field-level sibling: gate any change touching a named dotted path,
+// whatever the verb. No `verbs` clause on purpose -- the rule is about the field, and constraining
+// it to `apply` would make the test agree with the implementation about which verbs carry paths.
+func gateFieldPath(t *testing.T, name, dotted string) classify.RuleSet {
+	t.Helper()
+	rs, err := classify.FromChangePolicy(&agentv1alpha1.ChangePolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: agentv1alpha1.ChangePolicySpec{Rules: []agentv1alpha1.ChangeRule{{
+			ID:     "review-" + strings.ReplaceAll(dotted, ".", "-"),
+			When:   agentv1alpha1.ChangeRuleWhen{FieldPaths: []string{dotted}},
+			Class:  agentv1alpha1.ChangePolicyClassGated,
+			Reason: "changes to " + dotted + " are reviewed",
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("FromChangePolicy: %v", err)
+	}
+	return rs
+}
+
 // createEnvelope is the reference happy-path submission: create one ConfigMap in the agent's own
-// namespace. `create` rather than `apply` on purpose -- see TestApplyFailsClosedAtTheIntegrityCheck.
+// namespace. `create` rather than `apply` on purpose: it is the whole-object verb, so it exercises
+// execute.checkWholeObject rather than the path comparison applyEnvelope drives.
 func createEnvelope() *broker.Envelope {
 	return &broker.Envelope{
 		APIVersion: broker.APIVersion,
@@ -786,33 +829,112 @@ func TestJournalFailureIsNotSuccess(t *testing.T) {
 	}
 }
 
-// TestApplyFailsClosedAtTheIntegrityCheck records a real gap this assembly uncovered.
+// --- V-BRK-020: the classifier and the integrity check see the same fields ------------------------
 //
-// classify.ResolvedOp.WholeObject is set for create, apply AND delete, because to a rule "every
-// field is touched" is true of all three. execute.Classified.WholeObject means something narrower
-// -- create and delete only -- and execute.CheckIntegrity deliberately refuses any other verb that
-// arrives with it set (execute.TestIntegrityWholeObjectIsNotAnEscapeHatch asserts exactly that).
-// The two packages were each right and had never been connected, which is the LSN-007 shape.
-//
-// The consequence is that an `apply` cannot execute through this pipeline. That is FAIL-CLOSED, so
-// it is missing functionality rather than a hole: the action is refused at step 9 and nothing is
-// mutated. Closing it means giving the classifier the computed pre-state->desired diff for an
-// apply (classify.RawOp.Patch is documented as carrying exactly that) and the same paths to the
-// integrity check -- which is P9-T7c-4, not this unit.
-//
-// This test exists so the gap is a recorded property rather than a surprise. When T7c-4 lands it
-// should be replaced by its positive counterpart, not deleted.
-func TestApplyFailsClosedAtTheIntegrityCheck(t *testing.T) {
-	env := createEnvelope()
-	env.Operations[0].Op = "apply"
+// These replace TestApplyFailsClosedAtTheIntegrityCheck, which recorded the gap this task closed.
+// The gap was that classify marked `apply` as a whole-object verb and execute.CheckIntegrity
+// refuses any verb but create/delete carrying that flag, so no apply could execute at all. Its
+// positive counterparts are below, and they assert more than "an apply now works": the point of
+// giving an apply a real field set is that a `when.fieldPaths` rule can fire on it, and that the
+// integrity check has something specific to compare the server's answer against.
+
+// TestAnApplyIsClassifiedFieldByFieldAndExecutes is the direct counterpart of the gap test.
+func TestAnApplyIsClassifiedFieldByFieldAndExecutes(t *testing.T) {
+	env := applyEnvelope("debug")
 
 	r := newRig(t, func(r *rig) { r.reader = &fakeReader{obj: liveConfigMap()} })
 	tr, res, err := r.submit(env)
+	if err != nil {
+		t.Fatalf("an apply was refused: %v\ntrace: %s", err, tr)
+	}
+	if res.Phase != string(agentv1alpha1.PhaseVerified) {
+		t.Fatalf("phase = %s, want %s\ntrace: %s", res.Phase, agentv1alpha1.PhaseVerified, tr)
+	}
+	if r.applier.mutations != 1 {
+		t.Errorf("applier saw %d mutations, want 1", r.applier.mutations)
+	}
+}
+
+// TestAFieldPathsRuleFiresOnAnApply is the security property, and it is the reason an apply is not
+// a whole-object verb.
+//
+// A rule reading `when.fieldPaths: [data.log-level]` is the ordinary way an operator says "review
+// changes to this setting". Before an apply carried a field set, op.TouchedPaths was empty for it,
+// and classify.matches returns false for any fieldPaths rule against an empty path set -- so the
+// rule was silently inert against the verb agents use most, while reading in a policy review as a
+// control that was in force.
+//
+// The negative half is not decoration. A test that only asserted the rule fires would pass just as
+// well against an implementation that reported EVERY field as touched, which is the other way to
+// get a fieldPaths rule to match and is exactly as wrong.
+func TestAFieldPathsRuleFiresOnAnApply(t *testing.T) {
+	for _, tc := range []struct {
+		what      string
+		env       *broker.Envelope
+		wantGated bool
+	}{
+		{
+			what:      "an apply that changes the named field",
+			env:       applyEnvelope("debug"),
+			wantGated: true,
+		},
+		{
+			what: "an apply that changes a different field",
+			// Same object, same verb, same rule. Only the field differs, so a pass here can only
+			// come from the path set being specific to what actually changed.
+			env:       applyEnvelopeSetting("owner", "team-a"),
+			wantGated: false,
+		},
+		{
+			what: "an apply that re-asserts the live value",
+			// The desired state matches live exactly, so the diff is empty and nothing is touched.
+			env:       applyEnvelope("info"),
+			wantGated: false,
+		},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			r := newRig(t, func(r *rig) { r.reader = &fakeReader{obj: liveConfigMap()} })
+			r.classes.set(mustClassifier(t, []classify.RuleSet{gateFieldPath(t, "review-log-level", "data.log-level")}), nil)
+
+			tr, res, err := r.submit(tc.env)
+			if err != nil {
+				t.Fatalf("submit: %v\ntrace: %s", err, tr)
+			}
+			if gated := res.Decision == "gated"; gated != tc.wantGated {
+				t.Fatalf("decision = %q (gated=%v), want gated=%v\ntrace: %s", res.Decision, gated, tc.wantGated, tr)
+			}
+		})
+	}
+}
+
+// TestTheServersExtraFieldIsCaughtByTheIntegrityCheck is V-BRK-020 in its enforcing direction.
+//
+// The classifier is shown the diff of the SUBMITTED change. The dry run reports what the server
+// would actually do. When the second is wider than the first -- an admission webhook, a defaulter,
+// a mutating controller adding something nobody classified -- the action must not proceed. With an
+// apply pinned to WholeObject this could never be reached, because the verb was refused before the
+// comparison was made; the comparison passing is only meaningful if it can also fail.
+func TestTheServersExtraFieldIsCaughtByTheIntegrityCheck(t *testing.T) {
+	env := applyEnvelope("debug")
+
+	// What the server says it would produce: the requested change PLUS a field the envelope never
+	// mentioned and the classifier therefore never saw.
+	expanded := liveConfigMap()
+	expanded.Object["data"] = map[string]any{"log-level": "debug", "injected-by-a-webhook": "true"}
+
+	r := newRig(t, func(r *rig) {
+		r.reader = &fakeReader{obj: liveConfigMap()}
+		r.applier = &fakeApplier{result: expanded}
+	})
+	tr, res, err := r.submit(env)
 	if err == nil {
-		t.Fatalf("an apply executed (%+v); if P9-T7c-4 landed, replace this test\ntrace: %s", res, tr)
+		t.Fatalf("an apply whose server-side effect exceeded its classification executed (%+v)\ntrace: %s", res, tr)
 	}
 	if got := tr.Reached(); got != broker.StepExecute {
 		t.Fatalf("reached %s, want %s\ntrace: %s", got, broker.StepExecute, tr)
+	}
+	if !strings.Contains(err.Error(), "injected-by-a-webhook") {
+		t.Errorf("the refusal does not name the unclassified field, so a human cannot tell what the server added: %v", err)
 	}
 	if r.applier.mutations != 0 {
 		t.Errorf("the refused apply mutated %d objects", r.applier.mutations)
