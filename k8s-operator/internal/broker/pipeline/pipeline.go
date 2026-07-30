@@ -454,10 +454,12 @@ func (p *Pipeline) step(tr *broker.StepTrace, id broker.Step, fn func() (string,
 func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, error) {
 	tr := s.tr
 	return nil, p.step(tr, broker.StepResolveScope, func() (string, error) {
+		ag := p.cfg.Brake.Observe(ctx).Agent
 		s.caller = classify.Caller{
-			Name:  p.cfg.AgentName,
-			Tier:  string(s.id.Tier),
-			Scope: p.callerScope(ctx),
+			Name:           p.cfg.AgentName,
+			Tier:           string(s.id.Tier),
+			Scope:          scope.Of(ag),
+			ServingCluster: servingCluster(ag),
 		}
 		if !s.caller.Scope.IsWellFormed() {
 			return "", &broker.Refusal{
@@ -573,13 +575,22 @@ func liveReadRefusal(err error, what string) error {
 	}
 }
 
-// callerScope derives the caller's authority ceiling from the Agent CR this broker serves.
+// servingCluster reads the cluster this broker is installed in off the Agent CR it serves.
 //
-// From the CR, never from the envelope: 03 §4.1 step 1 says the broker derives (tier, scope) from
-// the authenticated identity. The authenticator has already established that the caller IS this
-// broker's agent, so the CR is the authenticated answer to "what is its scope".
-func (p *Pipeline) callerScope(ctx context.Context) scope.Scope {
-	return scope.Of(p.cfg.Brake.Observe(ctx).Agent)
+// From the same CR as the caller's scope, and for the same reason (03 §4.1 step 1: the broker
+// derives its caller from the authenticated identity, never from the envelope), but from a
+// different field. `spec.scope.clusterName` is the authority ceiling and is empty for the platform
+// tier by design; `spec.harness.clusterName` is where the agent runs and is populated for every
+// tier by the install template. classify.ScopeOfTarget documents why the target scope needs the
+// second one and what happens when it is missing.
+//
+// Nil-tolerant in both steps: a broker whose brake has not yet observed an Agent gets "", which
+// fails closed at the ownership lookup rather than panicking mid-envelope.
+func servingCluster(agent *agentv1alpha1.Agent) string {
+	if agent == nil || agent.Spec.Harness == nil {
+		return ""
+	}
+	return agent.Spec.Harness.ClusterName
 }
 
 // --- step 4: classify ------------------------------------------------------------------------

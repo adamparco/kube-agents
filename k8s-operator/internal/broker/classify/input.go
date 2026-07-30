@@ -52,6 +52,22 @@ type Caller struct {
 	Tier string
 	// Scope is the caller's authority ceiling.
 	Scope scope.Scope
+
+	// ServingCluster is the logical name of the cluster this broker serves -- `spec.harness.clusterName`
+	// on its own Agent CR, which 06 §1.2 keeps separate from `spec.scope.clusterName` precisely
+	// because they answer different questions. `scope.clusterName` is "which cluster is this agent's
+	// AUTHORITY bounded to", and the platform tier leaves it empty because its authority is the whole
+	// project. `harness.clusterName` is "which cluster is this agent RUNNING in", and every tier has
+	// exactly one answer, because 06 §2.2 bounds an actor to its cluster "by being installed only
+	// there".
+	//
+	// It is on Caller and not on Scope because it is not authority. Putting it in the scope triple
+	// would narrow a platform agent's ceiling to one cluster, which is the opposite of what the tier
+	// means; ScopeOfTarget is the one place the two are combined, and it combines them to describe
+	// the TARGET, never the caller.
+	//
+	// Empty is tolerated and fails closed -- see ScopeOfTarget.
+	ServingCluster string
 }
 
 // ResolvedOp is one operation with the live-state lookups already performed.
