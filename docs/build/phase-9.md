@@ -1804,10 +1804,10 @@ have made it the one place the broker's own identity was frozen — an inconsist
 reveals when read alone. Wiring the pinned field would have been the second half of the trap
 [[LSN-041]] describes: a seam that looks wired, is wired, and is wired to the wrong thing.
 
-| Unit               | Scope                                                                                                                                                                 | Checks                                 | Blocks on |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- | --------- |
-| **P9-T7c-3d-iv-a** | `SourceConfig.Agent` → `Identity func() (Agent, error)`, resolved once per poll; `Build` refuses an ill-formed own scope; nil `Identity` refused at construction. L1. | **V-BRK-026** (new)                    | nothing   |
-| **P9-T7c-3d-iv-b** | The wiring: discovery client, `pipeline.New`, the remaining sources, and the reflection-over-`pipeline.Config` assertion that closes [[LSN-007]].                     | V-BRK-022's sibling (new, TBA at iv-b) | **iv-a**  |
+| Unit               | Scope                                                                                                                                                                  | Checks                     | Blocks on |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- | --------- |
+| **P9-T7c-3d-iv-a** | `SourceConfig.Agent` → `Identity func() (Agent, error)`, resolved once per poll; `Build` refuses an ill-formed own scope; nil `Identity` refused at construction. L1.  | **V-BRK-026** (new)        | nothing   |
+| **P9-T7c-3d-iv-b** | The wiring: discovery client, `pipeline.New`, the remaining sources, and the reflection-over-`pipeline.Config` assertion that closes [[LSN-007]]. **Done 2026-07-29.** | **V-BRK-027** (new) — pass | **iv-a**  |
 
 ### The distinction iv-a is built on
 
@@ -1845,6 +1845,42 @@ policy.Agent{}, errors.New(...) }; return policy.Agent{Tier: ..., Scope: scope.O
   path (06 §4.3) has no implementation, so `BodyStore` and the rollback `Sink` must stay nil at
   iv-b. That is documented-legal ("a step that needs it then refuses by name rather than by nil
   dereference") and it is why those two fields need allowlist entries in iv-b's reflection check.
+
+### What iv-b actually landed — 2026-07-29
+
+`cmd/broker/wiring.go` (new) + the three-line change in `run` that replaces
+`broker.UnavailablePipeline{}` with the pipeline it builds. **V-BRK-027** is the check.
+
+Everything predicted above held: the identity closure reads through the brake, `BodyStore` and the
+rollback `Sink` are nil with allowlist entries carrying the BlobSink reason, and `pipeline.go:412`
+was left alone. Three things the survey had not predicted:
+
+- **The assembly needed its own file, not eighty more lines in `run`.** `run` dials a kubeconfig, a
+  clientset and a TLS keypair before it builds anything, so a `pipeline.Config` assembled inline is
+  unreachable from a test — and a check that cannot see the wiring is no defence against the lesson
+  it exists for. `pipelineConfig` is a function whose whole output is the config.
+- **Order turned out to be load-bearing, so it is asserted.** `brake` must be refreshed before
+  `policy`, because the policy source's first `Refresh` calls the identity closure, which reads the
+  brake's cache. Get it backwards and startup fails naming ChangePolicy for a problem that is the
+  Agent CR — the wrong RBAC rule, in the one message an operator will read. The five sources became
+  an ordered `[]startable` with a fatal first read; pollers start only after all five reads succeed.
+- **Discovery is not in the 06 §2.2.1 grant and does not need to be.** The grant has no
+  `nonResourceURLs` and the VAP refuses any that does, but Kubernetes binds `system:discovery` to
+  `system:authenticated`, so the two enumerating adapters get `/api` and `/apis` without the grant
+  widening — which is why it can stay byte-identical across tiers.
+
+**The mutation sweep found a hole in the check itself** (13 mutants, all now caught). M9 hoisted
+`go s.run` above the refresh and the "no poller is left running" assertion stayed green: it used a
+non-blocking `select ... default`, which only observes goroutines the scheduler happened to have run
+already. Asserting the **absence** of an event needs a bounded wait, not a poll. Fixed before the
+check was recorded. Also: a mutant that does not compile scores as an escape, which is how M2's
+first form was caught — `Contested: nil` orphans the `broker` import, so it never built.
+
+**Carried, still not fixed:** the `pipeline.go:412` `Scope{}` finding above; the V-BRK-020/021 and
+`execute/apply.go` V-REV-002-for-V-BRK-006 citation defects; and `ContestedIndex` is wired **empty**
+and known to be — rebuilding it from `ActionRecord.status.contested` is P9-T6c's, which is still not
+scheduled anywhere. Empty answers "not contested" for everything, which is the loosening direction;
+the only alternative available today is nil, and nil makes the brake refuse every action.
 
 ---
 
