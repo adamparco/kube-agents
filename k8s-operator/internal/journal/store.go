@@ -173,6 +173,13 @@ func (s *Store) Create(ctx context.Context, ar *agentv1alpha1.ActionRecord) erro
 	if !ValidULID(ar.Spec.ActionID) {
 		return fmt.Errorf("journal: spec.actionId %q is not a ULID; refusing to create a record that cannot be joined to its writes", ar.Spec.ActionID)
 	}
+	// 06 §4.3: a record may only be born in a phase something could have observed. Refused here
+	// rather than at the first SetPhase, because Create is the fail-closed point -- a caller that
+	// gets nil back proceeds to execute, and a record created as `Verified` would already be a
+	// journal entry claiming an outcome for an action that has not started.
+	if err := agentv1alpha1.ValidateActionPhaseTransition("", ar.Status.Phase); err != nil {
+		return fmt.Errorf("journal: refusing to create ActionRecord for %s: %w (the action must not execute -- fail closed, 03 §6)", ar.Spec.ActionID, err)
+	}
 	ar.Name = RecordName(ar.Spec.ActionID)
 	if ar.Labels == nil {
 		ar.Labels = map[string]string{}
@@ -180,14 +187,33 @@ func (s *Store) Create(ctx context.Context, ar *agentv1alpha1.ActionRecord) erro
 	for k, v := range Labels(ar) {
 		ar.Labels[k] = v
 	}
+	want := ar.Status.Phase
 	if err := s.client.Create(ctx, ar); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			// Idempotent by construction: the same action id names the same record. Report it as
 			// such so the caller can proceed rather than treating a safe retry as a journal failure
 			// and refusing an action that is already journaled.
+			//
+			// Deliberately does NOT re-assert the phase. The existing record has been through the
+			// lifecycle since; a retried Create that stamped its own idea of the starting phase back
+			// onto it would be a transition nothing validated, taken by the one code path whose
+			// whole contract is "this changed nothing".
 			return nil
 		}
 		return fmt.Errorf("journal: create ActionRecord %s/%s: %w (the action must not execute -- fail closed, 03 §6)", ar.Namespace, ar.Name, err)
+	}
+	// `status` is a subresource, so the Create above sent the object and the API server dropped the
+	// status block: `Labels[StatusLabel]` landed and `status.phase` did not. That asymmetry is not
+	// cosmetic -- 06 §4.3 makes `status.phase` authoritative and the label a derived index, and
+	// leaving it empty inverted the two. Every parked record read back `status.phase: ""` while its
+	// label said `PendingApproval`, so 06 §4.3's ChatOps row (`PendingApproval -> Pending/Rejected`,
+	// and nothing else) had no `PendingApproval` to transition out of.
+	if want == "" {
+		return nil
+	}
+	ar.Status.Phase = want
+	if err := s.client.Status().Update(ctx, ar); err != nil {
+		return fmt.Errorf("journal: create ActionRecord %s/%s: recording initial phase %q: %w (the action must not execute -- fail closed, 03 §6)", ar.Namespace, ar.Name, want, err)
 	}
 	return nil
 }
@@ -209,6 +235,13 @@ func (s *Store) SetPhase(ctx context.Context, ar *agentv1alpha1.ActionRecord, ph
 	var live agentv1alpha1.ActionRecord
 	if err := s.client.Get(ctx, client.ObjectKeyFromObject(ar), &live); err != nil {
 		return fmt.Errorf("journal: re-read %s/%s before phase change: %w", ar.Namespace, ar.Name, err)
+	}
+	// Validated against the phase that was just re-read, never against the caller's stale copy.
+	// Checking `ar.Status.Phase` would ask whether the transition was legal from a world that may
+	// have moved -- which is the same class of mistake as a read-modify-write without a conflict
+	// check, and it would let two writers each take a legal step into a pair that is not.
+	if err := agentv1alpha1.ValidateActionPhaseTransition(live.Status.Phase, phase); err != nil {
+		return fmt.Errorf("journal: refusing phase change on %s/%s: %w", ar.Namespace, ar.Name, err)
 	}
 	live.Status.Phase = phase
 	live.Status.Message = message

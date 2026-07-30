@@ -2322,6 +2322,101 @@ in a unit that would be reviewing itself.
 
 ---
 
+### P9-T9b splits into five: T9b-1 … T9b-5
+
+**Recorded 2026-07-30, at SELECT, under `harness-run` §2 sizing.** T9b as written is not one unit.
+Its recon says "None of the five deliverables exist"; since then guard 1 has landed as
+**V-CTN-037**, and `broker-auth-l2.sh` with `fixtures/actor-tenant-grant.yaml` has landed too, so
+the residual is smaller than the row but still five separable pieces of work with different levels,
+different preconditions, and no dependency between the first three.
+
+Split, in the order they will be done. **The ordering is the phase's own rule, not a preference:**
+every commit invalidates P1 for every L2 suite still to come, so all remaining L0/L1 work goes in
+front of all remaining L2 work.
+
+| Unit      | What it is                                                                                                                                                     | Checks                                            | Level | Blocker                       |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ----- | ----------------------------- |
+| **T9b-1** | The `ActionRecord` phase lifecycle as enforced data, at the journal's two write points                                                                         | V-CTR-006                                         | L1    | —                             |
+| **T9b-2** | Envelope schema round-trip; refused keys ignored or rejected, never honoured (06 §4.1, `¬`)                                                                    | V-CTR-005                                         | L1    | —                             |
+| **T9b-3** | Broker supply-chain minimality: no LLM SDK, plugin loader, interpreter or shell in the SBOM; no `/bin/sh` in the image; one listening socket; two mounts (`¬`) | V-RUN-010                                         | L0    | —                             |
+| **T9b-4** | `dev/verify/verify-phase9.sh`, its `dev/L0-CHAIN.txt` / `dev/L2-CHAIN.txt` lines, and the V-BRK-021 L0-vs-L2 evidence reconciliation                           | (the gate itself)                                 | L0    | T9b-1..3 landed               |
+| **T9b-5** | `broker-execute-l2.sh`, `actor-grant-sweep-l2.sh`, the tenant overlay's **write** half and the admission ruling it needs                                       | V-BRK-006/018/019, V-REV-002, V-REV-003 (L2 half) | L2    | P1 — images built after T9b-4 |
+
+T9b-5 is also what unblocks **P9-T8b-4b-ii-2b-ii** (the envelope corpus soak, journal mining, guard
+3 as a label assertion per [[LSN-045]], and V-REV-001 at L2), which is why that unit sits behind it
+rather than beside it.
+
+**The denominator moves by four**, not by five: T9b was already counted once.
+
+---
+
+### P9-T9b-1 — outcome, 2026-07-30
+
+**V-CTR-006** — "`ActionRecord` lifecycle: every legal transition succeeds, every illegal one is
+rejected (06 §4.3)". The check was scheduled as test-writing over an existing rule. There was no
+rule. Two defects in shipped code, both found by trying to write the check:
+
+1. **Nothing enforced the lifecycle anywhere.** `journal.Store.SetPhase` accepted `Verified →
+Pending`, `Rejected → Executing`, and `"" → Undone`. The lifecycle existed as an ASCII diagram in
+   a doc comment on `ActionPhase`, which is a statement of intent rather than a property of the
+   system. 06 §4.3's status-RBAC table then rests on that lifecycle — the ChatOps gateway is
+   permitted `PendingApproval → Pending/Rejected` **and nothing else**, the undo controller `→
+Undone` **only** — so both rows were unenforceable in the direction admission cannot cover: not
+   "who may write the field" but "what may the field become".
+2. **`status.phase` was never populated at creation.** `status` is a subresource, so `client.Create`
+   sent the block and the API server dropped it; only `Labels[kube-agents/status]` landed. Every
+   record read back `status.phase: ""` while its label named a phase — the exact inversion of 06
+   §4.3, which makes the field authoritative and the label a derived index. A parked record
+   therefore had no `PendingApproval` for the gateway's one permitted transition to leave from.
+   `rejection.go:156-158` carries a comment asserting "the status subresource is set by the
+   reconciler"; no such reconciler exists.
+
+**The ruling the table needed, which is not a halt.** 06 §4.3's diagram draws `Failed ──▶
+RolledBack`. The same section's phase table marks `Failed` terminal, and `verify/driver.go`
+implements the table: 04 §5.1 rung 3 succeeding writes `RolledBack`, rung 5 (rollback itself failed)
+writes `Failed` and pages. Rather than pick between a picture and a column, the edge was settled
+from the spec's own **principal list**: the four writers of `status.phase` are the owning broker,
+the undo controller (`→ Undone` only), the ChatOps gateway, and the exporter (which deliberately
+cannot touch `phase`). **No principal can write `Failed → RolledBack`.** That is an
+invariant-preserving resolution derived from the finer of two statements in the same section, so it
+is a decision, not a §8.5 contradiction. `Verified → Undone` survives the same test for the opposite
+reason: "terminal" is a claim about the broker's pipeline stopping, and `Undone` is a different
+principal, later. Both arguments live in `actionrecord_phases.go`'s file comment and in the ledger's
+decisions table.
+
+**The check is a closed truth table, not a list of remembered edges.** 121 ordered pairs (ten phases
+plus the empty from-phase), with the expected answer transcribed from 06 §4.3 a **second** time
+rather than read out of the production map — a test that iterates the map to decide what to expect
+asserts that the map equals itself, and stays green through deleting every entry. Vacuity guards pin
+27 legal cells and 94 refused. Alongside it: the CRD enum is read out of `actionrecord_types.go` as
+data and cross-joined against the table in both directions; reachability is a real BFS from the
+creation set, so orphaning a phase fails; and `Successors()` is asserted to hand back a copy.
+
+**The escape the sweep found, and what it says about the fake client.** The first sweep ran 11/12.
+`M10` — restoring defect (2) exactly — survived. The reason is that **controller-runtime's fake
+client does not model the status subresource on `Create`**: `withStatusSubresource` is consulted in
+`tracker.update` and not in `fakeClient.Create`, so the fake keeps a status block that every real
+API server discards. The test asserting `status.phase` came back was green because the fake never
+dropped it, and would have stayed green against a `Create` that wrote no status at all. That is the
+mechanism by which the defect survived five phases under a green suite. Fixed at the helper rather
+than in the one test that noticed: `newFakeStore` now installs a `Create` interceptor that zeroes
+`Status` before delegating, so the whole package is measured against the cluster it will run on.
+Second sweep: **12/12 caught**.
+
+**Findings filed, not fixed.** (a) The ASCII lifecycle diagram in `06-api-and-data-contracts.md`,
+reproduced verbatim in `actionrecord_types.go`, still draws `Failed ──▶ RolledBack` and still says
+DryRun is "reached from Pending" — a spec-art correction for the next improvement pass, not a
+behaviour change. (b) `rejection.go:156-158`'s "the status subresource is set by the reconciler" is
+now moot for `phase` and the sentence is still wrong. (c) A candidate gate rule with a wider blast
+radius than either: **a fake-client helper that models a subresource on `Update` and not on
+`Create` is a suite that cannot see its own most likely defect** — every `WithStatusSubresource`
+call site in this repository is a candidate, and none of the others has been audited.
+
+Evidence: **V-CTR-006 (L1) pass** — `verification/results.csv`, `verification/mutants/V-CTR-006.json`
+at 12/12.
+
+---
+
 ### P9-T8b-4 splits: 4a is the deployment path, 4b is the soak
 
 **Recorded 2026-07-30, at SELECT.** T8b-4 is "the L2 shadow soak with journal mining". Surveying
