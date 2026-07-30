@@ -53,6 +53,7 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/pipeline"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/rollback"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/journal"
 )
 
@@ -78,8 +79,11 @@ var unwiredByDesign = map[string]string{
 // regression. What both maps share, and what the test actually leans on, is that every field of the
 // struct is accounted for by exactly one of the three buckets.
 var defaultedByNew = map[string]string{
-	"Planner": "pipeline.New defaults it to undo.Generate, which is the production planner",
-	"Now":     "pipeline.New defaults it to time.Now",
+	"Planner": "pipeline.New defaults it to undo.GenerateAndValidate, which is the production " +
+		"planner. It used to default to the generate-only undo.Generate, and this entry used to " +
+		"say so approvingly -- an allowlist reason is a claim about the code and is wrong as " +
+		"loudly as any assertion",
+	"Now": "pipeline.New defaults it to time.Now",
 }
 
 // testDeps is a brokerDeps that constructs without a cluster.
@@ -425,5 +429,60 @@ func TestStartSourcesStopsOnTheFirstFailedReadAndStartsNothing(t *testing.T) {
 		t.Errorf("source %q was started despite a failed startup read; a poller must not outlive "+
 			"the process that is about to exit non-zero", name)
 	case <-time.After(250 * time.Millisecond):
+	}
+}
+
+// V-REV-003 at the composition root: the dry-runner the binary supplies reaches a real API client.
+//
+// TestEveryPipelineSeamIsWiredInTheRealBinary above already refuses a nil DryRunner, and that is
+// exactly the assertion that would have passed while undo was dead. The field it checks is a
+// FACTORY: a factory returning a PlanDryRunner with a nil Replayer is non-zero, satisfies
+// reflection, satisfies pipeline.New, and answers "no writer is configured" to every step it is
+// ever asked about -- which undo.Validate turns into a downgrade, which gates every action in the
+// fleet. "Populated" and "connected" are different claims and only the second one is the property.
+//
+// So this calls the factory and looks at what comes back.
+func TestBuildPipelineWiresADryRunnerThatReachesTheClusterClient(t *testing.T) {
+	cfg, _, err := pipelineConfig(context.Background(), testDeps(t))
+	if err != nil {
+		t.Fatalf("pipelineConfig: %v", err)
+	}
+	if cfg.DryRunner == nil {
+		t.Fatal("the binary supplies no DryRunner factory")
+	}
+
+	const identity = "developer-team/team-a"
+	dr := cfg.DryRunner(identity)
+	if dr == nil {
+		t.Fatal("the factory returned nil, so every step of every plan would panic or downgrade")
+	}
+	p, ok := dr.(*rollback.PlanDryRunner)
+	if !ok {
+		t.Fatalf("the factory returned %T; the production validator is *rollback.PlanDryRunner", dr)
+	}
+	if p.Replayer == nil || p.Replayer.Writer == nil {
+		t.Fatal("the validator has no writer, so it answers `no writer is configured` to every " +
+			"step -- a downgrade on every plan, which gates every action, which is undo being " +
+			"dead again wearing the opposite failure mode")
+	}
+	// The identity is threaded, not dropped. A validator that dry-runs under a fixed manager
+	// manufactures server-side-apply conflicts the real replay never hits.
+	if p.AgentIdentity != identity {
+		t.Errorf("AgentIdentity = %q, want %q -- the key the factory was called with", p.AgentIdentity, identity)
+	}
+
+	// The same writer the executor and the replayer use, per rollback's own package doc: "a second
+	// client opened next to it would be a second set of answers to the same questions" (LSN-040).
+	// Asserted through the Verifier's rollbacker, which is the only other holder of it in this
+	// config.
+	if cfg.Verifier == nil || cfg.Verifier.Rollback == nil {
+		t.Fatal("the verifier has no rollbacker to compare the validator against")
+	}
+	if replayer, ok := cfg.Verifier.Rollback.(*rollback.Replayer); !ok {
+		t.Fatalf("the verifier's rollbacker is %T, not *rollback.Replayer", cfg.Verifier.Rollback)
+	} else if replayer != p.Replayer {
+		t.Error("the plan validator and the rollback replayer are different objects; two paths to " +
+			"the API server are two sets of answers, and the plan would be validated against a " +
+			"client the replay does not use")
 	}
 }

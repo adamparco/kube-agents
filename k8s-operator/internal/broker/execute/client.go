@@ -101,9 +101,16 @@ func (a *ClientApplier) Apply(ctx context.Context, obj *unstructured.Unstructure
 // It lives here rather than in the rollback package because this file is the single place in the
 // broker that talks to an API server, and a second client opened next to it would be a second set
 // of answers to the same questions. LSN-040.
-func (a *ClientApplier) Create(ctx context.Context, obj *unstructured.Unstructured, fieldManager string) (*unstructured.Unstructured, error) {
+// The dryRun flag has a second caller: plan-time validation (06 §4.3.1) dry-runs a `recreate`
+// step's create long before the delete it reverses has happened, which is what makes the
+// AlreadyExists it gets back an expected answer rather than a failure. See rollback.PlanDryRunner.
+func (a *ClientApplier) Create(ctx context.Context, obj *unstructured.Unstructured, fieldManager string, dryRun bool) (*unstructured.Unstructured, error) {
 	out := obj.DeepCopy()
-	if err := a.Client.Create(ctx, out, client.FieldOwner(fieldManager)); err != nil {
+	opts := []client.CreateOption{client.FieldOwner(fieldManager)}
+	if dryRun {
+		opts = append(opts, client.DryRunAll)
+	}
+	if err := a.Client.Create(ctx, out, opts...); err != nil {
 		return nil, err
 	}
 	return out, nil

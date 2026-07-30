@@ -2971,6 +2971,128 @@ the number until it passes" — a check you edit to make it pass is a check that
 edited past a real finding. Its replacement asserts that the count of _registration points_ is one,
 which no legitimate route addition changes.
 
+### P9-T8b-4b-ii-2b splits again: 2b-i wires the validator, 2b-ii is the soak
+
+**The fifth time surveying the soak turned up a defect in shipped code rather than a gap in the test
+scaffolding.** 4a found `KUBEAGENTS_BROKER_IMAGE` set nowhere; 4b-i found no client that could hold
+a certificate; 4b-ii-1 found an RBAC denial surfacing as a 500; 2a found a write overlay with no
+admission rule to govern it. This one is larger than all four.
+
+**`undo.GenerateAndValidate` has no non-test caller.** The function whose own doc comment reads "the
+call the broker actually makes at step 6" is called by nothing outside its own tests.
+`pipeline.Config.Planner` is a `Generate`-only seam that defaults to `undo.Generate`;
+`cmd/broker/wiring.go` leaves it unset and says so in its header — "the undo planner … is left unset
+so the owning package supplies it" — and the owning package supplies the half that does not
+validate. There is no `undo.DryRunner` implementation anywhere in the tree outside `undo`'s own
+tests. Consequences, each read off the code rather than inferred:
+
+- Every `ActionRecord` the shipped broker has ever written carries `undoPlan.validated: false`.
+- `undo.ValidateReplayable` refuses on exactly that field — _"the undo plan was never dry-run against
+  the API server, so nothing has checked that its steps would apply"_ — and it is the front door of
+  both replay paths (`verify/driver.go` and `rollback.Rollback`). **Undo is non-functional end to
+  end**, and the way a human would find that out is by trying to undo an outage.
+- 06 §4.3.1 is normative that validation happens and that failing it raises to `gated`. That arm
+  cannot fire at all today.
+- **V-REV-001 at L2 is therefore 0 %, not 100 %** — which is the exact property 2b was built to
+  measure. Running the soak first would have produced a red with no diagnosis attached.
+
+The escape shape is 09 §11.9, _component built, never wired_. V-REV-003's L1 row (2026-07-27, P9-T4)
+proved that `Validate` **downgrades correctly when the dry-runner is nil**. It proved the function
+and never the wiring, and its own evidence note says so without noticing: "an unwired dry-runner …
+each is a downgrade, not an error."
+
+| Unit                  | What                                                                                                                               | Checks             | Blocked on                           |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------ |
+| **P9-T8b-4b-ii-2b-i** | Wire the validator: a required `DryRunner` on the pipeline, a real one over the actor's client, step 6 refuses an unvalidated plan | **V-REV-003** (L1) | —                                    |
+| **2b-ii**             | The envelope corpus soak, journal mining, guard 3 as a label assertion, **V-REV-001** at L2                                        | **V-REV-001** (L2) | T9b's **write** overlay + its ruling |
+
+2b-i goes first under this phase's own L0-before-L2 rule, and it is unblocked. **2b-ii is blocked and
+the blocker is structural, not scheduling.** A server-side dry-run write is authorized as the write
+verb, so under the read-only tenant overlay every undo step's dry-run is a 403, every plan downgrades
+to `none`, and every action gates — a correct broker reporting 0 % coverage for a reason that has
+nothing to do with undo. The last mile is the **write** overlay, which is T9b's and which is itself
+waiting on the admission ruling 2a surfaced.
+
+### P9-T8b-4b-ii-2b-i — outcome, 2026-07-30
+
+**Undo is wired. `undoPlan.validated` is now a fact rather than a field.**
+
+What landed, in the order the seam runs:
+
+- **`pipeline.Config.DryRunner`** — a **required** `func(agentIdentity string) undo.DryRunner`.
+  Required, so a broker with nothing to validate with refuses to start rather than serving every
+  request and journalling `validated: false`. A **factory** keyed by identity, not a fixed object,
+  because server-side apply reports a conflict for every field owned by a different manager and an
+  undo commonly restores fields this agent set earlier — a dry run under any other name manufactures
+  conflicts the real replay never hits, downgrades working plans, and gates the fleet for a reason
+  that is an artifact of the check.
+- **`Planner` gained a fourth parameter** and the default moved from `undo.Generate` to
+  `undo.GenerateAndValidate`. A signature that cannot express "generate without validating" is what
+  stops that returning.
+- **`rollback.PlanDryRunner`** — the production `undo.DryRunner`, built **on the `Replayer`** rather
+  than beside it. The question plan-time validation asks is not "is this plan well-formed" but
+  "would the calls the replayer is going to make succeed", and only the replayer knows which calls
+  those are. A validator with its own op table would answer a question about a different program.
+- **`ClientApplier.Create` / `rollback.Writer.Create` gained `dryRun bool`**, so the validator goes
+  through the one client this broker has instead of opening a second one (LSN-040).
+- **`cmd/broker/wiring.go`** hoists the replayer beside the applier and hands the same object to the
+  verifier's rollbacker and to the validator's factory.
+
+**The design question 06 §4.3.1 does not answer, and the ruling taken.** An undo plan describes the
+world **after** the action and is validated **before** it, so two of the four steps address an object
+whose existence is exactly what the action is about to change: the `delete` that reverses a create
+gets a NotFound, the `create` that reverses a delete gets an AlreadyExists. Read literally, validation
+would downgrade both and gate every create and every delete in the fleet. The ruling: **the dry run
+asks "would the API server accept this step from this identity", and those two answers are positive
+evidence.** Kubernetes authorizes before it looks the object up — a caller without the verb gets 403,
+not 404 — and a create clears mutating and validating admission before storage. Everything else (403,
+Invalid, a webhook rejection, a missing scale target, a body `hydrate` refuses) is a failure that
+downgrades to `none`, which the 06 §4.2 step 6 floor raises to gated. The one honest gap, DELETE-time
+admission running after the fetch, is named in `dryrun.go` rather than papered over.
+
+**A side effect worth having.** Reusing `Replayer.hydrate` moves the redacted-Secret refusal — the
+worst thing in this package's blast radius — from replay time, during an incident, to generation
+time, where it is a downgrade and the action gates before mutating anything.
+
+**Three sites ask "is there a usable undo plan", not two.** classify's 06 §4.2 step 6 floor, the
+pipeline's step 6 re-check, and the brake's 06 §4.4 row 5. Only the first suppresses for a dry run.
+The first two now read one predicate, `classify.UndoPlanGateApplies`, so they cannot drift; be precise
+about what that buys, because the tempting claim is bigger than the truth — mutating step 6 back to
+its own spelling does **not** fail anything, since the brake has already raised the class by the time
+step 6 looks. It is a structural fix, and it is asserted directly rather than through behaviour.
+**The brake is the outstanding one and is filed, not fixed**: it raises a dry run whose plan cannot be
+validated to gated, so it parks for approval instead of previewing. Over-gating, safe, and a row in
+the 06 §4.4 table — V-BRK surface, and changing a brake row is a unit of its own rather than something
+folded into the unit whose wiring surfaced it.
+
+**A second escape found while verifying this one, and this one is not small.**
+`internal/broker/rollback`'s `TestMain` did `os.Exit(0)` when `KUBEBUILDER_ASSETS` was unset. That is
+a package-wide skip wearing the word `ok`: **the entire hermetic half of the package — including the
+refusal that stops a redacted Secret being written back as sixty-four characters of hex — had never
+run under `go test ./...`, which is what the L0 chain and PR CI execute.** The package reported `ok`
+in 1.3 seconds while asserting nothing, and it was found only because `dev/mutate.py` refused the
+sweep: `go test -list` returned no names, so the catchers "did not exist". LSN-048's guard caught a
+defect it was not written for. Fixed to the shape escalate, history and writeahead already use — the
+environment is optional, the six envtest tests skip individually via `requireEnv`. `probe` still has
+the old shape; it has no hermetic tests today, so it costs nothing yet, and it is filed.
+
+**Findings filed, not fixed** — three, and the first two are named above. (a) The brake's 06 §4.4 row 5
+is the third spelling of the undo-plan gate and does not suppress for dry runs. (b) `internal/broker/probe`'s
+`TestMain` still carries the `os.Exit(0)` shape. (c) New, and adjacent to (a): `BrakeInputs.UndoPlan` is fed
+`signal(s.plan.Undoable())` at [pipeline.go:708](../../k8s-operator/internal/broker/pipeline/pipeline.go#L708)
+and [:852](../../k8s-operator/internal/broker/pipeline/pipeline.go#L852) — the **weaker** predicate, the one
+step 6 stopped asking in this unit. It cannot under-gate today, because `Undoable()` is implied by
+`Validated()` and the brake only raises, so a plan that is undoable-but-unvalidated already reaches the brake
+as `true` and step 6 catches it after. But it means the brake's view of "is there a usable undo plan" and the
+pipeline's are two different questions wearing one field name, and the next person to add a lowering rule to
+the 06 §4.4 table inherits that. Same V-BRK surface as (a) and the same unit.
+
+Evidence: **V-REV-003 (L1) pass** — 13 new assertions across
+`internal/broker/pipeline`, `internal/broker/rollback` and `cmd/broker`; mutation sweep
+`verification/mutants/V-REV-003.json` **12/12 caught**, including two vacuity controls, with the
+mutants aimed at the **wiring** (the required-field arm, the default planner, the composition root,
+the identity threading) rather than at the function the old L1 row already proved.
+
 ---
 
 ## Deferrals opened by this phase (each with a named external blocker)

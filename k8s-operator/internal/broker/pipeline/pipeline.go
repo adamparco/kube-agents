@@ -137,18 +137,27 @@ func (s StaticClassifier) Current() (*classify.Classifier, error) {
 	return s.C, nil
 }
 
-// Planner produces the undo plan for an envelope's operations. undo.Generate is the implementation;
-// the interface exists so that the failure mode is injectable -- see Config.Planner.
+// Planner produces the undo plan for an envelope's operations AND validates it.
+// undo.GenerateAndValidate is the implementation; the interface exists so that the failure mode is
+// injectable -- see Config.Planner.
+//
+// The dry-runner is a parameter rather than something the implementation closes over, and that is
+// the whole correction of P9-T8b-4b-ii-2b-i. The seam used to be `Generate` alone, defaulted to
+// `undo.Generate`, and `undo.GenerateAndValidate` -- whose own doc comment reads "the call the
+// broker actually makes at step 6" -- had no caller outside its tests. Every ActionRecord the
+// broker wrote therefore carried `undoPlan.validated: false`, and undo.ValidateReplayable refuses
+// on exactly that field, so both replay paths refused every plan ever journaled. A signature that
+// cannot express "generate without validating" is what stops that returning.
 type Planner interface {
-	Generate(ctx context.Context, req undo.Request, idx undo.ReferenceIndex) (*undo.Result, error)
+	Generate(ctx context.Context, req undo.Request, idx undo.ReferenceIndex, dr undo.DryRunner) (*undo.Result, error)
 }
 
-// PlannerFunc adapts a function to Planner. undo.Generate satisfies it directly.
-type PlannerFunc func(ctx context.Context, req undo.Request, idx undo.ReferenceIndex) (*undo.Result, error)
+// PlannerFunc adapts a function to Planner. undo.GenerateAndValidate satisfies it directly.
+type PlannerFunc func(ctx context.Context, req undo.Request, idx undo.ReferenceIndex, dr undo.DryRunner) (*undo.Result, error)
 
 // Generate calls f.
-func (f PlannerFunc) Generate(ctx context.Context, req undo.Request, idx undo.ReferenceIndex) (*undo.Result, error) {
-	return f(ctx, req, idx)
+func (f PlannerFunc) Generate(ctx context.Context, req undo.Request, idx undo.ReferenceIndex, dr undo.DryRunner) (*undo.Result, error) {
+	return f(ctx, req, idx, dr)
 }
 
 // ApprovalNotifier tells the humans on the roster that a gated action is waiting (04 §3).
@@ -171,12 +180,29 @@ type Config struct {
 	Classifier ClassifierSource
 	Live       classify.LiveState
 	Refs       undo.ReferenceIndex
-	// Planner generates the undo plan. Defaults to undo.Generate; it is a seam for the same reason
-	// every other dependency here is one. Whether a plan could be produced is a gating input
-	// (06 §4.2 rule 6, 06 §4.4 row 5), and a pipeline whose planner cannot be made to fail is a
-	// pipeline whose behaviour on an unplannable action is untested -- which is precisely the
-	// behaviour that decides between "gated" and "executed with no way back".
-	Planner   Planner
+	// Planner generates the undo plan and validates it. Defaults to undo.GenerateAndValidate; it is
+	// a seam for the same reason every other dependency here is one. Whether a plan could be
+	// produced is a gating input (06 §4.2 rule 6, 06 §4.4 row 5), and a pipeline whose planner
+	// cannot be made to fail is a pipeline whose behaviour on an unplannable action is untested --
+	// which is precisely the behaviour that decides between "gated" and "executed with no way back".
+	Planner Planner
+
+	// DryRunner yields the plan-time dry-run client for one submission's identity, which is
+	// 06 §4.3.1's "validated by dry-running each step against the API server".
+	//
+	// A function of the identity rather than a fixed object, because the dry run has to be issued
+	// with the SAME field manager the replay would use. Server-side apply reports a conflict for
+	// every field owned by a different manager, and the fields an undo restores are frequently the
+	// ones this agent set in an earlier action -- so a dry run under any other name would report
+	// conflicts the real replay never hits, downgrade a working plan, and gate the action for a
+	// reason that is an artifact of the check.
+	//
+	// REQUIRED, and it is the one seam in this Config whose absence is silent rather than loud. A
+	// nil Executor 500s on the first action; a nil DryRunner produces a broker that serves every
+	// request, journals every record with `validated: false`, and has a dead undo path that nobody
+	// discovers until a human is trying to reverse an outage. New refuses it for that reason.
+	DryRunner func(agentIdentity string) undo.DryRunner
+
 	Reader    execute.Reader
 	BodyStore execute.BodyStore
 	Executor  *execute.Executor
@@ -230,12 +256,14 @@ func New(cfg Config) (*Pipeline, error) {
 		return nil, errors.New("pipeline: an Accountant is required; broker.BrakeInputs treats nil as nobody-counting, which refuses every action -- 04 §4.2 budgets are not optional and a broker must not be constructible without row 7")
 	case cfg.Contested == nil:
 		return nil, errors.New("pipeline: a ContestedIndex is required; broker.BrakeInputs treats nil as unavailable, which refuses every action")
+	case cfg.DryRunner == nil:
+		return nil, errors.New("pipeline: a DryRunner is required; 06 §4.3.1 validates each undo step against the API server before the action runs, and a broker without one journals `undoPlan.validated: false` on every record -- which undo.ValidateReplayable refuses, so nothing it ever did could be rolled back")
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
 	if cfg.Planner == nil {
-		cfg.Planner = PlannerFunc(undo.Generate)
+		cfg.Planner = PlannerFunc(undo.GenerateAndValidate)
 	}
 	return &Pipeline{cfg: cfg}, nil
 }
@@ -573,10 +601,16 @@ func (p *Pipeline) stepClassify(ctx context.Context, s *state) (*broker.Result, 
 		// whichever step first needs the answer -- which is this one. Step 6 keeps the part of 03
 		// §4.1's step 6 that is genuinely a step: attaching the plan to the record, and re-checking
 		// that the class never fell.
+		// Validated here too, in the same call, because the validation VERDICT is a classification
+		// input: a step that will not apply downgrades the plan to `none`, which is what makes
+		// UndoPlanPresent false below, which is what raises the action to gated. 06 §4.3.1 says so
+		// directly -- "if generation or validation fails, the action is raised to gated" -- and
+		// there is no later step at which that could still be arranged, because by step 6 the class
+		// is already fixed.
 		plan, err := p.cfg.Planner.Generate(ctx, undo.Request{
 			Operations:  undoOps(s.env, s.snaps),
 			GeneratedAt: metav1.NewTime(s.at),
-		}, p.cfg.Refs)
+		}, p.cfg.Refs, p.cfg.DryRunner(agentIdentity(s.id)))
 		if err != nil {
 			return "", fmt.Errorf("step 4: generating the undo plan: %w", err)
 		}
@@ -717,13 +751,34 @@ func (p *Pipeline) stepUndoPlan(ctx context.Context, s *state) (*broker.Result, 
 		if s.plan == nil || s.plan.Plan == nil {
 			return "", fmt.Errorf("step 6: no undo plan object reached this step; step 4 did not run or did not record one")
 		}
-		if !s.plan.Undoable() && s.class.Class < classify.ClassGated {
+		// VALIDATED, not merely Undoable, and the difference is the property this guard now carries.
+		//
+		// The classifier is fed `Undoable()`, because "is there a plan" is the input 06 §4.2 step 6
+		// names. This asks the stronger question -- was every step of it dry-run and would it apply
+		// -- and the two answers are identical only if something actually validated the plan.
+		// Nothing did, for five phases: the seam was generate-only and every record shipped with
+		// `validated: false` while ValidateReplayable, the front door of both replay paths, refuses
+		// on exactly that field. Asking here means a planner that skips validation cannot reach
+		// execution, whoever wired it, rather than producing an action whose rollback is already
+		// known to be unusable and saying nothing.
+		//
+		// The dry-run suppression is classify.UndoPlanGateApplies rather than a second `!DryRun`
+		// written out here. A dry-run envelope mutates nothing and terminates at PhaseDryRun, so
+		// the classifier deliberately excuses it from the undo-plan floor, and one predicate is how
+		// two sites stay unable to disagree about when it applies.
+		//
+		// It is shared for that reason and not because today's behaviour needs it: the brake's
+		// 06 §4.4 row 5 -- a THIRD spelling, which does not suppress for dry runs -- has already
+		// raised the class by the time this runs, so the second conjunct below is false whichever
+		// way the first is written. That third site is the outstanding one; see
+		// TestADryRunWhoseUndoPlanWouldNotApplyIsNotAServerFault.
+		if classify.UndoPlanGateApplies(s.env.DryRun, s.plan.Validated()) && s.class.Class < classify.ClassGated {
 			return "", fmt.Errorf(
-				"step 6: the envelope has no usable undo plan (%s) but is classified %s; 06 §4.2 step 6 requires at least gated, so the classification and the plan disagree and the action does not run",
-				strings.Join(s.plan.Refusals, "; "), s.class.Class)
+				"step 6: the envelope has no validated undo plan (strategy=%s validated=%t; %s) but is classified %s; 06 §4.2 step 6 requires at least gated, so the classification and the plan disagree and the action does not run",
+				s.plan.Plan.Strategy, s.plan.Plan.Validated, strings.Join(s.plan.Refusals, "; "), s.class.Class)
 		}
 		s.record = p.buildRecord(s)
-		return fmt.Sprintf("strategy=%s undoable=%t", s.plan.Plan.Strategy, s.plan.Undoable()), nil
+		return fmt.Sprintf("strategy=%s undoable=%t validated=%t", s.plan.Plan.Strategy, s.plan.Undoable(), s.plan.Validated()), nil
 	})
 }
 
