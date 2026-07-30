@@ -28,13 +28,12 @@
 # Usage: dev/cluster/reload-images.sh [operator|router|broker|agents|all|digest|digest-router|digest-broker] [kube-context]
 #   operator (default)  build+push the controller image, repoint + restart the controller
 #   router              build+push the kage-router image, repoint + restart the router
-#   broker              build+push the kage-broker image and print its digest. It repoints NOTHING,
-#                       and that is the honest state of the tree, not an omission: the broker has no
-#                       standalone Deployment. The operator renders one per Agent CR (P9-T7), so
-#                       until that lands there is no workload to `set image` on, and a target that
-#                       printed "OK: broker reloaded" would be 09 §11.9 -- built, never wired -- said
-#                       out loud by the tool whose job is to catch it. Once P9-T7 lands this grows a
-#                       deploy_broker that repoints the rendered pair.
+#   broker              build+push the kage-broker image, set KUBEAGENTS_BROKER_IMAGE on the
+#                       CONTROLLER at that digest, and wait for every rendered broker to converge on
+#                       it. There is no `deploy/kubeagents-broker` to `set image` on: the operator
+#                       renders one broker per Agent CR and reads the image off its own environment,
+#                       because naming the broker's image chooses the binary behind the actor
+#                       credential (06 §2.2.1). See deploy_broker.
 #   agents              build+push the three tier agent images, repoint every Agent CR of each tier
 #   all                 all of the above
 #   digest              build+push the controller image and print its DIGEST reference on stdout,
@@ -52,7 +51,9 @@
 #
 # Exit codes (contract shared with up.sh, and relied on by the L2 suites):
 #   0 ok · 1 usage · 2 refused (guard) · 3 required tool missing · 4 an image did not materialise
-#   5 the digest IS deployed but the workload did not become Ready — `router` only; see reload_router
+#   5 the digest IS deployed but the workload did not come up — `router` (see deploy_router) and
+#     `broker` (see deploy_broker). Both mean "the image is the one under test and the CLUSTER's
+#     config is what is wrong", which is a different answer from 4 and must not be collapsed into it.
 set -uo pipefail
 
 TARGET="${1:-operator}"
@@ -239,25 +240,84 @@ reload_router() {
   deploy_router "$(ref_for kage-router)"
 }
 
-# report_broker — the broker is built and pushed, and nothing is repointed.
+# deploy_broker — the ONE target here that does not `set image` on the thing it is deploying.
 #
-# Stated rather than skipped. The digest is printed so the next thing that DOES consume it (a
-# hand-rolled pair, or P9-T7's renderer once it exists) has the reference this build produced, and
-# so the difference between "the broker image is current" and "the running broker is current" stays
-# visible instead of being answered by the absence of a line.
-report_broker() {
-  local ref="$1"
+# There is no `deploy/kubeagents-broker` to repoint, and there is not supposed to be. The operator
+# renders one broker Deployment per Agent CR (pod_launcher.go BuildPair), and the image those
+# Deployments carry is read by `brokerImage()` off KUBEAGENTS_BROKER_IMAGE on the CONTROLLER's
+# Deployment. That indirection is a security decision, not an accident of layering: naming the
+# broker's image is choosing which binary sits behind the actor credential, which is the same
+# authority-choosing move 06 §2.2.1 forbids the CR from making about the actor ServiceAccount. So it
+# is operator-level configuration, and the only way to deploy a broker is to tell the operator.
+#
+# WHAT THIS FIXED. Until P9-T8b-4a the variable was set NOWHERE in this repository -- not in
+# config/manager, not in the provisioning path, not here -- so `brokerImage()` fell back to
+# `ghcr.io/gke-labs/kube-agents/kage-broker:v0.1.0`, one of the four tags the V-CMP-002 deferral
+# measured as unpullable. Every Agent CR on every cluster rendered a broker that could not start,
+# and the header of this file described that as a pending TODO ("Once P9-T7 lands this grows a
+# deploy_broker") for four units after P9-T7 landed. A note that ages into a defect is 09 §11.9.
+#
+# TWO WAITS, AND THE SECOND IS THE ONE THAT MATTERS. `rollout status` on the controller proves the
+# operator process is running with the new variable. It says nothing about whether any broker has
+# been re-rendered with it, and "the env var is set" is precisely the built-never-wired claim. So
+# the rendered brokers are polled until each carries $ref -- reached by the label the renderer
+# stamps (`kube-agents/role=actor`), never by reconstructing `brokerName()` here, which would be a
+# second definition site for a name derived from the CR (V-MET-013).
+#
+# rc 4 = no image, or the controller would not roll. Fatal anywhere.
+# rc 5 = the controller carries the digest and a rendered broker did not converge on it. Same split
+#        deploy_router makes, for the same reason: a broker can be correctly deployed and still not
+#        become Ready for reasons that are about the CLUSTER's config -- a missing actor
+#        ServiceAccount, an unissued mesh certificate -- and collapsing that into "the build
+#        failed" is how a step stops being run.
+BROKER_CONVERGE_TIMEOUT="${BROKER_CONVERGE_TIMEOUT:-180}"
+
+deploy_broker() {
+  local ref="$1" waited=0 total=0 stale=0 line dname dns dimg
   [ -n "$ref" ] || return 4
+  echo "-> setting KUBEAGENTS_BROKER_IMAGE on the controller: $ref"
+  $K -n "$NS" set env "deploy/kubeagents-controller-manager" "KUBEAGENTS_BROKER_IMAGE=$ref" || return 4
+  $K -n "$NS" rollout status "deploy/kubeagents-controller-manager" --timeout=180s || return 4
+
+  while :; do
+    total=0 stale=0
+    # -A: brokers live in their agent's namespace, and a developer-team agent's namespace is a
+    # tenant one this script has no list of.
+    while IFS='|' read -r dns dname dimg; do
+      [ -n "$dname" ] || continue
+      total=$((total + 1))
+      [ "$dimg" = "$ref" ] || { stale=$((stale + 1)); line="$dns/$dname"; }
+    done <<<"$($K get deploy -A -l kube-agents/role=actor \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}|{.metadata.name}|{.spec.template.spec.containers[?(@.name=="broker")].image}{"\n"}{end}' 2>/dev/null)"
+    [ "$stale" -eq 0 ] && break
+    if [ "$waited" -ge "$BROKER_CONVERGE_TIMEOUT" ]; then
+      echo "NOTE: $stale of $total rendered broker Deployment(s) still do not carry $ref" >&2
+      echo "  (last seen stale: ${line:-?}). The controller has the variable; its reconcile has not" >&2
+      echo "  reached them. Read why:" >&2
+      echo "    kubectl --context $CTX -n $NS logs deploy/kubeagents-controller-manager" >&2
+      return 5
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+
+  # Zero is legitimate and is reported as a count, not passed over: "deployed to nothing" and
+  # "deployed to everything" must not print the same line (the lesson patch_agent_crs already
+  # carries).
   echo "OK: broker image built and pushed at $TAG"
   echo "   $ref"
-  echo "   NOT deployed: the broker has no standalone Deployment; the operator renders one per Agent"
-  echo "   CR (P9-T7). Nothing on $CTX is running this image yet."
+  if [ "$total" -eq 0 ]; then
+    echo "   The controller will render every future broker at this digest. No Agent CR exists on"
+    echo "   $CTX yet, so nothing is running it — seed fixtures, then re-run to converge them."
+  else
+    echo "   $total rendered broker Deployment(s) converged on this digest."
+  fi
 }
 
 reload_broker() {
   echo "== broker =="
   build_concurrently "$BROKER_SPEC" || return 4
-  report_broker "$(ref_for kage-broker)"
+  deploy_broker "$(ref_for kage-broker)"
 }
 
 # patch_agent_crs — repoint every Agent CR at the digest built for ITS tier.
@@ -319,18 +379,28 @@ reload_agents() {
 # The router's rc 5 -- deployed at the right digest, will not start for want of config -- is carried
 # through rather than allowed to short-circuit the agents, because it is a disclosed CONFIG gap and
 # `&&` would have made it silently skip the rest of the reload.
+#
+# The broker's rc 5 is carried the same way as the router's, and for a closer reason: a rendered
+# broker that will not converge is a statement about the CLUSTER (no actor ServiceAccount, no issued
+# mesh certificate), and short-circuiting the agents on it would leave the three tier images built
+# and un-deployed because of a condition in a different component.
 reload_all() {
-  local rc=0 router_rc=0
+  local rc=0 router_rc=0 broker_rc=0
   build_concurrently "$OPERATOR_SPEC" "$ROUTER_SPEC" "$BROKER_SPEC" \
     "$(agent_spec platform)" "$(agent_spec cluster-admin)" "$(agent_spec developer-team)" || return 4
   echo "== operator =="; deploy_operator "$(ref_for k8s-operator)" || return 4
   echo "== router ==";   deploy_router   "$(ref_for kage-router)" || router_rc=$?
   [ "$router_rc" -eq 4 ] && return 4
-  echo "== broker ==";   report_broker   "$(ref_for kage-broker)" || return 4
+  # After the operator, always: deploy_broker sets an env var on the controller Deployment, and
+  # doing it before deploy_operator's `set image` would cost a second rollout and leave a window
+  # where the running controller has the new broker digest and the old operator binary.
+  echo "== broker ==";   deploy_broker   "$(ref_for kage-broker)" || broker_rc=$?
+  [ "$broker_rc" -eq 4 ] && return 4
   echo "== agents =="
   patch_agent_crs || return 4
   echo "OK: 3 agent images built and pushed at $TAG; $AGENT_CRS_PATCHED Agent CR(s) repointed at their digest."
   [ "$rc" -eq 0 ] && rc=$router_rc
+  [ "$rc" -eq 0 ] && rc=$broker_rc
   return $rc
 }
 
