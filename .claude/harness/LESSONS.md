@@ -79,8 +79,9 @@ will start selecting.
 | **LSN-048** | mutation, tooling, checks, vacuity, false-finding | A mutation sweep names a test that does not exist, and reports the mutation as **survived** — a hole that is not there, indistinguishable from one that is | closed | `dev/mutate.py` + `dev/test_mutate_sweep.py` (L0, in `dev/L0-CHAIN.txt` via `unittest discover dev`) — a spec carrying `-run` is refused outright, every catcher is checked against `go test -list` **before the first mutation**, and a mutant the sweep could not evaluate scores `BROKEN` rather than joining the survivor count |
 | **LSN-049** | mutation, tooling, checks, vacuity, false-finding | The sweep's own shell quoting kept a mutation from ever being applied, and `rc == 0` was scored as "the suite passed with it in place" — an invented hole, reported twice | closed | `dev/mutate.py` + `dev/test_mutate_sweep.py` (L0, in `dev/L0-CHAIN.txt` via `unittest discover dev`) — needles and replacements live in JSON and are applied by `str.replace` in-process, so nothing crosses a shell parse; the applier refuses unless the needle appears exactly once, which is also how the sweep observes that the mutation LANDED; and `rc != 0` is not a catch, every row naming the test that must be in the failing set |
 | **LSN-050** | harness, checks, coverage, false-green, pre-commit | Seven L0 checks discover files with `git ls-files` and no `--others`, so the chain is blind to any file not yet `git add`ed — which is every brand-new file at the one moment the chain is documented to run | closed | `dev/tests/gitcorpus.py` + `check_l0_corpus_is_not_index_only` in `dev/tests/invariants-gate.py` (L0, in `dev/L0-CHAIN.txt`) — one `--cached --others --exclude-standard` enumerator, now used by all ten call sites, and a gate arm that AST-parses every `.py` and `.sh` under `dev/` and fails any `ls-files` argv without `--others`. The gate covers the whole tree rather than just the chain, because the failure mode is the eighth script copying the seventh |
+| **LSN-051** | harness, halts, spec-reading, PROTOCOL §8.5, rbac | A §8.5 halt was declared after comparing the broker's live reads against 06 §2.2.1, the *broker-operations* grant; the actor's authority is 06 §2.2, one level up, and it grants every read the halt said was ungranted — a subsection number reads like a refinement of its section, so having read the subsection felt like having read the section | open | *candidate:* a `harness-run` §7 rule that a §8.5 blocker row must quote **both** conflicting statements by document and section. There was only ever one here, and being made to write the second down is where the absence becomes visible. Alternatives considered and likely too narrow: a lint pairing every `NN §X.Y.Z` citation in a halt with a `NN §X.Y` citation. To be chosen at the next improvement pass |
 
-**Open: 0 of 50**.
+**Open: 1 of 51**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2817,3 +2818,66 @@ pass. The immediate defect (the wrong group in one string) is fixed; the blindne
 Related: [[lsn-032]] (the check that was blind here), [[lsn-035]] (verifying the operation ran, not
 that it worked), [[lsn-019]] (a mechanization off the path the work takes), [[lsn-041]] (a control
 that is asserted to exist and does not).
+
+---
+
+## LSN-051 — A subsection is not the section, and the halt was declared against the wrong one
+
+**Area:** harness, halts, spec-reading, PROTOCOL §8.5, rbac
+**Status:** open — mechanization candidate below; needs an improvement pass
+**Earned:** 2026-07-30, P9-T9b-5b-i
+
+**What happened.** `broker-execute-l2.sh` drove the first real envelope through the broker pipeline
+and stopped at step 3 on `cannot list resource "agents" … at the cluster scope`. I read outward from
+that error, compared each of the executor's four live reads against **06 §2.2.1's** twenty triples,
+found none of them covered, concluded that the actor grant could not authorize the gates 06 §3 and
+06 §4.2 require, enumerated three resolutions that each weakened something a spec states in its own
+words, and recorded **PROTOCOL §8.5 — a spec contradiction with no invariant-preserving resolution**.
+
+There was no contradiction. **06 §2.2** — one level up, a different object, on the same page — is the
+actor **scope** template, and it grants the platform actor `namespaces` and `secrets` cluster-wide
+and `kubeagents.x-k8s.io/agents` cluster-wide, in rules whose header reads "these are the literal
+rule bodies the render overlay emits." Three of the four reads are answered outright and the fourth
+tolerates a `Forbidden` by construction. The halt cost a session and produced a blocker question a
+human could only have answered by reading the section I had not.
+
+**Why.** §2.2.1 is *sufficient for the broker's own operations* and its template says so at length;
+I had read that template several times and internalized it as "the actor grant". The subsection
+number reads like a refinement of the section, so having read §2.2.1 felt like having read §2.2. It
+is not a refinement — it is a different grant, bound to the same identity, with a different job. My
+own fixture header for `actor-tenant-grant.yaml` even cites "06 §2.2's tenant template" while its
+body reasons entirely about §2.2.1's twenty triples, so the confusion was written down before it was
+acted on and I did not notice it either time.
+
+**What made it worse.** Two genuine defects had already come out of the same suite in the same
+session (`brokerServiceAccount()`, and the fixture's missing `get namespaces`). Both were real, both
+were found by reading outward from an error exactly this way, and the method's two-for-two record
+was itself the reason the third reading went unchallenged. A halt is the one verdict that stops the
+harness, and it got the *least* scrutiny of the three because it arrived last and looked like more
+of the same.
+
+**The finding that survived.** Stated correctly it is smaller and sharper: `LowerTierOwner` issues a
+cluster-scoped `list agents` on every namespaced operation, `resolveOwner` guards it only with
+`live != nil`, §2.2.1's `agents` rule is namespaced and scoped by its own comment to "step 5: its own
+pause state", and 06 §2.2's template — the thing that *would* authorize it — has no renderer in this
+tree. That is unimplemented spec, which is ordinary scheduled work (now P9-T9b-5b-0), not a halt.
+
+**Mechanization candidates**, for the pass to choose between:
+
+1. **A `harness-run` §7 rule: a §8.5 halt must quote the two spec statements that contradict, by
+   document and section, in the ledger's blocker row.** This one would have caught it — there was
+   only ever one statement, and writing the second down is where the absence becomes visible. It is
+   the cheapest form and it lands on the skill, not on a check.
+2. A lint that any spec citation of the form `NN §X.Y.Z` appearing in a halt or a blocker row is
+   accompanied by a citation of `NN §X.Y`. Mechanical, and probably too narrow to be worth its
+   false-positive rate.
+3. Nothing enforceable, and rely on (1). Argue it if (1) is judged sufficient.
+
+**Not a lesson about this halt only.** Every §8.5 to date has been declared by reading outward from
+a runtime error, which is the right way to find one and the wrong way to confirm one: the error tells
+you what the implementation did, and a contradiction is a property of two specs. The reading that
+confirms it has to start at the spec.
+
+Related: [[lsn-041]] (a control asserted to exist and not existing), [[lsn-035]] (verifying the
+operation ran, not that it ran over the right thing), [[lsn-019]] (a mechanization off the path the
+work takes).

@@ -3883,7 +3883,7 @@ either, and a production broker needs this read for every namespaced operation i
 twenty triples are single-sourced and V-BRK-013 asserts exact equality against them, so adding one is
 a ruling with its own unit — the same shape as P9-T9b-5a — and not something to slip into a suite.
 
-#### The third finding is a halt, and the first two are why it is legible
+#### The third finding was recorded as a halt, and the halt was wrong
 
 With the namespace read granted, the next run reached the same step and stopped one call later:
 
@@ -3893,9 +3893,8 @@ owner: agents.kubeagents.x-k8s.io is forbidden: … cannot list resource "agents
 ```
 
 That is not another missing line in a fixture. Reading outward from it, **06 §2.2.1's actor grant is
-not sufficient for the gates 06 §3 and 06 §4.2 require the actor to run**, and every way of making it
-sufficient costs something the specs elsewhere say must not be spent. Four reads, in the order the
-executor makes them:
+not sufficient for the gates 06 §3 and 06 §4.2 require the actor to run**. Four reads, in the order
+the executor makes them:
 
 | Read                                       | Site               | On refusal                                                                                                                                                                 | Covered by the twenty triples?                                                        |
 | ------------------------------------------ | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
@@ -3904,37 +3903,98 @@ executor makes them:
 | every discovered namespaced kind, in scope | `livestate.go:240` | **tolerated** per kind — the count survives holes — but `listed == 0` is a hard error                                                                                      | no, and mostly should not be                                                          |
 | `list secrets`, **in the caller's scope**  | `livestate.go:295` | hard error → refuse; "an empty digest set would report 'no secret material in this payload' for every payload, which is the exfiltration gate answering yes to everything" | **no**                                                                                |
 
-The last row is the wall. For a platform-tier caller `scope.Namespace` is empty, so "the caller's
-scope" is the cluster, and the material-egress gate wants to read **every Secret value in the
-cluster** on every envelope. The code that does it says so plainly — `secretegress.go` calls the
-resulting map "a much better target than the Secrets themselves, since it is pre-collected and
-cross-namespace" — and `SecretDigests` zeroes its copies for that reason.
+I read that table as a spec contradiction and recorded PROTOCOL §8.5. **That was wrong, and the
+error is worth more than the finding.** Every row of the rightmost column asks "covered by the twenty
+triples?", and the twenty triples are **06 §2.2.1** — the _broker-operations_ grant. They are not the
+actor's authority. **06 §2.2**, one level up and a different object entirely, is the actor **scope**
+template, and its header says what it is: "These are the literal rule bodies the render overlay emits
+and `vap-agent-scope` validates against. A rule not present here is not grantable to an actor
+identity." Read it and every row of the table is answered:
 
-Three resolutions exist and the harness may not pick one:
+| Read                                       | 06 §2.2 platform ACTOR ClusterRole                                                      |
+| ------------------------------------------ | --------------------------------------------------------------------------------------- |
+| namespace labels                           | `[""] / [namespaces, serviceaccounts, configmaps, secrets] / [get, list, watch, …]`     |
+| `list agents`, cluster-scoped              | `[kubeagents.x-k8s.io] / [agents] / [get, list, watch, create, update, patch, delete]`  |
+| every discovered namespaced kind, in scope | partially; and `CountWorkloadObjects` tolerates a per-kind `Forbidden` by construction  |
+| `list secrets`, in the caller's scope      | `secrets`, cluster-wide, in the same rule as `namespaces` — deliberately, for this tier |
 
-1. **Widen the grant** to cluster-wide `list secrets`. This hands the broker the authority the design
-   documents describe as the better target, in order to run the gate that exists to stop
-   exfiltration. It also multiplies through six copies and every cluster the cascade template
-   renders.
-2. **Narrow the gates' reads** to the target's namespace. `resolve.go` pre-empts this in writing: the
-   digest set "is scoped to the CALLER, not to the target namespace … the exfiltration shape is
-   reading in one namespace and writing in another — so scoping the set to the write's namespace
-   would miss precisely the case worth catching." This is a documented security property and
-   narrowing it is a weakening.
-3. **Move the supply to the operator**, which already holds a cluster-wide cache legitimately and is
-   what `ownership.go` says production does: "Implemented over the operator's cached Agent lister in
-   production." The broker's own `l.Client.List` may be the deviation rather than the requirement.
-   This is the most likely correct answer and it is an architecture change, not a grant edit.
+So the "wall" is not a wall. `SecretDigests` already narrows to the namespace whenever the scope has
+one (`if s.Namespace != "" { InNamespace }`); the cluster-wide read arises only for a project-scoped
+platform caller, which is exactly the tier 06 §2.2 hands cluster-wide `secrets` to. There is nothing
+to rule on, no property to weaken, and resolutions 1–3 were three answers to a question the spec had
+already answered. **The halt is withdrawn.**
 
-Every path either weakens a property a spec states in its own words or changes where a gate's data
-comes from. That is PROTOCOL §8.5 — a spec contradiction with no resolution available to the harness
-that preserves every invariant — so it is recorded as a halt rather than decided here.
+What is actually true is narrower, and is not a contradiction: **06 §2.2's actor scope template has
+no renderer in this tree.** `k8s-operator/scripts/` holds ten templates and none of them is it; no
+manifest carries the `kube-agents/scope` label or a `cnrm.cloud.google.com` rule; and its validator
+`vap-agent-scope` matches no `name:` anywhere, because it is P10-T1. Unimplemented spec is ordinary
+scheduled work, and confusing it for a contradiction cost this unit a halt.
 
-**Why the claims cannot be deferred instead.** V-BRK-006 is BLOCKING-ALWAYS and green at no level;
-`check_deferrals_name_blockers` refuses exactly that row, and it is right to. Recording a deferral
-would be the softer word for a failure, which is the thing that check exists to prevent.
+#### The third finding, stated correctly, and it is the same shape as the first
 
-What this unit does land is real and independently verified: the identity defect and its L1 guard,
-the fixture's missing namespace read, and the suite, probe, chain line and floors that produced all
-three findings. The suite's own verdict on the run is `rc 3 DEFERRED` with the blocker printed — it
-declined to score V-BRK-006 or V-REV-001, which is the behaviour it was built to have.
+Set the grant question aside and one thing in the table survives on its own terms:
+
+> **The broker's ownership gate issues a cluster-scoped `list agents` on every namespaced operation,
+> and nothing the install path applies authorizes it.**
+
+§2.2.1 does grant `agents`, but in the **namespaced** half, and its own comment says what for: "step
+5: its own pause state." That is the caller reading its own Agent CR. It is not the ownership lookup.
+`LowerTierOwner` lists cluster-wide because it must — it answers "which agent's _scope_ covers
+namespace X", which cannot be found by listing in X — and `resolveOwner` has no short-circuit at all:
+
+```go
+func resolveOwner(ctx context.Context, live LiveState, caller Caller, op *ResolvedOp) (string, error) {
+	if live == nil {
+		return "", nil
+	}
+	return live.LowerTierOwner(ctx, caller, op.Kind, op.Namespace, op.Name)
+}
+```
+
+`live != nil` is the only guard, so on a freshly provisioned cluster every namespaced envelope fails
+closed at the ownership gate. This is the `brokerServiceAccount()` defect a second time and the
+resemblance is not a coincidence: a read the broker makes on every call, authorized by no grant that
+is actually applied, invisible to every level below L2, and found by the first suite to drive a real
+envelope through the pipeline. The thing that would authorize it is 06 §2.2's tier template — the one
+with no renderer. So the fix is not a spec edit and not a grant widening; it is the missing renderer,
+and it is now scheduled as **P9-T9b-5b-0** below.
+
+#### What this unit landed, and what it did not
+
+Landed and independently verified: the identity defect and its L1 guard, the fixture's missing
+namespace read, and the suite, probe, chain line and floors that produced all three findings. The
+suite's own verdict on the run is `rc 3 DEFERRED` with the blocker printed — it declined to score
+V-BRK-006 or V-REV-001, which is the behaviour it was built to have.
+
+Not landed: V-BRK-006 L2 and V-REV-001 remain unproven. They are not deferrable — both are
+BLOCKING-ALWAYS-family and green at no level, and `check_deferrals_name_blockers` refuses exactly
+that row. They are blocked on P9-T9b-5b-0, which is implementation work this harness can do, not on
+a human.
+
+---
+
+### P9-T9b-5b-0 — render 06 §2.2's actor scope template on the install path
+
+Scheduled out of the withdrawn halt above; it blocks 5b-i's two unproven claims, 5b-ii and 5c.
+
+**What to build.** A template rendering the three tier ACTOR grants of 06 §2.2 verbatim — the
+developer-team namespaced Role, the cluster-admin ClusterRole, the platform ClusterRole — plus the
+render function and the install-step wiring that applies the right one per tier, alongside the
+existing `render_broker_operations_grant`.
+
+**Spec sections.** 06 §2.2 (the three templates, and the `NOT GRANTED` lists, which are part of the
+statement). 03 §3.3 rule 3 for what stays out of every one of them.
+
+**Files.** A new `k8s-operator/scripts/actor-scope-grant.yaml.template`; `common.sh`; the tier
+install steps that already call the broker-operations renderer; a new L0 check.
+
+**Checks.** The new L0 check is the §2.2 analogue of V-BRK-013's §2.2.1 equality: 06 §2.2's fenced
+blocks are the single source, the rendered template is compared against them in both directions, and
+a superset fails as readily as a subset. It needs an ID from 09 §6 — reuse V-BRK-013's shape, not its
+ID. Downstream, it makes V-BRK-006 L2 and V-REV-001 runnable.
+
+**Sizing note.** Three templates, an exact-equality lint with a fenced-block parser, and install
+wiring is a full unit. Do not attempt it in the same session as 5b-ii.
+
+**Not in this unit.** `vap-agent-scope` (P10-T1) is §2.2's validator and may lag the grant — that is
+precisely the state §2.2.1 has shipped in since P9-T7d-5.
