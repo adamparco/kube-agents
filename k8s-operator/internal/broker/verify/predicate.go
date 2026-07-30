@@ -66,6 +66,16 @@ type Evaluation struct {
 // is a configuration fact about the broker, not a failure of the action.
 var ErrProbeUnsupported = errors.New("probe capability not available in this broker")
 
+// ErrTargetReplaced is returned by a Prober asked for an object whose name is now held by a
+// DIFFERENT object -- same kind, same namespace, same name, different uid. Every row but one reads
+// that as evidence about the wrong object and must not evaluate it; absencePredicate reads it as
+// the target having gone away, which is what it was verifying.
+//
+// It is a sentinel rather than a string the predicates match on because the only implementation
+// that can detect it lives in `internal/broker/probe`, which imports this package, so the shared
+// vocabulary has to be declared here for both sides to name it.
+var ErrTargetReplaced = errors.New("the object this action targeted was replaced")
+
 // ConnectivityProbe is one leg of the NetworkPolicy affirmative probe. Both legs are required:
 // asserting only that the denied path is refused passes for a policy that blocks everything.
 type ConnectivityProbe struct {
@@ -152,11 +162,30 @@ type Target struct {
 	// comparison, and a predicate handed no baseline cannot make it -- so it says so rather than
 	// comparing against zero, which would fail every verification of an already-crashlooping app
 	// and pass none of the ones that started crashlooping because of this change.
+	//
+	// CaptureRestartBaselines fills it, and must be called before the action mutates anything.
 	BaselineRestarts *int64
+
+	// ExpectAbsent inverts the target's row: the action's success condition is that the object is
+	// GONE. Every row of 04 §5.1 asserts something about a live object, and `mustGet` maps NotFound
+	// to VerdictFailed -- correctly, for a create or an apply, where absence after the action means
+	// the write did not land. For a delete it is exactly backwards, and a delete whose object is
+	// dutifully absent would be reported as failed and rolled back by recreating it.
+	ExpectAbsent bool
 }
 
 // Predicate evaluates one row of the 04 §5.1 table.
 type Predicate func(ctx context.Context, p Prober, t Target) Evaluation
+
+// predicateFor picks the row for one target. Kind chooses it, except when the action's success
+// condition is the object's absence -- see Target.ExpectAbsent. This is the only chooser the driver
+// calls; PredicateFor stays exported for the callers that hold a bare ref and no action.
+func predicateFor(t Target) Predicate {
+	if t.ExpectAbsent {
+		return absencePredicate
+	}
+	return PredicateFor(t.Ref)
+}
 
 // PredicateFor returns the predicate for a target's kind. Every kind resolves to something: the
 // last row of 04 §5.1 is the custom-resource fallback, and a kind with no row would otherwise
@@ -437,6 +466,114 @@ func customResourcePredicate(ctx context.Context, p Prober, t Target) Evaluation
 	default:
 		return Evaluation{VerdictPending, name, "Ready=" + status, CauseDependencyConverging}
 	}
+}
+
+// absencePredicate is the delete row: the object is gone, and stays gone.
+//
+// It is not in predicateByKind because it is not chosen by kind -- a Deployment verifies as a
+// rollout when it was applied and as an absence when it was deleted, and only the action knows
+// which. `predicateFor` makes that choice from Target.ExpectAbsent.
+//
+// Still-present is PENDING rather than failed, and the settle window is what makes that safe.
+// Deletion is asynchronous: the API server returns 200 while the object still has finalizers on it,
+// and a Deployment with a foreground propagation policy stays readable until its ReplicaSets and
+// Pods are collected. Failing on the first read would report every graceful delete as failed. The
+// window expiring turns it into VerdictFailed in the driver, which is where "still there after the
+// whole window" becomes a rollback -- and a delete's rollback is a recreate from the snapshot, so
+// getting this backwards in either direction resurrects objects.
+func absencePredicate(ctx context.Context, p Prober, t Target) Evaluation {
+	const name = "object-absent"
+	obj, err := p.Get(ctx, t.Ref)
+	if apierrors.IsNotFound(err) {
+		return Evaluation{VerdictSatisfied, name,
+			fmt.Sprintf("%s %s/%s is gone", t.Ref.Kind, t.Ref.Namespace, t.Ref.Name), ""}
+	}
+	if err != nil {
+		// ErrTargetReplaced is the ANSWER here, not a probe failure. It means the object this
+		// action targeted is gone and a different one now holds the name -- which for every other
+		// row is evidence about the wrong object, and for this one is the delete having succeeded.
+		// probeFailure would spend the whole settle window on it and then roll back by recreating.
+		if errors.Is(err, ErrTargetReplaced) {
+			return Evaluation{VerdictSatisfied, name,
+				fmt.Sprintf("%s %s/%s is gone; a different object now holds the name (%v)",
+					t.Ref.Kind, t.Ref.Namespace, t.Ref.Name, err), ""}
+		}
+		return probeFailure(name, "get", err)
+	}
+	if obj == nil {
+		return Evaluation{VerdictIndeterminate, name,
+			"the prober returned neither an object nor an error", CauseUnknown}
+	}
+
+	detail := fmt.Sprintf("%s %s/%s still exists", t.Ref.Kind, t.Ref.Namespace, t.Ref.Name)
+	if fins := obj.GetFinalizers(); len(fins) > 0 {
+		detail += fmt.Sprintf(" with finalizers %v", fins)
+	}
+	if ts := obj.GetDeletionTimestamp(); ts != nil {
+		detail += ", deletionTimestamp " + ts.String()
+	}
+	return Evaluation{VerdictPending, name, detail, CauseDependencyConverging}
+}
+
+// --- restart baselines --------------------------------------------------------------------------
+
+// restartBaselineKinds are the kinds whose row compares restart counts ACROSS the action, and which
+// therefore cannot be evaluated from post-action state alone.
+//
+// It is a second table keyed the same way as predicateByKind, which is a shape worth being nervous
+// about -- two lists of kinds that nothing compares are two lists that will disagree. They are
+// joined by TestRestartBaselineKindsAreExactlyTheWorkloadRows, which holds this map to the rows of
+// predicateByKind that resolve to workloadPredicate, in both directions.
+var restartBaselineKinds = map[classify.KindRef]bool{
+	{Group: "apps", Kind: "Deployment"}:  true,
+	{Group: "apps", Kind: "StatefulSet"}: true,
+}
+
+// NeedsRestartBaseline reports whether a target's row needs a pre-action restart count.
+func NeedsRestartBaseline(ref agentv1alpha1.TargetRef) bool {
+	return restartBaselineKinds[classify.KindRef{Group: ref.Group, Kind: ref.Kind}]
+}
+
+// CaptureRestartBaselines reads the pre-action restart total for every target whose row needs one,
+// returning one entry per ref, positionally. A nil entry means the row does not need a baseline.
+//
+// It must be called BEFORE the action mutates anything -- that is the whole point of the value, and
+// a baseline read afterwards is the post-action count compared against itself, which passes for a
+// workload that started crashlooping because of this change. Step 3 is where the pipeline calls it,
+// alongside the snapshot reads, for that reason.
+//
+// A target that does not exist yet baselines at ZERO rather than at nil. A create's object had no
+// pods before the action, so every restart the settle window observes is a new one, which is
+// exactly what a zero baseline expresses. Returning nil there would make workloadPredicate
+// Indeterminate and roll back every successful Deployment create.
+func CaptureRestartBaselines(ctx context.Context, p Prober, refs []agentv1alpha1.TargetRef) ([]*int64, error) {
+	out := make([]*int64, len(refs))
+	for i, ref := range refs {
+		if !NeedsRestartBaseline(ref) {
+			continue
+		}
+		if p == nil {
+			return nil, fmt.Errorf("no prober is wired, so the pre-action restart baseline of "+
+				"%s %s/%s cannot be read; its row cannot be evaluated without one",
+				ref.Kind, ref.Namespace, ref.Name)
+		}
+		n, err := p.RestartCount(ctx, ref)
+		if apierrors.IsNotFound(err) {
+			zero := int64(0)
+			out[i] = &zero
+			continue
+		}
+		if err != nil {
+			// Refuse rather than degrade to nil. An action executed with no baseline cannot be
+			// verified, and 04 §5.1 turns "could not be verified" into a rollback at the end of the
+			// settle window -- so a prober blip here would land the write and then undo it. Failing
+			// before step 5 costs the caller a retry instead.
+			return nil, fmt.Errorf("reading the pre-action restart baseline of %s %s/%s: %w",
+				ref.Kind, ref.Namespace, ref.Name, err)
+		}
+		out[i] = &n
+	}
+	return out, nil
 }
 
 // --- shared helpers ---------------------------------------------------------------------------

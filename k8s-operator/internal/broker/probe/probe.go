@@ -138,9 +138,12 @@ func (s *Source) Get(ctx context.Context, ref agentv1alpha1.TargetRef) (*unstruc
 		return nil, err
 	}
 	if ref.UID != "" && string(obj.GetUID()) != ref.UID {
+		// Wrapped in verify.ErrTargetReplaced so the one row that reads this as an answer rather
+		// than a failure -- absencePredicate, for which a replaced name means the deleted object is
+		// gone -- can identify it without matching on the prose below.
 		return nil, fmt.Errorf("%s exists but is uid %s, not the uid %s this action targeted: the "+
 			"object was replaced during the settle window, so its state is evidence about a "+
-			"different object", describe(ref), obj.GetUID(), ref.UID)
+			"different object: %w", describe(ref), obj.GetUID(), ref.UID, verify.ErrTargetReplaced)
 	}
 	return obj, nil
 }

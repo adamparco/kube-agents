@@ -210,6 +210,25 @@ var (
 	}
 )
 
+// ValidOps returns the closed set of `operations[].op` values, sorted. This is the definition site:
+// `validOps` above is the only place the envelope's verb vocabulary is written down, and everything
+// downstream that needs to enumerate it -- rather than merely test membership -- comes here.
+//
+// It is exported for the two callers that must not restate the set. V-BRK-022 drives every verb in
+// it end to end through the assembled pipeline, so a sixth verb added here is unexecuted-and-failing
+// rather than unexecuted-and-green. And the join in pipeline's verbs_test.go holds
+// classify.KnownVerbs() to it, which is the check [[LSN-040]] was opened for: classify keeps its own
+// copy to avoid an import cycle, and two copies of a verb set that nothing compares are two copies
+// that will disagree.
+func ValidOps() []string {
+	out := make([]string, 0, len(validOps))
+	for op := range validOps {
+		out = append(out, op)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // ReservedKeys are the top-level names an envelope may not carry, each mapped to the reason it is
 // refused. This is the security-load-bearing half of the schema (06 §4.1), and it is a REFUSAL
 // rather than a silent drop for one reason: an agent that has been talked into trying

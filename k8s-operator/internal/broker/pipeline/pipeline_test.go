@@ -190,6 +190,11 @@ func (f fakeWriteAhead) ConfirmDurable(context.Context, string) error { return f
 type fakeProber struct {
 	obj    *unstructured.Unstructured
 	absent bool
+
+	// restarts answers the workload row's "no new restarts" half. Zero is a real answer, not an
+	// unset one: a Deployment whose pods have never restarted reports 0, and the predicate compares
+	// it against a baseline rather than against zero.
+	restarts int64
 }
 
 func (f *fakeProber) Get(_ context.Context, ref agentv1alpha1.TargetRef) (*unstructured.Unstructured, error) {
@@ -199,8 +204,14 @@ func (f *fakeProber) Get(_ context.Context, ref agentv1alpha1.TargetRef) (*unstr
 	return f.obj.DeepCopy(), nil
 }
 
-func (f *fakeProber) RestartCount(context.Context, agentv1alpha1.TargetRef) (int64, error) {
-	return 0, errors.New("fakeProber: RestartCount is not wired for this test")
+func (f *fakeProber) RestartCount(_ context.Context, ref agentv1alpha1.TargetRef) (int64, error) {
+	// NotFound for an absent object, like probe.Source, which reads the workload to find its pod
+	// selector before it can count anything. verify.CaptureRestartBaselines depends on the
+	// difference: NotFound is "nothing was running, baseline zero", any other error is a refusal.
+	if f.absent {
+		return 0, apierrors.NewNotFound(schema.GroupResource{Group: ref.Group, Resource: ref.Kind}, ref.Name)
+	}
+	return f.restarts, nil
 }
 
 func (f *fakeProber) EndpointCount(context.Context, agentv1alpha1.TargetRef) (int, error) {
@@ -325,6 +336,10 @@ type rig struct {
 	brake   *fakeBrake
 	budget  *solventLedger
 	classes *fakeClassifierSource
+
+	// verifyClock is the settle window's clock, and it ADVANCES -- see newRig. The pipeline's own
+	// clock stays pinned at testClock so action timestamps remain golden.
+	verifyClock time.Time
 
 	pipeline *Pipeline
 }
@@ -480,15 +495,16 @@ func newRig(t *testing.T, tweaks ...func(*rig)) *rig {
 	t.Helper()
 
 	r := &rig{
-		t:       t,
-		live:    &fakeLive{nsLabels: map[string]string{"env": "dev"}},
-		reader:  &fakeReader{absent: true},
-		applier: &fakeApplier{},
-		prober:  &fakeProber{obj: liveConfigMap()},
-		rollup:  &fakeRollback{},
-		pager:   &fakePager{},
-		pauser:  &fakePauser{},
-		records: &fakeRecords{},
+		t:           t,
+		verifyClock: testClock,
+		live:        &fakeLive{nsLabels: map[string]string{"env": "dev"}},
+		reader:      &fakeReader{absent: true},
+		applier:     &fakeApplier{},
+		prober:      &fakeProber{obj: liveConfigMap()},
+		rollup:      &fakeRollback{},
+		pager:       &fakePager{},
+		pauser:      &fakePauser{},
+		records:     &fakeRecords{},
 		brake: &fakeBrake{view: BrakeView{
 			Agent:   testAgentCR(),
 			Freezes: &broker.FreezeView{ObservedAt: testClock},
@@ -512,14 +528,22 @@ func newRig(t *testing.T, tweaks ...func(*rig)) *rig {
 		Reader:              r.reader,
 		Executor:            &execute.Executor{Applier: r.applier, Journal: r.wal},
 		Verifier: &verify.Driver{
-			Prober:       r.prober,
-			Rollback:     r.rollup,
-			Pager:        r.pager,
-			Pauser:       r.pauser,
-			Cooldown:     fakeCooldown{},
-			Now:          func() time.Time { return testClock },
-			Sleep:        func(context.Context, time.Duration) error { return nil },
-			PollInterval: time.Millisecond,
+			Prober:   r.prober,
+			Rollback: r.rollup,
+			Pager:    r.pager,
+			Pauser:   r.pauser,
+			Cooldown: fakeCooldown{},
+			// The settle window's clock advances by whatever the driver sleeps. A fixed clock plus
+			// a no-op sleep is not a fast test, it is an infinite one: verifyOne polls a Pending
+			// predicate until the deadline, and a deadline that never arrives hangs the whole
+			// package instead of failing one case. Nothing sleeps for real -- the advance is the
+			// sleep -- so this stays as fast as the stub it replaces.
+			Now: func() time.Time { return r.verifyClock },
+			Sleep: func(_ context.Context, d time.Duration) error {
+				r.verifyClock = r.verifyClock.Add(d)
+				return nil
+			},
+			PollInterval: 15 * time.Second,
 		},
 		Records:    r.records,
 		Brake:      r.brake,

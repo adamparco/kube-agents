@@ -171,15 +171,39 @@ func (r Rule) Validate(codeFloor bool) error {
 	return nil
 }
 
-// knownVerbs mirrors the envelope's op enum. Duplicated as a set here rather than imported from the
-// broker package to keep this package free of a dependency cycle -- classify is imported BY the
-// broker. The corpus lint asserts the two agree.
+// knownVerbs is the op set this package matches rules against. It is the envelope's op enum plus
+// VerbsNotCarriedByAnEnvelopeOp, duplicated as a set here rather than imported from the broker
+// package to keep this package free of a dependency cycle -- classify is imported BY the broker.
+//
+// The join to the definition site is TestClassifyKnownVerbsAgreeWithTheEnvelopeEnum, in the pipeline
+// package because that is the lowest package that imports both. Until 2026-07-29 the comment here
+// said "the corpus lint asserts the two agree" and no such lint existed, which is the
+// [[LSN-041]] shape: the sentence claiming a control exists is the reason nobody writes it.
 var knownVerbs = map[string]bool{
 	"create": true, "apply": true, "patch": true, "delete": true, "scale": true, "cloud": true,
 }
 
-// KnownVerbs returns the op set this package matches on, sorted, for the lint that joins it to the
-// envelope's enum.
+// VerbsNotCarriedByAnEnvelopeOp are the entries of knownVerbs that no `operations[].op` field can
+// ever hold, each mapped to why it is nonetheless matchable. The map is exported because it is the
+// declared half of a deliberate divergence: the join test requires knownVerbs to be exactly
+// broker.ValidOps() plus these keys, so a verb added to either side without a written reason fails
+// the build, and an entry here that becomes a real envelope op fails it too.
+//
+// Keeping the divergence in a variable rather than in the join test's source is the point. A verb
+// that matches nothing is a rule that gates nothing, and 06 §4.2's whole premise is that a
+// ChangePolicy naming a verb is a control in force -- so the exception needs a home a policy author
+// can be pointed at, not a comment inside a test.
+var VerbsNotCarriedByAnEnvelopeOp = map[string]string{
+	"cloud": "a Config Connector write is a write, and the code floor gates it by name " +
+		"(floor.go's writeVerbs). But no envelope carries `op: cloud` -- a cloud action arrives as an " +
+		"ordinary verb against a *.cnrm.cloud.google.com kind, and this broker refuses every " +
+		"cloudTarget outright with `cloud-target-unavailable`. So a ChangePolicy rule naming this " +
+		"verb matches nothing today. That is safe only for as long as the refusal holds, which is why " +
+		"TestNoCloudTargetReachesTheClassifier asserts it rather than leaving it to this sentence.",
+}
+
+// KnownVerbs returns the op set this package matches on, sorted, for the join that holds it to
+// broker.ValidOps().
 func KnownVerbs() []string {
 	out := make([]string, 0, len(knownVerbs))
 	for v := range knownVerbs {

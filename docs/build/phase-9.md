@@ -1087,7 +1087,7 @@ readAt.IsZero()` is subsumed by the staleness ceiling (a zero read time is stale
       | Unit                 | Scope                                                                                                                                                                                                                                                                                                          | Checks               | Blocks on |
       | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | --------- |
       | **P9-T7c-4a** — done | The conversion. `apply`, `scale` and merge-patch reach the classifier with real `TouchedPaths`; the `stepResolve` reorder that makes `snap.Live` available before `classify.Resolve`; `apply` stops being `WholeObject`; the two false comments deleted.                                                       | **V-BRK-020** — pass | nothing   |
-      | **P9-T7c-4b**        | The mechanization. **V-BRK-022** — every verb in the envelope's closed enum executes end to end through the assembled pipeline, the verb set **discovered from the enum** — plus exporting that enum and the lint joining it to `classify.KnownVerbs()`. Closes [[LSN-040]] and the `KnownVerbs` prose defect. | **V-BRK-022** (new)  | **4a**    |
+      | **P9-T7c-4b** — done | The mechanization. **V-BRK-022** — every verb in the envelope's closed enum executes end to end through the assembled pipeline, the verb set **discovered from the enum** — plus exporting that enum and the lint joining it to `classify.KnownVerbs()`. Closes [[LSN-040]] and the `KnownVerbs` prose defect. | **V-BRK-022** — pass | **4a**    |
 
       **The complication LSN-040 warns about dissolves on inspection.** The lesson says feeding a
       computed diff into `classify.PatchOp.Value` is lossy for the typed rules, because
@@ -1134,6 +1134,61 @@ readAt.IsZero()` is subsumed by the staleness ceiling (a zero read time is stale
       4b's end-to-end-per-verb check has something to assert against. `classify.knownVerbs` still
       contains `"cloud"` where `broker.validOps` does not, which 4b's lint has to account for
       rather than trip over.
+
+    - **What 4b actually landed — 2026-07-29.** V-BRK-022 exists, discovers its verb set from
+      `broker.ValidOps()`, and drives all five ops through the assembled pipeline. **It found two
+      more gaps the first time it ran**, both the LSN-040 shape — a package that is individually
+      right, and the assembly as its first caller:
+
+      - **`delete` could never be verified.** Every row of 04 §5.1 asserts something about a live
+        object and `verify.mustGet` maps NotFound to `VerdictFailed`. A delete that worked would
+        have been reported failed and rolled back **by recreating what it deleted**. Fixed with
+        `verify.Target.ExpectAbsent` and an `absencePredicate` chosen by the action rather than by
+        the kind, with still-present as `Pending` (deletion is asynchronous; finalizers) so only the
+        settle window expiring makes it a failure.
+      - **No Deployment or StatefulSet action could ever be verified.** `verifyTargets` built
+        `verify.Target{Ref: r}` and dropped every other field, so `BaselineRestarts` was always nil,
+        `workloadPredicate` always returned `VerdictIndeterminate`, and the settle window always
+        expired into `VerdictFailed`. Every workload change that worked would have rolled back.
+        Fixed by `verify.CaptureRestartBaselines` at step 3, next to the snapshots, on the same
+        all-or-nothing terms — a baseline read after the write is the post-action count compared
+        against itself.
+
+      Neither was reachable from either package's own tests: `verify` tested `workloadPredicate`
+      with a baseline the test supplied, and the pipeline tested a ConfigMap, whose row needs none.
+      This is the entire argument for a check that discovers its verb set instead of restating it.
+
+      **A rig defect surfaced with them.** The pipeline test rig gave `verify.Driver` a fixed clock
+      and a no-op `Sleep`, so any `Pending` verdict polled forever — the `scale` case hung the whole
+      package for 120s rather than failing one subtest. The clock now advances by whatever the
+      driver sleeps, which is the honest fake of a clock/sleep pair and no slower.
+
+      **Two prose defects closed, both [[LSN-041]].** `classify.knownVerbs` claimed "the corpus lint
+      asserts the two agree" and no such lint existed; it is now
+      `TestClassifyKnownVerbsAgreeWithTheEnvelopeEnum`, a Go test in `package pipeline` — the lowest
+      package importing both `broker` and `classify` — rather than a Python lint parsing Go source.
+      The `cloud` divergence is declared in code as `classify.VerbsNotCarriedByAnEnvelopeOp` with a
+      written reason, and the condition making it safe is a property
+      (`TestNoCloudTargetReachesTheClassifier`) rather than a sentence.
+
+      **`verify.ErrTargetReplaced`.** A UID mismatch is evidence about a stranger for every row and
+      the answer for `absencePredicate` — the deleted object is gone and something else holds its
+      name. `probe.Source` now wraps a sentinel instead of prose, and the envtest that asserts the
+      refusal asserts the sentinel too; that assertion is the only place the two packages' halves of
+      the contract are compared.
+
+      **Sweep: 15/15 caught** (`verification/mutants/V-BRK-022.json`), baseline green, catchers
+      verified against the suite.
+
+      **One finding filed rather than fixed.** `agentv1alpha1.ChangeVerb`'s kubebuilder marker
+      (`+kubebuilder:validation:Enum=create;apply;patch;delete;scale;cloud`) is a **third** copy of
+      the verb set, and its doc comment claims it "mirrors the envelope's own" with nothing
+      comparing them — the same prose-as-control shape the join test just closed twice. Both
+      mismatch directions fail closed today (a `ChangePolicy` naming a verb the CRD rejects is
+      refused at admission; a verb the CRD admits that classify does not know matches no rule), so
+      it is a finding, not a live defect. Fixing it means joining the marker to `broker.ValidOps()`,
+      which is a generated-manifest lint rather than a Go test, and belongs with the other
+      corpus-lint work rather than folded in here.
 
 **Why T7c split into four.** T7c-1 was scoped as "assemble the pipeline and claim the two L1
 checks", and the assembly turned out to be the small part. Three things came out of doing it.
