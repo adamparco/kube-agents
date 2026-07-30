@@ -8,6 +8,14 @@ name: Review Gate
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    # THIS LIST IS A DEFINITION SITE, AND IT IS CHECKED. `dev/test_review_gate_paths.py`
+    # (V-MET-007) derives the repository's security surface — Go files carrying a
+    # `+kubebuilder:rbac`/`:webhook` marker or building a `tls.Config`/`TokenReview`/
+    # `SubjectAccessReview`, plus every manifest declaring an authority-granting kind — and fails
+    # if any derived file is not matched below. The check is one-directional: it can tell you a
+    # glob is MISSING, never that one is unnecessary, because over-triggering costs CI minutes and
+    # under-triggering costs a review. So when it goes red, add a glob; a glob it does not require
+    # is a judgement call, and the ones here that the derivation does not name are marked.
     paths:
       - "**/provisioning/**"
       - "**/agents/**"
@@ -18,6 +26,17 @@ on:
       - "security-review-waivers.yaml"
       - "scripts/review-gate/**"
       - ".github/workflows/review-gate.yml"
+      # The security surface stopped being manifests in Phase 9. Everything below was added
+      # because the derivation named a file under it and nothing above matched — see
+      # `verification/results.csv`, V-MET-007, 2026-07-27 (the finding) and 2026-07-30 (the fix).
+      - "k8s-operator/internal/**" # broker, webhook, controller, router, eventingress
+      - "k8s-operator/cmd/**" # the broker and operator entrypoints
+      - "k8s-operator/config/**" # RBAC, webhook, VAP, router manifests
+      - "k8s-operator/test/**" # the L2 suites that assert the negatives
+      - "examples/**" # NetworkPolicies and RBAC overlays people apply verbatim
+      # Not named by the derivation — judgement, in the over-trigger direction:
+      - "k8s-operator/api/**" # the CRD types every webhook validates against
+      - "deploy/**" # shipped defaults and the image build context
   schedule:
     - cron: "17 7 * * *" # daily heartbeat re-run (off the top-of-hour stampede)
   workflow_dispatch:

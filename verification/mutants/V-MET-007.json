@@ -1,0 +1,191 @@
+{
+  "check": "V-MET-007",
+  "why": "The review gate's trigger filter is the one piece of this repository's security machinery whose failure mode is silence: a filter that misses a path produces no red check, no annotation and no log line — just a PR page where the security gate is absent. Fifteen mutants, in three groups. Five break the filter itself (the regression, replayed). Six break the matcher or the workflow reader, because a coverage test built on a matcher that says yes to everything is a green light wired to nothing. Four break the derivation, since a surface that quietly stops finding files reports full coverage of an empty set.",
+  "suite": {
+    "kind": "unittest",
+    "dir": ".",
+    "packages": ["discover", "-p", "test_review_gate_paths.py", "dev"]
+  },
+  "mutants": [
+    {
+      "id": "M1-the-filter-reaches-only-the-broker-package",
+      "why": "The narrowest plausible version of the original defect: someone widens the filter for the package they are working on and leaves the webhook and controller out.",
+      "catcher": "test_every_derived_file_is_matched_by_the_filter",
+      "edits": [
+        {
+          "file": ".github/workflows/review-gate.yml",
+          "find": "\"k8s-operator/internal/**\" # broker, webhook, controller, router, eventingress",
+          "replace": "\"k8s-operator/internal/broker/**\" # broker only"
+        }
+      ]
+    },
+    {
+      "id": "M2-config-loses-a-star",
+      "why": "One `*` instead of two stops at the first directory boundary, so `config/rbac/role.yaml` falls out while the glob still looks right.",
+      "catcher": "test_the_broker_is_covered",
+      "edits": [
+        {
+          "file": ".github/workflows/review-gate.yml",
+          "find": "\"k8s-operator/config/**\" # RBAC, webhook, VAP, router manifests",
+          "replace": "\"k8s-operator/config/*\" # RBAC, webhook, VAP, router manifests"
+        }
+      ]
+    },
+    {
+      "id": "M3-the-shipped-examples-stop-being-reviewed",
+      "why": "`examples/` holds NetworkPolicies and RBAC overlays that people apply verbatim; it looks like documentation and is not.",
+      "catcher": "test_every_derived_file_is_matched_by_the_filter",
+      "edits": [
+        {
+          "file": ".github/workflows/review-gate.yml",
+          "find": "\"examples/**\" # NetworkPolicies and RBAC overlays people apply verbatim",
+          "replace": "\"examples/gitops-repo/**\" # the gitops example only"
+        }
+      ]
+    },
+    {
+      "id": "M4-the-entrypoints-fall-out",
+      "why": "`cmd/broker/main.go` is where the broker's TLS is configured; a filter that covers the package but not the entrypoint misses the wiring.",
+      "catcher": "test_every_derived_file_is_matched_by_the_filter",
+      "edits": [
+        {
+          "file": ".github/workflows/review-gate.yml",
+          "find": "      - \"k8s-operator/cmd/**\" # the broker and operator entrypoints\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M5-narrowing-the-filter-stops-being-reviewable",
+      "why": "If the workflow no longer triggers on itself, the one change that can disable the gate is the one change the gate never sees.",
+      "catcher": "test_the_workflow_reviews_its_own_filter",
+      "edits": [
+        {
+          "file": ".github/workflows/review-gate.yml",
+          "find": "      - \".github/workflows/review-gate.yml\"\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M6-leading-double-star-demands-a-directory",
+      "why": "Reading `**/agents/**` as requiring at least one leading directory is the plausible misreading, and it would silently exempt every path at the repository root.",
+      "catcher": "test_pr_79_did_trigger_the_gate_under_the_same_filter",
+      "edits": [
+        {
+          "file": "dev/test_review_gate_paths.py",
+          "find": "            out.append(\"(?:.*/)?\")",
+          "replace": "            out.append(\".*/\")"
+        }
+      ]
+    },
+    {
+      "id": "M7-a-single-star-crosses-directories",
+      "why": "Treating `*` as `.*` makes every narrow glob quietly broad, so a filter that does not cover the surface reports that it does.",
+      "catcher": "test_a_single_star_stops_at_a_directory_boundary",
+      "edits": [
+        {
+          "file": "dev/test_review_gate_paths.py",
+          "find": "            out.append(\"[^/]*\")",
+          "replace": "            out.append(\".*\")"
+        }
+      ]
+    },
+    {
+      "id": "M8-the-matcher-says-yes-to-everything",
+      "why": "The purest vacuous pass: coverage is total because nothing is ever unmatched.",
+      "catcher": "test_pr_33_did_not_trigger_the_gate_under_the_filter_of_the_day",
+      "edits": [
+        {
+          "file": "dev/test_review_gate_paths.py",
+          "find": "    return any(github_glob_to_regex(p).match(path) for p in patterns)",
+          "replace": "    return True if patterns else False"
+        }
+      ]
+    },
+    {
+      "id": "M9-the-matcher-says-no-to-everything",
+      "why": "The opposite failure, included because a matcher can also break in the direction that makes the check unfixably red and invites someone to delete it.",
+      "catcher": "test_every_derived_file_is_matched_by_the_filter",
+      "edits": [
+        {
+          "file": "dev/test_review_gate_paths.py",
+          "find": "    return any(github_glob_to_regex(p).match(path) for p in patterns)",
+          "replace": "    return False and bool(patterns and path)"
+        }
+      ]
+    },
+    {
+      "id": "M10-the-reader-stops-at-the-first-comment",
+      "why": "The added globs sit below a comment line. A reader that treats a comment as the end of the list sees only the nine original patterns and never says so.",
+      "catcher": "test_every_derived_file_is_matched_by_the_filter",
+      "edits": [
+        {
+          "file": "dev/test_review_gate_paths.py",
+          "find": "                continue  # interleaved comments are the norm in this block",
+          "replace": "                break  # interleaved comments are the norm in this block"
+        }
+      ]
+    },
+    {
+      "id": "M11-paths-becomes-paths-ignore",
+      "why": "One hyphen inverts the entire filter: the gate would run on everything EXCEPT the security surface. A reader that fetches a list by shape rather than by name would report the same nine globs and pass.",
+      "catcher": "test_the_filter_is_an_allow_list_not_an_ignore_list",
+      "edits": [
+        {
+          "file": ".github/workflows/review-gate.yml",
+          "find": "    paths:\n      - \"**/provisioning/**\"",
+          "replace": "    paths-ignore:\n      - \"**/provisioning/**\""
+        }
+      ]
+    },
+    {
+      "id": "M12-the-gate-judges-only-the-first-push",
+      "why": "Without `synchronize` the gate reviews the opening commit and nothing after it, so a PR can go green and then grow the change that needed reviewing.",
+      "catcher": "test_the_gate_reruns_on_every_push_to_the_pr",
+      "edits": [
+        {
+          "file": ".github/workflows/review-gate.yml",
+          "find": "    types: [opened, synchronize, reopened]",
+          "replace": "    types: [opened, reopened]"
+        }
+      ]
+    },
+    {
+      "id": "M13-the-authn-arm-of-the-derivation-dies",
+      "why": "Lose the TLS and token-review arm and the broker's authenticator stops being security surface — coverage then passes over a set that no longer contains the file the whole finding was about.",
+      "catcher": "test_the_authentication_source_finds_files",
+      "edits": [
+        {
+          "file": "dev/test_review_gate_paths.py",
+          "find": "GO_AUTHN = re.compile(r\"\\btls\\.Config\\b|\\bTokenReview\\b|\\bSubjectAccessReview\\b\")",
+          "replace": "GO_AUTHN = re.compile(r\"\\bztls\\.Config\\b|\\bzTokenReview\\b|\\bzSubjectAccessReview\\b\")"
+        }
+      ]
+    },
+    {
+      "id": "M14-the-manifest-arm-of-the-derivation-dies",
+      "why": "A typo in the kind regex empties the largest source silently; 41 of the 65 derived files vanish and the coverage assertion still reports zero uncovered.",
+      "catcher": "test_the_manifest_source_finds_files",
+      "edits": [
+        {
+          "file": "dev/test_review_gate_paths.py",
+          "find": "MANIFEST_AUTHORITY = re.compile(r\"^kind:\\s*(?:\" + \"|\".join(AUTHORITY_KINDS) + r\")\\s*$\", re.M)",
+          "replace": "MANIFEST_AUTHORITY = re.compile(r\"^knid:\\s*(?:\" + \"|\".join(AUTHORITY_KINDS) + r\")\\s*$\", re.M)"
+        }
+      ]
+    },
+    {
+      "id": "M15-the-file-list-comes-back-empty",
+      "why": "If the enumeration itself yields nothing, every derived set is empty and every assertion about them is trivially satisfied — the LSN-021 shape, a check running green over nothing at all. The neighbouring failure, a bare `git ls-files` that sees the index and not the working tree (LSN-050), is deliberately NOT a mutant here: it cannot be caught by this suite, because at the moment the suite runs in CI everything is committed. `invariants-gate.py` carries that one, and it caught this very file on its first run.",
+      "catcher": "test_git_lists_files",
+      "edits": [
+        {
+          "file": "dev/test_review_gate_paths.py",
+          "find": "    return repo_files(REPO)",
+          "replace": "    return [f for f in repo_files(REPO) if f.startswith(\"nothing/\")]"
+        }
+      ]
+    }
+  ]
+}
