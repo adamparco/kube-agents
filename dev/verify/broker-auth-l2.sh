@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 at L2 — what a DEPLOYED broker does
-# with the credentials it is handed (09 §6.2, 03 §4.1, 05 §7).
+# V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 · V-BRK-031 at L2 — what a DEPLOYED
+# broker does with the credentials it is handed (09 §6.2, 03 §4.1, 05 §7).
 #
 # All five rows are BLOCKING-ALWAYS, all five carry `¬`, and until this suite existed not one of
 # them had a single row in `verification/results.csv`. They are acceptance bullet (c)'s entire L2
@@ -20,6 +20,11 @@
 #         refused this" results prove nothing about a broker that refuses everything — including a
 #         broker whose pod is wedged, whose Service resolves nowhere, or that cannot reach the API
 #         server to answer a TokenReview. LSN-024 in one sentence, aimed at authentication.
+#         This arm also carries V-BRK-031, because passing through it is what produces the
+#         condition: the phase-9 actor holds the 06 §2.2.1 grant and no tenant authority, so its
+#         step-3 pre-state read of the envelope's target is denied by the real API server, and what
+#         the broker answers to that is the row. Injecting a Forbidden into a fake is L1's half; a
+#         genuine denial of a genuine actor by a genuine authorizer is only observable here.
 #   L2-1  V-BRK-009, the token layer: valid mTLS and no bearer token is 401 `token-required`; valid
 #         mTLS and a garbage bearer token is 401 `token-invalid`.
 #   L2-2  V-BRK-008 / V-BRK-017, the audience: the pod's own automounted
@@ -148,7 +153,7 @@ bad() {
 # 2 x P1 + broker Available + L2-0 nonce + L2-0 envelope + 8 credential arms + V-BRK-010b.
 EXPECTED_ASSERTIONS=14
 
-field() { # <scenario> <1=outcome 2=status 3=reason 4=detail>
+field() { # <scenario> <1=outcome 2=status 3=reason 4=detail 5=retryAfterSeconds>
   printf '%s\n' "$FLAT" | awk -F'\t' -v s="$1" -v i="$(($2 + 1))" '$1 == s { print $i; exit }'
 }
 seen() { printf '%s\n' "$FLAT" | awk -F'\t' -v s="$1" '$1 == s { found = 1 } END { exit !found }'; }
@@ -326,7 +331,105 @@ assert_security_event() {
   fi
 }
 
-# run_negative_control — the mandatory `¬` for V-BRK-007/008/009/010/017.
+# assert_envelope_baseline — L2-0's second half, and V-BRK-031's L2 row.
+#
+# A function rather than an inline block for one reason: `--negative-control` replays it against
+# transcripts of brokers that answered wrongly, which is the only way to show that its
+# discrimination IS one, rather than a shape that happens to be green against today's broker.
+assert_envelope_baseline() {
+  local envelope_status envelope_reason envelope_retry auth_layer_refusal
+  envelope_status="$(field envelope-accepted 2)"
+  envelope_reason="$(field envelope-accepted 3)"
+  envelope_retry="$(field envelope-accepted 5)"
+
+  # WHY THIS DISCRIMINATES ON THE REASON AND NOT ON THE STATUS.
+  #
+  # It used to read `401 | 403) bad "refused at the AUTH layer"`, which was true when the only 403
+  # the actions route could produce was `forbidden-caller`. V-BRK-031 added a second one, and the
+  # two are opposites: `forbidden-caller` is the AUTHENTICATOR saying this caller is not this
+  # broker's agent at all, and `target-forbidden` is the broker's own ACTOR identity hitting its
+  # authority ceiling while reading a target it was correctly permitted to ask about. Two 403s about
+  # two different subjects — there, the identity presenting the credential; here, the identity the
+  # broker acts as.
+  #
+  # In shadow mode the second is the EXPECTED answer for every envelope, because the phase-9 actor
+  # holds the 06 §2.2.1 broker-operations grant and no tenant authority whatsoever (see
+  # `agent-identity.yaml.template`: binding a tenant credential now would hand the actor months of
+  # authority ahead of the controls meant to bound it). So a status-only arm would have gone red on
+  # a broker doing exactly the right thing. The change is a NARROWING — every reason that was a
+  # failure before is still a failure, and one reason that could not previously occur is now named.
+  auth_layer_refusal=0
+  case "$envelope_reason" in
+    forbidden-caller | peer-identity-mismatch | scope-spoofed | token-*) auth_layer_refusal=1 ;;
+  esac
+
+  case "$(field envelope-accepted 1)" in
+    http)
+      case "$envelope_status" in
+        401 | 403)
+          if [ "$auth_layer_refusal" = 1 ]; then
+            bad "an envelope from the agent's own identity was refused at the AUTH layer (HTTP $envelope_status '$envelope_reason'). The nonce path and the actions path do not agree about who this caller is."
+          elif [ "$envelope_status" = "403" ] && [ "$envelope_reason" = "target-forbidden" ]; then
+            # V-BRK-031 at L2, and the only place in this suite it is observable: it takes a real
+            # cluster to produce a real RBAC denial of a real actor by a real authorizer. The L1
+            # table can inject an `apierrors.NewForbidden`; it cannot show that what the API server
+            # actually returns to the shipped actor is classified as one.
+            if [ "$envelope_retry" = "0" ]; then
+              pass "V-BRK-031: the actor's authority ceiling is answered as a typed refusal — HTTP 403 target-forbidden, no Retry-After, not 500 internal-error. $(field envelope-accepted 4)"
+            else
+              bad "V-BRK-031: HTTP 403 target-forbidden carries retryAfterSeconds=$envelope_retry. An RBAC denial does not clear on its own, and a fleet told to wait and try again spends the rest of the phase retrying a permission boundary."
+            fi
+          else
+            bad "the envelope was answered HTTP $envelope_status '$envelope_reason', which is neither an authentication refusal this suite recognises nor the actor's own ceiling: $(field envelope-accepted 4). A 4xx nobody has classified is a hole in this arm, not a pass."
+          fi
+          ;;
+        400)
+          # A 400 is not an auth answer, so it does not contradict any of the five rows — which is
+          # precisely why it must be loud rather than tolerated. It means the envelope never reached
+          # the pipeline, so "the door is open" was demonstrated for GET /nonce and assumed for
+          # POST /actions.
+          bad "the envelope was rejected as malformed (HTTP 400 '$envelope_reason'): $(field envelope-accepted 4). The probe's envelope does not match 06 §4.1's closed schema — fix the fixture, not the broker."
+          ;;
+        503)
+          # `Authenticate` answers 503 — not 401 — when the TokenReview itself could not be
+          # completed (auth.go's "a control plane outage should not become a debugging session about
+          # credentials"). So a 503 there means authentication was never actually DECIDED on this
+          # path, and the door was not shown to be open: the documented P9-T7d-4 egress hole, which
+          # invalidates the baseline rather than merely annotating it.
+          #
+          # V-BRK-031 gave step 3 a 503 of its own — `snapshot-failed`, a live read that failed
+          # transiently. That one is past authentication, so it does not invalidate the rows below;
+          # it is still a real fault and still reported, one arm down.
+          if [ "$envelope_reason" = "snapshot-failed" ]; then
+            bad "the envelope reached step 3 and its live reads failed transiently (HTTP 503 snapshot-failed, retryAfterSeconds=$envelope_retry): $(field envelope-accepted 4). Authentication was decided, so the rows below stand — but the API server was not answering the actor, and this run's baseline is a broker talking to a sick cluster."
+          else
+            bad "the envelope POST was answered HTTP 503 '$envelope_reason': $(field envelope-accepted 4). The broker could not complete a TokenReview, so authentication on POST /actions was never decided — the negatives below would be measuring an unreachable API server, not a policy."
+          fi
+          ;;
+        5??)
+          # An unclassified error from INSIDE the actions handler: server.go's `refuse` falls back to
+          # 500 `internal-error` for any error that is not a typed *Refusal.
+          #
+          # THIS USED TO PASS WITH A NOTE, and that was right at the time — every step-3 live read
+          # returned a bare `fmt.Errorf`, so in shadow mode the arm fired on every run, and the
+          # defect was known, filed, and owned by the unit that has now closed it. What reaches here
+          # after V-BRK-031 is an error nobody has classified, in a handler where every known
+          # outcome is typed. Tolerating it a second time would mean this arm can no longer tell
+          # "the defect we are tracking" from "a new one".
+          bad "the envelope POST died inside the actions handler: HTTP $envelope_status '$envelope_reason' $(field envelope-accepted 4). Every outcome of this route is supposed to be a typed *broker.Refusal — an untyped error is answered 500 internal-error AND journaled nowhere, so the envelope's disposition is recorded in no place at all."
+          if [ -n "${broker_pod:-}" ]; then
+            echo "  Broker log tail follows."
+            $K -n "$NS" logs "pod/$broker_pod" --tail=40 2>/dev/null | sed 's/^/  broker| /'
+          fi
+          ;;
+        *) pass "a shipped-builder envelope reaches the pipeline — HTTP $envelope_status $envelope_reason $(field envelope-accepted 4)" ;;
+      esac
+      ;;
+    *) bad "the envelope POST did not complete: $(field envelope-accepted 4)" ;;
+  esac
+}
+
+# run_negative_control — the mandatory `¬` for V-BRK-007/008/009/010/017/031.
 #
 # WHY IT LOOKS LIKE THIS. The usual `¬` shape is "inject the defect, watch the check catch it".
 # Here the defect is *a broker that accepts a credential it must refuse*, and there is no way to
@@ -353,8 +456,8 @@ run_negative_control() {
   local nc_fail=0 name transcript out n_pass n_fail
 
   echo "===================================================================="
-  echo " NEGATIVE CONTROL (¬) for V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017"
-  echo " No cluster is addressed. Every arm must go RED on all three transcripts."
+  echo " NEGATIVE CONTROL (¬) for V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 · V-BRK-031"
+  echo " No cluster is addressed. Every credential arm must go RED on all three transcripts."
   echo "===================================================================="
 
   for name in admitted wrong-reason truncated; do
@@ -398,6 +501,30 @@ run_negative_control() {
       printf '%s\n' "$out" | sed 's/^/    /'
     fi
   done
+
+  # V-BRK-031's own vacuity modes, replayed through assert_envelope_baseline. Four transcripts,
+  # each a broker that answered the actor's authority ceiling wrongly in a different way, plus the
+  # correct answer so the arm is not merely always-red. The four are exactly the failure modes the
+  # 09 §6 row names, and the fourth is the one this arm was rewritten for: a 403 that IS an
+  # authentication refusal must still be a failure, or the narrowing would have swallowed the case
+  # the arm originally existed to catch.
+  local ev_name ev_line ev_want
+  while IFS='|' read -r ev_name ev_want ev_line; do
+    [ -n "$ev_name" ] || continue
+    out="$(FLAT="$(printf 'envelope-accepted\t%s' "$ev_line")" assert_envelope_baseline 2>&1)"
+    if printf '%s\n' "$out" | grep -q "^$ev_want:"; then
+      echo "PASS: ¬ V-BRK-031 — '$ev_name' is reported as a $ev_want"
+    else
+      nc_fail=1
+      echo "FAIL: ¬ V-BRK-031 — '$ev_name' should have been a $ev_want. Got: $out"
+    fi
+  done <<'EV'
+the ceiling answered as an unclassified 500|FAIL|http	500	internal-error	step 3: capturing pre-state for 1 targets	0
+the ceiling answered as a retryable 503|FAIL|http	503	snapshot-failed	forbidden	30
+a target-forbidden that tells the fleet to retry|FAIL|http	403	target-forbidden	the actor may not read this	60
+a genuine auth refusal, still a failure|FAIL|http	403	forbidden-caller	not this broker's agent	0
+the ceiling answered correctly|PASS|http	403	target-forbidden	configmaps "app-config" is forbidden	0
+EV
 
   # V-BRK-010's second clause has its own vacuity mode: a log with no refusal line in it.
   out="$(assert_security_event "some unrelated broker chatter
@@ -647,6 +774,7 @@ for line in sys.stdin:
         "" if status is None else str(status),
         r.get("reason") or "",
         (r.get("detail") or "").replace("\t", " ")[:1000],
+        str(r.get("retryAfterSeconds") or 0),
     ]))
 ')"
 
@@ -675,50 +803,7 @@ else
   exit 1
 fi
 
-envelope_status="$(field envelope-accepted 2)"
-case "$(field envelope-accepted 1)" in
-  http)
-    case "$envelope_status" in
-      401 | 403)
-        bad "an envelope from the agent's own identity was refused at the AUTH layer (HTTP $envelope_status '$(field envelope-accepted 3)'). The nonce path and the actions path do not agree about who this caller is."
-        ;;
-      400)
-        # A 400 is not an auth answer, so it does not contradict any of the five rows — which is
-        # precisely why it must be loud rather than tolerated. It means the envelope never reached
-        # the pipeline, so "the door is open" was demonstrated for GET /nonce and assumed for
-        # POST /actions, and P9-T8b-4b-ii's soak would be built on the assumption.
-        bad "the envelope was rejected as malformed (HTTP 400 '$(field envelope-accepted 3)'): $(field envelope-accepted 4). The probe's envelope does not match 06 §4.1's closed schema — fix the fixture, not the broker."
-        ;;
-      503)
-        # `Authenticate` answers 503 — not 401 — when the TokenReview itself could not be completed
-        # (auth.go's "a control plane outage should not become a debugging session about
-        # credentials"). So a 503 here means authentication was never actually DECIDED on this path,
-        # and the door was not shown to be open. That is the documented P9-T7d-4 egress hole, and it
-        # invalidates the baseline rather than merely annotating it.
-        bad "the envelope POST was answered HTTP 503 '$(field envelope-accepted 3)': $(field envelope-accepted 4). The broker could not complete a TokenReview, so authentication on POST /actions was never decided — the negatives below would be measuring an unreachable API server, not a policy."
-        ;;
-      5??)
-        # A 5xx that is NOT a 503 is an unclassified error from INSIDE the actions handler
-        # (server.go's `refuse`/`write` fall back to 500 `internal-error` for any error that is not
-        # a typed *Refusal). Every authentication outcome in auth.go is typed, and the one
-        # environmental failure among them is the 503 above — so reaching this arm means the request
-        # got PAST authentication and PAST the closed-schema decode, and died in the pipeline. The
-        # auth claim these five rows need is therefore satisfied, and passing it is honest.
-        #
-        # It is still a real defect, and it is not this unit's: P9-T8b-4b-ii's soak runs over this
-        # exact path and cannot be built on a 500. The broker log tail is dumped so the run artifact
-        # carries the cause rather than requiring the pod to still exist afterwards.
-        pass "a shipped-builder envelope is authenticated and accepted as well-formed, and reaches the pipeline — HTTP $envelope_status $(field envelope-accepted 3) $(field envelope-accepted 4)"
-        echo "  NOTE: the pipeline then answered $envelope_status. That is past both auth layers and past the"
-        echo "  closed-schema decode, so it does not weaken any row below — but it is an open defect that"
-        echo "  P9-T8b-4b-ii's soak depends on. Broker log tail follows."
-        $K -n "$NS" logs "pod/$broker_pod" --tail=40 2>/dev/null | sed 's/^/  broker| /'
-        ;;
-      *) pass "a shipped-builder envelope reaches the pipeline — HTTP $envelope_status $(field envelope-accepted 3) $(field envelope-accepted 4)" ;;
-    esac
-    ;;
-  *) bad "the envelope POST did not complete: $(field envelope-accepted 4)" ;;
-esac
+assert_envelope_baseline
 
 # L2-1 through L2-5a: the eight negatives, over the transcript the driver just produced. Defined
 # as a function so `--negative-control` can replay the identical arms against a broker that

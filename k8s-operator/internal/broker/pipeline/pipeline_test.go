@@ -195,6 +195,9 @@ type fakeProber struct {
 	// unset one: a Deployment whose pods have never restarted reports 0, and the predicate compares
 	// it against a baseline rather than against zero.
 	restarts int64
+
+	// restartErr fails the baseline read itself, as distinct from `absent`.
+	restartErr error
 }
 
 func (f *fakeProber) Get(_ context.Context, ref agentv1alpha1.TargetRef) (*unstructured.Unstructured, error) {
@@ -205,6 +208,11 @@ func (f *fakeProber) Get(_ context.Context, ref agentv1alpha1.TargetRef) (*unstr
 }
 
 func (f *fakeProber) RestartCount(_ context.Context, ref agentv1alpha1.TargetRef) (int64, error) {
+	// Injected before the absent check so a test can ask what a FAILED baseline read does, which is
+	// a different question from what an absent workload does. V-BRK-031 needs both.
+	if f.restartErr != nil {
+		return 0, f.restartErr
+	}
 	// NotFound for an absent object, like probe.Source, which reads the workload to find its pod
 	// selector before it can count anything. verify.CaptureRestartBaselines depends on the
 	// difference: NotFound is "nothing was running, baseline zero", any other error is a refusal.
@@ -487,6 +495,25 @@ func createEnvelope() *broker.Envelope {
 		Nonce:          "0123456789abcdef0123456789abcdef",
 		IdempotencyKey: "sha256:" + strings.Repeat("a", 64),
 	}
+}
+
+// deploymentEnvelope is createEnvelope over an apps/v1 Deployment, for the one property that a
+// ConfigMap cannot exercise: verify.NeedsRestartBaseline is keyed by kind, and only the workload
+// kinds get a pre-action restart read at step 3. A test that wants to fault that read has to submit
+// a target whose row actually needs it, or the prober is never called at all.
+func deploymentEnvelope() *broker.Envelope {
+	env := createEnvelope()
+	env.Intent = "create the application deployment"
+	env.Operations[0].Target = &broker.Target{
+		Group: "apps", Version: "v1", Kind: "Deployment", Namespace: testTenantNS, Name: "app",
+	}
+	env.Operations[0].DesiredState = map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata":   map[string]any{"name": "app", "namespace": testTenantNS},
+		"spec":       map[string]any{"replicas": int64(1)},
+	}
+	return env
 }
 
 // newRig assembles a pipeline whose every dependency permits, then applies the tweaks. A test
@@ -1294,4 +1321,133 @@ func TestTheseAssertionsCanFail(t *testing.T) {
 		t.Error("a healthy ClassifierSource produced a policy-unavailable refusal; the fail-closed " +
 			"assertion would pass on a broker that never classifies anything")
 	}
+}
+
+// --- V-BRK-031: a permission boundary is an answer, not a crash ---------------------------------
+
+// TestALiveReadFailureIsTypedByWhetherItCanEverSucceed is V-BRK-031's positive half.
+//
+// Step 3 makes three live reads with the ACTOR identity, and before this check none of their
+// failures was a typed *Refusal. `server.go`'s `refuse` type-asserts for one, did not find one, and
+// answered 500 `internal-error` -- so a caller could not tell its own authority ceiling from a
+// broken broker, and, because `Journal` and `SecurityEvent` ride ON the Refusal, the envelope's
+// disposition was recorded nowhere at all.
+//
+// The property is not "these failures are typed". It is that they are typed by WHETHER RETRYING
+// COULD EVER HELP: an RBAC denial is permanent and carries no Retry-After, an API-server fault is
+// transient and does. Both halves are asserted for every one of the three reads, because a fix
+// applied to the snapshot alone would leave two sites answering 500 and would look identical from
+// the arm that motivated it.
+func TestALiveReadFailureIsTypedByWhetherItCanEverSucceed(t *testing.T) {
+	forbidden := apierrors.NewForbidden(
+		schema.GroupResource{Resource: "configmaps"}, "app-config",
+		errors.New(`User "system:serviceaccount:kubeagents-system:platform-dev-actor" cannot get resource "configmaps"`))
+	unauthorized := apierrors.NewUnauthorized("the actor's token was rejected")
+
+	sites := []struct {
+		read   string
+		env    *broker.Envelope
+		break_ func(*rig, error)
+	}{
+		{"the pre-state snapshot", createEnvelope(), func(r *rig, e error) { r.reader.err = e }},
+		// A Deployment, not the ConfigMap the other two rows use: verify.NeedsRestartBaseline is
+		// keyed by kind, and a ConfigMap's row does not compare restart counts across the action, so
+		// the prober is never called and this row would pass green having exercised nothing.
+		{"the restart baseline", deploymentEnvelope(), func(r *rig, e error) { r.prober.restartErr = e }},
+		{"the live-state resolve", createEnvelope(), func(r *rig, e error) { r.live.getErr = e }},
+	}
+	classes := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantReason string
+		wantRetry  bool
+	}{
+		{"an RBAC denial", forbidden, http.StatusForbidden, broker.ReasonTargetForbidden, false},
+		{"a rejected credential", unauthorized, http.StatusForbidden, broker.ReasonTargetForbidden, false},
+		{"an API-server fault", errInjected, http.StatusServiceUnavailable, broker.ReasonSnapshotFailed, true},
+	}
+
+	for _, site := range sites {
+		for _, class := range classes {
+			t.Run(site.read+"/"+class.name, func(t *testing.T) {
+				r := newRig(t, func(r *rig) { site.break_(r, class.err) })
+				_, _, err := r.submit(site.env)
+
+				ref, ok := err.(*broker.Refusal)
+				if !ok {
+					t.Fatalf("%s failed with %v (%T), which is not a *broker.Refusal -- server.go "+
+						"type-asserts for one and answers 500 internal-error without it", site.read, err, err)
+				}
+				if ref.Status != class.wantStatus || ref.Reason != class.wantReason {
+					t.Errorf("%s / %s: HTTP %d %q, want %d %q",
+						site.read, class.name, ref.Status, ref.Reason, class.wantStatus, class.wantReason)
+				}
+				if gotRetry := ref.RetryAfterSeconds > 0; gotRetry != class.wantRetry {
+					t.Errorf("%s / %s: retryAfterSeconds=%d, want retryable=%v. Telling a fleet to "+
+						"wait and retry a permission boundary is a loop that never terminates",
+						site.read, class.name, ref.RetryAfterSeconds, class.wantRetry)
+				}
+				if !ref.Journal {
+					t.Errorf("%s / %s: Journal=false. The journal is the complete record of every "+
+						"envelope's disposition; an agent enumerating what it may touch must leave a trace",
+						site.read, class.name)
+				}
+				if ref.SecurityEvent {
+					t.Errorf("%s / %s: SecurityEvent=true. In shadow mode the actor holds no tenant "+
+						"authority at all, so this fires on every action -- an alarm that gets muted. "+
+						"03 §6's events are for identity violations; forbidden-caller is that case",
+						site.read, class.name)
+				}
+				if !strings.Contains(ref.Detail, "step 3") {
+					t.Errorf("%s / %s: detail %q does not name the step; a refusal that says only "+
+						"'the read failed' sends a human to the wrong object", site.read, class.name, ref.Detail)
+				}
+			})
+		}
+	}
+}
+
+// TestLiveReadRefusalDiscriminatesRatherThanDefaulting is V-BRK-031's mandatory negative control.
+//
+// The test above passes on an implementation that answers 403 `target-forbidden` for every error it
+// ever sees -- two thirds of its rows would fail, but a reader skimming a green run would not know
+// that, and the shape of "type everything as the case that motivated the fix" is exactly how this
+// gets written. So the discrimination itself is asserted directly, on the one function that makes
+// it: the two classes must differ in reason, in status, and in retryability, and a nil error must
+// stay nil rather than becoming a refusal of the pipeline's own healthy reads.
+func TestLiveReadRefusalDiscriminatesRatherThanDefaulting(t *testing.T) {
+	if got := liveReadRefusal(nil, "step 3: a read that worked"); got != nil {
+		t.Fatalf("a nil error produced %v; every successful read in step 3 would refuse", got)
+	}
+
+	perm, ok := liveReadRefusal(
+		apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, "c", errors.New("denied")),
+		"step 3: x").(*broker.Refusal)
+	if !ok {
+		t.Fatal("a Forbidden did not produce a *broker.Refusal")
+	}
+	trans, ok := liveReadRefusal(errInjected, "step 3: x").(*broker.Refusal)
+	if !ok {
+		t.Fatal("an API-server fault did not produce a *broker.Refusal")
+	}
+
+	if perm.Reason == trans.Reason {
+		t.Errorf("both classes answer %q; the helper is defaulting, not discriminating", perm.Reason)
+	}
+	if perm.Status == trans.Status {
+		t.Errorf("both classes answer HTTP %d; a caller cannot branch on the status alone", perm.Status)
+	}
+	if perm.RetryAfterSeconds != 0 {
+		t.Errorf("the permanent class carries retryAfterSeconds=%d; Refusal's own rule is that an "+
+			"authorization refusal is never retryable", perm.RetryAfterSeconds)
+	}
+	if trans.RetryAfterSeconds <= 0 {
+		t.Error("the transient class carries no retryAfterSeconds, so a recoverable outage reads as final")
+	}
+
+	// A NotFound never reaches here -- CaptureAll turns it into an empty pre-state, which is the
+	// correct reading for a `create` whose target does not exist yet, and every other test in this
+	// file runs on exactly that path (newRig's reader is `absent: true`). Asserted there, by
+	// construction, rather than restated here as a case this helper is not the owner of.
 }

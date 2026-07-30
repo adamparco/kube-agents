@@ -67,8 +67,35 @@ ENV_DEFAULT_AUDIENCE_TOKEN_FILE = "PROBE_DEFAULT_AUDIENCE_TOKEN_FILE"
 TIMEOUT = 30
 
 
-def emit(scenario: str, *, outcome: str, status: int | None = None, reason: str = "", detail: str = "") -> None:
-    print(json.dumps({"scenario": scenario, "outcome": outcome, "status": status, "reason": reason, "detail": detail}), flush=True)
+def emit(
+    scenario: str,
+    *,
+    outcome: str,
+    status: int | None = None,
+    reason: str = "",
+    detail: str = "",
+    retry: int = 0,
+) -> None:
+    """One transcript line. `retry` is the broker's `retryAfterSeconds`, and zero is a real answer.
+
+    It is carried because V-BRK-031's whole property is the SPLIT between a refusal that could
+    succeed on a retry and one that never will, and the status alone does not express it: 403
+    `target-forbidden` and 503 `snapshot-failed` are both refusals of the same read, and the only
+    machine-readable difference an agent runtime can act on is whether it was given a wait.
+    """
+    print(
+        json.dumps(
+            {
+                "scenario": scenario,
+                "outcome": outcome,
+                "status": status,
+                "reason": reason,
+                "detail": detail,
+                "retryAfterSeconds": retry,
+            }
+        ),
+        flush=True,
+    )
 
 
 def context_for(tls_dir: str | None, *, ca_dir: str) -> ssl.SSLContext:
@@ -228,6 +255,7 @@ def main() -> int:
             status=reply.get("_status"),
             reason=reply.get("reason", ""),
             detail=(reply.get("message") or reply.get("decision") or "")[:400],
+            retry=int(reply.get("retryAfterSeconds") or 0),
         )
     except Exception as exc:  # noqa: BLE001
         emit("envelope-accepted", outcome="probe-error", detail=f"{type(exc).__name__}: {exc}"[:400])

@@ -40,6 +40,7 @@ import (
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
@@ -451,7 +452,8 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 			// V-BRK-018: all snapshots or none. CaptureAll already refuses to return a partial set;
 			// what this branch adds is that a failure here stops the pipeline at step 3, so no
 			// classification, no plan and no execution ever sees a half-read cluster.
-			return "", fmt.Errorf("step 3: capturing pre-state for %d targets: %w", len(targets), err)
+			return "", liveReadRefusal(err,
+				fmt.Sprintf("step 3: capturing pre-state for %d targets", len(targets)))
 		}
 		s.snaps = snaps
 
@@ -461,8 +463,8 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 		// it is captured here, next to the snapshots, and refuses on the same all-or-nothing terms.
 		baselines, err := verify.CaptureRestartBaselines(ctx, p.cfg.Verifier.Prober, targets)
 		if err != nil {
-			return "", fmt.Errorf("step 3: capturing pre-action restart baselines for %d targets: %w",
-				len(targets), err)
+			return "", liveReadRefusal(err,
+				fmt.Sprintf("step 3: capturing pre-action restart baselines for %d targets", len(targets)))
 		}
 		s.baselines = baselines
 
@@ -474,12 +476,73 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 
 		resolved, err := classify.Resolve(ctx, p.cfg.Live, s.caller, raws)
 		if err != nil {
-			return "", fmt.Errorf("step 3: resolving %d operations against live state: %w", len(raws), err)
+			return "", liveReadRefusal(err,
+				fmt.Sprintf("step 3: resolving %d operations against live state", len(raws)))
 		}
 		s.resolved = resolved
 
 		return fmt.Sprintf("%d operations, %d pre-states", len(resolved), len(snaps)), nil
 	})
+}
+
+// liveReadRefusal types a failure of one of step 3's live reads. V-BRK-031.
+//
+// All three reads above are made with the ACTOR identity, so "the read failed" has two entirely
+// different meanings and only one of them is transient. An API-server timeout or a 500 may well
+// succeed a minute later, which is what `snapshot-failed` and its Retry-After are for. An RBAC
+// denial will not: the actor's tier template does not reach this object and will not reach it in a
+// minute, so telling the caller to wait and retry is telling a loop to run forever against a
+// permission boundary. `Refusal.RetryAfterSeconds` documents that split as a rule of the type --
+// "zero means do not retry, which is the right answer for every schema and authorization refusal"
+// -- and this is the site that was not honouring it.
+//
+// BEFORE THIS EXISTED, NEITHER ANSWER WAS GIVEN. The error went back as a bare `fmt.Errorf`,
+// `server.go`'s `refuse` looked for a `*Refusal`, did not find one, and answered 500
+// `internal-error` with a stack trace in the broker log. Two consequences, and the second is the
+// one that matters:
+//
+//   - A caller could not tell its own authority ceiling from a broken broker. In shadow mode that
+//     is EVERY action, because the phase-9 actor holds the 06 §2.2.1 grant and no tenant authority
+//     at all -- so the entire pipeline reported itself as crashing while behaving exactly as
+//     designed.
+//   - `Journal` and `SecurityEvent` are carried ON the Refusal, so with no Refusal there is no
+//     journal entry and no event. The envelope's disposition was recorded NOWHERE. An agent
+//     enumerating what it may touch left no trace at all -- which is the opposite of what 06 §4.1's
+//     per-reason table exists to guarantee.
+//
+// The forbidden arm journals and does NOT raise a security event, deliberately. The journal is the
+// complete record of every envelope's disposition, and that is what makes a probing pattern findable
+// by analysis. A security event is an alarm, and in shadow mode an alarm on every single action is
+// an alarm that gets muted -- which would cost more than it buys, including for the events that do
+// matter. 03 §6's security events are for identity violations: a caller that is not who it says it
+// is. This is an authorization outcome for a correctly authenticated caller, and
+// `forbidden-caller` (V-BRK-010) remains the identity case that alarms.
+//
+// `what` names WHICH of the three reads failed. A refusal that says only "the pre-action read
+// failed" sends a human to the wrong object, which is the same argument `CaptureAll` makes about
+// naming the target index.
+func liveReadRefusal(err error, what string) error {
+	if err == nil {
+		return nil
+	}
+	// IsUnauthorized alongside IsForbidden because an expired or rejected credential is equally
+	// permanent from the caller's side and equally not a broker fault; both are answers about
+	// authority, and neither becomes true by waiting.
+	if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+		return &broker.Refusal{
+			Status:  http.StatusForbidden,
+			Reason:  broker.ReasonTargetForbidden,
+			Detail:  what + ": " + err.Error(),
+			Journal: true,
+		}
+	}
+	return &broker.Refusal{
+		Status:            http.StatusServiceUnavailable,
+		Reason:            broker.ReasonSnapshotFailed,
+		Detail:            what + ": " + err.Error(),
+		Journal:           true,
+		RetryAfterSeconds: broker.PausedRetryAfterSeconds,
+	}
 }
 
 // callerScope derives the caller's authority ceiling from the Agent CR this broker serves.

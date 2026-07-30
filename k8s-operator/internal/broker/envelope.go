@@ -316,6 +316,17 @@ const (
 	ReasonScopeSpoof             = "scope-spoofed"
 	ReasonForbiddenCaller        = "forbidden-caller"
 
+	// ReasonTargetForbidden is the actor's OWN authority ceiling, met while reading a target -- as
+	// distinct from ReasonForbiddenCaller, which is the authenticator saying the caller is not this
+	// broker's agent at all. Two 403s about two different subjects: there, the identity presenting
+	// the credential; here, the identity the broker acts as.
+	//
+	// It carries no RetryAfterSeconds, per this type's own rule that an authorization refusal is
+	// never retryable. That is the whole reason it is not folded into ReasonSnapshotFailed: an RBAC
+	// denial does not clear on its own, and a fleet told to wait sixty seconds and try again would
+	// spend the rest of the phase retrying a permission boundary.
+	ReasonTargetForbidden = "target-forbidden"
+
 	// The brake (06 §4.4). Same list, deliberately, rather than a second const block in brake.go:
 	// these strings are a single namespace as far as a caller matching on `reason` is concerned,
 	// and two definition sites is how the same string ends up meaning two things.
