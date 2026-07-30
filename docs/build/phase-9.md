@@ -22,6 +22,33 @@ found in this pass are ordering or scoping problems that would otherwise have su
 
 ---
 
+## ⛔ STOPPED OPEN — read this before resuming
+
+**Phase 9 is OPEN.** The harness was stopped here on 2026-07-30 by an explicit human instruction,
+after the unit `P9-T9b-5b-0-ii-a`, and **not** because the phase closed. Nothing halted, nothing is
+red, no check is deferred.
+
+The `phase-9-a-real-caller-at-the-door` branch was pushed and merged so that a large body of
+verified work would not sit stranded on a branch. **A merged phase branch is the normal signal that
+a phase closed, and here it means nothing of the kind.** `harness-milestone` was deliberately not
+invoked, so the 09 §10 phase ratchet and the `L2_CHAIN_FLOOR` lowering are both unmoved and both
+unearned. Do not back-fill them.
+
+**Resume at `P9-T9b-5b-0-ii-b`** — its section below states what it owes. In one sentence: three
+read-only per-tier actor templates carrying the READ half of 06 §2.2 ∪ §2.2.1 (profiles of 83 / 89 /
+68 triples against ceilings of 171 / 172 / 136), their bindings, and the
+`v in ['get', 'list', 'watch'] ||` disjunct in all three copies of `vap-agent-readonly` — as **one**
+unit, because 5b-0-i established that the render and the admission bound cannot be separated.
+Render **developer-team as a `Role`, never a `ClusterRole`**.
+
+V-BRK-013 is already green on both today's tree and the tree that unit will build, so its first run
+there is a real signal: if it goes red, the implementation is wrong, not the check ([[LSN-053]]).
+
+The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
+[`LEDGER.md`](LEDGER.md).
+
+---
+
 ## Survey of the current state — Phase 9 is greenfield
 
 Unlike Phase 8, which repaired things that existed and were wrong, Phase 9 builds things that do not
