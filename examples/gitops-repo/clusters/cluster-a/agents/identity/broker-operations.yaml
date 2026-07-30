@@ -42,6 +42,26 @@ rules:
   - apiGroups: ["kubeagents.x-k8s.io"]
     resources: ["changepolicies"]
     verbs: ["get", "list", "watch"]
+  # steps 3 and 5: the Agent set. Read-only, and CLUSTER-SCOPED deliberately.
+  #
+  # 06 §2.2 appends this grant "verbatim to every actor Role/ClusterRole", and for the platform
+  # and cluster-admin tiers that object is a ClusterRole -- so the spec grants this read at
+  # cluster scope. It used to sit in the namespaced half below, on the reading that agents is a
+  # namespaced kind. That is true of the kind and false of the requirement: `LowerTierOwner`
+  # answers "which Agent's SCOPE covers namespace X", which cannot be found by listing in X,
+  # so it lists cluster-wide on every namespaced operation and `resolveOwner` guards it with
+  # nothing but `live != nil`. Granted namespaced, the ownership gate failed closed for every
+  # envelope on every cluster, and nothing below L2 could see it -- `broker-execute-l2.sh` was
+  # the first thing to submit a real envelope at a deployed broker and it stopped here.
+  #
+  # Moving it does not widen the grant: the (apiGroup, resource, verb) set is unchanged, which
+  # is why V-BRK-013 stays green across this edit. Nor does it touch the split's actual rule --
+  # "every verb that changes PERSISTED state lands in the namespaced half" -- because get, list
+  # and watch change nothing. The two verbs that do write, `create actionrecords` and the status
+  # update, stay below, bound by a RoleBinding, for the reason stated there.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["agents"]
+    verbs: ["get", "list", "watch"]
 ---
 # The namespaced half. One instance per namespace that hosts an agent — this one is the
 # `kubeagents-system` instance, which serves the platform and cluster-admin tiers; the team-x
@@ -67,10 +87,6 @@ rules:
   - apiGroups: ["kubeagents.x-k8s.io"]
     resources: ["actionrecords/status"]
     verbs: ["get", "update", "patch"]
-  # step 5: its own pause state.
-  - apiGroups: ["kubeagents.x-k8s.io"]
-    resources: ["agents"]
-    verbs: ["get", "list", "watch"]
   # step 7: approval input.
   - apiGroups: ["kubeagents.x-k8s.io"]
     resources: ["approvalrosters"]
