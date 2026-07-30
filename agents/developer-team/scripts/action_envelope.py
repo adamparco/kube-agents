@@ -16,7 +16,7 @@ therefore *joined* rather than merely duplicated:
   * So a divergence of one byte between this file and the Go does not degrade gracefully. It makes
     every write from every agent in the fleet refused, reported as a key mismatch rather than as
     the drift it is.
-  * The join is **V-BRK-023**: `dev/test_action_envelope.py` runs this module over
+  * The join is **V-BRK-028**: `dev/test_action_envelope.py` runs this module over
     `verification/fixtures/envelopes/valid/`, the same six envelopes `TestValidFixtureIdempotencyKeys`
     pins the Go side against, and asserts the same six keys. Each fixture carries the key its own
     operations hash to, so there is no golden file on either side and nothing to drift independently.
