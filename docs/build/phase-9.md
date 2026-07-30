@@ -4049,3 +4049,114 @@ V-BRK id is **V-BRK-033** if 5b-0-ii's L2 arm turns out to need one of its own.
 
 **Not in this unit family.** `vap-agent-scope` (P10-T1) is §2.2's validator and may lag the grant —
 precisely the state §2.2.1 has shipped in since P9-T7d-5.
+
+### P9-T9b-5b-0 — outcome so far: two product defects fixed, and 5b-0-ii confirmed as the blocker
+
+The plan above was written before any of it had been executed against a live broker. Three
+`broker-execute-l2.sh` runs later it is neither superseded nor wrong — it is **vindicated and was
+attempted too narrowly**. This section records what actually landed, the two product defects the
+runs found, and why V-BRK-006 (L2) and V-REV-001 are still `deferred`.
+
+#### What was tried instead of 5b-0-i/ii, and why it was not enough
+
+`8182078` took the small road: it moved `agents [get,list,watch]` from the namespaced half of
+`broker-operations-grant.yaml.template` to the tier-neutral `ClusterRole`, which is the single rule
+the step-3 diagnosis above named. That is a real fix and it holds — `LowerTierOwner` now gets its
+cluster-scoped `list agents` — but it treated a **class** of demotion as one instance of it. The
+plan's own sentence "the same demotion applies to `actionrecords` and `approvalrosters`, which is
+worth checking in the same unit rather than discovering one at a time" was the warning, and the
+thing discovered one at a time turned out not to be in §2.2.1 at all.
+
+#### Defect 4 — `ScopeOfTarget` built a malformed target scope for the platform tier
+
+Fixed at `0e0ebf0`. Found by the second run, which got past the `agents` list and died one line
+later with `503 snapshot-failed … target scope {ProjectID:your-gcp-project-id ClusterName:
+Namespace:kubeagents-execute-tenant} is malformed`.
+
+`ScopeOfTarget` built the target's scope by stamping the target's namespace onto the caller's
+**authority** scope. 06 §1.2 gives the platform tier `projectId` and nothing else, so for a platform
+caller that produced `{p, "", ns}` — an empty level above a non-empty one, which is precisely the
+hole `scope.IsWellFormed` exists to reject and `scope.Contains` would read as a wildcard.
+`resolveOwner` guards the live lookup with nothing but `live != nil`, so **the broker answered 503 at
+step 3 for every namespaced operation a platform agent had ever submitted, on every cluster, since
+the ownership lookup started reading live state.**
+
+The missing datum is not authority — it is which cluster the target sits in, and a broker serves
+exactly one. `Caller` gains `ServingCluster`, read from `spec.harness.clusterName` on the broker's
+own Agent CR, and `ScopeOfTarget` fills the cluster from it when the caller's scope names none. Filled
+**unconditionally**, for the same reason the namespace assignment is: the conditional form is the
+gat-151 shape one line up, and here it would leave a platform agent's cluster-scoped writes ungated
+against a cluster-admin owner.
+
+Invisible below L2 by construction: the one platform-tier unit test that reached `Find` passed `""`
+for the namespace, the single target shape that does not open the hole.
+`TestTargetScopeIsWellFormedForEveryTier` now covers the cross product of three tiers × two target
+shapes and the fail-closed direction; mutation verdict `caught`.
+
+The fix does not move the blast-radius denominator (`CountWorkloadObjects` reads `s.Namespace` and
+nothing else). Its only other behavioural delta is that a platform agent's cluster-scoped writes now
+gate as `cross-tier-direct-operation` when a cluster-admin agent owns the cluster, which is what
+06 §4.2 says and is strictly more gating, never less.
+
+#### Defect 5 — the material-egress scan needs an authority only 06 §2.2 confers
+
+The third run got past ownership and stopped at
+
+```
+403 target-forbidden — step 3: resolving 1 operations against live state: resolving secret digests:
+listing Secrets in scope your-gcp-project-id// for the material-egress scan: secrets is forbidden:
+User "system:serviceaccount:kubeagents-system:platform-your-gcp-project-id-actor" cannot list
+resource "secrets" in API group "" at the cluster scope
+```
+
+**The product is conformant here and the identity is not.** 06 §4.2's `secret-material-egress`
+builds its digest set from "every `Secret` **readable in the caller's scope**", and 06:1659 fixes
+the granularity — "scoped to the caller's own namespace / cluster rather than the fleet". For a
+platform caller that is the serving cluster, so a cluster-wide `list secrets` is the specified read.
+`livestate.SecretDigests` fails **closed** on a denied List and is right to: treating Forbidden as an
+empty digest set would report "no secret material" for every payload, and the actor's grant is not a
+sound proxy for the reader SA's, so an unreadable Secret is not an unexfiltratable one.
+
+06 §2.2's platform template grants exactly this — `- apiGroups: [""] resources: [namespaces,
+serviceaccounts, configmaps, secrets] verbs: [get, list, watch, …]`, on a **ClusterRole**. It is not
+in §2.2.1 and never was, so no narrowing of the shared pair reaches it. **Only 5b-0-ii lands it.**
+
+**And the fixture path is closed, deliberately.** The obvious shortcut — widen the test-only overlay
+— cannot be taken and should not be:
+
+- V-CTN-037 (`check_test_only_grants_are_confined`, L0, BLOCKING-ALWAYS) fails any
+  `kube-agents/test-only-grant` document that is cluster-scoped. A `ClusterRole` granting cluster-wide
+  `list secrets` is exactly that. The check refuses the shortcut before review has to.
+- `actor-tenant-write-grant.yaml`'s header already ruled on the narrower version: "`secrets` is
+  absent and is the one omission worth stating … a test-only grant over Secrets on a shared scratch
+  cluster is the one thing here that would be worth stealing."
+
+So the blocker is not environmental and not a missing fixture. It is the install path owing the
+platform actor an authority the spec gives it, which is 5b-0-ii, gated behind 5b-0-i by Guardrail 9.
+
+#### The tier the suite drives, recorded as a question and not resolved here
+
+`broker-execute-l2.sh` drives `examples/gitops-repo/fleet/platform-agent.yaml`, i.e. a **platform**
+agent writing a ConfigMap into a tenant namespace — which is the operation 03 §3.2 says the platform
+agent may not perform directly and 06 §4.2's `cross-tier-direct-operation` exists to gate. Driving
+the suite as a developer-team caller would be more faithful **and** would put the digest-set list
+inside one namespace, where a namespaced test-only Role can grant it within V-CTN-037's bounds.
+
+It is not done here because V-6 (`validateParentCeiling`) requires a developer-team Agent CR to name
+a live cluster-admin parent, which must in turn name a platform parent: the suite would seed a
+three-agent chain, three actor identities and three broker deployments. That is a fixture reshape of
+its own size, and it would also stop exercising defect 4's fix at L2 (a developer-team caller's scope
+already names its cluster, so the `ServingCluster` fill never fires). Recorded as a carried finding
+for 5b-0-ii to rule on once the grant exists, not as a way around the grant.
+
+#### Verdicts
+
+| ID            | Level | Verdict    | Blocker                                                                    |
+| ------------- | ----- | ---------- | -------------------------------------------------------------------------- |
+| **V-BRK-006** | L2    | `deferred` | P9-T9b-5b-0-ii — the platform actor holds no §2.2 grant, so step 3 refuses |
+| **V-REV-001** | L2    | `deferred` | same                                                                       |
+| **V-BRK-013** | L0    | `pass`     | unchanged and green; no check was touched in this unit                     |
+
+The suite reports this as `DEFERRED: the envelope was not accepted, so no journal entry exists to
+judge`, which is the correct shape — neither row is about admission, and a check that could not run
+its property is never a pass.
