@@ -306,7 +306,7 @@ func (d *Driver) verifyAll(ctx context.Context, req Request) ([]agentv1alpha1.Ve
 // verifyOne polls one target's predicate until it is satisfied, definitively fails, or the settle
 // window closes.
 func (d *Driver) verifyOne(ctx context.Context, t Target) Evaluation {
-	pred := PredicateFor(t.Ref)
+	pred := predicateFor(t)
 	window := SettleWindow(t.Ref)
 	deadline := d.now().Add(window)
 

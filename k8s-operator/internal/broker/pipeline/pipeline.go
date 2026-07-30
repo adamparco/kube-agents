@@ -257,6 +257,10 @@ type state struct {
 	resolved []classify.ResolvedOp
 	snaps    []execute.Snapshot
 
+	// baselines are the pre-action observations step 10 cannot reconstruct, positional with
+	// targets. Captured at step 3 because that is the last moment they are still "pre-action".
+	baselines []*int64
+
 	class     *classify.Classification
 	plan      *undo.Result
 	brakeView BrakeView
@@ -450,6 +454,17 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 			return "", fmt.Errorf("step 3: capturing pre-state for %d targets: %w", len(targets), err)
 		}
 		s.snaps = snaps
+
+		// The other pre-action read. Its window of validity is the same as the snapshot's -- once
+		// step 5 has written, "the restart count before the action" is unrecoverable, and a row that
+		// cannot be evaluated is a rollback at the end of the settle window rather than a pass. So
+		// it is captured here, next to the snapshots, and refuses on the same all-or-nothing terms.
+		baselines, err := verify.CaptureRestartBaselines(ctx, p.cfg.Verifier.Prober, targets)
+		if err != nil {
+			return "", fmt.Errorf("step 3: capturing pre-action restart baselines for %d targets: %w",
+				len(targets), err)
+		}
+		s.baselines = baselines
 
 		// Between the two reads, not after them: an apply's changed-field set is a diff against the
 		// live state CaptureAll just returned, and classify.Resolve is the consumer of it.
@@ -816,10 +831,14 @@ func (p *Pipeline) stepVerify(ctx context.Context, s *state) (*broker.Result, er
 	}
 
 	return nil, p.step(tr, broker.StepVerify, func() (string, error) {
+		targets, err := verifyTargets(s.env, s.targets, s.baselines)
+		if err != nil {
+			return "", fmt.Errorf("step 10: assembling verification targets for action %s: %w", s.actionID, err)
+		}
 		res, err := p.cfg.Verifier.Run(ctx, verify.Request{
 			ActionID:         s.actionID,
 			AgentIdentity:    agentIdentity(s.id),
-			Targets:          verifyTargets(s.targets),
+			Targets:          targets,
 			UndoPlan:         *s.plan.Plan,
 			ExecutionFailure: s.execFail,
 		})
@@ -1321,12 +1340,30 @@ func executeOps(env *broker.Envelope, resolved []classify.ResolvedOp, snaps []ex
 	return out, nil
 }
 
-func verifyTargets(refs []agentv1alpha1.TargetRef) []verify.Target {
-	out := make([]verify.Target, 0, len(refs))
-	for _, r := range refs {
-		out = append(out, verify.Target{Ref: r})
+// verifyTargets assembles what step 10 verifies from the three things that know it: the refs, the
+// envelope's op at the same index (which says what "success" means for that target), and the
+// baselines step 3 captured.
+//
+// The three are positional with each other because `rawOps` builds refs one per operation, in
+// order. The length check is not defensive noise -- a future step that filters targets would
+// silently shift every op and every baseline by one, and verifying the wrong row against the wrong
+// baseline is the failure this whole function exists to prevent.
+func verifyTargets(env *broker.Envelope, refs []agentv1alpha1.TargetRef, baselines []*int64) ([]verify.Target, error) {
+	if len(refs) != len(env.Operations) || len(baselines) != len(refs) {
+		return nil, fmt.Errorf("internal: %d targets, %d operations and %d baselines must be "+
+			"positional with each other", len(refs), len(env.Operations), len(baselines))
 	}
-	return out
+	out := make([]verify.Target, 0, len(refs))
+	for i, r := range refs {
+		out = append(out, verify.Target{
+			Ref: r,
+			// A delete's success condition is the object's absence. Every other verb's is a live
+			// object satisfying its row, which is what the kind table already answers.
+			ExpectAbsent:     env.Operations[i].Op == "delete",
+			BaselineRestarts: baselines[i],
+		})
+	}
+	return out, nil
 }
 
 func appliedTargets(res *execute.Result) []agentv1alpha1.AppliedTarget {

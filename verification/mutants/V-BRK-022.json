@@ -1,0 +1,190 @@
+{
+  "_comment": "Mutation sweep for V-BRK-022 -- every verb in the envelope's closed enum executes end to end, and the verb set is discovered from the enum rather than restated. Run: python3 dev/mutate.py verification/mutants/V-BRK-022.json. Every row names the test that must fail; see dev/mutate.py for why rc != 0 is not a catch.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./internal/broker/..."]
+  },
+  "mutants": [
+    {
+      "id": "M1-the-enum-shrinks-to-the-verbs-that-worked",
+      "why": "THE property. Before this unit, create/apply/patch passed and delete/scale could not complete; a check that took its verb list from a table would have printed green on exactly this. Discovery from the enum is what makes a shrunk enum visible.",
+      "catcher": "TestEveryEnvelopeVerbExecutesEndToEnd",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "func ValidOps() []string {\n\tout := make([]string, 0, len(validOps))\n\tfor op := range validOps {\n\t\tout = append(out, op)\n\t}",
+          "replace": "func ValidOps() []string {\n\tout := make([]string, 0, len(validOps))\n\tfor _, op := range []string{\"create\", \"apply\", \"patch\"} {\n\t\tout = append(out, op)\n\t}"
+        }
+      ]
+    },
+    {
+      "id": "M2-the-enum-is-empty",
+      "why": "The vacuity direction. An empty enum makes the loop body unreachable, and a check that iterates nothing passes.",
+      "catcher": "TestEveryEnvelopeVerbExecutesEndToEnd",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\tfor op := range validOps {\n\t\tout = append(out, op)\n\t}\n\tsort.Strings(out)",
+          "replace": "\tsort.Strings(out)"
+        }
+      ]
+    },
+    {
+      "id": "M3-a-delete-verifies-as-a-presence",
+      "why": "The delete gap this unit closed. Without ExpectAbsent the kind's own row runs, mustGet reads NotFound as VerdictFailed, and a delete that worked is rolled back by recreating what it deleted.",
+      "catcher": "TestEveryEnvelopeVerbExecutesEndToEnd",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\tExpectAbsent:     env.Operations[i].Op == \"delete\",",
+          "replace": "\t\t\tExpectAbsent:     false,"
+        }
+      ]
+    },
+    {
+      "id": "M4-the-absent-row-is-chosen-by-kind-anyway",
+      "why": "Same gap, one layer down: the driver's chooser ignoring the flag. Kind cannot answer this -- a Deployment verifies as a rollout when applied and as an absence when deleted.",
+      "catcher": "TestPredicateForPrefersAbsenceOverTheKindRow",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/verify/predicate.go",
+          "find": "func predicateFor(t Target) Predicate {\n\tif t.ExpectAbsent {",
+          "replace": "func predicateFor(t Target) Predicate {\n\tif false {"
+        }
+      ]
+    },
+    {
+      "id": "M5-a-still-present-object-counts-as-deleted",
+      "why": "The absence row's own failure direction. Reporting a delete that did nothing as satisfied is worse than reporting a good delete as failed: nothing rolls back and the journal says it worked.",
+      "catcher": "TestTheVerbAssertionsCanFail",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/verify/predicate.go",
+          "find": "\treturn Evaluation{VerdictPending, name, detail, CauseDependencyConverging}\n}",
+          "replace": "\treturn Evaluation{VerdictSatisfied, name, detail, \"\"}\n}"
+        }
+      ]
+    },
+    {
+      "id": "M6-an-unreadable-cluster-counts-as-deleted",
+      "why": "'I could not look' reported as 'it is gone'. The one error that IS an absence is the replaced-uid sentinel; treating every error that way verifies a delete against a dead API server.",
+      "catcher": "TestAbsencePredicate",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/verify/predicate.go",
+          "find": "\t\tif errors.Is(err, ErrTargetReplaced) {",
+          "replace": "\t\tif err != nil {"
+        }
+      ]
+    },
+    {
+      "id": "M7-no-restart-baseline-is-ever-captured",
+      "why": "The scale gap this unit closed. A nil baseline makes workloadPredicate Indeterminate, the settle window expires, and EVERY Deployment or StatefulSet action rolls back after appearing to work.",
+      "catcher": "TestEveryEnvelopeVerbExecutesEndToEnd",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/verify/predicate.go",
+          "find": "\t\tif !NeedsRestartBaseline(ref) {\n\t\t\tcontinue\n\t\t}",
+          "replace": "\t\tif true {\n\t\t\tcontinue\n\t\t}"
+        }
+      ]
+    },
+    {
+      "id": "M8-the-baseline-is-captured-but-not-passed-on",
+      "why": "Captured at step 3 and dropped at step 10 is indistinguishable from never captured, and reads as covered because the capture has its own tests.",
+      "catcher": "TestEveryEnvelopeVerbExecutesEndToEnd",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\tBaselineRestarts: baselines[i],",
+          "replace": "\t\t\tBaselineRestarts: nil,"
+        }
+      ]
+    },
+    {
+      "id": "M9-a-workload-that-does-not-exist-yet-gets-no-baseline",
+      "why": "A create's object had no pods, so zero is the right baseline and nil is a rollback of every Deployment create that worked.",
+      "catcher": "TestCaptureRestartBaselines",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/verify/predicate.go",
+          "find": "\t\tif apierrors.IsNotFound(err) {\n\t\t\tzero := int64(0)\n\t\t\tout[i] = &zero\n\t\t\tcontinue\n\t\t}",
+          "replace": "\t\tif apierrors.IsNotFound(err) {\n\t\t\tcontinue\n\t\t}"
+        }
+      ]
+    },
+    {
+      "id": "M10-an-unreadable-baseline-degrades-instead-of-refusing",
+      "why": "Degrading to nil lands the write and then undoes it at the end of the settle window. Refusing before step 5 costs a retry.",
+      "catcher": "TestCaptureRestartBaselines",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/verify/predicate.go",
+          "find": "\t\t\treturn nil, fmt.Errorf(\"reading the pre-action restart baseline of %s %s/%s: %w\",\n\t\t\t\tref.Kind, ref.Namespace, ref.Name, err)",
+          "replace": "\t\t\tcontinue"
+        }
+      ]
+    },
+    {
+      "id": "M11-a-workload-row-loses-its-baseline-entry",
+      "why": "Two tables of kinds that nothing compares are two tables that will disagree. A StatefulSet with a workload predicate and no baseline row verifies as Indeterminate forever.",
+      "catcher": "TestRestartBaselineKindsAreExactlyTheWorkloadRows",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/verify/predicate.go",
+          "find": "\t{Group: \"apps\", Kind: \"StatefulSet\"}: true,\n}",
+          "replace": "}"
+        }
+      ]
+    },
+    {
+      "id": "M12-classify-learns-a-verb-nobody-declared",
+      "why": "[[LSN-040]] itself, in its second form: classify's copy of the verb set drifting from the envelope's with nothing comparing them. A rule naming the extra verb reads as a control and matches nothing.",
+      "catcher": "TestClassifyKnownVerbsAgreeWithTheEnvelopeEnum",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/rule.go",
+          "find": "\t\"create\": true, \"apply\": true, \"patch\": true, \"delete\": true, \"scale\": true, \"cloud\": true,",
+          "replace": "\t\"create\": true, \"apply\": true, \"patch\": true, \"delete\": true, \"scale\": true, \"cloud\": true, \"drain\": true,"
+        }
+      ]
+    },
+    {
+      "id": "M13-the-divergence-is-declared-with-no-reason",
+      "why": "An exception with a placeholder justification is the LSN-041 shape -- the sentence claiming a control is the reason nobody writes the control. A declaration with nothing in it must not satisfy the declaration requirement.",
+      "catcher": "TestClassifyKnownVerbsAgreeWithTheEnvelopeEnum",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/rule.go",
+          "find": "\t\"cloud\": \"a Config Connector write is a write, and the code floor gates it by name \" +\n\t\t\"(floor.go's writeVerbs). But no envelope carries `op: cloud` -- a cloud action arrives as an \" +\n\t\t\"ordinary verb against a *.cnrm.cloud.google.com kind, and this broker refuses every \" +\n\t\t\"cloudTarget outright with `cloud-target-unavailable`. So a ChangePolicy rule naming this \" +\n\t\t\"verb matches nothing today. That is safe only for as long as the refusal holds, which is why \" +\n\t\t\"TestNoCloudTargetReachesTheClassifier asserts it rather than leaving it to this sentence.\",",
+          "replace": "\t\"cloud\": \"see above\","
+        }
+      ]
+    },
+    {
+      "id": "M14-the-cloud-refusal-is-removed",
+      "why": "What makes the `cloud` divergence a property rather than a claim. The verb matching nothing is safe only while no cloudTarget reaches the classifier.",
+      "catcher": "TestNoCloudTargetReachesTheClassifier",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\tcase op.CloudTarget != nil:\n\t\treturn agentv1alpha1.TargetRef{}, &broker.Refusal{\n\t\t\tStatus:  http.StatusNotImplemented,\n\t\t\tReason:  \"cloud-target-unavailable\",",
+          "replace": "\tcase op.CloudTarget != nil && false:\n\t\treturn agentv1alpha1.TargetRef{}, &broker.Refusal{\n\t\t\tStatus:  http.StatusNotImplemented,\n\t\t\tReason:  \"cloud-target-unavailable\","
+        }
+      ]
+    },
+    {
+      "id": "M15-the-absence-test-is-inverted",
+      "why": "The other polarity of M3, and the more dangerous one: every non-delete verified by whether its object has GONE. A create whose object is present reads as failed and rolls back, and only a check that drives all five verbs sees both directions.",
+      "catcher": "TestEveryEnvelopeVerbExecutesEndToEnd",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\tExpectAbsent:     env.Operations[i].Op == \"delete\",",
+          "replace": "\t\t\tExpectAbsent:     env.Operations[i].Op != \"delete\","
+        }
+      ]
+    }
+  ]
+}

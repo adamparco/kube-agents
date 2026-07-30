@@ -151,6 +151,14 @@ func TestGetRefusesAnObjectThatWasReplacedDuringTheSettleWindow(t *testing.T) {
 		if !strings.Contains(err.Error(), "replaced during the settle window") {
 			t.Fatalf("error does not name the cause an operator has to act on: %v", err)
 		}
+		// And the machine-readable half. verify.absencePredicate reads this exact condition as the
+		// answer rather than as a failure -- a delete whose name is now held by a different object
+		// is a delete that worked -- and it identifies it by the sentinel, not by the prose above.
+		// The two halves live in different packages, so this is the only place they are compared.
+		if !errors.Is(err, verify.ErrTargetReplaced) {
+			t.Fatalf("error does not wrap verify.ErrTargetReplaced, so the one predicate that must "+
+				"distinguish 'replaced' from 'unreadable' cannot: %v", err)
+		}
 	})
 
 	t.Run("NotFound passes through unwrapped for verify.mustGet", func(t *testing.T) {

@@ -68,7 +68,7 @@ will start selecting.
 | **LSN-037** | builds, dockerfiles, ci, toolchain | An image build fails on symbols that `go build ./...` resolves fine | closed | `dev/tests/go-build-targets-packages.py` + `--negative-control` (L0-CHAIN) · package-path builds in all 3 Dockerfiles + 2 Makefile recipes |
 | **LSN-039** | wiring, completeness, manifests, install-path | The manifest is correct, the check that reads it is green, and no install path ever applies it | closed | `dev/tests/identity-has-install-path.py` (**V-CMP-007**, L0-CHAIN) — manifest→step reachability over `k8s-operator/scripts/`, 7 properties, 8 negative controls including a reproduction of the original defect · the install path itself in `common.sh` (`render_agent_identity`, `apply_agent_identity`, `delete_agent_identity`) + `agent-identity.yaml.template` + `broker-operations-grant.yaml.template`, applied from `provision_08` and `provision_12` |
 | **LSN-038** | checks, probes, discovery, negative-controls | A guard that fails safe still fails, and a green run is how it tells you | closed | `check_machinery_probes_resolve` + `CLOSED_MARKER` + the Go arm of `_invoked_by` in `invariants-gate.py` (L0-CHAIN) · `dev/test_invariants_gate.py` (19 negative controls) · `dev/tests/golex.py` shared by `scope-label-single-sourced.py` and `api-group-single-sourced.py` |
-| **LSN-040** | seams, integration, assembly, broker | Two packages, each right, mean different things by the same field, and the first caller is the only thing that can tell | **open** | — fix scheduled as **P9-T7c-4b** (**V-BRK-022**); the gap itself is pinned by `TestApplyFailsClosedAtTheIntegrityCheck` in `internal/broker/pipeline/pipeline_test.go` |
+| **LSN-040** | seams, integration, assembly, broker | Two packages, each right, mean different things by the same field, and the first caller is the only thing that can tell | closed | **V-BRK-020** + **V-BRK-022** — `k8s-operator/internal/broker/pipeline/verbs_test.go` drives every verb of `broker.ValidOps()` end to end, discovered from the enum |
 | **LSN-041** | admission, CEL, policy, security, fail-open, checks | A security artifact's comment says a control exists; grep says it never did, and the hole it described is live | **closed** | `dev/tests/journal-status-vap-parity.py` + `--negative-control` in `dev/L0-CHAIN.txt` — derives the required CEL variable set from the Go type, so a status field with no policy row fails the build |
 | **LSN-042** | build, ci, deploy, kustomize, install-path, checks | Nothing in the repository ever built the thing the repository installs | closed | `make render` (a prerequisite of `build`/`test`) + `dev/tests/install-render-is-faithful.py` (**V-CMP-008**) for the overlay; `dev/tests/install-artifacts-are-rendered.py` (L0, in `dev/L0-CHAIN.txt`) for the general property — every kustomize directory an install path applies is one `render` builds, both sets derived, and `render` must stay a prerequisite of a CI-invoked target |
 | **LSN-043** | harness, orient, durability, git | The ORIENT drain was done, verified green, and then silently reverted by a branch switch | closed | `.claude/skills/harness-run/SKILL.md` §1 step 6 (commit the drain before SELECT) + `dev/tests/invariants-gate.py` `_drain_is_committed` (L0) — fails on an uncommitted drain, i.e. one that removes inbox items or advances `Last drained`, while an uncommitted human *append* still passes |
@@ -80,7 +80,7 @@ will start selecting.
 | **LSN-049** | mutation, tooling, checks, vacuity, false-finding | The sweep's own shell quoting kept a mutation from ever being applied, and `rc == 0` was scored as "the suite passed with it in place" — an invented hole, reported twice | closed | `dev/mutate.py` + `dev/test_mutate_sweep.py` (L0, in `dev/L0-CHAIN.txt` via `unittest discover dev`) — needles and replacements live in JSON and are applied by `str.replace` in-process, so nothing crosses a shell parse; the applier refuses unless the needle appears exactly once, which is also how the sweep observes that the mutation LANDED; and `rc != 0` is not a catch, every row naming the test that must be in the failing set |
 | **LSN-050** | harness, checks, coverage, false-green, pre-commit | Seven L0 checks discover files with `git ls-files` and no `--others`, so the chain is blind to any file not yet `git add`ed — which is every brand-new file at the one moment the chain is documented to run | closed | `dev/tests/gitcorpus.py` + `check_l0_corpus_is_not_index_only` in `dev/tests/invariants-gate.py` (L0, in `dev/L0-CHAIN.txt`) — one `--cached --others --exclude-standard` enumerator, now used by all ten call sites, and a gate arm that AST-parses every `.py` and `.sh` under `dev/` and fails any `ls-files` argv without `--others`. The gate covers the whole tree rather than just the chain, because the failure mode is the eighth script copying the seventh |
 
-**Open: 1 of 50** (LSN-040 — mechanization scheduled as **P9-T7c-4b** / **V-BRK-022**).
+**Open: 0 of 50**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2072,9 +2072,11 @@ enforced — the same gap between an artifact and its effect), [[lsn-036]] (enum
 
 ## LSN-040 — Two packages, each right, about the same word
 
-**Tag:** seams, integration, assembly, broker · **Status: open** (fix scheduled as **P9-T7c-4b**,
-which adds **V-BRK-022**: every verb in the envelope's closed enum executes end to end through the
-assembled pipeline, the verb set discovered from the enum rather than restated).
+**Tag:** seams, integration, assembly, broker · **Phase:** 9 (P9-T7c-1 found it, P9-T7c-4a and
+P9-T7c-4b fixed it) · **Status:** closed — mechanized by
+`k8s-operator/internal/broker/pipeline/verbs_test.go` (**V-BRK-022**, L1), run by
+`.github/workflows/k8s-operator-test.yml`'s `Run Controller Tests` on every PR. Non-vacuity:
+`verification/mutants/V-BRK-022.json`, 15/15 caught.
 
 **Trigger.** Assembling steps 3–11 into a working pipeline (P9-T7c-1) and driving one real envelope
 through it end to end. The very first happy-path fixture — `apply` a ConfigMap — was refused at step
@@ -2095,10 +2097,10 @@ different things by it.
 Neither package is wrong. What was missing is the conversion between them, which did not exist
 because nothing had ever called one with the other's output. The pipeline is that first caller.
 
-**Consequence.** Only `create`, `delete` and JSON-patch `patch` can traverse the pipeline today.
-`apply`, `scale` and merge-patch fail closed at step 9 — refused, nothing mutated — so this is
-missing functionality and not a hole. It is recorded as a test
-(`TestApplyFailsClosedAtTheIntegrityCheck`) rather than a comment, so the gap is a property with a
+**Consequence, at the time of the finding.** Only `create`, `delete` and JSON-patch `patch` could
+traverse the pipeline. `apply`, `scale` and merge-patch failed closed at step 9 — refused, nothing
+mutated — so this was missing functionality and not a hole. It was recorded as a test
+(`TestApplyFailsClosedAtTheIntegrityCheck`) rather than a comment, so the gap was a property with a
 verdict instead of a surprise waiting for the next reader.
 
 **Root cause, one level down.** `classify.RawOp.Patch` is documented as carrying "the RFC 6902 patch
@@ -2114,13 +2116,44 @@ check on either package could have found it, because each package's tests assert
 both readings are right. It is findable only by the first thing that puts them in a line, and
 therefore the mechanization has to be at the seam, not in either package:
 
-**Planned mechanization (P9-T7c-4).** Supply the classifier the computed
-`execute.Diff(snap.Live, desired)` for an `apply` and `/spec/replicas` for a `scale`, derive paths
-for a merge-patch, and then — the part that is the lesson rather than the bug — add a check that
-**every verb in the envelope's closed verb enum executes end to end through the assembled pipeline**,
-discovered from the enum rather than from a list of verbs someone wrote down ([[lsn-036]]). A table
-covering the three verbs that happen to work today would have printed green throughout the entire
-period in which the other three did not.
+**Mechanization, as built.** P9-T7c-4a supplied the classifier the computed
+`execute.Diff(snap.Live, desired)` for an `apply`, `/spec/replicas` for a `scale`, and a recursive
+walk for a merge-patch (**V-BRK-020**). P9-T7c-4b added the part that is the lesson rather than the
+bug: **V-BRK-022**, every verb in the envelope's closed enum driven end to end through the assembled
+pipeline, the verb set read out of `broker.ValidOps()` rather than from a list someone wrote down
+([[lsn-036]]). A table covering the three verbs that happened to work would have printed green
+throughout the entire period in which the other three did not.
+
+**What the mechanization found the day it was written, which is the whole argument for it.** With
+`apply` fixed, three of five verbs passed and two did not — and both failures were the same shape as
+the lesson: a package that is individually right, and an assembly that is the first caller to put it
+in a line.
+
+- **`delete` could never be verified.** Every row of 04 §5.1 asserts something about a live object
+  and `verify.mustGet` maps NotFound to `VerdictFailed`. Correct for a create; exactly backwards for
+  a delete, which succeeds by the object being gone. A delete that worked would have been reported
+  failed and rolled back by recreating what it deleted. Fixed with `verify.Target.ExpectAbsent` and
+  an `absencePredicate` chosen by the action rather than by the kind.
+- **No Deployment or StatefulSet action could ever be verified.** `pipeline.verifyTargets` built
+  `verify.Target{Ref: r}` and dropped every other field, so `BaselineRestarts` was always nil,
+  `workloadPredicate` always returned `VerdictIndeterminate`, and the settle window always expired
+  into `VerdictFailed` — a rollback of every workload change that worked. Fixed by capturing the
+  baseline at step 3, alongside the snapshots, where it is still pre-action.
+
+Neither was reachable from any package's own tests. `verify` tested `workloadPredicate` with a
+baseline supplied by the test; the pipeline tested a ConfigMap, whose row needs none.
+
+**Two further seam defects the same unit closed, both of the [[lsn-041]] shape.**
+`classify.knownVerbs` said "the corpus lint asserts the two agree" and no such lint existed; it is
+now `TestClassifyKnownVerbsAgreeWithTheEnvelopeEnum`, in `package pipeline` because that is the
+lowest package importing both. Its one legitimate divergence, `cloud`, is declared in code as
+`classify.VerbsNotCarriedByAnEnvelopeOp` with a written reason, and the condition that makes the
+divergence safe is a property (`TestNoCloudTargetReachesTheClassifier`) rather than a sentence.
+
+**Still open, filed not fixed.** `agentv1alpha1.ChangeVerb`'s kubebuilder enum is a **third** copy of
+the verb set, and its doc comment claims it "mirrors the envelope's own" with nothing comparing them.
+Both mismatch directions fail closed today, so it is a finding rather than a defect — see the
+Phase 9 breakdown.
 
 **Complication for whoever does it.** `execute.DiffResult.Ops` are
 `agentv1alpha1.AppliedDiffOp{Op, Path, From, Value string}` — `Value` is a **rendered string**, so
