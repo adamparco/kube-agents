@@ -39,8 +39,26 @@ import (
 // header, no build-tag-guarded skip path. Claims of that shape cannot be proved by probing a
 // running process -- a probe only covers the routes somebody thought to try -- so the assertions
 // here are made against the server's own enumeration of its surface plus a scan of the package
-// source. Both are needed: the enumeration proves the mux has one mutating route, and the source
-// scan proves nobody added a second one and forgot to enumerate it.
+// source.
+//
+// Reshaped 2026-07-30 (P9-T7c-2c) on a human ruling. The old form asserted a NUMBER: one mutating
+// route. That was never in 03 §4.1, which the check cites; it was the check's own paraphrase, true
+// while one route existed and wrong the moment 05 §1.3's `replay` and `approve` are built. The
+// replacement asserts what the source actually requires, and it is strictly more:
+//
+//	1. MutatingRoutes() EQUALS the registered set less the declared non-mutating allowlist. Derived,
+//	   so the declaration cannot drift from the server it describes.
+//	2. That set is a SUBSET of the 05 §1.3 route table -- a route the design does not name cannot
+//	   exist; a route it does name may.
+//	3. Every member of it traverses 03 §4.1's non-skippable steps: authenticate at step 1 and reach
+//	   Pipeline.Submit for 3-11. Asserted over the call graph, because a mutating handler that
+//	   returns early is a door that opens onto nothing the journal will ever see.
+//	4. The registration point is unique. Exactly one call site touches the mux, and it is `handle`,
+//	   which is what makes (1) ground truth rather than a second copy.
+//
+// What replaced what matters here: the old part 5 pinned `strings.Count(src, "s.mux.HandleFunc(")`
+// to 4. That did catch a smuggled handler, but it needed editing for every legitimate route, which
+// makes it a check whose maintenance instruction is "raise the number until it passes".
 
 // recordingJournal captures the refusals that were journaled.
 type recordingJournal struct {
@@ -205,27 +223,181 @@ func (h *harness) submittable(t *testing.T, fixture string) []byte {
 	return out
 }
 
-// V-BRK-021, part 1: the route set is exactly three, and exactly one of them mutates.
-func TestRouteSetIsThreeWithOneMutating(t *testing.T) {
+// designMutatingRoutes is the 05 §1.3 route table -- every path the design sanctions as a door into
+// the pipeline. `approve` and `replay` do not exist yet (P10-T4/T7 and P9-T7c-2b); they are listed
+// because this is the DESIGN's table, and the assertion below is a subset, not an equality. A route
+// the design names may exist; a route it does not name may not.
+//
+// Both unbuilt entries carry `{actionId}` as Go 1.22 wildcard syntax, which is how they will be
+// registered. Nothing matches them today, which is the point: the subset holds trivially now and
+// starts doing work the moment someone registers a fourth handler.
+var designMutatingRoutes = map[string]bool{
+	"/v1alpha1/actions":                    true,
+	"/v1alpha1/actions/{actionId}/approve": true,
+	"/v1alpha1/actions/{actionId}/replay":  true,
+}
+
+// V-BRK-021, part 1: the mutating surface is derived from what was registered, and bounded by what
+// the design names.
+//
+// The equality is the load-bearing half. MutatingRoutes() is not a literal any more -- it is
+// Registered() minus nonMutatingPaths -- so this recomputes the subtraction independently and
+// compares. A handler registered without being added to the allowlist appears here as mutating,
+// where the design-table subset refuses it. That is the drift the old `[]string{ActionsPath}` could
+// not see: it would have kept reporting one route while the mux served two.
+func TestMutatingSurfaceIsDerivedAndBoundedByTheDesign(t *testing.T) {
 	h := newHarness(t)
 
-	want := []string{ActionsPath, HealthzPath, NoncePath}
-	sort.Strings(want)
-	got := h.server.Routes()
-	if len(got) != len(want) {
-		t.Fatalf("Routes() = %v, want %v", got, want)
+	// Registered() is the ground truth, and it must actually contain something -- a server that
+	// registered nothing would satisfy every set relation below vacuously.
+	reg := h.server.Registered()
+	if len(reg) == 0 {
+		t.Fatal("Registered() is empty, so every assertion in this test is vacuous")
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("Routes() = %v, want %v", got, want)
+	if !containsStr(reg, CatchAllPath) {
+		t.Errorf("Registered() = %v, which omits the catch-all %q; an unregistered catch-all means "+
+			"the mux's default handler serves unknown paths and part 2's 404s prove nothing about this server", reg, CatchAllPath)
+	}
+
+	// (0) The reporters FOLLOW the registrations.
+	//
+	// This arm exists because the sweep found the ones below insufficient without it, and the reason
+	// is worth stating: on a server with one mutating route, a correct literal and a real derivation
+	// return the same answer. Every set relation in this test held with `MutatingRoutes()` rewritten
+	// back to `[]string{ActionsPath}` and with `Registered()` rewritten to the four production
+	// paths -- because both literals were still true of THIS server. "Derived, not declared" is not a
+	// property of one observation; it only becomes visible when the input varies.
+	//
+	// So vary it. A second server registering a path nothing else knows about: if either reporter is
+	// a literal, it cannot mention that path, and if it is a derivation it must.
+	probe := &Server{mux: http.NewServeMux()}
+	probe.handle("/v1alpha1/only-here", func(http.ResponseWriter, *http.Request) {})
+	if r := probe.Registered(); len(r) != 1 || r[0] != "/v1alpha1/only-here" {
+		t.Errorf("a server registering only %q reports Registered() = %v; Registered() is restating "+
+			"a fixed list instead of reporting what handle() recorded", "/v1alpha1/only-here", r)
+	}
+	if m := probe.MutatingRoutes(); len(m) != 1 || m[0] != "/v1alpha1/only-here" {
+		t.Errorf("a server registering only %q reports MutatingRoutes() = %v; the mutating surface "+
+			"is a literal, so it will keep naming the routes it was written with while the mux "+
+			"serves others -- which is the drift this reshape of V-BRK-021 exists to end", "/v1alpha1/only-here", m)
+	}
+	if r := probe.Routes(); len(r) != 1 || r[0] != "/v1alpha1/only-here" {
+		t.Errorf("a server registering only %q reports Routes() = %v", "/v1alpha1/only-here", r)
+	}
+	// And the catch-all is subtracted by Routes() rather than by coincidence.
+	probe2 := &Server{mux: http.NewServeMux()}
+	probe2.handle(CatchAllPath, func(http.ResponseWriter, *http.Request) {})
+	if r := probe2.Routes(); len(r) != 0 {
+		t.Errorf("a server registering only the catch-all reports Routes() = %v, want none", r)
+	}
+
+	// (1) The equality. Recomputed here rather than trusted, so that a MutatingRoutes() rewritten
+	// back into a literal diverges from the registration and fails.
+	var wantMutating []string
+	for _, p := range reg {
+		if !nonMutatingPaths[p] {
+			wantMutating = append(wantMutating, p)
 		}
 	}
-	if m := h.server.MutatingRoutes(); len(m) != 1 || m[0] != ActionsPath {
-		t.Fatalf("MutatingRoutes() = %v, want exactly [%s]", m, ActionsPath)
+	sort.Strings(wantMutating)
+	got := h.server.MutatingRoutes()
+	if strings.Join(got, ",") != strings.Join(wantMutating, ",") {
+		t.Fatalf("MutatingRoutes() = %v, but Registered() minus the declared non-mutating allowlist is %v; "+
+			"the mutating surface must be derived from the registrations, not declared beside them", got, wantMutating)
+	}
+	if len(got) == 0 {
+		t.Fatal("no route is classified as mutating; the broker's whole purpose is one, so either " +
+			"the allowlist swallowed the submission route or nothing registered it")
+	}
+
+	// (2) The subset. This is where a fourth door fails.
+	if unnamed := notInDesignTable(got); len(unnamed) > 0 {
+		t.Errorf("%v mutate and are not in the 05 §1.3 route table; a mutating route the design "+
+			"does not name is a second way into the executor, and 03 §4.1 says there is no other write path", unnamed)
+	}
+
+	// (3) The allowlist is itself bounded. Subtracting a declared set from the registrations makes
+	// forgetting safe -- but only while the declared set stays honest. A new route added AND
+	// declared non-mutating passes (1) and (2) trivially, because it never enters the mutating set
+	// to be measured. So the allowlist may name only the three paths that genuinely cannot write:
+	// the probe, the nonce issuer, and the absence of a route.
+	inert := map[string]bool{HealthzPath: true, NoncePath: true, CatchAllPath: true}
+	for p := range nonMutatingPaths {
+		if !inert[p] {
+			t.Errorf("nonMutatingPaths declares %q inert. Only %q, %q and %q are; anything else is a "+
+				"route excusing itself from the mutating surface it belongs to, which is the one way "+
+				"past both the equality and the design-table subset", p, HealthzPath, NoncePath, CatchAllPath)
+		}
+	}
+	for p := range inert {
+		if !nonMutatingPaths[p] {
+			t.Errorf("%q is not declared in nonMutatingPaths, so it is reported as mutating; either "+
+				"it grew the ability to write or the allowlist lost an entry", p)
+		}
+	}
+
+	// Routes() is the registered set less the catch-all, and the submission route is in it.
+	if r := h.server.Routes(); containsStr(r, CatchAllPath) || !containsStr(r, ActionsPath) {
+		t.Errorf("Routes() = %v, want the registered paths without %q and with %q", r, CatchAllPath, ActionsPath)
 	}
 	if Port != 8443 {
 		t.Fatalf("Port = %d, want 8443 (08 §2.3)", Port)
 	}
+}
+
+// notInDesignTable is the subset test, extracted so it can be exercised on inputs this server does
+// not produce. That is the whole point of pulling it out: the reshape's central claim is that the
+// check accepts a route 05 §1.3 names and refuses one it does not, and the accepting half cannot be
+// demonstrated against a server that has only ever had one route.
+func notInDesignTable(mutating []string) []string {
+	var out []string
+	for _, p := range mutating {
+		if !designMutatingRoutes[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// The control the reshape exists for, and the reason V-BRK-021 was a spec contradiction until now.
+//
+// The old assertion was `len(MutatingRoutes()) != 1` plus a registration count pinned to 4. Both go
+// red on `/v1alpha1/actions/{actionId}/replay` -- a route 05 §1.3 designs, that 03 §4.1 permits
+// because it runs the full pipeline, and that C-UC cannot do its job without. A check that refuses
+// what the design requires is not a strict check, it is a wrong one, and the harness had to halt
+// rather than pick a side (P9-T7c-2b, 2026-07-29).
+//
+// So this asserts the accepting half directly: all three design routes pass, and a debug door in
+// the same shape does not. Without it the subset arm is only ever exercised on a one-element set,
+// where "subset of the table" and "equal to ActionsPath" are indistinguishable.
+func TestTheSubsetArmAcceptsEveryRouteTheDesignNamesAndNothingElse(t *testing.T) {
+	all := []string{
+		"/v1alpha1/actions",
+		"/v1alpha1/actions/{actionId}/approve",
+		"/v1alpha1/actions/{actionId}/replay",
+	}
+	if len(designMutatingRoutes) != len(all) {
+		t.Fatalf("designMutatingRoutes has %d entries, this control names %d; 05 §1.3's table has "+
+			"three rows and both copies must move together", len(designMutatingRoutes), len(all))
+	}
+	if bad := notInDesignTable(all); len(bad) > 0 {
+		t.Errorf("the subset arm refuses %v, which 05 §1.3 names; this is the exact failure that "+
+			"made the old count a spec contradiction", bad)
+	}
+	for _, p := range []string{"/v1alpha1/debug/apply", "/v1alpha1/actions/force", "/admin", "/v1alpha1/actions/{actionId}"} {
+		if bad := notInDesignTable([]string{p}); len(bad) == 0 {
+			t.Errorf("the subset arm accepts %q, which no 05 §1.3 row names", p)
+		}
+	}
+}
+
+func containsStr(hay []string, needle string) bool {
+	for _, s := range hay {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }
 
 // V-BRK-021, part 2: everything outside the route set is a 404, including the shapes a caller
@@ -420,19 +592,174 @@ func TestNoBuildTagGuardedPathsInPackage(t *testing.T) {
 			continue
 		}
 		if n := strings.Count(string(src), "mux.HandleFunc("); n > 0 {
-			t.Errorf("%s registers %d route(s); every route belongs in server.go where Routes() enumerates it", name, n)
+			t.Errorf("%s registers %d route(s); every route belongs in server.go, registered through handle()", name, n)
 		}
 	}
+}
 
-	// And the enumeration is not stale: exactly four registrations in server.go -- three routes
-	// plus the catch-all -- matching Routes() plus "/".
+// V-BRK-021, part 6: the registration point is unique.
+//
+// This replaced a count. The old assertion pinned `strings.Count(src, "s.mux.HandleFunc(")` to
+// exactly 4 -- three routes plus the catch-all -- which caught a smuggled handler and also went red
+// on every legitimate route addition, so its maintenance instruction was "raise the number until it
+// passes". A check you edit to make it pass is a check that will one day be edited past a real
+// finding.
+//
+// The property that actually matters is not how many registrations there are; it is that
+// MutatingRoutes() sees all of them. It sees exactly the ones that go through handle(), so:
+// registrations that bypass handle() are the failure, at any count.
+func TestTheMuxHasExactlyOneRegistrationPoint(t *testing.T) {
 	src, err := os.ReadFile("server.go")
 	if err != nil {
 		t.Fatalf("read server.go: %v", err)
 	}
-	if n := strings.Count(string(src), "s.mux.HandleFunc("); n != 4 {
-		t.Fatalf("server.go registers %d handlers; Routes() enumerates 3 plus the catch-all, so this must be 4", n)
+	body := string(src)
+
+	const marker = "s.mux.HandleFunc("
+	n := strings.Count(body, marker)
+	if n == 0 {
+		t.Fatal("server.go never calls s.mux.HandleFunc; either the server stopped registering " +
+			"handlers or this scan is looking for a spelling that no longer exists, and a scan that " +
+			"finds nothing reports the same green as a scan that found nothing wrong")
 	}
+	if n != 1 {
+		t.Errorf("server.go has %d call sites for %s; there must be exactly one, inside handle(), "+
+			"because handle() is what records the path into Registered() and therefore what makes "+
+			"MutatingRoutes() a derivation instead of a guess", n, marker)
+	}
+
+	// And the one call site is inside handle(), not somewhere that skips the recording.
+	fn := strings.Index(body, "func (s *Server) handle(path string, h http.HandlerFunc) {")
+	if fn < 0 {
+		t.Fatal("server.go has no `func (s *Server) handle(path string, h http.HandlerFunc)`; the " +
+			"single registration point this check is named for does not exist")
+	}
+	end := strings.Index(body[fn:], "\n}\n")
+	if end < 0 {
+		t.Fatal("could not find the end of handle()")
+	}
+	if !strings.Contains(body[fn:fn+end], marker) {
+		t.Error("handle() does not call s.mux.HandleFunc, so the sole registration this check " +
+			"located is somewhere that does not record the path into Registered()")
+	}
+	if !strings.Contains(body[fn:fn+end], "s.registered = append(s.registered, path)") {
+		t.Error("handle() registers a path on the mux without recording it in s.registered; " +
+			"MutatingRoutes() would then under-report the surface, which is the exact drift this " +
+			"reshape of V-BRK-021 exists to make impossible")
+	}
+}
+
+// V-BRK-021, part 7: every mutating route traverses the non-skippable steps.
+//
+// 03 §4.1: steps 1, 3, 4, 5, 6 and 11 are "not skippable by any caller". The count this check used
+// to assert was a proxy for that sentence; this is the sentence. Steps 3-11 belong to the pipeline
+// and are asserted step by step by V-BRK-011/014, so what has to be true out here is that the
+// handler for each mutating route (a) authenticates before anything else and (b) hands off to the
+// pipeline. A mutating route that answers without doing both is a write path with no journal entry,
+// which is precisely what 03 §4.1 says cannot exist.
+//
+// Over the source rather than by driving requests, because a request-driven version can only prove
+// it about the handler it knew to call, and the whole subject here is a handler nobody knew about.
+func TestEveryMutatingRouteReachesTheAuthenticatorAndThePipeline(t *testing.T) {
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatalf("read server.go: %v", err)
+	}
+	body := string(src)
+
+	h := newHarness(t)
+	mutating := h.server.MutatingRoutes()
+	if len(mutating) == 0 {
+		t.Fatal("no mutating route to check; this test would pass over a broker that cannot write at all")
+	}
+
+	// Path constant -> handler method, read out of the registrations themselves so a rewired route
+	// is followed rather than assumed.
+	handlerFor := map[string]string{}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "s.handle(") {
+			continue
+		}
+		args := strings.TrimSuffix(strings.TrimPrefix(line, "s.handle("), ")")
+		constName, method, ok := strings.Cut(args, ", ")
+		if !ok {
+			t.Fatalf("cannot parse registration %q", line)
+		}
+		handlerFor[pathOfConst(t, body, strings.TrimSpace(constName))] = strings.TrimSpace(method)
+	}
+
+	reEntryChecked := 0
+	for _, route := range mutating {
+		method, ok := handlerFor[route]
+		if !ok {
+			t.Errorf("mutating route %q has no registration this scan could follow; it cannot be "+
+				"shown to traverse anything", route)
+			continue
+		}
+		fnSrc := funcBody(t, body, strings.TrimPrefix(method, "s."))
+		if !strings.Contains(fnSrc, "s.cfg.Authenticator.Authenticate(") {
+			t.Errorf("%s serves the mutating route %q and never calls Authenticator.Authenticate; "+
+				"step 1 of 03 §4.1 is not skippable by any caller", method, route)
+		}
+		if !strings.Contains(fnSrc, "s.cfg.Pipeline.Submit(") {
+			t.Errorf("%s serves the mutating route %q and never calls Pipeline.Submit; steps 3-11 "+
+				"-- classify, plan undo, snapshot, execute, journal -- would not run, so the write "+
+				"would happen outside everything that records it", method, route)
+		}
+
+		// A re-entry route -- 05 §1.3's `approve` and `replay` -- executes a plan the broker already
+		// recorded. It takes an action ID and MUST NOT read operations off the wire: if it did, the
+		// journal's account of what was approved would not be what ran, and the route would be the
+		// submission route wearing a different name and a different caller identity.
+		//
+		// The population is EMPTY today and this loop body does not execute. That is recorded rather
+		// than papered over: an assertion over nothing is not an assertion, and the count below is
+		// what tells a later reader whether this clause was live when the phase closed.
+		if route == ActionsPath {
+			continue
+		}
+		reEntryChecked++
+		if strings.Contains(fnSrc, "DecodeEnvelope(") {
+			t.Errorf("%s serves the re-entry route %q and decodes a caller-supplied envelope; a "+
+				"re-entry route replays what was journaled, so caller operations on it are a second "+
+				"submission path that bypasses the attribution the first one recorded", method, route)
+		}
+	}
+	if reEntryChecked == 0 {
+		t.Logf("no re-entry route exists yet (05 §1.3's approve/replay are P10-T4/T7 and P9-T7c-2b); " +
+			"the re-entry clause of V-BRK-021 is vacuous at this phase and is recorded as empty, not as satisfied")
+	}
+}
+
+// pathOfConst resolves a route constant's name to its literal value by reading the const block, so
+// the scan follows a renamed or re-pointed constant instead of matching on spelling.
+func pathOfConst(t *testing.T, body, name string) string {
+	t.Helper()
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, name+" = ") {
+			continue
+		}
+		return strings.Trim(strings.TrimPrefix(line, name+" = "), `"`)
+	}
+	t.Fatalf("route constant %s has no `%s = \"...\"` declaration in server.go", name, name)
+	return ""
+}
+
+// funcBody returns the source of a method on *Server, from its signature to the closing brace in
+// column zero.
+func funcBody(t *testing.T, body, method string) string {
+	t.Helper()
+	start := strings.Index(body, "func (s *Server) "+method+"(")
+	if start < 0 {
+		t.Fatalf("no method (s *Server) %s in server.go", method)
+	}
+	end := strings.Index(body[start:], "\n}\n")
+	if end < 0 {
+		t.Fatalf("could not find the end of %s", method)
+	}
+	return body[start : start+end]
 }
 
 // Health is unauthenticated by necessity -- the kubelet has no projected token -- and therefore

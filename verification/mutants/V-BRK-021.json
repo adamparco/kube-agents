@@ -1,0 +1,145 @@
+{
+  "_comment": "V-BRK-021 -- non-skippability, reshaped 2026-07-30 (P9-T7c-2c) from a route COUNT to four properties: MutatingRoutes() equals the registered set less a declared non-mutating allowlist; that set is a subset of 05 \u00a71.3's route table; the allowlist is itself bounded to the three genuinely inert paths; and every mutating route authenticates at step 1 and reaches the pipeline for 3-11. The mutants attack the reshape where it is new -- a second door (M1), a door that excuses itself into the allowlist (M2), a redeclared literal (M3, M4), a bypassed registration point (M5, M6), a skipped step (M7, M8) -- plus two vacuity controls (M9, M10), because a derivation over an empty population reports the same green as a derivation over a correct one. The control for the reshape itself is NOT a mutant: dev/mutate.py has no expected-to-escape verdict, and 'the check must accept a route the design names' is a positive property, so it is TestTheSubsetArmAcceptsEveryRouteTheDesignNamesAndNothingElse in the suite. Run with `python3 dev/mutate.py verification/mutants/V-BRK-021.json`.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./internal/broker/"]
+  },
+  "mutants": [
+    {
+      "id": "M1-a-second-door-that-the-design-never-named",
+      "why": "THE property. A debug apply route registered beside the real one. The old count caught this too -- but only because it was a fourth registration; this catches it because the design does not name it, which still holds when the count is legitimately four.",
+      "catcher": "TestMutatingSurfaceIsDerivedAndBoundedByTheDesign",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "\ts.handle(CatchAllPath, s.handleNotFound)",
+          "replace": "\ts.handle(\"/v1alpha1/debug/apply\", s.handleActions)\n\ts.handle(CatchAllPath, s.handleNotFound)"
+        }
+      ]
+    },
+    {
+      "id": "M2-the-second-door-excuses-itself-into-the-allowlist",
+      "why": "The subtle version of M1, and a real hole the first draft of this sweep found: the route is added AND declared non-mutating, so MutatingRoutes() still reports one and both the equality and the subset arms hold -- the route never enters the set they measure. The first draft used /v1alpha1/apply and was caught only because TestNoDebugRoutes happens to probe that exact string, i.e. by a guess. The path here is one no probe guesses, which is what forces the arm that actually closes it: the allowlist may name only the three paths that genuinely cannot write.",
+      "catcher": "TestMutatingSurfaceIsDerivedAndBoundedByTheDesign",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "\ts.handle(CatchAllPath, s.handleNotFound)",
+          "replace": "\ts.handle(\"/v1alpha1/ops/reconcile\", s.handleActions)\n\ts.handle(CatchAllPath, s.handleNotFound)"
+        },
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "\tCatchAllPath: true,\n}",
+          "replace": "\tCatchAllPath:              true,\n\t\"/v1alpha1/ops/reconcile\": true,\n}"
+        }
+      ]
+    },
+    {
+      "id": "M3-MutatingRoutes-goes-back-to-being-a-literal",
+      "why": "The exact defect this reshape exists to remove: the reporter stops deriving and states the answer. It is correct today, which is what makes it dangerous -- it stays correct-looking while the mux grows a route. The equality arm recomputes from Registered() and fails.",
+      "catcher": "TestMutatingSurfaceIsDerivedAndBoundedByTheDesign",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "func (s *Server) MutatingRoutes() []string {\n\tout := make([]string, 0, len(s.registered))\n\tfor _, p := range s.registered {\n\t\tif !nonMutatingPaths[p] {",
+          "replace": "func (s *Server) MutatingRoutes() []string {\n\tout := make([]string, 0, len(s.registered))\n\tfor _, p := range []string{ActionsPath} {\n\t\tif true {"
+        }
+      ]
+    },
+    {
+      "id": "M4-Registered-reports-a-literal-instead-of-what-was-registered",
+      "why": "One level below M3: the derivation is intact but its input is faked, so every set relation is computed over a description of the server rather than the server. Behaviour-identical today. If nothing catches this, the reshape is decoration.",
+      "catcher": "TestMutatingSurfaceIsDerivedAndBoundedByTheDesign",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "func (s *Server) Registered() []string {\n\tout := append([]string(nil), s.registered...)",
+          "replace": "func (s *Server) Registered() []string {\n\tout := []string{HealthzPath, NoncePath, ActionsPath, CatchAllPath}"
+        }
+      ]
+    },
+    {
+      "id": "M5-a-route-is-registered-straight-on-the-mux",
+      "why": "The bypass. handle() is skipped, so the path never reaches s.registered and MutatingRoutes() under-reports a live mutating door. Both the uniqueness scan (two call sites now) and the 404 probe should see it; the uniqueness scan is the one that names the cause.",
+      "catcher": "TestTheMuxHasExactlyOneRegistrationPoint",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "\ts.handle(CatchAllPath, s.handleNotFound)",
+          "replace": "\ts.mux.HandleFunc(\"/v1alpha1/force\", s.handleActions)\n\ts.handle(CatchAllPath, s.handleNotFound)"
+        }
+      ]
+    },
+    {
+      "id": "M6-handle-stops-recording-what-it-registers",
+      "why": "The registration point stays unique and stops being a recording point, which empties s.registered while the mux serves everything. This is the failure that would make the derivation report an empty mutating surface -- green by vacuity -- so the emptiness floors in both arms are what has to catch it.",
+      "catcher": "TestTheMuxHasExactlyOneRegistrationPoint",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "\ts.registered = append(s.registered, path)\n\ts.mux.HandleFunc(path, h)",
+          "replace": "\ts.mux.HandleFunc(path, h)"
+        }
+      ]
+    },
+    {
+      "id": "M7-the-mutating-route-stops-authenticating",
+      "why": "Step 1 of 03 \u00a74.1, skipped. The call-graph arm is the only thing here that reads the handler's body, and this is the clause the reshape added that the count never had.",
+      "catcher": "TestEveryMutatingRouteReachesTheAuthenticatorAndThePipeline",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "\t\tid, err = s.cfg.Authenticator.Authenticate(ctx, r)",
+          "replace": "\t\tid, err = s.authenticateRenamed(ctx, r)"
+        },
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "// ServeHTTP applies the checks that are true of every route before dispatching.",
+          "replace": "func (s *Server) authenticateRenamed(ctx context.Context, r *http.Request) (*Identity, error) {\n\treturn s.cfg.Authenticator.Authenticate(ctx, r)\n}\n\n// ServeHTTP applies the checks that are true of every route before dispatching."
+        }
+      ]
+    },
+    {
+      "id": "M8-the-mutating-route-stops-reaching-the-pipeline",
+      "why": "Steps 3-11 skipped: the handler answers 202 for an action that was never classified, planned, executed or journaled. Behaviourally this looks like success to a caller, which is why it has to be caught structurally rather than by a response assertion.",
+      "catcher": "TestEveryMutatingRouteReachesTheAuthenticatorAndThePipeline",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "\tresult, err := s.cfg.Pipeline.Submit(ctx, id, env, tr)",
+          "replace": "\tresult, err := s.submitRenamed(ctx, id, env, tr)"
+        },
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "// ServeHTTP applies the checks that are true of every route before dispatching.",
+          "replace": "func (s *Server) submitRenamed(ctx context.Context, id *Identity, env *Envelope, tr *StepTrace) (*Result, error) {\n\treturn s.cfg.Pipeline.Submit(ctx, id, env, tr)\n}\n\n// ServeHTTP applies the checks that are true of every route before dispatching."
+        }
+      ]
+    },
+    {
+      "id": "M9-the-submission-route-is-swallowed-by-the-allowlist",
+      "why": "Vacuity control for the derivation arms. Declaring the submission route non-mutating empties MutatingRoutes(), and every set relation over an empty set holds. Without the emptiness floors, M9 is green everywhere -- which would mean the whole reshape could be satisfied by a broker with no mutating surface at all.",
+      "catcher": "TestMutatingSurfaceIsDerivedAndBoundedByTheDesign",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "\tCatchAllPath: true,\n}",
+          "replace": "\tCatchAllPath: true,\n\tActionsPath:  true,\n}"
+        }
+      ]
+    },
+    {
+      "id": "M10-the-uniqueness-scan-stops-finding-anything",
+      "why": "Vacuity control for the source scan, and behaviour-preserving: the registration is spelled through a local alias, so the server is identical and `strings.Count(src, \"s.mux.HandleFunc(\")` is zero. A scan that finds nothing must fail, not pass -- this is the LSN-035/038 shape, and it is why the zero case is a separate branch from the wrong-count case.",
+      "catcher": "TestTheMuxHasExactlyOneRegistrationPoint",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/server.go",
+          "find": "\ts.registered = append(s.registered, path)\n\ts.mux.HandleFunc(path, h)",
+          "replace": "\ts.registered = append(s.registered, path)\n\tm := s.mux\n\tm.HandleFunc(path, h)"
+        }
+      ]
+    }
+  ]
+}

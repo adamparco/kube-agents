@@ -706,9 +706,12 @@ type safety over a value nothing in this process reads. They are rendered as `un
       **V-BRK-021 is _not_ deferred and stays green.** It is BLOCKING-ALWAYS, and a BLOCKING-ALWAYS
       check may never be deferred. What is deferred is the _task_; the check continues to assert what
       it asserts over the routes that exist. This distinction is the whole reason the ruling was
-      safe to take.
+      safe to take. **The blocker CLOSED 2026-07-30** — 09 §6 was edited by T7c-2c
+      below, which is exactly the promotion condition the deferral row named. The task itself moves
+      to Phase 10, where it is one unit with `/approve` against the one reshaped check.
 
-    - **P9-T7c-2c** — **the ruling arrived, and it is option (a): reshape V-BRK-021.** Scheduled
+    - **P9-T7c-2c** — **done 2026-07-30. The ruling arrived, and it is option (a): reshape
+      V-BRK-021.** Re-records **V-BRK-021** at L0 over the new form; sweep 10/10. Scheduled
       2026-07-30 from `BACKLOG.md` **B-003**, a human ruling on the deferral row 2b opened. The row's
       promotion condition was one sentence — _"this row closes when 09 or 05 is edited"_ — so this
       task is what closes it. **`todo`, and it is the next unit**, ahead of T8b-4b-ii-2b and T9b,
@@ -2906,6 +2909,67 @@ name" to the whole write path is an improvement-pass item. And three needles in 
 V-BRK-029 went `BROKEN` when the signatures and the skill text moved — not findings ([[LSN-048]]),
 but five in one unit is the first time a spec's needles have been this brittle, and needles anchored
 on a signature line are the pattern.
+
+### P9-T7c-2c — outcome, 2026-07-30
+
+**The number was never in the source.** V-BRK-021 asserted "one listening port, **one mutating
+route**" and cited 03 §4.1. 03 §4.1 contains no route count. What it contains is _"there is no other
+write path"_ and _"steps 1, 3, 4, 5, 6 and 11 are not skippable by any caller"_ — properties of the
+**pipeline**, not of an integer. "One mutating route" was a faithful proxy while exactly one route
+existed and became wrong the moment 05 §1.3's `replay` opened a second door into the same corridor,
+which is what halted T7c-2b on 2026-07-29. A human ruled option (a) — reshape the check — and this
+is that reshape. It is recorded as a **strengthening**, and PROTOCOL §10.2 is satisfied by the ruling
+rather than argued around: §10.2's remedy for weakening a BLOCKING-ALWAYS check is a halt for human
+review, and the review is the thing that scheduled this task ([`BACKLOG.md`](BACKLOG.md) B-003).
+
+**The shape.** `MutatingRoutes()` was `[]string{ActionsPath}` with a doc comment reading "Exactly
+one, and asserted." It is now `Registered()` less a declared non-mutating allowlist, where
+`Registered()` is written by `handle` — the single function that touches the mux. The subtraction
+runs in that direction on purpose: **the small set is the declared one**, so a route someone adds
+and forgets to think about lands in the _mutating_ set, where the 05 §1.3 subset assertion refuses
+it. Declaring the mutating routes and treating the remainder as harmless makes forgetting invisible,
+which is precisely what the hand-written literal did.
+
+**Four properties replaced one number**, and the count they replaced is now a consequence rather
+than an assertion: equality against the registered set, subset of the design table, an allowlist
+bounded to the three genuinely inert paths, and — new, and the clause that makes "non-skippability"
+mean what 03 §4.1 says — every mutating route reaches `Authenticator.Authenticate` and
+`Pipeline.Submit`, read off the call graph. A handler that answers 202 without touching the pipeline
+is a write with no journal entry and looks like success to its caller; nothing before this looked
+for it.
+
+**Two escapes, and the reason is general enough to be worth the paragraph.** The first sweep caught
+8 of 10. M3 rewrote `MutatingRoutes()` back into a literal and M4 rewrote `Registered()` into one —
+and every set relation in the new test still held, because **on a server with one mutating route a
+correct literal and a real derivation return the same answer**. "Derived, not declared" is not a
+property of a single observation; it is a property of how the reporter responds when the input
+changes, and a test that observes one server can never see it. Closed by building a second server
+that registers a path nothing else knows about: a literal cannot mention it. The same blindness
+applies to any check of the form "the accessor agrees with the facts" where the facts have only ever
+had one shape — and it is the second time in three units that a new check's first sweep found it
+weaker than its author believed, which is the argument for the sweep being part of VERIFY rather
+than a flourish.
+
+**One hole the sweep found in the design, not just the check.** M2 adds a route _and_ declares it
+non-mutating: it never enters the set the equality and subset arms measure, so both hold. The first
+draft's M2 was caught only because it happened to use a path `TestNoDebugRoutes` probes by name —
+caught by a guess, which is not caught. The real closure is the third arm: `nonMutatingPaths` may
+name only `/healthz`, `/v1alpha1/nonce` and the catch-all. A route excusing itself into the
+allowlist now fails on the allowlist.
+
+**What this did not do.** It did not implement `/replay` or `/approve` — those stay in Phase 10
+beside P10-T4/T7, as one unit against one reshaped check, and the T7c-2b deferral row closes on the
+09 edit exactly as its promotion condition said. It did not settle V-BRK-021's **L2** half: the
+2026-07-29 P9-T9 recon records it needing L0+L2 with only L1 evidence on file while the deferral row
+records it green at L0, and that reconciliation is **T9b's**. Touching a row does not earn the right
+to answer a question about it. The re-entry clause is in the row as a conditional over an **empty**
+population, and the suite logs it as empty rather than satisfied.
+
+**Retired with it:** `strings.Count(src, "s.mux.HandleFunc(") != 4`. It did catch a smuggled
+handler, and it also went red on every legitimate route, so its maintenance instruction was "raise
+the number until it passes" — a check you edit to make it pass is a check that will one day be
+edited past a real finding. Its replacement asserts that the count of _registration points_ is one,
+which no legitimate route addition changes.
 
 ---
 
