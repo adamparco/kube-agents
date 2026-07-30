@@ -1077,6 +1077,25 @@ readAt.IsZero()` is subsumed by the staleness ceiling (a zero read time is stale
       "integrity". Same shape as the P9-T7c-2b halt, where 09 cites 03 §4.1 for V-BRK-021's "one
       mutating route" and 03 §4.1 does not contain it. The property is well-defined in 09 itself, so
       this is a citation defect rather than a spec contradiction.
+    - **Split into 4a and 4b at SELECT, 2026-07-29.** The recon above is five findings deep and the
+      task carries two independent deliverables — a **conversion** between two packages' readings of
+      the same word, and a **mechanization** that discovers its own verb set. Each has its own check
+      and each is checkpointable alone, which is the `harness-run` §2 test. Doing them together
+      would mean a unit whose diff spans `classify`, `execute`, `pipeline` and a new lint, verified
+      by one check that did not exist when the work started.
+
+      | Unit                | Scope                                                                                                                                                                                                                                                                                                    | Checks               | Blocks on |
+      | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | --------- |
+      | **P9-T7c-4a** | The conversion. `apply`, `scale` and merge-patch reach the classifier with real `TouchedPaths`; the `stepResolve` reorder that makes `snap.Live` available before `classify.Resolve`; `apply` stops being `WholeObject`; the two false comments deleted. | **V-BRK-020**        | nothing   |
+      | **P9-T7c-4b** | The mechanization. **V-BRK-022** — every verb in the envelope's closed enum executes end to end through the assembled pipeline, the verb set **discovered from the enum** — plus exporting that enum and the lint joining it to `classify.KnownVerbs()`. Closes [[LSN-040]] and the `KnownVerbs` prose defect. | **V-BRK-022** (new)  | **4a**    |
+
+      **The complication LSN-040 warns about dissolves on inspection.** The lesson says feeding a
+      computed diff into `classify.PatchOp.Value` is lossy for the typed rules, because
+      `execute.DiffResult.Ops` render `Value` as a **string** and `DirectionOfBoolField` would see
+      `"true"`. But `classify.PatchOp.Value` is `any`, and for an `apply` the **desired object is in
+      hand** — so the diff supplies the *paths* and the desired object supplies the *typed values*.
+      Nothing has to be read back out of a rendered string. This is only true because both inputs are
+      available at the same point, which is what the `stepResolve` reorder buys.
 
 **Why T7c split into four.** T7c-1 was scoped as "assemble the pipeline and claim the two L1
 checks", and the assembly turned out to be the small part. Three things came out of doing it.
