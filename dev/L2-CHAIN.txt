@@ -237,6 +237,29 @@ bash dev/verify/broker-auth-l2.sh gke-scratch-kube-agents-dev
 # client.DryRunAll and a server-side dry-run is authorized before it is dry-run.
 bash dev/verify/actor-overlay-admission-l2.sh gke-scratch-kube-agents-dev
 
+# V-BRK-006 (its L2 clause) and V-REV-001 (n=1) — Phase 9 acceptance bullet (a), and the first line in
+# this chain whose evidence is an object the BROKER wrote. Everything else that reads an ActionRecord
+# reads one a test put there; this submits one well-formed envelope through the shipped client and
+# then judges what the journal actually holds.
+#
+# It goes AFTER actor-overlay-admission-l2.sh, as that line's own comment requires. The dependency is
+# real and not stylistic: the executor's step-8 apply is issued with client.DryRunAll, the API server
+# authorizes a dry-run before it dry-runs it, and the write grant that makes it possible is the one the
+# ruling above put outside the policy's population. Run this first and it fails 403 from inside the
+# executor, which reads like a broker defect.
+#
+# It also runs in the terminal group, for the same reason its two neighbours do: it deletes and
+# re-applies the platform-agent CR in kubeagents-system. It leaves the tenant namespace and the
+# ActionRecord standing on purpose ([[LSN-045]]) — kube-agents-journal-retention denies DELETE of a
+# record until export confirms, so a suite that tore its namespace down would hang forever on its own
+# evidence.
+#
+# WHAT IT DOES NOT CLAIM, so the next reader does not go looking: V-BRK-018 and V-REV-003 are fault
+# injection and belong to P9-T9b-5b-ii; V-REV-002 needs an undo executed; V-BRK-019's field-manager
+# string is unreadable from a shadow because a server-side dry-run persists no managedFields. The
+# suite's own header carries the full accounting.
+bash dev/verify/broker-execute-l2.sh gke-scratch-kube-agents-dev
+
 # --- Phase 9's gate ------------------------------------------------------------------------------
 # verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the
 # two suites P9-T9b-5 still owes, the L0 chain run as a file, and the whole prior ratchet through the

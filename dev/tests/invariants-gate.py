@@ -1554,7 +1554,9 @@ CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
 # Raised 16 -> 17 on 2026-07-30 (P9-T9b-5a): actor-overlay-admission-l2.sh, the line that executes
 # the phase's admission ruling. Moved in the same commit as the line it counts, which is the only
 # way this ratchet is ever allowed to move upward.
-L2_CHAIN_FLOOR = 17
+# Raised 17 -> 18 on 2026-07-30 (P9-T9b-5b-i): broker-execute-l2.sh, acceptance bullet (a). Same
+# commit as the line, same rule.
+L2_CHAIN_FLOOR = 18
 # How many scripts the TRANSITIVE scope held when it was widened (2026-07-25, P8-T8). A separate
 # ratchet from the one above because the two guard different things: L2_CHAIN_FLOOR notices a line
 # leaving L2-CHAIN.txt, this one notices a claim-making script leaving the closure — including one
@@ -1567,7 +1569,9 @@ L2_CHAIN_FLOOR = 17
 # Raised 25 -> 26 on 2026-07-30 (P9-T9b-5a): actor-overlay-admission-l2.sh. It joins by being named
 # on a chain line rather than by being reached from one, so both floors move together this time —
 # they will not always, and the day they diverge is the day one of the two is doing work.
-L2_SCOPE_FLOOR = 26
+# Raised 26 -> 27 on 2026-07-30 (P9-T9b-5b-i): broker-execute-l2.sh, also named on a chain line, so
+# both floors move together a second time.
+L2_SCOPE_FLOOR = 27
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:

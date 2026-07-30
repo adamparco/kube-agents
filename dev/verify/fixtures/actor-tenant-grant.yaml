@@ -81,6 +81,25 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets", "statefulsets"]
     verbs: ["get", "list", "watch"]
+  # The namespace OBJECT, which is not one of the workload kinds above and is easy to miss for
+  # exactly that reason. `classify/resolve.go` reads namespace LABELS for every operation that
+  # names a namespace, because namespace labels are a classification input — an `apply` into a
+  # namespace labelled production is not the same action as the same apply into a scratch one.
+  # So this read happens before any risk class exists, on every envelope, and an actor without it
+  # gets `403 target-forbidden` from inside the executor at step 3 with a message about namespaces
+  # rather than about its target. `broker-execute-l2.sh` is what found that: it is the first suite
+  # to drive a real envelope through the pipeline, and the earlier suites all stopped at a refusal
+  # upstream of the read.
+  #
+  # `get` alone, deliberately. The pipeline calls `GetNamespaceLabels`, which is a single-object
+  # read; `list` and `watch` on a cluster-scoped kind are not requests a namespaced Role can
+  # authorize anyway, so granting them would be a rule that reads as authority and confers none.
+  # What this Role does confer is `get` on ONE namespace — the tenant's own — because a RoleBinding
+  # in ${KAGE_TENANT_NS} only matches requests whose namespace is ${KAGE_TENANT_NS}, and for the
+  # namespaces resource that is the object's own name.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

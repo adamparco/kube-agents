@@ -279,6 +279,34 @@ func buildBrokerDeployment(agent *agentv1alpha1.Agent) *appsv1.Deployment {
 						Name:  "broker",
 						Image: brokerImage(),
 						Args:  brokerArgs(agent),
+						// The broker's own write identity, taken from the pod spec by the
+						// downward API rather than derived a second time here.
+						//
+						// This is the value the broker stamps into
+						// `ActionRecord.spec.actorServiceAccount`, and the journal admission
+						// policy (`kube-agents-agent-scope-journal`) decides whether a status
+						// write comes from the owning broker by comparing
+						// `system:serviceaccount:<record namespace>:<that field>` against the
+						// authenticated user. So the field is not descriptive: it is one half of
+						// an equality the API server evaluates, and the other half is the SA the
+						// kubelet actually projected a token for.
+						//
+						// `spec.serviceAccountName` is set eleven lines above from
+						// `actorServiceAccountName(agent)`. Writing that call here too would put
+						// the two halves of the equality in two places that agree only as long as
+						// nobody edits one -- and the failure mode is silent, because a broker
+						// that names an identity it does not hold starts, serves, classifies,
+						// journals the record, and is refused only on the status write that makes
+						// the record mean anything. Reading it back off the pod makes the two
+						// halves the same value by construction.
+						Env: []corev1.EnvVar{{
+							Name: "KAGE_BROKER_SERVICE_ACCOUNT",
+							ValueFrom: &corev1.EnvVarSource{
+								FieldRef: &corev1.ObjectFieldSelector{
+									FieldPath: "spec.serviceAccountName",
+								},
+							},
+						}},
 						Ports: []corev1.ContainerPort{{
 							Name:          brokerPortName,
 							ContainerPort: broker.Port,

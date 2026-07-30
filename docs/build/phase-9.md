@@ -2398,6 +2398,33 @@ server would do with it.
 
 **The denominator moves by two more.**
 
+#### T9b-5b splits in two: T9b-5b-i and T9b-5b-ii
+
+**Recorded 2026-07-30, at SELECT, under `harness-run` §2 sizing.** The row above bundles three
+subjects that share only the fact that they all point at a running broker. Accept (a) is a
+**positive**: submit one well-formed envelope and read back what the journal recorded. Accept (d)'s
+journal half is a **fault injection**: take the journal away from a broker that is already serving
+and watch it decline. V-BRK-021's L2 half is a **surface scan**: debug routes, override parameters,
+the ten bypass headers, one listening port, no build-tag skip path. Three different fixtures, three
+different failure modes, and only the first of them establishes the submission path the other two
+need to be interesting.
+
+| Unit          | What it is                                                                                                    | Checks                                                                       | Level |
+| ------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ----- |
+| **T9b-5b-i**  | `broker-execute-l2.sh` — one envelope: submit → classify → journal → shadow-execute, and the record read back | V-BRK-006 (L2 clause), V-REV-001 (n=1) — **revised at IMPLEMENT, see below** | L2    |
+| **T9b-5b-ii** | The journal-unavailable refusal (Accept (d)'s half) and V-BRK-021's L2 surface scan, on the same driver       | V-BRK-021, V-BRK-018, V-REV-003, Accept (d) journal half                     | L2    |
+
+**Why the positive goes first, and alone.** `verify-phase9.sh` section B says in its own words that
+"an envelope flows end-to-end in shadow mode and produces a well-formed `ActionRecord` with a valid
+undo plan" **has never been executed once against a cluster** — four suites prove the undo machinery
+and not one of them submits an envelope. That sentence is the phase's largest unmeasured claim, and
+it is worth landing on its own rather than as the first third of a unit whose other two thirds are
+fault injection. It is also the strict prerequisite: a journal-unavailable refusal is only evidence
+if the same envelope succeeds when the journal is there, and 5b-ii's fixture is 5b-i's fixture with
+one thing broken.
+
+**The denominator moves by one more.**
+
 ---
 
 ### P9-T9b-1 — outcome, 2026-07-30
@@ -3686,3 +3713,228 @@ next improvement pass. Separately, `kubeagents-router` is in `CrashLoopBackOff` 
 cluster with 466 restarts over 39 hours, unrelated to this unit and unexamined.
 
 **The denominator moves by one.** T9b-5a is closed; 5b and 5c remain.
+
+### P9-T9b-5b-i — outcome, 2026-07-30
+
+**Landed:** `dev/verify/broker-execute-l2.sh` (new, `--negative-control` 13/13),
+`dev/verify/fixtures/broker_execute_probe.py` (new), the driver parameterization in
+`dev/lib/broker-driver.sh`, one `dev/L2-CHAIN.txt` line, `L2_CHAIN_FLOOR` 17→18 and
+`L2_SCOPE_FLOOR` 26→27 in the same commit.
+
+**Acceptance bullet (a) has now been executed.** "An envelope flows end-to-end in shadow mode and
+produces a well-formed `ActionRecord` with a valid undo plan" was the phase's largest unmeasured
+claim: four suites proved the undo machinery and every one of them started from an `ActionRecord` a
+test had written. This is the first line in the chain whose evidence is an object the **broker**
+produced.
+
+#### The claim set was cut in half at IMPLEMENT, and that is the finding
+
+The SELECT-time row claimed V-BRK-006, V-BRK-018, V-BRK-019, V-REV-002 and V-REV-003. Four of the
+five are not observable from a single successful shadow submission, and writing the suite is what
+surfaced it. Each is recorded here with where it went, because a check ID silently dropped between
+planning and implementation is indistinguishable from one that was never planned:
+
+| ID            | Why a shadow submit cannot witness it                                                                                                                                                                              | Where it went                                        |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------- |
+| **V-BRK-018** | "Snapshot-persist failure ⇒ refuse; neither target applied" is fault injection over a multi-target envelope. Nothing in this suite fails, deliberately.                                                            | **T9b-5b-ii**                                        |
+| **V-BRK-019** | The field-manager string is unreadable from a shadow: a server-side dry-run persists no `managedFields`, so there is nothing on the object to read the manager off. Needs a real apply, which Phase 9 does not do. | **Carried, unscheduled** — named in the suite header |
+| **V-REV-002** | `undo <id>` restores prior state. Requires executing an undo.                                                                                                                                                      | Later phase                                          |
+| **V-REV-003** | "No generatable undo plan ⇒ reclassified gated" is the **negative** of what this suite asserts, and needs an operation whose inverse does not exist. This envelope's inverse does.                                 | **T9b-5b-ii**                                        |
+
+What replaced them is **V-REV-001**, which nobody had scheduled here and which fits precisely: the
+record carries a validated undo plan the broker generated. Its row says "100%" and this is n=1, so
+the `results.csv` note says n=1 and names P9-T8b-4b-ii-2b-ii's corpus soak as what makes it a
+population claim. A suite that reported "100%" off one record would be the exact defect
+`broker-auth-l2.sh`'s assertion counter exists to prevent, one level up.
+
+**V-BRK-006 is claimed for its L2 clause only.** 09 §6 lists the row at L2 **and** L4 for a reason:
+"the record exists before the mutation" is observable from a running cluster, and "a broker killed
+mid-action leaves no unjournaled write" is not. The L2 half is asserted across **two clocks and two
+writers** — `metadata.creationTimestamp`, which the API server assigns, against
+`status.timestamps.executionStarted`, which the broker stamps when it issues the first mutating
+call. Equal stamps pass: RFC3339 here is second-granular and a fast pipeline routinely produces
+identical values, so treating equality as a violation would fail the arm for being quick.
+
+#### Two things the suite refuses to read from a second copy
+
+**The legal phase set comes off the served CRD**, not from `actionrecord_phases.go` and not from a
+list in the file. Either of those would be the suite agreeing with a copy of the same enum and would
+stay green on a cluster serving a different one. The `--negative-control` arm does hold the tree's
+list, and that is correct there: it is testing the assertion block, not a cluster, and
+`invented-phase` needs a set to be invented against.
+
+**The target object's name comes off the probe's own `note` line.** The suite has to go looking for
+an object after the run to answer "did the shadow mutate anything", and the probe is where that
+object's identity is decided. A suite that hardcoded the name would check the right object today and
+the wrong one the day the probe's constant changed — and checking the wrong object for absence
+always passes.
+
+#### The `¬` arm, and the bug it would have had
+
+Thirteen cases: eleven documents each broken in exactly one way, plus a correct one that must go
+**green** (an assertion block that failed everything would "catch" all eleven for the wrong reason),
+plus two that are not documents at all — the world in which the shadow created the object, and the
+world in which the suite could not tell. Every row carries a **needle**, and counts as caught only
+when a `FAIL:` line contains it (LSN-035): without that, breaking `jrec` would score 13/13 while
+proving the suite is broken.
+
+The first draft read the verdict off `$fail`. `assert_record` runs inside a command substitution,
+which is a subshell, so every `fail=1` it set died with it — the arm would have reported all eleven
+mutants as escapes. `broker-auth-l2.sh` counts `^PASS:`/`^FAIL:` lines for exactly this reason and
+the note is now in this file's header too.
+
+#### P1 fired on the first live run, and that is the second finding
+
+The first invocation against `gke-scratch-kube-agents-dev` stopped at P1: the deployed controller
+was `dev-7c4e163` against a tree at `8ffb43e`. This is the ordering rule Phase 9 wrote down for
+itself — every commit invalidates P1 for every L2 suite still to come — arriving on schedule, and
+the reason all remaining L0/L1 work goes in front of the remaining L2 work. Resolved with
+`dev/cluster/reload-images.sh operator gke-scratch-kube-agents-dev`, which deploys by digest.
+
+It then fired a **second** time, on a different image, and that is worth recording separately
+because the first resolution looked complete. The broker is not the controller: it is `kage-broker`,
+built and deployed by its own `reload-images.sh broker` target, which sets `KUBEAGENTS_BROKER_IMAGE`
+**on the controller** rather than on a Deployment, because the operator renders one broker per Agent
+CR and `brokerImage()` reads its own environment. P1 for any broker suite therefore requires **both**
+targets to have been run, and a suite that checked only the controller would report a current build
+while testing a stale broker. Both arms are in the suite for that reason.
+
+#### The defect the suite was written to find, which it found on its first run past P1
+
+**No deployed broker could write any ActionRecord's status. Ever, in any namespace.**
+
+`kube-agents-agent-scope-journal` matches `UPDATE` on `actionrecords/status` and decides whether the
+writer is the owning broker with
+
+```cel
+request.userInfo.username == 'system:serviceaccount:' + object.metadata.namespace + ':' + object.spec.actorServiceAccount
+```
+
+The left side is the ServiceAccount the kubelet projected a token for. The right side is whatever the
+broker process stamped into the record, which came from `brokerServiceAccount()` in
+`k8s-operator/cmd/broker/main.go`, which read `KAGE_BROKER_SERVICE_ACCOUNT` — **a variable nothing in
+the repository set** — and fell back to the literal `"kage-broker"`. That string is the name of the
+broker _image_. It is not a ServiceAccount anywhere in this tree; `grep` finds the literal at exactly
+one site, and every other occurrence of the token is an image reference. Meanwhile the pod runs as
+`actorServiceAccountName(agent)` — `<tier>-<leaf>-actor`, set eleven lines above the container spec.
+
+So the equality compared `…:kage-broker` against `…:platform-your-gcp-project-id-actor` and could not
+hold for any agent, on any cluster, at any time.
+
+What makes this the right defect for Accept (a) to have caught is **where** it surfaces. It is not a
+startup failure. The broker starts, serves TLS, authenticates the caller, validates the envelope,
+classifies it, and _creates_ the record — `Store.Create` succeeds, because the policy does not match
+CREATE. The refusal lands on the very next line, `s.client.Status().Update`, which is where
+`journal/store.go` writes the initial phase that the CREATE dropped along with the rest of the status
+subresource. Every record would sit at an empty `status.phase` with a status _label_ claiming
+otherwise — the exact inversion that store.go's own comment says was fixed once already — and every
+refusal would go unjournaled, contrary to 06 §4.1.
+
+Nothing could have seen it below L2. The envtest suites use a client whose identity is the test's,
+the golden manifest tests asserted the pod's `serviceAccountName` and had no reason to ask what the
+process would later _say_ that name was, and the two halves of the equality live in different
+repositories of thought: one in `internal/controller/broker_manifests.go`, one in `cmd/broker`. It
+required an authenticated agent submitting a real envelope at a deployed broker with the live
+admission policies loaded, which is the definition of this suite and the reason Phase 9 exists.
+
+**The fix is the downward API, not a second derivation.** `buildBrokerDeployment` now sets
+
+```yaml
+env:
+  - name: KAGE_BROKER_SERVICE_ACCOUNT
+    valueFrom:
+      fieldRef:
+        fieldPath: spec.serviceAccountName
+```
+
+and `brokerServiceAccount()` has no fallback at all. Writing `actorServiceAccountName(agent)` into
+the env would have been the smaller diff and would work today; it would also put the two halves of an
+equality the API server evaluates into two places that agree only as long as nobody edits one. Read
+off the pod, they are the same value by construction. Removing the fallback matters independently:
+`pipelineConfig` already refuses an empty actor service account before the listener opens, and the
+default defeated that guard by converting _unconfigured_ into _confidently wrong_ — the strictly
+worse state, because unconfigured fails at startup where someone is watching.
+
+`TestBrokerRecordsTheIdentityItHolds` is the L1 guard. It asserts the fieldRef, not the presence of
+the variable, and a three-mutant check confirms it: dropping the env block, pointing the fieldRef at
+`metadata.name`, and — the one that matters — replacing the fieldRef with a **correct literal** are
+all caught. The third is the regression wearing a disguise, and a test that only asked "is the value
+right?" would wave it through.
+
+#### The other finding, which was a gap in this suite's own fixture
+
+The run before that one stopped one step earlier, at step 3, with
+`403 target-forbidden … cannot get resource "namespaces"`. `classify/resolve.go` reads namespace
+**labels** for every operation that names a namespace, because a namespace label is a classification
+input — an apply into a namespace labelled production is not the same action as the same apply into a
+scratch one. That read happens before any risk class exists, on every envelope.
+
+`actor-tenant-grant.yaml` grants "the kinds the broker's step-3 live reads actually touch" and states
+in its own comment that a kind the pipeline never reads is a kind it must not grant. The namespace
+object _is_ a kind the pipeline reads, and it was missing — the fixture was incomplete against its
+own stated rule. It now grants `get` on `namespaces`, and `get` alone: `GetNamespaceLabels` is a
+single-object read, and `list`/`watch` on a cluster-scoped kind are not requests a namespaced Role
+can authorize, so granting them would read as authority while conferring none. The RoleBinding lives
+in the tenant namespace, so what this actually confers is `get` on that one namespace's own object.
+
+**Filed, not fixed:** the shipped actor grant
+(`k8s-operator/scripts/broker-operations-grant.yaml.template`, 06 §2.2.1) has no `namespaces` rule
+either, and a production broker needs this read for every namespaced operation it classifies. Those
+twenty triples are single-sourced and V-BRK-013 asserts exact equality against them, so adding one is
+a ruling with its own unit — the same shape as P9-T9b-5a — and not something to slip into a suite.
+
+#### The third finding is a halt, and the first two are why it is legible
+
+With the namespace read granted, the next run reached the same step and stopped one call later:
+
+```
+403 target-forbidden — step 3: … resolving lower-tier owner: listing Agents to find a lower-tier
+owner: agents.kubeagents.x-k8s.io is forbidden: … cannot list resource "agents" … at the cluster scope
+```
+
+That is not another missing line in a fixture. Reading outward from it, **06 §2.2.1's actor grant is
+not sufficient for the gates 06 §3 and 06 §4.2 require the actor to run**, and every way of making it
+sufficient costs something the specs elsewhere say must not be spent. Four reads, in the order the
+executor makes them:
+
+| Read                                       | Site               | On refusal                                                                                                                                                                 | Covered by the twenty triples?                                                        |
+| ------------------------------------------ | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| namespace labels                           | `resolve.go:88`    | hard error → refuse                                                                                                                                                        | **no** (fixture now grants it; shipped grant does not)                                |
+| `list agents`, **cluster-scoped**          | `livestate.go:335` | hard error → refuse, deliberately: "returning [no owner] when the truth is 'I could not look' would drop the gate exactly when the API server is unhealthy"                | **no** — granted namespaced, and a RoleBinding cannot authorize a cluster-scoped list |
+| every discovered namespaced kind, in scope | `livestate.go:240` | **tolerated** per kind — the count survives holes — but `listed == 0` is a hard error                                                                                      | no, and mostly should not be                                                          |
+| `list secrets`, **in the caller's scope**  | `livestate.go:295` | hard error → refuse; "an empty digest set would report 'no secret material in this payload' for every payload, which is the exfiltration gate answering yes to everything" | **no**                                                                                |
+
+The last row is the wall. For a platform-tier caller `scope.Namespace` is empty, so "the caller's
+scope" is the cluster, and the material-egress gate wants to read **every Secret value in the
+cluster** on every envelope. The code that does it says so plainly — `secretegress.go` calls the
+resulting map "a much better target than the Secrets themselves, since it is pre-collected and
+cross-namespace" — and `SecretDigests` zeroes its copies for that reason.
+
+Three resolutions exist and the harness may not pick one:
+
+1. **Widen the grant** to cluster-wide `list secrets`. This hands the broker the authority the design
+   documents describe as the better target, in order to run the gate that exists to stop
+   exfiltration. It also multiplies through six copies and every cluster the cascade template
+   renders.
+2. **Narrow the gates' reads** to the target's namespace. `resolve.go` pre-empts this in writing: the
+   digest set "is scoped to the CALLER, not to the target namespace … the exfiltration shape is
+   reading in one namespace and writing in another — so scoping the set to the write's namespace
+   would miss precisely the case worth catching." This is a documented security property and
+   narrowing it is a weakening.
+3. **Move the supply to the operator**, which already holds a cluster-wide cache legitimately and is
+   what `ownership.go` says production does: "Implemented over the operator's cached Agent lister in
+   production." The broker's own `l.Client.List` may be the deviation rather than the requirement.
+   This is the most likely correct answer and it is an architecture change, not a grant edit.
+
+Every path either weakens a property a spec states in its own words or changes where a gate's data
+comes from. That is PROTOCOL §8.5 — a spec contradiction with no resolution available to the harness
+that preserves every invariant — so it is recorded as a halt rather than decided here.
+
+**Why the claims cannot be deferred instead.** V-BRK-006 is BLOCKING-ALWAYS and green at no level;
+`check_deferrals_name_blockers` refuses exactly that row, and it is right to. Recording a deferral
+would be the softer word for a failure, which is the thing that check exists to prevent.
+
+What this unit does land is real and independently verified: the identity defect and its L1 guard,
+the fixture's missing namespace read, and the suite, probe, chain line and floors that produced all
+three findings. The suite's own verdict on the run is `rc 3 DEFERRED` with the blocker printed — it
+declined to score V-BRK-006 or V-REV-001, which is the behaviour it was built to have.

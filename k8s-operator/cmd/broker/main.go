@@ -383,11 +383,24 @@ func (o *options) tlsConfig() (*tls.Config, error) {
 
 // brokerServiceAccount reports the broker's own write identity for the journal's `actor` field.
 // Recorded so a record says who COULD have written, distinct from who asked.
+// brokerServiceAccount is the identity this broker actually holds, projected into the pod by the
+// downward API from `spec.serviceAccountName` (see buildBrokerDeployment).
+//
+// There is no fallback, and the missing one is the point. It used to return "kage-broker" -- the
+// IMAGE's name, which is not a ServiceAccount anywhere in this repo -- and that default is why a
+// deployed broker could never write a record's status: it stamped `spec.actorServiceAccount:
+// kage-broker` into every ActionRecord, the journal policy computed `isOwningBroker` as
+// `system:serviceaccount:<ns>:kage-broker`, and the authenticated user was
+// `system:serviceaccount:<ns>:<tier>-<leaf>-actor`. The equality could not hold for any broker, in
+// any namespace, ever, and nothing said so until an envelope was submitted at a real one.
+//
+// `pipelineConfig` already refuses an empty actor service account before the listener opens. The
+// default defeated that guard by turning "unconfigured" into "configured wrong", which is the
+// strictly worse of the two states: unconfigured fails at startup where someone is watching, and
+// configured-wrong fails on the status write, after the action has been classified and the record
+// created, in a code path nothing exercised without a cluster.
 func brokerServiceAccount() string {
-	if v := os.Getenv("KAGE_BROKER_SERVICE_ACCOUNT"); v != "" {
-		return v
-	}
-	return "kage-broker"
+	return os.Getenv("KAGE_BROKER_SERVICE_ACCOUNT")
 }
 
 func envOr(key, fallback string) string {

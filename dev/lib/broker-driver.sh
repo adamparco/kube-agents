@@ -70,6 +70,39 @@ BROKER_DRIVER_UNTRUSTED_TLS_DIR=/etc/kage/untrusted
 # makes ten requests, most of which fail fast; a run that exceeds this is stuck, not slow.
 BROKER_DRIVER_TIMEOUT="${BROKER_DRIVER_TIMEOUT:-300}"
 
+# WHICH PROBE THE POD RUNS (P9-T9b-5b-i)
+#   Everything above is about putting a real caller at the door; what that caller then ASKS is a
+#   separate question, and there is now more than one answer. `broker_probe.py` presents ten
+#   credentials and asserts on refusals; `broker_execute_probe.py` presents one and asserts on what
+#   the journal recorded. Both need the same certificate, the same audience-bound token and the same
+#   hostAliases short-circuit, and none of that is worth a second copy.
+#
+#   Set through `broker_driver_use_probe`, never by assigning these two directly: they must agree
+#   (the mounted key is what the command executes) and a suite that set one would get a pod that
+#   runs a file which is not there. The default is the original probe, so every existing caller is
+#   unchanged by this.
+BROKER_DRIVER_PROBE="dev/verify/fixtures/broker_probe.py"
+BROKER_DRIVER_PROBE_NAME="broker_probe.py"
+
+# The tenant namespace the probe should aim a write at, when it aims one. Empty for probes that do
+# not — `broker_probe.py` targets its own namespace and ignores this.
+BROKER_DRIVER_TENANT_NS="${BROKER_DRIVER_TENANT_NS:-}"
+
+# broker_driver_use_probe <path-relative-to-repo-root>
+#   Both halves at once. rc 1 if the file is not there, which is the whole reason this is a function
+#   and not two assignments: a typo'd path would otherwise surface as a pod that exits 2 with
+#   "can't open file", four minutes after the suite started.
+broker_driver_use_probe() {
+  local rel="$1" root
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+  if [ ! -f "$root/$rel" ]; then
+    echo "broker_driver_use_probe: no probe at $rel (relative to $root)" >&2
+    return 1
+  fi
+  BROKER_DRIVER_PROBE="$rel"
+  BROKER_DRIVER_PROBE_NAME="${rel##*/}"
+}
+
 # broker_driver_env <kubectl-cmd> <namespace> <agent> <ENV_NAME>
 #   One value from the RENDERED agent Deployment (P6), never reconstructed from the naming
 #   functions. `brokerEndpoint`, `brokerSAN` and `agentIdentity` all exist in Go and would each be a
@@ -108,7 +141,7 @@ broker_driver_apply_code() {
   $K -n "$ns" create configmap "$cm" \
     --from-file=broker_client.py="$root/agents/platform/scripts/broker_client.py" \
     --from-file=action_envelope.py="$root/agents/platform/scripts/action_envelope.py" \
-    --from-file=broker_probe.py="$root/dev/verify/fixtures/broker_probe.py" \
+    --from-file="$BROKER_DRIVER_PROBE_NAME=$root/$BROKER_DRIVER_PROBE" \
     --dry-run=client -o yaml | $K apply -f - >/dev/null || return 1
 }
 
@@ -220,7 +253,7 @@ spec:
   containers:
     - name: probe
       image: python:3.12-slim
-      command: ["python3", "$BROKER_DRIVER_CODE_MOUNT/broker_probe.py"]
+      command: ["python3", "$BROKER_DRIVER_CODE_MOUNT/$BROKER_DRIVER_PROBE_NAME"]
       securityContext:
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
@@ -245,6 +278,8 @@ spec:
           value: "$tls_dir"
         - name: PROBE_NAMESPACE
           value: "$ns"
+        - name: PROBE_TENANT_NAMESPACE
+          value: "$BROKER_DRIVER_TENANT_NS"
         - name: PROBE_FOREIGN_TLS_DIR
           value: "$BROKER_DRIVER_FOREIGN_TLS_DIR"
         - name: PROBE_UNTRUSTED_TLS_DIR

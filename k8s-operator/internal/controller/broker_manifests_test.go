@@ -570,6 +570,55 @@ func TestTwoAgentsOfOneTierGetDistinctIdentities(t *testing.T) {
 	}
 }
 
+// TestBrokerRecordsTheIdentityItHolds is the L1 guard on the equality the journal admission policy
+// evaluates, and it exists because both halves of that equality were once computed separately and
+// disagreed for every broker that has ever run.
+//
+// `kube-agents-agent-scope-journal` decides "is this the owning broker?" as
+//
+//	request.userInfo.username == 'system:serviceaccount:' + object.metadata.namespace + ':' + object.spec.actorServiceAccount
+//
+// The left side is the SA the kubelet projected a token for — `spec.serviceAccountName`. The right
+// side is whatever the broker process stamped into the record, which is `brokerServiceAccount()`,
+// which reads KAGE_BROKER_SERVICE_ACCOUNT. Nothing set that variable, so it fell back to a literal
+// "kage-broker" — the name of the IMAGE, which is not a ServiceAccount anywhere in this repo. The
+// two sides could not be equal for any agent, in any namespace, and the symptom was not a startup
+// failure but a denied status write AFTER the record had been created: every ActionRecord stuck at
+// an empty phase, and every refusal unjournaled, contrary to 06 §4.1.
+//
+// So the assertion is not "the env var is present". It is that the env var is sourced from the pod
+// field that decides the other side, because a literal here that merely happens to match today is
+// the same defect with a better disguise. `broker-execute-l2.sh` proves it end to end against a
+// real API server; this proves it without one, which is where a regression would be reintroduced.
+func TestBrokerRecordsTheIdentityItHolds(t *testing.T) {
+	agent := brokerTestAgent("payments", "team-payments", agentv1alpha1.TierDeveloperTeam,
+		&agentv1alpha1.ScopeSpec{ProjectID: "acme-prod", ClusterName: "eu-1", Namespace: "team-payments"})
+	dep := buildBrokerDeployment(agent)
+
+	var found *corev1.EnvVar
+	for i, e := range dep.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "KAGE_BROKER_SERVICE_ACCOUNT" {
+			found = &dep.Spec.Template.Spec.Containers[0].Env[i]
+		}
+	}
+	if found == nil {
+		t.Fatal("the broker is started without KAGE_BROKER_SERVICE_ACCOUNT; it will record an actor " +
+			"identity it does not hold and the journal policy will refuse every status write")
+	}
+	if found.Value != "" {
+		t.Errorf("KAGE_BROKER_SERVICE_ACCOUNT is a literal %q; it must come from the pod's own "+
+			"spec.serviceAccountName, or it is a second copy of a value that must not drift", found.Value)
+	}
+	switch {
+	case found.ValueFrom == nil || found.ValueFrom.FieldRef == nil:
+		t.Fatal("KAGE_BROKER_SERVICE_ACCOUNT must be a downward-API fieldRef")
+	case found.ValueFrom.FieldRef.FieldPath != "spec.serviceAccountName":
+		t.Errorf("KAGE_BROKER_SERVICE_ACCOUNT reads %q; the journal policy compares against the SA "+
+			"the pod runs as, so it must read spec.serviceAccountName",
+			found.ValueFrom.FieldRef.FieldPath)
+	}
+}
+
 // envValue reads one env var off the agent container.
 func envValue(dep *appsv1.Deployment, name string) string {
 	for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
