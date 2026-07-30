@@ -123,6 +123,33 @@ python3 dev/tests/scope-label-single-sourced.py --negative-control
 python3 dev/tests/one-broker-per-agent.py
 python3 dev/tests/one-broker-per-agent.py --negative-control
 
+# V-RUN-010 (P9-T9b-3): the broker's supply chain, image, socket count and mount set are minimal --
+# 08 §2.1's "smallest possible supply chain" and 08 §2.6's shell-free, read-only, two-mount pod. Six
+# properties, and the load-bearing one is the FIRST-PARTY IMPORT GRAPH walked textually from
+# `cmd/broker`: no package this repository owns and the broker links may import a shell, a plugin
+# loader, an interpreter, an inference client or a debug HTTP surface. It is textual because L0 CI
+# has Python and no Go toolchain, and it is a graph walk rather than a scan of `cmd/broker` because
+# all three defects it found on landing were a package or more away from main.
+#
+# Those three are why this check is not a formality. `internal/journal` held the Cloud Logging audit
+# source, so the broker binary shipped `exec.CommandContext` on a configurable argv -- unreachable,
+# since nothing constructed one, and one call site from reachable in the only process whose
+# ServiceAccount can write. `cmd/broker` carried kubebuilder's scaffolded
+# `_ "k8s.io/client-go/plugin/pkg/client/auth"`, which is a credential PLUGIN LOADER: its purpose is
+# to let a kubeconfig name a binary the client will fork. And `ctrl "sigs.k8s.io/controller-runtime"`
+# is a facade over `pkg/manager`, which imports `net/http/pprof`, whose init registers /debug/pprof
+# on http.DefaultServeMux -- while main.go's own package doc had claimed "no pprof" since it was
+# written. No image scan, SBOM or RBAC review shows any of the three: a distroless image with no
+# /bin/sh is shell-free by every measure except the one that matters, which is what the process can
+# still fork. The other five properties are the module SBOM (direct requires only -- `cel-go` is in
+# the indirect closure by way of k8s.io/apiserver and no import discipline here removes it), the
+# entry package's blank imports, the Dockerfile runtime stage (shell-free repo AND tag: `:debug` is
+# the same base plus busybox), one listener agreeing with one containerPort and one servicePort, and
+# the closed mount inventory on a read-only root. `--negative-control` is the `¬` of 09 §6; its base
+# arm is there because the check's first draft matched the base by prefix and accepted `:debug`.
+python3 dev/tests/broker-supply-chain-minimal.py
+python3 dev/tests/broker-supply-chain-minimal.py --negative-control
+
 # V-BRK-013 (P9-T7d-3): the broker-operations grant is written down once, in 06 §2.2.1, and every
 # copy of it agrees with THAT rather than with a sibling copy. The grant currently exists in six
 # places -- the spec, three copies of `vap-agent-readonly` (canonical, materialized, and the cascade

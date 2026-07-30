@@ -2514,6 +2514,92 @@ at 13/13.
 
 ---
 
+### P9-T9b-3 — outcome, 2026-07-30
+
+**V-RUN-010 — "Broker supply-chain minimality" (08 §2.1, §2.6, L0, `¬`) — recorded for the first
+time.** New: `dev/tests/broker-supply-chain-minimal.py`, two lines in `dev/L0-CHAIN.txt`, negative
+control **15/15**.
+
+**The unit found three real defects, all of them shipped, all of them invisible to the review that
+would normally be trusted for this property.** Writing the check is what found them; none was
+suspected going in.
+
+1. **`os/exec` was in the broker binary via first-party code.** `internal/journal/auditsource.go`
+   held `CloudLoggingSource`, which runs `exec.CommandContext(ctx, c.bin(), "logging", "read", …)`
+   where `c.bin()` defaults to `"gcloud"` and is a settable struct field. `internal/journal` is
+   linked into `cmd/broker` both directly and through `internal/broker`. It was unreachable —
+   nothing outside its own tests constructs one — which is precisely why nothing noticed, and it was
+   one call site from reachable inside the only process in the mesh whose ServiceAccount can write.
+   Fixed by extracting it to **`internal/journal/cloudaudit`**, a package whose consumer is the
+   V-BRK-003 reconciler in the operator and never the broker. The package boundary is the
+   enforcement; the doc comment says so, and `var _ journal.AuditSource = (*Source)(nil)` sits at
+   the boundary so the split implementation cannot drift from the interface silently.
+2. **A plugin loader was registered on purpose.** `cmd/broker/main.go` carried kubebuilder's
+   scaffolded `_ "k8s.io/client-go/plugin/pkg/client/auth"`. That import's entire job is to register
+   out-of-process credential providers so a kubeconfig may name a binary for the client to fork. The
+   broker authenticates exactly one way, with the projected token the kubelet mounts. Deleted.
+3. **`net/http/pprof` was linked in, and the file's own doc comment said it was not.**
+   `ctrl "sigs.k8s.io/controller-runtime"` is a facade over `pkg/manager`, `pkg/builder` and
+   `pkg/controller` — an entire controller runtime in a process that runs no controller — and
+   `pkg/manager` imports `net/http/pprof`, whose package init registers `/debug/pprof` on
+   `http.DefaultServeMux`. main.go's package doc has claimed "No metrics listener, no pprof, no
+   admin socket, no second Service" since the file was written. Replaced with the four narrow
+   subpackages (`pkg/client`, `pkg/client/config`, `pkg/log`, `pkg/log/zap`, `pkg/manager/signals`),
+   four call-site renames, no behaviour change. `go list -deps ./cmd/broker` went from
+   `{os/exec, runtime/pprof, net/http/pprof}` to `{os/exec}`.
+
+**Why the import graph is the load-bearing property and the image is not.** The broker image was
+already `gcr.io/distroless/static:nonroot` — no shell, no package manager, non-root, read-only root.
+Every one of the three defects survived that, an SBOM diff and an RBAC review, because a Go binary's
+shell is `os/exec`, not `/bin/sh`: the image can be shell-free while the process retains the ability
+to fork one, and that is the half an image scan structurally cannot see. So P1 walks the first-party
+import graph textually from `cmd/broker` (23 packages today, with a floor and three must-reach
+packages as the [[LSN-035]] non-vacuity arm) and forbids shells, plugin loaders, interpreters,
+inference clients and debug HTTP surfaces in **any** of them. Textually because L0 CI has Python
+3.12 and no Go toolchain by design; a graph walk rather than a scan of the entry package because all
+three defects were a package or more away from `main`.
+
+**Stated non-claim, recorded rather than waved away.** `k8s.io/client-go/rest` imports
+`plugin/pkg/client/auth/exec` unconditionally, and `k8s.io/apiserver` brings
+`github.com/google/cel-go`. Both are in the indirect closure of having a Kubernetes client at all
+and no import discipline in this repository removes either. P2 therefore scopes to **direct**
+requires — the set this repository actually chooses — and the residue is named in the check's
+docstring and moved to an L2 SBOM scan of the built image, which is where a module graph exists.
+P1 still catches the case that matters: a `cel-go` import in `internal/broker` fails on the line it
+is written.
+
+**The negative control earned its place twice, against the check rather than the code.**
+(a) The base allowlist matched by prefix, so `gcr.io/distroless/static:debug` passed — same
+repository, plus a busybox shell at `/busybox/sh`, and the exact tag someone reaches for at 3am
+trying to get a prompt inside the broker. Now matched on repository exactly, with a separate tag
+scan. (b) The `Volumes:` extractor was a lazy regex terminating on `\n\t+\},\n\t+\}`, which matched
+the end of the nested `SecretVolumeSource` instead of the end of the slice; P6 read only the first
+volume and would have gone on passing had the two been declared the other way round. Replaced with a
+brace-depth matcher. Nested Go composite literals are not a regular language.
+
+**Filed, not fixed** — for P9-T9b-4 or the next improvement pass:
+
+- **08 §2.6 says two mounts and the renderer makes three.** The third is a `/tmp` `emptyDir` whose
+  stated justification ("Go's TLS stack and the client-go transport both want a temp dir") is
+  unverified and only testable against a running broker. It is carried as the one named, reasoned
+  entry in `ALLOWED_MOUNTS`, and pinned to **be** an anonymous `EmptyDir` so the same mount name
+  cannot quietly become a Secret, ConfigMap, hostPath or PVC. The spec sentence is deliberately not
+  edited here: PROTOCOL §10 forbids resolving a check's own failure by editing the thing it checks
+  in the same unit. Resolution is either an L2 probe that removes the mount and watches the broker,
+  or a sentence in 08 §2.6 recording the ephemeral scratch.
+- **A doc comment asserted a security property the build contradicted** (defect 3 above). This is
+  another instance of the class already carried from T9b-1 and T9b-2 — the candidate gate rule that
+  every `V-*` or posture claim in a Go or Python doc comment must name something mechanically
+  asserted. It is now the sixth instance in this phase, and the first where the claim was not a
+  `V-*` ID but a plain-English list of what the binary does not contain.
+
+Evidence: **V-RUN-010 (L0) pass** — `verification/results.csv`; the check replayed against
+`git show HEAD:` content for `cmd/broker/main.go` and `internal/journal/auditsource.go` with the new
+`cloudaudit` package removed reports all three shipped defects, which is the evidence that it would
+have caught them.
+
+---
+
 ### P9-T8b-4 splits: 4a is the deployment path, 4b is the soak
 
 **Recorded 2026-07-30, at SELECT.** T8b-4 is "the L2 shadow soak with journal mining". Surveying
