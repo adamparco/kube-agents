@@ -80,8 +80,9 @@ will start selecting.
 | **LSN-049** | mutation, tooling, checks, vacuity, false-finding | The sweep's own shell quoting kept a mutation from ever being applied, and `rc == 0` was scored as "the suite passed with it in place" — an invented hole, reported twice | closed | `dev/mutate.py` + `dev/test_mutate_sweep.py` (L0, in `dev/L0-CHAIN.txt` via `unittest discover dev`) — needles and replacements live in JSON and are applied by `str.replace` in-process, so nothing crosses a shell parse; the applier refuses unless the needle appears exactly once, which is also how the sweep observes that the mutation LANDED; and `rc != 0` is not a catch, every row naming the test that must be in the failing set |
 | **LSN-050** | harness, checks, coverage, false-green, pre-commit | Seven L0 checks discover files with `git ls-files` and no `--others`, so the chain is blind to any file not yet `git add`ed — which is every brand-new file at the one moment the chain is documented to run | closed | `dev/tests/gitcorpus.py` + `check_l0_corpus_is_not_index_only` in `dev/tests/invariants-gate.py` (L0, in `dev/L0-CHAIN.txt`) — one `--cached --others --exclude-standard` enumerator, now used by all ten call sites, and a gate arm that AST-parses every `.py` and `.sh` under `dev/` and fails any `ls-files` argv without `--others`. The gate covers the whole tree rather than just the chain, because the failure mode is the eighth script copying the seventh |
 | **LSN-051** | harness, halts, spec-reading, PROTOCOL §8.5, rbac | A §8.5 halt was declared after comparing the broker's live reads against 06 §2.2.1, the *broker-operations* grant; the actor's authority is 06 §2.2, one level up, and it grants every read the halt said was ungranted — a subsection number reads like a refinement of its section, so having read the subsection felt like having read the section | open | *candidate:* a `harness-run` §7 rule that a §8.5 blocker row must quote **both** conflicting statements by document and section. There was only ever one here, and being made to write the second down is where the absence becomes visible. Alternatives considered and likely too narrow: a lint pairing every `NN §X.Y.Z` citation in a halt with a `NN §X.Y` citation. To be chosen at the next improvement pass |
+| **LSN-052** | harness, ci, goldens, checkpoint, binding §Build | `TestAgentsGolden` was red for three commits: the renderer gained a downward-API env var and the two golden fixtures were not regenerated. No step a unit is required to perform runs `go test` — L0 CI has no Go toolchain, `k8s-operator-test.yml` triggers only on PRs to `main` (once per phase, after dozens of commits), and CHECKPOINT §6.1's `make build` is fmt+vet+build, not test | open | *candidate:* `binding.md` §Build gains `cd k8s-operator && go test ./...` for any unit touching `k8s-operator/**`, putting it inside CHECKPOINT §6.1 where it attributes to one commit. Alternatives: a push trigger on every branch (off the local loop, does not stop the bad commit); a gate rule pairing `*_manifests.go` with `testdata/*/expected/` (third rule of that shape, subsumed). To be chosen at the next improvement pass |
 
-**Open: 1 of 51**.
+**Open: 2 of 52**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2881,3 +2882,59 @@ confirms it has to start at the spec.
 Related: [[lsn-041]] (a control asserted to exist and not existing), [[lsn-035]] (verifying the
 operation ran, not that it ran over the right thing), [[lsn-019]] (a mechanization off the path the
 work takes).
+
+---
+
+## LSN-052 — The Go unit suite runs once per phase, so a golden was red for three commits
+
+**What happened.** `TestAgentsGolden` had been failing since commit `6220874`, three commits and two
+CHECKPOINTs earlier. That commit added the downward-API `KAGE_BROKER_SERVICE_ACCOUNT` env var to the
+rendered broker container — a correct fix, verified against a live cluster — and did not regenerate
+the two golden fixtures the renderer is compared to. It was found only because a full `go test ./...`
+was run for an unrelated reason while working the next defect, and even then it was nearly
+misdiagnosed twice: first as a Halt-2 regression caused by the working tree (it is not — a detached
+worktree at `HEAD` reproduced it), then as a whitespace catastrophe (`-update` re-marshals every
+golden with Go's 2-space list indentation, producing a 62 KB diff; `npx prettier --write` over the
+regenerated files collapses it to the 10 real lines).
+
+**Why nothing caught it.** Three layers each had a reason not to look, and the reasons are all
+individually defensible:
+
+- `dev/L0-CHAIN.txt` is the pre-commit chain, and it cannot hold this. L0 CI has Python 3.12 and no
+  Go toolchain (V-MET-013 makes the file the single definition site, so a line that only runs on a
+  developer's laptop would be a check that reports a verdict it did not compute — the shape already
+  on the carried-findings list).
+- `.github/workflows/k8s-operator-test.yml` does run `go test`, but on `pull_request: [main]` and
+  `push: [main]` only. The harness commits to a phase branch for the whole of a phase and opens the
+  PR at `/harness-milestone`, so on this workflow the Go suite fires **once per phase**, after
+  dozens of commits, with every one of them a candidate cause.
+- `harness-run` §6.1 requires "build, format, and lint pass". `make -C k8s-operator build` is
+  manifests + generate + fmt + vet + build. It is not `test`, and it passed at every checkpoint.
+
+So the honest statement is not "someone forgot to run the tests". It is that **no step any unit is
+required to perform runs them**, and the one that does is scheduled at a cadence that cannot
+attribute a failure to a commit.
+
+**What made it survive.** A golden is exactly the check that rots quietly here: it is not claimed by
+any check ID, so VERIFY never selects it, and its failure mode is a diff rather than a crash. The
+three defects before this one were all found by driving a real envelope at a deployed broker, which
+trains attention onto L2 — and L2 is the one level that cannot see a rendering mismatch, because the
+cluster runs whatever the renderer emits and the golden is the only thing that disagrees.
+
+**Mechanization candidates**, for the next improvement pass:
+
+1. *(preferred, cheapest, earliest)* `binding.md` §Build gains a second command for any unit whose
+   diff touches `k8s-operator/**`: `cd k8s-operator && go test ./...`. That puts it inside
+   CHECKPOINT §6.1, where it attributes to one commit. It is a skill/binding change, not a check.
+2. A `k8s-operator-test.yml` trigger on `push` to every branch, not just `main`. Correct but slower
+   and off the local loop, and it does not stop the bad commit from being written.
+3. A gate rule that a commit touching `internal/controller/*_manifests.go` must also touch
+   `internal/testing/testdata/*/expected/`. Narrow, and it is the third gate rule of that shape;
+   candidate 1 subsumes it.
+
+Also worth recording as a procedural note wherever goldens are regenerated: `-update` then
+`prettier --write`, then read the diff — never `-update` and commit.
+
+Related: [[lsn-001]] (the artifact under test not being the artifact built), [[lsn-019]] (a
+mechanization off the path the work takes), [[lsn-035]] (verifying the operation ran, not that it
+ran over the right thing).

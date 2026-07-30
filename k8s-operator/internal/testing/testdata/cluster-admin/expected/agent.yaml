@@ -360,6 +360,11 @@ spec:
             - --tls-cert-file=/etc/kage/tls/tls.crt
             - --tls-key-file=/etc/kage/tls/tls.key
             - --client-ca-file=/etc/kage/tls/ca.crt
+          env:
+            - name: KAGE_BROKER_SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
           image: ghcr.io/gke-labs/kube-agents/kage-broker:v0.1.0
           livenessProbe:
             initialDelaySeconds: 15
