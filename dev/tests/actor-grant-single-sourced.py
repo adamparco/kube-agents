@@ -46,24 +46,49 @@ satisfy it, because a check may not be changed in the same unit as the implement
 motivated the change. Both arms are exercised: the tier-neutral one by the real tree, the tier one by
 the negative control, which synthesises the object the render will emit.
 
+A CEILING AND A PROFILE, WHICH ARE NOT THE SAME SET. 06 §2.2's templates carry
+`create`/`update`/`patch`/`delete`; the platform one carries them on `secrets`, cluster-wide. Phase
+9's acceptance (07 §2) is that the whole safety machinery runs end to end **with no write authority
+anywhere**, so rendering a template WHOLE inside Phase 9 would hand every platform actor cluster-wide
+`delete secrets` in the phase whose entire point is that nothing can write. The install path
+therefore renders the READ half, and the write half arrives with P10-T1 -- which 03 §4.2 defines as
+this very policy inverted: "the same policy object as the read-only generation's
+`vap-agent-readonly`, **inverted**: reader SAs keep the read-verb allow-list; actor SAs get a
+scope-and-template allow-list instead of a blanket write denial".
+
+Only the completeness direction moves. Property 3's CEILING is the whole template -- an actor object
+may never exceed 06 §2.2, dark or not -- while property 4's PROFILE is the read-verb half, which is
+what the tree is required to have actually rendered. `DARK_PROFILE` below is the one place that
+flips, and property 6 is what keeps the distinction from being decorative: under a read-widened
+policy a write triple is admitted by neither the allow-list nor the read disjunct, so ADMISSION is
+what holds Phase 9 dark, and this check asserts admission's shape rather than trusting it.
+
 Seven properties:
 
   1. THE SPEC PARSES, AND IS THE ONLY DEFINITION SITE. 06 §2.2.1's fenced YAML block expands to a set
      of (apiGroup, resource, verb) triples, and each of 06 §2.2's three fenced templates expands to
      one more, keyed by the tier its own labels declare. Everything else is compared against those.
-  2. EVERY VAP COPY'S ACTOR ALLOW-LIST EQUALS THE BROKER-OPERATIONS GRANT, IN BOTH DIRECTIONS. A
-     missing triple is a policy that denies a legitimate actor identity; an extra one is a hole.
-     Copies are DISCOVERED BY GLOB, not by a list of paths ([[LSN-036]], [[LSN-038]]) -- the cascade
-     template renders a fourth copy into every cluster the fleet grows, and a hardcoded list would
-     not know about it.
+  2. EVERY VAP COPY'S ACTOR ALLOW-LIST EQUALS THE BROKER-OPERATIONS GRANT, IN BOTH DIRECTIONS, AND
+     THE EXPRESSION AROUND IT HAS ONE OF EXACTLY TWO SHAPES. A missing triple is a policy that denies
+     a legitimate actor identity; an extra one is a hole. Copies are DISCOVERED BY GLOB, not by a list
+     of paths ([[LSN-036]], [[LSN-038]]) -- the cascade template renders a fourth copy into every
+     cluster the fleet grows, and a hardcoded list would not know about it. The literal list is only
+     half of what validation 3 says: the CEL around it either bounds an actor to the list ALONE
+     (`bare`) or to the list plus any read verb (`read-widened`, the form that admits a rendered tier
+     profile). Both are pinned exactly, and a third shape fails -- an allow-list is only a bound if
+     the expression consuming it is one you have read.
   3. NO ACTOR RBAC OBJECT GRANTS ANYTHING OUTSIDE WHAT ITS TIER IS OWED. Every Role/ClusterRole
      labelled `kube-agents/role: actor` is checked rule by rule against the set above. This is the
      property that fails if someone lands a tenant grant by editing an RBAC file rather than by
      rendering the template 06 §2.2 actually specifies -- and, for a tier-stamped object, if the
      rules drift from that template by one resource.
-  4. WHAT A TIER IS OWED IS FULLY REALISED. Per tier, the UNION of that tier's actor objects must
-     EQUAL what the tier is owed, not merely be contained in it. Containment alone is satisfied by an
-     empty tree, and by the far more likely accident of a rule silently dropped in one of six copies
+  4. WHAT A TIER IS OWED **AT THIS PHASE** IS FULLY REALISED. Per tier, the UNION of that tier's
+     actor objects must EQUAL that tier's profile -- §2.2.1's grant plus the READ verbs of its §2.2
+     template while `DARK_PROFILE` holds -- not merely be contained in it. Note the asymmetry with
+     property 3, which is deliberate: the ceiling is the whole template and does not move, so a write
+     triple is never admitted by being unasserted here; it is caught by property 6 instead.
+     Containment alone is satisfied by an empty tree, and by the far more likely accident of a rule
+     silently dropped in one of six copies
      -- 06 §2.2.1's point about `fleetfreezes` is that the missing-grant direction is the one that
      bricks a tier. A union rather than a per-object equality because the grant is deliberately SPLIT
      across a ClusterRole and a Role: cluster-scoped reads above, persisted writes below. Realisation
@@ -74,13 +99,16 @@ Seven properties:
      VAP copies and actor objects. A check that found nothing to compare would print PASS forever
      after a refactor moved the tree it reads ([[LSN-035]]).
   6. NOTHING IN THE TREE GRANTS WHAT ADMISSION WOULD REJECT. `vap-agent-readonly` validation 3 bounds
-     every actor object to a literal allow-list, under `failurePolicy: Fail`. By property 2 that
-     allow-list is §2.2.1's grant -- so a tier-stamped actor object carrying its 06 §2.2 rules is
-     DENIED AT APPLY TIME by the very policy this check keeps honest. The spec permits the object and
+     every actor object under `failurePolicy: Fail`, to the allow-list alone or to the allow-list plus
+     any read verb, depending on which of property 2's two shapes every copy carries -- the bound is
+     the INTERSECTION across copies, because a rule one cluster's policy admits and another's refuses
+     is refused. While every copy is `bare`, a tier-stamped actor object carrying its 06 §2.2 rules is
+     DENIED AT APPLY TIME by the very policy this check keeps honest: the spec permits the object and
      the installed policy refuses it, and the two disagreeing quietly is how a render lands that no
-     cluster will ever accept. 06 §2.2 names `vap-agent-scope` as the validator for the tier
-     templates and it does not exist (P10-T1); until the bound moves, this property is the standing
-     record of what the render owes.
+     cluster will ever accept. Once the copies are `read-widened`, the read profile is admitted and
+     the WRITE half is not -- which is the mechanism, not merely the intention, that keeps Phase 9
+     dark. 06 §2.2 names `vap-agent-scope` as the validator for the tier templates and it does not
+     exist (P10-T1); until then this property is the standing record of what the render owes.
   7. PROPERTY 6'S PREMISE, ASSERTED RATHER THAN ASSUMED. Property 6 reduces "admission would reject
      it" to "it is outside the allow-list" only because `variables.isActor` selects on the actor
      label ALONE, with no tier condition -- so validation 3 governs tier-stamped objects too. Narrow
@@ -146,6 +174,21 @@ MIN_ACTOR_OBJECTS = 6
 # triples, so a floor of 20 says only "this fence was read", which is all a vacuity floor is for.
 MIN_TIER_TRIPLES = 20
 
+# The read verbs, in the one place both this check and `vap-agent-readonly` validation 1 spell them.
+# Property 2's `read-widened` shape is BUILT from this tuple rather than compared to a literal, so
+# the policy's disjunct and this check's profile cannot come to disagree about what "read" means.
+READ_VERBS = ("get", "list", "watch")
+
+# Phase 9 renders the READ half of each 06 §2.2 template and nothing else -- see the module
+# docstring. Flip this at P10-T1, in the same unit that widens the allow-list from `read-widened` to
+# the per-tier template allow-list 03 §4.2 requires; the two are one change wearing two hats, and
+# flipping either alone turns this check red, which is the intended coupling.
+DARK_PROFILE = True
+# A tier's profile must be a STRICT subset of its ceiling and still substantial. Both directions
+# matter: a profile equal to the ceiling means the read filter did nothing (Phase 9 is not dark), and
+# an empty one means it ate everything (property 4 stops asserting anything).
+MIN_PROFILE_TRIPLES = 10
+
 # A flow sequence: `[a, b]` or `["a", "b"]`, on one line or reflowed across several. The only form
 # either the spec blocks or the RBAC files use, and the only form accepted -- see parse_rules.
 FLOW_SEQ = re.compile(r"^\[(.*)\]$", re.DOTALL)
@@ -166,6 +209,51 @@ VAP_ALLOWLIST = re.compile(
     re.DOTALL,
 )
 VAP_TRIPLE = re.compile(r"'([^']+)'")
+
+# Everything CEL evaluates between `r.verbs.all(v,` and the allow-list membership test. Empty in the
+# `bare` shape; exactly one read-verb disjunct in the `read-widened` one. Anything else and this
+# check no longer knows what validation 3 permits, which is a failure and not a default.
+#
+# The head is TEMPERED against `r.verbs.all(` rather than being a plain `.*?`, because validation 1
+# opens a `r.verbs.all(v, v in ['get','list','watch'])` of its own several hundred characters
+# earlier and a lazy dot happily spans from there to validation 3's allow-list -- reporting the two
+# validations and the comment between them as validation 3's verb test, which is a third shape, so
+# the check fails loudly on the tree it is supposed to pass on.
+VAP_VERB_HEAD = re.compile(
+    r"r\.verbs\.all\(\s*v\s*,(?P<head>(?:(?!r\.verbs\.all\().)*?)\(g \+ '/' \+ res \+ ':' \+ v\)",
+    re.DOTALL,
+)
+VAP_READ_DISJUNCT = "v in [" + ", ".join(f"'{v}'" for v in READ_VERBS) + "] ||"
+
+
+# Validation 2, the wrong-scope rule: a namespace-scoped tier may not be granted a ClusterRole. The
+# tier is parsed OUT of the policy rather than named here, for the same reason the allow-list is --
+# "developer-team is namespace-scoped" already has definition sites in 03 §4 and in the policy, and
+# a third one in a check that exists to forbid third copies would be its own joke.
+VAP_WRONG_SCOPE = re.compile(
+    r"!\(object\.kind == 'ClusterRole' &&\s*"
+    r"'kube-agents/tier' in object\.metadata\.labels &&\s*"
+    r"object\.metadata\.labels\['kube-agents/tier'\] == '(?P<tier>[^']+)'\)"
+)
+
+
+def vap_verb_shape(text: str) -> str | None:
+    """Which of property 2's two shapes this copy's validation 3 has, or None for a third thing.
+
+    `bare` bounds an actor to the allow-list alone; `read-widened` bounds it to the allow-list plus
+    any read verb, which is what admits a rendered tier profile without admitting a tier's writes.
+    None is not "unknown, assume the strict one" -- it is a failure, because the shapes this returns
+    are the only two whose consequences property 6 knows how to compute.
+    """
+    m = VAP_VERB_HEAD.search(text)
+    if not m:
+        return None
+    squashed = "".join(m.group("head").split())
+    if squashed == "":
+        return "bare"
+    if squashed == "".join(VAP_READ_DISJUNCT.split()):
+        return "read-widened"
+    return None
 
 
 class GrantSyntaxError(Exception):
@@ -535,18 +623,57 @@ def check(sources: dict[str, str]) -> list[str]:
     templates, tier_failures = spec_tier_templates(spec_text)
     failures.extend(tier_failures)
 
-    def owed(tier: str) -> set[str]:
-        """What an actor object stamped with `tier` may hold. 06 §2.2 ∪ §2.2.1.
+    def ceiling(tier: str) -> set[str]:
+        """What an actor object stamped with `tier` may hold. 06 §2.2 ∪ §2.2.1. Property 3's bound.
 
         06 §2.2.1: the three templates "cover what an agent acts on. They do not cover what the
         broker needs to run its own pipeline"; every actor identity "additionally receives exactly
         this rule set". Additionally -- so the union, and for a tier-neutral object the grant alone.
+
+        This does NOT move with the phase. Dark mode is a statement about what is rendered, never a
+        licence to render something the spec does not describe.
         """
         return grant | templates.get(tier, set())
+
+    def profile(tier: str) -> set[str]:
+        """What a tier's objects must actually realise at this phase. Property 4's bound.
+
+        The whole grant, plus the READ verbs of the tier template while Phase 9 is dark. A
+        tier-neutral object has no template, so its profile is its ceiling and nothing about it
+        changes at P10.
+        """
+        tmpl = templates.get(tier, set())
+        if DARK_PROFILE:
+            tmpl = {t for t in tmpl if t.rsplit(":", 1)[-1] in READ_VERBS}
+        return grant | tmpl
+
+    # Non-vacuity for the split itself. A profile that equals its ceiling means the read filter is a
+    # no-op and property 4 is quietly demanding write authority in a phase that forbids it; an empty
+    # one means the filter ate the template and property 4 is quietly demanding nothing.
+    if DARK_PROFILE:
+        for tier in sorted(templates):
+            prof, ceil = profile(tier), ceiling(tier)
+            if prof >= ceil:
+                failures.append(
+                    f"VACUOUS: the {tier} profile is not a strict subset of its ceiling, so the "
+                    f"read-verb filter selected nothing away. Either 06 §2.2's {tier} template has "
+                    f"stopped carrying write verbs -- in which case dark mode is over and "
+                    f"DARK_PROFILE should say so -- or the filter is broken."
+                )
+            elif len(prof) < MIN_PROFILE_TRIPLES:
+                failures.append(
+                    f"VACUOUS: the {tier} profile is {len(prof)} triple(s), below the floor of "
+                    f"{MIN_PROFILE_TRIPLES}. The read-verb filter ate the template, so property 4 "
+                    f"would accept an actor object holding almost nothing."
+                )
 
     # --- property 2: every VAP copy's allow-list equals the grant --------------------------------
     vap_copies = sorted(rel for rel in sources if _is_vap_copy(rel))
     admissible: set[str] | None = None  # intersection over copies; property 6's bound
+    admits_reads: bool | None = None  # conjunction over copies, for the same reason
+    # Denials, unlike admissions, UNION across copies: one copy refusing a shape is enough to refuse
+    # it, which is the same conjunction seen from the other side.
+    no_clusterrole: set[str] = set()
     if len(vap_copies) < MIN_VAP_COPIES:
         failures.append(
             f"VACUOUS: found {len(vap_copies)} copy/copies of vap-agent-readonly, below the floor of "
@@ -568,6 +695,41 @@ def check(sources: dict[str, str]) -> list[str]:
         # the bound property 6 measures against is the intersection, not the union. A tier grant
         # admitted by one copy and rejected by another is rejected.
         admissible = found if admissible is None else (admissible & found)
+
+        # --- property 2, second half: the shape of the expression around the list -----------------
+        # The list is only a bound in the company of the CEL that consumes it. Two shapes are
+        # admissible and a third is a failure, because a check that reads the list and shrugs at the
+        # expression would score a `v != 'delete' ||` prefix -- everything but one verb, admitted --
+        # as an unchanged twenty-triple policy.
+        shape = vap_verb_shape(sources[rel])
+        if shape is None:
+            head = VAP_VERB_HEAD.search(sources[rel])
+            got = repr(head.group("head").strip()[:200]) if head else "no `r.verbs.all(v, ...)` at all"
+            failures.append(
+                f"{rel}: validation 3 bounds an actor by neither the allow-list alone nor the "
+                f"allow-list plus {list(READ_VERBS)}, but by a third thing this check cannot score: "
+                f"{got}. An allow-list is only a bound in the company of the expression that "
+                f"consumes it, and a disjunct admitting one WRITE verb reads exactly like the read "
+                f"one while leaving Phase 9 not dark. Teach this check the new shape in its own "
+                f"unit -- Guardrail 9 -- or revert."
+            )
+        widened = shape == "read-widened"
+        admits_reads = widened if admits_reads is None else (admits_reads and widened)
+
+        # --- property 6's other half: validation 2, the wrong-scope rule --------------------------
+        # A tier the policy declares namespace-scoped cannot be handed a ClusterRole, and 06 §2.2
+        # gives that tier a template like any other -- so "render each tier's template" reads as a
+        # ClusterRole three times and is refused once. The check has to know that before the render
+        # does, or it certifies a tree the API server will not take.
+        scope = VAP_WRONG_SCOPE.search(sources[rel])
+        if not scope:
+            failures.append(
+                f"{rel}: no wrong-scope validation. A namespace-scoped tier could be granted a "
+                f"cluster-scoped ClusterRole and this copy would admit it, and property 6 would go "
+                f"on reporting that admission accepts the tree."
+            )
+        else:
+            no_clusterrole.add(scope.group("tier"))
 
         # --- property 7: property 6's premise, in this copy -------------------------------------
         iso = sources[rel].find(ISACTOR_ANCHOR)
@@ -647,8 +809,10 @@ def check(sources: dict[str, str]) -> list[str]:
             realised.setdefault(tier, set())
             realised[tier] |= got
 
-            # --- property 3: nothing outside what the tier is owed ------------------------------
-            for extra in sorted(got - owed(tier)):
+            # --- property 3: nothing outside the tier's CEILING ---------------------------------
+            # The ceiling is the whole of 06 §2.2, write verbs and all, and does not move with the
+            # phase: dark mode says what the tree renders, never what the spec permits.
+            for extra in sorted(got - ceiling(tier)):
                 if tier:
                     failures.append(
                         f"{rel}: {kind}/{name} (tier {tier}) grants {extra!r}, which is in neither "
@@ -664,16 +828,38 @@ def check(sources: dict[str, str]) -> list[str]:
                     )
 
             # --- property 6: nothing admission would reject -------------------------------------
+            # First the shape of the object, which validation 2 judges before validation 3 gets to
+            # look at a single rule.
+            if kind == "ClusterRole" and tier in no_clusterrole:
+                failures.append(
+                    f"{rel}: {kind}/{name} is a ClusterRole stamped `kube-agents/tier: {tier}`, "
+                    f"which vap-agent-readonly's wrong-scope validation denies outright -- the tier "
+                    f"is namespace-scoped and gets a Role in its own namespace. 06 §2.2 gives every "
+                    f"tier a template and says nothing about the KIND that carries it, so rendering "
+                    f"all three the same way is the natural mistake and this is where it stops."
+                )
+            # Then the rules, against whichever of property 2's two shapes every copy carries: the
+            # allow-list alone, or the allow-list plus any read verb. Both halves conjoin across
+            # copies -- a triple one cluster's policy admits and another's refuses is refused.
             if admissible is not None:
                 for rejected in sorted(got - admissible):
+                    if admits_reads and rejected.rsplit(":", 1)[-1] in READ_VERBS:
+                        continue  # reached by the read disjunct, not by the allow-list
+                    why = (
+                        "it is outside the allow-list and is not a read verb, so neither disjunct "
+                        "of validation 3 reaches it"
+                        if admits_reads
+                        else "it is outside the allow-list, which is validation 3's whole bound"
+                    )
                     failures.append(
                         f"{rel}: {kind}/{name} grants {rejected!r}, which no installed "
-                        f"vap-agent-readonly admits. `isActor` selects on the actor label alone, so "
-                        f"validation 3 governs this object under failurePolicy: Fail and the API "
-                        f"server will REFUSE the apply -- the spec permits the rule and the shipped "
-                        f"policy does not. 06 §2.2 names `vap-agent-scope` as the validator for the "
-                        f"tier templates and it does not exist yet (P10-T1); until the bound moves, "
-                        f"a tier-stamped actor object cannot be rendered onto a cluster."
+                        f"vap-agent-readonly admits -- {why}. `isActor` selects on the actor label "
+                        f"alone, so validation 3 governs this object under failurePolicy: Fail and "
+                        f"the API server will REFUSE the apply. If this is a WRITE triple from 06 "
+                        f"§2.2, that refusal is the mechanism holding Phase 9 dark (07 §2: the "
+                        f"machinery runs end to end with no write authority anywhere) and the fix "
+                        f"is to stop rendering it, never to widen the policy -- `vap-agent-scope` "
+                        f"is where a tier template becomes admissible, and it arrives at P10-T1."
                     )
 
     if actor_objects < MIN_ACTOR_OBJECTS:
@@ -683,16 +869,21 @@ def check(sources: dict[str, str]) -> list[str]:
             f"splitter stopped seeing them; both make a PASS here meaningless."
         )
     elif not failures or realised:
-        # --- property 4: per tier, the union EQUALS what that tier is owed ------------------------
+        # --- property 4: per tier, the union EQUALS that tier's PROFILE ---------------------------
         # Only for a tier that has objects. A tier with none has not been rendered yet, and demanding
         # it here would make V-BRK-013 fail until an unrelated unit lands -- which for a
         # BLOCKING-ALWAYS check is not a deferral that 09 §9.6 permits, it is a red gate.
+        #
+        # The bound is the PROFILE, not property 3's ceiling. The asymmetry is deliberate and is not
+        # a hole: a write triple left unasserted here is still refused by property 3's ceiling if it
+        # is outside the template, and by property 6 if it is inside one, since a rendered write
+        # triple is admitted by neither disjunct of a read-widened policy.
         for tier in sorted(realised):
-            for missing in sorted(owed(tier) - realised[tier]):
+            for missing in sorted(profile(tier) - realised[tier]):
                 where = (
-                    f"06 §2.2's {tier} actor template or §2.2.1"
-                    if tier
-                    else "06 §2.2.1"
+                    f"the READ half of 06 §2.2's {tier} actor template, or §2.2.1"
+                    if tier and DARK_PROFILE
+                    else f"06 §2.2's {tier} actor template or §2.2.1" if tier else "06 §2.2.1"
                 )
                 who = f"tier-{tier} actor" if tier else "tier-neutral actor"
                 failures.append(
@@ -714,6 +905,10 @@ def negative_control() -> int:
     canon_vap = "examples/gitops-repo/policy/vap-agent-readonly.yaml"
     canon_rbac = "examples/gitops-repo/policy/rbac-overlay/broker-operations.yaml"
     boot_vap = "examples/gitops-repo/clusters/cluster-a/bootstrap/20-policy/vap-agent-readonly.yaml"
+    tmpl_vap = (
+        "agents/platform/skills/propose-cluster-admin/assets/bootstrap/20-policy/"
+        "vap-agent-readonly.yaml.tmpl"
+    )
     overlay = "examples/gitops-repo/policy/rbac-overlay/platform.yaml"
 
     # --- the tier arm's subject, which the real tree does not contain yet -------------------------
@@ -734,12 +929,53 @@ def negative_control() -> int:
         idx = sources[SPEC].find(SPEC_HEADING)
         return re.search(r"```ya?ml\n(.*?)```", sources[SPEC][idx:], re.DOTALL).group(1)
 
-    def rendered_actor(tier: str, *, extra: str = "", drop: str = "", stamp: str = "") -> str:
-        """The per-tier actor object as 06 §2.2 ∪ §2.2.1 specifies it, optionally perturbed."""
-        body = fence_rules(tier)
-        if drop:
-            assert drop in body, f"the drop anchor has moved: {drop!r}"
-            body = body.replace(drop, "", 1)
+    def rules_from_triples(triples: set[str]) -> str:
+        """Re-emit a set of triples as a `rules:` block, one rule each.
+
+        Used for the dark-mode object, whose rules are a SUBSET of a §2.2 template's and so cannot
+        be lifted as fence text. Still built from the spec -- parsed out of it and re-emitted, never
+        transcribed -- so the tier profile this control renders moves when 06 §2.2 moves.
+        """
+        return "".join(
+            f'  - apiGroups: ["{t.rsplit(":", 1)[0].split("/", 1)[0]}"]\n'
+            f'    resources: ["{t.rsplit(":", 1)[0].split("/", 1)[1]}"]\n'
+            f'    verbs: ["{t.rsplit(":", 1)[1]}"]\n'
+            for t in sorted(triples)
+        )
+
+    def read_half(tier: str) -> set[str]:
+        """The READ verbs of 06 §2.2's template for `tier` -- what 5b-0-ii-b renders under dark mode."""
+        tmpl, _ = spec_tier_templates(sources[SPEC])
+        assert tier in tmpl, f"06 §2.2 has no actor template for {tier!r} to build the control from"
+        got = {t for t in tmpl[tier] if t.rsplit(":", 1)[-1] in READ_VERBS}
+        assert got, f"the {tier} template has no read verbs left, so the dark-mode control is empty"
+        return got
+
+    def rendered_actor(
+        tier: str,
+        *,
+        extra: str = "",
+        drop: str = "",
+        stamp: str = "",
+        dark: bool = False,
+        drop_triple: str = "",
+    ) -> str:
+        """The per-tier actor object 5b-0-ii-b will render, optionally perturbed.
+
+        `dark=False` renders 06 §2.2 ∪ §2.2.1 whole -- the object the spec describes and Phase 9
+        may not have. `dark=True` renders the read half plus §2.2.1, which is the phase profile.
+        """
+        if dark:
+            triples = read_half(tier)
+            if drop_triple:
+                assert drop_triple in triples, f"the drop-triple anchor has moved: {drop_triple!r}"
+                triples -= {drop_triple}
+            body = rules_from_triples(triples)
+        else:
+            body = fence_rules(tier)
+            if drop:
+                assert drop in body, f"the drop anchor has moved: {drop!r}"
+                body = body.replace(drop, "", 1)
         return (
             "\n---\n"
             "apiVersion: rbac.authorization.k8s.io/v1\n"
@@ -754,6 +990,24 @@ def negative_control() -> int:
 
     def with_actor(s: dict[str, str], doc: str) -> dict[str, str]:
         return {**s, overlay: s[overlay] + doc}
+
+    # --- the other half of 5b-0-ii-b: the allow-list that admits the profile ----------------------
+    # Applied to EVERY copy, because property 2's shape test and property 6's bound are both
+    # conjunctions -- widening one copy and forgetting another leaves the bound where it was, which
+    # is the correct answer and not the one the mutation is trying to demonstrate.
+    VERB_ANCHOR = "r.verbs.all(v,\n                (g + '/' + res + ':' + v)"
+
+    def widen(s: dict[str, str], disjunct: str = VAP_READ_DISJUNCT) -> dict[str, str]:
+        out = dict(s)
+        for rel in [canon_vap, boot_vap, tmpl_vap]:
+            assert VERB_ANCHOR in out[rel], f"the verb-test anchor has moved in {rel}"
+            out[rel] = out[rel].replace(
+                VERB_ANCHOR,
+                f"r.verbs.all(v,\n                {disjunct}\n                "
+                f"(g + '/' + res + ':' + v)",
+                1,
+            )
+        return out
 
     # 06 §2.2's platform block names apiextensions.k8s.io in its NOT GRANTED footer by name.
     OUTSIDE_TEMPLATE = (
@@ -912,6 +1166,58 @@ def negative_control() -> int:
             ),
             "expected a flow sequence like [a, b]",
         ),
+        (
+            # Half of 5b-0-ii-b, landed alone: the READ-only profile is rendered and the policy is
+            # left bare. This is the ordering constraint the previous unit discovered, stated as a
+            # mutation -- the render and the widening are one change, and doing the render first is
+            # the appealing order, because the templates are the visible work.
+            "the dark-mode read profile is rendered while every VAP copy is still bare",
+            lambda s: with_actor(s, rendered_actor("platform", dark=True)),
+            "grants '/secrets:list', which no installed vap-agent-readonly admits",
+        ),
+        (
+            # The other half alone, and the one that would go unnoticed: widening a policy nothing
+            # yet exercises. Under `bare` this is caught by property 6 the moment a tier object
+            # lands; under a WRITE-widened policy it would never be caught at all, because every
+            # rendered write triple would be admissible. So property 2 pins the shape itself.
+            "the read disjunct is widened by one write verb",
+            lambda s: widen(s, "v in ['get', 'list', 'watch', 'patch'] ||"),
+            "bounds an actor by neither the allow-list alone nor the allow-list plus",
+        ),
+        (
+            # Property 4 against the profile rather than the ceiling. The tempting way to write
+            # 5b-0-ii-b is to hand-list the read rules; drop one and the tier silently loses an
+            # authority, which at L2 surfaces as a refusal the operator reads as policy working.
+            "the rendered profile is missing one read triple its template requires",
+            lambda s: with_actor(
+                widen(s), rendered_actor("platform", dark=True, drop_triple="/secrets:list")
+            ),
+            "no tier-platform actor RBAC object in the tree grants '/secrets:list'",
+        ),
+        (
+            # THE MECHANISM THAT HOLDS PHASE 9 DARK. Policy widened as 5b-0-ii-b widens it, and the
+            # render reaches for the whole template instead of its read half. Everything the spec
+            # describes, admitted by nothing: the write triples fall outside the allow-list and are
+            # not read verbs, so neither disjunct reaches them. Without this row, `DARK_PROFILE`
+            # would be a comment -- property 4 alone permits a superset.
+            "under a read-widened policy the whole template is rendered, write verbs and all",
+            lambda s: with_actor(widen(s), rendered_actor("platform")),
+            "is not a read verb, so neither disjunct of validation 3 reaches it",
+        ),
+        (
+            # Validation 2. 06 §2.2 gives all three tiers a template and is silent on the KIND that
+            # carries it, so "render each tier's template" reads as a ClusterRole three times --
+            # perfectly conformant to §2.2, admissible under a widened validation 3, and refused by
+            # the policy anyway. Found by probing this check against the tree 5b-0-ii-b will build.
+            "the namespace-scoped tier's profile is rendered as a ClusterRole",
+            lambda s: with_actor(widen(s), rendered_actor("developer-team", dark=True)),
+            "which vap-agent-readonly's wrong-scope validation denies outright",
+        ),
+        (
+            "a VAP copy loses its wrong-scope validation",
+            lambda s: edit(s, boot_vap, "object.kind == 'ClusterRole' &&", "object.kind == '' &&"),
+            "no wrong-scope validation",
+        ),
     ]
 
     clean = check(sources)
@@ -963,8 +1269,15 @@ def main() -> int:
 
     grant, _ = spec_grant(sources[SPEC])
     templates, _ = spec_tier_templates(sources[SPEC])
-    copies = sum(1 for rel in sources if _is_vap_copy(rel))
-    tiers = ", ".join(f"{t}={len(templates[t])}" for t in sorted(templates))
+    copies = sorted(rel for rel in sources if _is_vap_copy(rel))
+    shapes = sorted({vap_verb_shape(sources[rel]) or "unreadable" for rel in copies})
+    tiers = ", ".join(
+        f"{t}: ceiling {len(grant | templates[t])}, profile "
+        f"{len(grant | {x for x in templates[t] if x.rsplit(':', 1)[-1] in READ_VERBS})}"
+        if DARK_PROFILE
+        else f"{t}: ceiling {len(grant | templates[t])} (= profile)"
+        for t in sorted(templates)
+    )
     stamped = sorted(
         {
             tier
@@ -975,11 +1288,19 @@ def main() -> int:
         }
     )
     print(
-        f"PASS: V-BRK-013 -- 06 §2.2.1 grants {len(grant)} (apiGroup, resource, verb) triples and "
-        f"06 §2.2 adds per tier ({tiers}); {copies} VAP copies compile exactly the {len(grant)}, "
-        f"every actor RBAC object grants only what its tier is owed and only what admission would "
-        f"admit, and per tier the union is exactly that. Tier-stamped actor objects present: "
-        f"{', '.join(stamped) if stamped else 'none (06 §2.2 has no renderer -- P9-T9b-5b-0-ii)'}"
+        f"PASS: V-BRK-013 -- 06 §2.2.1 grants {len(grant)} (apiGroup, resource, verb) triples, and "
+        f"joined with 06 §2.2 per tier ({tiers}); {len(copies)} VAP copies compile exactly the "
+        f"{len(grant)} and bound actors {'/'.join(shapes)}; every actor RBAC object stays under its "
+        f"tier's ceiling and inside what admission admits, and per tier the union is exactly the "
+        f"profile. Tier-stamped actor objects present: "
+        f"{', '.join(stamped) if stamped else 'none (06 §2.2 has no renderer -- P9-T9b-5b-0-ii-b)'}"
+        + (
+            f" . DARK_PROFILE is on: the write half of 06 §2.2 is specified, unrendered, and "
+            f"inadmissible, which is how 07 §2's 'no write authority anywhere' is enforced rather "
+            f"than intended."
+            if DARK_PROFILE
+            else ""
+        )
     )
     return 0
 

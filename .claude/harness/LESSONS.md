@@ -81,8 +81,9 @@ will start selecting.
 | **LSN-050** | harness, checks, coverage, false-green, pre-commit | Seven L0 checks discover files with `git ls-files` and no `--others`, so the chain is blind to any file not yet `git add`ed — which is every brand-new file at the one moment the chain is documented to run | closed | `dev/tests/gitcorpus.py` + `check_l0_corpus_is_not_index_only` in `dev/tests/invariants-gate.py` (L0, in `dev/L0-CHAIN.txt`) — one `--cached --others --exclude-standard` enumerator, now used by all ten call sites, and a gate arm that AST-parses every `.py` and `.sh` under `dev/` and fails any `ls-files` argv without `--others`. The gate covers the whole tree rather than just the chain, because the failure mode is the eighth script copying the seventh |
 | **LSN-051** | harness, halts, spec-reading, PROTOCOL §8.5, rbac | A §8.5 halt was declared after comparing the broker's live reads against 06 §2.2.1, the *broker-operations* grant; the actor's authority is 06 §2.2, one level up, and it grants every read the halt said was ungranted — a subsection number reads like a refinement of its section, so having read the subsection felt like having read the section | open | *candidate:* a `harness-run` §7 rule that a §8.5 blocker row must quote **both** conflicting statements by document and section. There was only ever one here, and being made to write the second down is where the absence becomes visible. Alternatives considered and likely too narrow: a lint pairing every `NN §X.Y.Z` citation in a halt with a `NN §X.Y` citation. To be chosen at the next improvement pass |
 | **LSN-052** | harness, ci, goldens, checkpoint, binding §Build | `TestAgentsGolden` was red for three commits: the renderer gained a downward-API env var and the two golden fixtures were not regenerated. No step a unit is required to perform runs `go test` — L0 CI has no Go toolchain, `k8s-operator-test.yml` triggers only on PRs to `main` (once per phase, after dozens of commits), and CHECKPOINT §6.1's `make build` is fmt+vet+build, not test | open | *candidate:* `binding.md` §Build gains `cd k8s-operator && go test ./...` for any unit touching `k8s-operator/**`, putting it inside CHECKPOINT §6.1 where it attributes to one commit. Alternatives: a push trigger on every branch (off the local loop, does not stop the bad commit); a gate rule pairing `*_manifests.go` with `testdata/*/expected/` (third rule of that shape, subsumed). To be chosen at the next improvement pass |
+| **LSN-053** | harness, checks, guardrail-9, rbac | A check is reshaped ahead of the implementation it will judge (Guardrail 9), it is green on today's tree, and nobody establishes that it is green on the tree the *next* unit will produce — so the next unit's first run reads as "my change broke the check" and the cheapest way out is to edit the check | open | *candidate:* a `harness-run` §4 rule that a unit whose only artifact is a check change must exhibit BOTH trees — the current one and a synthesised future one — and that the future one is a negative-control row, not a `/tmp` probe. To be chosen at the next improvement pass |
 
-**Open: 2 of 52**.
+**Open: 3 of 53**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2938,3 +2939,57 @@ Also worth recording as a procedural note wherever goldens are regenerated: `-up
 Related: [[lsn-001]] (the artifact under test not being the artifact built), [[lsn-019]] (a
 mechanization off the path the work takes), [[lsn-035]] (verifying the operation ran, not that it
 ran over the right thing).
+
+## LSN-053 — A check split off from its implementation has two trees to be green on, not one
+
+**What happened.** P9-T9b-5b-0-ii-a reshaped V-BRK-013 ahead of the render it will judge, because
+Guardrail 9 puts a check change and the implementation that motivated it in different units. The
+check passed on the tree as it stands. A throwaway probe — synthesise the widened policy and the
+three read-only per-tier objects, then call `check()` on that dict — found a **false negative**: the
+reshaped check would have PASSED a `developer-team` ClusterRole, which `vap-agent-readonly`'s
+wrong-scope validation denies outright. 06 §2.2 gives all three tiers a template and says nothing
+about the **kind** that carries it, so "render each tier's template" reads as a ClusterRole three
+times: conformant to §2.2, admissible under the widened validation 3, and refused by the API server
+anyway. Nothing in the unit as planned would have run that probe.
+
+**Why it matters more than a missed assertion.** Consider what happens if the probe is skipped. The
+next unit renders three ClusterRoles, V-BRK-013 stays green, `kubectl apply` fails on a live cluster,
+and the diagnosis starts at the render. That is the good case. The bad case is the mirror image and
+it is the one Guardrail 9 exists to prevent: a check reshaped ahead of its implementation that is
+green today and **red** on the correct future tree presents, on the next unit's first run, as *"my
+implementation broke the check"* — and the cheapest diff to green is to edit the check. The guardrail
+separates the two units so that pressure cannot be applied; it does nothing about the pressure
+arriving one unit later, disguised as a regression.
+
+**Why nothing caught it.** The harness has a rule for the arm no input reaches ([[lsn-035]]:
+non-vacuity, floors, and a negative control that names which property caught each mutation), and
+5b-0-i had already applied it — the tier arm's mutations synthesise the object the render will emit.
+But the synthesis was aimed at *breaking* the check, one perturbation at a time. Nothing asserted the
+unperturbed future tree is **clean**. A negative control answers "does the check notice N specific
+wrong things"; it is silent on "does the check accept the one right thing", and the right thing is
+what the next unit is about to build.
+
+**Mechanization candidates**, for the next improvement pass:
+
+1. *(preferred)* A `harness-run` §4 rule: a unit whose only artifact is a check change, split from
+   its implementation under Guardrail 9, must exhibit **both** trees — the current one and a
+   synthesised future one — and the clean-future-tree assertion belongs in `--negative-control` as a
+   row, not in a `/tmp` probe that vanishes with the session. Cheap, and it lands where the omission
+   happens.
+2. A convention that every negative control gains a positive control: one synthesised tree,
+   representing the intended next state, asserted to produce zero findings. More general than 1 and
+   more work; several checks have no meaningful "next state".
+3. Nothing, on the argument that the probe was in fact run. Refused: it was run because this unit's
+   plan happened to say "green on today's tree and on the tree 5b-0-ii-b will produce", and a
+   plan-of-record is not a mechanism.
+
+**Note the shape of the hole itself**, which is a second small lesson: the check knew validation 3
+in detail and did not know validation 2 existed. Admission is conjunctive, so a check that models one
+validation of a policy and reports "admission accepts this tree" is overclaiming by exactly the
+validations it skipped. Fixed here by parsing the namespace-scoped tier **out of** the policy rather
+than naming it — 03 §4 and the policy already say "developer-team is namespace-scoped", and a third
+copy inside the check that exists to forbid third copies would be its own joke.
+
+Related: [[lsn-035]] (an arm no input reaches is unexercised prose — this is its complement),
+[[lsn-019]] (a mechanization off the path the work takes), [[lsn-007]] (every unit test passes and
+the feature does nothing in a real install).

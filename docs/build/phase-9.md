@@ -4260,3 +4260,113 @@ by the property it targets, not merely by the check going red.
 Unchanged and still blocked: **V-BRK-006** (L2) and **V-REV-001**, on 5b-0-ii. 5b-0-ii now owes three
 things rather than two — the per-tier actor object, the binding, **and** the `vap-agent-readonly`
 allow-list that admits it.
+
+### P9-T9b-5b-0-ii-a — the phase profile, and the two shapes of the bound
+
+5b-0-ii was planned as one unit: render the per-tier actor object, bind it, and (after 5b-0-i) widen
+the allow-list that admits it. Planning it turned it again, and made it both smaller and different in
+kind.
+
+#### 06 §2.2's templates cannot be rendered whole inside Phase 9
+
+The platform ACTOR ClusterRole at 06:714–760 grants `create`/`update`/`patch`/`delete` on
+`namespaces, serviceaccounts, configmaps, secrets` **cluster-wide**. Phase 9's acceptance in 07 §2 is
+that the whole safety machinery runs end to end **with no write authority anywhere** — actor SAs bound
+to "empty" roles, everything dry-run. Rendering the template whole would hand every platform actor
+cluster-wide `delete secrets` in the phase whose entire point is that nothing can write. That is not a
+sizing problem; it breaks the phase's own acceptance criterion.
+
+#### The spec already sequences the write half elsewhere
+
+03 §4.2 (03:245–254) is decisive: `vap-agent-scope` is "**the same policy object as the read-only
+generation's `vap-agent-readonly`, inverted**: reader SAs keep the read-verb allow-list; actor SAs get
+a scope-and-template allow-list instead of a blanket write denial", and "'exceeds its tier template'
+is decidable in CEL **only because the template is compiled into the policy as a literal allow-list,
+generated from the same source as the rendered manifests**." That generator is **P10-T0**, deliberately
+scheduled ahead of **P10-T1**'s flip. Hand-transcribing three per-tier literal allow-lists into YAML
+in Phase 9 is exactly what B-002 refused, and would create a fourth definition site of the thing
+V-BRK-013 exists to single-source.
+
+So: **Phase 9 renders the READ half.** All four of `broker-execute-l2.sh` step 3's live reads
+(`list secrets`, `get namespaces`, `list agents`, the per-kind counts) are reads, so the read profile
+is sufficient to unblock V-BRK-006 (L2) and V-REV-001. The write half arrives with `vap-agent-scope`.
+
+#### What admission then needs, and what it does not
+
+Validation 3's inner test becomes `v in ['get','list','watch'] || (g+'/'+res+':'+v) in [ …20… ]`. No
+new literal list, no `has(...)` carve-out (5a's ruling forbids those as "a hole in the one runtime
+backstop, shaped exactly like a label that turns the policy off"), and `isActor` untouched. It
+preserves 01:200's stated property exactly — the set of **write** verbs admissible to any agent
+identity stays the four already enumerated — and it makes the actor arm say what validation 1 already
+says about every other agent RBAC object. **03 §4.3's obligation table (03:277–287) assigns
+`vap-agent-scope` only _write_ obligations for actors**; no row obliges admission to bound actor
+_reads_ per tier, which is what licenses the disjunct.
+
+#### Guardrail 9 forces the split, again
+
+The check must learn the new shapes before the product carries them. **5b-0-ii-a** (this unit, check
+only) → **5b-0-ii-b** (three read-only templates, `render_actor_grant`, the binding, the wiring into
+`apply_agent_identity`, retire the shared pair, and the disjunct in all three VAP copies) →
+**5b-0-iii** (L2).
+
+#### What changed in V-BRK-013
+
+**A ceiling and a profile, which are not the same set.** Property 3's bound becomes `ceiling(tier)` —
+the whole of 06 §2.2 ∪ §2.2.1, write verbs and all, which does **not** move with the phase. Property
+4's bound becomes `profile(tier)` — §2.2.1's grant plus the read verbs of §2.2's template while
+`DARK_PROFILE` holds. Only the completeness direction moves. The asymmetry is guarded: a strict-subset
+assertion plus a floor of 10 triples fails loudly if the read filter ever selects nothing away (dark
+mode is over, say so) or eats the template (the filter is broken).
+
+**Property 2 gained an assertion it never had.** The allow-list is only a bound in the company of the
+CEL that consumes it, so validation 3's verb test is now pinned to exactly two shapes: `bare` (the
+list alone) or `read-widened` (the list plus the three read verbs). A third shape is a failure. A
+check that reads the list and shrugs at the expression would score a `v != 'delete' ||` prefix —
+everything but one verb, admitted — as an unchanged twenty-triple policy.
+
+**Property 6 became the mechanism rather than the intention.** Its bound is whichever shape _every_
+copy carries, conjunctively. Under `read-widened`, a write triple from a tier's own template is
+admitted by neither disjunct — so what holds Phase 9 dark is admission, and this check asserts
+admission's shape rather than trusting the render to stay honest.
+
+`DARK_PROFILE = True` is the one constant that flips, in the same unit that widens the allow-list from
+`read-widened` to P10-T1's per-tier template allow-list. Flipping either alone turns the check red,
+which is the intended coupling.
+
+#### One hole the probe found, and closed
+
+Verifying "green on the tree 5b-0-ii-b will produce" is not optional for a check reshaped ahead of its
+implementation — a check that is green today and red on the correct future tree makes the next unit
+look like it broke something. Probing it that way found a false negative: **the check would have
+passed a `developer-team` ClusterRole**, which `vap-agent-readonly`'s wrong-scope validation denies
+outright. 06 §2.2 gives all three tiers a template and says nothing about the **kind** that carries
+it, so "render each tier's template" reads as a ClusterRole three times, is perfectly conformant to
+§2.2, is admissible under a widened validation 3 — and is refused anyway. Property 6 now covers
+validation 2 as well, with the namespace-scoped tier **parsed out of the policy**, not named in the
+check: "developer-team is namespace-scoped" already has definition sites in 03 §4 and in the policy,
+and a third one inside the check that exists to forbid third copies would be its own joke.
+
+#### What ran
+
+| Artifact                                           | Result                                                                                                          |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `actor-grant-single-sourced.py`                    | PASS — per tier, ceiling/profile: cluster-admin 171/83, developer-team 172/89, platform 136/68; 3 copies `bare` |
+| `actor-grant-single-sourced.py --negative-control` | PASS — **20/20** (was 14/14), each caught by the property it targets                                            |
+| the future-tree probe                              | 0 findings on the widened policy + three read-only profiles, developer-team as a `Role`                         |
+| `dev/tests/invariants-gate.py`                     | 22/22                                                                                                           |
+| `negative-controls-name-their-rule.py`             | PASS — 11 controls                                                                                              |
+| full `dev/L0-CHAIN.txt`                            | clean                                                                                                           |
+
+The six new mutations are the six wrong ways to land 5b-0-ii-b: the render without the widening (the
+ordering constraint 5b-0-i discovered, restated as a mutation); the widening with a **write** verb in
+the disjunct; a profile missing one read triple; the whole template rendered under a widened policy —
+the row without which `DARK_PROFILE` would be a comment, since property 4 alone permits a superset;
+the namespace-scoped tier as a ClusterRole; and a copy losing its wrong-scope validation.
+
+#### Verdicts
+
+| ID            | Level | Verdict | Note                                                                                     |
+| ------------- | ----- | ------- | ---------------------------------------------------------------------------------------- |
+| **V-BRK-013** | L0    | `pass`  | strictly more asserted; 20/20 control; green on today's tree **and** on 5b-0-ii-b's tree |
+
+Still blocked on 5b-0-ii-b: **V-BRK-006** (L2) and **V-REV-001**.
