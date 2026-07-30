@@ -1,0 +1,100 @@
+# actor-tenant-grant.yaml — a READ-ONLY tenant authority for the phase-9 actor identity.
+#
+# WHY THIS EXISTS
+#   The shipped actor grant (`k8s-operator/scripts/broker-operations-grant.yaml.template`, 06
+#   §2.2.1) gives the actor exactly the twenty triples it needs to run the BROKER: mint a
+#   TokenReview, read the freeze and policy CRs, write ActionRecords. It gives the actor no
+#   authority over a tenant workload at all. That is correct for shadow mode and it is why every
+#   envelope in P9-T8b-4b-ii-1 came back 403 target-forbidden at step 3 — the broker refused
+#   itself, for the right reason, before it could ever exercise steps 4 through 9.
+#
+#   To drive the pipeline past step 3 a suite has to grant the actor something to read. This file
+#   is that something, and nothing else: `get`/`list`/`watch` on six workload kinds, in one
+#   namespace that exists only for the test.
+#
+# WHY IT CARRIES `kube-agents/tier` AND NOT `kube-agents/role: actor`
+#   These two labels are not interchangeable and picking the wrong one either breaks a green check
+#   or invites it to be weakened.
+#
+#   `kube-agents/role: actor` is the label V-BRK-013 (`dev/tests/actor-grant-single-sourced.py`)
+#   discovers by. That check asserts every object wearing it has rules equal to 06 §2.2.1's twenty
+#   triples EXACTLY — that is the whole point of it, single-sourcing the actor grant so a second
+#   copy cannot drift. A test fixture wearing that label would turn V-BRK-013 red, correctly, and
+#   the one-line green would be to teach the check an exception. So: not that label, ever.
+#
+#   `kube-agents/tier` is the predicate `vap-agent-readonly`'s `is-agent-rbac` matchCondition uses.
+#   Wearing it means the cluster's own admission policy evaluates this Role and, because there is
+#   no `kube-agents/role: actor` to make `isActor` true, validation 1 permits only
+#   ['get','list','watch']. The read-onlyness below is therefore enforced at admission, by the
+#   shipped policy, and not merely asserted by the file that grants it. It is also the predicate
+#   `check_write_verbs_have_machinery` (invariant 7) discovers by, so this grant is inside that
+#   invariant's population rather than beside it.
+#
+#   The consequence for T9b, stated here because it is a design question and not a fixture detail:
+#   a WRITE tenant overlay cannot wear `kube-agents/tier` (validation 1 denies it) and, without it,
+#   is governed by no admission rule at all — `vap-agent-scope` does not exist until P10-T1, and
+#   `vap-agent-readonly`'s matchConstraints cover roles and clusterroles but not rolebindings.
+#   T9b has to rule on that. Until it does, `check_test_only_grants_are_confined` (V-CTN-037) is
+#   the only thing standing between this fixture and a real over-grant.
+#
+# WHY EVERY DOCUMENT CARRIES `kube-agents/test-only-grant: "true"`
+#   V-CTN-037 discovers this file by that marker, not by its path, and then proves four things
+#   about it: the marker appears nowhere outside `dev/`, nothing outside `dev/` references the
+#   file, no document here is cluster-scoped, and no rule reaches `escalate`/`bind`/`impersonate`,
+#   `*`, or the RBAC API group itself. A test-only grant that drifts into the install path is the
+#   single worst outcome of this decision, so it is the one thing a lint refuses rather than a
+#   convention discourages.
+#
+# WHY THE NAMESPACE IS CREATED HERE AND NEVER DELETED
+#   `actor_overlay_revoke` deletes the Role and the RoleBinding and leaves the Namespace standing.
+#   Revoking the authority is the whole of teardown; deleting the namespace would additionally
+#   delete every ActionRecord the run wrote into it, and an append-only journal that a teardown
+#   erases is [[LSN-045]]. `cluster-check-hygiene.py` property 2 fails any script that does both.
+#
+# Rendered by `dev/lib/actor-overlay.sh` via envsubst. Not directly appliable, deliberately:
+#   ${KAGE_TENANT_NS}   the tenant namespace, created below
+#   ${KAGE_ACTOR_NS}    where the actor ServiceAccount lives (the agent's namespace)
+#   ${KAGE_ACTOR_SA}    read from `status.broker.actorServiceAccount`, never recomputed
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${KAGE_TENANT_NS}
+  labels:
+    kube-agents/test-only-grant: "true"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubeagents-actor-tenant-readonly
+  namespace: ${KAGE_TENANT_NS}
+  labels:
+    kube-agents/tier: platform
+    kube-agents/test-only-grant: "true"
+rules:
+  # The kinds the broker's step-3 live reads actually touch: CaptureAll snapshots the targets,
+  # CaptureRestartBaselines reads the pods behind them, and resolve reads labels. Nothing here is
+  # chosen for breadth — a kind the pipeline never reads is a kind this fixture must not grant.
+  - apiGroups: [""]
+    resources: ["configmaps", "pods", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubeagents-actor-tenant-readonly
+  namespace: ${KAGE_TENANT_NS}
+  labels:
+    kube-agents/tier: platform
+    kube-agents/test-only-grant: "true"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeagents-actor-tenant-readonly
+subjects:
+  - kind: ServiceAccount
+    name: ${KAGE_ACTOR_SA}
+    namespace: ${KAGE_ACTOR_NS}

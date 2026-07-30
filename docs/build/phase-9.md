@@ -2618,6 +2618,99 @@ arm can no longer tell the tracked defect from a new one.
   again at 400, so there are two caps and only one of them is documented as dangerous. For
   `harness-improve`, with 4b-i's finding.
 
+### P9-T8b-4b-ii-2 splits: 2a is the overlay and its lint, 2b is the soak
+
+Oversized on inspection, so split per `harness-run` §2. **2a** — the read-only tenant overlay and
+planning defect 2's guard 1 — is hermetic L0 and depends on no cluster. **2b** — the envelope
+corpus, journal mining and V-REV-001 at L2 — is a new L2 suite with a corpus and a `¬` mode. The
+order follows this phase's own recorded rule that all remaining L0 work goes in front of the
+remaining L2 work, so the images are built once against a tree that has stopped moving (every commit
+invalidates P1).
+
+| Unit                | What                                                                                        | Checks             | Blocked on |
+| ------------------- | ------------------------------------------------------------------------------------------- | ------------------ | ---------- |
+| **P9-T8b-4b-ii-2a** | The read-only tenant overlay, its applier, and the lint that confines it to `dev/`          | **V-CTN-037** (L0) | 4b-ii-1    |
+| **P9-T8b-4b-ii-2b** | The envelope corpus soak over the overlay, journal mining, and guard 3 as a label assertion | **V-REV-001** (L2) | 2a         |
+
+### P9-T8b-4b-ii-2a — outcome, 2026-07-30
+
+**Green.** `dev/verify/fixtures/actor-tenant-grant.yaml` grants the deployed actor `get`/`list`/
+`watch` on six workload kinds in one tenant namespace; `dev/lib/actor-overlay.sh` renders it,
+applies it, and does not return until the API server's own authorizer agrees — and, in the same
+breath, that the actor still cannot write there and still cannot read `kube-system`.
+`check_test_only_grants_are_confined` (**V-CTN-037**, new in `invariants-gate.py`, 22/22 green) is
+guard 1, with 12 negative controls in `dev/test_invariants_gate.py`.
+
+**The labels were the whole design, and reading `vap-agent-readonly.yaml` settled them.** The
+overlay carries `kube-agents/tier: platform` and deliberately **not** `kube-agents/role: actor`:
+
+- `kube-agents/role: actor` is V-BRK-013's discovery key, and that check asserts every object
+  wearing it equals 06 §2.2.1's twenty triples **exactly**. A fixture wearing it turns a green
+  BLOCKING-ALWAYS check red — correctly — and the one-line green is an exception in the check.
+- `kube-agents/tier` is `is-agent-rbac`'s predicate, so the overlay's read-onlyness is enforced at
+  admission by the shipped policy rather than merely asserted by the file granting it. It is also
+  invariant 7's predicate, which puts the overlay **inside** that invariant's population rather than
+  beside it. Read verbs are explicitly not authority there, so nothing is weakened.
+
+**A design question for T9b, surfaced here and not answerable here.** A **write** overlay cannot
+wear `kube-agents/tier` — validation 1 denies it — and without the label it is governed by no
+admission rule at all: `vap-agent-scope` does not exist until P10-T1, and `vap-agent-readonly`'s
+`matchConstraints` cover `roles`/`clusterroles` but not `rolebindings`. T9b has to rule. Until it
+does, guard 1 is the only thing between a test fixture and a real over-grant, which is exactly the
+weight planning defect 2 assigned it.
+
+**Guard 3 costs nothing because teardown never deletes a namespace.** The applier creates-or-reuses
+the tenant namespace and `actor_overlay_revoke` deletes only the Role and the RoleBinding — revoking
+the authority, which is the point. No script deletes a namespace, so `cluster-check-hygiene.py`
+property 2 ([[LSN-045]]) is never engaged. Guard 3 becomes a label assertion in 2b.
+
+**The lint is derived from a marker, and its scope limit is stated rather than silent.** Discovery
+is by `kube-agents/test-only-grant`, never by a path — a rule keyed to one filename is a headcount
+of one ([[LSN-036]]). Heredoc RBAC inside a `dev/**.sh` is **out of scope and said so in the
+docstring**: a heredoc's disposition is not statically derivable, and `negative-attenuation.sh`
+applies a ClusterRole granting `impersonate` on purpose, as an adversarial input proving the VAP
+rejects it. Marking that would be a lie and exempting it by helper name would be an enumeration. The
+consequence runs the other way too — the rule is enforceable on files and not on heredocs, so the
+fixture was made a **file** in order to be inside it.
+
+**`dev/test_review_gate_paths.py` caught the fixture on the first full chain run.** A file that
+decides authority and does not trigger the security review gate is exactly what V-MET-007 derives,
+and it named the new fixture within seconds of it existing. A `dev/verify/fixtures/**` glob — a
+directory, not the filename, because nothing outside `dev/` may name such a file — was added to
+`review-gate.yml`. This is the harness catching the harness, and it is worth recording as a
+non-defect.
+
+**Then the new check caught its own evidence row.** The first `verification/results.csv` row written
+for V-CTN-037 quoted the marker verbatim and named the fixture by basename, and P1 and P3 both fired
+on it: a CSV outside `dev/` is not prose, and the check does not know the difference between a
+record of a grant and a path that applies one. The temptation was to add `verification/` to the
+allow-list beside `.md` — which is a check edit in the unit that authored the check, and a widening
+of exactly the kind [[LSN-036]] warns about, since every future evidence row would inherit the hole.
+The row was reworded instead: it describes the marker rather than spelling it and points at
+`dev/verify/fixtures/` rather than the filename. Cost: one sentence. The standing rule that follows
+is worth more than the row — **evidence about a test-only grant describes it, it does not quote it**,
+and the check enforces that for free.
+
+**Findings filed, not fixed.**
+
+- **`dev/assertion-baseline.json` is stale by roughly 1 000 assertions.** The committed baseline
+  holds **34 files / 194 named tests**; the tree today yields **131 / 1 209**. The ratchet
+  (V-MET-003, BLOCKING-ALWAYS) therefore has a floor 84 % below the actual assertion count and would
+  not notice a thousand assertions being deleted. It is passing — `inventory() ⊇ baseline` — which
+  is why nothing has said so. This unit regenerated it, saw the size of the jump, and **reverted**:
+  raising a security ratchet by 1 015 names is a review event that deserves its own commit and its
+  own reasoning, not a ride-along in a fixture unit. The ratchet is no weaker than it was this
+  morning. For `harness-improve`, and it is the highest-value item on that list.
+- **The heredoc half of V-CTN-037.** Closing it needs a way to tell an applied grant from an
+  adversarial input. Two scripts already grant that way: `brake-fanout-l2.sh` applies and keeps a
+  Role with `create`/`patch`/`update` on ActionRecords, and `negative-attenuation.sh` applies four
+  documents of which three are supposed to be denied. For `harness-improve`.
+- **`actionlint` is not installed on this host**, so the `review-gate.yml` edit was checked by
+  prettier and by `dev/test_review_gate_paths.py` (which parses the workflow and reads
+  `on.pull_request.paths`) rather than by the linter CLAUDE.md names. The edit is one entry appended
+  to an existing list. A candidate precondition for `binding.md`: a workflow edit with no actionlint
+  available is a stated gap, not a silent one.
+
 ---
 
 ## Deferrals opened by this phase (each with a named external blocker)

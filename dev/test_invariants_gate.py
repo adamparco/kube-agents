@@ -229,5 +229,171 @@ class DeferralClosureMarker(unittest.TestCase):
         self.assertIsNone(gate.CLOSED_MARKER.match(blocker))
 
 
+_MARKED_ROLE = """apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubeagents-actor-tenant-readonly
+  namespace: kubeagents-tenant-probe
+  labels:
+    kube-agents/tier: platform
+    kube-agents/test-only-grant: "true"
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+"""
+_FIXTURE = "dev/verify/fixtures/actor-tenant-grant.yaml"
+
+
+class TestOnlyGrantsAreConfined(unittest.TestCase):
+    """V-CTN-037's `¬`. Five properties, one control each, each control blinded to the other four.
+
+    The corpus is injected rather than written to disk. `check_test_only_grants_are_confined`
+    reaches the tree through exactly one call — `read_repo_files(REPO)` — so replacing that name in
+    the module's namespace substitutes the whole world the check can see, and a control cannot
+    accidentally leave an over-grant in the working tree if it fails partway. The properties are
+    about paths, and a `tempfile` corpus would have to fake those anyway.
+
+    Each control asserts WHICH property caught it, and most assert that exactly one did
+    ([[LSN-035]]): five properties over the same documents overlap enough that a mutation aimed at
+    P5 can land on P4 first, and the narrow rule underneath then accumulates a control that has
+    never executed it.
+    """
+
+    def setUp(self):
+        self._read = gate.read_repo_files
+
+    def tearDown(self):
+        gate.read_repo_files = self._read
+
+    def _corpus(self, files):
+        gate.read_repo_files = lambda *a, **k: dict(files)
+        return gate.check_test_only_grants_are_confined()
+
+    # -- the positive arm, against the tree as it stands ------------------------------------
+
+    def test_the_real_tree_is_green(self):
+        self.assertEqual([], gate.check_test_only_grants_are_confined())
+
+    def test_the_real_tree_actually_contains_a_marked_grant(self):
+        # The green above is only evidence if the population is non-empty. This is the half of
+        # [[LSN-038]] that a passing check cannot tell you: `_rbac_documents` returning nothing and
+        # every property holding print the same tick.
+        corpus = gate.read_repo_files(gate.REPO)
+        marked = [d for d in gate._rbac_documents(corpus) if gate.TEST_ONLY_MARKER in d[3]]
+        self.assertTrue(marked, "no marked RBAC document in the tree; the check is over nothing")
+        self.assertTrue(all(rel.startswith("dev/") for rel, _, _, _ in marked))
+
+    # -- P1: the marker is confined to dev/ ---------------------------------------------------
+
+    def test_p1_the_same_grant_in_an_install_path_fails(self):
+        problems = self._corpus({"k8s-operator/scripts/tenant-grant.yaml": _MARKED_ROLE})
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("not under dev/", problems[0])
+
+    def test_p1_prose_may_discuss_the_marker(self):
+        # 09 §6, invariants.md and the phase breakdown all name it. A rule that forbade that would
+        # be a rule against documenting the rule.
+        self.assertEqual(
+            [],
+            self._corpus(
+                {
+                    _FIXTURE: _MARKED_ROLE,
+                    "docs/design/09-verification-and-validation.md": (
+                        f"V-CTN-037 asserts `{gate.TEST_ONLY_MARKER}` never leaves dev/."
+                    ),
+                }
+            ),
+        )
+
+    # -- P2: an unmarked fixture cannot dodge P1 ----------------------------------------------
+
+    def test_p2_an_unmarked_rbac_document_under_dev_fails(self):
+        problems = self._corpus(
+            {
+                _FIXTURE: _MARKED_ROLE,
+                "dev/verify/fixtures/other.yaml": _MARKED_ROLE.replace(
+                    f'    {gate.TEST_ONLY_MARKER}: "true"\n', ""
+                ),
+            }
+        )
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("carries no", problems[0])
+
+    # -- P3: nothing outside dev/ names the file ----------------------------------------------
+
+    def test_p3_an_install_script_referencing_the_fixture_fails(self):
+        problems = self._corpus(
+            {
+                _FIXTURE: _MARKED_ROLE,
+                "k8s-operator/scripts/provision_99_grant.sh": (
+                    "kubectl apply -f ../../dev/verify/fixtures/actor-tenant-grant.yaml\n"
+                ),
+            }
+        )
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("references", problems[0])
+
+    # -- P4: a test-only grant is never cluster-scoped ----------------------------------------
+
+    def test_p4_a_cluster_scoped_marked_grant_fails(self):
+        problems = self._corpus({_FIXTURE: _MARKED_ROLE.replace("kind: Role", "kind: ClusterRole")})
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("must be namespaced", problems[0])
+
+    def test_p4_a_marked_rolebinding_is_fine(self):
+        binding = (
+            "apiVersion: rbac.authorization.k8s.io/v1\n"
+            "kind: RoleBinding\n"
+            "metadata:\n"
+            "  name: t\n"
+            "  namespace: kubeagents-tenant-probe\n"
+            "  labels:\n"
+            f'    {gate.TEST_ONLY_MARKER}: "true"\n'
+            "roleRef:\n"
+            "  apiGroup: rbac.authorization.k8s.io\n"
+            "  kind: Role\n"
+            "  name: t\n"
+        )
+        # The binding's roleRef legitimately names the RBAC API group. P5 must not read that as a
+        # grant over RBAC — a binding carries no rules at all.
+        self.assertEqual([], self._corpus({_FIXTURE: _MARKED_ROLE + "---\n" + binding}))
+
+    # -- P5: the blast radius of a fixture that did escape ------------------------------------
+
+    def test_p5_an_escalation_verb_fails(self):
+        for verb in sorted(gate.ESCALATION_VERBS):
+            with self.subTest(verb=verb):
+                problems = self._corpus(
+                    {_FIXTURE: _MARKED_ROLE.replace('"watch"', f'"watch", "{verb}"')}
+                )
+                self.assertEqual(1, len(problems), problems)
+                self.assertIn("LSN-004", problems[0])
+
+    def test_p5_a_grant_over_rbac_itself_fails(self):
+        problems = self._corpus(
+            {_FIXTURE: _MARKED_ROLE.replace('apiGroups: [""]', f'apiGroups: ["{gate.RBAC_API_GROUP}"]')}
+        )
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("widen", problems[0])
+
+    # -- P6: the check refuses to be green over nothing ---------------------------------------
+
+    def test_p6_an_empty_corpus_is_vacuous_not_green(self):
+        problems = self._corpus({})
+        self.assertEqual(1, len(problems))
+        self.assertIn("VACUOUS", problems[0])
+
+    def test_p6_renaming_the_marker_is_vacuous_not_green(self):
+        # The [[LSN-038]] mutation: the fixture is still there, still an over-grant risk, and the
+        # check can no longer see it. Silent in the safe direction is the failure mode this whole
+        # file exists for.
+        problems = self._corpus(
+            {_FIXTURE: _MARKED_ROLE.replace(gate.TEST_ONLY_MARKER, "kube-agents/fixture")}
+        )
+        self.assertTrue(problems)
+        self.assertIn("VACUOUS", problems[0])
+
+
 if __name__ == "__main__":
     unittest.main()
