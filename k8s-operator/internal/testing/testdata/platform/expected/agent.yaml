@@ -499,6 +499,8 @@ spec:
             - name: GOOGLE_CHAT_HOME_CHANNEL
             - name: TOKEN_BROKER_URL
               value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+            - name: KUBEAGENTS_AGENT_IDENTITY
+              value: platform
             - name: KUBEAGENTS_BROKER_ENDPOINT
               value: https://agent-broker.kubeagents-system.svc.cluster.local:8443
             - name: KUBEAGENTS_BROKER_SAN

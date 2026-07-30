@@ -354,6 +354,35 @@ func buildBrokerDeployment(agent *agentv1alpha1.Agent) *appsv1.Deployment {
 	}
 }
 
+// agentIdentity is the `<tier>/<scope-leaf>` string the agent pod must hash into every
+// `idempotencyKey` it computes (06 §4.1), rendered from the CR into KUBEAGENTS_AGENT_IDENTITY.
+//
+// The pod cannot derive this for itself. It knows its tier — `AGENT_TIER` has been in the general
+// env block since the read-only generation — and it has never known its scope leaf: not in an env
+// var, not in the rendered ConfigMap, not in the golden manifests. Half an identity is not one, and
+// the missing half is precisely the half that distinguishes two agents of the same tier.
+//
+// The value is composed from the SAME two expressions brokerArgs passes as `--tier` and `--scope`,
+// through the SAME production formatter the broker uses to join them. Not a `Sprintf` here that
+// happens to agree with `Identity.AgentIdentity()` today: agreement is the entire property, so it is
+// obtained by calling the function rather than by matching its output ([[LSN-036]], [[LSN-041]]).
+// The empty-scope arm comes along for free, which matters — a platform agent with no
+// `spec.scope.projectId` renders bare `platform` on both sides, and a local `tier + "/" + leaf`
+// would render `platform/` and be refused on every write.
+//
+// A mismatch fails closed and that is exactly what makes it dangerous to leave uncompared. The
+// broker recomputes the key over its own identity and refuses a difference, so a drifted value is
+// not a security hole — it is a total outage of the write path, reported per request as
+// `idempotency-key-mismatch`, a message about a hash. V-BRK-030 is the join that keeps the two
+// renderings equal.
+func agentIdentity(agent *agentv1alpha1.Agent) string {
+	id := broker.Identity{
+		Tier:  agentindex.EffectiveTier(agent),
+		Scope: scope.Of(agent).Leaf(),
+	}
+	return id.AgentIdentity()
+}
+
 // brokerArgs renders the broker's startup configuration.
 //
 // Flags, not envelope fields, and not env vars read inside the handler. 03 §4.1 step 1 derives
@@ -528,6 +557,7 @@ func agentBrokerVolumeMounts() []corev1.VolumeMount {
 // that identity rather than from anything on the wire.
 func agentBrokerEnvVars(agent *agentv1alpha1.Agent) []corev1.EnvVar {
 	return []corev1.EnvVar{
+		{Name: "KUBEAGENTS_AGENT_IDENTITY", Value: agentIdentity(agent)},
 		{Name: "KUBEAGENTS_BROKER_ENDPOINT", Value: brokerEndpoint(agent)},
 		{Name: "KUBEAGENTS_BROKER_SAN", Value: brokerSAN(agent)},
 		{Name: "KUBEAGENTS_BROKER_TOKEN_FILE", Value: agentBrokerTokenMountPath + "/token"},

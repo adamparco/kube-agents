@@ -2066,6 +2066,47 @@ the agent's own scope identity, which the pod knows from its rendered config. Th
 string; a builder that used it would compute keys nothing accepts. This is the sort of thing that is
 obvious once seen and invisible from the spec text, so it is written down here.
 
+### P9-T8b-2 splits again — the pod knows its tier and not its scope
+
+**Recorded 2026-07-30, at SELECT for T8b-2.** T8b-1's builder refuses to compute a key without an
+`agentIdentity`, deliberately: `compute_idempotency_key` raises rather than defaulting, because a
+defaulted identity produces a well-formed key for the wrong agent. The obvious next question is
+where the pod gets that string, and the survey found it cannot.
+
+`agentIdentity` is `<tier>/<leaf>` — the format is `Identity.AgentIdentity()` in
+`k8s-operator/internal/broker/rejection.go`, including its one-armed case for an empty scope. The
+broker learns both halves as **startup flags**: `broker_manifests.go` renders
+`--tier=agentindex.EffectiveTier(agent)` and `--scope=scope.Of(agent).Leaf()`. The agent pod is
+rendered from the same CR a few hundred lines away and gets **`AGENT_TIER` and nothing else** — no
+scope leaf, in any env var, in the rendered ConfigMap, or in the golden manifests. So the pod holds
+half the identity, and the half it is missing is the one that differs between two agents of the same
+tier.
+
+**This is fail-closed, which is why it survived to be found here.** A wrong `agentIdentity` produces
+a key the broker's recomputation refuses, so nothing unsafe happens — it is a total outage of the
+write path dressed as a per-request 400, and it would land the first time anyone called
+`submit_action`. Not an escape from shipped code: nothing imports the builder yet.
+
+| Unit          | What                                                                                                                                                                                 | Checks              |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------- |
+| **P9-T8b-2a** | The operator renders the agent's own identity into the agent pod, **joined** to the two flags the broker is started with, so the two cannot drift                                    | **V-BRK-030** (new) |
+| **P9-T8b-2b** | The `submit_action` / `plan_action` MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029**       |
+
+**Why 2a is its own unit and not a line inside 2b.** It is the only part that changes the operator,
+which means golden manifests, an envtest run and `Run Controller Tests` — a different substrate from
+2b's Python entirely. And it is the half with a _drift_ obligation rather than a behavioural one: the
+value has to equal what the broker was started with, forever, and the check that says so has to read
+**both rendered manifests from one CR** and compose them through the production
+`Identity.AgentIdentity()` rather than restating the `<tier>/<leaf>` format a third time ([[LSN-036]],
+[[LSN-041]]). Bundling it under 2b would put that join inside a unit whose failures are all about
+TLS and nonces, where a format regression reads as a transport bug.
+
+**Where it goes: `agentBrokerEnvVars`, with the other five.** Not the general env block. Those five
+are appended _after_ `mergeEnvVars` specifically so `spec.deployment.env` cannot win against them,
+and the identity belongs to the same class: a CR author who could set it could not forge an identity
+— the broker derives its own and refuses a mismatch — but they could make **every write from that
+agent refused**, which is a denial of service authored in a field that looks like configuration.
+
 ---
 
 ## Recon 2026-07-29 — P9-T9, and the real size of the gate

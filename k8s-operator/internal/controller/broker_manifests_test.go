@@ -28,6 +28,7 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -436,4 +437,159 @@ func TestNoFleetWideBroker(t *testing.T) {
 			t.Errorf("%s does not vary with the Agent CR (%q for both) — that is a fleet-wide writer", tc.what, tc.a)
 		}
 	}
+}
+
+// --- V-BRK-030: the pod's identity is the broker's identity ----------------------------------
+
+// TestAgentIdentityMatchesTheBrokerItTalksTo is the join. 06 §4.1 hashes `agentIdentity` into every
+// `idempotencyKey`, the broker recomputes the key over ITS OWN identity, and
+// `CompareIdempotencyKey` refuses a difference — so these two renderings of the same CR agree or
+// the agent's write path does not work at all.
+//
+// Both sides are read out of the rendered manifests, not out of the functions that produced them.
+// Asserting `agentIdentity(agent) == agentIdentity(agent)` would pass on any implementation; what
+// has to hold is that the string the POD receives equals the identity the BROKER assembles from the
+// flags it was STARTED with, and the only place both of those exist is the two Deployments.
+//
+// The composition goes through the production `Identity.AgentIdentity()`. Writing `tier + "/" +
+// scope` here would be a third copy of the format and would agree with a wrong implementation for
+// the two tiers that have a scope — the empty-scope arm is exactly where a local join renders
+// `platform/` and the real one renders `platform` ([[LSN-036]], [[LSN-041]]).
+func TestAgentIdentityMatchesTheBrokerItTalksTo(t *testing.T) {
+	cases := []struct {
+		name  string
+		tier  agentv1alpha1.AgentTier
+		scope *agentv1alpha1.ScopeSpec
+		want  string
+	}{
+		{
+			name:  "platform",
+			tier:  agentv1alpha1.TierPlatform,
+			scope: &agentv1alpha1.ScopeSpec{ProjectID: "acme-prod"},
+			want:  "platform/acme-prod",
+		},
+		{
+			name:  "cluster-admin",
+			tier:  agentv1alpha1.TierClusterAdmin,
+			scope: &agentv1alpha1.ScopeSpec{ProjectID: "acme-prod", ClusterName: "eu-1"},
+			want:  "cluster-admin/eu-1",
+		},
+		{
+			name:  "developer-team",
+			tier:  agentv1alpha1.TierDeveloperTeam,
+			scope: &agentv1alpha1.ScopeSpec{ProjectID: "acme-prod", ClusterName: "eu-1", Namespace: "team-payments"},
+			want:  "developer-team/team-payments",
+		},
+		{
+			// The arm a hand-written join gets wrong. `Identity.AgentIdentity()` emits the bare
+			// tier when the scope is empty; `tier + "/" + leaf` emits a trailing slash, and every
+			// key computed against it is refused.
+			name:  "a scope-less agent renders the bare tier, with no trailing slash",
+			tier:  agentv1alpha1.TierPlatform,
+			scope: nil,
+			want:  "platform",
+		},
+		{
+			// Tier defaulting is the operator's, not the CRD's, and it happens in two places that
+			// have to agree: `agentindex.EffectiveTier` here and the same call in brokerArgs.
+			name:  "an unset tier defaults to platform on both sides",
+			tier:  "",
+			scope: &agentv1alpha1.ScopeSpec{ProjectID: "acme-prod"},
+			want:  "platform/acme-prod",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := brokerTestAgent("payments", "team-payments", tc.tier, tc.scope)
+
+			got := envValue(buildDeployment(agent, "h1", "h2", "h3"), "KUBEAGENTS_AGENT_IDENTITY")
+			if got == "" {
+				t.Fatal("the agent pod carries no KUBEAGENTS_AGENT_IDENTITY; it cannot compute an " +
+					"idempotencyKey the broker will accept, and 06 §4.1's builder refuses to default one")
+			}
+
+			// The other end: what the broker will call itself, assembled from the flags it is
+			// actually started with.
+			args := buildBrokerDeployment(agent).Spec.Template.Spec.Containers[0].Args
+			asStarted := broker.Identity{
+				Tier:  agentv1alpha1.AgentTier(flagValue(t, args, "--tier")),
+				Scope: flagValue(t, args, "--scope"),
+			}
+			brokerSide := asStarted.AgentIdentity()
+
+			if got != brokerSide {
+				t.Errorf("the pod is told it is %q; its broker was started as %q. Every key the "+
+					"agent computes will be refused as idempotency-key-mismatch", got, brokerSide)
+			}
+			if got != tc.want {
+				t.Errorf("identity = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAgentIdentityNotOverridableBySpecEnv puts the identity in the same class as the endpoint and
+// the SAN. A CR author cannot forge an identity with it — the broker derives its own and refuses a
+// mismatch — but they can make every write from the agent refused, which is a denial of service
+// authored in a field that reads as configuration.
+func TestAgentIdentityNotOverridableBySpecEnv(t *testing.T) {
+	agent := brokerTestAgent("payments", "team-payments", agentv1alpha1.TierDeveloperTeam,
+		&agentv1alpha1.ScopeSpec{ProjectID: "acme-prod", ClusterName: "eu-1", Namespace: "team-payments"})
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "KUBEAGENTS_AGENT_IDENTITY", Value: "platform/acme-prod"}},
+	}
+	dep := buildDeployment(agent, "h1", "h2", "h3")
+
+	seen := 0
+	for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+		if e.Name != "KUBEAGENTS_AGENT_IDENTITY" {
+			continue
+		}
+		seen++
+		if e.Value != agentIdentity(agent) {
+			t.Errorf("identity was overridden by spec.deployment.env: %q", e.Value)
+		}
+	}
+	if seen != 1 {
+		t.Errorf("expected exactly one KUBEAGENTS_AGENT_IDENTITY entry, got %d", seen)
+	}
+}
+
+// TestTwoAgentsOfOneTierGetDistinctIdentities is the reason the scope leaf has to be there at all.
+// `AGENT_TIER` alone has been in the pod since the read-only generation and is identical for these
+// two; an identity built from it would make their keys collide in the broker's dedup index.
+func TestTwoAgentsOfOneTierGetDistinctIdentities(t *testing.T) {
+	a := brokerTestAgent("payments", "team-payments", agentv1alpha1.TierDeveloperTeam,
+		&agentv1alpha1.ScopeSpec{ProjectID: "acme-prod", ClusterName: "eu-1", Namespace: "team-payments"})
+	b := brokerTestAgent("search", "team-search", agentv1alpha1.TierDeveloperTeam,
+		&agentv1alpha1.ScopeSpec{ProjectID: "acme-prod", ClusterName: "eu-1", Namespace: "team-search"})
+
+	if x, y := agentIdentity(a), agentIdentity(b); x == y {
+		t.Errorf("two developer-team agents in different namespaces both render %q", x)
+	}
+}
+
+// envValue reads one env var off the agent container.
+func envValue(dep *appsv1.Deployment, name string) string {
+	for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == name {
+			return e.Value
+		}
+	}
+	return ""
+}
+
+// flagValue reads `--name=value` out of a rendered arg list. It fails the test on a missing flag
+// rather than returning empty, because an empty scope is a legitimate value here and "absent"
+// would otherwise be indistinguishable from "a platform agent with no project".
+func flagValue(t *testing.T, args []string, name string) string {
+	t.Helper()
+	for _, a := range args {
+		if strings.HasPrefix(a, name+"=") {
+			return strings.TrimPrefix(a, name+"=")
+		}
+	}
+	t.Fatalf("the broker is started without %s; args = %v", name, args)
+	return ""
 }
