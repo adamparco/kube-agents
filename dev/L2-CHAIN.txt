@@ -133,3 +133,24 @@ bash dev/verify/rollback-replayer-l2.sh gke-scratch-kube-agents-dev
 # than of brake_role.yaml, which is hand-written and so has no `make manifests` run to catch a verb
 # it forgot.
 bash dev/verify/brake-fanout-l2.sh gke-scratch-kube-agents-dev
+
+# V-BRK-012: one broker per Agent CR, and NO FLEET-WIDE WRITER, in the deployed fleet. The second
+# line here that needs P1 in full, and the first that needs it on the BROKER pod rather than only on
+# the operator — which is why `_p1_build_inputs` had to learn `kage-broker` before this line could
+# exist. The two ends of the image indirection are different subjects: the controller CHOOSES the
+# broker image through KUBEAGENTS_BROKER_IMAGE and a pod it renders EXECUTES it, so a controller that
+# is the build under test can still be handing out last week's broker digest, and P1 on the operator
+# would report green about it.
+#
+# The L0 half of this row has been green since P9-T7b and is a real result — every broker-derived
+# name is a function of the CR, the unpaired render is unrepresentable. It is also exactly what a
+# source lint can see, and for four units the deployed fleet had no brokers on any cluster while it
+# stayed green: the image variable was set nowhere and the fallback tag is one V-CMP-002 measured as
+# unpullable. Nothing but a cluster with two real Agent CRs on it can tell those two states apart.
+#
+# It runs LAST because it is the only Phase 9 line that seeds and deletes Agent CRs in
+# kubeagents-system — the same reason webhook-negatives-l2.sh is last in Phase 8. Its fixture is the
+# two SHIPPED manifests co-located in one namespace, which is the only arrangement where a Service
+# selector of `role: actor` alone can be caught round-robining one agent's envelopes into another
+# agent's broker.
+bash dev/verify/broker-per-agent-l2.sh gke-scratch-kube-agents-dev

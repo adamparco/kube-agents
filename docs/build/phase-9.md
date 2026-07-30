@@ -2023,14 +2023,16 @@ deliverables wearing one name, and two of them cannot be checkpointed in a sessi
 
 The remaining two halves are hermetic and each is a unit. The split:
 
-| Unit             | What                                                                                                                                                                                | Checks                                   | Blocked on                     |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ------------------------------ |
-| **P9-T8b-1**     | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic   | **V-BRK-028** (new)                      | nothing                        |
-| **P9-T8b-2**     | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029** (new)                      | T8b-1                          |
-| ~~**P9-T8b-3**~~ | ~~The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)~~ — **split, see below**: the skill is Phase 9's, the retirement is Phase 10's     | ~~V-GAT-019 (phase **10**)~~ — mis-bound | —                              |
-| **P9-T8b-3a**    | The `apply-change` skill in all three tiers, alongside `submit-suggestion` — **done 2026-07-30**                                                                                    | **V-CTR-020** (new)                      | T8b-2b                         |
-| **P9-T8b-3b**    | `submit-suggestion`'s retirement — **deferred into Phase 10 as P10-T3**                                                                                                             | —                                        | Phase 10                       |
-| **P9-T8b-4**     | The L2 shadow soak with journal mining                                                                                                                                              | V-REV-001 (L2)                           | T8b-3a, a live scratch cluster |
+| Unit             | What                                                                                                                                                                                | Checks                                   | Blocked on             |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ---------------------- |
+| **P9-T8b-1**     | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic   | **V-BRK-028** (new)                      | nothing                |
+| **P9-T8b-2**     | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029** (new)                      | T8b-1                  |
+| ~~**P9-T8b-3**~~ | ~~The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)~~ — **split, see below**: the skill is Phase 9's, the retirement is Phase 10's     | ~~V-GAT-019 (phase **10**)~~ — mis-bound | —                      |
+| **P9-T8b-3a**    | The `apply-change` skill in all three tiers, alongside `submit-suggestion` — **done 2026-07-30**                                                                                    | **V-CTR-020** (new)                      | T8b-2b                 |
+| **P9-T8b-3b**    | `submit-suggestion`'s retirement — **deferred into Phase 10 as P10-T3**                                                                                                             | —                                        | Phase 10               |
+| ~~**P9-T8b-4**~~ | ~~The L2 shadow soak with journal mining~~ — **split, see below**: the broker has no deployment path, so there is nothing to soak yet                                               | ~~V-REV-001 (L2)~~                       | —                      |
+| **P9-T8b-4a**    | The broker's deployment path, and the L2 claim it makes checkable                                                                                                                   | **V-BRK-012 (L2)**                       | a live scratch cluster |
+| **P9-T8b-4b**    | The L2 shadow soak with journal mining                                                                                                                                              | V-REV-001 (L2)                           | T8b-4a                 |
 
 **Why T8b-1 is the first half and not an arbitrary slice.** Everything downstream is transport and
 prose; this is the only part with a _correctness_ obligation the broker will enforce. The broker
@@ -2291,6 +2293,68 @@ is V-MET-007 — the one check ID the T9 row names explicitly — it does not de
 and it is the reason the security gate never ran on the broker. Doing it inside the gate unit means
 doing it late; doing it in its own unit means it stops being true sooner. It still must not be done
 in a unit that would be reviewing itself.
+
+---
+
+### P9-T8b-4 splits: 4a is the deployment path, 4b is the soak
+
+**Recorded 2026-07-30, at SELECT.** T8b-4 is "the L2 shadow soak with journal mining". Surveying
+what the soak needs before starting it turned up a defect in the shipped system, not a gap in the
+test scaffolding, and the defect has to be fixed before any L2 broker claim can be made at all:
+
+- `pod_launcher.go:168` renders a **broker Deployment for every `Agent` CR**, and the `PodLauncher`
+  interface deliberately offers no way to ask for just the agent half.
+- The broker's image comes from `brokerImage()`, which reads `KUBEAGENTS_BROKER_IMAGE` off the
+  controller's own Deployment and otherwise falls back to
+  `ghcr.io/gke-labs/kube-agents/kage-broker:v0.1.0`.
+- **`KUBEAGENTS_BROKER_IMAGE` is set nowhere in this repository** — not in `config/manager/`, not in
+  the provisioning path, not in `reload-images.sh`. Checked, not assumed.
+- That GHCR tag is one of the four the **V-CMP-002** deferral measured as unpullable (the other
+  three answer 403; `platform-agent` answers 404).
+
+So every `Agent` CR on every cluster renders a broker Deployment whose pod cannot pull. That is 09
+§11.9 — built, never wired — in the component that holds the actor credential, and
+`reload-images.sh` says so about itself in its own header: the `broker` target "repoints NOTHING …
+Once P9-T7 lands this grows a `deploy_broker`". P9-T7 landed four units ago. The note aged into a
+defect.
+
+**The split.** 4a is the deployment path and the L2 claim that path makes true; 4b is the soak.
+
+| Unit          | What                                                                                                                                                                                     | Checks             | Blocked on                           |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------ |
+| **P9-T8b-4a** | `deploy_broker`; the `kage-broker` P1 mapping; the actor identity as a dev fixture rendered by the shipped renderer; `dev/verify/broker-per-agent-l2.sh` and its `dev/L2-CHAIN.txt` line | **V-BRK-012 (L2)** | a live scratch cluster               |
+| **P9-T8b-4b** | The shadow soak proper: drive envelopes at the deployed broker and mine the journal                                                                                                      | V-REV-001 (L2)     | T8b-4a — nothing to drive until then |
+
+**Why V-BRK-012 and not a new ID.** 09 §6.2 gives V-BRK-012 as `L0, L2` and `verification/results.csv`
+records only the L0 row (2026-07-28, P9-T7b), whose own note ends "the lint reads source, so it says
+nothing about a _deployed_ fleet — that is the `L2` half, P9-T9's". The L2 half is the open half, it
+is BLOCKING-ALWAYS with a mandatory `¬`, and it is exactly the claim a working deployment path makes
+checkable: one broker per CR, owned by that CR, on the digest under test, with a Service whose
+endpoints resolve to its own broker pod and nobody else's. Adding an ID for "the broker deploys"
+would be a second name for the same property (V-MET-013), so the row moves from T9b to here.
+
+**LSN-015 is honoured by the fixture, not by a note.** The two shipped manifests
+`examples/gitops-repo/fleet/platform-agent.yaml` and
+`clusters/cluster-a/agents/agent.yaml` both live in `kubeagents-system` — a platform broker and a
+cluster-admin broker co-located, which is 08 §2.6's shape and the only arrangement in which "the
+Service selector pins `agent:` as well as `role:`" can fail. A one-CR fixture cannot fail it. They
+are seeded through `seed_parent_agent`, so they are the shipped manifests and not this suite's
+paraphrase of them (LSN-024).
+
+**Three consequences for P1, all of which are work in 4a.**
+
+1. `_p1_build_inputs` maps `k8s-operator` and `kage-router` and **returns 1 for everything else**,
+   so P1 against a broker pod answers state 3 — could not verify — and a broker suite that mapped 3
+   to a pass would be certifying whatever image happened to be running. `kage-broker` builds from
+   the same `k8s-operator/` context and gains the mapping here.
+2. The freshness half compares the deployed tag against `git rev-parse --short HEAD`, so the tree
+   must be committed before the Cloud Build and must not move until the L2 run is over. Same
+   discipline as T9a's ordering argument, one level tighter: this unit's own ledger commit is taken
+   **after** the run, not between the build and it.
+3. The broker image reaches the pod through the **controller's** environment, so P1 has two subjects
+   here and both are asserted: the controller pod (which chose the image) and the broker pod (which
+   is running it). A cluster where those two disagree is one where the rendered Deployment is a
+   generation behind the env var, and every claim below it would be about the previous build.
 
 ---
 

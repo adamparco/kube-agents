@@ -70,7 +70,12 @@ _p1_build_inputs() {
   local last="${1%%@*}"
   last="${last##*/}"
   case "${last%%:*}" in
-    k8s-operator | kage-router) echo "k8s-operator" ;; # docker build context is k8s-operator/
+    # All three are built from the k8s-operator/ context, by three Dockerfiles in it. kage-broker
+    # is here because P1 against a BROKER pod is not the same question as P1 against the operator:
+    # the broker's image is chosen by the operator (KUBEAGENTS_BROKER_IMAGE) and pulled by a pod the
+    # operator renders, so a broker running last week's binary is invisible to the operator's own
+    # P1 and answers every V-BRK claim about the deployed fleet.
+    k8s-operator | kage-router | kage-broker) echo "k8s-operator" ;; # docker build context is k8s-operator/
     *) return 1 ;;
   esac
 }
