@@ -160,6 +160,16 @@ func JoinPointer(tokens ...string) string {
 	return b.String()
 }
 
+// SplitPointer splits an RFC 6901 pointer into unescaped tokens.
+//
+// Exported for the same reason JoinPointer is, and it is JoinPointer's inverse. The broker's seam
+// between the diff builder and the classifier has to read a value back out of an object at a
+// pointer this package's escaper produced (internal/broker/pipeline, valueAtPointer); a second
+// unescaper over there would agree on the day it was written and then diverge on the first
+// annotation key containing a slash, at which point the classifier is shown a nil value for a
+// field that is being set -- and a nil value is not scanned for secret material.
+func SplitPointer(ptr string) []string { return splitPointer(ptr) }
+
 // splitPointer splits an RFC 6901 pointer into unescaped tokens. The empty pointer "" is the whole
 // document and yields no tokens; "/" is one empty token, which is a legal (if strange) key.
 func splitPointer(ptr string) []string {

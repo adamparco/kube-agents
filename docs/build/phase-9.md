@@ -1077,6 +1077,63 @@ readAt.IsZero()` is subsumed by the staleness ceiling (a zero read time is stale
       "integrity". Same shape as the P9-T7c-2b halt, where 09 cites 03 §4.1 for V-BRK-021's "one
       mutating route" and 03 §4.1 does not contain it. The property is well-defined in 09 itself, so
       this is a citation defect rather than a spec contradiction.
+    - **Split into 4a and 4b at SELECT, 2026-07-29.** The recon above is five findings deep and the
+      task carries two independent deliverables — a **conversion** between two packages' readings of
+      the same word, and a **mechanization** that discovers its own verb set. Each has its own check
+      and each is checkpointable alone, which is the `harness-run` §2 test. Doing them together
+      would mean a unit whose diff spans `classify`, `execute`, `pipeline` and a new lint, verified
+      by one check that did not exist when the work started.
+
+      | Unit                 | Scope                                                                                                                                                                                                                                                                                                          | Checks               | Blocks on |
+      | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | --------- |
+      | **P9-T7c-4a** — done | The conversion. `apply`, `scale` and merge-patch reach the classifier with real `TouchedPaths`; the `stepResolve` reorder that makes `snap.Live` available before `classify.Resolve`; `apply` stops being `WholeObject`; the two false comments deleted.                                                       | **V-BRK-020** — pass | nothing   |
+      | **P9-T7c-4b**        | The mechanization. **V-BRK-022** — every verb in the envelope's closed enum executes end to end through the assembled pipeline, the verb set **discovered from the enum** — plus exporting that enum and the lint joining it to `classify.KnownVerbs()`. Closes [[LSN-040]] and the `KnownVerbs` prose defect. | **V-BRK-022** (new)  | **4a**    |
+
+      **The complication LSN-040 warns about dissolves on inspection.** The lesson says feeding a
+      computed diff into `classify.PatchOp.Value` is lossy for the typed rules, because
+      `execute.DiffResult.Ops` render `Value` as a **string** and `DirectionOfBoolField` would see
+      `"true"`. But `classify.PatchOp.Value` is `any`, and for an `apply` the **desired object is in
+      hand** — so the diff supplies the _paths_ and the desired object supplies the _typed values_.
+      Nothing has to be read back out of a rendered string. This is only true because both inputs are
+      available at the same point, which is what the `stepResolve` reorder buys.
+
+    - **What 4a actually landed — 2026-07-29.** The dissolution above held, and the reorder was the
+      whole mechanism: `stepResolve` now runs `execute.CaptureAll` before `classify.Resolve`, and
+      `fillTouchedPaths` sits between them. No new API read, no new interface, one new function on
+      the path.
+
+      **It closed a live fail-closed bug, not just a classification gap.** `classify.Resolve` set
+      `WholeObject` for create, **apply** and delete; `execute.checkWholeObject` accepts only create
+      and delete and its `default:` arm refuses anything else. So **no `apply` could execute through
+      the assembled pipeline at all.** `TestApplyFailsClosedAtTheIntegrityCheck` recorded that
+      deliberately in T7c-1 and instructed its own replacement by a positive counterpart; three
+      end-to-end tests are that counterpart.
+
+      **The security property is the negative half.** `classify.matches` returns false for any
+      `when.fieldPaths` rule against an empty path set, so a rule reading
+      `fieldPaths: [data.log-level]` was silently inert against `apply` while reading in a policy
+      review as a control in force. `TestAFieldPathsRuleFiresOnAnApply` asserts both directions,
+      because a test asserting only "the rule fires" would pass equally against an implementation
+      reporting **every** field as touched — the other way to make a fieldPaths rule match, and
+      exactly as wrong. That implementation is mutant M3 and the negative subtest is what kills it.
+
+      **The sweep found a hole in the check itself.** The scale expectation was written as
+      `Path: scaleReplicasPointer`, comparing the constant against itself; M8 changed the constant to
+      `/spec/replica` and the package stayed green. Fixed by spelling the pointer the way a rule
+      author would. Final score **14/14 caught, 0 escaped**.
+
+      **Two findings filed rather than fixed** (never in the same unit as the implementation):
+      09 §6's V-BRK-020 row cites **03 §4.4**, which contains none of "strategic", "expand" or
+      "integrity"; and **05 §1.1** claims the dry-run carve-out list "is a code constant" where the
+      implementation has an injected `ClientApplier.DryRunUnsupported func(TargetRef) bool` and no
+      `V-BRK` check asserts an envelope per carve-out kind. The second is an **unimplemented spec
+      requirement**, so it is scheduled rather than edited — narrowing the doc to match the code
+      would be weakening a spec, which invariant 10 forbids.
+
+      **What 4b inherits.** The conversion is in place for every verb that arrives as an object, so
+      4b's end-to-end-per-verb check has something to assert against. `classify.knownVerbs` still
+      contains `"cloud"` where `broker.validOps` does not, which 4b's lint has to account for
+      rather than trip over.
 
 **Why T7c split into four.** T7c-1 was scoped as "assemble the pipeline and claim the two L1
 checks", and the assembly turned out to be the small part. Three things came out of doing it.

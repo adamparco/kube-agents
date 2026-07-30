@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -56,9 +57,18 @@ import (
 // bound the rejection journal uses, and for the same reason: the intent is model-authored prose.
 const MaxIntentLen = 512
 
-// The one envelope string value this package has to recognize by name. It is validated by the
-// envelope's own closed enum, so this is a read of a shared vocabulary rather than a second one.
-const mediaJSONPatch = "application/json-patch+json"
+// The envelope string values this package has to recognize by name. They are validated by the
+// envelope's own closed enums, so these are reads of a shared vocabulary rather than second ones.
+const (
+	mediaJSONPatch  = "application/json-patch+json"
+	mediaApplyPatch = "application/apply-patch+yaml"
+
+	// scaleReplicasPointer is where a scale writes, as the classifier's rules name it. A constant
+	// because it is asserted from two directions -- fillTouchedPaths writes it and the /scale
+	// subresource's diff is checked against it -- and two spellings of the same pointer would make
+	// the integrity check reject every scale.
+	scaleReplicasPointer = "/spec/replicas"
+)
 
 // RecordStore is the ActionRecord persistence seam. `*journal.Store` satisfies it.
 type RecordStore interface {
@@ -397,6 +407,13 @@ func (p *Pipeline) step(tr *broker.StepTrace, id broker.Step, fn func() (string,
 // both here rather than at their point of use is what makes steps 4 and 6 pure functions, which is
 // what makes the 09 §7.1 classification corpus and the §7.3 undo corpus hermetic.
 //
+// The ORDER of the two is load-bearing, and it is snapshot first. An apply, a scale and a merge
+// patch all arrive as objects rather than as patch operations, so the field set 06 §4.2 matches
+// `when.fieldPaths` against has to be COMPUTED, and for an apply computing it means diffing the
+// desired object against live state. That makes the snapshot an input to classification and not
+// merely a companion of it: resolve-then-capture would have to either read live state twice or
+// classify an apply as touching no fields at all.
+//
 // It is also why "resolve scope" is step 3 and not a formality. 03 §4.1 says one out-of-scope
 // target rejects the whole envelope; the containment verdict itself is rendered at step 4, because
 // 06 §4.2 makes scope the classifier's own evaluation-order step 1 and re-deciding it here would be
@@ -425,12 +442,6 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 		}
 		s.targets = targets
 
-		resolved, err := classify.Resolve(ctx, p.cfg.Live, s.caller, raws)
-		if err != nil {
-			return "", fmt.Errorf("step 3: resolving %d operations against live state: %w", len(raws), err)
-		}
-		s.resolved = resolved
-
 		snaps, err := execute.CaptureAll(ctx, p.cfg.Reader, s.actionID, targets, metav1.NewTime(s.at), p.cfg.BodyStore)
 		if err != nil {
 			// V-BRK-018: all snapshots or none. CaptureAll already refuses to return a partial set;
@@ -439,6 +450,18 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 			return "", fmt.Errorf("step 3: capturing pre-state for %d targets: %w", len(targets), err)
 		}
 		s.snaps = snaps
+
+		// Between the two reads, not after them: an apply's changed-field set is a diff against the
+		// live state CaptureAll just returned, and classify.Resolve is the consumer of it.
+		if err := fillTouchedPaths(s.env, raws, snaps); err != nil {
+			return "", err
+		}
+
+		resolved, err := classify.Resolve(ctx, p.cfg.Live, s.caller, raws)
+		if err != nil {
+			return "", fmt.Errorf("step 3: resolving %d operations against live state: %w", len(raws), err)
+		}
+		s.resolved = resolved
 
 		return fmt.Sprintf("%d operations, %d pre-states", len(resolved), len(snaps)), nil
 	})
@@ -994,9 +1017,10 @@ func targetRef(op broker.Operation) (agentv1alpha1.TargetRef, error) {
 
 // patchOps turns a JSON Patch body into the classifier's op list, which is what TouchedPaths reads.
 //
-// Only the JSON Patch media type produces one. A merge patch and an apply patch are OBJECTS whose
-// touched paths are the shape of the object itself, and the classifier derives those from Payload
-// instead -- so returning nil for them is the correct answer, not a gap.
+// Only the JSON Patch media type produces one here, because only it arrives already in this shape.
+// Every other field-level verb carries an OBJECT, and its op list is computed by fillTouchedPaths
+// once live state is in hand -- returning nil for them at this point is incompleteness, not the
+// answer.
 func patchOps(op broker.Operation) ([]classify.PatchOp, error) {
 	if op.Patch == nil || op.Patch.Type != mediaJSONPatch {
 		return nil, nil
@@ -1013,6 +1037,176 @@ func patchOps(op broker.Operation) ([]classify.PatchOp, error) {
 		return nil, fmt.Errorf("a json-patch body that passed validation does not decode as a patch list: %w", err)
 	}
 	return ops, nil
+}
+
+// fillTouchedPaths gives the classifier the changed-field set for the verbs that do not carry one.
+//
+// A JSON Patch arrives as a list of operations and patchOps has already read it. Every other
+// field-level verb arrives as an OBJECT, and until this function existed the classifier was shown
+// an empty path set for all of them -- so `when.fieldPaths` could not fire on an apply, a scale or
+// a merge patch, which is most of what an agent sends. 06 §4.2 matches fieldPaths against the
+// fields the operation touches, and "the operation is an object, so we do not know" is not one of
+// the answers that section admits.
+//
+// It runs between execute.CaptureAll and classify.Resolve because that is the only window in which
+// both halves of the answer exist: an apply's touched fields are a diff against live state, and
+// live state is what CaptureAll just read. See stepResolve for why that fixes the order of step 3.
+//
+// raws is indexed in lockstep with env.Operations -- rawOps builds one entry per operation and
+// returns early on the first it cannot convert, so a short slice cannot reach here.
+func fillTouchedPaths(env *broker.Envelope, raws []classify.RawOp, snaps []execute.Snapshot) error {
+	live := make(map[int]*unstructured.Unstructured, len(snaps))
+	for _, s := range snaps {
+		live[s.TargetIndex] = s.Live
+	}
+
+	for i := range raws {
+		op := env.Operations[i]
+		var (
+			ops []classify.PatchOp
+			err error
+		)
+		switch {
+		case op.Op == "apply":
+			ops, err = diffPatchOps(i, live[i], op.DesiredState)
+
+		case op.Op == "patch" && op.Patch != nil && op.Patch.Type == mediaApplyPatch:
+			// An apply patch is an apply that came in through the patch verb. Same object, same
+			// server-side merge, so the same answer -- classifying it by the shape of its body
+			// instead would give the same change two different field sets depending on which
+			// spelling the agent chose.
+			desired, isObject := op.Patch.Body.(map[string]any)
+			if !isObject {
+				return fmt.Errorf("operation %d: an apply-patch body that passed envelope validation is not an object", i)
+			}
+			ops, err = diffPatchOps(i, live[i], desired)
+
+		case op.Op == "patch" && op.Patch != nil && op.Patch.Type != mediaJSONPatch:
+			ops = mergePatchOps(nil, op.Patch.Body)
+
+		case op.Op == "scale" && op.Scale != nil && op.Scale.Replicas != nil:
+			// The one verb whose touched field is fixed by the verb itself. Named rather than
+			// diffed: a scale writes the /scale subresource, so a diff of the main object would be
+			// a diff of something the operation does not write.
+			ops = []classify.PatchOp{{
+				Op:    "replace",
+				Path:  scaleReplicasPointer,
+				Value: int64(*op.Scale.Replicas),
+			}}
+
+		default:
+			// create, delete, and a JSON Patch. The first two set WholeObject; the third already
+			// has its op list.
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		raws[i].Patch = ops
+	}
+	return nil
+}
+
+// diffPatchOps turns an apply's effect into classifier ops: the PATHS come from the diff against
+// live state, and the VALUES are read back out of the desired object.
+//
+// That split is the point, and it is the answer to the objection that this conversion is lossy.
+// execute.DiffResult renders its Value as a string, because its other consumer is an ActionRecord
+// field with a length bound. The classifier needs the value with its type intact -- the secret scan
+// walks structured payloads, and DirectionOfBoolField asks whether a value IS the bool true, which
+// the string "true" is not. Neither package can supply both halves. At this seam both inputs are in
+// hand at the same moment, so each supplies the half it actually has.
+func diffPatchOps(index int, live *unstructured.Unstructured, desired map[string]any) ([]classify.PatchOp, error) {
+	res, err := execute.Diff(live, &unstructured.Unstructured{Object: desired})
+	if err != nil {
+		return nil, fmt.Errorf("operation %d: computing the changed-field set against live state: %w", index, err)
+	}
+	if res.Truncated {
+		// Symmetric with execute.CheckIntegrity, which refuses a truncated diff at the other end of
+		// the pipeline for the same reason. A path set that is a PREFIX of the real one understates
+		// the change, and a fieldPaths rule that would have fired on the two-hundred-and-first field
+		// silently does not. Refusing is the only answer here that is not a quiet loosening.
+		return nil, &broker.Refusal{
+			Status: http.StatusRequestEntityTooLarge,
+			Reason: "change-too-large-to-classify",
+			Detail: fmt.Sprintf(
+				"operation %d changes %d fields, over the %d the broker can classify and record; classifying a prefix of the change would understate it, so it is refused rather than partially classified",
+				index, res.TotalOps, execute.MaxDiffOps),
+			Journal: true,
+		}
+	}
+
+	ops := make([]classify.PatchOp, 0, len(res.Ops))
+	for _, d := range res.Ops {
+		p := classify.PatchOp{Op: d.Op, Path: d.Path}
+		if v, found := valueAtPointer(desired, d.Path); found {
+			p.Value = v
+		}
+		ops = append(ops, p)
+	}
+	return ops, nil
+}
+
+// mergePatchOps walks a merge-patch body down to its leaves.
+//
+// RFC 7386 semantics decide what a leaf is: a null DELETES the field, a nested object recurses, and
+// anything else -- scalar, array, empty object -- replaces wholesale. Rendering a null as `remove`
+// rather than as a replace-with-nothing is what lets DirectionOfPatch see a merge patch that strips
+// a securityContext as a loosening.
+//
+// Keys are walked in sorted order so two runs over the same body produce the same op list, which is
+// what makes the classification corpus reproducible.
+func mergePatchOps(prefix []string, body any) []classify.PatchOp {
+	obj, isObject := body.(map[string]any)
+	if !isObject || len(obj) == 0 {
+		if len(prefix) == 0 {
+			// A merge-patch body that is not an object touches nothing nameable. Envelope validation
+			// already refused the array case; this is the scalar-at-the-root case.
+			return nil
+		}
+		return []classify.PatchOp{{Op: "replace", Path: classify.JoinPointer(prefix...), Value: body}}
+	}
+
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var out []classify.PatchOp
+	for _, k := range keys {
+		path := append(append([]string{}, prefix...), k)
+		if obj[k] == nil {
+			out = append(out, classify.PatchOp{Op: "remove", Path: classify.JoinPointer(path...)})
+			continue
+		}
+		out = append(out, mergePatchOps(path, obj[k])...)
+	}
+	return out
+}
+
+// valueAtPointer reads what the desired object holds at a pointer execute.Diff produced, and reports
+// whether it is there at all. A `remove` op's pointer is not, and that is the right answer: nothing
+// is being set, so there is no new value to scan or to read a direction from.
+//
+// Map tokens only. execute.Diff compares a slice as a single value rather than descending into it,
+// so every pointer it emits is a chain of map keys. A numeric index arriving here would mean the
+// diff changed shape underneath this function, and reporting "not found" is better than guessing at
+// an indexing convention the producer no longer uses.
+func valueAtPointer(desired map[string]any, ptr string) (any, bool) {
+	var cur any = desired
+	for _, tok := range classify.SplitPointer(ptr) {
+		node, isObject := cur.(map[string]any)
+		if !isObject {
+			return nil, false
+		}
+		v, present := node[tok]
+		if !present {
+			return nil, false
+		}
+		cur = v
+	}
+	return cur, true
 }
 
 // payloadOf is what the secret scanner and the merge-patch path read. A patch body counts: a merge

@@ -29,7 +29,10 @@ type RawOp struct {
 	Kind      KindRef
 	Namespace string
 	Name      string
-	// Patch is the RFC 6902 patch for `patch`, or the computed diff for `apply`.
+	// Patch is the operation's changed-field set, in RFC 6902 shape: the submitted patch itself for
+	// a JSON Patch, and for every other field-level verb the equivalent the caller computed -- the
+	// diff against live state for `apply`, the leaf pointers of the body for a merge patch,
+	// `/spec/replicas` for `scale`. Empty for create and delete, which set WholeObject instead.
 	Patch []PatchOp
 	// Payload is the decoded object for create/apply, scanned for secret material.
 	Payload any
@@ -63,7 +66,7 @@ func Resolve(ctx context.Context, live LiveState, caller Caller, raws []RawOp) (
 		}
 
 		switch raw.Verb {
-		case "create", "apply", "delete":
+		case "create", "delete":
 			op.WholeObject = true
 		}
 		op.TouchedPaths = TouchedPaths(raw.Patch)

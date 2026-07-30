@@ -83,13 +83,20 @@ type ResolvedOp struct {
 	// NamespaceLabels are the target namespace's labels, live.
 	NamespaceLabels map[string]string
 
-	// TouchedPaths is the union of `path` and `from` over the operation's JSON Patch, as RFC 6901
-	// pointers. Empty for whole-object verbs, where PathsAreWholeObject is set instead.
+	// TouchedPaths is the union of `path` and `from` over the operation's changed-field set, as RFC
+	// 6901 pointers. For a JSON Patch that is the patch's own `path`/`from`. For every other
+	// field-level verb the caller computes it -- an apply's is the diff against live state, a merge
+	// patch's is the leaf pointers of the body, a scale's is `/spec/replicas` -- and hands it in via
+	// RawOp.Patch. Empty for the whole-object verbs, where WholeObject is set instead.
 	TouchedPaths []string
-	// WholeObject marks create/apply/delete, where "which fields changed" is not a meaningful
-	// question -- every field is touched. Rules with fieldPaths do not fire on these unless the rule
-	// names a path the computed diff actually contains; the broker computes a diff for `apply`
-	// against live state so an apply that changes one field is not treated as touching all of them.
+	// WholeObject marks create/delete, where "which fields changed" is not a meaningful question --
+	// every field is touched. Rules with fieldPaths do not fire on these.
+	//
+	// `apply` is NOT one of them, deliberately. It looks like a whole-object verb because it carries
+	// a whole object, but an apply that changes one field is a one-field change, and calling it a
+	// whole-object change means every fieldPaths rule stops firing on the verb agents use most.
+	// The broker diffs the desired object against live state before calling Resolve, so an apply
+	// arrives here with a real path set (see internal/broker/pipeline, fillTouchedPaths).
 	WholeObject bool
 
 	// Direction is the security direction computed by the direction analysis (see direction.go).
