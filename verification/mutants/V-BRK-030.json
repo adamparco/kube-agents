@@ -1,0 +1,111 @@
+{
+  "_comment": "Mutation sweep for V-BRK-030 -- the agent pod's rendered KUBEAGENTS_AGENT_IDENTITY equals the identity its broker assembles from the flags it is started with. Run: python3 dev/mutate.py verification/mutants/V-BRK-030.json. Every row names the test that must fail; see dev/mutate.py for why rc != 0 is not a catch. M8 was originally 'a duplicate entry is rendered'; it is removed rather than strengthened against, because mergeEnvVars keys its override list by name and structurally cannot emit two entries of one name -- the mutation expressed no defect, so scoring it either way would have been a lie about coverage.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./internal/controller/..."]
+  },
+  "mutants": [
+    {
+      "id": "M1-the-identity-is-not-rendered-at-all",
+      "why": "The state the repo was in before this unit. The pod knows AGENT_TIER and nothing else, so it cannot compute a key the broker will accept and 06 SS4.1's builder refuses to default one. This is the whole reason the unit exists; a check that does not catch it is not the check.",
+      "catcher": "TestAgentIdentityMatchesTheBrokerItTalksTo",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/controller/broker_manifests.go",
+          "find": "\t\t{Name: \"KUBEAGENTS_AGENT_IDENTITY\", Value: agentIdentity(agent)},\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M2-the-scope-leaf-is-dropped-and-only-the-tier-ships",
+      "why": "The half-identity. AGENT_TIER already exists and is identical for every developer-team agent, so an identity built from the tier alone collides two agents in the broker's dedup index -- and looks entirely plausible in a golden file.",
+      "catcher": "TestTwoAgentsOfOneTierGetDistinctIdentities",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/controller/broker_manifests.go",
+          "find": "\tid := broker.Identity{\n\t\tTier:  agentindex.EffectiveTier(agent),\n\t\tScope: scope.Of(agent).Leaf(),\n\t}\n\treturn id.AgentIdentity()",
+          "replace": "\tid := broker.Identity{\n\t\tTier: agentindex.EffectiveTier(agent),\n\t}\n\treturn id.AgentIdentity()"
+        }
+      ]
+    },
+    {
+      "id": "M3-the-format-is-restated-locally-instead-of-composed",
+      "why": "The LSN-036/LSN-041 shape, and the reason the test composes through the production formatter. `tier + \"/\" + leaf` agrees with Identity.AgentIdentity() for every tier that HAS a scope; it diverges only on the empty-scope arm, where it renders `platform/` and every key computed against it is refused. A test that hand-joined the two halves would agree with this mutant.",
+      "catcher": "TestAgentIdentityMatchesTheBrokerItTalksTo",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/controller/broker_manifests.go",
+          "find": "\tid := broker.Identity{\n\t\tTier:  agentindex.EffectiveTier(agent),\n\t\tScope: scope.Of(agent).Leaf(),\n\t}\n\treturn id.AgentIdentity()",
+          "replace": "\treturn string(agentindex.EffectiveTier(agent)) + \"/\" + scope.Of(agent).Leaf()"
+        }
+      ]
+    },
+    {
+      "id": "M4-the-wrong-scope-level-is-used",
+      "why": "Leaf() is namespace-then-cluster-then-project; the project is the level a reader most easily assumes. For a developer-team agent this renders the project where the broker was started with the namespace -- the two sides disagree while each looks individually sane.",
+      "catcher": "TestAgentIdentityMatchesTheBrokerItTalksTo",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/controller/broker_manifests.go",
+          "find": "\t\tScope: scope.Of(agent).Leaf(),\n\t}\n\treturn id.AgentIdentity()",
+          "replace": "\t\tScope: scope.Of(agent).ProjectID,\n\t}\n\treturn id.AgentIdentity()"
+        }
+      ]
+    },
+    {
+      "id": "M5-tier-defaulting-is-skipped-on-the-agent-side",
+      "why": "brokerArgs calls agentindex.EffectiveTier; reading spec.Tier raw agrees with it for every CR that sets a tier and diverges for one that does not -- where the broker starts as `platform` and the pod is told the empty string. Defaulting that happens in two places has to happen the same way in both.",
+      "catcher": "TestAgentIdentityMatchesTheBrokerItTalksTo",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/controller/broker_manifests.go",
+          "find": "\t\tTier:  agentindex.EffectiveTier(agent),\n\t\tScope: scope.Of(agent).Leaf(),",
+          "replace": "\t\tTier:  agent.Spec.Tier,\n\t\tScope: scope.Of(agent).Leaf(),"
+        }
+      ]
+    },
+    {
+      "id": "M6-the-identity-moves-out-of-the-non-overridable-block",
+      "why": "The five broker vars are appended AFTER mergeEnvVars precisely so spec.deployment.env cannot win. Rendered in the general block instead, the identity keeps its correct default and becomes settable -- and a CR author who sets it makes every write from that agent refused, a denial of service authored in a field that reads as configuration.",
+      "catcher": "TestAgentIdentityNotOverridableBySpecEnv",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/controller/broker_manifests.go",
+          "find": "\t\t{Name: \"KUBEAGENTS_AGENT_IDENTITY\", Value: agentIdentity(agent)},\n",
+          "replace": ""
+        },
+        {
+          "file": "k8s-operator/internal/controller/agent_manifests.go",
+          "find": "\tenvVars = append(envVars, corev1.EnvVar{\n\t\tName:  \"TOKEN_BROKER_URL\",",
+          "replace": "\tenvVars = append(envVars, corev1.EnvVar{\n\t\tName:  \"KUBEAGENTS_AGENT_IDENTITY\",\n\t\tValue: agentIdentity(agent),\n\t})\n\tenvVars = append(envVars, corev1.EnvVar{\n\t\tName:  \"TOKEN_BROKER_URL\","
+        }
+      ]
+    },
+    {
+      "id": "M7-the-broker-is-started-with-a-different-scope-than-the-pod-is-told",
+      "why": "The drift direction the join exists for, driven from the OTHER end. Nothing here touches the agent side; the broker's --scope changes and the two renderings part company. A check that only asserted the pod's value against a literal would still be green.",
+      "catcher": "TestAgentIdentityMatchesTheBrokerItTalksTo",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/controller/broker_manifests.go",
+          "find": "\t\t\"--scope=\" + scope.Of(agent).Leaf(),",
+          "replace": "\t\t\"--scope=\" + scope.Of(agent).ProjectID,"
+        }
+      ]
+    },
+    {
+      "id": "M8-tier-defaulting-is-skipped-on-the-broker-side",
+      "why": "M5's mirror, driven from the other end. brokerArgs stops calling agentindex.EffectiveTier, so a CR with no explicit tier starts its broker as the empty string while the pod is told `platform`. Same divergence, opposite origin -- and a check that only ever varied the agent side would be green on it.",
+      "catcher": "TestAgentIdentityMatchesTheBrokerItTalksTo",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/controller/broker_manifests.go",
+          "find": "\t\t\"--tier=\" + string(agentindex.EffectiveTier(agent)),",
+          "replace": "\t\t\"--tier=\" + string(agent.Spec.Tier),"
+        }
+      ]
+    }
+  ]
+}
