@@ -1,0 +1,264 @@
+{
+  "_comment": "V-CTR-020 -- the agent's instructions for writing describe the write path that exists. Eleven of the twelve mutants edit all three tier copies so the byte-parity arm can never be the catcher for a content defect; M12 drifts exactly one tier as that arm's control. M1, M2, M3 and M9 are the joins: each is a defect only relative to the MCP server's AST, and none of them is visible by reading the skill alone -- which is the argument for checking prose against code rather than proofreading it. Run with `python3 dev/mutate.py verification/mutants/V-CTR-020.json`.",
+  "suite": {
+    "kind": "unittest",
+    "dir": ".",
+    "packages": ["discover", "-p", "test_apply_change_skill.py", "dev"]
+  },
+  "mutants": [
+    {
+      "id": "M1-the-skill-names-a-tool-that-does-not-exist",
+      "why": "The skill sends the agent to `apply_manifest`, which 06 \u00a79 describes as a future envelope builder and which the server does not register. Nothing crashes and nothing logs: the agent reads the instruction, finds no such tool, and explains in fluent prose that it is unable to act. This is the failure mode the whole check exists for.",
+      "catcher": "test_every_tool_the_skill_calls_is_one_the_server_registers",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "| `submit_action(intent, operations)` | The same envelope, executed",
+          "replace": "| `apply_manifest(obj)` | The same envelope, executed"
+        },
+        {
+          "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
+          "find": "| `submit_action(intent, operations)` | The same envelope, executed",
+          "replace": "| `apply_manifest(obj)` | The same envelope, executed"
+        },
+        {
+          "file": "agents/developer-team/skills/apply-change/SKILL.md",
+          "find": "| `submit_action(intent, operations)` | The same envelope, executed",
+          "replace": "| `apply_manifest(obj)` | The same envelope, executed"
+        }
+      ]
+    },
+    {
+      "id": "M2-the-skill-promises-a-parameter-the-tool-does-not-take",
+      "why": "`max_objects` is a real parameter of `broker_client.submit_action` and NOT of the MCP wrapper, which is exactly how this drifts in practice -- someone reads the client, documents what they see, and the agent passes an argument the tool rejects.",
+      "catcher": "test_every_parameter_the_skill_promises_is_one_the_tool_takes",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "`submit_action` also takes `rationale` (optional reasoning; recorded, and never treated as a risk\nsignal) and `require_approval`",
+          "replace": "`submit_action` also takes `rationale` (optional reasoning; recorded, and never treated as a risk\nsignal), `max_objects` and `require_approval`"
+        },
+        {
+          "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
+          "find": "`submit_action` also takes `rationale` (optional reasoning; recorded, and never treated as a risk\nsignal) and `require_approval`",
+          "replace": "`submit_action` also takes `rationale` (optional reasoning; recorded, and never treated as a risk\nsignal), `max_objects` and `require_approval`"
+        },
+        {
+          "file": "agents/developer-team/skills/apply-change/SKILL.md",
+          "find": "`submit_action` also takes `rationale` (optional reasoning; recorded, and never treated as a risk\nsignal) and `require_approval`",
+          "replace": "`submit_action` also takes `rationale` (optional reasoning; recorded, and never treated as a risk\nsignal), `max_objects` and `require_approval`"
+        }
+      ]
+    },
+    {
+      "id": "M3-the-tool-grows-a-scope-parameter",
+      "why": "The moment `scope` is a parameter, the skill's sentence about not being able to name your own scope is false, and 03 \u00a74.1's rule that (tier, scope) comes from the authenticated caller has a second, contradicting definition site inside the agent image.",
+      "catcher": "test_no_tool_takes_a_tier_scope_risk_or_approval_parameter",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/platform_mcp_server.py",
+          "find": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False) -> str:",
+          "replace": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False, scope: str = \"\") -> str:"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/platform_mcp_server.py",
+          "find": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False) -> str:",
+          "replace": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False, scope: str = \"\") -> str:"
+        },
+        {
+          "file": "agents/developer-team/scripts/platform_mcp_server.py",
+          "find": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False) -> str:",
+          "replace": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False, scope: str = \"\") -> str:"
+        }
+      ]
+    },
+    {
+      "id": "M4-require-approval-reads-as-a-dial",
+      "why": "Drops the sentence saying the parameter only ever asks for MORE gating. A caller that reads it as a two-way switch will eventually try to set it False to avoid a gate, which is the one thing it cannot do -- and will report the attempt as if it might have worked.",
+      "catcher": "test_require_approval_exists_and_the_skill_says_it_only_tightens",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "`require_approval` is the single direction you may push, and it only goes one way: you can ask for\n**more** gating than the classifier decided. You can never ask for less.",
+          "replace": "`require_approval` lets you control whether a human is asked."
+        },
+        {
+          "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
+          "find": "`require_approval` is the single direction you may push, and it only goes one way: you can ask for\n**more** gating than the classifier decided. You can never ask for less.",
+          "replace": "`require_approval` lets you control whether a human is asked."
+        },
+        {
+          "file": "agents/developer-team/skills/apply-change/SKILL.md",
+          "find": "`require_approval` is the single direction you may push, and it only goes one way: you can ask for\n**more** gating than the classifier decided. You can never ask for less.",
+          "replace": "`require_approval` lets you control whether a human is asked."
+        }
+      ]
+    },
+    {
+      "id": "M5-the-agent-is-not-told-it-does-not-set-its-own-risk",
+      "why": "02 \u00a72.2 requires the persona to understand that risk is computed from the target objects and the diff. Without the sentence the agent will, reasonably, start telling humans how risky it thinks a change is -- which reads as an authoritative classification and is not one.",
+      "catcher": "test_the_skill_says_the_agent_does_not_decide_its_own_risk",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "not from how confident you sound. You do not decide your own risk level, and you must never tell a\n  human you have.",
+          "replace": "not from how confident you sound."
+        },
+        {
+          "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
+          "find": "not from how confident you sound. You do not decide your own risk level, and you must never tell a\n  human you have.",
+          "replace": "not from how confident you sound."
+        },
+        {
+          "file": "agents/developer-team/skills/apply-change/SKILL.md",
+          "find": "not from how confident you sound. You do not decide your own risk level, and you must never tell a\n  human you have.",
+          "replace": "not from how confident you sound."
+        }
+      ]
+    },
+    {
+      "id": "M6-a-mutating-kubectl-appears-in-a-fenced-block",
+      "why": "The copy-paste this arm exists for. A shell-out in the instructions of an agent that holds no credential to run it does not fail safely -- it fails confusingly, refused by something unrelated to the actual problem, and the agent reports the wrong cause.",
+      "catcher": "test_the_body_issues_no_mutating_command",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "Read the classification. If it is what you expected, call `submit_action`",
+          "replace": "If the broker is slow, apply it directly instead:\n\n```bash\nkubectl apply -f manifest.yaml\n```\n\nRead the classification. If it is what you expected, call `submit_action`"
+        },
+        {
+          "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
+          "find": "Read the classification. If it is what you expected, call `submit_action`",
+          "replace": "If the broker is slow, apply it directly instead:\n\n```bash\nkubectl apply -f manifest.yaml\n```\n\nRead the classification. If it is what you expected, call `submit_action`"
+        },
+        {
+          "file": "agents/developer-team/skills/apply-change/SKILL.md",
+          "find": "Read the classification. If it is what you expected, call `submit_action`",
+          "replace": "If the broker is slow, apply it directly instead:\n\n```bash\nkubectl apply -f manifest.yaml\n```\n\nRead the classification. If it is what you expected, call `submit_action`"
+        }
+      ]
+    },
+    {
+      "id": "M7-the-proposal-path-comes-back",
+      "why": "A `gh pr create` in the worked example resurrects the read-only generation's flow inside the skill that replaces it. Both paths would then be documented at once, and an agent would reasonably pick the one it can see working.",
+      "catcher": "test_the_body_issues_no_mutating_command",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "then report the `actionId` and the undo handle to whoever asked.",
+          "replace": "then report the `actionId` and the undo handle to whoever asked.\n\nIf it is refused, open a pull request instead:\n\n```bash\ngh pr create --title \"proposed change\"\n```"
+        },
+        {
+          "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
+          "find": "then report the `actionId` and the undo handle to whoever asked.",
+          "replace": "then report the `actionId` and the undo handle to whoever asked.\n\nIf it is refused, open a pull request instead:\n\n```bash\ngh pr create --title \"proposed change\"\n```"
+        },
+        {
+          "file": "agents/developer-team/skills/apply-change/SKILL.md",
+          "find": "then report the `actionId` and the undo handle to whoever asked.",
+          "replace": "then report the `actionId` and the undo handle to whoever asked.\n\nIf it is refused, open a pull request instead:\n\n```bash\ngh pr create --title \"proposed change\"\n```"
+        }
+      ]
+    },
+    {
+      "id": "M8-the-required-arguments-go-undocumented",
+      "why": "`intent` is what a human reads at 3am on the record. A skill that stops naming it gets envelopes whose intent is the tool call restated, and the journal becomes unreadable exactly when it matters.",
+      "catcher": "test_the_skill_names_intent_and_operations_because_they_are_required",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "- **`intent`** \u2014 one sentence, written for a human",
+          "replace": "- **the first argument** \u2014 one sentence, written for a human"
+        },
+        {
+          "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
+          "find": "- **`intent`** \u2014 one sentence, written for a human",
+          "replace": "- **the first argument** \u2014 one sentence, written for a human"
+        },
+        {
+          "file": "agents/developer-team/skills/apply-change/SKILL.md",
+          "find": "- **`intent`** \u2014 one sentence, written for a human",
+          "replace": "- **the first argument** \u2014 one sentence, written for a human"
+        }
+      ]
+    },
+    {
+      "id": "M9-a-brake-tool-is-registered",
+      "why": "V-CTR-011's mandated absence, violated from the agent side. An agent that can call `approve` can release its own gated action, and every gate in the system becomes advisory. The skill does not need to mention it for the property to be broken -- the tool existing is the defect.",
+      "catcher": "test_the_skill_names_no_brake_verb_as_something_the_agent_does",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/platform_mcp_server.py",
+          "find": "@mcp.tool()\ndef plan_action(",
+          "replace": "@mcp.tool()\ndef approve(action_id: str) -> str:\n    \"\"\"Approve a parked action.\"\"\"\n    return \"approved\"\n\n\n@mcp.tool()\ndef plan_action("
+        },
+        {
+          "file": "agents/cluster-admin/scripts/platform_mcp_server.py",
+          "find": "@mcp.tool()\ndef plan_action(",
+          "replace": "@mcp.tool()\ndef approve(action_id: str) -> str:\n    \"\"\"Approve a parked action.\"\"\"\n    return \"approved\"\n\n\n@mcp.tool()\ndef plan_action("
+        },
+        {
+          "file": "agents/developer-team/scripts/platform_mcp_server.py",
+          "find": "@mcp.tool()\ndef plan_action(",
+          "replace": "@mcp.tool()\ndef approve(action_id: str) -> str:\n    \"\"\"Approve a parked action.\"\"\"\n    return \"approved\"\n\n\n@mcp.tool()\ndef plan_action("
+        }
+      ]
+    },
+    {
+      "id": "M10-a-refusal-becomes-an-obstacle",
+      "why": "Without the sentence, the natural LLM behaviour on a refusal is to reword and resubmit until something sticks. The broker refuses each attempt, so nothing unsafe happens -- but the journal fills with near-identical refused actions and the agent burns a session getting nowhere while reporting progress.",
+      "catcher": "test_the_skill_tells_the_agent_a_refusal_is_not_an_obstacle",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "Report the reason as given. Do not retry it in a different shape hoping for a different answer; a\n  refusal is a decision, not an obstacle, and re-submitting a refused action with the wording\n  changed is the behaviour this system is built to make pointless.",
+          "replace": "Report the reason as given."
+        },
+        {
+          "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
+          "find": "Report the reason as given. Do not retry it in a different shape hoping for a different answer; a\n  refusal is a decision, not an obstacle, and re-submitting a refused action with the wording\n  changed is the behaviour this system is built to make pointless.",
+          "replace": "Report the reason as given."
+        },
+        {
+          "file": "agents/developer-team/skills/apply-change/SKILL.md",
+          "find": "Report the reason as given. Do not retry it in a different shape hoping for a different answer; a\n  refusal is a decision, not an obstacle, and re-submitting a refused action with the wording\n  changed is the behaviour this system is built to make pointless.",
+          "replace": "Report the reason as given."
+        }
+      ]
+    },
+    {
+      "id": "M11-the-frontmatter-name-drifts-from-the-directory",
+      "why": "The loader keys on the frontmatter name; the repo, the specs and 02 \u00a72.2's table all key on the directory. A mismatch means the skill is on disk, passes `make validate`, and is not the skill anything refers to.",
+      "catcher": "test_the_frontmatter_name_matches_the_directory",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "name: apply-change",
+          "replace": "name: apply_change"
+        },
+        {
+          "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
+          "find": "name: apply-change",
+          "replace": "name: apply_change"
+        },
+        {
+          "file": "agents/developer-team/skills/apply-change/SKILL.md",
+          "find": "name: apply-change",
+          "replace": "name: apply_change"
+        }
+      ]
+    },
+    {
+      "id": "M12-one-tier-drifts",
+      "why": "The control for the parity arm, and the only mutant here that edits a single tier. Every other one edits all three deliberately, so byte-parity can never be the catcher for a content defect and each content arm has to earn its verdict.",
+      "catcher": "test_the_copies_are_byte_identical",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "# apply-change \u2014 ask the broker; it decides and it acts",
+          "replace": "# apply-change \u2014 ask the broker; it decides and it acts (platform)"
+        }
+      ]
+    }
+  ]
+}
