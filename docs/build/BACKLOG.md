@@ -81,7 +81,7 @@ turns out to be wrong is closed with a reason, not recycled.
 
 ## Inbox
 
-**Last drained:** 2026-07-29
+**Last drained:** 2026-07-30
 
 _(empty — append new items here, below this line)_
 
