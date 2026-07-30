@@ -2023,16 +2023,19 @@ deliverables wearing one name, and two of them cannot be checkpointed in a sessi
 
 The remaining two halves are hermetic and each is a unit. The split:
 
-| Unit             | What                                                                                                                                                                                | Checks                                   | Blocked on             |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ---------------------- |
-| **P9-T8b-1**     | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic   | **V-BRK-028** (new)                      | nothing                |
-| **P9-T8b-2**     | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029** (new)                      | T8b-1                  |
-| ~~**P9-T8b-3**~~ | ~~The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)~~ — **split, see below**: the skill is Phase 9's, the retirement is Phase 10's     | ~~V-GAT-019 (phase **10**)~~ — mis-bound | —                      |
-| **P9-T8b-3a**    | The `apply-change` skill in all three tiers, alongside `submit-suggestion` — **done 2026-07-30**                                                                                    | **V-CTR-020** (new)                      | T8b-2b                 |
-| **P9-T8b-3b**    | `submit-suggestion`'s retirement — **deferred into Phase 10 as P10-T3**                                                                                                             | —                                        | Phase 10               |
-| ~~**P9-T8b-4**~~ | ~~The L2 shadow soak with journal mining~~ — **split, see below**: the broker has no deployment path, so there is nothing to soak yet                                               | ~~V-REV-001 (L2)~~                       | —                      |
-| **P9-T8b-4a**    | The broker's deployment path, and the L2 claim it makes checkable                                                                                                                   | **V-BRK-012 (L2)**                       | a live scratch cluster |
-| **P9-T8b-4b**    | The L2 shadow soak with journal mining                                                                                                                                              | V-REV-001 (L2)                           | T8b-4a                 |
+| Unit              | What                                                                                                                                                                                | Checks                                                                                                                               | Blocked on             |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ---------------------- |
+| **P9-T8b-1**      | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic   | **V-BRK-028** (new)                                                                                                                  | nothing                |
+| **P9-T8b-2**      | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029** (new)                                                                                                                  | T8b-1                  |
+| ~~**P9-T8b-3**~~  | ~~The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)~~ — **split, see below**: the skill is Phase 9's, the retirement is Phase 10's     | ~~V-GAT-019 (phase **10**)~~ — mis-bound                                                                                             | —                      |
+| **P9-T8b-3a**     | The `apply-change` skill in all three tiers, alongside `submit-suggestion` — **done 2026-07-30**                                                                                    | **V-CTR-020** (new)                                                                                                                  | T8b-2b                 |
+| **P9-T8b-3b**     | `submit-suggestion`'s retirement — **deferred into Phase 10 as P10-T3**                                                                                                             | —                                                                                                                                    | Phase 10               |
+| ~~**P9-T8b-4**~~  | ~~The L2 shadow soak with journal mining~~ — **split, see below**: the broker has no deployment path, so there is nothing to soak yet                                               | ~~V-REV-001 (L2)~~                                                                                                                   | —                      |
+| **P9-T8b-4a**     | The broker's deployment path, and the L2 claim it makes checkable                                                                                                                   | **V-BRK-012 (L2)**                                                                                                                   | a live scratch cluster |
+| ~~**P9-T8b-4b**~~ | ~~The L2 shadow soak with journal mining~~ — **split again, see below**: nothing in `dev/` can present a credential to a broker, so there is no caller to soak with                 | ~~V-REV-001 (L2)~~                                                                                                                   | —                      |
+| **P9-T8b-4b-i**   | The in-cluster envelope driver, and the five transport checks it makes answerable                                                                                                   | **V-BRK-007/008/009/010/017 (L2)**                                                                                                   | T8b-4a                 |
+| **P9-T8b-4b-ii**  | The L2 shadow soak with journal mining                                                                                                                                              | V-REV-001 (L2)                                                                                                                       | T8b-4b-i               |
+| **P9-T8b-4c**     | `session_trace()` emits `parentSpanId`, which the broker's closed schema refuses; fix the shipped client across all three tiers and add the assertion that would have caught it     | a NEW 09 §6.2 row — ID assigned by that unit, not guessed here (four wrong `V-*` bindings are already on this phase's findings list) | —                      |
 
 **Why T8b-1 is the first half and not an arbitrary slice.** Everything downstream is transport and
 prose; this is the only part with a _correctness_ obligation the broker will enforce. The broker
@@ -2323,7 +2326,7 @@ defect.
 | Unit          | What                                                                                                                                                                                     | Checks             | Blocked on                           |
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------ |
 | **P9-T8b-4a** | `deploy_broker`; the `kage-broker` P1 mapping; the actor identity as a dev fixture rendered by the shipped renderer; `dev/verify/broker-per-agent-l2.sh` and its `dev/L2-CHAIN.txt` line | **V-BRK-012 (L2)** | a live scratch cluster               |
-| **P9-T8b-4b** | The shadow soak proper: drive envelopes at the deployed broker and mine the journal                                                                                                      | V-REV-001 (L2)     | T8b-4a — nothing to drive until then |
+| **P9-T8b-4b** | The shadow soak proper: drive envelopes at the deployed broker and mine the journal — **split again into 4b-i and 4b-ii below**                                                          | V-REV-001 (L2)     | T8b-4a — nothing to drive until then |
 
 **Why V-BRK-012 and not a new ID.** 09 §6.2 gives V-BRK-012 as `L0, L2` and `verification/results.csv`
 records only the L0 row (2026-07-28, P9-T7b), whose own note ends "the lint reads source, so it says
@@ -2355,6 +2358,92 @@ paraphrase of them (LSN-024).
    here and both are asserted: the controller pod (which chose the image) and the broker pod (which
    is running it). A cluster where those two disagree is one where the rendered Deployment is a
    generation behind the env var, and every claim below it would be about the previous build.
+
+---
+
+### P9-T8b-4b splits again: 4b-i is a caller that can get in, 4b-ii is the soak
+
+**Recorded 2026-07-30, at SELECT.** 4a made the broker _exist_ on a cluster. Sizing 4b — "drive
+envelopes at the deployed broker and mine the journal" — turned up that the sentence hides two
+different units, and the first one is not the soak:
+
+- **Nothing in `dev/` can speak to a broker.** Not the shell, not a probe, not a fixture. The broker
+  requires mutual TLS with a certificate this cluster's `kubeagents-mesh-ca` signed, a projected
+  ServiceAccount token carrying audience `kubeagents-broker`, and the two bound to each other
+  through a SPIFFE URI. `broker-per-agent-l2.sh` deliberately said so: it proves each broker pod
+  _runs_, and states as a non-claim that it does not prove the broker _serves_, "because no client
+  here holds a certificate".
+- **The obvious shortcut does not work, and the reason is a finding.** Driving the shipped
+  `broker_client.py` from the working tree over `kubectl port-forward` looked viable because the
+  module's own docstring says "The server certificate is verified against `KUBEAGENTS_BROKER_SAN`,
+  not against the host in the URL." It is not. `cfg.san` is read from the environment, required by
+  `BrokerConfig.require()`, and then **never used again** — `build_ssl_context` sets
+  `check_hostname = True` and `urllib` derives `server_hostname` from the URL, so the name actually
+  verified is the endpoint's host. The two strings are equal today, so nothing is broken; the
+  docstring describes an intent no code implements. Filed as a finding, not fixed here — fixing it
+  is a change to shipped agent code and belongs in its own unit.
+- So the caller has to be **in the cluster**, which is the honest arrangement anyway: it goes
+  through the real Service, the real `<agent>-broker-ingress` NetworkPolicy and the real
+  `<agent>-to-broker` egress hop, none of which a port-forward touches.
+
+**What that unlocks is bigger than the soak.** Five checks in 09 §6.2 are the transport, every one
+of them `L2`, phase 9, BLOCKING-ALWAYS, and carrying the mandatory `¬` — and **not one has a single
+row in `verification/results.csv`**:
+
+| ID            | Property                                                                                  | State before 4b-i |
+| ------------- | ----------------------------------------------------------------------------------------- | ----------------- |
+| **V-BRK-007** | mTLS is required — a plaintext or wrong-CA client is refused ¬                            | no evidence       |
+| **V-BRK-008** | The projected token must carry audience `kubeagents-broker` ¬                             | no evidence       |
+| **V-BRK-009** | Neither layer alone suffices ¬                                                            | no evidence       |
+| **V-BRK-010** | A foreign agent's reader SA is refused **and raises a security event** ¬                  | no evidence       |
+| **V-BRK-017** | The default-audience token is refused — `TokenReview` says `authenticated: true` for it ¬ | no evidence       |
+
+They are the whole of acceptance bullet (c)'s L2 half, they were scheduled onto P9-T2 and never
+gathered, and every one of them is a question about a **credential presented to a running broker**.
+A driver that can present one answers all five; the soak needs the same driver and nothing more.
+
+**The split.**
+
+| Unit             | What                                                                                                               | Checks                                                                | Blocked on |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- | ---------- |
+| **P9-T8b-4b-i**  | The in-cluster envelope driver — a real reader identity at the broker's door — and `dev/verify/broker-auth-l2.sh`  | **V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017**, all L2 | T8b-4a     |
+| **P9-T8b-4b-ii** | The shadow soak proper: a corpus of envelopes through the driver, then journal mining over the `DryRun` population | **V-REV-001 (L2)**                                                    | 4b-i       |
+
+**Why the driver is a pod and what that costs.** The three agent images in Artifact Registry are
+stale (2026-07-24 to 2026-07-27) and build `FROM nousresearch/hermes-agent`, so rebuilding them to
+get a Python interpreter next to the shipped scripts is a slow build for a fixture. Instead the pod
+runs a stock `python:3.12-slim` and the **shipped** `broker_client.py` and `action_envelope.py`
+arrive in a ConfigMap generated from the working tree — so the code under test is byte-for-byte the
+file this repo ships, and only the interpreter around it is a fixture. Its environment is read off
+the **rendered agent Deployment** (P6), never reconstructed from the naming functions, so a driver
+pointed at the wrong endpoint is a driver that fails rather than one that quietly proves nothing.
+
+**Name resolution is short-circuited, deliberately, and it is a non-claim.** The pod carries
+`hostAliases` mapping the broker's SAN to the broker Service's ClusterIP. `<agent>-to-broker` makes
+every reader-labelled pod default-deny on egress and opens exactly one hole — TCP 8443 to the actor
+half of its own pair — with no DNS rule anywhere in it (the real agent pod gets DNS from the
+per-tier egress policy, which is an install-time artifact this cluster does not carry). Resolving
+the name locally means the driver reaches the broker through **precisely** the allowance the pair
+policy grants and nothing else, which is a sharper demonstration than a working DNS lookup would
+be. What it does not demonstrate is that cluster DNS publishes that name; that is
+`broker-per-agent-l2.sh`'s L2-3, which reads the Endpoints the API server computed.
+
+**A second finding, filed while writing the probe: `session_trace()` can build an envelope the
+broker must refuse.** `broker_client.py:367` adds `parentSpanId` to the trace whenever `SPAN_ID` is
+set in the agent's environment. `broker.Trace` has `traceId`, `spanId`, `sessionId` and `threadId`
+and no such field, and `DecodeEnvelope` runs `dec.DisallowUnknownFields()` — so an agent in a traced
+session has **every** mutation refused with a 400 `unknown-field`, and the refusal names a trace
+field rather than anything the agent did. Nothing in the repo sets `SPAN_ID` today, so it is latent;
+it is also exactly the shape of defect that only appears once tracing is wired, at which point it
+looks like the broker rejecting everything. Not fixed here: it is one line in shipped agent code
+that all three tiers carry byte-identically, so the fix is a `dev/test_agent_script_parity.py`-scoped
+edit plus a test asserting the client's trace keys are a subset of `broker.Trace`'s JSON tags — the
+mirror image of the `RESPONSE_FIELDS` assertion `dev/test_broker_client.py` already makes about the
+reply, which is a check that exists in one direction only and is why this was never caught.
+**Scheduled as P9-T8b-4c**, with its check ID to be assigned by that unit against 09 §6.2 rather
+than guessed here. The driver pod leaves
+`SPAN_ID` unset and says so in a comment, because setting it would be measuring the bug from the
+fixture that discovered it.
 
 ---
 

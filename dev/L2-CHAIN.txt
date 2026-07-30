@@ -154,3 +154,20 @@ bash dev/verify/brake-fanout-l2.sh gke-scratch-kube-agents-dev
 # selector of `role: actor` alone can be caught round-robining one agent's envelopes into another
 # agent's broker.
 bash dev/verify/broker-per-agent-l2.sh gke-scratch-kube-agents-dev
+
+# V-BRK-007/008/009/010/017: what the deployed broker does with a credential. The third line that
+# needs P1 in full on the BROKER pod, and the first that needs the broker to actually SERVE — every
+# preceding broker line asserts around the door, because until dev/lib/broker-driver.sh nothing here
+# could assemble the three things the broker demands at once (a mesh-CA certificate, a projected
+# token with audience kubeagents-broker, and a SPIFFE URI in the first naming the ServiceAccount in
+# the second). broker-per-agent-l2.sh states that as an explicit non-claim.
+#
+# All five rows are BLOCKING-ALWAYS and all five carry the mandatory negative control. Nine of the
+# ten credentials this presents are ones the broker must refuse; the tenth runs FIRST and its
+# failure aborts the run, because refusals from a broker that refuses everything are not evidence.
+#
+# It runs after broker-per-agent-l2.sh, and both are last for the same reason: they seed and delete
+# Agent CRs in kubeagents-system. This one additionally mints a 15-minute token for the cluster-admin
+# agent's reader ServiceAccount so the broker can be asked to refuse it, which is a thing to do on a
+# scratch cluster and nowhere else. Its own anchored guard is what keeps that true.
+bash dev/verify/broker-auth-l2.sh gke-scratch-kube-agents-dev
