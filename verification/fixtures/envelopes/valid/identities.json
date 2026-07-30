@@ -1,8 +1,10 @@
 {
+  "cluster-admin.delete-with-preconditions.json": "cluster-admin/adamparco-kage/gke-scratch-kube-agents-dev",
   "cluster-admin.patch-namespace-label.json": "cluster-admin/adamparco-kage/gke-scratch-kube-agents-dev",
   "cluster-admin.selector-fan-out-delete.json": "cluster-admin/adamparco-kage/gke-scratch-kube-agents-dev",
   "developer-team.apply-configmap.json": "developer-team/adamparco-kage/gke-scratch-kube-agents-dev/checkout",
   "developer-team.apply-secret.json": "developer-team/adamparco-kage/gke-scratch-kube-agents-dev/checkout",
+  "platform.cloud-nodepool-resize.json": "platform/adamparco-kage",
   "platform.multi-operation.json": "platform/adamparco-kage",
   "platform.scale-deployment.json": "platform/adamparco-kage"
 }

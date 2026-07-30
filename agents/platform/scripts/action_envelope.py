@@ -17,9 +17,12 @@ therefore *joined* rather than merely duplicated:
     every write from every agent in the fleet refused, reported as a key mismatch rather than as
     the drift it is.
   * The join is **V-BRK-028**: `dev/test_action_envelope.py` runs this module over
-    `verification/fixtures/envelopes/valid/`, the same six envelopes `TestValidFixtureIdempotencyKeys`
-    pins the Go side against, and asserts the same six keys. Each fixture carries the key its own
+    `verification/fixtures/envelopes/valid/`, the same corpus `TestValidFixtureIdempotencyKeys`
+    pins the Go side against, and asserts the same keys. Each fixture carries the key its own
     operations hash to, so there is no golden file on either side and nothing to drift independently.
+    The corpus is not fixed in size and neither side names a count: V-CTR-005 fails until every
+    declared schema path is carried by some fixture, so the corpus grows with the schema and both
+    implementations are re-joined over the new shape automatically.
 
 Three things a re-implementation gets wrong, all of them covered by that corpus:
 

@@ -1,0 +1,166 @@
+{
+  "_comment": "V-CTR-005 -- envelope schema round-trip; refused keys are ignored or rejected, never honoured (06 §4.1, L1, `¬`). Before P9-T9b-2 the round-trip was never asserted at all, and twelve of the schema's fifty-seven declared paths -- `dryRun`, all four of `cloudTarget`, both delete preconditions, `gracePeriodSeconds`, `requester.assertion`, `trace.threadId` -- were carried by no valid fixture, so a decoder that dropped any of them left the corpus green. These mutants attack the four layers the check now rests on: the wire schema's faithfulness on the way out (M1, M2, M3, M4), the corpus-coverage guard that stops the round-trip being vacuous (M5, M6), the reserved-key list as enforcement (M7, M9, M10, M11), and the join between that list and the table 06 §4.1 publishes (M8, M12, M13) -- including two mutants that edit the SPEC rather than the code, because a test that reads prose as data is one silent parse failure away from asserting nothing. Run with `python3 dev/mutate.py verification/mutants/V-CTR-005.json`.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./internal/broker/"]
+  },
+  "mutants": [
+    {
+      "id": "M1-a-field-stops-being-part-of-the-wire-schema",
+      "why": "`trace.threadId` loses its JSON tag -- the shape a field takes when it is added to the struct for internal use and nobody thinks about the encoder. It is not dropped quietly: it becomes an unknown field, so every envelope that carries a thread id is now refused as malformed. Until this unit no fixture carried one, and this mutant would have escaped.",
+      "catcher": "TestAValidEnvelopeSurvivesTheRoundTrip",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\tThreadID  string `json:\"threadId,omitempty\"`",
+          "replace": "\tThreadID  string `json:\"-\"`"
+        }
+      ]
+    },
+    {
+      "id": "M2-the-broker-invents-a-field-the-caller-never-sent",
+      "why": "The opposite direction, and the cheaper mistake: `requester.assertion` loses `omitempty`, so the broker's re-serialisation of every unsigned envelope now carries `\"assertion\": \"\"`. An empty assertion and no assertion are the same thing to the validator and emphatically not the same thing to a reader deciding whether attribution was verified -- 06 §4.1 makes the absent case `attributionUnverified: true` and the present case a claim about a signature.",
+      "catcher": "TestAValidEnvelopeSurvivesTheRoundTrip",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\tAssertion   string `json:\"assertion,omitempty\"`",
+          "replace": "\tAssertion   string `json:\"assertion\"`"
+        }
+      ]
+    },
+    {
+      "id": "M3-decode-bakes-the-default-deadline-in",
+      "why": "The single most natural edit anyone would make to this decoder, and the one `EffectiveDeadline` exists to avoid. A decoded envelope that carries defaults the caller did not send is no longer what the caller sent -- and `CompareIdempotencyKey` recomputes over exactly that value. Four of the eight valid fixtures omit `deadlineSeconds`.",
+      "catcher": "TestAValidEnvelopeSurvivesTheRoundTrip",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\tif err := e.Validate(); err != nil {\n\t\treturn nil, err\n\t}\n\treturn &e, nil\n}",
+          "replace": "\tif err := e.Validate(); err != nil {\n\t\treturn nil, err\n\t}\n\tif e.DeadlineSeconds == nil {\n\t\td := DefaultDeadlineSeconds\n\t\te.DeadlineSeconds = &d\n\t}\n\treturn &e, nil\n}"
+        }
+      ]
+    },
+    {
+      "id": "M4-the-decoder-discards-model-prose",
+      "why": "`rationale` is never read by the classifier (03 §8), which is one short step from `rationale` is never kept. It is: 06 §4.1 records it, and the record is what a human reads months later when asking why an action was taken. A field that is dropped between the wire and the journal is unrecoverable in a way a field that is merely ignored is not.",
+      "catcher": "TestAValidEnvelopeSurvivesTheRoundTrip",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\tif err := e.Validate(); err != nil {\n\t\treturn nil, err\n\t}\n\treturn &e, nil\n}",
+          "replace": "\tif err := e.Validate(); err != nil {\n\t\treturn nil, err\n\t}\n\te.Rationale = \"\"\n\treturn &e, nil\n}"
+        }
+      ]
+    },
+    {
+      "id": "M5-a-new-top-level-field-no-fixture-exercises",
+      "why": "The defect the coverage guard is FOR, rather than a defect in the guard. A field added to the wire schema with no fixture carrying it is a field the round-trip, the idempotency join, the Python builder comparison and the L2 conformance run are all silent about -- which is the state `dryRun` and `cloudTarget` were in for five phases. The guard makes growing the schema fail until the corpus grows with it.",
+      "catcher": "TestEveryDeclaredSchemaPathIsExercisedBySomeValidFixture",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\tDryRun          bool `json:\"dryRun,omitempty\"`",
+          "replace": "\tDryRun          bool `json:\"dryRun,omitempty\"`\n\tPriority        string `json:\"priority,omitempty\"`"
+        }
+      ]
+    },
+    {
+      "id": "M6-a-new-nested-field-no-fixture-exercises",
+      "why": "M5 one level down, because the walker's recursion is the part that can quietly stop working. A guard that only enumerated top-level keys would have called the corpus complete while `cloudTarget.provider` and its three siblings went unexercised -- and nested fields are where the uncovered ones actually were.",
+      "catcher": "TestEveryDeclaredSchemaPathIsExercisedBySomeValidFixture",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "type CloudTarget struct {\n\tProvider string `json:\"provider\"`",
+          "replace": "type CloudTarget struct {\n\tZone     string `json:\"zone,omitempty\"`\n\tProvider string `json:\"provider\"`"
+        }
+      ]
+    },
+    {
+      "id": "M7-a-key-the-spec-refuses-becomes-acceptable",
+      "why": "`approved` leaves ReservedKeys. The envelope may now assert its own approval state, which 06 §4.1 refuses in its own row and 06 §4.3 makes the ChatOps gateway's write against the roster. The spoofing corpus catches it too; this mutant is here for the join, because the corpus can only catch the keys somebody remembered to write a fixture for.",
+      "catcher": "TestTheReservedKeyListIsTheOneTheSpecPublishes",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\t\"approved\":  \"approval is recorded by the ChatOps gateway against the roster, never self-declared\",\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M8-the-broker-refuses-a-key-the-published-table-does-not-list",
+      "why": "The other direction of the same join, and the friendlier-looking failure: a key refused by the broker and absent from the contract agents are written against. The caller gets a 400 naming a rule that is written down nowhere, and a security event fires for a field somebody added in good faith.",
+      "catcher": "TestTheReservedKeyListIsTheOneTheSpecPublishes",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\t// Undo poisoning.\n\t\"undoPlan\":",
+          "replace": "\t\"priority\": \"there is no priority\",\n\n\t// Undo poisoning.\n\t\"undoPlan\":"
+        }
+      ]
+    },
+    {
+      "id": "M9-a-loud-refusal-becomes-a-quiet-one",
+      "why": "`emergency` leaves bypassFamily. It is still refused, still journaled, still a security event -- but reported as a generic reserved key rather than as the bypass attempt 06 §4.1 says these names exist to be. The distinction is what lets an operator separate `somebody sent a stale field` from `an agent was talked into asking for an emergency path`, and losing it costs nothing that any status code would show.",
+      "catcher": "TestTheReservedKeyListIsTheOneTheSpecPublishes",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\t\"bypass\": true, \"force\": true, \"skipJournal\": true, \"skipVerify\": true, \"emergency\": true,",
+          "replace": "\t\"bypass\": true, \"force\": true, \"skipJournal\": true, \"skipVerify\": true,"
+        }
+      ]
+    },
+    {
+      "id": "M10-a-reserved-key-is-given-somewhere-to-land",
+      "why": "`approved` becomes a real field of Envelope. Today the reserved-key scan runs before strict decoding and refuses it, so the field is unreachable and the mutant looks harmless -- which is the point. It is one reordering away from a caller declaring its own approval and the value being read, and the reordering is a two-line edit that every other test in this package would survive. Never honoured has to be a property of the type, not only of the order two checks happen to run in.",
+      "catcher": "TestNoReservedKeyHasAPlaceToLand",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\tRequireApproval bool `json:\"requireApproval,omitempty\"`",
+          "replace": "\tRequireApproval bool `json:\"requireApproval,omitempty\"`\n\tApproved        bool `json:\"approved,omitempty\"`"
+        }
+      ]
+    },
+    {
+      "id": "M11-the-refusal-stops-leaving-evidence",
+      "why": "The reserved-key refusal keeps its status and its reason and stops raising the record and the event. A caller sees an identical 400; the cluster sees nothing. 06 §4.1's closing paragraph is explicit that refusal MEANS the Rejected record plus the security event -- an injected agent probing the broker leaves evidence rather than a gap, and this is the edit that turns the gap back on while every status-code assertion in the suite stays green.",
+      "catcher": "TestNoReservedKeyHasAPlaceToLand",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/envelope.go",
+          "find": "\t\t\tJournal:       true,\n\t\t\tSecurityEvent: true,",
+          "replace": "\t\t\tJournal:       false,\n\t\t\tSecurityEvent: false,"
+        }
+      ]
+    },
+    {
+      "id": "M12-the-spec-side-of-the-join-stops-being-read",
+      "why": "Vacuity control for the one test in this repo that reads a design doc as data. The heading moves by two characters and the parser finds nothing. If that does not turn the suite red, the join is asserting the empty set against the empty set and M7, M8 and M13 are all accidents of some other test -- which is [[LSN-048]] exactly: a pattern that matched nothing, scored as agreement.",
+      "catcher": "TestTheReservedKeyListIsTheOneTheSpecPublishes",
+      "edits": [
+        {
+          "file": "docs/design/06-api-and-data-contracts.md",
+          "find": "#### What the broker ignores — and what it refuses",
+          "replace": "#### What the broker ignores, and what it refuses"
+        }
+      ]
+    },
+    {
+      "id": "M13-the-contract-quietly-drops-a-refusal-it-still-performs",
+      "why": "`severity` leaves the published table while the broker goes on refusing it. This is the drift that actually happens -- an editor tidying a row, not a developer deleting a rule -- and it is invisible from the code side: every Go test still passes, every refusal still fires, and the document agents are written against has stopped describing the broker.",
+      "catcher": "TestTheReservedKeyListIsTheOneTheSpecPublishes",
+      "edits": [
+        {
+          "file": "docs/design/06-api-and-data-contracts.md",
+          "find": "`riskClass`, `class`, `severity`, or `approved: true`",
+          "replace": "`riskClass`, `class`, or `approved: true`"
+        }
+      ]
+    }
+  ]
+}

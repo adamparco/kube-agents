@@ -18,16 +18,23 @@ forgets to digest a Secret's `data` gets both a wrong key and credential materia
 
 WHY THERE IS NO GOLDEN FILE
 ---------------------------
-`verification/fixtures/envelopes/valid/` already holds six envelopes, each carrying the key its own
+`verification/fixtures/envelopes/valid/` already holds the envelopes, each carrying the key its own
 operations hash to, plus `identities.json` naming the identity each was submitted under. The Go
 side pins itself against exactly that corpus in `TestValidFixtureIdempotencyKeys`. This file runs
-the Python builder over the same six files and asserts the same six keys. The two implementations
-are therefore joined through an artifact both already depend on -- there is no second corpus, no
-golden output, and nothing that can be regenerated to make a failure go away.
+the Python builder over the same files and asserts the same keys. The two implementations are
+therefore joined through an artifact both already depend on -- there is no second corpus, no golden
+output, and nothing that can be regenerated to make a failure go away.
+
+Neither side names a count, deliberately. V-CTR-005
+(`k8s-operator/internal/broker/envelope_roundtrip_test.go`) fails until every declared path of the
+06 §4.1 schema is carried by some valid fixture, so the corpus grows whenever the schema does and
+this join extends to the new shape without anyone remembering to extend it.
 
 The corpus is not incidental. It covers a Secret `apply` (the sanitizer), a selector fan-out delete
 and a three-operation envelope with mixed verbs (the sort order), which are the three places a
-re-implementation actually goes wrong.
+re-implementation actually goes wrong -- plus, since P9-T9b-2, a cloud target under `dryRun` and a
+single-object delete carrying full preconditions, which are the two shapes the Python projection
+handles and nothing used to exercise.
 
 TIER PARITY
 -----------

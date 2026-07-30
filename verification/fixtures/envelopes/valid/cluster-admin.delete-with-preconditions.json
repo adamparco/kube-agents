@@ -1,0 +1,47 @@
+{
+  "apiVersion": "kubeagents.x-k8s.io/v1alpha1",
+  "kind": "ActionEnvelope",
+  "intent": "delete the wedged import-reconciler pod, and only the instance we looked at",
+  "rationale": "import-reconciler-7d9f is stuck terminating a lease it no longer owns. The preconditions pin the delete to the UID and resourceVersion observed during triage, so a replacement scheduled in the meantime is not the object that gets removed.",
+  "operations": [
+    {
+      "op": "delete",
+      "target": {
+        "version": "v1",
+        "kind": "Pod",
+        "namespace": "checkout",
+        "name": "import-reconciler-7d9f"
+      },
+      "delete": {
+        "propagationPolicy": "Foreground",
+        "gracePeriodSeconds": 30,
+        "preconditions": {
+          "uid": "6f1c9a02-4b7e-4c31-9a55-0d3e2b81f4a7",
+          "resourceVersion": "48213907"
+        }
+      }
+    }
+  ],
+  "requester": {
+    "kind": "human",
+    "id": "slack:U02ABCDEF",
+    "platform": "slack",
+    "displayName": "Dana",
+    "assertion": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImthZ2Utcm91dGVyLTIwMjYtMDcifQ.eyJpc3MiOiJrYWdlLXJvdXRlciIsInN1YiI6InNsYWNrOlUwMkFCQ0RFRiIsImF1ZCI6ImNsdXN0ZXItYWRtaW4iLCJpYXQiOjE3ODUwMDI0MDAsImV4cCI6MTc4NTAwMjcwMH0.bm90LWEtcmVhbC1zaWduYXR1cmUtdGhpcy1pcy1hLWZpeHR1cmU"
+  },
+  "trigger": {
+    "source": "chat",
+    "ref": "slack:C01ABC/1785002380.000700",
+    "detail": "@cluster-admin drop that stuck reconciler pod, the one we're looking at"
+  },
+  "trace": {
+    "traceId": "b3d5077f41a29ce6480d0e93a3c92f34",
+    "spanId": "902b7aa00f067ab0",
+    "sessionId": "s-2026-07-30-04",
+    "threadId": "slack:C01ABC/1785002310.000100"
+  },
+  "issuedAt": "2026-07-30T09:20:03Z",
+  "nonce": "0d3e2b81f4a76f1c9a024b7e4c319a55",
+  "idempotencyKey": "sha256:98316e04e13dbf78a0916e3abfe50074f72b503f63abc19c30f7a8cfe315132b",
+  "deadlineSeconds": 120
+}

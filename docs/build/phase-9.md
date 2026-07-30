@@ -2417,6 +2417,103 @@ at 12/12.
 
 ---
 
+### P9-T9b-2 — outcome, 2026-07-30
+
+**V-CTR-005 — "Envelope schema round-trip; refused keys are ignored or rejected, never honoured"
+(06 §4.1, L1, `¬`) — recorded at L1 for the first time.** New:
+`k8s-operator/internal/broker/envelope_roundtrip_test.go`, two valid fixtures, and
+`verification/mutants/V-CTR-005.json` at **13/13 caught**.
+
+**No defect in shipped code this time. The defect was in what the corpus could see.** The round-trip
+property itself — decode → marshal → decode — already held over every valid fixture and was simply
+unasserted. What was not true is the thing an unasserted round-trip is usually assumed to imply:
+that the corpus exercises the schema. Reflecting over `Envelope` yields **57 declared JSON paths**,
+and **12 of them appeared in no valid fixture at all**:
+
+| Uncovered path                                                                       | Why it mattered                                                                                             |
+| ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `dryRun`                                                                             | It is inside the idempotency key (`keyInput`). Every dry-run key in the product was unpinned on both sides. |
+| `operations.cloudTarget` + `.provider` `.service` `.resource` `.method`              | The entire non-Kubernetes target shape, including its own leg of `operationSortKey`.                        |
+| `operations.delete.gracePeriodSeconds`, `.preconditions` + `.uid` `.resourceVersion` | The "delete this object, not the one that replaced it" guard.                                               |
+| `requester.assertion`                                                                | The field whose absence is what makes a record `attributionUnverified`.                                     |
+| `trace.threadId`                                                                     | Correlation back to a chat thread.                                                                          |
+
+Every one of those is legal per `Operation.validate`, handled by the Python builder's `_CLOUD_FIELDS`
+/ `_DELETE_FIELDS` / `_PRECONDITION_FIELDS` projections, and reachable from the MCP tool — they were
+simply never written down in an artifact anything asserts against. A decoder that dropped any of
+them would have left `TestFixtureCorpus`, `TestValidFixtureIdempotencyKeys` and the whole V-BRK-028
+Python↔Go join green.
+
+**So the first test in the file is a coverage assertion, not a round-trip.**
+`TestEveryDeclaredSchemaPathIsExercisedBySomeValidFixture` walks the Go type for declared paths,
+walks the corpus for observed ones, and fails on the difference. It is the vacuity guard the
+round-trip needs, and it is self-maintaining in the direction that matters: **adding a field to the
+wire schema now fails until some fixture carries it.** Path walking stops at `desiredState` and
+`patch.body` in both directions — they are deliberately open (`TestPatchBodyTypeIsNotClosed`), and
+without the stop a `desiredState` containing a key named `scale` would read as coverage of
+`operations.scale`.
+
+Two fixtures close the twelve:
+
+- **`platform.cloud-nodepool-resize.json`** — a `scale` op against a GKE node pool `cloudTarget`,
+  under `dryRun: true`. Its key had to be computed fresh, because `dryRun` is in `keyInput`.
+- **`cluster-admin.delete-with-preconditions.json`** — a single-object `delete` carrying
+  `propagationPolicy`, `gracePeriodSeconds` and both preconditions, from a human requester with a
+  router-signed `assertion` and a `trace.threadId`.
+
+Both were added to `identities.json`, so they join the Python↔Go idempotency comparison
+automatically; `dev/test_action_envelope.py` went from six shapes to eight with no edit to the test.
+The four docstrings that said "the same six envelopes" now name no count at all and point at
+V-CTR-005 as the reason the corpus grows — **a count in prose is stale by construction**, which is
+the same failure mode as the "next free ID" lines already filed in this file.
+
+**The other half — "never honoured".** `TestFixtureCorpus` already proves the reserved-key refusal
+fires. "Never honoured" is a stronger claim: that the value could not reach a decision even if the
+scan were removed. Two mechanisms, asserted separately:
+
+1. **No field of `Envelope` is spelled with a reserved name.** Today the scan runs before strict
+   decoding so such a field would be unreachable — but that ordering is a two-line edit, and every
+   other test in the package would survive reversing it (M10).
+2. **Every reserved name is also an unknown field to a bare strict decoder.** Strip the scan and the
+   closed schema still refuses all fourteen, losing the security event and never honouring the
+   value.
+
+**And the list is joined to the spec.** `TestTheReservedKeyListIsTheOneTheSpecPublishes` parses
+06 §4.1's "What the broker ignores — and what it refuses" table as data and compares rows 1–4 to
+`ReservedKeys` in both directions, per [[LSN-040]]/[[LSN-041]] — two definition sites of a security
+rule are only allowed here when something mechanically compares them. The table is parsed
+positionally, so its **shape** is asserted before its contents: eight data rows, row 5 the
+anti-replay row, row 6 the closed-schema catch-all. A reordered table fails loudly rather than
+silently redefining which rows are the reserved ones. `bypassFamily` is asserted as a **superset**
+of row 3, not an equal: the code also puts `approved` and `undoPlan` in it, a widening the row
+boundaries do not express and the prose does support.
+
+**The sweep is the reason to believe any of it.** 13/13, and three of the mutants exist only because
+a test that reads prose as data is one silent parse failure away from asserting nothing (LSN-048).
+**M12 renames the spec heading by two characters** and must turn the suite red; **M13 deletes
+`severity` from the published table while the broker goes on refusing it** — the drift that actually
+happens, invisible from the code side. **M5 and M6 add an undocumented field** to `Envelope` and to
+`CloudTarget`: they are not defects in the guard, they are the defect the guard is _for_.
+
+Findings filed, not fixed:
+
+- **`TestFixtureCorpus`'s doc comment claims to be V-CTR-005** and is not — it is the corpus decode
+  and the V-BRK-002 refusal half. The round-trip and coverage halves did not exist until now. That
+  is the **fifth** wrong or over-claiming `V-*` binding filed in this phase, after V-BRK-020's
+  citation, `execute/apply.go` citing V-REV-002 for V-BRK-006, T8b-3's row binding V-GAT-019, and
+  V-BRK-008 ≡ V-BRK-017. **A class, and overdue for the improvement pass**: a candidate gate rule
+  that every `V-*` mentioned in a Go or Python doc comment names a check whose 09 §6 statement the
+  test actually asserts.
+- The reserved-key table's **rows 7 and 8** ("recorded and ignored", "recorded, not trusted") are
+  not joined to anything. `rationale` never reaching the classifier is a V-BRK-surface property and
+  `attributionUnverified` is a journal one; neither is this check's, and neither is asserted from
+  the table.
+
+Evidence: **V-CTR-005 (L1) pass** — `verification/results.csv`, `verification/mutants/V-CTR-005.json`
+at 13/13.
+
+---
+
 ### P9-T8b-4 splits: 4a is the deployment path, 4b is the soak
 
 **Recorded 2026-07-30, at SELECT.** T8b-4 is "the L2 shadow soak with journal mining". Surveying
