@@ -3973,28 +3973,79 @@ a human.
 
 ---
 
-### P9-T9b-5b-0 — render 06 §2.2's actor scope template on the install path
+### P9-T9b-5b-0 — the actor grant does not have the shape 06 §2.2 gives it
 
-Scheduled out of the withdrawn halt above; it blocks 5b-i's two unproven claims, 5b-ii and 5c.
+Scheduled out of the withdrawn halt above; it blocks 5b-i's two unproven claims, 5b-ii and 5c. Its
+first draft said "render 06 §2.2's actor scope template, which has no renderer." Reading §2.2 to the
+end made the finding both smaller and worse, and changed what has to be built.
 
-**What to build.** A template rendering the three tier ACTOR grants of 06 §2.2 verbatim — the
-developer-team namespaced Role, the cluster-admin ClusterRole, the platform ClusterRole — plus the
-render function and the install-step wiring that applies the right one per tier, alongside the
-existing `render_broker_operations_grant`.
+**06 §2.2 has a fourth fenced block, and it is a placement rule.** After the three tier templates:
 
-**Spec sections.** 06 §2.2 (the three templates, and the `NOT GRANTED` lists, which are part of the
-statement). 03 §3.3 rule 3 for what stays out of every one of them.
+```yaml
+# Broker operations — appended verbatim to every actor Role/ClusterRole.
+```
 
-**Files.** A new `k8s-operator/scripts/actor-scope-grant.yaml.template`; `common.sh`; the tier
-install steps that already call the broker-operations renderer; a new L0 check.
+and §2.2.1's own prose agrees — "the three actor templates above cover what an agent **acts on**.
+They do not cover what the broker needs to **run its own pipeline** … Every actor identity
+**additionally** receives exactly this rule set, byte-identical across tiers." So a conformant actor
+identity holds **one** object per tier — a namespaced `Role` for developer-team, a `ClusterRole` for
+cluster-admin and platform — whose rules are the tier template's **plus** the broker-operations rules
+appended.
 
-**Checks.** The new L0 check is the §2.2 analogue of V-BRK-013's §2.2.1 equality: 06 §2.2's fenced
-blocks are the single source, the rendered template is compared against them in both directions, and
-a superset fails as readily as a subset. It needs an ID from 09 §6 — reuse V-BRK-013's shape, not its
-ID. Downstream, it makes V-BRK-006 L2 and V-REV-001 runnable.
+**The install path builds something else.** `broker-operations-grant.yaml.template` renders a
+tier-neutral pair and splits the rules between them on what its own header calls "THE API'S OWN
+SEAM":
 
-**Sizing note.** Three templates, an exact-equality lint with a fenced-block parser, and install
-wiring is a full unit. Do not attempt it in the same session as 5b-ii.
+| Object                       | Resources                                                                |
+| ---------------------------- | ------------------------------------------------------------------------ |
+| `ClusterRole` (tier-neutral) | `tokenreviews`, `fleetfreezes`, `changepolicies`                         |
+| `Role` (per namespace)       | `actionrecords`, `actionrecords/status`, **`agents`**, `approvalrosters` |
 
-**Not in this unit.** `vap-agent-scope` (P10-T1) is §2.2's validator and may lag the grant — that is
+That split keeps the rule set byte-identical, which is what §2.2.1's sentence asks for in isolation,
+and it silently changes the **scope** of every rule in the namespaced half. §2.2 says these rules are
+appended to the tier's own object; for platform and cluster-admin that object is a **ClusterRole**,
+so `agents: [get, list, watch]` is a cluster-scoped list. Attached instead to a namespaced Role, the
+identical rule authorizes a namespaced list and nothing else.
+
+**That is the whole of the step-3 failure.** `LowerTierOwner` needs a cluster-scoped `list agents`;
+06 §2.2 grants it to the top two tiers; the install path renders it namespaced; no identity on any
+cluster has ever held it. It is not a missing template and not a spec gap — the authority is
+specified, and an object-shape decision made in the render overlay demotes it. The same demotion
+applies to `actionrecords` and `approvalrosters`, which is worth checking in the same unit rather
+than discovering one at a time.
+
+**Why this cannot be one unit, and the ordering that follows.** `dev/tests/actor-grant-single-sourced.py`
+(V-BRK-013) asserts that every object labelled `kube-agents/role: actor` has rules **exactly** equal
+to §2.2.1's twenty triples, and its template says a superset fails as readily as a subset. Under
+§2.2 a conformant actor object is a strict superset by construction, so the check as written
+**encodes the deviation**: fix the install path and the check goes red; land a conformant template
+wearing the actor label and the check goes red before the install path is touched at all. That is a
+previously-green BLOCKING-ALWAYS suite going red, i.e. Halt 2, reached by doing the right thing.
+
+The check is not being _weakened_ — the reshaped assertion is "equals the tier template ∪ the twenty
+triples", which asserts strictly more and still fails both directions — so PROTOCOL §10.2 is not
+engaged. But it is a check change motivated by an implementation defect, which Guardrail 9 puts in a
+different unit from the fix. Three ordered sub-units, and the order is forced:
+
+- **5b-0-i — reshape V-BRK-013 to read 06 §2.2 as well as §2.2.1.** Discover actor objects by label,
+  determine the tier from `kube-agents/tier`, and require the rule set to equal the tier's §2.2
+  template plus the §2.2.1 block, in both directions. The existing shared pair is recognized during
+  the transition by the marker its own header already claims (tier-neutral, no `kube-agents/tier`)
+  and asserted against §2.2.1 alone, so the check stays green on today's tree while describing
+  tomorrow's. Needs the multi-line flow-sequence handling §2.2's blocks use and §2.2.1's do not —
+  Prettier reflows long `resources: [...]` lists — so `_flow_items` gains a bracket-joining
+  normalizer. No install change. L0.
+- **5b-0-ii — render the conformant per-tier actor object.** Three templates
+  (`actor-grant-{developer-team,cluster-admin,platform}.yaml.template`, following the existing
+  per-tier template family), a `render_actor_grant <tier> <namespace> <leaf>`, the binding, and the
+  wiring into `apply_agent_identity` — which already renders grant-then-identity in that order for
+  the reason this needs too. Retire the shared pair rather than delete it. L0 for the equality, L2
+  for the two-sided `auth can-i` that proves the scope actually changed.
+- **5b-0-iii — re-run `broker-execute-l2.sh` past step 3** and score V-BRK-006 L2 and V-REV-001.
+
+**New check ID.** None. This is V-BRK-013 doing what it was always for; a second check reading the
+same spec section would be the two-copies-that-agree failure its own template warns about. Next free
+V-BRK id is **V-BRK-033** if 5b-0-ii's L2 arm turns out to need one of its own.
+
+**Not in this unit family.** `vap-agent-scope` (P10-T1) is §2.2's validator and may lag the grant —
 precisely the state §2.2.1 has shipped in since P9-T7d-5.
