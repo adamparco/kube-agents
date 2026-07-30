@@ -4160,3 +4160,103 @@ for 5b-0-ii to rule on once the grant exists, not as a way around the grant.
 The suite reports this as `DEFERRED: the envelope was not accepted, so no journal entry exists to
 judge`, which is the correct shape — neither row is about admission, and a check that could not run
 its property is never a pass.
+
+### P9-T9b-5b-0-i — V-BRK-013 now reads 06 §2.2 as well as §2.2.1
+
+The check had one definition site and one bound: every Role/ClusterRole labelled
+`kube-agents/role: actor` holds exactly 06 §2.2.1's twenty broker-operations triples. That is true of
+today's tree and it is the sentence that has to stop being true before 5b-0-ii can render anything —
+so it is replaced here, in its own unit, per Guardrail 9.
+
+It now reads **two** definition sites and joins them by tier. 06 §2.2 gives three per-tier ACTOR
+templates — what an agent acts on, different for each tier — and §2.2.1 gives the grant every actor
+identity _additionally_ receives, byte-identical across tiers. What an object is owed therefore
+depends on whether it stamps itself with a `kube-agents/tier`:
+
+- **tier-neutral** (no `kube-agents/tier`) — the shared broker-operations pair, owed §2.2.1 alone.
+  That is all eleven actor objects in the tree today.
+- **tier-stamped** — owed its tier's §2.2 template **∪** §2.2.1's grant.
+
+Property 3 (nothing outside the bound) and property 4 (the bound is fully realised) are both
+evaluated against that per-tier set. Property 4 stays a **union over the tier's objects** rather than
+a per-object equality, because the grant is deliberately split across a ClusterRole and a Role —
+cluster-scoped reads above, persisted writes below — and it is only demanded of a tier that has at
+least one object. A tier with none has not been rendered yet, and a BLOCKING-ALWAYS check that goes
+red until an unrelated future unit lands is not a deferral 09 §9.6 permits; it is a red gate.
+
+Reading §2.2 at all required one parser change. Its `resources:` lists are long enough that Prettier
+reflows them across lines, and §2.2.1's are not, which is why this never came up. `parse_rules` gains
+`_join_flow_sequences`, a bracket-depth pass that collapses a reflowed flow sequence back onto one
+logical line **before** the key/value reader sees it. Joining is done there, on physical lines, and
+not by making the reader tolerant of newlines: a `resources:` with nothing after it is
+indistinguishable from the start of a _block_ sequence until you have counted brackets, and quietly
+reading a block sequence as empty is exactly the silently-smaller-grant failure `GrantSyntaxError`
+exists to prevent. Depth only rises at a `[`, so a bare `resources:` still raises.
+
+#### Two things the unit found that the plan did not have
+
+**1. `k8s-operator/scripts/*.yaml.template` was outside the check's population.** `read_sources`
+admitted `.yaml` and `.yaml.tmpl`. The provisioning path renders `broker-operations-grant.yaml.template`,
+so the one copy of the grant that actually lands on a live cluster was the one copy nothing compared
+to the spec — and it is also where 5b-0-ii's per-tier templates will live, which would have made the
+whole tier arm describe a tree it could not see ([[LSN-036]], [[LSN-050]]). Fixed by extension, not
+by path. The corpus goes from 6 actor objects to 11; both new ones are green.
+
+**2. The spec permits the per-tier object and the shipped admission policy refuses it.** This is the
+real find, and it is a constraint on 5b-0-ii that the plan did not carry.
+
+`vap-agent-readonly` validation 3 bounds every actor object to a literal CEL allow-list under
+`failurePolicy: Fail`, and property 2 has always asserted that allow-list equals §2.2.1's grant. Its
+`isActor` variable selects on the actor label **alone**, with no tier condition — so it governs
+tier-stamped objects too. A conformant platform actor ClusterRole carries 122 triples from 06 §2.2,
+of which **116 are outside that allow-list**, `list secrets` among them. The API server would refuse
+the apply. The spec says one thing, the installed policy says the other, and the two disagreeing
+quietly is how a render lands that no cluster will ever accept.
+
+06 §2.2 names `vap-agent-scope` as the validator for the tier templates and it does not exist
+(P10-T1). Note that landing it does not by itself help: admission is conjunctive, so a second policy
+admitting the tier rules leaves `vap-agent-readonly` still rejecting them. **The bound in
+`vap-agent-readonly` itself has to move, in the same unit as the render.**
+
+That is now **property 6** — no actor object grants a triple the installed allow-list rejects,
+measured against the **intersection** across copies, because a rule admitted by one cluster's policy
+and refused by another's is refused. It is green today (no tier-stamped object exists) and goes red
+the moment 5b-0-ii renders one without moving the bound.
+
+Property 6 reduces "admission would reject it" to "it is outside the allow-list" **only** while
+`isActor` is the bare label test. Narrowing `isActor` is the most natural way to make property 6's
+finding go away, it reads as a scoping fix, and it silently turns the reduction false. So the premise
+is asserted rather than assumed: **property 7** compares the `isActor` expression, in every copy,
+against the one form the reduction holds for.
+
+#### What ran
+
+| Artifact                                           | Result                                                                                                                 |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `actor-grant-single-sourced.py`                    | PASS — 20 grant triples; §2.2 adds cluster-admin=157, developer-team=152, platform=122; 3 VAP copies; 11 actor objects |
+| `actor-grant-single-sourced.py --negative-control` | PASS — **14/14** (was 8/8), each caught by the property it targets                                                     |
+| `dev/tests/invariants-gate.py`                     | 22/22                                                                                                                  |
+| full `dev/L0-CHAIN.txt`                            | clean                                                                                                                  |
+
+The six new mutations exist because the tier arm has no subject in the real tree, and an arm no input
+reaches is unexercised prose ([[LSN-035]]). The control **synthesises** the object 5b-0-ii will
+render — built _from_ the spec, not from a literal copied out of it, because a literal would be a
+fourth definition site and that is the one thing this check exists to forbid — and then perturbs it:
+conformant-but-inadmissible (property 6), one rule its template excludes (3), one rule its template
+requires, dropped (4), a typo'd tier (the mis-stamp that the old check would have measured against
+the wrong template and passed), a narrowed `isActor` (7), and a spec flow sequence swapped for a
+block sequence (the joiner's own risk).
+
+No mutant spec under `verification/mutants/`: V-BRK-013 predates `dev/mutate.py` and carries its
+sweep in-tree as `--negative-control`, which is the same discipline — each mutation named, and caught
+by the property it targets, not merely by the check going red.
+
+#### Verdicts
+
+| ID            | Level | Verdict | Note                                                                   |
+| ------------- | ----- | ------- | ---------------------------------------------------------------------- |
+| **V-BRK-013** | L0    | `pass`  | reshaped; strictly more asserted, 14/14 control, green on today's tree |
+
+Unchanged and still blocked: **V-BRK-006** (L2) and **V-REV-001**, on 5b-0-ii. 5b-0-ii now owes three
+things rather than two — the per-tier actor object, the binding, **and** the `vap-agent-readonly`
+allow-list that admits it.
