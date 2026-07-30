@@ -63,6 +63,7 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/pipeline"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/journal"
 )
 
@@ -186,6 +187,33 @@ func run(ctx context.Context, o options) error {
 
 	security := broker.LogSecuritySink{Log: ctrl.Log.WithName("security")}
 
+	// ONE store, shared by the pipeline's step 11 and by the rejection journal below. A second one
+	// would be a second answer to "which namespace do records live in".
+	records := journal.NewStore(k8s, nil)
+
+	// Steps 3-11. See wiring.go for the assembly and for what is deliberately left nil.
+	pipeCfg, sources, err := pipelineConfig(ctx, brokerDeps{
+		RESTConfig:          cfg,
+		Client:              k8s,
+		Records:             records,
+		AgentName:           o.agentName,
+		Namespace:           o.namespace,
+		ActorServiceAccount: brokerServiceAccount(),
+	})
+	if err != nil {
+		return err
+	}
+	pipe, err := pipeline.New(pipeCfg)
+	if err != nil {
+		return err
+	}
+	// Before the listener opens. A broker that is accepting submissions while its brake has never
+	// been read is a broker whose first few actions were decided by a source that had nothing in
+	// it -- and startSources exits non-zero rather than degrading, for the reasons stated there.
+	if err := startSources(ctx, sources); err != nil {
+		return err
+	}
+
 	server, err := broker.NewServer(broker.Config{
 		Authenticator: &broker.Authenticator{
 			Reviewer: broker.APITokenReviewer{Client: clientset},
@@ -200,18 +228,13 @@ func run(ctx context.Context, o options) error {
 			Security:    security,
 		},
 		Guard: broker.NewReplayGuard(time.Now),
-		// Steps 3-11 exist and are tested end to end -- see internal/broker/pipeline -- but they are
-		// not constructed here yet, because pipeline.Config takes twelve client-backed seams
-		// (LiveState, Applier, Reader, BodyStore, Prober, Rollbacker, Pager, Pauser, cooldown
-		// registry, ActionHistory, ReferenceIndex, BrakeSource) and none of their real adapters is
-		// written. P9-T7c-3 writes them and replaces this line with a pipeline.New call.
-		//
-		// Until then every envelope that survives auth, the schema, the key recomputation and the
-		// three anti-replay mechanisms gets a 503 that names this build -- not a 202 for an action
-		// nobody performed. See the Pipeline doc comment.
-		Pipeline: broker.UnavailablePipeline{},
+		// The real pipeline, not broker.UnavailablePipeline. Until P9-T7c-3d-iv-b this line held the
+		// 503 stub, and every envelope that survived auth, the schema, the key recomputation and the
+		// three anti-replay mechanisms was refused by a broker whose steps 3-11 existed only in their
+		// own tests -- LSN-007 exactly. V-BRK-027 is the assertion that keeps it wired.
+		Pipeline: pipe,
 		Journal: &broker.StoreRejectionJournal{
-			Store:               journal.NewStore(k8s, nil),
+			Store:               records,
 			Namespace:           o.namespace,
 			AgentName:           o.agentName,
 			ActorServiceAccount: brokerServiceAccount(),
