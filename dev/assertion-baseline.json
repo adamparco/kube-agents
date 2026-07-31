@@ -432,7 +432,8 @@
       "test_trailer_value_is_single_line"
     ],
     "dev/verify/broker-auth-l2.sh": [
-      "$($K -n "
+      "$($K -n ",
+      "$envelope_port"
     ],
     "dev/verify/broker-execute-l2.sh": [
       "$target_exists"

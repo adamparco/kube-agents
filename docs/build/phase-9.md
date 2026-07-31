@@ -71,7 +71,17 @@ nor the refusing one can reach. `ii-b` was split at SELECT into `ii-b-1` (V-REV-
 (V-BRK-021's surface scan **plus** the `verify-phase9.sh` §G retarget, which is a false pass today);
 its section is at the end of this file.
 
-**Resume at `P9-T9b-5b-ii-b-2`.** The remaining Phase 9 ladder is `5b-ii-b-2` → `5c` →
+**`P9-T9b-5b-ii-b-2` landed 2026-07-31** — `dev/verify/broker-auth-l2.sh` is **21/21, rc 0, PROVEN**
+(negative control 20/20): **V-BRK-021** at L2, the surface of the binary the controller handed out.
+Seven arms — nineteen non-routes 404, eight methods 405, three query parameters 400, all ten of
+`server.go`'s bypass headers 400 on an unauthenticated route with no token presented, the 200
+differential that makes those ten attributable to the headers, one reachable port of eight dialled,
+and the three-writer declared-port surface. The unit also closed `verify-phase9.sh` §G's V-BRK-021
+detector, **a false pass since it was written**: it discovered its claimant with
+`grep -l 'V-BRK-021' dev/verify/*-l2.sh`, and the tree's one match was `broker-refuse-l2.sh`'s
+comment saying it does _not_ carry the property. Its section is at the end of this file.
+
+**Resume at `P9-T9b-5c`.** The remaining Phase 9 ladder is `5c` →
 `T8b-4b-ii-2b-ii` → `T9c`, then `harness-milestone`. **`P9-T9c` was appended 2026-07-31** by the
 ORIENT drain of `BACKLOG.md` B-006 — 06 §4.4 row 3's auto-pause has no consumer; its section is at
 the end of this file.
@@ -4941,3 +4951,132 @@ ReplicaSet is `0/0 created`. It is scratch-cluster configuration drift, not a re
 caused and not something any L2 chain line asserts. Recorded in the ledger's findings; it needs a
 ruling before the Phase 9 milestone, because a milestone run on a cluster with a dead router should
 say so out loud rather than not notice.
+
+---
+
+## P9-T9b-5b-ii-b-2 — V-BRK-021 at L2: the surface of the binary the controller handed out
+
+**Landed 2026-07-31.** `dev/verify/broker-auth-l2.sh` is **21/21, rc 0, PROVEN** on
+`gke-scratch-kube-agents-dev` (up from 14/14); the negative control is **20/20**. **V-BRK-021** is
+scored `pass` at L2 — one row in `verification/results.csv`. No new chain line: the suite that grew
+the scan was already a live line of `dev/L2-CHAIN.txt` and its `--negative-control` was already a
+live line of `dev/L0-CHAIN.txt`, so both floors stand.
+
+### Why this is not the L0 half again
+
+V-BRK-021's L0 half went green on 2026-07-30 (`P9-T7c-2c`, `results.csv` row 138), reshaped from a
+route COUNT into four derived properties of `Server.MutatingRoutes()`. That row's own note says what
+it does not settle, and 09 §6 gives the check **L0 and L2** rather than either alone. Three of the
+clause's properties are structurally unreachable from `go test`:
+
+- **A build-tag-guarded skip path is not in the binary the test builds.** `go test` compiles without
+  the tag, so a `//go:build !prod` bypass is invisible to every assertion in the package — including
+  the ones that read the route table.
+- **A listener that is not `internal/broker` is invisible to a scan of `internal/broker`.** A sidecar,
+  a profiler left in the base image, a debug server started from `main` — none of them appear in a
+  source property of the mux.
+- **05 §1.3's two future doors can only be shown empty on a deployed server.** `/v1alpha1/approve`
+  and `/v1alpha1/replay` are named in the route table as Phase 10 work. "The population is empty,
+  recorded as empty and never as satisfied" is a statement about what answers on the wire.
+
+So the L2 half asserts **the same properties of a different subject**: the image the controller
+handed out, at the digest P1 pinned, behind the real TLS listener, across the real Service and the
+real NetworkPolicy.
+
+### Where it was built, and why not somewhere new
+
+Extended `dev/verify/fixtures/broker_probe.py` and `dev/verify/broker-auth-l2.sh` rather than adding
+a suite. The probe already holds a mesh certificate, an audience-bound projected token and the
+`hostAliases` pin that makes the SAN resolve without a DNS rule; a second driver pod would re-derive
+all three to ask a cheaper question. `broker_probe.py` had exactly one consumer, so there was no
+second caller to keep in step.
+
+**Every scan request carries the agent's own good certificate and own good token.** That is the whole
+reason a 404 is attributable to the ROUTE SET rather than to the caller — an unauthenticated probe of
+an unknown path gets a refusal either way and cannot tell you which.
+
+### The seven arms
+
+| Arm | What it reads                                                                                  |
+| --- | ---------------------------------------------------------------------------------------------- |
+| a   | 19 non-routes — L0's 17 plus 05 §1.3's two future doors — all 404 `no-such-route`              |
+| b   | 8 methods — five on the actions route, three on the nonce route — all 405 `method-not-allowed` |
+| c   | 3 query parameters, all 400 `unsupported-query-parameter`                                      |
+| d   | all 10 of `server.go`'s `bypassHeaders`, 400 `bypass-key`, plus one on the mutating route      |
+| e   | the differential: the same route, same credentials, no header → 200 with an empty reason       |
+| f   | 8 ports dialled from inside the cluster; exactly one accepts                                   |
+| g   | container, Service and EndpointSlice each declare one port, and it is the same one             |
+
+Three of these are load-bearing in ways worth writing down.
+
+**(c) carries a real envelope.** Each query request submits an envelope built by the shipped builder
+with a fresh nonce. A `{}` body comes back 400 `invalid-envelope`, and an arm that read only the
+status could not tell the two apart — it would score a broker that ignores query strings entirely as
+a broker that refuses them. `pretty=true` is in the list for the same reason: an innocuous parameter
+is what separates an allowlist of zero from a denylist of the scary ones.
+
+**(d) presents no Authorization header at all**, on `/healthz`. A 400 in that condition can only have
+come from `ServeHTTP` ahead of the mux, which is where `rejectBypassHeaders` runs — so the arm is a
+property of the server rather than of one handler. The count is an **equality**, not a floor:
+`bypassHeaders` mirrors 06 §4.1's reserved body keys, and a scan of nine of them is a scan with a
+hole in a place the design enumerates.
+
+**(e) exists because (d) alone is satisfied by a broken broker.** Eleven refusals is also what a
+broker that 400s everything produces, including one whose health route has failed.
+
+### What the suite states it does not claim
+
+- **(f) is a reachability claim, and is written as one.** A port nothing listens on and a port the
+  `<agent>-to-broker` egress policy drops both arrive at the driver pod as "did not connect". Reading
+  the timeout as proof that no process is bound would be reading the NetworkPolicy's verdict as the
+  binary's. The claim is reachability from where an agent stands — which is the property
+  non-skippability actually needs — and **(g)** covers the other side from three independent
+  API-server writers rather than pretending the dial did.
+- **Nothing decompiles the image.** What is asserted is the observable consequence of a skip path on
+  the digest P1 pinned, not its absence from the object code.
+
+### The section G retarget — the third false pass in one file
+
+§G's V-BRK-021 detector was `grep -l 'V-BRK-021' dev/verify/*-l2.sh | head -1`, plus a check that the
+match is a live `L2-CHAIN.txt` line. The tree's one match was `broker-refuse-l2.sh` — in a comment
+recording that it does **not** carry the property ("→ P9-T9b-5b-ii-b, with V-BRK-021's L2 surface
+scan"), and that file is a live chain line. Both halves of the test were satisfied by a note about
+the absence of the thing under test.
+
+This is the same shape as the Accept (d) arm (retargeted 2026-07-31, one unit earlier) and the
+guard-1 arm (rewritten when it matched a function name and "was right by accident"). Three arms in
+one file, three different doors, one defect: **a detector aimed at a NAME is indistinguishable, in
+its own output, from a detector that is satisfied.**
+
+The replacement discovers by the **refusal vocabulary the shipped server answers with**, each of the
+four strings resolved out of `k8s-operator/internal/broker/*.go` from the code path that emits it —
+`http.StatusNotFound`'s `Response`, `http.StatusMethodNotAllowed`'s, the block guarded by
+`len(r.URL.Query()) > 0`, and `ReasonBypassKey`'s value. Rename a reason in the server without
+renaming it in the suite and the arm fails, rather than quietly unhooking and going green on a suite
+that now matches nothing. A claimant must also read both port outcomes in the same function body,
+bound its own size against a floor, be called from somewhere, be a live `L2-CHAIN.txt` line, **and**
+have its `--negative-control` be a live `L0-CHAIN.txt` line — both trees, as a gate rather than as a
+habit.
+
+**Guardrail 9 does not apply**, and it was checked before the edit rather than after: the detector
+was a false pass on the pre-unit tree, so retargeting it closes a known false pass instead of editing
+a check to make an implementation green. `ii-b-1`'s own split table assigned the retarget here.
+
+**Shown non-vacuous twice.** Against the real pre-unit tree — `git stash` of the two changed files,
+detector declines with "no live line of dev/L2-CHAIN.txt runs a suite that scans the deployed
+surface" — and against four clause mutants under `dev/mutate.sh`, **4/4 caught**: the port outcomes,
+every count floor, the ¬ chain line, and a server-side reason rename.
+
+One of those four escaped on its first run and the **mutant** was wrong, not the detector: it deleted
+one of five floors, and the clause only ever claimed the scan bounds its size _somewhere_ — a regex
+over one function body cannot attribute a floor to a dimension. Strengthening the arm until that
+mutant died would have been writing a claim to fit a test. The mutant was corrected to remove every
+count comparison, and the bound is now stated in the arm's own comment.
+
+### A note on `/bin/bash` 3.2
+
+The first draft put the detector in `verdict="$(python3 - <<'PY' … PY)"`. macOS ships bash 3.2, which
+mis-parses a heredoc nested inside a command substitution and reports the entire 600-line file as an
+unterminated quote — `bash -n` fails at EOF and names no useful line. The verdict now travels through
+a file and the pass/fail stays in the exit status, which is also the shape the guard-1 arm below it
+already used.

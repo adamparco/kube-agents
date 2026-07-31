@@ -83,6 +83,27 @@ turns out to be wrong is closed with a reason, not recycled.
 
 **Last drained:** 2026-07-31
 
+### The LSN-060 gate arm keys on the control flag's spelling, so naming it in prose is a finding
+
+- **Kind:** finding
+- **Where:** `dev/tests/invariants-gate.py:2955` (`check_negative_controls_exercise_the_statement_under_test`)
+- **Why it matters:** the arm's test for "this suite has a control mode" is
+  `if "--negative-control" not in text: continue` — a substring search over the whole file. Any
+  script that merely _mentions_ the flag is then required to carry a
+  `NEGATIVE CONTROL DOES NOT EXERCISE:` block describing a mode it does not have. It fired on
+  `dev/verify/verify-phase9.sh` during `P9-T9b-5b-ii-b-2`, whose new §G arm has to reason about
+  whether a claimant's control runs at L0. Worked around in that unit by matching the invocation's
+  _shape_ instead (`<suite>.sh <flag>` on a live `L0-CHAIN.txt` line), which is defensible on its own
+  terms — the flag is a convention, the property is "reached from the no-cluster chain" — but the
+  gate arm should recognise a mode by its **handler** (a `case`/`if` on `$1`, or the flag appearing
+  in an argument parse) rather than by the string appearing anywhere, including in a comment. As it
+  stands the arm taxes writing about controls, and the cheapest way to satisfy it is to stop naming
+  them. Guardrail 9 kept the fix out of that unit.
+- **Priority:** normal
+- **Added:** 2026-07-31
+
+---
+
 ### `kubeagents-router` has been in CrashLoopBackOff on the scratch cluster for at least four days
 
 - **Kind:** finding

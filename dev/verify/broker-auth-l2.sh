@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 · V-BRK-031 at L2 — what a DEPLOYED
-# broker does with the credentials it is handed (09 §6.2, 03 §4.1, 05 §7).
+# V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 · V-BRK-021 · V-BRK-031 at L2 — what a
+# DEPLOYED broker does with the credentials it is handed, and what else there is to talk to
+# (09 §6.2, 03 §4.1, 05 §1.3, 05 §7).
 #
 # All five rows are BLOCKING-ALWAYS, all five carry `¬`, and until this suite existed not one of
 # them had a single row in `verification/results.csv`. They are acceptance bullet (c)'s entire L2
@@ -55,6 +56,15 @@
 #         — is 403 `forbidden-caller`, AND the broker emits a security event for it, observed as a
 #         `broker security refusal` line appearing in the broker pod's log DURING this run. A
 #         refusal nobody can see is not a detection.
+#   L2-6  V-BRK-021's L2 half, and the only section here whose subject is the SURFACE rather than
+#         the caller: with the credential layer fully satisfied, nineteen non-routes 404, eight
+#         wrong methods 405, three query parameters 400, the ten bypass headers 400 on the
+#         UNAUTHENTICATED health route — and that same route answering 200 without one. Then the
+#         port surface from two directions: eight ports dialled from inside the cluster, of which
+#         exactly the envelope port accepts, and the declared surface read off three different
+#         writers in the API server. The long comment above `assert_surface` states what this
+#         covers that the already-green L0 half structurally cannot; `probe_port`'s docstring
+#         states what the dial does not prove.
 #
 # WHAT THIS DOES NOT CLAIM
 #   That the published agent IMAGE carries this transport code. The driver pod mounts
@@ -62,6 +72,18 @@
 #   agent images in Artifact Registry are days stale and are the wrong artifact for the question
 #   anyway — what is under test is the shipped source against the deployed broker. Image parity is
 #   P1's job, on a row that is not one of these five.
+#
+#   That the broker process binds no port other than the envelope port. A port the
+#   `<agent>-to-broker` egress policy drops is unreachable from the driver pod AND indistinguishable
+#   from a closed one, so the dial's claim is bounded to reachability from where an agent stands —
+#   which is the property non-skippability needs, and is stated that way rather than overclaimed.
+#   The declared-surface arm covers the other side as far as three API-server reads can.
+#
+#   That no build tag was used when the image was built. Nothing here decompiles anything. What is
+#   asserted is the observable consequence on the digest P1 pinned: every shape a build-tag-guarded
+#   skip path could open — a debug route, an override parameter, a bypass header, a second port —
+#   is closed on the broker the controller actually handed out. The source scan for build tags is
+#   the L0 half's `TestNoBuildTagGuardedPathsInPackage`, and it scans one package of the tree.
 #
 #   That cluster DNS publishes the broker's name. The driver pod pins the SAN to the Service's
 #   ClusterIP with `hostAliases`, because `<agent>-to-broker` grants a reader pod exactly one egress
@@ -115,6 +137,14 @@ set -uo pipefail
 #   - the transcript's own field order and separator. It is written by the same hand that parses
 #     it here, so a change to the driver's output format is invisible to the ¬ arm and shows up
 #     only on the live run
+#   - for V-BRK-021 specifically: every request the surface scan makes. The ¬ rows prove the six
+#     arms discriminate between a bounded surface and four different unbounded ones; they say
+#     nothing about whether the probe can reach forty-odd paths, open a raw socket to eight ports,
+#     or build a well-formed envelope for the query arm. A scan that silently made no request at
+#     all is caught by the floors, and only on the live run
+#   - and the three API-server reads behind `assert_declared_port_surface`. The ¬ rows hand it
+#     `count/port` strings; that the jsonpath expressions select the right thing, and that an
+#     EndpointSlice exists to select from, is live-only
 MODE=live
 if [ "${1:-}" = "--negative-control" ]; then
   MODE=negative-control
@@ -164,8 +194,9 @@ bad() {
   fail=1
 }
 
-# 2 x P1 + broker Available + L2-0 nonce + L2-0 envelope (V-BRK-031) + 8 credential arms + V-BRK-010b.
-EXPECTED_ASSERTIONS=14
+# 2 x P1 + broker Available + L2-0 nonce + L2-0 envelope (V-BRK-031) + 8 credential arms
+# + V-BRK-010b + V-BRK-021's six surface arms (a-f) + its declared-surface arm (g).
+EXPECTED_ASSERTIONS=21
 
 field() { # <scenario> <1=outcome 2=status 3=reason 4=detail 5=retryAfterSeconds>
   printf '%s\n' "$FLAT" | awk -F'\t' -v s="$1" -v i="$(($2 + 1))" '$1 == s { print $i; exit }'
@@ -332,6 +363,218 @@ assert_credentials() {
     "V-BRK-010a: ${FOREIGN_AGENT}'s reader identity, certificate and token agreeing"
 }
 
+# ------------------------------------------------------------------------------------------------
+# V-BRK-021 at L2 — the surface of the binary the controller handed out
+# ------------------------------------------------------------------------------------------------
+#
+# 09 §6 gives V-BRK-021 levels L0 AND L2. The L0 half went green on 2026-07-30 (P9-T7c-2c,
+# results.csv row 138) and is the derivation: `MutatingRoutes()` equals the registered set less a
+# declared allowlist, that set is a subset of 05 §1.3's table, registration has one call site, and
+# every mutating route reaches the authenticator and the pipeline. Its own header says why it is
+# not a probe — "a probe only covers the routes somebody thought to try".
+#
+# The L2 half is the half a derivation cannot reach, and it is not a weaker restatement of the L0
+# one. It asserts the same properties of a DIFFERENT SUBJECT: the image the controller actually
+# handed out, at the digest P1 pinned, behind the real TLS listener, across the real Service and
+# the real NetworkPolicy. Three things live only here:
+#
+#   - A BUILD-TAG-GUARDED SKIP PATH IS INVISIBLE TO THE L0 HALF BY CONSTRUCTION. `go test` compiles
+#     without the tag, so a `//go:build debug` file registering `/debug/apply` is absent from every
+#     server the L0 tests build and present in an image built with `-tags debug`.
+#     `TestNoBuildTagGuardedPathsInPackage` scans the package source for build tags, which is a
+#     scan of ONE package in the tree — not of the binary, not of its dependencies, and not of the
+#     base image. What is asserted here is the observable consequence: on the deployed digest,
+#     every shape such a tag could open is closed.
+#   - THE ROUTE SET IS NOT THE ONLY THING SERVING ON THAT POD. A sidecar, an init-installed proxy or
+#     a base image with its own listener adds a door that no test of `internal/broker` can see. The
+#     port arm and the declared-surface arm are about the pod, not the package.
+#   - 05 §1.3'S TWO FUTURE DOORS. `/v1alpha1/approve` and `/v1alpha1/replay` are routes the design
+#     NAMES, which is why the L0 subset arm permits them; V-BRK-021's re-entry clause is recorded
+#     at L0 as "a conditional whose population is empty". Empty is a claim about a deployed server,
+#     and this is the only place it is made against one.
+#
+# WHY EVERY SCAN REQUEST CARRIES THE AGENT'S OWN GOOD CREDENTIALS. A 404 from a broker that refused
+# the caller is not evidence that the route is absent — it is evidence about the caller. The
+# credential layer is satisfied on every arm below precisely so the answer is attributable to the
+# route set, and the ¬ transcript `surface-auth` exists to prove that distinction is live.
+#
+# The counts below are floors, not decoration. The probe owns the lists (it has to: they are made
+# of paths, methods and headers, and a second copy in the shell would be a second thing to keep in
+# step); the shell owns the assertion that the probe reported a scan of the size it claims. Without
+# them a probe that emitted one route scenario would pass this arm having scanned nothing, which is
+# the truncation failure mode L2-2's sibling arms already learned once.
+SURFACE_PATHS_MIN=19       # SURFACE_PATHS in broker_probe.py
+SURFACE_METHODS_MIN=8      # SURFACE_METHODS (5) + the nonce route's three
+SURFACE_QUERIES_MIN=3      # SURFACE_QUERIES
+SURFACE_HEADERS_EXPECT=10  # server.go's bypassHeaders — an EQUALITY, because that list is 06 §4.1's
+SURFACE_PORTS_MIN=8        # the envelope port plus SURFACE_PORTS
+
+# scenarios_with_prefix <prefix> — every scenario name in $FLAT that starts with it, in order.
+# `index($1, p) == 1` is a prefix test and not a substring one, which is what keeps `header:` from
+# also collecting `header-actions:`.
+scenarios_with_prefix() {
+  printf '%s\n' "$FLAT" | awk -F'\t' -v p="$1" 'index($1, p) == 1 { print $1 }'
+}
+
+# assert_surface <envelope-port> — V-BRK-021's six L2 arms, over $FLAT.
+#
+# A function for the same reason `assert_credentials` is one: `--negative-control` replays it
+# against transcripts of a broker that answered wrongly. The envelope port is a PARAMETER rather
+# than a literal because the live path reads it off the rendered Deployment (P6) and the ¬ path has
+# no cluster to read it from.
+assert_surface() {
+  local want_port="$1"
+  local s n offenders st rn oc
+
+  echo
+  echo "== L2-6: V-BRK-021 — no second door on the image the controller handed out =="
+
+  # (a) Every probed non-route is a 404 from the ROUTE SET, by reason and not merely by status.
+  n=0
+  offenders=""
+  for s in $(scenarios_with_prefix "route:"); do
+    n=$((n + 1))
+    st="$(field "$s" 2)"
+    rn="$(field "$s" 3)"
+    if [ "$(field "$s" 1)" != "http" ] || [ "$st" != "404" ] || [ "$rn" != "no-such-route" ]; then
+      offenders="$offenders ${s#route:}→${st:-none}/${rn:-none}"
+    fi
+  done
+  if [ "$n" -lt "$SURFACE_PATHS_MIN" ]; then
+    bad "V-BRK-021a: the probe reported $n route scenarios, fewer than the $SURFACE_PATHS_MIN it scans. A scan that stopped early is not a smaller scan, it is an unmeasured surface."
+  elif [ -n "$offenders" ]; then
+    bad "V-BRK-021a: $n paths probed with the agent's own valid credentials; these did not answer 404 no-such-route:$offenders. A path that answers anything else is a door, or is a refusal attributable to the caller rather than to the route set."
+  else
+    pass "V-BRK-021a: $n non-routes — including 05 §1.3's two future doors — all answer 404 no-such-route on the deployed digest"
+  fi
+
+  # (b) The method sets. 405, again by reason: a 405 with no reason field would mean something
+  #     other than the broker answered.
+  n=0
+  offenders=""
+  for s in $(scenarios_with_prefix "method:") $(scenarios_with_prefix "nonce-method:"); do
+    n=$((n + 1))
+    st="$(field "$s" 2)"
+    rn="$(field "$s" 3)"
+    if [ "$(field "$s" 1)" != "http" ] || [ "$st" != "405" ] || [ "$rn" != "method-not-allowed" ]; then
+      offenders="$offenders ${s}→${st:-none}/${rn:-none}"
+    fi
+  done
+  if [ "$n" -lt "$SURFACE_METHODS_MIN" ]; then
+    bad "V-BRK-021b: the probe reported $n method scenarios, fewer than the $SURFACE_METHODS_MIN it scans."
+  elif [ -n "$offenders" ]; then
+    bad "V-BRK-021b: these methods were not refused 405 method-not-allowed:$offenders. A GET that mutates is retried by every proxy between the agent and the broker; a nonce route that accepts POST is a submission path nobody would inventory."
+  else
+    pass "V-BRK-021b: $n non-POST methods on the mutating route and non-GET methods on the nonce route all answer 405 method-not-allowed"
+  fi
+
+  # (c) Query parameters, each carrying a well-formed envelope with a fresh nonce. The reason is
+  #     the whole assertion: a `400 invalid-envelope` would mean the arm measured the body.
+  n=0
+  offenders=""
+  for s in $(scenarios_with_prefix "query:"); do
+    n=$((n + 1))
+    st="$(field "$s" 2)"
+    rn="$(field "$s" 3)"
+    if [ "$(field "$s" 1)" != "http" ] || [ "$st" != "400" ] || [ "$rn" != "unsupported-query-parameter" ]; then
+      offenders="$offenders ${s#query:}→${st:-none}/${rn:-none}"
+    fi
+  done
+  if [ "$n" -lt "$SURFACE_QUERIES_MIN" ]; then
+    bad "V-BRK-021c: the probe reported $n query scenarios, fewer than the $SURFACE_QUERIES_MIN it scans."
+  elif [ -n "$offenders" ]; then
+    bad "V-BRK-021c: these query parameters were not refused 400 unsupported-query-parameter:$offenders. The envelope carried was built by the shipped builder with a fresh nonce and reached the pipeline without a query string (see envelope-accepted), so a different reason here means the arm measured the body instead of the parameter."
+  else
+    pass "V-BRK-021c: $n query parameters — including the innocuous \`pretty=true\`, which is what makes this an allowlist of zero rather than a denylist — all refused 400 unsupported-query-parameter"
+  fi
+
+  # (d) The ten bypass headers on the UNAUTHENTICATED health route, plus one on the mutating route.
+  #     An EQUALITY on the count, not a floor: `bypassHeaders` mirrors 06 §4.1's reserved body keys,
+  #     and a scan of nine of them is a scan with a hole in a place the design enumerates.
+  n=0
+  offenders=""
+  for s in $(scenarios_with_prefix "header:") $(scenarios_with_prefix "header-actions:"); do
+    st="$(field "$s" 2)"
+    rn="$(field "$s" 3)"
+    case "$s" in header:*) n=$((n + 1)) ;; esac
+    if [ "$(field "$s" 1)" != "http" ] || [ "$st" != "400" ] || [ "$rn" != "bypass-key" ]; then
+      offenders="$offenders ${s}→${st:-none}/${rn:-none}"
+    fi
+  done
+  if [ "$n" -ne "$SURFACE_HEADERS_EXPECT" ]; then
+    bad "V-BRK-021d: the probe reported $n bypass-header scenarios on /healthz, not the $SURFACE_HEADERS_EXPECT of server.go's bypassHeaders. The two lists have moved apart, so this arm is scanning a surface the design does not describe."
+  elif [ -n "$offenders" ]; then
+    bad "V-BRK-021d: these bypass headers were not refused 400 bypass-key:$offenders. A header the broker ignores teaches a caller that headers are worth trying; a header it honours is the override V-BRK-021 says does not exist."
+  else
+    pass "V-BRK-021d: all $n bypass headers are refused 400 bypass-key on /healthz — an unauthenticated route with no token presented, so the refusal is in ServeHTTP ahead of the mux — and on the mutating route"
+  fi
+
+  # (e) The differential for (d). Without it, eleven refusals are also what a broker that 400s
+  #     everything produces, including one whose health route is broken.
+  st="$(field healthz-clean 2)"
+  if [ "$(field healthz-clean 1)" = "http" ] && [ "$st" = "200" ] && [ -z "$(field healthz-clean 3)" ]; then
+    pass "V-BRK-021e: the SAME route with the SAME credentials and no bypass header answers 200 — so (d) is the header's doing and not a broker refusing everything"
+  else
+    bad "V-BRK-021e: /healthz without a bypass header answered outcome='$(field healthz-clean 1)' status='$st' reason='$(field healthz-clean 3)', not 200 with no reason: $(field healthz-clean 4). The ten refusals above are not attributable to the headers while this route refuses on its own."
+  fi
+
+  # (f) Reachable ports. See probe_port's docstring for what a closed port here does and does not
+  #     prove — the claim is reachability from where an agent stands, which is the property
+  #     non-skippability actually needs.
+  n=0
+  offenders=""
+  local saw_envelope_port=0
+  for s in $(scenarios_with_prefix "port:"); do
+    n=$((n + 1))
+    oc="$(field "$s" 1)"
+    if [ "${s#port:}" = "$want_port" ]; then
+      saw_envelope_port=1
+      [ "$oc" = "port-open" ] || offenders="$offenders ${s#port:}(envelope port)→$oc"
+    else
+      [ "$oc" = "port-closed" ] || offenders="$offenders ${s#port:}→$oc"
+    fi
+  done
+  if [ "$n" -lt "$SURFACE_PORTS_MIN" ]; then
+    bad "V-BRK-021f: the probe reported $n port scenarios, fewer than the $SURFACE_PORTS_MIN it dials."
+  elif [ "$saw_envelope_port" -ne 1 ]; then
+    bad "V-BRK-021f: the probe never dialled the envelope port $want_port. Seven closed ports with no open one is what an unreachable broker looks like, not a bounded surface."
+  elif [ -n "$offenders" ]; then
+    bad "V-BRK-021f: the reachable-port surface is not exactly the envelope port:$offenders"
+  else
+    pass "V-BRK-021f: of $n ports dialled from inside the cluster, exactly one — the envelope port $want_port, read off the rendered Deployment — accepts a connection"
+  fi
+}
+
+# assert_declared_port_surface <containers> <service> <endpointslice> <expected-port>
+#   The pod's declared surface, as three `count/port` observations read off the API server.
+#
+#   This is the arm that speaks to what the port dial cannot: a listener bound on a port the egress
+#   policy drops is unreachable AND undetectable from the driver pod, and a suite that stopped at
+#   the dial would be reporting the NetworkPolicy's verdict as the process's. The declaration is
+#   the other side of it — the controller renders exactly one containerPort, the Service publishes
+#   exactly one, and the EndpointSlice the API SERVER computed carries exactly one. All three,
+#   because they are three different writers and a disagreement between them is itself the finding.
+#
+#   What it still does not claim: that the process bound nothing else. Nothing short of reading the
+#   pod's own network namespace could, and that is stated as a non-claim in the header rather than
+#   papered over.
+assert_declared_port_surface() {
+  local containers="$1" service="$2" endpoints="$3" want="$4" wrong=""
+  local obs label
+  for obs in "containerPort=$containers" "servicePort=$service" "endpointSlicePort=$endpoints"; do
+    label="${obs%%=*}"
+    case "${obs#*=}" in
+      "1/$want") ;;
+      *) wrong="$wrong $label=${obs#*=}" ;;
+    esac
+  done
+  if [ -n "$wrong" ]; then
+    bad "V-BRK-021g: the deployed broker's declared port surface is not exactly one port equal to the envelope port $want (each reported as count/port):$wrong"
+  else
+    pass "V-BRK-021g: the broker container declares one port, the Service publishes one, and the EndpointSlice the API server computed carries one — all $want"
+  fi
+}
+
 # assert_security_event <log-text> — V-BRK-010's second clause, over the broker log lines written
 # during this run.
 assert_security_event() {
@@ -443,7 +686,91 @@ assert_envelope_baseline() {
   esac
 }
 
-# run_negative_control — the mandatory `¬` for V-BRK-007/008/009/010/017/031.
+# nc_surface_transcript <name> — a whole synthetic scan transcript, for the `¬` arm.
+#
+# GENERATED, NOT TYPED OUT. The live scan emits fifty-odd lines; four hand-written copies of that
+# would be two hundred rows, and a typo in any of them reads as a finding rather than as a typo.
+# The generator takes the answers as parameters, which is also what lets one shape produce the
+# CORRECT transcript — `surface-good` is the control on the control, and without it six arms that
+# were accidentally always-red would satisfy every vacuity row here and then measure nothing live.
+#
+# It deliberately does NOT reuse the probe's real path/header names. The arms assert on outcomes,
+# statuses and reasons; a transcript that also reproduced the names would invite an arm that
+# recognised a name, and this file has already learned once that a check matching a name is not a
+# check on the property (see section G of verify-phase9.sh).
+nc_surface_transcript() {
+  local name="$1" i
+  local r_st r_rn m_st m_rn q_st q_rn h_st h_rn hz_st port_other
+
+  case "$name" in
+    surface-open)
+      # Nothing is wired: every probe is answered 200 and every port accepts. Note that /healthz
+      # answering 200 is CORRECT even here, so arm (e) passes — it is a positive control and a
+      # transcript in which it went red would mean the arm had stopped being one.
+      r_st=200 r_rn=""
+      m_st=200 m_rn=""
+      q_st=200 q_rn=""
+      h_st=200 h_rn=""
+      hz_st=200
+      port_other=port-open
+      ;;
+    surface-auth)
+      # Every probe refused by the CREDENTIAL layer instead of by the route set, and the bypass
+      # headers silently ignored. The ports are correct, so (f) passes: this transcript is about
+      # the four arms that could be satisfied by a refusal that is about the caller.
+      r_st=403 r_rn=forbidden-caller
+      m_st=401 m_rn=token-invalid
+      q_st=401 q_rn=token-invalid
+      h_st=200 h_rn=""
+      hz_st=200
+      port_other=port-closed
+      ;;
+    surface-good)
+      r_st=404 r_rn=no-such-route
+      m_st=405 m_rn=method-not-allowed
+      q_st=400 q_rn=unsupported-query-parameter
+      h_st=400 h_rn=bypass-key
+      hz_st=200
+      port_other=port-closed
+      ;;
+    surface-part)
+      # The scan died a third of the way in. Six correct rows and nothing else: enough to look like
+      # an answer, short of every floor. All six arms must go red on it.
+      for i in 1 2 3 4 5 6; do
+        printf 'route:/p%s\thttp\t404\tno-such-route\tsynthetic\t0\n' "$i"
+      done
+      return 0
+      ;;
+    *)
+      echo "nc_surface_transcript: unknown transcript '$name'" >&2
+      return 1
+      ;;
+  esac
+
+  for i in $(seq 1 19); do
+    printf 'route:/p%s\thttp\t%s\t%s\tsynthetic\t0\n' "$i" "$r_st" "$r_rn"
+  done
+  for i in GET PUT PATCH DELETE OPTIONS; do
+    printf 'method:%s\thttp\t%s\t%s\tsynthetic\t0\n' "$i" "$m_st" "$m_rn"
+  done
+  for i in POST PUT DELETE; do
+    printf 'nonce-method:%s\thttp\t%s\t%s\tsynthetic\t0\n' "$i" "$m_st" "$m_rn"
+  done
+  for i in a=1 b=2 c=3; do
+    printf 'query:%s\thttp\t%s\t%s\tsynthetic\t0\n' "$i" "$q_st" "$q_rn"
+  done
+  for i in $(seq 1 10); do
+    printf 'header:X-Synthetic-%s\thttp\t%s\t%s\tsynthetic\t0\n' "$i" "$h_st" "$h_rn"
+  done
+  printf 'header-actions:X-Synthetic-1\thttp\t%s\t%s\tsynthetic\t0\n' "$h_st" "$h_rn"
+  printf 'healthz-clean\thttp\t%s\t\tok\t0\n' "$hz_st"
+  printf 'port:8443\tport-open\t\t\tsynthetic\t0\n'
+  for i in 6060 2345 8080 8081 9090 9443 8000; do
+    printf 'port:%s\t%s\t\t\tsynthetic\t0\n' "$i" "$port_other"
+  done
+}
+
+# run_negative_control — the mandatory `¬` for V-BRK-007/008/009/010/017/031/021.
 #
 # WHY IT LOOKS LIKE THIS. The usual `¬` shape is "inject the defect, watch the check catch it".
 # Here the defect is *a broker that accepts a credential it must refuse*, and there is no way to
@@ -470,8 +797,9 @@ run_negative_control() {
   local nc_fail=0 name transcript out n_pass n_fail
 
   echo "===================================================================="
-  echo " NEGATIVE CONTROL (¬) for V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 · V-BRK-031"
-  echo " No cluster is addressed. Every credential arm must go RED on all three transcripts."
+  echo " NEGATIVE CONTROL (¬) for V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 · V-BRK-021 · V-BRK-031"
+  echo " No cluster is addressed. Every credential arm must go RED on all three transcripts, and every
+ surface arm must discriminate a bounded surface from four unbounded ones."
   echo "===================================================================="
 
   for name in admitted wrong-reason truncated; do
@@ -540,6 +868,77 @@ a genuine auth refusal, still a failure|FAIL|http	403	forbidden-caller	not this 
 the ceiling answered correctly|PASS|http	403	target-forbidden	configmaps "app-config" is forbidden	0
 EV
 
+  # ---- V-BRK-021's own vacuity modes -----------------------------------------------------------
+  #
+  # Four transcripts, GENERATED rather than written out, because the surface scan emits fifty-odd
+  # lines and fifty hand-typed rows are fifty chances to write a typo that reads as a finding. The
+  # generator takes the answers as parameters, which is also what lets the same shape produce the
+  # correct transcript — and the correct one is the important one: five arms that are always red
+  # would pass an always-red check, and the arms would then be worthless on the live run.
+  #
+  #   surface-open   every probe answered 200, every port open. The scan wired to nothing.
+  #   surface-auth   every probe refused by the CREDENTIAL layer — 403 forbidden-caller on the
+  #                  routes, 401 token-invalid on the methods and queries, and the bypass headers
+  #                  simply ignored (200). This is the sharp one. An arm reading "not 200" would
+  #                  pass the first three of those while proving nothing about the route set: a
+  #                  broker that refused this caller outright would look identical, and so would a
+  #                  broker whose every route exists but whose authenticator is broken.
+  #   surface-part   the scan died a third of the way in: enough rows to look like an answer, fewer
+  #                  than the floors. Truncation must be red and must not be a smaller pass.
+  #   surface-good   the answers a correct broker gives. Every arm must go GREEN.
+  #
+  # THE EXPECTED COUNTS ARE PER-TRANSCRIPT AND ARE NOT ALL `0 PASS`, DELIBERATELY. Arms (e) and (f)
+  # are not sensitive to the defects the first two transcripts carry — a wide-open broker's health
+  # route still answers 200, and a broker whose authenticator refuses everything still has one
+  # reachable port. Writing `0/6` for all four and then bending the arms until they agreed would
+  # have coupled six independent arms into one, and the coupling would have hidden which arm
+  # actually caught the next real defect. The table says which arm each transcript is about.
+  local nc_want nc_got
+  while IFS='|' read -r name nc_want; do
+    [ -n "$name" ] || continue
+    out="$(FLAT="$(nc_surface_transcript "$name")" assert_surface 8443 2>&1)"
+    n_pass="$(printf '%s\n' "$out" | grep -c '^PASS:')"
+    n_fail="$(printf '%s\n' "$out" | grep -c '^FAIL:')"
+    nc_got="$n_pass/$n_fail"
+    if [ "$nc_got" = "$nc_want" ]; then
+      echo "PASS: ¬ V-BRK-021 transcript '$name' — $n_pass PASS / $n_fail FAIL, as required"
+    else
+      nc_fail=1
+      echo "FAIL: ¬ V-BRK-021 transcript '$name' — expected $nc_want PASS/FAIL, got $nc_got. Output:"
+      printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+  done <<'SURF'
+surface-open|1/5
+surface-auth|2/4
+surface-part|0/6
+surface-good|6/0
+SURF
+
+  # And the declared surface, whose failure modes are counts rather than answers. The second row is
+  # the one this arm exists for: a broker that declares 8443 AND a second port is not caught by any
+  # count-of-one check that forgets to also pin the value, and is not caught by the port dial at
+  # all when the extra port is one the egress policy drops.
+  local dp_name dp_want dp_args
+  while IFS='|' read -r dp_name dp_want dp_args; do
+    [ -n "$dp_name" ] || continue
+    # dp_args is four deliberate positional words, not one string.
+    # shellcheck disable=SC2086
+    out="$(assert_declared_port_surface $dp_args 2>&1)"
+    if printf '%s\n' "$out" | grep -q "^$dp_want:"; then
+      echo "PASS: ¬ V-BRK-021g — '$dp_name' is reported as a $dp_want"
+    else
+      nc_fail=1
+      echo "FAIL: ¬ V-BRK-021g — '$dp_name' should have been a $dp_want. Got: $out"
+    fi
+  done <<'DECL'
+the container declares a second port|FAIL|2/8443 1/8443 1/8443 8443
+the container declares a debug port instead|FAIL|1/6060 1/8443 1/8443 8443
+the Service publishes two ports|FAIL|1/8443 2/8443 1/8443 8443
+the EndpointSlice the API server computed disagrees|FAIL|1/8443 1/8443 1/9443 8443
+nothing was readable at all|FAIL|0/ 0/ 0/ 8443
+one port everywhere, and it is the envelope port|PASS|1/8443 1/8443 1/8443 8443
+DECL
+
   # V-BRK-010's second clause has its own vacuity mode: a log with no refusal line in it.
   out="$(assert_security_event "some unrelated broker chatter
 and another line" 2>&1)"
@@ -603,7 +1002,7 @@ esac
 cd "$REPO_ROOT" || exit 1
 
 echo "===================================================================="
-echo " V-BRK-007/008/009/010/017 at L2 — a real caller at the broker's door"
+echo " V-BRK-007/008/009/010/017/021/031 at L2 — a real caller at the broker's door, and no other door"
 echo " ctx: $CTX"
 echo "===================================================================="
 
@@ -828,6 +1227,47 @@ assert_credentials
 assert_security_event "$($K -n "$NS" logs "pod/$broker_pod" 2>/dev/null | tail -n "+$((log_baseline + 1))")"
 
 # ------------------------------------------------------------------------------------------------
+# L2-6: V-BRK-021 — the deployed binary's surface
+# ------------------------------------------------------------------------------------------------
+#
+# The envelope port is read off the RENDERED Deployment (P6) and never written as 8443 here. That
+# is not pedantry: the whole arm is "exactly one port is reachable, and it is the one the
+# controller told the agent to use", and a literal would let a controller rendering 9443 into an
+# agent that talks to 8443 pass an arm that says the two agree.
+brk_endpoint="$(broker_driver_env "$K" "$NS" "$AGENT" KUBEAGENTS_BROKER_ENDPOINT)"
+envelope_port="${brk_endpoint##*:}"
+case "$envelope_port" in
+  '' | *[!0-9]*)
+    bad "V-BRK-021: KUBEAGENTS_BROKER_ENDPOINT on ${AGENT}-gateway is '${brk_endpoint:-<empty>}', which carries no port. The surface arms cannot say which port is the sanctioned one."
+    envelope_port=0
+    ;;
+esac
+
+assert_surface "$envelope_port"
+
+# count_slash_first <space-separated list> — "<how many>/<the first>", the shape
+# assert_declared_port_surface compares. An empty list is "0/", which that function rejects: a
+# reader that could not see a port must not look like a reader that saw exactly one.
+count_slash_first() {
+  # Deliberate word-splitting: the argument IS a list.
+  # shellcheck disable=SC2086
+  set -- $1
+  printf '%s/%s' "$#" "${1:-}"
+}
+
+# Three writers, three reads. The container spec is the controller's, the Service is the
+# controller's too but through a different renderer, and the EndpointSlice is the API SERVER's own
+# computation over the pods that actually matched — which is the only one of the three that reflects
+# a running thing. Slice ports are deduplicated across slices because a fleet large enough to have
+# two slices still publishes one port; container and Service ports are not, because two containers
+# each declaring 8443 is genuinely two declarations of a surface.
+assert_declared_port_surface \
+  "$(count_slash_first "$($K -n "$NS" get "deploy/$broker_deploy" -o jsonpath='{.spec.template.spec.containers[*].ports[*].containerPort}' 2>/dev/null)")" \
+  "$(count_slash_first "$($K -n "$NS" get "svc/${AGENT}-broker" -o jsonpath='{.spec.ports[*].port}' 2>/dev/null)")" \
+  "$(count_slash_first "$($K -n "$NS" get endpointslice -l "kubernetes.io/service-name=${AGENT}-broker" -o jsonpath='{.items[*].ports[*].port}' 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')")" \
+  "$envelope_port"
+
+# ------------------------------------------------------------------------------------------------
 if [ "$assertions" -ne "$EXPECTED_ASSERTIONS" ]; then
   echo
   bad "only $assertions of $EXPECTED_ASSERTIONS assertions ran. The verdict below would be about arms that never executed."
@@ -836,8 +1276,9 @@ fi
 echo
 echo "===================================================================="
 if [ "$fail" -eq 0 ]; then
-  echo " PROVEN: V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 · V-BRK-031 at L2"
-  echo " A real reader identity reached a deployed broker; eight other credentials did not."
+  echo " PROVEN: V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 · V-BRK-021 · V-BRK-031 at L2"
+  echo " A real reader identity reached a deployed broker; eight other credentials did not, and with
+ that identity satisfied there was nowhere else on the pod to take it."
   echo "===================================================================="
   exit 0
 fi

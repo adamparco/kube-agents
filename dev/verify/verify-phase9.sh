@@ -350,23 +350,166 @@ echo; echo "== G. Phase-9 completeness — BLOCKING-ALWAYS gaps in this phase's 
 # handed out. L1 evidence exists (row 54) and is not one of the required levels, so it does not
 # discharge this.
 #
-# Detected as: some dev/verify/*-l2.sh claims the ID, and that script is in L2-CHAIN.txt. Both halves
-# matter. A script that claims it but is in no chain is evidence nobody runs; a chain line that runs
-# a script claiming nothing is a chain that has grown a line without growing a claim.
-b21="$(grep -l 'V-BRK-021' dev/verify/*-l2.sh 2>/dev/null | head -1)"
-if [ -n "$b21" ] && grep -qF "$b21" dev/L2-CHAIN.txt; then
-  pass "V-BRK-021 L2: claimed by $b21, which is a live line of dev/L2-CHAIN.txt (L0 half green since 2026-07-30)"
-elif [ -n "$b21" ]; then
-  bad "V-BRK-021 L2: $b21 claims the ID but is in no live line of dev/L2-CHAIN.txt, so nothing runs"
-  bad "  it as part of an L2 run. Evidence that is not in the chain is evidence nobody gathers."
+# THIS ARM WAS A FALSE PASS UNTIL 2026-07-31, for the third time in this file and by the third
+# route. It discovered the claimant with `grep -l 'V-BRK-021' dev/verify/*-l2.sh | head -1`, and the
+# tree's one match was broker-refuse-l2.sh — in a comment saying it does NOT carry the property
+# ("→ P9-T9b-5b-ii-b, with V-BRK-021's L2 surface scan"). That file is a live L2-CHAIN.txt line, so
+# both halves of the old test were satisfied by a note recording the absence of the thing under
+# test. Same shape as the Accept (d) arm above and the guard-1 arm below: a detector aimed at a NAME
+# is indistinguishable, in its own output, from a detector that is satisfied.
+#
+# Retargeted to discover by the PROPERTY, which for a surface scan is the refusal vocabulary the
+# SHIPPED server answers with. A claimant is a suite that:
+#   - is a live line of dev/L2-CHAIN.txt, so the live tree runs it against a deployed broker, AND is
+#     also run by a live line of dev/L0-CHAIN.txt under a FLAG rather than a cluster context, so the
+#     ¬ tree runs on every PR. Both, because a check split off from its implementation has two trees
+#     to be green on, and a scan with no committed ¬ row is a scan whose own arms have never been
+#     shown to fail. The L0 clause matches the SHAPE of the invocation — an `-l2.sh` reached from the
+#     no-cluster chain can only be running its control mode, since every other path takes a context —
+#     rather than the control flag's spelling, which is a convention and not the property;
+#   - has ONE function whose body scans all four vocabularies at once — unknown path, wrong method,
+#     query parameter, bypass header. One function and not four, because "the suite mentions 404
+#     somewhere" is true of every suite that has ever seen a 404;
+#   - reads both port outcomes in that same body, so a scan that can only ever report "closed" —
+#     which is also what a scan pointed at nothing reports — does not count; and
+#   - compares a COUNT against a floor, which is the line between scanning a surface and spot-
+#     checking the one route somebody remembered. Bounded, and stated as such: a regex over one
+#     function body cannot attribute a floor to a dimension, so this clause says the scan bounds its
+#     own size SOMEWHERE, not that each of the five dimensions carries a floor of its own. The suite
+#     carries five; keeping them five is that suite's own arms, not this gate's.
+#
+# Every one of the four reason strings is RESOLVED out of k8s-operator/internal/broker/*.go from the
+# code path that emits it, never spelled here — the guard-1 arm's constant-resolution trick, applied
+# to four. Rename a reason in the server without renaming it in the suite and this arm fails, rather
+# than quietly unhooking and going green on a suite that now matches nothing.
+#
+# The verdict travels through a file rather than `$(...)` because /bin/bash 3.2 — what macOS ships
+# and what this script is run under — mis-parses a heredoc nested inside a command substitution and
+# reports the whole file as an unterminated quote. The guard-1 arm below uses `if python3 - <<PY`
+# for the same reason; this one needs a sentence out of the detector as well as its verdict, so the
+# sentence goes to a file and the verdict stays in the exit status.
+B21_OUT=/tmp/p9-b21-verdict.txt
+if python3 - >"$B21_OUT" 2>&1 <<'PY'
+import pathlib, re, sys
+
+
+def die(msg):
+    print(msg)
+    sys.exit(1)
+
+
+root = pathlib.Path(".")
+l2p, l0p = root / "dev/L2-CHAIN.txt", root / "dev/L0-CHAIN.txt"
+srvp = root / "k8s-operator/internal/broker/server.go"
+envp = root / "k8s-operator/internal/broker/envelope.go"
+for p in (l2p, l0p, srvp, envp):
+    if not p.exists():
+        die(f"cannot resolve the property — {p} is missing, so nothing here was checked")
+
+srv, envsrc = srvp.read_text(), envp.read_text()
+
+# What the shipped server answers, per code path. Not a list of strings this gate believes in.
+PATHS = {
+    "an unknown path": (srv, r"http\.StatusNotFound,\s*Response\{\s*Reason:\s*\"([^\"]+)\""),
+    "a wrong method": (srv, r"http\.StatusMethodNotAllowed,\s*Response\{\s*Reason:\s*\"([^\"]+)\""),
+    "a query parameter": (srv, r"len\(r\.URL\.Query\(\)\)\s*>\s*0.*?Reason:\s*\"([^\"]+)\""),
+    "a bypass header": (envsrc, r"ReasonBypassKey\s*=\s*\"([^\"]+)\""),
+}
+vocab = {}
+for what, (src, pat) in PATHS.items():
+    m = re.search(pat, src, re.S)
+    if not m:
+        die(
+            f"cannot resolve what the shipped server answers for {what}, so this arm would be "
+            "scanning a vocabulary of its own invention"
+        )
+    vocab[what] = m.group(1)
+
+# The bypass rejection has to run AHEAD of the mux or the scan's unauthenticated-route evidence is
+# a property of one handler rather than of the server.
+if not re.search(
+    r"func \(s \*Server\) ServeHTTP.*?rejectBypassHeaders\(r\).*?s\.mux\.ServeHTTP", srv, re.S
+):
+    die(
+        "server.go no longer rejects bypass headers ahead of the mux, so a refusal on an "
+        "unauthenticated route no longer attributes to the server"
+    )
+
+
+def live(p):
+    return [ln.strip() for ln in p.read_text().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+l2_lines, l0_lines = live(l2p), live(l0p)
+FUNC = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{")
+
+claimant = None
+for suite in sorted(root.glob("dev/verify/*-l2.sh")):
+    rel = suite.as_posix()
+    if not any(rel in ln for ln in l2_lines):
+        continue
+    text = suite.read_text()
+    lines = text.splitlines()
+    bodies, name, buf = {}, None, []
+    for line in lines:
+        m = FUNC.match(line)
+        if m:
+            name, buf = m.group(1), []
+        elif name is not None and line.startswith("}"):
+            bodies[name] = "\n".join(buf)
+            name = None
+        elif name is not None:
+            buf.append(line)
+    for fn, body in bodies.items():
+        if not all(f'"{v}"' in body for v in vocab.values()):
+            continue
+        if "port-open" not in body or "port-closed" not in body:
+            continue
+        if not re.search(r"\-lt|\-ne", body):
+            continue
+        # A function nothing calls checks nothing (the CHECKS-table clause of the guard-1 arm).
+        called = [
+            ln
+            for ln in lines
+            if re.search(rf"\b{re.escape(fn)}\b", ln)
+            and not ln.lstrip().startswith("#")
+            and not FUNC.match(ln)
+        ]
+        if not called:
+            continue
+        claimant = (rel, fn)
+        break
+    if claimant:
+        break
+
+if not claimant:
+    die(
+        "no live line of dev/L2-CHAIN.txt runs a suite that scans the deployed surface — one "
+        "function answering for all of "
+        + ", ".join(f"{w} ({v})" for w, v in vocab.items())
+        + ", both port outcomes, and a count against a floor"
+    )
+
+rel, fn = claimant
+if not any(re.search(rf"{re.escape(rel)}\s+--\S+", ln) for ln in l0_lines):
+    die(
+        f"{rel} carries the scan in {fn}() and runs at L2, but no live line of dev/L0-CHAIN.txt "
+        "runs it under a flag, so the control tree that shows those arms can fail runs nowhere"
+    )
+print(f"{rel}:{fn}()")
+PY
+then
+  pass "V-BRK-021 L2: $(tail -1 "$B21_OUT") scans the deployed surface in the vocabulary server.go emits, runs from dev/L2-CHAIN.txt, and its ¬ runs from dev/L0-CHAIN.txt (L0 half green since 2026-07-30)"
 else
-  bad "V-BRK-021 L2 MISSING: no dev/verify/*-l2.sh claims it. Its L0 half is green (results.csv row"
-  bad "  138, P9-T7c-2c) and 09 §6 requires L0 AND L2. The L2 half is the clause the L0 half cannot"
-  bad "  reach: debug routes, override query params and the ten X-Kube-Agents-* bypass headers all"
-  bad "  404/405 against a RUNNING broker, exactly one listening port on the pod, and no"
-  bad "  build-tag-guarded skip path in the image the controller handed out. A source scan proves"
-  bad "  what the tree says; only a probe proves what was shipped. V-BRK is BLOCKING-ALWAYS and may"
-  bad "  not be deferred (09 §9.6). P9-T9b-5."
+  # A traceback lands here too, through the 2>&1 — a detector that crashed is a detector that
+  # measured nothing, and it must read as such rather than as a missing artifact.
+  bad "V-BRK-021 L2 UNPROVEN: $(tail -1 "$B21_OUT")"
+  bad "  Its L0 half is green (results.csv row 138, P9-T7c-2c) and 09 §6 requires L0 AND L2. The L2"
+  bad "  half is the clause the L0 half cannot reach: debug routes, override query params and the"
+  bad "  ten X-Kube-Agents-* bypass headers all 404/405 against a RUNNING broker, one reachable"
+  bad "  port on the pod, and no build-tag-guarded skip path in the image the controller handed"
+  bad "  out — a skip path compiled out of \`go test\` is invisible to any source scan. V-BRK is"
+  bad "  BLOCKING-ALWAYS and may not be deferred (09 §9.6). P9-T9b-5b-ii-b-2."
 fi
 # Planning defect 2, guard 1 — "the single worst outcome of this decision", in that paragraph's own
 # words. The tenant test-only overlay grants write verbs to a fixture identity; the guard is the lint
