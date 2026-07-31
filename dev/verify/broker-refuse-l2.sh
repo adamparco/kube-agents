@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# V-BRK-018 at L2, and the journal half of Phase 9 acceptance bullet (d) — what a DEPLOYED broker
-# does when it accepts an envelope and then discovers, several steps in, that it cannot proceed
-# (09 §6.2, 06 §4.4 rows 3 and 4, 03 §6, 05 §1.2).
+# V-BRK-018 and V-ISO-006 at L2, and the journal half of Phase 9 acceptance bullet (d) — what a
+# DEPLOYED broker does when it accepts an envelope and then discovers, several steps in, that it
+# cannot proceed (09 §6.2, 09 §6.4, 06 §4.4 rows 3 and 4, 05 §8 CH6, 03 §6, 05 §1.2).
 #
 # `broker-execute-l2.sh` next to it in the chain submits one envelope that WORKS, and says so in its
 # own words: "Nothing here fails, on purpose." This suite is the other half. Two submissions, two
@@ -19,6 +19,35 @@
 #       probes the ActionRecord store at step 5 and refuses 503 — four steps before the write-ahead
 #       Create at step 7 would have been attempted, which is the whole point: nothing executes
 #       unjournaled means nothing gets as far as trying.
+#
+#   C · journal-restored — 05 §8 CH6's last sentence, and the reason B and C together are V-ISO-006
+#       rather than B alone. The grant goes back and THE SAME ENVELOPE is submitted again, to the
+#       SAME RUNNING POD: it is accepted, and this time it leaves the record B proved could not be
+#       written. See "WHY THE RESTORE IS AN ARM" below.
+#
+# WHY B AND C ARE V-ISO-006 AND NOT JUST V-BRK-018's NEIGHBOUR
+#   09 §6.4 line 369 is `V-ISO-006 | CH6 journal down — broker refuses to execute ¬ | L2 | 9`, and
+#   05 §8 CH6 spells the scenario out: "Make ActionRecord writes fail (remove the CRD's storage
+#   version, OR DENY THE BROKER'S CREATE ON IT). The broker refuses to execute rather than executing
+#   unjournaled; auto-brake pauses the agent; the audit log shows zero mutations by that actor
+#   identity during the window; the failure is reported to humans. Restoring the journal restores
+#   service without a broker restart."
+#
+#   Arm B induces CH6's SECOND listed fault verbatim — it denies the broker's create — and asserts
+#   the refusal, the zero mutations and the zero records. What it had no claimant for is the ID: the
+#   row was carried by a suite that named V-BRK-018 and nothing else, so 09's CH6 row had no results
+#   line while the property behind it had been green for units. Binding it here is the whole of
+#   P9-T11b-2; arm C is what the binding turned out to cost.
+#
+# WHY THE RESTORE IS AN ARM AND NOT CLEANUP
+#   "Restoring the journal restores service without a broker restart" is the clause that separates a
+#   broker that REFUSES from a broker that BRICKS, and it is invisible from arm B. A broker that
+#   latched the fault on first sight — cached the failed probe forever, or wedged the brake — emits a
+#   transcript byte-identical to a correct one for as long as the grant is stripped. The restore
+#   already happened in this file: `cleanup()` did it, on the EXIT trap, with its result discarded.
+#   Repairing the cluster and asserting the repair worked are the same three API calls; only one of
+#   them is evidence. So the restore is now `restore_journal_grant`, called in the body and asserted
+#   on, and the trap keeps calling it as the safety net for a run that dies before reaching arm C.
 #
 # WHY V-BRK-018 IS NOT VACUOUS UNDER SHADOW MODE, which is the hard part of this file
 #   Phase 9 runs everything as a server-side dry run, so "neither target was applied" is a claim
@@ -73,16 +102,30 @@
 #        the journal genuinely unreachable in both directions — from a brake that refused for some
 #        other reason while the store was fine.
 #   B-4  the tenant ConfigMap still does not exist.
+#   C-1  the SAME envelope, submitted after the grant is restored, is ACCEPTED — 2xx, and not the
+#        503 `journal-unavailable` it got a minute earlier. The brake re-probed; it did not latch.
+#   C-2  the journal took the write: at least one ActionRecord carries C's trace id. This is the
+#        arm, not C-1. A 2xx proves the brake let the submission past; only a record proves the
+#        store it was refusing on behalf of is genuinely writable again. It is B-3 inverted, against
+#        the same store, minutes apart, with the grant as the only difference.
+#   C-3  WITHOUT A BROKER RESTART — the pod serving C-1 is the same pod, by name and by
+#        restartCount, that was serving when the fault was staged. A broker that recovered by dying
+#        and being rescheduled satisfies C-1 and C-2 and fails CH6's actual sentence, and on a
+#        Deployment with a healthy probe that recovery is invisible within seconds.
 #
 # WHAT THIS DOES NOT CLAIM, so the next reader does not go looking
-#   THE AUTO-PAUSE HALF OF ROW 3 IS NOT ASSERTED, AND IT IS NOT IMPLEMENTED. `brake.go`'s row-3
-#     branch sets `d.AutoPause = true` and nothing reads it: there is no consumer in
-#     `internal/broker/pipeline/`, in `server.go` or in `cmd/broker/`, and
-#     `status.broker.journalReachable` has no writer at all (`agent_controller.go`: "stays at its
-#     fail-closed zero until the broker itself reports it"). Row 9's auto-pause IS wired, through
-#     `verify/driver.go` to `escalate.Recorder.Pause`, which is what makes the absence here a gap
-#     rather than a feature nobody built yet. Filed as a finding; asserting it would be asserting a
-#     property no code has. The refusal half — the part that fails closed — is fully asserted.
+#   THE AUTO-PAUSE HALF OF ROW 3 IS NOT ASSERTED, AND IT CANNOT BE IN THIS FAULT. The consumer
+#     exists as of P9-T9c-1 — this header used to say it did not, and that sentence was true when it
+#     was written and is not now. What replaces it is narrower and permanent: the pause is recorded
+#     ON THE ACTIONRECORD (`escalate.Recorder.record` Gets `journal.RecordName(actionID)` and patches
+#     `status.escalation.pauseRequested`), and in THIS fault there is no record to put it on, because
+#     `StoreRejectionJournal.Reject` is the write that just failed. `server.go`'s `autoPause` says so
+#     itself and gives up: "a refusal asked for an auto-pause and there is no record to put it on;
+#     the agent stays live". So B-3 being zero and the pause being unobservable are the same fact,
+#     not two gaps. Asserting the pause needs CH6's FIRST listed fault instead — remove the CRD's
+#     storage version — which breaks the store for every subject rather than for one, and is a
+#     different and much less reversible experiment. Filed; not this unit. The refusal half is fully
+#     asserted, and arm C now asserts the recovery half.
 #   V-REV-003 (no generatable undo plan ⇒ reclassified gated) needs an operation whose inverse does
 #     not exist, not a refusal. → P9-T9b-5b-ii-b, with V-BRK-021's L2 surface scan.
 #   V-BRK-019's field-manager string is unreadable from a shadow: a server-side dry run persists no
@@ -98,7 +141,9 @@
 # TEMPORARILY REVOKES THE ACTOR'S `actionrecords` GRANT out from under the running broker. For the
 # few seconds that is in force the deployed broker cannot journal anything, which is the fault under
 # test and is also exactly what it sounds like. On the live install that would be a test blinding
-# the fleet's audit trail.
+# the fleet's audit trail. The revocation is now UNDONE IN THE BODY rather than only on the exit
+# trap, because arm C asserts the undo — which means the window is shorter than it was, and that a
+# failure to restore is a loud red arm rather than a warning inside a trap nobody reads.
 # Exit: 0 = PROVEN · 1 = FAILED · 2 = refused target / P10 · 3 = DEFERRED (P1 or the run itself).
 # Usage: dev/verify/broker-refuse-l2.sh [kube-context]
 #
@@ -116,7 +161,9 @@
 #      so a pod from the previous generation can never be read as this one's. The driver pod, its
 #      ConfigMap, the write overlay and the RBAC fault are all created and undone inside the run. The
 #      ActionRecords are deliberately NOT recreated — they are the output — and are disambiguated by
-#      the trace id the probe minted in THIS run.
+#      the trace id the probe minted in THIS run. P3 is also what makes arm C's no-restart claim
+#      meaningful: the pod is resolved once, by ownership, BEFORE the fault, and C-3 compares that
+#      exact name and restartCount against a fresh read after the restore.
 #   P6 runtime-authoritative: every assertion reads objects from the API server. Nothing is read from
 #      the broker's reply body except the reply-shape arms, which are explicitly ABOUT the reply
 #      (A-1, A-2, A-3, B-1, B-2) and are cross-checked against the journal by A-4 through A-6. The
@@ -169,14 +216,19 @@ TARGET_NAME=broker-refuse-l2-shadow-target
 UNREADABLE_NAME=broker-refuse-l2-unreadable-target
 
 # NEGATIVE CONTROL DOES NOT EXERCISE: (LSN-060.) The control SYNTHESISES every observation — the
-# HTTP status, the reason word, the record count, the record document, the two existence answers —
-# and hands them to the assertion blocks directly, so everything upstream of the assertions is
-# unmeasured by it:
-#   - the envelope build and the two HTTP POSTs to the deployed broker. A synthesised status is not
-#     a broker's answer; the ¬ arm cannot tell a running broker from an absent one
-#   - THE RBAC FAULT ITSELF. `journal_strip` and its `auth can-i` convergence poll are the entire
-#     mechanism of scenario B, and the control never calls them. A strip that silently patched
-#     nothing would leave B's live arm asserting a 503 that never comes, and the ¬ arm 21/21 green
+# HTTP status, the reason word, the record count, the record document, the two existence answers,
+# the pod name and restartCount on either side of the fault — and hands them to the assertion blocks
+# directly, so everything upstream of the assertions is unmeasured by it:
+#   - the envelope build and the three HTTP POSTs to the deployed broker. A synthesised status is
+#     not a broker's answer; the ¬ arm cannot tell a running broker from an absent one
+#   - THE RBAC FAULT ITSELF, AND ITS UNDO. The strip, `restore_journal_grant`, and the two `auth
+#     can-i` convergence polls are the entire mechanism of scenarios B and C, and the control never
+#     calls them. A strip that silently patched nothing would leave B's live arm asserting a 503
+#     that never comes, and the ¬ arm green
+#   - THE POD IDENTITY READ. C-3's four strings are synthesised, so what the control proves is that
+#     the arm can tell a replacement from a survivor — not that `broker_restarts` reads the right
+#     pod, and not that `p3_pod_of_deploy` resolves by ownership rather than by the name it was
+#     given. Those are live-arm properties and P3's
 #   - the trace-id search of the API server (A-4, B-3). The control passes a COUNT; it never runs
 #     the list-and-match that produces one. This is `broker-execute-l2.sh`'s exact scar — a lookup
 #     line that could not have worked against any commit, green in ¬ for weeks because ¬ skipped it
@@ -200,8 +252,8 @@ bad() {
   fail=1
 }
 
-# 2 x P1 + broker Available + A-1..A-7 + B-1..B-4.
-EXPECTED_ASSERTIONS=14
+# 2 x P1 + broker Available + A-1..A-7 + B-1..B-4 + C-1..C-3.
+EXPECTED_ASSERTIONS=17
 
 # ------------------------------------------------------------------------------------------------
 # jrec <dotted key> — one field out of $RECORD, via python. `broker-execute-l2.sh`'s helper,
@@ -396,6 +448,64 @@ assert_journal_gone() {
 }
 
 # ------------------------------------------------------------------------------------------------
+# C — the journal-restored assertion block. 05 §8 CH6's last sentence.
+#
+#   assert_journal_restored <status> <reason> <n_records> <pod_before> <pod_after> \
+#                           <restarts_before> <restarts_after>
+#
+# THE POD IDENTITY IS PASSED IN AS FOUR STRINGS rather than read here, so the `¬` arm can synthesise
+# a restart it has no way to cause. Two pieces, not one: a pod that CRASHED and was restarted by the
+# kubelet keeps its name and bumps `restartCount`, and a pod that was RESCHEDULED gets a new name.
+# CH6 says "without a broker restart" and both of those are one.
+# ------------------------------------------------------------------------------------------------
+assert_journal_restored() {
+  local status="$1" reason="$2" n_records="$3"
+  local pod_before="$4" pod_after="$5" restarts_before="$6" restarts_after="$7"
+
+  echo
+  echo "== C-1: the same envelope is accepted once the journal is back =="
+  if [ -z "$status" ]; then
+    bad "C-1: the probe reported no HTTP status for the post-restore submission. The recovery arm observed nothing, so it is judging nothing."
+  elif [ "$status" = "503" ] && [ "$reason" = "journal-unavailable" ]; then
+    bad "C-1: STILL 503 'journal-unavailable' after the grant was restored. The brake latched the fault rather than re-probing, so this broker does not refuse — it bricks, and 05 §8 CH6's last sentence is false of it."
+  elif [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+    bad "C-1: the post-restore submission was refused HTTP $status reason '${reason:-<none>}'. Not the latch above, but service was not restored either; whatever this refusal is, it was not there before the fault."
+  else
+    pass "C-1: HTTP $status — the submission refused 503 a minute ago is accepted now, so the brake re-probed the store instead of latching"
+  fi
+
+  echo
+  echo "== C-2: the write the fault prevented actually lands =="
+  # `-gt 0` and not `= 1`: B-3's count is the assertion about how many records a submission may
+  # produce, and it is made where it is falsifiable. Here the question is whether the store is
+  # writable at all, and demanding an exact count would make this arm fail on a broker that
+  # journaled a rejection AND a write-ahead record — which would be a different finding entirely,
+  # and not one this arm should be the one to report.
+  case "$n_records" in
+    '' | *[!0-9]*) n_records="" ;;
+  esac
+  if [ -z "$n_records" ]; then
+    bad "C-2: no record count was observed for the post-restore submission; the arm did not run"
+  elif [ "$n_records" -gt 0 ]; then
+    pass "C-2: $n_records ActionRecord(s) carry the post-restore trace id — the store B-3 proved was unwritable took this write, minutes later, with the grant as the only difference"
+  else
+    bad "C-2: ZERO ActionRecords carry the post-restore trace id. The broker answered 2xx and journaled nothing, which is the state 'nothing executes unjournaled' exists to make impossible — and it is worse than the 503, because this one does not tell the caller."
+  fi
+
+  echo
+  echo "== C-3: and without a broker restart =="
+  if [ -z "$pod_before" ] || [ -z "$pod_after" ]; then
+    bad "C-3: the broker pod identity was not observed on both sides of the fault (before='${pod_before:-<none>}' after='${pod_after:-<none>}'); the no-restart arm did not run"
+  elif [ "$pod_before" != "$pod_after" ]; then
+    bad "C-3: THE BROKER POD WAS REPLACED — '$pod_before' before the fault, '$pod_after' after. Service came back because a new process came up, which is exactly the recovery 05 §8 CH6 says must not be necessary."
+  elif [ "$restarts_before" != "$restarts_after" ]; then
+    bad "C-3: THE BROKER CONTAINER RESTARTED — restartCount '$restarts_before' before the fault, '$restarts_after' after. Same pod, new process; 'without a broker restart' is false."
+  else
+    pass "C-3: the same pod '$pod_after' at the same restartCount '$restarts_after' served the refusal and the recovery — the journal came back, the broker did not have to"
+  fi
+}
+
+# ------------------------------------------------------------------------------------------------
 # The `¬` arm
 # ------------------------------------------------------------------------------------------------
 # WHY SYNTHESISED OBSERVATIONS AND NOT A MUTATION. Making a real broker leak an actionId on a
@@ -498,6 +608,47 @@ B-journaled-anyway|red|1 ActionRecord(s) carry|503|journal-unavailable|rejected|
 B-target-created|red|THE TARGET OBJECT EXISTS|503|journal-unavailable|rejected|60|0|yes
 BCASES
 
+  # --- C ------------------------------------------------------------------------------------------
+  # name | expect | needle | status | reason | n | pod-before | pod-after | restarts-before | restarts-after
+  #
+  # `C-latched` is the case this whole arm exists for. It is the ONLY observation in this file that
+  # a run against a permanently-wedged broker produces, and until arm C existed it was also what a
+  # correct run produced, because nothing looked after the restore.
+  local c1 c2 c3 c4 c5 c6 c7
+  while IFS='|' read -r name expect needle c1 c2 c3 c4 c5 c6 c7; do
+    [ -n "$name" ] || continue
+    total=$((total + 1))
+    out="$(assert_journal_restored "$c1" "$c2" "$c3" "$c4" "$c5" "$c6" "$c7" 2>&1)"
+    n_fail="$(printf '%s\n' "$out" | grep -c '^FAIL:')"
+    if [ "$expect" = green ]; then
+      if [ "$n_fail" -eq 0 ]; then
+        echo "  ok   $name — the correct observation passes, so the arms below are not always-red"
+        caught=$((caught + 1))
+      else
+        echo "  MISS $name — a CORRECT observation was failed $n_fail time(s)"
+        printf '%s\n' "$out" | grep '^FAIL:' | sed 's/^/       /'
+        rc=1
+      fi
+    elif printf '%s\n' "$out" | grep '^FAIL:' | grep -qF "$needle"; then
+      echo "  ok   $name — caught by the arm that targets it ('$needle')"
+      caught=$((caught + 1))
+    else
+      echo "  MISS $name — went red $n_fail time(s) but no FAIL line mentions '$needle'"
+      printf '%s\n' "$out" | grep '^FAIL:' | sed 's/^/       /'
+      rc=1
+    fi
+  done <<'CCASES'
+C-baseline|green|-|202||1|broker-abc|broker-abc|0|0
+C-latched|red|STILL 503|503|journal-unavailable|0|broker-abc|broker-abc|0|0
+C-no-status|red|no HTTP status|||1|broker-abc|broker-abc|0|0
+C-other-refusal|red|was refused HTTP 403|403|target-forbidden|1|broker-abc|broker-abc|0|0
+C-accepted-unjournaled|red|ZERO ActionRecords carry the post-restore trace id|202||0|broker-abc|broker-abc|0|0
+C-count-unknown|red|no record count was observed|202||?|broker-abc|broker-abc|0|0
+C-pod-replaced|red|THE BROKER POD WAS REPLACED|202||1|broker-abc|broker-xyz|0|0
+C-container-restarted|red|THE BROKER CONTAINER RESTARTED|202||1|broker-abc|broker-abc|0|1
+C-pod-unobserved|red|was not observed on both sides|202||1|broker-abc||0|0
+CCASES
+
   echo
   echo "negative control: $caught/$total"
   return $rc
@@ -542,41 +693,58 @@ p10_assert_control_plane_healthy "$K" "$CTX" || exit 2
 JOURNAL_STRIPPED=no
 JOURNAL_SNAPSHOT_DIR=""
 
+# restore_journal_grant — put the actor's `actionrecords` authority back. rc 0 = restored.
+#
+# CALLED TWICE ON PURPOSE, and idempotent because of it: once from the body, where arm C asserts
+# that the broker recovers from it, and once from the EXIT trap, which is the safety net for a run
+# that died before reaching the body's call. `JOURNAL_STRIPPED=no` on success is what stops the trap
+# doing the work a second time — and, more importantly, what stops a SILENT second attempt from
+# being the thing that actually repaired the cluster after arm C already reported it had not.
+#
+# SNAPSHOTS FIRST, `seed_agent_identity` SECOND, and both. The strip is discovery-based — it removes
+# `actionrecords` from every role object actually bound to the actor, which on a long-lived cluster
+# includes objects NO TEMPLATE OWNS (see the strip's comment). Re-seeding re-renders only the
+# shipped ones, so an unowned object stripped here would stay stripped forever and the next run
+# would find the fault already staged. Restoring the snapshot is what puts back exactly what was
+# there; the re-seed is the belt for anything the snapshot missed.
+restore_journal_grant() {
+  [ "$JOURNAL_STRIPPED" = yes ] || return 0
+  echo "  restoring the actor's actionrecords grant (snapshots, then a re-seed)"
+  local restore_failed=no snap
+  if [ -n "$JOURNAL_SNAPSHOT_DIR" ] && [ -d "$JOURNAL_SNAPSHOT_DIR" ]; then
+    for snap in "$JOURNAL_SNAPSHOT_DIR"/*.json; do
+      [ -f "$snap" ] || continue
+      $K apply -f "$snap" >/dev/null 2>&1 || {
+        restore_failed=yes
+        echo "  WARNING: could not restore $snap" >&2
+      }
+    done
+  fi
+  seed_agent_identity "$K" "$NS" "$AGENT" >/dev/null 2>&1 || {
+    restore_failed=yes
+    echo "  WARNING: the re-seed failed. The actor may still be unable to journal; re-run seed_agent_identity by hand." >&2
+  }
+  if [ "$restore_failed" = no ]; then
+    JOURNAL_STRIPPED=no
+    [ -n "$JOURNAL_SNAPSHOT_DIR" ] && rm -rf "$JOURNAL_SNAPSHOT_DIR"
+    return 0
+  fi
+  if [ -n "$JOURNAL_SNAPSHOT_DIR" ]; then
+    # Kept on purpose: these files are the only record of what the grant looked like before the
+    # strip, and a restore that failed is exactly when somebody needs them.
+    echo "  the pre-strip grant snapshots are KEPT at $JOURNAL_SNAPSHOT_DIR — re-apply them by hand." >&2
+  fi
+  return 1
+}
+
 cleanup() {
   # The journal grant FIRST and unconditionally. Everything else in this trap is tidying; this one
   # is repair. A run killed between the strip and the restore leaves the deployed broker unable to
-  # journal, which is a cluster that fails closed on every submission and gives no clue why.
-  #
-  # SNAPSHOTS FIRST, `seed_agent_identity` SECOND, and both. The strip below is discovery-based —
-  # it removes `actionrecords` from every role object actually bound to the actor, which on a
-  # long-lived cluster includes objects NO TEMPLATE OWNS (see the strip's comment). Re-seeding
-  # re-renders only the shipped ones, so an unowned object stripped here would stay stripped
-  # forever and the next run would find the fault already staged. Restoring the snapshot is what
-  # puts back exactly what was there; the re-seed is the belt for anything the snapshot missed.
+  # journal, which is a cluster that fails closed on every submission and gives no clue why. On a
+  # run that reached arm C this is a no-op — `restore_journal_grant` already cleared the flag.
   if [ "$JOURNAL_STRIPPED" = yes ]; then
     echo
-    echo "  restoring the actor's actionrecords grant (snapshots, then a re-seed)"
-    restore_failed=no
-    if [ -n "$JOURNAL_SNAPSHOT_DIR" ] && [ -d "$JOURNAL_SNAPSHOT_DIR" ]; then
-      for snap in "$JOURNAL_SNAPSHOT_DIR"/*.json; do
-        [ -f "$snap" ] || continue
-        $K apply -f "$snap" >/dev/null 2>&1 || {
-          restore_failed=yes
-          echo "  WARNING: could not restore $snap" >&2
-        }
-      done
-    fi
-    seed_agent_identity "$K" "$NS" "$AGENT" >/dev/null 2>&1 || {
-      restore_failed=yes
-      echo "  WARNING: the re-seed failed. The actor may still be unable to journal; re-run seed_agent_identity by hand." >&2
-    }
-    if [ "$restore_failed" = no ] && [ -n "$JOURNAL_SNAPSHOT_DIR" ]; then
-      rm -rf "$JOURNAL_SNAPSHOT_DIR"
-    elif [ -n "$JOURNAL_SNAPSHOT_DIR" ]; then
-      # Kept on purpose: these files are the only record of what the grant looked like before the
-      # strip, and a restore that failed is exactly when somebody needs them.
-      echo "  the pre-strip grant snapshots are KEPT at $JOURNAL_SNAPSHOT_DIR — re-apply them by hand." >&2
-    fi
+    restore_journal_grant
   fi
   actor_overlay_revoke_write "$K" "$TENANT_NS" >/dev/null 2>&1
   actor_overlay_revoke "$K" "$TENANT_NS" >/dev/null 2>&1
@@ -904,6 +1072,21 @@ assert_split "$a_status" "$a_reason" "$a_action" "$a_detail" "$A_N" "$a_target_e
 echo
 echo "== B: revoking the actor's actionrecords grant out from under the running broker =="
 
+# broker_restarts — the restartCount of every container in the broker pod, joined. C-3 reads this
+# before the fault and again after the recovery. Joined rather than summed so a two-container pod
+# where one restarts and another is added cannot cancel out to the same number.
+broker_restarts() {
+  $K -n "$NS" get "pod/$broker_pod" \
+    -o jsonpath='{range .status.containerStatuses[*]}{.name}={.restartCount},{end}' 2>/dev/null
+}
+
+# Captured HERE and not at pod-resolution time: C-3's claim is CH6's sentence exactly — the journal
+# came back without the BROKER having to — so the window it measures is the fault's window and not
+# the whole run's. A crash during arm A is a real problem and a different arm's to report.
+POD_BEFORE="$broker_pod"
+RESTARTS_BEFORE="$(broker_restarts)"
+echo "  broker pod before the fault: $POD_BEFORE (restarts: ${RESTARTS_BEFORE:-<none>})"
+
 # EVERY OBJECT THAT CARRIES THE GRANT, DISCOVERED — not a list of the ones this suite expects.
 # `actor-grant-platform.yaml.template` puts `actionrecords get/list/watch` on the CLUSTER-scoped
 # ClusterRole as well as `get/list/watch/create` on the namespaced Role, so a strip that took only
@@ -1107,6 +1290,106 @@ fi
 
 assert_journal_gone "$b_status" "$b_reason" "$b_decision" "$b_retry" "$B_N" "$b_target_exists"
 
+# ================================================================================================
+# C — journal-restored. 05 §8 CH6's last sentence.
+# ================================================================================================
+echo
+echo "== C: restoring the grant and submitting the same envelope again =="
+
+# A FAILED RESTORE IS could-not-run, NOT a red arm. If the grant does not go back, arm C would be
+# submitting into the SAME fault B just measured and asserting the opposite outcome — a failure of
+# the experiment, not of the broker, and rc 1 would name the wrong defect (LSN-026). The trap still
+# runs and will try again; the snapshots are kept either way.
+if ! restore_journal_grant; then
+  echo "DEFERRED: the actor's actionrecords grant could not be restored, so arm C has no recovered"
+  echo "  journal to submit into. The cluster may still be blinded — see the WARNING above and the"
+  echo "  kept snapshots."
+  exit 3
+fi
+
+# Converged on, for the strip's reason inverted: the authorizer's caches take a moment to agree the
+# grant is BACK, and a submission made before they do would be refused 503 by a brake that is right.
+echo "  waiting for the authorizer to agree the grant is back"
+back=no
+deadline=$((SECONDS + 60))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if [ "$($K auth can-i list actionrecords --as="$ACTOR_SUBJECT" -n "$NS" 2>/dev/null)" = "yes" ]; then
+    back=yes
+    break
+  fi
+  sleep 2
+done
+if [ "$back" != yes ]; then
+  echo "DEFERRED: the actor still cannot list ActionRecords 60s after the restore. Same reasoning as"
+  echo "  above: arm C would be measuring a fault that was never lifted."
+  exit 3
+fi
+echo "  the authorizer says yes again"
+
+# The same three `DefaultCacheTTL`s as the strip, and for the mirror-image reason: the brake caches
+# its observation, so a submission inside the TTL could be answered from a cache filled while the
+# grant was still stripped. Sleeping is the honest way to ask "did it re-probe" rather than "did it
+# happen to have expired" — and it is what makes a C-1 pass evidence of a re-probe.
+sleep 15
+
+BROKER_DRIVER_EXTRA_ENV="PROBE_SCENARIO=journal-restored"
+export BROKER_DRIVER_EXTRA_ENV
+
+c_out="$(broker_driver_run "$K" "$NS" "$AGENT" "$AGENT" "$DRIVER_POD" "$DRIVER_CM" "$UNTRUSTED_SECRET")"
+driver_rc=$?
+if [ "$driver_rc" -ne 0 ]; then
+  echo "DEFERRED: the driver pod could not be run to completion for scenario C."
+  exit 3
+fi
+echo "$c_out" | sed 's/^/  | /'
+
+C_FLAT="$(printf '%s\n' "$c_out" | flatten)"
+if [ -z "$C_FLAT" ]; then
+  echo "DEFERRED: the driver pod produced no parseable probe output for scenario C."
+  exit 3
+fi
+
+c_nonce="$(field "$C_FLAT" nonce-accepted 1)"
+if [ "$c_nonce" != "http" ]; then
+  echo "DEFERRED: the door never opened for scenario C ($(field "$C_FLAT" nonce-accepted 9))."
+  exit 3
+fi
+
+c_status="$(field "$C_FLAT" submit 2)"
+c_reason="$(field "$C_FLAT" submit 3)"
+c_trace="$(field "$C_FLAT" target 5)"
+
+if [ -z "$c_trace" ]; then
+  echo "DEFERRED: the probe emitted no trace id for scenario C, so C-2 has nothing to search for."
+  exit 3
+fi
+echo "  scenario C trace id: $c_trace"
+
+# C-2 IS A POSITIVE, SO IT IS POLLED UNTIL TRUE — the mirror of B-3's window. The write-ahead Create
+# happens before the reply is written, so the record is expected to be there already; the poll is
+# for the API server's read-after-write, not for the broker.
+C_N=0
+deadline=$((SECONDS + 30))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  C_N="$(records_for_trace "$c_trace" | sed -n 1p)"
+  [ "${C_N:-0}" != "0" ] && break
+  sleep 3
+done
+[ -n "$C_N" ] || C_N=0
+echo "  ActionRecords in $NS carrying the post-restore trace id: $C_N"
+
+# Re-resolved by ownership rather than re-read by the name held in POD_BEFORE: a `get pod/<name>`
+# that 404s would return an empty string and land in the "not observed" arm, when the thing that
+# actually happened — the pod is gone and a new one took over — is precisely what C-3 exists to
+# catch and must report as a REPLACEMENT.
+POD_AFTER="$(p3_pod_of_deploy "$K" "$NS" "$broker_deploy" 60)"
+broker_pod="${POD_AFTER:-$broker_pod}"
+RESTARTS_AFTER="$(broker_restarts)"
+echo "  broker pod after the recovery: ${POD_AFTER:-<none>} (restarts: ${RESTARTS_AFTER:-<none>})"
+
+assert_journal_restored "$c_status" "$c_reason" "$C_N" \
+  "$POD_BEFORE" "$POD_AFTER" "$RESTARTS_BEFORE" "$RESTARTS_AFTER"
+
 # ------------------------------------------------------------------------------------------------
 if [ "$assertions" -ne "$EXPECTED_ASSERTIONS" ]; then
   echo
@@ -1116,10 +1399,12 @@ fi
 echo
 echo "===================================================================="
 if [ "$fail" -eq 0 ]; then
-  echo " PROVEN: V-BRK-018 at L2 · the journal half of Phase 9 acceptance (d)"
+  echo " PROVEN: V-BRK-018 · V-ISO-006 (05 §8 CH6) at L2 · the journal half of Phase 9 acceptance (d)"
   echo " A two-target envelope with one unreadable target was refused at step 3 and left no"
-  echo " write-ahead record, no captured pre-state and neither object behind; and a broker whose"
-  echo " journal had been revoked out from under it refused 503 rather than executing unjournaled."
+  echo " write-ahead record, no captured pre-state and neither object behind; a broker whose journal"
+  echo " had been revoked out from under it refused 503 rather than executing unjournaled, and wrote"
+  echo " nothing; and when the grant went back the same envelope was accepted and journaled by the"
+  echo " same pod at the same restartCount — the journal recovered, the broker never had to."
   echo "===================================================================="
   exit 0
 fi

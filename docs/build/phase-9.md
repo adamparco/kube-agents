@@ -39,8 +39,11 @@ found in this pass are ordering or scoping problems that would otherwise have su
 > row was invisible to it — 10 IDs falsely reported unasserted, two of them `T11b-1`'s own, which is
 > why the fix was split out under Guardrail 9. `T11a-2` split the cell on the ID pattern and gave the
 > control the grouped-row cases it had never had: the arm now prints **28 not green / 12
-> BLOCKING-ALWAYS**, and that figure is the real worklist. **Resume at `harness-run`, unit
-> `P9-T11b-2`.** Do not re-run `harness-milestone` until the T11 ladder is green.
+> BLOCKING-ALWAYS**, and that figure is the real worklist. **`P9-T11b-2` is done too** — V-ISO-006
+> green at L2, and not by the route the plan row described: binding arm B to the ID would have
+> recorded a green with CH6's recovery clause unasserted, so arm C was added and the arm now proves
+> the journal comes back without a broker restart. **27 not green / 11 BLOCKING-ALWAYS. Resume at
+> `harness-run`, unit `P9-T11c`.** Do not re-run `harness-milestone` until the T11 ladder is green.
 
 **Phase 9 is OPEN.** It was stopped here on 2026-07-30 by an explicit human instruction, after the
 unit `P9-T9b-5b-0-ii-a`, and **not** because the phase closed. The same person lifted the stop later
@@ -127,8 +130,8 @@ observations against the etcd 05 §1.2 puts the journal in, refreshed on a 60 s 
 field has no watch behind it; 8/8 mutants caught. B-006 is closed on both halves.
 `P9-T9c` was the last task in the ladder as planned — and the ladder was not the whole phase.
 `harness-milestone` ran, stopped at §1, and opened **`P9-T11a`–`d`**; `T11a`, `T11b-1` and `T11a-2`
-closed the same day. **Resume at `harness-run`, unit `P9-T11b-2`** (§ Milestone audit 2026-07-31, at
-the end of this file).
+closed the same day, and `T11b-2` with them. **Resume at `harness-run`, unit `P9-T11c`**
+(§ Milestone audit 2026-07-31, at the end of this file).
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
 [`LEDGER.md`](LEDGER.md).
@@ -5762,7 +5765,7 @@ implementation, and `T11b`–`T11d` ship no change to `T11a`'s arm.
 | **P9-T11a-2** ✅ | **The ratchet arm under-counts green.** `parse_results` keys on the raw `check_id` cell, so a row naming `V-ISO-001, V-ISO-002` is filed under that literal string and matches neither ID. 36 of the 160 rows group IDs that way — it is the file's convention for a suite proving several rows at once, not an anomaly. Split the cell on the `V-XXX-nnn` pattern already in the module as `CHECK_ID`. Add a `--negative-control` case for a grouped row, since the current control only ever synthesises single-ID rows and is therefore blind to this. | 09 §9.4                   | `dev/tests/phase-ratchet-is-asserted.py`                                            | V-MET-013, V-MET-014                                                        | small  |
 | ~~**P9-T11b**~~  | **Split on 2026-07-31 into T11b-1 and T11b-2** (`harness-run` §2 Sizing — the row was weighted `large` and carries two independent suites, each needing its own destructive L2 run against the scratch cluster).                                                                                                                                                                                                                                                                                                                                          | 05 §8; 03 §4.1            | —                                                                                   | —                                                                           | large  |
 | **P9-T11b-1** ✅ | V-ISO-001/002 — chaos for the **pair**. C1 and C2 asserted the agent workload only; extend both to the broker Deployment, both ServiceAccounts and both rebinds. Put `chaos-suite.sh` on `dev/L2-CHAIN.txt`, which it had never been on.                                                                                                                                                                                                                                                                                                                  | 05 §8                     | `dev/verify/chaos-suite.sh` · `dev/L2-CHAIN.txt`                                    | **V-ISO-001**, **V-ISO-002**                                                | medium |
-| **P9-T11b-2**    | V-ISO-006 — CH6, journal down → broker refuses to execute. `dev/verify/broker-refuse-l2.sh` arm B **already induces the exact fault and asserts the exact property**; what is missing is that nothing binds arm B to the ID, so the row has no claimant and no `results.csv` row. Bind it, add the CH6 cross-reference in `chaos-suite.sh`, run and record.                                                                                                                                                                                               | 03 §4.1; 06 §4.4 row 3    | `dev/verify/broker-refuse-l2.sh` · `dev/verify/chaos-suite.sh`                      | **V-ISO-006**                                                               | small  |
+| **P9-T11b-2** ✅ | V-ISO-006 — CH6, journal down → broker refuses to execute. Arm B was bound to the ID it already proved, and **arm C was added**: CH6's last clause — restoring the journal restores service _without a broker restart_ — separates a broker that refuses from one that bricks, and arm B passes either way. Cross-reference added in `chaos-suite.sh` instead of a second, thinner CH6.                                                                                                                                                                   | 03 §4.1; 06 §4.4 row 3    | `dev/verify/broker-refuse-l2.sh` · `dev/verify/chaos-suite.sh`                      | **V-ISO-006**                                                               | small  |
 | **P9-T11c**      | The four unasserted BLOCKING-ALWAYS broker/undo L2s: the pod-token direct write (V-BRK-001), the stripped-`action-id` admission rejection (V-BRK-004), post-execution journal failure → rollback + `RolledBack` + auto-pause + page (V-BRK-016), and the destructive-undo gate (V-REV-009).                                                                                                                                                                                                                                                               | 03 §4.1, §4.3, §6, §11    | `dev/verify/` (new or extended L2 script) · the tenant overlay of planning defect 2 | **V-BRK-001**, **V-BRK-004**, **V-BRK-016**, **V-REV-009**                  | large  |
 | **P9-T11d**      | The workload pair at L2: two workloads owner-referenced and no third, non-interchangeable identities, the four labels selectable, both startup orders converging, agent-without-broker failing closed, CR deletion removing workloads and sparing SAs, and one fleet-wide Socket Mode connection.                                                                                                                                                                                                                                                         | 08 §2.4, §7; 05 §8, C15   | `dev/verify/` (new pair suite) · `dev/L2-CHAIN.txt`                                 | V-RUN-001, V-RUN-002, V-RUN-004, V-RUN-005, V-RUN-006, V-RUN-009, V-RUN-014 | large  |
 
@@ -6069,3 +6072,102 @@ genuinely unrun, and its redness is the T11b–T11d worklist) · `invariants-gat
 
 **Resume at `harness-run`, unit `P9-T11b-2`** — V-ISO-006, binding `broker-refuse-l2.sh` arm B to the
 ID it already proves.
+
+---
+
+## P9-T11b-2 — CH6, the journal half · 2026-07-31 · ✅
+
+**V-ISO-006 at L2, BLOCKING-ALWAYS, green.** The plan row said _bind, cross-reference, run, record_ —
+`broker-refuse-l2.sh` arm B already induced the exact fault and asserted the exact property, and
+nothing named the ID, so the row had no claimant and no `results.csv` line. The unit did that, and
+then did one thing the plan row did not ask for: it added **arm C**.
+
+### Why the plan row was not the whole unit
+
+05 §8 CH6 is five clauses, not one:
+
+> **CH6 — Journal store down.** Make `ActionRecord` writes fail … The broker **refuses to execute**
+> rather than executing unjournaled; auto-brake pauses the agent; the audit log shows zero mutations
+> by that actor identity during the window; the failure is reported to humans. **Restoring the
+> journal restores service without a broker restart.**
+
+Arm B asserts the refusal, the zero mutations and the report. Executing the plan row literally would
+have written a green V-ISO-006 with the last clause unasserted — and that clause is the one that
+separates _refuses_ from _bricks_. A broker that latches the fault and never recovers passes every
+assertion arm B makes. Arm C is that clause, and the code it needs already existed: the restore lived
+inside `cleanup()`, where its result was discarded. The change was to make it evidence.
+
+### The arms added
+
+| Arm     | Claim                                                                                           |
+| ------- | ----------------------------------------------------------------------------------------------- |
+| **C-1** | after the grant is restored the same envelope is **accepted** (202), not still 503              |
+| **C-2** | an `ActionRecord` now **exists** for the restored run's trace — service, not just a status code |
+| **C-3** | the **same broker pod** served both, at the same `restartCount` — recovery without a restart    |
+
+C-3 checks the pod **name first** and the restart count second, so a replacement is reported as a
+replacement rather than surfacing as a puzzling count mismatch, and `POD_AFTER` is re-resolved by
+ownership (`p3_pod_of_deploy`) so a pod that vanished lands in the REPLACED arm and not in the
+"could not observe" one.
+
+**A failed restore is `deferred` (rc 3), not red.** If the grant does not come back, arm C is
+submitting into the same fault arm B just measured and asserting the opposite outcome: that is the
+experiment failing, not the broker ([[LSN-026]]). rc 3, with the blocker named.
+
+**The third probe scenario is not `journal-gone` run twice.** `broker_refuse_probe.py` gains
+`journal-restored`, whose operations are byte-identical to `journal-gone`'s and deliberately so — the
+recovery claim is only worth something if the thing that succeeds afterwards is the thing that was
+refused before. What differs is `intent` and `rationale`, the two strings that land verbatim in the
+ActionRecord this run actually writes.
+
+### The auto-pause clause, corrected at the site
+
+The header used to say the auto-pause consumer did not exist. That was true when written and is not
+now — `P9-T9c-1` shipped it. The clause still cannot be asserted **in this fault**, for a different
+and better reason: the pause is recorded **on the ActionRecord** (`escalate.Recorder.record` Gets
+`journal.RecordName(actionID)`), and in this fault there is no record to put it on, because
+`StoreRejectionJournal.Reject` is the write that just failed. `server.go`'s `autoPause` says so
+itself and gives up — _"a refusal asked for an auto-pause and there is no record to put it on; the
+agent stays live"_. So B-3 reading zero and the pause being unobservable are the same fact, not two
+gaps. The paragraph now cites the lines instead of asserting the shape.
+
+### Non-vacuity, and the gap the control admits
+
+`--negative-control` went **25/25 → 34/34** with nine C-cases: baseline green, plus latched-503,
+missing status, wrong refusal reason, accepted-but-unjournaled, unknown count, pod replaced,
+container restarted, pod unobserved.
+
+The control **synthesises the four pod strings**, so it proves the arm discriminates and says nothing
+about whether `broker_restarts` and `p3_pod_of_deploy` read the pod that actually served the request.
+That gap is written into the suite's own "NEGATIVE CONTROL DOES NOT EXERCISE" section, and then
+closed live: mutant **M1** deletes the broker pod between the fault and the restore. Service still
+returns — a fresh broker with a restored grant accepts and journals — so **C-1 and C-2 stayed green
+and C-3 alone reddened by its own needle**, naming `…-k6pkd` before and `…-njdk2` after. That is
+precisely the run a suite without C-3 would have printed PROVEN for.
+
+### CH6 is not in the chaos suite, and that is not a gap
+
+`chaos-suite.sh` gains a cross-reference block rather than a CH6 arm. Re-staging the fault there
+would produce a second, thinner copy of a suite that already exists — and the copy is the one that
+rots. The block names `dev/verify/broker-refuse-l2.sh` arms B and C and says why.
+
+### Gate
+
+`bash dev/verify/broker-refuse-l2.sh gke-scratch-kube-agents-dev` → **rc 0, 17/17**, banner
+`PROVEN: V-BRK-018 · V-ISO-006 (05 §8 CH6) at L2 · the journal half of Phase 9 acceptance (d)`.
+Arm B: 503 `journal-unavailable`, **0** records for trace `e47e8e15…`. Arm C: **202**, actionId
+`01KYWDZK1DMFSC6XQ95T9AAW6V`, **1** record for trace `e8a2cdae…`, pod
+`platform-agent-broker-66fd9d45ff-rxg45` at `broker=0` on both sides.
+
+P1 green on **both** binaries — `k8s-operator@sha256:a7decacc29cb` and
+`kage-broker@sha256:cc49feaab631`, both rebuilt at `dev-1190585-dirty`. The first two live runs failed
+P1, once per image: `reload-images.sh operator` does not rebuild the broker, and there is no
+`deploy/kubeagents-broker` to `set image` on — `reload-images.sh broker` sets
+`KUBEAGENTS_BROKER_IMAGE` on the **controller**, which renders one broker per Agent CR.
+
+Control **34/34** · `invariants-gate.py` **31/31** (baseline wound for `$c_status`, [[LSN-056]]) ·
+L0 chain 48 clean · `unittest discover dev` **397 OK** · `make validate` clean · ratchet arm
+**27 not green / 11 BLOCKING-ALWAYS**, down from 28 / 12 · `results.csv` 161 → **162** rows.
+
+**Resume at `harness-run`, unit `P9-T11c`** — V-BRK-001, V-BRK-004, V-BRK-016 and V-REV-009 at L2,
+the four unasserted BLOCKING-ALWAYS broker/undo rows. Weighted `large`; expect to split it.

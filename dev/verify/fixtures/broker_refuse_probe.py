@@ -19,9 +19,24 @@ WHY A THIRD PROBE
         journal half of Accept (d), and it is the only scenario here that needs the suite to change
         the cluster between runs.
 
-    Both are things the broker does correctly and quietly. A refusal leaves nothing behind on the
-    target — which is exactly why it needs a probe that reports what it asked for: absence proves
-    nothing unless something is known to have tried.
+      · `journal-restored` — THE SAME ENVELOPE AGAIN, after the grant is put back. 05 §8 CH6's last
+        sentence: "Restoring the journal restores service without a broker restart." That clause is
+        what separates a broker that refuses from a broker that bricks, and it is unobservable from
+        the `journal-gone` run alone — a broker that latched the fault permanently and one that
+        re-probes produce byte-identical transcripts while the grant is stripped.
+
+    The first two are things the broker does correctly and quietly. A refusal leaves nothing behind
+    on the target — which is exactly why it needs a probe that reports what it asked for: absence
+    proves nothing unless something is known to have tried.
+
+WHY THE THIRD SCENARIO IS NOT JUST `journal-gone` RUN TWICE
+    The body it submits IS `journal-gone`'s, operation for operation, and deliberately so: the
+    recovery claim is only worth anything if the thing that succeeds afterwards is the thing that
+    was refused before. What differs is the `intent` and `rationale` — the two strings that end up
+    verbatim in the ActionRecord this run WILL write. A recovery submission carrying "submitted with
+    the journal unreachable" would put a false sentence in the audit trail, and the transcript's
+    `scenario-note` line — the suite's only way to tell two runs apart when it reads them back —
+    would say `journal-gone` twice.
 
 WHY THE TRACE ID IS THE OUTPUT THAT MATTERS
     A refusal reply is deliberately thin. `server.go`'s `write()` renders `reason`, `message`,
@@ -81,10 +96,12 @@ import action_envelope
 import broker_client
 from broker_client import BrokerConfig
 
-# The object the readable half of `split-snapshot` aims at, and the object `journal-gone` aims at.
-# Absent before the run, and it is the whole point that it is still absent after: in the first
-# scenario because the sibling target's 403 must take it down with it, in the second because the
-# brake refused before the pipeline ever reached an executor.
+# The object the readable half of `split-snapshot` aims at, and the object the two journal scenarios
+# aim at. Absent before the run, and it is the whole point that it is still absent after: in the
+# first scenario because the sibling target's 403 must take it down with it, in the second because
+# the brake refused before the pipeline ever reached an executor, and in the third because Phase 9
+# runs in shadow — an ACCEPTED submission persists nothing either, which is why `journal-restored`
+# is asserted on the journal and not on the target.
 TARGET_NAME = "broker-refuse-l2-shadow-target"
 
 # The unreadable half of `split-snapshot`. A Deployment, in a namespace the read overlay does not
@@ -94,7 +111,7 @@ TARGET_NAME = "broker-refuse-l2-shadow-target"
 # different answers and only the 403 exercises the row under test.
 UNREADABLE_NAME = "broker-refuse-l2-unreadable-target"
 
-SCENARIOS = ("split-snapshot", "journal-gone")
+SCENARIOS = ("split-snapshot", "journal-gone", "journal-restored")
 
 
 def emit(
@@ -263,13 +280,24 @@ def main() -> int:
             "pre-state must stop the first target being applied — including in shadow mode, where "
             "'applied' means a server-side dry run the API server authorizes for real."
         )
-    else:
+    elif scenario == "journal-gone":
         operations = [readable_target(tenant_ns)]
         intent = "broker-refuse-l2: one ordinary target, submitted with the journal unreachable"
         rationale = (
             "06 §4.4 row 3 and Accept (d): nothing executes unjournaled. The brake probes the "
             "ActionRecord store at step 5 and refuses 503 with an auto-pause, which is four steps "
             "before the write-ahead Create would have been attempted."
+        )
+    else:
+        # Byte-identical operations to `journal-gone`; see the header. Only the two prose fields
+        # differ, and they differ because this run is the one that gets journaled.
+        operations = [readable_target(tenant_ns)]
+        intent = "broker-refuse-l2: the same target again, after the journal was restored"
+        rationale = (
+            "05 §8 CH6, last sentence: restoring the journal restores service WITHOUT A BROKER "
+            "RESTART. The brake re-probes the ActionRecord store on its next Observe rather than "
+            "latching the fault, so the submission the previous run was refused 503 for now reaches "
+            "the write-ahead Create and leaves a record behind."
         )
 
     # `session_trace()` is the shipped builder and the id it mints is the ONLY handle the suite will
@@ -310,7 +338,12 @@ def main() -> int:
         trace_id=trace_id,
         namespace=tenant_ns,
         detail=TARGET_NAME,
-        reason="the trace id the refusal record must carry, and the object that must not exist after",
+        reason=(
+            "the trace id the ACCEPTED record must carry, and the object that must still not exist "
+            "after — shadow mode persists nothing even on the happy path"
+            if scenario == "journal-restored"
+            else "the trace id the refusal record must carry, and the object that must not exist after"
+        ),
     )
     if scenario == "split-snapshot":
         emit(

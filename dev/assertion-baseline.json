@@ -455,7 +455,8 @@
     ],
     "dev/verify/broker-refuse-l2.sh": [
       "$a_status",
-      "$b_status"
+      "$b_status",
+      "$c_status"
     ],
     "dev/verify/egress-enforcement-l2.sh": [
       "169.254.169.252/32",

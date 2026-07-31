@@ -49,6 +49,20 @@
 # — C4 proves the load-bearing half (cluster state + workloads survive hub loss) on the one L2 cluster
 # and defers the agent-reasoning-pause. Never asserted green here.
 #
+# CH6 IS NOT HERE, AND THAT IS NOT A GAP — IT IS SOMEBODY ELSE'S ARM. 09 §10 puts V-ISO-001, V-ISO-002 AND
+# V-ISO-006 in Phase 9's ratchet, and the first two are C1 and C2 above. The third is 05 §8 CH6, "journal
+# store down": make ActionRecord writes fail, the broker refuses to execute rather than executing
+# unjournaled, and restoring the journal restores service without a broker restart. It is proven by
+#   ==> dev/verify/broker-refuse-l2.sh, arms B and C <==
+# and it belongs there rather than here for a reason worth writing down. Every scenario in THIS file is a
+# fault induced by killing a POD and observed on Kubernetes objects; CH6's fault is an RBAC revocation
+# aimed at one identity, and its observation is an HTTP refusal and the presence or absence of an
+# ActionRecord carrying a trace id a probe minted. That needs the broker driver, the shipped transport and
+# the third probe — the entire apparatus broker-refuse-l2.sh already stands up for V-BRK-018. Re-staging it
+# here would be a second, thinner copy of a suite that exists, and the copy would be the one that rots.
+# The pointer is what stops the next reader concluding, from a chaos suite that covers CH1-CH4, that CH6
+# was forgotten.
+#
 # FIXTURES (D1): controller *reconcile-behaviour* (C1 no-reconcile/resume, C2 Deployment relaunch) uses the
 # REAL Agent CR + REAL controller — applied by THIS script and removed on exit, so the suite runs
 # standalone against a clean cluster instead of inheriting another suite's leftovers —
