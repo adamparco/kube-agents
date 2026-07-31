@@ -14,7 +14,7 @@
       "edits": [
         {
           "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
-          "find": "\t\ts.record.Status.Timestamps.ExecutionStarted = ptrTime(p.cfg.Now())",
+          "find": "\t\ts.clock().ExecutionStarted = ptrTime(p.cfg.Now())",
           "replace": "\t\t_ = ptrTime"
         }
       ]
@@ -26,8 +26,8 @@
       "edits": [
         {
           "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
-          "find": "\t\ts.record.Status.Timestamps.ExecutionStarted = ptrTime(p.cfg.Now())",
-          "replace": "\t\ts.record.Status.Timestamps.ExecutionStarted = ptrTime(s.at)"
+          "find": "\t\ts.clock().ExecutionStarted = ptrTime(p.cfg.Now())",
+          "replace": "\t\ts.clock().ExecutionStarted = ptrTime(s.at)"
         }
       ]
     },
@@ -38,8 +38,8 @@
       "edits": [
         {
           "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
-          "find": "\t\ts.record.Status.Timestamps.ExecutionEnded = ptrTime(p.cfg.Now())",
-          "replace": "\t\ts.record.Status.Timestamps.ExecutionEnded = ptrTime(s.at)"
+          "find": "\t\ts.clock().ExecutionEnded = ptrTime(p.cfg.Now())",
+          "replace": "\t\ts.clock().ExecutionEnded = ptrTime(s.at)"
         }
       ]
     },
@@ -50,7 +50,7 @@
       "edits": [
         {
           "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
-          "find": "\t\ts.record.Status.Timestamps.Verified = ptrTime(p.cfg.Now())",
+          "find": "\t\ts.clock().Verified = ptrTime(p.cfg.Now())",
           "replace": "\t\t_ = ptrTime"
         }
       ]
@@ -146,8 +146,44 @@
       "edits": [
         {
           "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
-          "find": "\t\ts.record.Status.Timestamps.Verified = ptrTime(p.cfg.Now())",
+          "find": "\t\ts.clock().Verified = ptrTime(p.cfg.Now())",
           "replace": "\t\ts.record.Status = agentv1alpha1.ActionRecordStatus{Phase: s.record.Status.Phase}"
+        }
+      ]
+    },
+    {
+      "id": "M13-create-restores-only-the-phase",
+      "why": "The tree as it shipped, and the reason the first live run panicked. `status` is a subresource, the API server drops the block a Create sends, and Create put back exactly one field of it -- so the write-ahead record became durable without `submitted` and `classified`, the half of the clock that precedes execution and the half V-BRK-006 is about.",
+      "catcher": "TestCreateLeavesTheBirthBeatsOnTheServer",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tmergeOwnedStatus(&ar.Status, born)\n\tar.Status.Phase = want",
+          "replace": "\tar.Status.Phase = want"
+        }
+      ]
+    },
+    {
+      "id": "M14-the-snapshot-is-taken-after-the-create",
+      "why": "The Create's reply body OVERWRITES ar.Status with what the server kept, which for a subresource is nothing. A snapshot taken one line later is a snapshot of the drop -- it restores an empty block and looks exactly like a working restore.",
+      "catcher": "TestCreateLeavesTheBirthBeatsOnTheServer",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tborn := ar.Status.DeepCopy()\n\tif err := s.client.Create(ctx, ar); err != nil {",
+          "replace": "\tborn := &agentv1alpha1.ActionRecordStatus{}\n\tif err := s.client.Create(ctx, ar); err != nil {"
+        }
+      ]
+    },
+    {
+      "id": "M15-step-8-dereferences-whatever-came-back",
+      "why": "The panic itself. Stamping through s.record.Status.Timestamps assumes the store restored the block; when it has not, the broker dies at the one moment a failure is unrecoverable -- the journal says Executing and nothing has executed, and no code path will ever advance that record. Fail closed means refuse, not die.",
+      "catcher": "TestTheClockSurvivesAServerThatKeepsNoStatus",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\ts.clock().ExecutionStarted = ptrTime(p.cfg.Now())",
+          "replace": "\t\ts.record.Status.Timestamps.ExecutionStarted = ptrTime(p.cfg.Now())"
         }
       ]
     }

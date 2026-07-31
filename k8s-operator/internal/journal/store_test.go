@@ -266,6 +266,54 @@ func TestSetPhaseKeepsStatusAndLabelInStep(t *testing.T) {
 	}
 }
 
+// `status` is a subresource, so the API server keeps spec and metadata from a Create and DISCARDS
+// the status block. Store.Create has always known that -- it re-writes `status.phase` afterwards --
+// and put back exactly one field of the block it knew had been dropped.
+//
+// Everything else the broker composes at 06 §4.2 step 6 went with it, and what it composes there is
+// `status.timestamps.submitted` and `.classified`: the half of the lifecycle clock that PRECEDES
+// execution, on the write-ahead record, which is the artifact V-BRK-006 is about. A record that
+// becomes durable without them is durable without the evidence it exists to carry. Worse, the
+// caller's copy came back with a nil `status.timestamps`, and the pipeline stamped step 8 straight
+// through it: a panic between "the journal says Executing" and "anything has executed".
+func TestCreateLeavesTheBirthBeatsOnTheServer(t *testing.T) {
+	ctx := context.Background()
+	s, c := newFakeStore(t)
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "developer-team/p/c/team-x")
+	submitted := metav1.NewTime(time.Date(2026, 7, 31, 5, 45, 18, 0, time.UTC))
+	classified := metav1.NewTime(time.Date(2026, 7, 31, 5, 45, 19, 0, time.UTC))
+	ar.Status.Timestamps = &agentv1alpha1.ActionTimestamps{Submitted: &submitted, Classified: &classified}
+
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// On the server, because durability is the property under test -- a birth beat that lives only
+	// in the caller's memory is exactly what the write-ahead rule says must not be relied on.
+	var got agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.Timestamps == nil {
+		t.Fatal("the write-ahead record is durable with no lifecycle clock; the subresource drop took it and Create put back only the phase")
+	}
+	if !got.Status.Timestamps.Submitted.Equal(&submitted) {
+		t.Errorf("submitted = %v, want %v", got.Status.Timestamps.Submitted, submitted)
+	}
+	if !got.Status.Timestamps.Classified.Equal(&classified) {
+		t.Errorf("classified = %v, want %v", got.Status.Timestamps.Classified, classified)
+	}
+	if got.Status.Phase != agentv1alpha1.PhaseExecuting {
+		t.Errorf("phase = %q; the restore must not cost the field it was already putting back", got.Status.Phase)
+	}
+
+	// And in the caller's copy, because the pipeline reads it at step 8 without re-fetching. This is
+	// the assertion that stands where the panic was.
+	if ar.Status.Timestamps == nil || ar.Status.Timestamps.Submitted == nil {
+		t.Fatalf("the caller's copy came back with no clock: %+v", ar.Status.Timestamps)
+	}
+}
+
 // SetPhase re-reads the record and writes the LIVE copy, so for as long as it copied nothing across
 // from the caller, every status field the caller had composed was discarded. The pipeline composes
 // four of them — `status.applied` at step 9, `status.verification` and `status.recovery` at step 11,

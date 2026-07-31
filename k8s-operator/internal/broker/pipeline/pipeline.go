@@ -920,7 +920,7 @@ func (p *Pipeline) stepExecute(ctx context.Context, s *state) (*broker.Result, e
 		// -- a server-side dry run is authorized and admitted before it is discarded -- so a mutating
 		// call WAS issued, which is what the field records. A shadow run that left this nil would
 		// make the write-ahead ordering unobservable on exactly the path Phase 9 runs.
-		s.record.Status.Timestamps.ExecutionStarted = ptrTime(p.cfg.Now())
+		s.clock().ExecutionStarted = ptrTime(p.cfg.Now())
 
 		res, execErr := p.cfg.Executor.Execute(ctx, execute.Request{
 			ActionID:      s.actionID,
@@ -933,7 +933,7 @@ func (p *Pipeline) stepExecute(ctx context.Context, s *state) (*broker.Result, e
 		// mutating call returned" is answerable whether or not the pass succeeded, and it is the
 		// base for `undoWindowExpiresAt`. A partially-applied action is precisely the one whose undo
 		// window a human needs, so it is the one case where losing this would matter most.
-		s.record.Status.Timestamps.ExecutionEnded = ptrTime(p.cfg.Now())
+		s.clock().ExecutionEnded = ptrTime(p.cfg.Now())
 
 		// The Result is kept even on error: it carries Mutated, which is the recovery ladder's
 		// only input on whether there is anything to roll back. Discarding it here is the bug
@@ -1005,7 +1005,7 @@ func (p *Pipeline) stepVerify(ctx context.Context, s *state) (*broker.Result, er
 			return "", fmt.Errorf("step 10: verifying action %s: %w", s.actionID, err)
 		}
 		s.verify = res
-		s.record.Status.Timestamps.Verified = ptrTime(p.cfg.Now())
+		s.clock().Verified = ptrTime(p.cfg.Now())
 
 		d := broker.Decide(broker.BrakeInputs{
 			Stage:      broker.StagePostExecute,
@@ -1151,6 +1151,22 @@ func (p *Pipeline) buildRecord(s *state) *agentv1alpha1.ActionRecord {
 // the beginning of the epoch. `ActionTimestamps`'s own doc says "nil means the phase was never
 // reached", and a `0001-01-01T00:00:00Z` in an audit record does not mean that -- it means a clock
 // nobody set, wearing the shape of a real answer.
+// clock returns the record's timestamp block, creating it if the record does not have one.
+//
+// Not defensive programming for its own sake: `status` is a SUBRESOURCE, so the API server drops
+// the whole block from the object the broker POSTs at step 8 and hands back a record whose
+// `status.timestamps` is nil. `journal.Store.Create` puts the broker-owned fields back, but the
+// pipeline must not be one refactor of the store away from a nil dereference HERE -- at step 8,
+// after the write-ahead record is durable and before the executor has run. A panic at that point
+// leaves a record in `Executing` that no code path will ever advance, which is strictly worse than
+// the missing timestamp it would be crashing about. Fail closed means refuse, not die.
+func (s *state) clock() *agentv1alpha1.ActionTimestamps {
+	if s.record.Status.Timestamps == nil {
+		s.record.Status.Timestamps = &agentv1alpha1.ActionTimestamps{}
+	}
+	return s.record.Status.Timestamps
+}
+
 func ptrTime(t time.Time) *metav1.Time {
 	if t.IsZero() {
 		return nil

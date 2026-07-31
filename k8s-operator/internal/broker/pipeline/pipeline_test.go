@@ -307,6 +307,9 @@ type fakeRecords struct {
 
 	// finalStatus is the record's status as step 11 handed it to the store. See SetPhase.
 	finalStatus *agentv1alpha1.ActionRecordStatus
+
+	// dropStatusOnCreate models the API server without the store's restore. See Create.
+	dropStatusOnCreate bool
 }
 
 func (f *fakeRecords) Create(_ context.Context, ar *agentv1alpha1.ActionRecord) error {
@@ -315,6 +318,15 @@ func (f *fakeRecords) Create(_ context.Context, ar *agentv1alpha1.ActionRecord) 
 		return f.createErr
 	}
 	f.stored = append(f.stored, ar.DeepCopy())
+	// `status` is a SUBRESOURCE: the API server drops the block from the object the broker POSTs and
+	// the reply overwrites the caller's copy. `journal.Store.Create` restores the broker-owned fields
+	// with a follow-up status write, so by default this fake leaves `ar.Status` alone -- that is the
+	// store's contract as it stands. `dropStatusOnCreate` models the raw server WITHOUT the restore,
+	// which is the tree as it was: step 8 dereferenced the nil `status.timestamps` and took the
+	// broker down after the record was durable and before the executor ran.
+	if f.dropStatusOnCreate {
+		ar.Status = agentv1alpha1.ActionRecordStatus{Phase: ar.Status.Phase}
+	}
 	return nil
 }
 
@@ -1836,6 +1848,45 @@ func TestTheLifecycleClockIsStampedAndOrdered(t *testing.T) {
 // `status.applied`, step 11 sets `status.verification` and `status.recovery`, and for as long as
 // `SetPhase` wrote only phase and message every one of them was dropped on the floor -- a live
 // record from `broker-execute-l2.sh` read back with a phase, a message, and nothing else.
+// The write-ahead record is durable at step 8 and the executor runs at step 9, so anything the
+// pipeline does between them happens at the one moment a failure is unrecoverable: the journal
+// already says an action is Executing, and nothing has executed. A nil dereference there does not
+// fail the action -- it kills the process and leaves a record no code path will advance.
+//
+// This is not hypothetical. `status` is a subresource, the API server drops the block the broker
+// POSTs, and the first version of the lifecycle clock stamped straight through the nil pointer that
+// came back. It panicked on a live cluster on 2026-07-31. The store now restores the block, so this
+// test asserts the OTHER guarantee -- that the pipeline does not depend on it having done so.
+func TestTheClockSurvivesAServerThatKeepsNoStatus(t *testing.T) {
+	r := newRig(t, withAdvancingClock(time.Second))
+	r.records.dropStatusOnCreate = true
+
+	tr, _, err := r.submit(createEnvelope())
+	if err != nil {
+		t.Fatalf("submit: %v\ntrace: %s", err, tr)
+	}
+
+	// The three beats the pipeline owns AFTER the Create must all be there: they are the ones it can
+	// still stamp on a record the server handed back empty.
+	st := r.records.finalStatus
+	if st == nil || st.Timestamps == nil {
+		t.Fatalf("status.timestamps is nil after a submission that reached step 11: %+v", st)
+	}
+	ts := st.Timestamps
+	for _, b := range []struct {
+		name string
+		at   *metav1.Time
+	}{
+		{"executionStarted", ts.ExecutionStarted},
+		{"executionEnded", ts.ExecutionEnded},
+		{"verified", ts.Verified},
+	} {
+		if b.at == nil {
+			t.Errorf("status.timestamps.%s is nil; the pipeline stamps it after the Create and must not need the server to have kept anything", b.name)
+		}
+	}
+}
+
 func TestStepElevenHandsTheStoreTheWholeOutcome(t *testing.T) {
 	r := newRig(t)
 	tr, _, err := r.submit(createEnvelope())

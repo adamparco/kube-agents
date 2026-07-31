@@ -188,7 +188,10 @@ func (s *Store) Create(ctx context.Context, ar *agentv1alpha1.ActionRecord) erro
 	for k, v := range Labels(ar) {
 		ar.Labels[k] = v
 	}
+	// Snapshotted BEFORE the Create, because the Create's reply body overwrites `ar.Status` with
+	// what the server kept -- which, for a subresource, is nothing. See the restore below.
 	want := ar.Status.Phase
+	born := ar.Status.DeepCopy()
 	if err := s.client.Create(ctx, ar); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			// Idempotent by construction: the same action id names the same record. Report it as
@@ -209,10 +212,21 @@ func (s *Store) Create(ctx context.Context, ar *agentv1alpha1.ActionRecord) erro
 	// leaving it empty inverted the two. Every parked record read back `status.phase: ""` while its
 	// label said `PendingApproval`, so 06 §4.3's ChatOps row (`PendingApproval -> Pending/Rejected`,
 	// and nothing else) had no `PendingApproval` to transition out of.
-	if want == "" {
+	// The same drop takes the whole status block, not just the phase, and the restore below has to
+	// put the whole block back. `status.timestamps.submitted` and `.classified` are composed by the
+	// broker at 06 §4.2 step 6 and are the half of the lifecycle clock that PRECEDES execution -- so
+	// they belong to the write-ahead record, the artifact whose durability V-BRK-006 is about. A
+	// record that becomes durable without them is durable without the evidence it exists to carry,
+	// and the broker then crashed on the nil `status.timestamps` at step 8 rather than merely
+	// losing it.
+	//
+	// Restoring only `phase` here was the narrower reading of the very defect the comment above
+	// describes: the code already knew the server drops the status block, and put one field back.
+	mergeOwnedStatus(&ar.Status, born)
+	ar.Status.Phase = want
+	if want == "" && !hasOwnedStatus(born) {
 		return nil
 	}
-	ar.Status.Phase = want
 	if err := s.client.Status().Update(ctx, ar); err != nil {
 		return fmt.Errorf("journal: create ActionRecord %s/%s: recording initial phase %q: %w (the action must not execute -- fail closed, 03 §6)", ar.Namespace, ar.Name, want, err)
 	}
@@ -326,6 +340,14 @@ func (s *Store) SetPhase(ctx context.Context, ar *agentv1alpha1.ActionRecord, ph
 //
 // Nil-guarded per field rather than copied wholesale: a caller that never set a field must not blank
 // what the server holds, and `SetPhase` is used for plain transitions as well as for terminal ones.
+// hasOwnedStatus answers whether there is anything for the post-Create status write to carry. A
+// record born with neither a phase nor a composed outcome needs no second round trip, and skipping
+// it keeps Create a single call on the path that does not need two.
+func hasOwnedStatus(st *agentv1alpha1.ActionRecordStatus) bool {
+	return st != nil && (st.Timestamps != nil || len(st.Applied) > 0 || st.Verification != nil ||
+		st.Recovery != nil || st.Report != nil || st.ObservedGeneration != 0)
+}
+
 func mergeOwnedStatus(live, caller *agentv1alpha1.ActionRecordStatus) {
 	if caller.Timestamps != nil {
 		live.Timestamps = caller.Timestamps
