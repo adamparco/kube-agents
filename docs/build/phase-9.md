@@ -103,7 +103,11 @@ auto-pause consumer) and **`-2`** (a writer for `status.broker.journalReachable`
 first had a seam to wire — see its section. **`-1` landed 2026-07-31**: the refusal that row 3
 produces now carries its own `AutoPause` to the HTTP boundary, where it is recorded on the refusal's
 own `ActionRecord` through the same `escalate.Recorder.Pause` seam row 9 uses; 4/4 mutants caught.
-**Resume at `P9-T9c-2`.** The remaining Phase 9 ladder is `T9c-2`, then `harness-milestone`.
+**`-2` landed 2026-07-31**: `status.broker.journalReachable` is now written by the operator — the
+only principal that may, since no broker grant reaches `agents/status` — from three conjoined
+observations against the etcd 05 §1.2 puts the journal in, refreshed on a 60 s clock because the
+field has no watch behind it; 8/8 mutants caught. B-006 is closed on both halves.
+**Resume at `harness-milestone`.** `P9-T9c` was the last task in the Phase 9 ladder.
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
 [`LEDGER.md`](LEDGER.md).
@@ -5523,3 +5527,101 @@ agree about what row 3 _is_, and only one of them is under test at the boundary.
 **Verification.** `make -C k8s-operator test` green including the 116 s controller envtest; L0 chain
 **47/47**; invariants gate 30/30 after winding `dev/assertion-baseline.json` for the three new named
 tests (LSN-056). No check ID claimed — see the note in the task section above.
+
+### P9-T9c-2 — outcome, 2026-07-31
+
+**Row 3's middle clause, and the design question `-2` was split out to answer.** The question was
+_who writes `status.broker.journalReachable`_, and reading 06 §2.2.1 and §2.2 together answers it
+closed: the broker-operations grant is `[get, list, watch]` on `agents` and nothing else; the actor
+templates add `update, patch` on `agents` for the platform and cluster-admin tiers — for provisioning
+their **children** — and **nothing anywhere grants `agents/status`**, which is a subresource and
+therefore a separate grant ([[LSN-061]]). developer-team has no `agents` verb at all. No broker at
+any tier can write this field. The operator is the only principal that can, so the writer is a
+controller.
+
+**The objection that stood for five phases, and why it does not apply.** `agent_controller.go` has
+carried a comment since Phase 4 saying the controller "cannot observe" journal reachability. That is
+an argument against **one transport** — asking the broker over HTTP, where a broker answering "yes"
+proves nothing about the broker's own writes — not against the controller observing anything. What
+makes a controller-side observation evidence is 05 §1.2: the journal store is not a service, it is
+the `ActionRecord` CRD in the cluster's own etcd. _"For a Cluster Admin or Developer Team Agent the
+journal lives in the same etcd as the objects it describes"_; for the platform tier it lives in the
+hub cluster's etcd, which is where the operator runs. The store the broker probes and the store the
+operator probes are the same store, always.
+
+**Three observations, conjoined, every unknown false.**
+
+1. The broker Deployment is ready — already computed by `updateStatusReady`. This also covers total
+   loss of the broker's API path, because `brake.NewSource`'s startup `Refresh` is synchronous: a
+   broker that cannot read the API server dies at boot, not on the first envelope.
+2. An **uncached** `List` of `ActionRecord` in the agent's namespace, `Limit(1)` — deliberately the
+   same shape as `brake.Source.probe`. Uncached because a `List` served from an informer is the false
+   green `brake.MaxFreezeStaleness` already argues against; the nil-reader case fails closed rather
+   than falling back to the cached client.
+3. A `SubjectAccessReview` asking whether the actor ServiceAccount may `create actionrecords` there.
+   **This is the one that stops the whole thing being a proxy** — it is not the operator's
+   connectivity restated, it is the API server's authoritative answer about the _broker's_ authority,
+   obtained by the one principal that may ask.
+
+| What changed                                    | Where                                                                              |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------- |
+| The probe, and ~90 lines on why it lives here   | `journal_reachability.go` — new                                                    |
+| `APIReader` + `Authorizer` on the reconciler    | `agent_controller.go` — defaulted in `SetupWithManager`, fail-closed when nil      |
+| `JournalReachable` written into `BrokerStatus`  | `agent_controller.go` — `updateStatusReady`; the reason is logged on the EDGE only |
+| Periodic requeue, `brokerHealthRequeue` = 60 s  | `agent_controller.go` — the one status field with **no watch behind it**           |
+| `subjectaccessreviews: create`                  | `config/rbac/role.yaml`, regenerated — +6 lines, no other drift                    |
+| `journal_reachability.go` classified: RENDERING | `dev/tests/pause-is-not-scale-to-zero.py` — see below                              |
+
+**Why the clock.** A journal outage changes no object the controller owns or watches, so
+`journalReachable` is the only field in `updateStatusReady` that goes stale silently. The periodic
+requeue broke `agent_controller_test.go`'s `RequeueAfter != 0` assertion; rather than weaken it, it
+was **split into two stronger ones** — "not the 30 s degraded retry" (the original property, restated
+precisely, which `!= 0` only implied) and "is the broker-health period". Guardrail 9 forbids editing
+a check to accommodate an implementation; strengthening it to say what it meant is the other
+direction.
+
+**The check that caught the new file, and the latch it forecloses.** V-RUN-012 fails any unclassified
+file in `internal/controller`, which is the arm that stops the guard silently narrowing as the
+package grows — so the new file had to be declared. It landed in **RENDERING**, the strict arm, even
+though it renders no workload, because it is the one file where reading the brake would _close a
+latch_: row 3 auto-pauses on an unreachable journal, so a probe that also consulted `paused` ("a
+paused agent is not executing, don't bother probing") would report unreachable **because** it had
+been paused, and the pause would outlive the outage with no path back.
+
+**Non-vacuity: 8 mutants, 8 caught, each by the arm that targets it** ([[LSN-035]]). Through
+`dev/mutate.sh` for the same reason as `-1` — 09 has no check ID for row 3 yet.
+
+| Mutant                                           | Caught by                                                             |
+| ------------------------------------------------ | --------------------------------------------------------------------- |
+| `JournalReachable` dropped from `newBroker`      | `TestJournalReachableReachesAgentStatus/the_broker_may_write...`      |
+| Return true before the `SubjectAccessReview`     | 3 tests; `reviews issued = 0, want exactly 1`                         |
+| A failing `List` returns reachable               | `.../the_store_does_not_answer`                                       |
+| Nil dependencies return reachable                | all 3 subtests of `TestJournalProbeWithNoDependenciesWiredIs...`      |
+| `Resource: "actionrecords/status"` ([[LSN-044]]) | `review resource = .../actionrecords/status, want .../actionrecords`  |
+| The three ServiceAccount `Groups` dropped        | `review groups [] are missing "system:serviceaccounts"` ×3            |
+| The periodic requeue removed                     | `TestAgentReconciler_Reconcile_ExistingRuntimeClass`                  |
+| The probe reads `.Spec.Operations.Paused`        | V-RUN-012 property 3 — both the `.Spec.Operations` and `.Paused` arms |
+
+The fifth is worth keeping: it is LSN-044's exact shape, and the test that caught it is the one that
+pins the _question_ rather than the answer. `wantUser` in that test is a **literal**
+(`system:serviceaccount:team-x:developer-team-team-x-actor`) with a separate assertion that the
+fixture still produces it — built from `actorServiceAccountName(agent)` it would have been a value
+compared against itself, which can never report the wrong shape ([[LSN-034]]).
+
+**The recorded residue.** A broker whose pod-level network path to the API server breaks _after_ boot
+while its pod stays Ready. Its probes are `tcpSocket` on its own mTLS listener (which demands a
+client certificate the kubelet does not have), and a bound port says nothing about egress. In that
+state the broker knows and the operator does not. Closing it needs a transport from the broker to
+something the broker may write — and that list is exactly `actionrecords` and `actionrecords/status`,
+which _are_ the surface that is down. A heartbeat record would put a fourth kind of thing in an
+append-only audit trail whose contents are evidence. Rejected transports are enumerated in the file
+header so nobody re-derives them.
+
+**Verification.** `make -C k8s-operator test` green including the 125 s controller envtest, and
+`reap-envtest` reported nothing orphaned (B-004's fix, working); L0 chain **47/47** including
+V-RUN-012 and its negative control (8/8 breakages caught); invariants gate **30/30** after winding
+`dev/assertion-baseline.json` for the five new named tests (LSN-056); prettier clean over the full
+`origin/main...HEAD` set. No check ID claimed — 09 has no ID covering row 3, and the task section
+binds verification at the improvement pass. **The L2 opportunity to record there:**
+`dev/verify/broker-refuse-l2.sh` already induces exactly this condition, so an assertion on
+`status.broker.journalReachable` could ride it without new setup.

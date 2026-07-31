@@ -1339,6 +1339,13 @@
     "k8s-operator/internal/controller/journal_policy_envtest_test.go": [
       "TestJournalStatusPolicy"
     ],
+    "k8s-operator/internal/controller/journal_reachability_test.go": [
+      "TestJournalProbeAsksAboutTheBrokersIdentity",
+      "TestJournalProbeShortCircuitsOnAnUnreadyBroker",
+      "TestJournalProbeWithNoDependenciesWiredIsUnreachable",
+      "TestJournalReachableReachesAgentStatus",
+      "TestJournalReachableRequiresAllThreeObservations"
+    ],
     "k8s-operator/internal/controller/journal_reconciler_test.go": [
       "TestJournalReconcilerDoesNotConfirmWhenTheSinkRefuses",
       "TestJournalReconcilerExportsTerminalRecords",

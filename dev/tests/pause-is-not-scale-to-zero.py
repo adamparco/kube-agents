@@ -144,6 +144,13 @@ RENDERING = {
     "rule should not admit the broker hop', which is the SAME misreading of 06 §4.4 -- it makes the "
     "pause indistinguishable from a network fault, and it does it at the layer where the agent cannot "
     "even report the refusal, because the connection is dropped rather than answered",
+    "journal_reachability.go": "observes 06 §4.4 row 3 and writes status.broker.journalReachable. It "
+    "renders no workload, so property 2 has nothing to bite on -- but it belongs in the strict arm "
+    "because it is the one file where reading the brake would CLOSE A LATCH. Row 3 auto-pauses on an "
+    "unreachable journal; a probe that also consulted `paused` ('a paused agent is not executing, so "
+    "do not bother probing') would report unreachable BECAUSE it had been paused, and the pause would "
+    "outlive the outage that caused it with no path back. The probe must be able to observe the store "
+    "recovering while the brake is still on",
 }
 
 # Controllers that may legitimately read `spec.operations`, each with the reason. Property 2 still
