@@ -89,8 +89,10 @@ transcript, because a one-sided sweep passes perfectly against a fleet whose RBA
 `¬` is on the cluster: an **unlabelled** Role, invisible to both the L0 check and the VAP and fully
 effective, made A-4 and A-5 go red by name. Its section is at the end of this file.
 
-**Resume at `P9-T8b-4b-ii-2b-ii`.** The remaining Phase 9 ladder is
-`T8b-4b-ii-2b-ii` → `T9c`, then `harness-milestone`. **`P9-T9c` was appended 2026-07-31** by the
+**`P9-T8b-4b-ii-2b-ii` was split at SELECT on 2026-07-31** into **`2b-ii-a`** (the derived soak
+corpus, L0) and **`2b-ii-b`** (the soak itself, V-REV-001 at L2); the split and its reasoning are in
+its own section at the end of this file. **Resume at `P9-T8b-4b-ii-2b-ii-a`.** The remaining Phase 9
+ladder is `T8b-4b-ii-2b-ii-a` → `T8b-4b-ii-2b-ii-b` → `T9c`, then `harness-milestone`. **`P9-T9c` was appended 2026-07-31** by the
 ORIENT drain of `BACKLOG.md` B-006 — 06 §4.4 row 3's auto-pause has no consumer; its section is at
 the end of this file.
 
@@ -5179,3 +5181,53 @@ a subject, not for the code that runs as it. The `NEGATIVE CONTROL DOES NOT EXER
 filter, P1 and the fixtures — everything upstream of the assertion block, which the `¬` synthesises
 past. S-4 is what covers the first three, and it is live-mode only: a decoy grant is a statement
 about an authorizer, and there is no authorizer at L0.
+
+### P9-T8b-4b-ii-2b-ii splits: 2b-ii-a is the corpus, 2b-ii-b is the soak
+
+**Sized at SELECT, 2026-07-31, and it is a session and a half.** A new L2 suite, a new corpus probe,
+a derived envelope corpus, a `--negative-control`, target seeding, journal mining over the executed
+population, guard 3 restated as a label assertion, and both chains rewired — the same magnitude as
+`P9-T9b-5c`, which took a whole session and produced one suite. Carrying it forward whole is the
+shape PROTOCOL §2 names: an oversized unit is not finished late, it is checkpointed half-done.
+
+| Unit                       | What                                                                                                                                                                                              | Checks               | Level |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | ----- |
+| **P9-T8b-4b-ii-2b-ii-a**   | The soak **corpus**: derive the executable envelope population from `verification/fixtures/classifier-corpus.yaml`, filtered by what `dev/verify/fixtures/actor-tenant-write-grant.yaml` authorizes, with a `--self-test` carrying vacuity floors and negative arms. Hermetic, no cluster. | feeds **V-REV-001**  | L0    |
+| **P9-T8b-4b-ii-2b-ii-b**   | The **soak**: a corpus probe, `dev/verify/undo-coverage-l2.sh`, target seeding, journal mining over the `DryRun` population, guard 3 as a label assertion                                          | **V-REV-001**        | L2    |
+
+**The split is free, and that is a fact about P1 rather than a judgement.** `_p1_build_inputs()`
+(`dev/lib/preconditions.sh:62`) maps freshness per image: `k8s-operator | kage-router | kage-broker`
+resolve to the `k8s-operator` build context and everything else returns 1. A commit touching only
+`dev/`, `verification/` and `docs/` therefore does not invalidate the running broker's P1, so 2b-ii-b
+inherits 2b-ii-a's tree without a rebuild. Splitting a unit that _did_ touch the operator would cost
+a `cloud-build-push` between the halves; this one costs nothing.
+
+**Why the corpus is a unit and not a helper file.** It is the exact parallel of
+`actor_grant_expectations.py` preceding `actor-grant-sweep-l2.sh`, and three things live in it that
+have already gone wrong in this phase:
+
+- **It is where the population that makes V-REV-001 non-vacuous is established.** The phase has
+  reached an empty or n=1 population twice — `broker-execute-l2.sh` claims V-REV-001 today with
+  **n=1**, and its own `results.csv` note says so. A coverage check over one record is a check whose
+  denominator is a rounding artifact. 09 §11.11 keeps V-REV-001 and V-REV-002 apart "precisely
+  because the first is cheap and reassuring and the second is the one that matters"; a cheap check
+  over n=1 is not even reassuring.
+- **It is where LSN-036's headcount risk lives.** A corpus that is _derived_ can silently shrink to
+  nothing when its input moves; a corpus that is _listed_ goes stale without saying so. Deriving it
+  is the right call — the grant is shipped, the classifier corpus is spec-bound at 120–200 cases —
+  but a derivation with no floor under it is the worse of the two failures, because it presents an
+  empty result as a clean run.
+- **It is where the filter can quietly become a hardcoded kind list.** The authorized set must be
+  read out of the write overlay, subresource granularity included (`deployments/scale` is a separate
+  rule from `deployments`), so that narrowing the grant narrows the corpus. A hand-listed
+  `{ConfigMap, Deployment}` passes every test on the day it is written and stops tracking the grant
+  the first time the grant moves.
+
+**The one thing the corpus must NOT do.** It must not assert that the live broker's classification
+equals `expect.class`. The classifier corpus is a source of **envelopes**, not of expected classes:
+its cases are already-resolved inputs scored against the offline classifier, while the live broker
+classifies against production labels, live state and the seen/novel history of a real cluster. An
+equality assertion there would be a second V-MET-005 wearing V-REV-001's ID, and it would go red for
+reasons that say nothing about undo coverage. `expect.class` is used for exactly one thing: as the
+selection filter for the **non-gated** classes, because those are the population 09 §6.3 scopes the
+check to. What the soak reads back is the class the broker actually chose.
