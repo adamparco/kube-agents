@@ -19,6 +19,57 @@
 # AN EMPTY `checks:` IS A FINDING, NOT A WAIVER. It means no check claims the requirement, and it
 # is published in verification/coverage.yaml's `uncovered:` list on every run.
 #
+#
+# HOW THE CURATION IS ARGUED
+# --------------------------
+# Grouped, on verification/traceability.yaml's precedent: the arguments live here, in one header,
+# and no entry carries a per-entry rationale. A rationale beside every mapping is a second thing to
+# keep in step with the mapping itself, and the entries are generated territory.
+#
+# SECTION CITATION IS NOT COVERAGE. A catalog row whose SRC column names the section is a candidate
+# for its requirements, not a mapping for them: 09 section 6's SRC records where a check came from,
+# and a section can hold obligations its own check never reaches. Every mapping below was decided by
+# reading the requirement against the check's assertion text. Where a check carries only part of a
+# conjunction, every check carrying part of the load is listed -- the normal case, as in
+# traceability.yaml.
+#
+# A REQUIREMENT WITH NO HONEST CHECK IS LEFT UNMAPPED, and the gap is published by ID rather than
+# closed with the nearest-looking catalog row. A mapping nobody established would make V-MET-002
+# green over a requirement nothing asserts, which is the failure V-MET-014 names.
+#
+# The mapping is NOT restricted to the owning suite. V-MET-002's property is "maps to at least one
+# check", any ID in the 09 section 6 catalog; coverage-ratchet.yaml's per-section suite ownership is
+# a different question (which suites are load-bearing for a section) and is not a filter on this
+# file. Several of 06's rows are covered by V-CMP-010 or V-MET-005, neither of which owns a 06
+# section.
+#
+# Document 06, section by section. 06 section 1.1's budget-field table resolves as a unit under
+# V-PRO-029 (one definition site per default and ceiling, an over-ceiling leaf clamping rather than
+# winning). Section 1.2's V-1..V-10 rows are V-CTR-002, which requires a negative test per rule with
+# the field path in the message. Section 4.2's code-floor rule rows take V-MET-005 and V-GAT-001
+# together and neither alone: V-MET-005 guarantees the rule set and the corpus stay in step,
+# V-GAT-001 asserts the corpus passes in full, and a rule row is covered only when both hold.
+# Section 4.3's ten ActionRecord phases are V-CTR-006 (every legal transition succeeds, every
+# illegal one is rejected) plus, per phase, the check that owns the phase's own behaviour. Section
+# 4.4's nine fail-closed rules are V-CTR-015, which asserts them as one decision function and so
+# covers exactly R-06.4.4-9..17. Schema field tables throughout take V-CMP-010, the field-level diff
+# between 06's schema block and the generated OpenAPI/type.
+#
+# Published gaps in 06 -- five requirements deliberately left unmapped, because no catalog row
+# asserts them:
+#   R-06.2.3-6   "developer-team actor: none in v1". Nothing asserts the ABSENCE of a
+#                developer-team actor GSA; every containment check asserts what a principal
+#                cannot do, not that a principal does not exist.
+#   R-06.4.2-17  a `fieldPaths` entry beginning with `/` is rejected at ChangePolicy admission.
+#                No check asserts ChangePolicy dialect admission at all.
+#   R-06.4.2-30  the `secret-material-egress` rule.
+#   R-06.4.2-44  the live-Secret digest comparison method,
+#                `sha256(secretNamespace || 0x1f || value)`.
+#   R-06.4.2-45  digests are never journaled or logged; `reasons[]` names the source Secret and
+#                key, never the value.
+# The last three are one hole: no check in the catalog reaches secret-material handling inside the
+# code floor. Closing it is a catalog change, not a curation change.
+#
 # 853 requirements.
 
 "R-01.2-1":
@@ -1523,124 +1574,195 @@
   checks: []
 "R-06.1.1-1":
   text: "The **actor** SA is _derived_ from `tier` + `scope` (§2) and looked up by name — the CRD has, and must never gain, a `brokerServiceAccountName` / `actorServiceAccountName` / equivalent."
-  checks: []
+  checks:
+    - V-CTR-003
+    - V-CMP-011
 "R-06.1.1-2":
   text: "**Slack app credentials and command registration are not per-agent facts, and the CRD must not pretend they are.** A Slack **app token permits exactly one Socket Mode connection**, and Slack registers **slash commands statically, per app** — so a per-agent Slack block carrying its own tokens is either unusable (the second agent's connection is refused) or a fleet-wide setting typed `n` times and free to disagree."
-  checks: []
+  checks:
+    - V-RUN-014
 "R-06.1.1-3":
   text: "Scaling chat ingress is therefore an availability problem, not a throughput one — which is acceptable because **dispatch is not chat-bound** (§2b) and the brake never is (§4.4)."
-  checks: []
+  checks:
+    - V-RUN-013
 "R-06.1.1-4":
   text: "A single `actionsPerHour` number cannot express the agreed default — **50 `routine` + 10 `elevated` per agent per hour** ([05](05-system-architecture.md) §6) — because those two are different allowances that must be exhausted independently: burning the routine bucket on log-noise cleanup must not consume the headroom an incident needs for its one `elevated` scale-up."
-  checks: []
+  checks:
+    - V-PRO-020
+    - V-PRO-029
 "R-06.1.1-5":
   text: "| `selfInitiated.routinePerHour` | int | `30` | ceiling **50** | `routine` actions the agent started itself, per rolling hour |"
-  checks: []
+  checks:
+    - V-PRO-029
 "R-06.1.1-6":
   text: "| `selfInitiated.elevatedPerHour` | int | `6` | ceiling **10** | `elevated` sub-cap — deliberately an order of magnitude tighter |"
-  checks: []
+  checks:
+    - V-PRO-029
+    - V-PRO-020
 "R-06.1.1-7":
   text: "| `selfInitiated.gatedPerHour` | int | `3` | ceiling **5** | `gated` **submissions**; approval consumes nothing (a human is already in the loop) |"
-  checks: []
+  checks:
+    - V-PRO-029
 "R-06.1.1-8":
   text: "| `selfInitiated.actionsPerDay` | int | `200` | ceiling **500** | All classes together, per rolling 24 h |"
-  checks: []
+  checks:
+    - V-PRO-029
 "R-06.1.1-9":
   text: "| `humanRequested.routinePerHour` | int | `120` | ceiling **200** | Separate, larger allowance for `trigger.source ∈ {chat, undo}` |"
-  checks: []
+  checks:
+    - V-PRO-029
+    - V-PRO-020
 "R-06.1.1-10":
   text: "| `humanRequested.elevatedPerHour` | int | `40` | ceiling **60** | — |"
-  checks: []
+  checks:
+    - V-PRO-029
+    - V-PRO-020
 "R-06.1.1-11":
   text: "| `humanRequested.gatedPerHour` | int | `20` | ceiling **30** | — |"
-  checks: []
+  checks:
+    - V-PRO-029
+    - V-PRO-020
 "R-06.1.1-12":
   text: "| `humanRequested.actionsPerDay` | int | `800` | ceiling **2000** | — |"
-  checks: []
+  checks:
+    - V-PRO-029
+    - V-PRO-020
 "R-06.1.1-13":
   text: "| `maxObjectsPerAction` | int | `25` | ceiling **50** | Per-envelope object cap. 50 is where the code floor gates regardless (§4.2), so a higher value is meaningless and is rejected rather than accepted-and-ignored |"
-  checks: []
+  checks:
+    - V-PRO-029
 "R-06.1.1-14":
   text: "| `flapWindow` | duration | `30m` | **floor 5m** | A shorter window is rejected |"
-  checks: []
+  checks:
+    - V-PRO-029
+    - V-CTR-018
 "R-06.1.1-15":
   text: "| `flapThreshold` | int | `3` | ceiling **5** | Repeats of the same `(target, intent)` in `flapWindow` |"
-  checks: []
+  checks:
+    - V-PRO-029
+    - V-CTR-018
 "R-06.1.1-16":
   text: "**Origin is derived from `trigger.source` in the envelope, never asserted separately.** `chat` and `undo` draw on `humanRequested`; `watch`, `alert`, `cron`, `delegation`, and `escalation` draw on `selfInitiated`."
-  checks: []
+  checks:
+    - V-PRO-029
 "R-06.1.1-17":
   text: "A **`delegation` from a parent spends the callee's self-initiated bucket** (§7 rule 8) — a chatty parent must not be able to spend a child's human allowance."
-  checks: []
+  checks:
+    - V-PRO-029
 "R-06.1.1-18":
   text: "**`Rejected`, `forbidden`, and deduplicated envelopes decrement nothing** (they never executed); **`DryRun` decrements nothing**; a `RolledBack` action **does** decrement, because it ran."
-  checks: []
+  checks:
+    - V-PRO-029
+    - V-BRK-025
 "R-06.1.1-19":
   text: "**Undo is exempt from every hourly bucket**: `trigger.source: undo` is never refused for budget reasons, for the same reason a `FleetFreeze` still permits undo (§4.4)."
-  checks: []
+  checks:
+    - V-PRO-029
+    - V-CTR-018
 "R-06.1.2-1":
   text: "| `platform` | `projectId` | — (root) | `kubeagents-system` | 1 per project | `platform-agent` | `platform-<project>-actor` |"
-  checks: []
+  checks:
+    - V-CTR-002
+    - V-CTN-015
+    - V-CMP-007
 "R-06.1.2-2":
   text: "| `cluster-admin` | `projectId`, `clusterName` | parent = platform agent | `kubeagents-system` | 1 per cluster | `cluster-admin-agent` | `cluster-admin-<cluster>-actor` |"
-  checks: []
+  checks:
+    - V-CTR-002
+    - V-CTN-015
+    - V-CMP-007
 "R-06.1.2-3":
   text: "| `developer-team` | `projectId`, `clusterName`, `namespace` | parent = cluster-admin | **= `scope.namespace`** | 1 per namespace | `developer-team-agent` | `developer-team-<namespace>-actor` |"
-  checks: []
+  checks:
+    - V-CTR-002
+    - V-CTN-015
+    - V-CTN-016
+    - V-CMP-007
 "R-06.1.2-4":
   text: "| **V-1** | `spec.tier` ∈ {`platform`,`cluster-admin`,`developer-team`}; **immutable** after create | CRD enum + CEL `self == oldSelf` + webhook | `Invalid` |"
-  checks: []
+  checks:
+    - V-CTR-002
 "R-06.1.2-5":
   text: "| **V-2** | Per-tier required `scope` fields present (table above) | validating webhook | `Required` |"
-  checks: []
+  checks:
+    - V-CTR-002
 "R-06.1.2-6":
   text: "| **V-3** | `parentRef.name` present for non-platform tiers | validating webhook | `Required` |"
-  checks: []
+  checks:
+    - V-CTR-002
 "R-06.1.2-7":
   text: "| **V-4** | **Developer-team placement:** `metadata.namespace == spec.scope.namespace` | validating webhook | `Invalid` |"
-  checks: []
+  checks:
+    - V-CTR-002
+    - V-CTN-016
 "R-06.1.2-8":
   text: "| **V-5** | **`(tier, scope)` cardinality:** exactly one non-terminating `Agent` per identity key | validating webhook (cluster-wide `List`) | `Duplicate` |"
-  checks: []
+  checks:
+    - V-CTR-002
+    - V-CTN-015
 "R-06.1.2-9":
   text: "| **V-6** | **Cross-object ceiling — NEW, v1:** the child's scope must be a **strict subset** of `parentRef`'s scope, and the parent's tier must be the tier immediately above the child's | validating webhook (reads the parent CR) | `Invalid` |"
-  checks: []
+  checks:
+    - V-CTR-002
+    - V-CTN-013
 "R-06.1.2-10":
   text: "| **V-7** | **Closed allowlist:** an enabled chat integration (`slack` _or_ `googleChat`) must carry a non-empty `allowedUsers`, and an all-blank/whitespace list is **not** an allowlist — it is empty | CRD CEL + validating webhook | `Required` |"
-  checks: []
+  checks:
+    - V-CTR-002
+    - V-CTR-014
 "R-06.1.2-11":
   text: "| **V-8** | **Budget clamp, per class:** any `initiativeBudget` leaf above its code ceiling — or `flapWindow` below the 5m floor — is **rejected**, not silently clamped. Checked leaf-by-leaf against the §1.1 table | validating webhook | `Invalid` |"
-  checks: []
+  checks:
+    - V-CTR-002
 "R-06.1.2-12":
   text: "| **V-9** | **No authority fields:** the schema is closed; an unknown field under `spec` — in particular anything named `rbac`, `rules`, `riskClass`, `allow`, `bypass`, `scopeOverride` — is pruned/refused | CRD structural schema (`x-kubernetes-preserve-unknown-fields` is **never** set on `spec`) | field pruned; CI test asserts absence |"
-  checks: []
+  checks:
+    - V-CTR-002
+    - V-CTR-003
+    - V-CMP-011
 "R-06.1.2-13":
   text: "| **V-10** | **Reader-only SA override:** `spec.security.serviceAccountName` may name only the **reader** SA and must match the tier template pattern `^<tier>-agent$`. There is **no** field anywhere in the CRD that names the actor SA | validating webhook | `Invalid` |"
-  checks: []
+  checks:
+    - V-CTR-002
+    - V-CTR-003
+    - V-CMP-011
 "R-06.1.2-14":
   text: "| **V-11** | **Platform-qualified principals — NEW:** every `allowedUsers` entry matches `^(slack\\|googlechat):\\S+$` with a platform-native **immutable user ID**; a bare ID, `@handle`, display name, or email is refused | CRD CEL pattern + validating webhook | `Invalid` |"
-  checks: []
+  checks:
+    - V-CTR-019
+    - V-CTN-033
 "R-06.1.2-15":
   text: "| **V-12** | **Channel binding is exclusive — NEW:** a `(platform, channelId)` / `(platform, spaceId)` pair may be bound by **at most one** `Agent` across the fleet; a second binding is a conflict, exactly like V-5's `(tier, scope)` | validating webhook (cluster-wide `List` over the binding index) | `Duplicate` |"
-  checks: []
+  checks:
+    - V-CTN-034
 "R-06.1.2-16":
   text: "| **V-13** | **`ChatOpsConfig` singleton — NEW:** at most one object, named `default`; `slack.socketMode.maxConnections` may only be `1`; a chat platform enabled on any `Agent` must be enabled in `ChatOpsConfig` | CRD CEL (`self.metadata.name == 'default'`) + validating webhook | `Invalid` / `Duplicate` |"
-  checks: []
+  checks:
+    - V-CTR-013
 "R-06.1.2-17":
   text: "**V-11 in detail — why the principal format is a hard schema rule, not a style guide.** An allowlist entry must be the platform's **immutable** identifier: a Slack member ID (`U…`, or `W…` on Enterprise Grid) or a Google Chat resource name (`users/<numeric-id>`)."
-  checks: []
+  checks:
+    - V-CTR-019
+    - V-CTN-033
 "R-06.1.2-18":
   text: "A principal from one platform **never** matches a list entry from another: `slack:U02ABCDEF` and `googlechat:users/1234567890` are different principals even when they are the same human, because nothing in either platform proves that."
-  checks: []
+  checks:
+    - V-CTR-019
+    - V-CTN-033
 "R-06.1.2-19":
   text: "**V-12 in detail — the channel is an address, never an authority.** A bound channel makes a bare message resolvable (§2b step 4); it does **not** admit the people in it."
-  checks: []
+  checks:
+    - V-CTN-034
+    - V-CTR-002
 "R-06.1.2-20":
   text: 'A channel bound to two agents would make a bare message ambiguous, and "ambiguous" is the one thing deterministic routing may not be — so the second binding is rejected at admission rather than resolved by a rule nobody can predict.'
-  checks: []
+  checks:
+    - V-CTN-034
 "R-06.1.2-21":
   text: "The same function keys the ChatOps routing index (§2b) and the actor SA name derivation (§2), so routing, identity, and cardinality can never drift."
-  checks: []
+  checks:
+    - V-CMP-007
+    - V-CTN-034
 "R-06.2-1":
   text: "| **Reader** | `<tier>-agent` | `kubeagents-system` (dev-team: its `ns`) | The agent pod | `get`/`list`/`watch` within scope. **No write verb, ever.** | `kube-agents/tier: <tier>`, `kube-agents/role: reader` |"
   checks: []
@@ -1670,28 +1792,38 @@
   checks: []
 "R-06.2.2.1-1":
   text: "**`create` but never `update`/`delete` on `actionrecords`.** The broker appends to the journal and advances `status`; it can never rewrite or remove a record, including its own."
-  checks: []
+  checks:
+    - V-BRK-013
 "R-06.2.3-1":
   text: "| platform **reader** | `kubeagents-platform-gsa` | `roles/viewer`, `roles/container.viewer`, `roles/monitoring.viewer` | project-scoped |"
-  checks: []
+  checks:
+    - V-CTN-030
 "R-06.2.3-2":
   text: '| platform **actor** | `kubeagents-platform-actor-gsa` | `roles/container.admin`, `roles/compute.networkAdmin`, `roles/monitoring.editor`, a custom role for the KCC resources it manages | `resource.project == "<project>"` |'
-  checks: []
+  checks:
+    - V-CTN-018
 "R-06.2.3-3":
   text: '| cluster-admin **reader** | `kubeagents-cluster-admin-<cluster>-gsa` | `roles/container.viewer`, `roles/monitoring.viewer` | `resource.name.startsWith("projects/P/locations/L/clusters/C")` |'
-  checks: []
+  checks:
+    - V-CTN-030
+    - V-CTN-019
 "R-06.2.3-4":
   text: "| cluster-admin **actor** | `kubeagents-cluster-admin-<cluster>-actor` | custom role: `container.clusters.update`, `container.nodePools.*`, `container.operations.get` | same `startsWith` condition — **one GSA per cluster, never one per project** |"
-  checks: []
+  checks:
+    - V-CTN-018
+    - V-CTN-019
 "R-06.2.3-5":
   text: "| developer-team **reader** | `kubeagents-devteam-<ns>-gsa` | `roles/monitoring.viewer` (logs/metrics for its workloads) | log-filter / label condition on the namespace |"
-  checks: []
+  checks:
+    - V-CTN-030
 "R-06.2.3-6":
   text: "| developer-team **actor** | **none in v1** | — | a namespace tier has no cloud write surface; add a narrowly-conditioned GSA only when a concrete need appears |"
   checks: []
 "R-06.2.3-7":
   text: "**Never granted to any actor GSA, at any tier:** `roles/owner`, `roles/editor`, `roles/iam.securityAdmin`, `roles/resourcemanager.projectIamAdmin`, `roles/iam.serviceAccountTokenCreator` on an agent GSA, or any role permitting `iam.serviceAccounts.setIamPolicy` / `resourcemanager.projects.setIamPolicy`."
-  checks: []
+  checks:
+    - V-CTN-018
+    - V-CTN-029
 "R-06.3-1":
   text: "| `submit-suggestion` skill and the propose branch naming | Agents execute; they do not propose | §4.1 Action Envelope |"
   checks: []
@@ -1739,250 +1871,424 @@
   checks: []
 "R-06.4.1-1":
   text: "| `intent` | string, 1–512 | ✓ | — | Human-readable, imperative, one line. Rendered in chat, the digest, and `ActionRecord` |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-CMP-010
 "R-06.4.1-2":
   text: '| `rationale` | string, ≤4096 | | `""` | Recorded for review. **Never** read by the classifier |'
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-CMP-010
+    - V-ADV-006
 "R-06.4.1-3":
   text: "| `operations[]` | array, 1–50 | ✓ | — | Applied in order, atomically w.r.t. scope/classification (see atomicity, below) |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-CMP-010
+    - V-BRK-018
 "R-06.4.1-4":
   text: "| `operations[].op` | enum | ✓ | — | `create` \\| `apply` \\| `patch` \\| `delete` \\| `scale` |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-BRK-022
 "R-06.4.1-5":
   text: '| `operations[].target` | object | (b) | — | `{group, version, kind, namespace, name}`. `group: ""` for core. Cloud variant below |'
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-CMP-010
 "R-06.4.1-6":
   text: "| `operations[].targetSelector` | `{group, version, kind, namespace, labelSelector}` | (b) | — | Fan-out form. **Expanded against live state at step 3**, before classification (§4.2 blast radius) |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-BRK-031
+    - V-BRK-011
 "R-06.4.1-7":
   text: "| `operations[].desiredState` | object | (a) | — | Full object for `create`/`apply`. Mutually exclusive with `patch` |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-CMP-010
 "R-06.4.1-8":
   text: "| `operations[].patch` | `{type, body}` | (a) | — | `type` ∈ `application/merge-patch+json`, `application/json-patch+json`, `application/apply-patch+yaml` |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-CMP-010
+    - V-BRK-020
 "R-06.4.1-9":
   text: "| `operations[].delete` | `{propagationPolicy, gracePeriodSeconds, preconditions}` | | `Foreground` | Only with `op: delete` |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-CMP-010
 "R-06.4.1-10":
   text: "| `operations[].scale` | `{replicas}` | (a) | — | Only with `op: scale` |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-CMP-010
 "R-06.4.1-11":
   text: "| `requester` | object | ✓ | — | Attribution. **Not** an authorization input in v1 (§2a) |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-ADV-006
 "R-06.4.1-12":
   text: "| `trigger` | object | ✓ | — | `source` is a closed enum; drives autonomy metrics ([01](01-vision-scope.md) §7) |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-PRO-029
 "R-06.4.1-13":
   text: "| `trace` | object | ✓ | — | `traceId` required; the chain in §8 depends on it |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-OBS-005
 "R-06.4.1-14":
   text: "| `issuedAt` | RFC-3339 UTC | ✓ | — | Freshness. Outside the acceptance window ⇒ `403 envelope-expired` |"
-  checks: []
+  checks:
+    - V-ADV-008
+    - V-CTR-005
 "R-06.4.1-15":
   text: "| `nonce` | string, 32 hex | ✓ | — | Single-use, broker-issued. Reuse ⇒ `403 replayed-envelope` |"
-  checks: []
+  checks:
+    - V-ADV-008
+    - V-CTR-005
 "R-06.4.1-16":
   text: "| `idempotencyKey` | string, ≤128 | ✓ | — | `sha256:<hex>`. Broker recomputes and compares — see below |"
-  checks: []
+  checks:
+    - V-BRK-028
+    - V-CTR-005
 "R-06.4.1-17":
   text: "| `dryRun` | bool | | `false` | Forced `true` when `spec.operations.dryRunOnly` is set |"
-  checks: []
+  checks:
+    - V-BRK-025
 "R-06.4.1-18":
   text: "| `requireApproval` | bool | | `false` | Stricter-only: `true` raises to `gated`; `false` never lowers anything |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-ADV-006
 "R-06.4.1-19":
   text: "| `maxObjects` | int | | `1` | Guards fan-out for selector-shaped operations |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-ADV-003
 "R-06.4.1-20":
   text: "| `deadlineSeconds` | int, 1–900 | | `120` | Clamped to the code ceiling |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-CMP-010
 "R-06.4.1-21":
   text: "(b) exactly one of `target` / `targetSelector` / `cloudTarget` per operation. `targetSelector` is refused for `op: create` (there is nothing to select) and never crosses a namespace boundary."
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-CTN-003
 "R-06.4.1-22":
   text: '| **Canonical JSON** | **RFC 8785 (JCS)** — UTF-8, lexicographic key ordering by UTF-16 code unit, no insignificant whitespace, RFC-8785 number serialization. Not "`json.Marshal` with sorted keys", which differs on numbers and escapes |'
-  checks: []
+  checks:
+    - V-BRK-028
 "R-06.4.1-23":
   text: "| **Normalization** | `payload` is passed through the **§4.3.1 sanitizer** — the same function, not a parallel one. Its `DROP` list removes `resourceVersion`, `uid`, `managedFields`, `creationTimestamp`, `status`, and the reassigned `spec.clusterIP*` / `nodePort` fields |"
-  checks: []
+  checks:
+    - V-BRK-028
 "R-06.4.1-24":
   text: "| **Secrets** | The sanitizer's `REDACT` rule applies, so a `Secret` payload is hashed as per-key digests. **The key never embeds Secret material**, and two writes of the same value dedupe correctly anyway |"
-  checks: []
+  checks:
+    - V-BRK-028
+    - V-REV-011
 "R-06.4.1-25":
   text: "| **Sort order** | `operations` sorted by the string `op + \"\\x1f\" + group + \"/\" + version + \"/\" + kind + \"/\" + namespace + \"/\" + name`, byte-wise ascending. Ties (a genuinely repeated operation) keep envelope order and are **not** de-duplicated within the envelope |"
-  checks: []
+  checks:
+    - V-BRK-028
 "R-06.4.1-26":
   text: "| **Excluded** | `intent`, `rationale`, `requester`, `trigger`, `trace`, `nonce`, `issuedAt`, `requireApproval`, `maxObjects`, `deadlineSeconds`. Prose and provenance must not change the key, or retries with a reworded intent would double-execute |"
-  checks: []
+  checks:
+    - V-BRK-028
 "R-06.4.1-27":
   text: "| **Verification** | The broker recomputes `K` from the accepted envelope. A mismatch is `400 idempotency-key-mismatch`, journaled `Rejected` — a caller **cannot** choose its own key |"
-  checks: []
+  checks:
+    - V-BRK-028
+    - V-ADV-008
 "R-06.4.1-28":
   text: "| **1** | **Freshness window** on `issuedAt` | Accepted only when `now - 120s ≤ issuedAt ≤ now + 30s`. The asymmetry is deliberate: 120 s covers a slow inference turn plus retry, 30 s covers clock skew only. This bounds the replay window to ≤150 s even if 2 and 3 both failed | `403 envelope-expired` |"
-  checks: []
+  checks:
+    - V-ADV-008
 "R-06.4.1-29":
   text: "| **2** | **Single-use broker-issued `nonce`** | The agent calls `GET /v1alpha1/nonce` (same mTLS listener) and receives `{nonce, expiresAt}` — 128 bits from a CSPRNG, TTL **120 s**, at most **32** outstanding per caller. The broker marks it consumed on receipt, before any other processing, and keeps consumed nonces for the full TTL | `403 replayed-envelope` |"
-  checks: []
+  checks:
+    - V-ADV-008
+    - V-BRK-021
+    - V-BRK-029
 "R-06.4.1-30":
   text: "| **3** | **`(agentIdentity, traceId, idempotencyKey)` uniqueness** | This tuple may execute **once**, ever, within the 24 h key window. A genuine retry necessarily carries a **fresh nonce and a fresh `spanId`** but may reuse the tuple, and gets `decision: deduplicated`; a **re-POST of the identical bytes** is caught by 2 first | `403 replayed-envelope` |"
-  checks: []
+  checks:
+    - V-ADV-008
+    - V-BRK-028
 "R-06.4.1-31":
   text: "Every rejection above is journaled as an `ActionRecord` in status `Rejected` with `reason: replayed-envelope` / `envelope-expired` / `idempotency-key-mismatch`, **plus a security event** — a replay attempt must leave evidence, not a silent 403."
-  checks: []
+  checks:
+    - V-ADV-008
+    - V-ADV-004
+    - V-BRK-003
 "R-06.4.1-32":
   text: "| a `tier`, `scope`, `namespace` **authority**, or `actor` | **Refused.** These are reserved top-level keys. Scope is derived from the authenticated caller's SA ([03](03-security-model.md) §4.1 step 1) |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-BRK-002
+    - V-BRK-032
 "R-06.4.1-33":
   text: "| a `riskClass`, `class`, `severity`, or `approved: true` | **Refused.** Classification is computed, never asserted |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-ADV-006
+    - V-BRK-032
 "R-06.4.1-34":
   text: "| a `bypass`, `force`, `skipJournal`, `skipVerify`, `emergency` | **Refused**, and emits a security event — these names exist only to be rejected loudly |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-BRK-029
+    - V-BRK-032
 "R-06.4.1-35":
   text: "| an `undoPlan` | **Refused.** The broker generates the plan; a caller-supplied one is an undo-poisoning vector |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-BRK-032
+    - V-REV-003
 "R-06.4.1-36":
   text: '| a reused `nonce`, a stale `issuedAt`, or a self-chosen `idempotencyKey` | **Refused** at step 2, before classification, with a security event — see "Anti-replay" below |'
-  checks: []
+  checks:
+    - V-ADV-008
+    - V-BRK-011
 "R-06.4.1-37":
   text: "| any other unknown field | **Refused** (`400 unknown field`). The schema is closed; nothing is silently dropped |"
-  checks: []
+  checks:
+    - V-BRK-032
+    - V-CTR-005
 "R-06.4.1-38":
   text: "| `rationale` arguing an action is safe / urgent / approved | **Recorded and ignored.** Model output is never a risk signal ([03](03-security-model.md) §8) |"
-  checks: []
+  checks:
+    - V-ADV-006
+    - V-ADV-007
 "R-06.4.1-39":
   text: "| `requester.id` (unsigned) | **Recorded, not trusted.** Without a valid `assertion` the record carries `attributionUnverified: true` |"
-  checks: []
+  checks:
+    - V-ADV-006
+    - V-CTR-005
 "R-06.4.2-1":
   text: "Its inputs are the envelope's targets and the live cluster state — never `intent`, never `rationale`, never anything a model wrote in prose."
-  checks: []
+  checks:
+    - V-GAT-017
+    - V-GAT-022
 "R-06.4.2-2":
   text: "| `id` | string, unique | Appears in `classification.reasons[].rule` and in the audit event |"
-  checks: []
+  checks:
+    - V-GAT-014
+    - V-GAT-019
+    - V-CMP-010
 "R-06.4.2-3":
   text: "| `when.verbs` | []enum | Envelope `op` values this rule matches. Empty = any |"
-  checks: []
+  checks:
+    - V-CMP-010
+    - V-BRK-022
 "R-06.4.2-4":
   text: "| `when.kinds` | []`{group, kind}` | Target kinds. Empty = any |"
-  checks: []
+  checks:
+    - V-CMP-010
+    - V-GAT-009
 "R-06.4.2-5":
   text: "| `when.excludeKinds` | []`{group, kind}` | Target kinds this rule never matches. Applied after `when.kinds` |"
-  checks: []
+  checks:
+    - V-CMP-010
+    - V-GAT-009
 "R-06.4.2-6":
   text: "| `when.ownedByLowerTier` | bool | Code floor only. True ⇒ matches when a lower tier's agent owns the target |"
-  checks: []
+  checks:
+    - V-CMP-010
+    - V-GAT-009
 "R-06.4.2-7":
   text: "| `when.namespaces` / `when.namespaceSelector` | []string / labelSelector | Target namespaces |"
-  checks: []
+  checks:
+    - V-CMP-010
+    - V-GAT-009
 "R-06.4.2-8":
   text: "| `when.labelSelector` | labelSelector | Matched against the **live** target object, not the desired state |"
-  checks: []
+  checks:
+    - V-GAT-022
+    - V-CMP-010
 "R-06.4.2-9":
   text: "| `when.fieldPaths` | []string (**dotted path**, see below) | Fires when the change touches these paths (e.g. `spec.type`, `spec.ingress`) |"
-  checks: []
+  checks:
+    - V-CMP-010
+    - V-GAT-021
 "R-06.4.2-10":
   text: "| `when.direction` | `loosen` \\| `tighten` \\| `any` | Security direction; `loosen` is what gates |"
-  checks: []
+  checks:
+    - V-GAT-010
+    - V-GAT-021
 "R-06.4.2-11":
   text: "| `class` | `routine`\\|`elevated`\\|`gated`\\|`forbidden`\\|`+1` | The class this rule contributes |"
-  checks: []
+  checks:
+    - V-CMP-010
+    - V-GAT-001
 "R-06.4.2-12":
   text: "| `maxObjects` | int | Blast-radius cap; exceeding it raises to `gated`, exceeding the hard cap aborts |"
-  checks: []
+  checks:
+    - V-GAT-011
 "R-06.4.2-13":
   text: "| `reason` | string | Shown verbatim to the human |"
-  checks: []
+  checks:
+    - V-GAT-019
 "R-06.4.2-14":
   text: "**Two path dialects, and which is which.** This document uses both, and a reader who assumes one will write a rule that never fires:"
-  checks: []
+  checks:
+    - V-CMP-010
 "R-06.4.2-15":
   text: '| `when.fieldPaths` (rule authoring) | **Dotted relaxed JSONPath** — the Kubernetes `kubectl`/`client-go` dialect, no leading `$`, `[i]` for list indices, `[*]` for "any element" | `spec.template.spec.containers[*].image` |'
-  checks: []
+  checks:
+    - V-CMP-010
+    - V-GAT-021
 "R-06.4.2-16":
   text: "| `status.applied[].diff[].path` (output) | **RFC 6901 JSON Pointer** — because the diff is an RFC 6902 JSON Patch and Patch mandates Pointer | `/spec/template/spec/containers/0/resources/limits/memory` |"
-  checks: []
+  checks:
+    - V-CMP-010
 "R-06.4.2-17":
   text: "They are never interchangeable and neither is ever accepted where the other is expected: a `fieldPaths` entry beginning with `/` is rejected at `ChangePolicy` admission with `Invalid: expected a dotted field path, not a JSON Pointer`."
   checks: []
 "R-06.4.2-18":
   text: "**The code floor, abridged** — the rules that must exist, mapping 1:1 onto [03](03-security-model.md) §5.2:"
-  checks: []
+  checks:
+    - V-CTN-027
+    - V-GAT-001
+    - V-MET-005
 "R-06.4.2-19":
   text: "| `out-of-scope` | any target outside the caller's derived scope | `forbidden` |"
-  checks: []
+  checks:
+    - V-CTN-009
+    - V-CTN-003
+    - V-GAT-001
+    - V-MET-005
 "R-06.4.2-20":
   text: "| `forbidden-set` | agent RBAC/IAM, escalation verbs, control plane, journal, protected namespaces | `forbidden` |"
-  checks: []
+  checks:
+    - V-CTN-005
+    - V-CTN-006
+    - V-CTN-007
+    - V-CTN-008
+    - V-CTN-010
+    - V-CTN-027
 "R-06.4.2-21":
   text: "| `no-undo-plan` | broker cannot generate a validated undo plan | `gated` |"
-  checks: []
+  checks:
+    - V-REV-003
+    - V-GAT-001
+    - V-MET-005
 "R-06.4.2-22":
   text: "| `destructive-stateful-delete` | delete of PVC/PV/Namespace/StatefulSet/cluster/node pool/bucket/disk/snapshot/backup | `gated` |"
-  checks: []
+  checks:
+    - V-GAT-014
+    - V-GAT-001
+    - V-MET-005
 "R-06.4.2-23":
   text: "| `security-loosen` | delete or weaken NetworkPolicy/PSA label/policy; widen an RBAC or IAM grant to a non-agent principal | `gated` |"
-  checks: []
+  checks:
+    - V-GAT-010
+    - V-GAT-021
+    - V-MET-005
 "R-06.4.2-24":
   text: "| `public-exposure` | Service→`LoadBalancer`/`NodePort`, Ingress/Gateway added, `0.0.0.0/0` in an allow rule | `gated` |"
-  checks: []
+  checks:
+    - V-GAT-021
+    - V-GAT-014
+    - V-MET-005
 "R-06.4.2-25":
   text: "| `traffic-shift-production` | Service/Ingress/Gateway/HTTPRoute change on a production-labelled target | `gated` |"
-  checks: []
+  checks:
+    - V-GAT-022
+    - V-GAT-014
+    - V-MET-005
 "R-06.4.2-26":
   text: "| `identity-change` | any write to ServiceAccount, Secret of type `*token*`, IAM binding | `gated` |"
-  checks: []
+  checks:
+    - V-GAT-014
+    - V-CTN-005
+    - V-MET-005
 "R-06.4.2-27":
   text: "| `blast-radius-cap` | `objects > min(50, maxObjects)`, counted **after** selector expansion | `gated` |"
-  checks: []
+  checks:
+    - V-GAT-011
+    - V-MET-005
 "R-06.4.2-28":
   text: "| `blast-radius-hard-cap` | `objects > 100` or `fractionOfScope > 0.5` | abort |"
-  checks: []
+  checks:
+    - V-GAT-011
+    - V-MET-005
 "R-06.4.2-29":
   text: "| `secret-write` | create/update of a `Secret` | `elevated` |"
-  checks: []
+  checks:
+    - V-GAT-001
+    - V-GAT-014
+    - V-MET-005
 "R-06.4.2-30":
   text: "| `secret-material-egress` | a **non-Secret** payload carries a value equal to live `Secret` material in the caller's scope | `gated` |"
   checks: []
 "R-06.4.2-31":
   text: "| `cross-tier-direct-operation` | direct operation on a resource owned by a **lower tier that has its own agent** | `gated` |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
+    - V-MET-005
 "R-06.4.2-32":
   text: "| `production-environment` | target namespace/object carries `kube-agents/environment: production` (or the `env` alias) | `+1` |"
-  checks: []
+  checks:
+    - V-GAT-022
+    - V-MET-005
 "R-06.4.2-33":
   text: "| `novel-action` | first occurrence of `(op, kind)` for this agent in the trust-building window | `+1` |"
-  checks: []
+  checks:
+    - V-BRK-024
+    - V-MET-005
 "R-06.4.2-34":
   text: "| `object-override` | `kube-agents/change-policy: gated\\|forbidden` annotation on the object or its namespace | as stated |"
-  checks: []
+  checks:
+    - V-GAT-012
+    - V-MET-005
 "R-06.4.2-35":
   text: "| _default_ | anything else, in scope, reversible | `routine` |"
-  checks: []
+  checks:
+    - V-GAT-001
+    - V-MET-005
 "R-06.4.2-36":
   text: "| Literal operations in one envelope | **≤ 50** | schema (§4.1) | `400` at validation — the envelope is malformed, nothing is classified |"
-  checks: []
+  checks:
+    - V-CTR-005
+    - V-GAT-011
 "R-06.4.2-37":
   text: "| Objects touched, per action | **> 50 ⇒ `gated`** | `blast-radius-cap` | Human approval; `maxObjects` / `ChangePolicy` may lower it, never raise |"
-  checks: []
+  checks:
+    - V-GAT-011
+    - V-GAT-009
 "R-06.4.2-38":
   text: "| Objects touched, per action | **> 100**, or `fractionOfScope > 0.5` | `blast-radius-hard-cap` | **Abort.** No approval path — this action does not exist in a gated form |"
-  checks: []
+  checks:
+    - V-GAT-011
+    - V-GAT-004
 "R-06.4.2-39":
   text: "The gate at 50 and the hard abort at 100 look redundant against a 50-operation envelope ceiling, and would be, if operations were always literal."
-  checks: []
+  checks:
+    - V-GAT-011
 "R-06.4.2-40":
   text: "So the 100-object hard cap is reachable **only** via selector fan-out — which is exactly the shape of the accident it exists to stop (one mistyped selector matching an entire namespace), and never via an agent laboriously enumerating 101 targets it could not have fitted in the envelope anyway."
-  checks: []
+  checks:
+    - V-GAT-011
 "R-06.4.2-41":
   text: "| `developer-team` | In its namespace: `apps/{Deployment,StatefulSet,DaemonSet}`, `batch/{Job,CronJob}`, `v1/{Service,ConfigMap,Secret,PersistentVolumeClaim,ServiceAccount}`, `autoscaling/HorizontalPodAutoscaler`, `policy/PodDisruptionBudget`, `networking.k8s.io/{Ingress,NetworkPolicy}`, `gateway.networking.k8s.io/{HTTPRoute,GRPCRoute}` |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-CTN-002
 "R-06.4.2-42":
   text: "| `cluster-admin` | The same kind set across **every non-protected namespace** in its cluster, plus `v1/Namespace` and `v1/Node` |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-CTN-002
 "R-06.4.2-43":
   text: "| `platform` | `container.cnrm…/{ContainerCluster,ContainerNodePool}` plus every other KCC object in the project. Kubernetes workloads are **not** counted — the platform tier does not own them (see `cross-tier-direct-operation`) |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-CTN-002
 "R-06.4.2-44":
   text: "**Comparison method — a match against live Secret values, never a heuristic.** At classification the broker builds a set of digests of every value in every `Secret` **readable in the caller's scope**: for each key, `sha256(secretNamespace || 0x1f || value)` and `sha256(value)`, plus the base64 and URL-encoded forms of the value."
   checks: []
@@ -1991,232 +2297,388 @@
   checks: []
 "R-06.4.2-46":
   text: '**`cross-tier-direct-operation` — making a stated prohibition into a rule.** [03](03-security-model.md) §3.2 says the Platform Agent "may not operate tenant workloads directly — delegate to the tier that owns them".'
-  checks: []
+  checks:
+    - V-CTN-021
 "R-06.4.2-47":
   text: "| `platform` | `apps/v1 Deployment team-x/api` in `cluster-a` | `developer-team` agent for `team-x` ✓ | **`gated`** — delegate down the chain instead |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
 "R-06.4.2-48":
   text: "| `platform` | same Deployment, in a namespace with **no** agent | ✗ | Rule does not fire; classified normally |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
 "R-06.4.2-49":
   text: "| `cluster-admin` | `apps/v1 Deployment team-x/api`, `team-x` has an agent | ✓ | **`gated`** — same rule, all tiers, not a platform special case |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
 "R-06.4.2-50":
   text: "| `cluster-admin` | `v1/ResourceQuota team-x/compute` | agent exists, but quota is **not** in the child's actor template (§2.2) | Rule does not fire — the child cannot own what it cannot write |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
 "R-06.4.2-51":
   text: "| `platform` | `container.cnrm…/ContainerNodePool` in `cluster-a` | cluster-admin agent exists **and** holds `containernodepools` | **`gated`** |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
 "R-06.4.2-52":
   text: "A chat message insisting the volume is empty and the deletion urgent changes nothing — the classifier never reads it ([03](03-security-model.md) §8.1)."
-  checks: []
+  checks:
+    - V-GAT-017
+    - V-ADV-007
 "R-06.4.3-1":
   text: "**`status.report` is structured, and the chat text is rendered from it — never the reverse.** The four beats of [02](02-agent-personas.md) §2.5.4 are fields, not prose the harness has to parse back out of a chat message."
-  checks: []
+  checks:
+    - V-CHR-008
+    - V-CHR-011
 "R-06.4.3-2":
   text: "**`status.recovery` makes the ladder observable.** [04](04-workflow-model.md) §5 requires that the agent never skips a rung silently and never restarts at the bottom for the same target after a rollback."
-  checks: []
+  checks:
+    - V-REV-006
+    - V-CHR-008
 "R-06.4.3-3":
   text: "A condition with no field behind it is a sentence in a design document: the controller would have to _infer_ durability, and every way of inferring it (elapsed time, sink liveness, a metric) fails in the same direction, deleting evidence that never landed."
-  checks: []
+  checks:
+    - V-REV-008
+    - V-CMP-010
 "R-06.4.3-4":
   text: "| `confirmed` | bool | `C-JR` | Written only after the sink returned success. Never set speculatively, never set by anything else — it is the sole input to the deletion predicate |"
-  checks: []
+  checks:
+    - V-REV-008
+    - V-CMP-010
 "R-06.4.3-5":
   text: "| `at` | RFC-3339 | `C-JR` | When the sink accepted it. An `at` far past the phase timestamp is a late export; the 60 s freshness budget of [05](05-system-architecture.md) §1.2 |"
-  checks: []
+  checks:
+    - V-REV-008
+    - V-CMP-010
 "R-06.4.3-6":
   text: "| `sink` | string | `C-JR` | Where the evidence went. A reader holding only the CR needs to know which archive to search, and an install that changed sinks needs the per-record value |"
-  checks: []
+  checks:
+    - V-REV-008
+    - V-CMP-010
 "R-06.4.3-7":
   text: "| `Pending` | Accepted, classified, undo plan generated; not yet executing | |"
-  checks: []
+  checks:
+    - V-CTR-006
+    - V-CMP-010
 "R-06.4.3-8":
   text: "| `PendingApproval` | `gated`; awaiting the roster. Nothing has been written | |"
-  checks: []
+  checks:
+    - V-CTR-006
+    - V-GAT-003
 "R-06.4.3-9":
   text: "| `Executing` | Snapshot taken; server-side apply in progress | |"
-  checks: []
+  checks:
+    - V-CTR-006
+    - V-BRK-011
 "R-06.4.3-10":
   text: "| `Verified` | Executed **and** the intended outcome confirmed | ✓ |"
-  checks: []
+  checks:
+    - V-CTR-006
 "R-06.4.3-11":
   text: "| `Failed` | Execution errored; partial work rolled back where possible | ✓ |"
-  checks: []
+  checks:
+    - V-CTR-006
+    - V-REV-006
 "R-06.4.3-12":
   text: "| `RolledBack` | Executed, verification failed, pre-state automatically restored | ✓ |"
-  checks: []
+  checks:
+    - V-CTR-006
+    - V-REV-006
 "R-06.4.3-13":
   text: "| `Undone` | A human ran `undo`; the plan replayed successfully | ✓ |"
-  checks: []
+  checks:
+    - V-CTR-006
+    - V-CTR-016
+    - V-REV-002
 "R-06.4.3-14":
   text: "| `Rejected` | Refused before execution (forbidden / out of scope / braked / rejected by an approver) | ✓ |"
-  checks: []
+  checks:
+    - V-CTR-006
+    - V-GAT-004
 "R-06.4.3-15":
   text: "| `Expired` | `gated` action whose approval TTL elapsed | ✓ |"
-  checks: []
+  checks:
+    - V-CTR-006
+    - V-GAT-007
 "R-06.4.3-16":
   text: "| `DryRun` | Classified, planned, journaled; deliberately not executed | ✓ |"
-  checks: []
+  checks:
+    - V-CTR-006
+    - V-BRK-025
 "R-06.4.3-17":
   text: "| `routine` | **30 d** | **7 d** | Enough to notice and undo; keeps etcd small |"
-  checks: []
+  checks:
+    - V-REV-008
 "R-06.4.3-18":
   text: "| `elevated` | **90 d** | **30 d** | Consequential changes stay undoable across a month, readable for a quarter |"
-  checks: []
+  checks:
+    - V-REV-008
 "R-06.4.3-19":
   text: "| `gated` | **365 d** | **90 d** | Approval evidence; also the audit-review horizon |"
-  checks: []
+  checks:
+    - V-REV-008
 "R-06.4.3-20":
   text: "| `Rejected` (forbidden) | **365 d** | n/a (nothing executed) | Security evidence — never short-lived |"
-  checks: []
+  checks:
+    - V-REV-008
 "R-06.4.3-21":
   text: "| `spec.retention.class` | enum | broker, at creation | The final risk class. Immutable with the rest of `spec` |"
-  checks: []
+  checks:
+    - V-REV-008
+    - V-CMP-010
 "R-06.4.3-22":
   text: "| `spec.retention.ttl` | duration | broker, at creation | From the table. A `ChangePolicy` may **lengthen** it (stricter-only in the audit direction), never shorten it |"
-  checks: []
+  checks:
+    - V-REV-008
+    - V-GAT-009
 "R-06.4.3-23":
   text: "| `spec.retention.expiresAt` | RFC-3339 | broker, at creation | `timestamps.submitted + ttl`. The cleanup controller deletes on this, and **only after** the exporter confirms the record landed in the audit sink ([05](05-system-architecture.md) §1.2) |"
-  checks: []
+  checks:
+    - V-REV-008
+    - V-CMP-010
 "R-06.4.3-24":
   text: "| `spec.retention.undoWindow` | duration | broker, at creation | From the table. Must satisfy `undoWindow ≤ ttl`, validated by CEL |"
-  checks: []
+  checks:
+    - V-REV-008
+    - V-CMP-010
 "R-06.4.3-25":
   text: "| `spec.retention.undoWindowExpiresAt` | RFC-3339 | broker, at creation | `timestamps.executionEnded + undoWindow` (falls back to `submitted` for records that never executed) |"
-  checks: []
+  checks:
+    - V-REV-008
+    - V-CMP-010
 "R-06.4.3-26":
   text: "| `system:serviceaccount:<ns>:<tier>-<scope>-actor` — **the owning broker** | `actionrecords/status` | `phase`, `observedGeneration`, `applied`, `verification`, `recovery`, `report`, `timestamps`, `message` | Only on records whose `spec.agentIdentity` equals the broker's own derived identity. **Never** `approvals`, `contested`, `undoneBy`, or `exported` |"
-  checks: []
+  checks:
+    - V-BRK-013
+    - V-CTN-008
 "R-06.4.3-27":
   text: "| `system:serviceaccount:kubeagents-system:kube-agents-undo-controller` (`C-UC`) | `actionrecords/status` | `phase` (→ `Undone` only), `undoneBy`, `contested`, `message` | Any record in any namespace — undo must work for an agent that no longer exists ([05](05-system-architecture.md) §1.3) |"
-  checks: []
+  checks:
+    - V-BRK-013
+    - V-CTR-016
+    - V-REV-007
 "R-06.4.3-28":
   text: "| `system:serviceaccount:kubeagents-system:kube-agents-chatops-gateway` | `actionrecords/status` | `approvals` (`granted`, `rejected`, `expiresAt`), `phase` (`PendingApproval` → `Pending`/`Rejected`), `contested` (clear only, for `/kage uncontest`) | Enforces the roster, four-eyes, and `minApprovals` before writing (§4.4). Cannot touch `applied` or `verification` |"
-  checks: []
+  checks:
+    - V-BRK-013
+    - V-GAT-020
+    - V-GAT-005
 "R-06.4.3-29":
   text: "| `system:serviceaccount:kubeagents-system:kubeagents-controller` (`C-JR`, **the exporter**) | `actionrecords/status` | `exported` (`confirmed`, `at`, `sink`) and nothing else | Any record in any namespace. Writes it only after the sink accepted the entry. Deliberately cannot touch `phase` — an exporter that could advance the lifecycle could manufacture a terminal record for an action that never ran |"
-  checks: []
+  checks:
+    - V-BRK-013
+    - V-REV-008
 "R-06.4.3-30":
   text: "| `system:serviceaccount:kubeagents-system:kube-agents-retention-controller` | (main resource) | nothing — `delete` only | May `delete` only when `now > spec.retention.expiresAt` **and** `status.exported.confirmed` is true |"
-  checks: []
+  checks:
+    - V-BRK-013
+    - V-REV-008
 "R-06.4.3-31":
   text: "| **Every agent reader SA** | — | nothing | `get`/`list`/`watch` only (§2.1) |"
-  checks: []
+  checks:
+    - V-CTN-004
+    - V-BRK-013
 "R-06.4.3-32":
   text: "| **A human `cluster-admin`** | — | **nothing.** Explicitly denied | See below |"
-  checks: []
+  checks:
+    - V-CTN-008
+    - V-BRK-013
 "R-06.4.3-33":
   text: "**A human cluster-admin may not write `ActionRecord.status`, and this is deliberate.** The `vap-agent-scope-journal` policy matches on **all** principals, not just agent identities, so a `kubectl patch actionrecord … --subresource=status` by a human is rejected the same way an agent's is."
-  checks: []
+  checks:
+    - V-CTN-008
+    - V-CTN-026
 "R-06.4.3-34":
   text: "Approving, rejecting, and un-contesting are done through `/kage approve`, `/kage reject`, and `/kage uncontest` (§2b.1) or by creating the equivalent objects — paths that check the roster, record the human, and leave an audit trail — never by hand-editing the outcome of an action."
-  checks: []
+  checks:
+    - V-GAT-020
+    - V-CTR-011
+    - V-GAT-013
 "R-06.4.3-35":
   text: '**Undo linkage is bidirectional, and both directions are required.** An undo action produces its **own** `ActionRecord` (§4.3.1: "undo is itself an action"), which leaves two objects that must find each other.'
-  checks: []
+  checks:
+    - V-REV-005
+    - V-CTR-016
 "R-06.4.3-36":
   text: '| forward (undo → original) | `spec.trigger.undoOf: <action-id>` | the **undo** record | "what did this undo action revert?" — and it is in `spec`, so it is **immutable** and survives the original''s deletion |'
-  checks: []
+  checks:
+    - V-REV-005
+    - V-CMP-010
 "R-06.4.3-37":
   text: '| reverse (original → undo) | `status.undoneBy: <action-id>` | the **original** | "was this action ever undone?" — the question a human asks before re-attempting a fix, and the one `contested` depends on |'
-  checks: []
+  checks:
+    - V-REV-005
+    - V-PRO-006
 "R-06.4.3-38":
   text: "| Format | ULID, uppercase in `spec`, **lower-cased in the label** (label values are case-sensitive and RFC-1123-constrained) |"
-  checks: []
+  checks:
+    - V-CMP-010
+    - V-OBS-005
 "R-06.4.3-39":
   text: "| Origination | The agent that starts a chain sets `chainId = its own actionId`, so the chain is named after the action that caused it and needs no allocator |"
-  checks: []
+  checks:
+    - V-MSH-006
+    - V-OBS-005
 "R-06.4.3-40":
   text: "| Propagation | Carried in `MeshRequest.chain.chainId` (§7) and copied verbatim by every callee into `spec.trigger.chainId` of **every** `ActionRecord` it produces for that request |"
-  checks: []
+  checks:
+    - V-MSH-006
+    - V-OBS-005
 "R-06.4.3-41":
   text: "| Label | `kube-agents/chain-id: <lowercased>` on every record in the chain, including the originator's. `kubectl get actionrecords -A -l kube-agents/chain-id=<id>` is the whole rollout |"
-  checks: []
+  checks:
+    - V-OBS-005
 "R-06.4.3-42":
   text: "| Non-chained actions | Set `chainId` to their own `actionId`. Every record has one; there is no empty case to handle |"
-  checks: []
+  checks:
+    - V-OBS-005
 "R-06.4.3-43":
   text: "| Trust | Like `from`, it is **not** an authority input — a forged `chainId` mislabels a query result and grants nothing. The `traceId` (§8) remains the correlation key for **latency**; `chainId` is the key for **causation**, and they are deliberately separate: a retried mesh call gets a new trace and keeps its chain |"
-  checks: []
+  checks:
+    - V-ADV-006
+    - V-MSH-002
 "R-06.4.3.1-1":
   text: "| `create` | `delete` | `delete` the created object, with `preconditions.uid` = the UID the create returned | **Exact.** Removing something that did not exist restores the prior state precisely |"
-  checks: []
+  checks:
+    - V-REV-004
+    - V-BRK-024
 "R-06.4.3.1-2":
   text: "| `apply` (object existed) | `restore` | `apply` the sanitized `preState` object with `preconditions.uid` | **Exact for spec/metadata.** Server-defaulted and controller-owned fields reconverge |"
-  checks: []
+  checks:
+    - V-REV-004
+    - V-REV-011
+    - V-BRK-024
 "R-06.4.3.1-3":
   text: "| `apply` (object did not exist) | `delete` | as `create` | Exact |"
-  checks: []
+  checks:
+    - V-REV-004
+    - V-BRK-024
 "R-06.4.3.1-4":
   text: "| `patch` | `restore` | `apply` the sanitized `preState` object | Exact for spec/metadata |"
-  checks: []
+  checks:
+    - V-REV-004
+    - V-REV-011
+    - V-BRK-024
 "R-06.4.3.1-5":
   text: "| `scale` | `restore` | `scale` back to the recorded `replicas` | Exact for the field; pod identities are not preserved (and for a Deployment need not be) |"
-  checks: []
+  checks:
+    - V-REV-004
+    - V-BRK-024
 "R-06.4.3.1-6":
   text: "| `delete` | `recreate` | `create` from the sanitized snapshot | **Structural only — see below.** This is why most deletes gate |"
-  checks: []
+  checks:
+    - V-REV-004
+    - V-REV-010
+    - V-BRK-024
 "R-06.4.3.1-7":
   text: "| cloud `apply`/`setSize` | `inverse` | the provider's inverse call with the recorded prior value | Exact where the provider exposes a true inverse; otherwise `none` |"
-  checks: []
+  checks:
+    - V-REV-004
 "R-06.4.3.1-8":
   text: "| anything else | `none` | — | ⇒ `gated` |"
-  checks: []
+  checks:
+    - V-REV-004
+    - V-CTR-015
 "R-06.4.4-1":
   text: "All five live in the controller and the broker, never in a skill, a prompt, or the model."
-  checks: []
+  checks:
+    - V-CTR-011
+    - V-CTR-015
 "R-06.4.4-2":
   text: "All five must work with the LLM, the router, and the inference stack unavailable ([03](03-security-model.md) §6)."
-  checks: []
+  checks:
+    - V-RUN-008
+    - V-RUN-013
 "R-06.4.4-3":
   text: "| `pause` | `Agent.spec.operations.paused: true` (+ `pauseReason`) | one agent | the agent's `allowedUsers`; anyone with `patch` on the CR | Broker refuses **new** envelopes immediately (`403 agent-paused`, `retryAfterSeconds`). The in-flight action completes or rolls back — never half-applied. The work queue is preserved |"
-  checks: []
+  checks:
+    - V-CTR-007
+    - V-CTN-025
+    - V-ISO-008
 "R-06.4.4-4":
   text: "| `resume` | `Agent.spec.operations.paused: false` | one agent | the agent's **approval roster** | Clears only the pause. `contested` markers, freezes, and budget cooldowns survive |"
-  checks: []
+  checks:
+    - V-CTR-007
 "R-06.4.4-5":
   text: "| `freeze` | `FleetFreeze` (cluster-scoped) | scope/fleet | approval roster of the owning agent or a parent's | Nothing executes in the frozen scope. Consulted on **every** envelope. **Fail-closed** |"
-  checks: []
+  checks:
+    - V-CTR-007
+    - V-CTR-015
 "R-06.4.4-6":
   text: "| `undo` | `UndoRequest` (namespaced) → new envelope | one action | the owning agent's `allowedUsers` | Replays the recorded plan as a first-class classified, journaled action |"
-  checks: []
+  checks:
+    - V-REV-007
+    - V-CTR-016
 "R-06.4.4-7":
   text: "| `contested` | `ActionRecord.status.contested: true` + advisory target annotation | one target | set **automatically**; cleared by the roster | The agent must not redo that change to that target without explicit human instruction |"
-  checks: []
+  checks:
+    - V-PRO-006
+    - V-BRK-019
 "R-06.4.4-8":
   text: "Expiry is never an approval: an `Expired` action is terminal (§4.3)."
-  checks: []
+  checks:
+    - V-GAT-007
+    - V-GAT-018
 "R-06.4.4-9":
   text: "| Cannot read the `FleetFreeze` list (API error, cache stale beyond 30 s) | **Treat the scope as frozen.** Refuse everything except `undo` |"
-  checks: []
+  checks:
+    - V-CTR-015
+    - V-CTR-007
+    - V-CTR-017
 "R-06.4.4-10":
   text: "| Cannot read its own `Agent` CR | Treat as paused |"
-  checks: []
+  checks:
+    - V-CTR-015
+    - V-CTR-017
 "R-06.4.4-11":
   text: "| Cannot reach the journal store | Refuse to execute; set `status.broker.journalReachable: false`; auto-pause |"
-  checks: []
+  checks:
+    - V-CTR-015
+    - V-CTR-017
+    - V-BRK-023
 "R-06.4.4-12":
   text: "| Cannot persist a pre-state snapshot | Refuse that envelope |"
-  checks: []
+  checks:
+    - V-CTR-015
+    - V-BRK-018
 "R-06.4.4-13":
   text: "| Cannot generate or validate an undo plan | Raise to `gated` (never execute on a hope) |"
-  checks: []
+  checks:
+    - V-CTR-015
+    - V-REV-004
+    - V-GAT-019
 "R-06.4.4-14":
   text: "| Approval roster missing / empty while a `gated` action waits | Action stays `PendingApproval` and expires; it is **never** auto-approved |"
-  checks: []
+  checks:
+    - V-CTR-015
+    - V-GAT-007
+    - V-GAT-003
 "R-06.4.4-15":
   text: "| Initiative budget exhausted, or flap threshold breached | Refuse and escalate to a human ([04](04-workflow-model.md) §4.2) |"
-  checks: []
+  checks:
+    - V-CTR-015
+    - V-CTR-018
+    - V-PRO-029
+    - V-PRO-003
 "R-06.4.4-16":
   text: "| Target carries a `contested` marker | Refuse; report; require explicit human instruction to proceed |"
-  checks: []
+  checks:
+    - V-CTR-015
+    - V-PRO-006
 "R-06.4.4-17":
   text: "| Broker cannot verify an executed action **and** cannot roll it back | Auto-pause the agent and page ([03](03-security-model.md) §6) |"
-  checks: []
+  checks:
+    - V-CTR-015
+    - V-CTR-016
 "R-06.4.4-18":
   text: "A contested marker is cleared only by an approval-roster member (`/kage uncontest <action-id>` or removing the annotation and patching the record's status) — never by the agent, and never by `resume`."
-  checks: []
+  checks:
+    - V-CTR-011
+    - V-PRO-006
 "R-06.5-1":
   text: "It lives outside the mirrored state paths, so it is never applied to a cluster."
   checks: []
@@ -2270,25 +2732,37 @@
   checks: []
 "R-06.7-1":
   text: "The mesh carries **requests, never authority**."
-  checks: []
+  checks:
+    - V-MSH-002
+    - V-MSH-003
 "R-06.7-2":
   text: "The callee derives `from.agentIdentity` from the authenticated identity and **overwrites** whatever the body said — the `from` field is a convenience for logs, never an input to a decision."
-  checks: []
+  checks:
+    - V-MSH-002
+    - V-MSH-007
 "R-06.7-3":
   text: "Authority is never inherited, never forwarded, never pooled."
-  checks: []
+  checks:
+    - V-MSH-002
+    - V-MSH-001
 "R-06.7-4":
   text: "**Refusal is a first-class outcome.** A callee may refuse — out of scope for it, contradicts a local `ChangePolicy`, or it simply disagrees. `refused` with a `refusalReason` is a normal response, not an error; the caller must handle it and must not retry it as a different shape."
-  checks: []
+  checks:
+    - V-MSH-004
 "R-06.7-5":
   text: "The caller **must not** route around it — no doing the work itself in the callee's scope (it has no authority there), and no asking a sibling."
-  checks: []
+  checks:
+    - V-MSH-001
+    - V-MSH-008
 "R-06.7-6":
   text: "A timed-out caller must treat the outcome as **unknown**, not failed, and reconcile by reading the callee's `ActionRecord`s for its `idempotencyKey`."
-  checks: []
+  checks:
+    - V-MSH-005
 "R-06.7-7":
   text: "**`chain.chainId`** is set once by the originator (its own `actionId`), never rewritten, and copied into `spec.trigger.chainId` and the `kube-agents/chain-id` label of every `ActionRecord` any callee produces for the request (§4.3)."
-  checks: []
+  checks:
+    - V-MSH-006
+    - V-OBS-005
 "R-06.8-1":
   text: "Every audit query in §10 must accept either correlation path."
   checks: []
@@ -2339,40 +2813,62 @@
   checks: []
 "R-06.9-1":
   text: "A tool may **never call a mutating API itself**."
-  checks: []
+  checks:
+    - V-CTR-009
+    - V-CTR-012
 "R-06.9-2":
   text: "| **`submit_action`** (new, core) | — | **The one mutation tool.** Takes `intent` + `operations` + `trigger`, fills `trace`/`requester` from the session, computes `idempotencyKey`, `POST`s to the broker, returns the `ActionResponse` (§4.1). Every other write-shaped tool is sugar over this |"
-  checks: []
+  checks:
+    - V-BRK-029
+    - V-BRK-028
+    - V-CTR-009
 "R-06.9-3":
   text: "| **`plan_action`** (new) | — | Same, with `dryRun: true`. Returns the classification, blast radius, and undo plan **without executing** — how an agent checks whether something will gate |"
-  checks: []
+  checks:
+    - V-BRK-029
+    - V-BRK-025
 "R-06.9-4":
   text: "| `apply_manifest` / `delete_cluster_manifest` | Undecorated `kubectl` helpers; deleted | **Return as envelope builders**: `apply_manifest(obj)` → `submit_action(op=apply, …)`. The `kubectl` shell-out never returns — the broker uses a typed client |"
-  checks: []
+  checks:
+    - V-CTR-009
+    - V-CTR-012
 "R-06.9-5":
   text: '| `create_cluster` (remote `gke` MCP) | Retired; provisioning became "author KCC YAML + open a PR" | **Returns as `provision_cluster`** — a builder emitting a `ContainerCluster` (or Terraform) desired state into an envelope. Classified `gated` (irreversible), so it lands in the platform roster''s approval queue, then the **broker** applies it |'
-  checks: []
+  checks:
+    - V-CTR-009
+    - V-CTR-012
 "R-06.9-6":
   text: "| `gke` MCP wiring (`renderConfigYAML()`) | Fronted read-only / dropped from `platform_toolsets`; ConfigMap mounted RO | **Stays describe/list/get.** A remote MCP writes with a credential the broker does not control and cannot journal — so the remote proxy remains read-only _permanently_. Cloud writes go envelope → broker → cloud API with the **actor GSA** |"
-  checks: []
+  checks:
+    - V-CTR-009
+    - V-CMP-006
 "R-06.9-7":
   text: "| `gke-cluster-creator` skill | Retired/adjusted to author YAML + open a PR | **Restored**: gathers requirements, grounds on the `cluster-blueprint` OKF, calls `plan_action`, shows the human the classification, calls `submit_action` |"
-  checks: []
+  checks:
+    - V-CMP-020
+    - V-CTR-010
 "R-06.9-8":
   text: "| `submit-suggestion` skill | The sole mutation path | **Deleted.** No branch, no PR, no propose verb anywhere in the agent surface |"
-  checks: []
+  checks:
+    - V-CMP-020
+    - V-CTR-009
 "R-06.9-9":
   text: "| `raise-escalation` skill | Wrote a `knowledge/escalation/` file; the parent polled for it | **Replaced** by the mesh call (§7). The OKF type survives only for human-resolved requests (§5) |"
-  checks: []
+  checks:
+    - V-CMP-020
 "R-06.9-10":
   text: "| Brake tools (`pause_self`, `freeze`, `approve`) | — | **Never exist.** An agent may not pause itself (it would also be able to resume itself), may not freeze, and may not approve. `undo` is human-invoked (§4.4) |"
-  checks: []
+  checks:
+    - V-CTR-011
 "R-06.9-11":
   text: "| `get_action_status` / `list_actions` (new) | — | Read-only over the agent's own `ActionRecord`s — how an agent reports what it did and offers the undo handle |"
-  checks: []
+  checks:
+    - V-CTR-009
 "R-06.9-12":
   text: "the rendered runtime config (`renderConfigYAML()` → the mounted ConfigMap, mounted `readOnly: true`) exposes no mutating remote MCP tool — checked against the **rendered** config, never only the baked `agents/<tier>/config.yaml`."
-  checks: []
+  checks:
+    - V-CMP-006
+    - V-CTR-009
 "R-07.2-1":
   text: "**Goal:** everything that must be true **before** any agent gets write authority."
   checks: []

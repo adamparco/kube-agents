@@ -823,11 +823,12 @@ def _mutate(args: tuple, index: int, fn) -> tuple:
 def negative_control() -> int:
     """Each mutation is a way this check could go quiet. Each names the signal it must produce.
 
-    Two of the seven properties are unexercised by today's tree -- there are no arrivals and the
-    floor is at zero, because the curated mapping is V-MET-002's unit and has not been written. A
-    clause with nothing to bite on is exactly the shape [[LSN-035]] is about, so the mutations
-    below manufacture the inputs the tree does not have: an arrival, a deferral missing its owner,
-    and a floor raised above the coverage under it.
+    One of the seven properties is unexercised by today's tree -- there are no arrivals, because no
+    spec statement has changed since the baseline was recorded. A clause with nothing to bite on is
+    exactly the shape [[LSN-035]] is about, so the mutations below manufacture the inputs the tree
+    does not have: an arrival, and a deferral missing its owner. The floor clause is no longer in
+    that category -- document 06's curation raised it off zero -- but its mutation is kept, because
+    a floor that stops being asserted reads exactly like a floor that holds.
     """
     base = _inputs()
     if check(*base):

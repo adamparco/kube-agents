@@ -91,8 +91,9 @@ will start selecting.
 | **LSN-060** | verification, negative-control, l2, self-concealing | `broker-execute-l2.sh`'s L2-1 arm looked the ActionRecord up by raw action id. The object name is `journal.RecordName` = `"ar-" + strings.ToLower(actionID)` (06 §4.3), so the lookup **could not have found a record against any commit** — yet the suite had never reported it, because the only thing that had ever exercised that arm was `--negative-control`, which **synthesises the record document** and feeds it straight to the assertion block. The ¬ form skipped the very statement under test, so 13/13 green measured an arm that had never run | **closed** | The arm derives `record_name` from the action id and the lookup is now exercised by the live path (`dev/verify/broker-execute-l2.sh`, PASS L2-1 naming `ar-01kyv…`). `dev/tests/invariants-gate.py` (`check_negative_controls_exercise_the_statement_under_test`, L0-CHAIN) fails any `--negative-control` block that synthesises an input the live path obtains from the cluster, unless the arm names the statement it is skipping |
 | **LSN-061** | go, kubernetes, api-semantics, subresource, silent-loss | `status` is a **subresource**: a Create keeps spec and metadata and **discards the whole status block**. `journal.Store.Create` had known that since Phase 5 — it re-writes `status.phase` afterwards — and put back exactly **one field** of the block it knew had been dropped. Everything else the broker composes at 06 §4.2 step 6 went with it, including the lifecycle clock the write-ahead rule exists to make observable; and the Create's reply body **overwrote the caller's copy**, so the pipeline reached step 8 holding a nil `status.timestamps` and **panicked on a live cluster** at the one moment a failure is unrecoverable. Symmetrically, `SetPhase` re-read the record and wrote the LIVE copy, discarding every field the caller had composed | **closed** | `mergeOwnedStatus` — the six fields 06 §4.3 assigns the owning broker SA, nil-guarded per field, snapshotted **before** the Create — used by both `Create` and `SetPhase` (`k8s-operator/internal/journal/store.go`). `state.clock()` makes the pipeline's stamping nil-safe. The journal package's fake client has modelled the subresource drop since it was written (`dropStatusLikeTheApiServer`); the pipeline's fake now models it too under `dropStatusOnCreate`. `verification/mutants/V-BRK-006.json` 15/15, M13/M14/M15 targeting exactly this. Run by `make -C k8s-operator test` (the L1 half) and by `dev/verify/broker-execute-l2.sh` (L2-CHAIN line 261), whose L2-2 arm is the property itself: `creationTimestamp` from the API server against `status.timestamps.executionStarted` from the broker |
 | **LSN-062** | records, verification, orient | A harness record states that a file "does not exist", and the file is right there. `P9-T11g-2a`'s split note said `verification/traceability.yaml` did not exist. It had existed since `P8-T10` — 71 KB, 177 entries, V-MET-011's artifact, green on every run. The question actually asked was *"does 09 §8's `R-<doc>.<section>-<n>` requirement mapping exist?"* — a correct **no** — and the answer was written down against the **filename §8 happens to use for it** rather than against the question. The unit's conclusion survived; its published reason did not, and it shipped in a commit message, a phase-file row and a ledger cell before the next ORIENT caught it | **open** | Proposed for the next improvement pass: an L0 lint that reads `docs/build/*.md`, `.claude/harness/*.md` and `verification/*.yaml` headers for a repo path asserted absent ("does not exist", "is absent", "is not in the tree", "nothing at") and fails when the path is present — the claim is cheap to make, load-bearing for scheduling, and trivially checkable |
+| **LSN-063** | checks, verification, mutation-testing | A negative-control row prints `MISS`, and the mutation it names never applied | **open** | Guarded in `requirements-are-enumerated.py`'s control loop (a mutated tuple equal to the base prints `BROKEN` and fails); proposed for the next improvement pass: the same guard for the other 19 `negative_control()` loops, hoisted into one helper and policed by `negative-controls-name-their-rule.py` |
 
-**Open: 1 of 62**.
+**Open: 2 of 63**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -3588,3 +3589,52 @@ to look. Cheap to write, and it polices exactly the class of statement that sche
 
 **Related:** [[LSN-019]] (prose on the artifact is not a mechanization) — the same gap between what a
 document says and what is true, in the opposite direction.
+
+---
+
+## LSN-063 — A negative-control mutation that stopped applying reported MISS, not BROKEN
+
+**Tags:** checks, verification, mutation-testing
+**Opened:** 2026-07-31 (P9-T11g-2b-ii-2a)
+**Status:** open — guarded in the one harness that failed; the propagation is an improvement pass
+
+**What happened.** `P9-T11g-2b-ii-2a` curated 222 of document 06's requirements into
+`verification/requirements.yaml`, which moved `verification/coverage.yaml`'s `totals.covered` from
+`0` to `222`. V-MET-009's negative control then went red on one row: _"a requirement is marked
+covered without a check"_. The mutation was
+`t.replace("  covered: 0", "  covered: 12", 1)` — a literal keyed to the value the tree happened to
+hold on the day the control was written. With no `covered: 0` left to find, the replace returned the
+string unchanged, the control re-ran the check against the **unmutated** tree, the check correctly
+found nothing, and the row printed **`MISS`**.
+
+**Why that is worse than a red.** `MISS` means _the check let the defect through_ — a finding about
+the check under test, and the thing `harness-run` §5 says to fix. What actually happened is that no
+defect was ever applied: the sweep could not evaluate the mutant, which is **`BROKEN`**, and
+[[LSN-048]] and [[LSN-049]] both say in as many words that a `BROKEN` row is not a finding. The two
+verdicts point at opposite repairs. `MISS` invites strengthening the check — which here would have
+produced a check that passes on the first run, looks exactly like the fix, and leaves the mutant
+still unmeasured, which is [[LSN-048]] arriving a third time through a different door.
+
+**The general shape.** _A mutation keyed to a literal from the tree is a mutation with an expiry
+date, and it expires silently._ Every value a control hardcodes — a count, an ID, a date, a first
+list entry — is a bet that the tree will not move past it, and the whole point of a ratchet is that
+the tree moves. The control cannot tell the difference between "the defect was injected and the
+check missed it" and "nothing was injected" unless it is made to look.
+
+**Mechanized here.** `dev/tests/requirements-are-enumerated.py`'s control loop now compares each
+mutated input tuple against the base and prints `BROKEN` — counted as a failure, with its own
+message — when they are equal. The offending mutation was also rewritten to increment whatever
+`covered:` it finds rather than match a literal `0`, so it cannot expire again. Both were exhibited:
+the repaired row is `caught`, and a deliberately no-op probe row prints `BROKEN  … the mutation did
+not change its input; nothing was evaluated`.
+
+**Proposed mechanization** (improvement pass; a check change across 19 files, so not this unit):
+nineteen other harnesses carry a `negative_control()` loop and none of them has the guard.
+`dev/tests/negative-controls-name-their-rule.py` is already the meta-lint over controls and is the
+place for it — either it requires the guard in each loop, or the loop moves to one shared helper the
+meta-lint can point at. The second is better: a guard nineteen files each implement is nineteen
+chances to implement it wrong.
+
+**Related:** [[LSN-048]] (a `-run` pattern that matched nothing scored three unevaluated mutants as
+survivors) · [[LSN-049]] (an applier that died and its `0` was read as the suite passing) ·
+[[LSN-035]] (a check that goes quiet reads identically to a passing one).

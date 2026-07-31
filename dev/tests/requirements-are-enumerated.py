@@ -342,6 +342,57 @@ def dump_requirements(entries: dict[str, dict]) -> str:
 # AN EMPTY `checks:` IS A FINDING, NOT A WAIVER. It means no check claims the requirement, and it
 # is published in verification/coverage.yaml's `uncovered:` list on every run.
 #
+#
+# HOW THE CURATION IS ARGUED
+# --------------------------
+# Grouped, on verification/traceability.yaml's precedent: the arguments live here, in one header,
+# and no entry carries a per-entry rationale. A rationale beside every mapping is a second thing to
+# keep in step with the mapping itself, and the entries are generated territory.
+#
+# SECTION CITATION IS NOT COVERAGE. A catalog row whose SRC column names the section is a candidate
+# for its requirements, not a mapping for them: 09 section 6's SRC records where a check came from,
+# and a section can hold obligations its own check never reaches. Every mapping below was decided by
+# reading the requirement against the check's assertion text. Where a check carries only part of a
+# conjunction, every check carrying part of the load is listed -- the normal case, as in
+# traceability.yaml.
+#
+# A REQUIREMENT WITH NO HONEST CHECK IS LEFT UNMAPPED, and the gap is published by ID rather than
+# closed with the nearest-looking catalog row. A mapping nobody established would make V-MET-002
+# green over a requirement nothing asserts, which is the failure V-MET-014 names.
+#
+# The mapping is NOT restricted to the owning suite. V-MET-002's property is "maps to at least one
+# check", any ID in the 09 section 6 catalog; coverage-ratchet.yaml's per-section suite ownership is
+# a different question (which suites are load-bearing for a section) and is not a filter on this
+# file. Several of 06's rows are covered by V-CMP-010 or V-MET-005, neither of which owns a 06
+# section.
+#
+# Document 06, section by section. 06 section 1.1's budget-field table resolves as a unit under
+# V-PRO-029 (one definition site per default and ceiling, an over-ceiling leaf clamping rather than
+# winning). Section 1.2's V-1..V-10 rows are V-CTR-002, which requires a negative test per rule with
+# the field path in the message. Section 4.2's code-floor rule rows take V-MET-005 and V-GAT-001
+# together and neither alone: V-MET-005 guarantees the rule set and the corpus stay in step,
+# V-GAT-001 asserts the corpus passes in full, and a rule row is covered only when both hold.
+# Section 4.3's ten ActionRecord phases are V-CTR-006 (every legal transition succeeds, every
+# illegal one is rejected) plus, per phase, the check that owns the phase's own behaviour. Section
+# 4.4's nine fail-closed rules are V-CTR-015, which asserts them as one decision function and so
+# covers exactly R-06.4.4-9..17. Schema field tables throughout take V-CMP-010, the field-level diff
+# between 06's schema block and the generated OpenAPI/type.
+#
+# Published gaps in 06 -- five requirements deliberately left unmapped, because no catalog row
+# asserts them:
+#   R-06.2.3-6   "developer-team actor: none in v1". Nothing asserts the ABSENCE of a
+#                developer-team actor GSA; every containment check asserts what a principal
+#                cannot do, not that a principal does not exist.
+#   R-06.4.2-17  a `fieldPaths` entry beginning with `/` is rejected at ChangePolicy admission.
+#                No check asserts ChangePolicy dialect admission at all.
+#   R-06.4.2-30  the `secret-material-egress` rule.
+#   R-06.4.2-44  the live-Secret digest comparison method,
+#                `sha256(secretNamespace || 0x1f || value)`.
+#   R-06.4.2-45  digests are never journaled or logged; `reasons[]` names the source Secret and
+#                key, never the value.
+# The last three are one hole: no check in the catalog reaches secret-material handling inside the
+# code floor. Closing it is a catalog change, not a curation change.
+#
 # {len(entries)} requirements.
 
 """
@@ -721,7 +772,7 @@ def negative_control() -> int:
         ),
         (
             "a requirement is marked covered without a check",
-            _mutate(base, 1, lambda t: t.replace("  covered: 0", "  covered: 12", 1)),
+            _mutate(base, 1, lambda t: re.sub(r"^(  covered: )(\d+)$", lambda m: f"{m.group(1)}{int(m.group(2)) + 1}", t, count=1, flags=re.M)),
             "coverage is stale",
         ),
         (
@@ -738,6 +789,16 @@ def negative_control() -> int:
 
     failures = 0
     for name, args, needle in mutations:
+        # A mutation that did not change its input cannot be evaluated. Without this arm the
+        # unmutated tree is re-checked, comes back clean, and the row prints MISS -- which reads as
+        # "the check let the defect through" when what happened is that the defect was never
+        # applied. A no-op is how a mutation keyed to a literal from the tree ("covered: 0") dies
+        # the day the tree moves past it.
+        if args == base:
+            failures += 1
+            print(f"  BROKEN  {name}")
+            print("           the mutation did not change its input; nothing was evaluated")
+            continue
         findings = check(*args)
         hit = any(needle in f for f in findings)
         print(f"  {'caught ' if hit else 'MISS   '} {name}")
