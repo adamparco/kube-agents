@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -261,6 +262,111 @@ func TestSetPhaseKeepsStatusAndLabelInStep(t *testing.T) {
 	}
 	if got.Labels[StatusLabel] != string(agentv1alpha1.PhaseVerified) {
 		t.Fatalf("%s = %q after a second transition", StatusLabel, got.Labels[StatusLabel])
+	}
+}
+
+// The broker's grant is the reason this arm exists. 06 §2.2.1 gives broker-operations
+// `actionrecords get list watch create` and `actionrecords/status get update patch`, and withholds
+// `update` on the main resource deliberately -- the broker appends and advances status, it can never
+// rewrite or remove a record. `kube-agents/status` is a LABEL, so keeping it in step is an `update`
+// on the main resource and always will be. Before this arm, that meant every terminal transition the
+// broker took returned a hard error for an action that had already executed and whose authoritative
+// `status.phase` had already landed through the subresource the grant does allow -- surfaced to the
+// caller as an HTTP 500 on a successful action, which is a false negative in the audit trail.
+//
+// Found live: `dev/verify/broker-execute-l2.sh` reached step 11 against
+// `gke-scratch-kube-agents-dev` and failed with exactly this Forbidden.
+func TestSetPhaseSurvivesAnIndexWriteTheGrantForbids(t *testing.T) {
+	ctx := context.Background()
+	forbidden := apierrors.NewForbidden(
+		schema.GroupResource{Group: "kubeagents.x-k8s.io", Resource: "actionrecords"},
+		"ar-01jzq8x9k7m4n2p6r8t0v3w5yz",
+		errors.New(`User "system:serviceaccount:kubeagents-system:platform-p-actor" cannot update resource "actionrecords"`))
+
+	var updates int
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithStatusSubresource(&agentv1alpha1.ActionRecord{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: dropStatusLikeTheApiServer,
+			// Only the MAIN resource is refused. `Status().Update` routes through SubResourceUpdate,
+			// which is left alone -- modelling the grant as it is written, not as a blanket denial,
+			// because a blanket denial would also have caught a bug in the status write and this
+			// test would then not be about the label at all.
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				updates++
+				return forbidden
+			},
+		}).
+		Build()
+	s := NewStore(c, newMemBlob())
+
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "platform/my-project/cluster-a/team-x")
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := s.SetPhase(ctx, ar, agentv1alpha1.PhaseVerified, "executed"); err != nil {
+		t.Fatalf("SetPhase reported failure for an action whose outcome WAS journaled: %v", err)
+	}
+	if updates == 0 {
+		t.Fatal("the label sync was never attempted, so this test proves nothing about tolerating its refusal")
+	}
+
+	var got agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	// The authoritative field landed. That is what makes swallowing the index failure legitimate.
+	if got.Status.Phase != agentv1alpha1.PhaseVerified {
+		t.Fatalf("status.phase = %q, want %q -- the outcome was not journaled at all", got.Status.Phase, agentv1alpha1.PhaseVerified)
+	}
+	if got.Status.Message != "executed" {
+		t.Fatalf("status.message = %q", got.Status.Message)
+	}
+	// The index legitimately lags. `JournalReconciler.repairStatusLabel` closes it, running in the
+	// operator, which does hold `update`.
+	if got.Labels[StatusLabel] == string(agentv1alpha1.PhaseVerified) {
+		t.Fatal("the label was refused by the API server and yet came back updated; the fake is not modelling the grant")
+	}
+	// And the caller's copy must not claim otherwise. Adopting live.Labels on this path would make
+	// an in-memory read of the index disagree with the server -- the exact drift the whole
+	// status/label pair exists to avoid.
+	if ar.Labels[StatusLabel] == string(agentv1alpha1.PhaseVerified) {
+		t.Fatalf("the caller's copy says %s=%q, but that write was refused", StatusLabel, ar.Labels[StatusLabel])
+	}
+	if ar.Status.Phase != agentv1alpha1.PhaseVerified {
+		t.Fatalf("the caller's copy did not adopt the status that DID land: %q", ar.Status.Phase)
+	}
+}
+
+// A Forbidden is the RBAC model working as specified; every other failure is not, and must still
+// reach the caller. Narrowing the tolerance is the difference between "this write is closed to me by
+// design" and "this write is broken", and only the first one is safe to continue past.
+func TestSetPhaseStillFailsOnAnIndexWriteThatIsNotForbidden(t *testing.T) {
+	ctx := context.Background()
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithStatusSubresource(&agentv1alpha1.ActionRecord{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: dropStatusLikeTheApiServer,
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				return apierrors.NewInternalError(errors.New("etcdserver: request timed out"))
+			},
+		}).
+		Build()
+	s := NewStore(c, newMemBlob())
+
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "platform/my-project/cluster-a/team-x")
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	err := s.SetPhase(ctx, ar, agentv1alpha1.PhaseVerified, "executed")
+	if err == nil {
+		t.Fatal("SetPhase swallowed a transient index failure; only a Forbidden is a by-design refusal")
+	}
+	if !strings.Contains(err.Error(), StatusLabel) {
+		t.Fatalf("the error does not say which write failed: %v", err)
 	}
 }
 

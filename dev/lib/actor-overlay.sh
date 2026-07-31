@@ -54,6 +54,12 @@ ACTOR_OVERLAY_WRITE_FIXTURE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../verify/fixt
 # exactly like the 403 it is trying to eliminate.
 ACTOR_OVERLAY_PROPAGATION_TIMEOUT="${ACTOR_OVERLAY_PROPAGATION_TIMEOUT:-60}"
 
+# The kinds the namespaced-containment probe asks about, in `resource.group` form (a dot, never a
+# slash — [[LSN-044]] is about the slash and this is the shape that avoids it). Exactly the kinds
+# `actor-tenant-grant.yaml` grants and no others: a probe about a kind the overlay does not grant
+# measures the actor's own authority and calls the answer a property of the overlay.
+ACTOR_OVERLAY_CONTAINMENT_PROBES="configmaps pods services deployments.apps replicasets.apps statefulsets.apps"
+
 # actor_overlay_actor_sa <kubectl-cmd> <agent-namespace> <agent>
 #   The actor identity the controller RESOLVED, printed on stdout. Empty output + rc 1 when the CR
 #   has not published one, which is a real answer: it means the broker is not reconciled and any
@@ -79,10 +85,30 @@ actor_overlay_actor_sa() {
 #   can-i proves the decision changed. No positional word here contains a `/` ([[LSN-044]]).
 actor_overlay_apply() {
   local K="$1" ns="$2" agent="$3" tenant_ns="$4"
-  local sa subject waited
+  local sa subject waited probe before after leaked
 
   sa="$(actor_overlay_actor_sa "$K" "$ns" "$agent")" || return 1
   subject="system:serviceaccount:${ns}:${sa}"
+
+  # CONTAINMENT IS MEASURED BEFORE, SO IT CAN BE MEASURED AS A DIFFERENCE.
+  #
+  # This block used to be one line, asked after the grant: `can-i list configmaps -n kube-system`
+  # must answer `no`. That was sound for exactly as long as the actor held no reads of its own —
+  # which was true from P9-T8b-4b-ii-1, when this library was written, until P9-T9b-5b-0-ii-b put
+  # the READ half of 06 §2.2 on the install path. A platform actor is now granted `configmaps`
+  # get/list/watch CLUSTER-WIDE by specification, so the line began reporting the tier's own read
+  # profile as an overlay leak, and `actor-overlay-admission-l2.sh` L2-6 went red on a cluster
+  # where nothing had leaked.
+  #
+  # The absolute form was never the property. "This overlay did not reach outside its namespace"
+  # is a statement about a CHANGE, and the way to measure a change is to ask the same question
+  # twice. The differential is also strictly stronger than what it replaces: it covers all six
+  # kinds the fixture grants instead of one, and it cannot go stale again when 06 §2.2 next grows,
+  # because it makes no assumption whatsoever about what the actor could already do.
+  local baseline=""
+  for probe in $ACTOR_OVERLAY_CONTAINMENT_PROBES; do
+    baseline="$baseline $probe=$($K auth can-i list "$probe" -n kube-system --as="$subject" 2>/dev/null)"
+  done
 
   KAGE_TENANT_NS="$tenant_ns" KAGE_ACTOR_NS="$ns" KAGE_ACTOR_SA="$sa" \
     envsubst '${KAGE_TENANT_NS} ${KAGE_ACTOR_NS} ${KAGE_ACTOR_SA}' <"$ACTOR_OVERLAY_FIXTURE" |
@@ -100,11 +126,20 @@ actor_overlay_apply() {
         echo "  overlay: FAILED — $subject can write in $tenant_ns; the overlay is not read-only" >&2
         return 2
       fi
-      if [ "$($K auth can-i list configmaps -n kube-system --as="$subject" 2>/dev/null)" != "no" ]; then
-        echo "  overlay: FAILED — $subject can read kube-system; the overlay is not namespaced" >&2
-        return 2
-      fi
-      echo "  overlay: authorizer agrees after ${waited}s (read yes · write no · cross-namespace no)"
+      leaked=0
+      for probe in $ACTOR_OVERLAY_CONTAINMENT_PROBES; do
+        before="$(printf '%s' "$baseline" | tr ' ' '\n' | awk -F= -v p="$probe" '$1 == p { print $2; exit }')"
+        after="$($K auth can-i list "$probe" -n kube-system --as="$subject" 2>/dev/null)"
+        if [ "$before" != "$after" ]; then
+          echo "  overlay: FAILED — granting the tenant Role changed what $subject may do in" >&2
+          echo "           kube-system: 'list $probe' was '${before:-<no answer>}' before and is" >&2
+          echo "           '${after:-<no answer>}' after. A RoleBinding in $tenant_ns cannot do" >&2
+          echo "           that; the fixture has become cluster-scoped." >&2
+          leaked=1
+        fi
+      done
+      [ "$leaked" -eq 0 ] || return 2
+      echo "  overlay: authorizer agrees after ${waited}s (read yes · write no · kube-system unchanged across all $(printf '%s' "$ACTOR_OVERLAY_CONTAINMENT_PROBES" | wc -w | tr -d ' ') probed kinds)"
       return 0
     fi
     sleep 2
@@ -222,6 +257,13 @@ actor_overlay_apply_write() {
   #   kube-system:      namespaced containment, the property the Role kind is supposed to give
   #   roles:            V-CTN-037 P5 as a runtime fact — authority over RBAC is authority to widen
   #   nodes:            cluster scope, which no Role can confer and a stray ClusterRoleBinding can
+  #
+  # ALL FOUR ARE STILL ABSOLUTES, and deliberately so — they did not need the differential the read
+  # half above was rewritten into. Every one of them names a WRITE verb, or a kind (`nodes`) that
+  # appears in no tier's 06 §2.2 template at all, and Phase 9 renders only the READ half of §2.2.
+  # So no growth in the shipped profile can make any of these answer `yes` while the phase is dark.
+  # When P10-T1 renders the write half, `patch secrets` in particular stops being self-evidently
+  # `no` and this block needs the same treatment. Recorded here so it is found then and not after.
   actor_overlay_can "$K" "$subject" patch  secrets     no -n "$tenant_ns" || rc=2
   actor_overlay_can "$K" "$subject" patch  configmaps  no -n kube-system  || rc=2
   actor_overlay_can "$K" "$subject" create roles       no -n "$tenant_ns" || rc=2
