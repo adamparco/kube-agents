@@ -83,53 +83,21 @@ turns out to be wrong is closed with a reason, not recycled.
 
 **Last drained:** 2026-07-31
 
-### The LSN-060 gate arm keys on the control flag's spelling, so naming it in prose is a finding
-
-- **Kind:** finding
-- **Where:** `dev/tests/invariants-gate.py:2955` (`check_negative_controls_exercise_the_statement_under_test`)
-- **Why it matters:** the arm's test for "this suite has a control mode" is
-  `if "--negative-control" not in text: continue` — a substring search over the whole file. Any
-  script that merely _mentions_ the flag is then required to carry a
-  `NEGATIVE CONTROL DOES NOT EXERCISE:` block describing a mode it does not have. It fired on
-  `dev/verify/verify-phase9.sh` during `P9-T9b-5b-ii-b-2`, whose new §G arm has to reason about
-  whether a claimant's control runs at L0. Worked around in that unit by matching the invocation's
-  _shape_ instead (`<suite>.sh <flag>` on a live `L0-CHAIN.txt` line), which is defensible on its own
-  terms — the flag is a convention, the property is "reached from the no-cluster chain" — but the
-  gate arm should recognise a mode by its **handler** (a `case`/`if` on `$1`, or the flag appearing
-  in an argument parse) rather than by the string appearing anywhere, including in a comment. As it
-  stands the arm taxes writing about controls, and the cheapest way to satisfy it is to stop naming
-  them. Guardrail 9 kept the fix out of that unit.
-- **Priority:** normal
-- **Added:** 2026-07-31
-
----
-
-### `kubeagents-router` has been in CrashLoopBackOff on the scratch cluster for at least four days
-
-- **Kind:** finding
-- **Where:** `deploy/kubeagents-router` on `gke-scratch-kube-agents-dev`; `k8s-operator/cmd/router/main.go:71`; whatever provisioning step is supposed to set `KAGE_PROJECT_ID`
-- **Why it matters:** the pod dies on `missing required --project-id / KAGE_PROJECT_ID` and every
-  ReplicaSet back to the deployment's creation is `0/0 created`, so the router has **never** run on
-  this cluster. Nothing in `dev/L2-CHAIN.txt` asserts router readiness, which is why four days
-  passed without a red line — `reload-images.sh all` reports it as a NOTE and returns rc 5, and rc 5
-  is not a value anything reads. Two questions for the drain: whether the missing variable is a
-  scratch-cluster provisioning gap or a defect in the deployment the operator ships (**the live
-  install should be looked at, read-only, for the same thing**), and whether "the ChatOps front door
-  is up" belongs in the L2 chain before the Phase 9 milestone runs on this cluster.
-- **Priority:** normal
-- **Added:** 2026-07-31
+_(empty)_
 
 ---
 
 ## Scheduled
 
-| ID    | Title                                                                              | Kind                   | Scheduled into                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | On         |
-| ----- | ---------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| B-003 | Ruling on the deferred `/replay` question: reshape V-BRK-021, do not narrow it     | finding (human ruling) | **`phase-9.md` P9-T7c-2c**, inserted as the next unit — ahead of the two remaining tasks, because it is L0 and Phase 9's own ordering rule puts the remaining L0 work in front of the remaining L2 work. The **implementation** of `/replay` and `/approve` is explicitly NOT in it; that stays in Phase 10 beside P10-T4 / P10-T7, as the item's own point 3 asks                                                                                                                                                                                               | 2026-07-30 |
-| B-005 | Run the builds on a provisioned, warm builder instead of standing one up per build | task                   | **The next improvement pass, step (1) only — the measurement.** Its steps (2) and (3) are implementation and may not be scheduled into a pass; the numbers the pass produces schedule their own unit. The item's own gate ("measure with the leak cleaned up") is satisfied for free by the ordering: the next pass fires at the Phase 9 milestone, which is after B-004. The **Spotlight sub-finding** (63 975 indexed entries under `GOCACHE`, `.metadata_never_index` as the cheap test) travels with this item, not with B-004 — the indexer orphans nothing | 2026-07-30 |
-| B-006 | 06 §4.4 row 3 promises an auto-pause the broker never performs                     | finding                | **`phase-9.md` P9-T9c**, appended to the Phase 9 ladder ahead of `harness-milestone` — it displaces nothing, because it is added at the end rather than inserted. The **check** question travels separately to the next improvement pass: 09 has no ID covering row 3's pause, and adding one is a spec edit a pass makes, not a unit                                                                                                                                                                                                                            | 2026-07-31 |
-| B-007 | A retired grant's residue on the scratch cluster still confers the journal verbs   | finding                | **The next improvement pass**, all three of its consequences. The mechanization is a check ("no RBAC object outside the rendered set grants an agent identity the journal verbs") and a provisioning-lifecycle rule, which is a pass's subject and not a unit's. The **live-install look** rides with it as a read-only `auth can-i` / `get role` comparison against `platform-agent-host` — verification only                                                                                                                                                   | 2026-07-31 |
-| B-008 | A negative control cannot see the probe→suite line-tag contract                    | finding                | **The next improvement pass.** An L0 line asserting that the tag set `broker_refuse_probe.py` can emit equals the tag set `broker-refuse-l2.sh` reads, generalised across all three probe/suite pairs. A check change, added to `dev/L0-CHAIN.txt` at its one definition site                                                                                                                                                                                                                                                                                    | 2026-07-31 |
+| ID    | Title                                                                                              | Kind                   | Scheduled into                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | On         |
+| ----- | -------------------------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| B-003 | Ruling on the deferred `/replay` question: reshape V-BRK-021, do not narrow it                     | finding (human ruling) | **`phase-9.md` P9-T7c-2c**, inserted as the next unit — ahead of the two remaining tasks, because it is L0 and Phase 9's own ordering rule puts the remaining L0 work in front of the remaining L2 work. The **implementation** of `/replay` and `/approve` is explicitly NOT in it; that stays in Phase 10 beside P10-T4 / P10-T7, as the item's own point 3 asks                                                                                                                                                                                               | 2026-07-30 |
+| B-005 | Run the builds on a provisioned, warm builder instead of standing one up per build                 | task                   | **The next improvement pass, step (1) only — the measurement.** Its steps (2) and (3) are implementation and may not be scheduled into a pass; the numbers the pass produces schedule their own unit. The item's own gate ("measure with the leak cleaned up") is satisfied for free by the ordering: the next pass fires at the Phase 9 milestone, which is after B-004. The **Spotlight sub-finding** (63 975 indexed entries under `GOCACHE`, `.metadata_never_index` as the cheap test) travels with this item, not with B-004 — the indexer orphans nothing | 2026-07-30 |
+| B-006 | 06 §4.4 row 3 promises an auto-pause the broker never performs                                     | finding                | **`phase-9.md` P9-T9c**, appended to the Phase 9 ladder ahead of `harness-milestone` — it displaces nothing, because it is added at the end rather than inserted. The **check** question travels separately to the next improvement pass: 09 has no ID covering row 3's pause, and adding one is a spec edit a pass makes, not a unit                                                                                                                                                                                                                            | 2026-07-31 |
+| B-007 | A retired grant's residue on the scratch cluster still confers the journal verbs                   | finding                | **The next improvement pass**, all three of its consequences. The mechanization is a check ("no RBAC object outside the rendered set grants an agent identity the journal verbs") and a provisioning-lifecycle rule, which is a pass's subject and not a unit's. The **live-install look** rides with it as a read-only `auth can-i` / `get role` comparison against `platform-agent-host` — verification only                                                                                                                                                   | 2026-07-31 |
+| B-008 | A negative control cannot see the probe→suite line-tag contract                                    | finding                | **The next improvement pass.** An L0 line asserting that the tag set `broker_refuse_probe.py` can emit equals the tag set `broker-refuse-l2.sh` reads, generalised across all three probe/suite pairs. A check change, added to `dev/L0-CHAIN.txt` at its one definition site                                                                                                                                                                                                                                                                                    | 2026-07-31 |
+| B-010 | The router crashloop's two survivors: no ledger row for it, and the live install unlooked-at       | finding (split)        | **The Phase 9 `harness-milestone`**, for the Deferrals row — the milestone is the step that writes deferrals, and this is a known-state disclosure rather than a repair. **The next improvement pass** for the live-install read-only look, riding with B-007's, which targets the same cluster with the same `auth can-i` / `get` shape. The crashloop ITSELF is refused — see B-009 in `## Refused`                                                                                                                                                            | 2026-07-31 |
+| B-011 | The LSN-060 gate arm detects a control mode by substring, so naming the flag in prose is a finding | finding                | **The next improvement pass.** Recognise a control mode by its HANDLER — the flag reaching an argument parse or a `case` on `$1` — rather than by the string appearing anywhere in the file, comments included. A check change at one definition site, which is a pass's subject and not a unit's; Guardrail 9 kept it out of the unit that tripped it                                                                                                                                                                                                           | 2026-07-31 |
 
 **The 2026-07-31 drain — three items the HARNESS wrote to its own inbox, and why that is not a
 protocol violation.** This file's rule is that humans write it and the harness drains it. All three
@@ -460,12 +428,95 @@ about processes that outlive their parent; this is about work the machine is doi
 
 ---
 
+### B-009 / B-010 / B-011 — the second 2026-07-31 drain's reasoning
+
+Two items, three IDs, because the router item resolves **both** ways and this file's rule is that an
+ID is never reused: the finding as stated is refused (**B-009**, in `## Refused`), and the two things
+it got right that the refusal does not answer are scheduled separately (**B-010**).
+
+**Severity: neither item is a live security regression.** B-009 describes a pod that has never
+started on a scratch cluster, which grants nothing and reaches nothing. B-011 describes a gate arm
+that is too eager — it fails builds it should pass, never the reverse — so its failure mode is
+friction, not permissiveness.
+
+**Why the router crashloop is refused rather than scheduled.** `dev/cluster/up.sh:280` prints a
+banner headed "THE ROUTER CRASHLOOPS HERE, AND THAT IS THE CORRECT OUTCOME, not a broken bring-up",
+and carries the _opposite_ banner for the case where the router comes up — which it calls a ledger
+edit. `config/router/deployment.yaml` ships `KAGE_PROJECT_ID` and `KAGE_INBOUND_SUBSCRIPTION` as
+empty strings deliberately, per **V-CMP-003**, so a missing value fails by naming the variable to set
+instead of letting a placeholder flow into the Pub/Sub client and resurface later as an
+uninterpretable credentials error; the ServiceAccount carries no Workload Identity annotation for the
+same reason. `provision_03` step 5 is what sets them on a real install. So the item's first question
+— provisioning gap or shipped-deployment defect — is answered "neither": it is the shipped
+deployment's designed behaviour in the absence of a provisioning step an inner-loop cluster does not
+run.
+
+**The item's third question is answered here rather than queued.** Router readiness does **not**
+belong in `dev/L2-CHAIN.txt`. A chain line asserting a pod the design expects to crashloop would
+assert the opposite of the design, and the routing logic is already proven hermetically against the
+`pstest` fake (`go test ./internal/router/`). Adding the line would make every scratch cluster red
+for a reason the tree already documents as correct.
+
+**What B-010 keeps.** Two survivors the refusal does not dispose of. (1) None of the above is in
+`LEDGER.md`, so an ORIENT cannot learn it without reading `up.sh` — that is a **Deferrals** row, and
+the milestone is the step that writes deferrals, so it goes to the Phase 9 `harness-milestone`. (2)
+The live install has never been checked for the same gap; that is a read-only look at
+`platform-agent-host`, which is verification-only and never a destructive target, and it rides with
+B-007's improvement-pass work because that already points the same `auth can-i` / `get` shape at a
+cluster.
+
+**Why B-011 waits for the pass rather than landing now.** It is a change to a check at its one
+definition site, motivated by a failure the unit in front of it hit — Guardrail 9's exact case. The
+unit worked around it in a way that is better on its own terms (matching the invocation's shape, not
+the flag's spelling), so nothing is blocked by the delay.
+
+### The LSN-060 gate arm keys on the control flag's spelling, so naming it in prose is a finding
+
+- **Kind:** finding
+- **Where:** `dev/tests/invariants-gate.py:2955` (`check_negative_controls_exercise_the_statement_under_test`)
+- **Why it matters:** the arm's test for "this suite has a control mode" is
+  `if "--negative-control" not in text: continue` — a substring search over the whole file. Any
+  script that merely _mentions_ the flag is then required to carry a
+  `NEGATIVE CONTROL DOES NOT EXERCISE:` block describing a mode it does not have. It fired on
+  `dev/verify/verify-phase9.sh` during `P9-T9b-5b-ii-b-2`, whose new §G arm has to reason about
+  whether a claimant's control runs at L0. Worked around in that unit by matching the invocation's
+  _shape_ instead (`<suite>.sh <flag>` on a live `L0-CHAIN.txt` line), which is defensible on its own
+  terms — the flag is a convention, the property is "reached from the no-cluster chain" — but the
+  gate arm should recognise a mode by its **handler** (a `case`/`if` on `$1`, or the flag appearing
+  in an argument parse) rather than by the string appearing anywhere, including in a comment. As it
+  stands the arm taxes writing about controls, and the cheapest way to satisfy it is to stop naming
+  them. Guardrail 9 kept the fix out of that unit.
+- **Priority:** normal
+- **Added:** 2026-07-31
+
+---
+
+---
+
 ## Refused
 
-| ID  | Title | Why not | On  |
-| --- | ----- | ------- | --- |
+| ID    | Title                                                                                          | Why not                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | On         |
+| ----- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| B-009 | `kubeagents-router` has been in CrashLoopBackOff on the scratch cluster for at least four days | **It is the documented and correct outcome on an inner-loop cluster, and the tree says so at bring-up.** `dev/cluster/up.sh:280` prints a banner headed "THE ROUTER CRASHLOOPS HERE, AND THAT IS THE CORRECT OUTCOME, not a broken bring-up", and carries the opposite banner for the case where it comes up — which it calls a ledger edit. `config/router/deployment.yaml` ships `KAGE_PROJECT_ID` and `KAGE_INBOUND_SUBSCRIPTION` as EMPTY strings **deliberately**, per V-CMP-003, so the failure names the variable to set instead of letting a placeholder flow into the Pub/Sub client and resurface as a missing-credentials error; the ServiceAccount carries no Workload Identity annotation for the same reason. Wiring them needs a real Pub/Sub subscription and a GSA — L3 work on a live install, not something an inner-loop cluster can or should invent. `provision_03` step 5 is what sets them. **The item's third question is answered NO here rather than queued:** router readiness does not belong in `dev/L2-CHAIN.txt`, because a chain line asserting a pod the design expects to crashloop would assert the opposite of the design, and the routing logic is already proven hermetically against the `pstest` fake (`go test ./internal/router/`). What the item got RIGHT is split out as the scheduled B-010: nothing in `LEDGER.md` records any of this, so ORIENT cannot learn it without reading `up.sh`, and the live install has never been checked for the same gap | 2026-07-31 |
 
-_(empty)_
+---
+
+### `kubeagents-router` has been in CrashLoopBackOff on the scratch cluster for at least four days
+
+- **Kind:** finding
+- **Where:** `deploy/kubeagents-router` on `gke-scratch-kube-agents-dev`; `k8s-operator/cmd/router/main.go:71`; whatever provisioning step is supposed to set `KAGE_PROJECT_ID`
+- **Why it matters:** the pod dies on `missing required --project-id / KAGE_PROJECT_ID` and every
+  ReplicaSet back to the deployment's creation is `0/0 created`, so the router has **never** run on
+  this cluster. Nothing in `dev/L2-CHAIN.txt` asserts router readiness, which is why four days
+  passed without a red line — `reload-images.sh all` reports it as a NOTE and returns rc 5, and rc 5
+  is not a value anything reads. Two questions for the drain: whether the missing variable is a
+  scratch-cluster provisioning gap or a defect in the deployment the operator ships (**the live
+  install should be looked at, read-only, for the same thing**), and whether "the ChatOps front door
+  is up" belongs in the L2 chain before the Phase 9 milestone runs on this cluster.
+- **Priority:** normal
+- **Added:** 2026-07-31
+
+---
 
 ---
 
