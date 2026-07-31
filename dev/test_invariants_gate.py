@@ -1030,6 +1030,78 @@ class PhaseRatchetIsAsserted(unittest.TestCase):
                 rc = mod.negative_control(9)
             return rc, buf.getvalue()
 
+    def _fixture_tables(self, mod=None):
+        """The two synthetic acceptance tables the future-tree tests run against.
+
+        ONE definition site, and it reads **09 only** -- never `docs/build/phase-9.md`. That is the
+        whole property; see the PARTIAL test's docstring for the failure that bought it.
+
+        `mod` is threaded in rather than loaded here so the test below can hand it a module pointed
+        at a different repository. Calling `_load_phase_ratchet()` internally would return a fresh
+        module every time and silently ignore the caller's patch -- which it did, and the mutant
+        for the sampled-off-the-document defect ESCAPED as a result.
+        """
+        mod = mod or _load_phase_ratchet()
+        spec_text = mod.SPEC.read_text()
+        required = sorted(mod.parse_ratchet(spec_text, 9, mod.parse_catalog(spec_text)).required)
+        return set(required), set(required[::2])
+
+    def test_the_stageability_guard_refuses_two_identical_hypothetical_tables(self):
+        """The detector added above, exercised directly rather than assumed.
+
+        `assert_hypotheticals_distinct` is the only arm that can see a hypothetical acceptance
+        table sampled off the live one while the live one still looks wrong. A detector whose only
+        evidence is "the thing it detects is not happening today" can be deleted with every gate
+        green, so it gets a test of its own.
+        """
+        mod = _load_phase_ratchet()
+        same = ({"V-GAT-001", "V-GAT-002"}, {"V-GAT-001", "V-GAT-002"})
+        with self.assertRaises(mod.ParseError) as caught:
+            mod.assert_hypotheticals_distinct((("complete", same[0]), ("partial", same[1])))
+        self.assertIn("audits one tree twice", str(caught.exception))
+        # ...and it must not fire on two genuinely different tables.
+        mod.assert_hypotheticals_distinct(
+            (("complete", {"V-GAT-001", "V-GAT-002"}), ("partial", {"V-GAT-001"}))
+        )
+
+    def test_the_future_tree_fixtures_are_derived_from_09_and_not_from_the_phase_file(self):
+        """Swap the phase file for a mangled one; the fixtures must not move.
+
+        This is the arm that catches the defect on TODAY's tree. Both future-tree fixtures were
+        once sampled off the live acceptance table, and that is invisible until the day the table
+        is corrected -- at which point the fixture collapses onto the real document and the test it
+        feeds stops describing a future tree at all. A time bomb with a commit date on it.
+
+        There is no way to see that by running the fixture once, so the property asserted here is
+        the structural one: recompute the fixtures against a repository whose phase-9.md carries a
+        completely different acceptance table, and require the answer to be identical.
+        """
+        before = self._fixture_tables()
+        mod = _load_phase_ratchet()
+        real_repo, real_spec, real_results = mod.REPO, mod.SPEC, mod.RESULTS
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                (root / "docs/build").mkdir(parents=True)
+                (root / "docs/design").mkdir(parents=True)
+                (root / "verification").mkdir(parents=True)
+                (root / "docs/build/phase-9.md").write_text(
+                    mod.ACCEPTANCE_HEADING + "\n\n| (a) | V-GAT-001 |\n\n## Something else\n"
+                )
+                (root / "docs/design/09-verification-and-validation.md").write_text(real_spec.read_text())
+                (root / "verification/results.csv").write_text(real_results.read_text())
+                mod.REPO, mod.SPEC = root, root / "docs/design/09-verification-and-validation.md"
+                mod.RESULTS = root / "verification/results.csv"
+                after = self._fixture_tables(mod)
+        finally:
+            mod.REPO, mod.SPEC, mod.RESULTS = real_repo, real_spec, real_results
+        self.assertEqual(
+            before,
+            after,
+            "a future-tree fixture moved when phase-9.md did, so it is sampled off the document it "
+            "is supposed to be a hypothetical alternative to",
+        )
+
     def test_the_control_still_stages_when_the_acceptance_table_is_COMPLETE(self):
         """[[LSN-053]] -- the tree the next unit builds, asserted rather than probed once.
 
@@ -1048,35 +1120,35 @@ class PhaseRatchetIsAsserted(unittest.TestCase):
         debt paid: the control is run against a phase file that names every required ID, and it
         must still stage and still catch everything.
         """
-        mod = _load_phase_ratchet()
-        spec_text = mod.SPEC.read_text()
-        catalog = mod.parse_catalog(spec_text)
-        required = mod.parse_ratchet(spec_text, 9, catalog).required
-        rc, out = self._control_against(required)
+        rc, out = self._control_against(self._fixture_tables()[0])
         self.assertNotIn("could not be staged", out, out)
         self.assertEqual(0, rc, out)
         # ...and it must still be the whole control, not the subset that could be staged.
         self.assertIn("20/20", out, out)
 
-    def test_the_control_still_stages_when_later_dated_ids_are_RETARGETED_out(self):
-        """The other tree on the ladder: the table keeps only what 09 §6 dates to phase 9 or before.
+    def test_the_control_still_stages_against_a_PARTIAL_acceptance_table(self):
+        """The other shape on the ladder: a table naming a proper subset of the required set.
 
         The complementary direction to the test above -- there the table grows to the full required
-        set, here it shrinks by the sixteen IDs 09 §6 dates to phases 10, 14 and 15. A control that
-        only works on the table as written today is a control that expires the next time the phase
-        file is corrected in either direction.
+        set, here it names only some of it, which is the shape both today's phase file and the one
+        `P9-T11c′` writes have. A control that only works on the table as written today is a
+        control that expires the next time the phase file is corrected in either direction.
+
+        THE SUBSET IS DERIVED FROM 09, NOT FROM THE LIVE TABLE. The first version of this test
+        built its fixture as "the live acceptance table minus what §6 dates after phase 9", and
+        `P9-T11c′` -- the unit this test was written to unblock -- then performed exactly that
+        subtraction on the real document, leaving nothing to subtract:
+
+            AssertionError: 39 not less than 39 : nothing to retarget -- the fixture proves nothing
+
+        That is the same borrow-the-artifact defect the whole `P9-T11c″` unit was about, sitting
+        one level up in the test that was supposed to prove it fixed. Sampling a hypothetical tree
+        off the real one produces a hypothetical that expires when the real one moves.
         """
-        mod = _load_phase_ratchet()
-        spec_text = mod.SPEC.read_text()
-        catalog = mod.parse_catalog(spec_text)
-        table = mod.parse_acceptance_table((gate.REPO / "docs/build/phase-9.md").read_text(), 9)
-        kept = {
-            c
-            for c in table
-            if (row := catalog.get(c)) is None or row.phase is None or row.phase <= 9
-        }
-        self.assertLess(len(kept), len(table), "nothing to retarget -- the fixture proves nothing")
-        rc, out = self._control_against(kept)
+        complete, partial = self._fixture_tables()
+        self.assertLess(len(partial), len(complete), "the fixture must be a PROPER subset")
+        self.assertTrue(partial, "the fixture must not be empty")
+        rc, out = self._control_against(partial)
         self.assertNotIn("could not be staged", out, out)
         self.assertEqual(0, rc, out)
         self.assertIn("20/20", out, out)

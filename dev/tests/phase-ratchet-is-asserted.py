@@ -537,6 +537,27 @@ def latest_phase() -> int:
     return max(phases)
 
 
+def assert_hypotheticals_distinct(hypotheticals: tuple[tuple[str, set[str]], ...]) -> None:
+    """The stageability guard's hypothetical acceptance tables must be DIFFERENT TABLES.
+
+    This is what makes "derive them from 09, never from the live table" mechanically checkable
+    rather than a comment. Derive either one from the document and there is a real acceptance table
+    that collapses them onto each other -- the first draft's "the live table minus what §6 dates
+    later" equals the complete table the moment the live table is complete -- and a guard auditing
+    the same tree twice reports two greens while covering one.
+
+    Lifted out of `stage()` so it can be exercised directly. A detector whose only test is "the
+    thing it detects is absent today" is a detector that can be deleted with every gate green.
+    """
+    (_, first), (_, second) = hypotheticals
+    if first == second:
+        raise ParseError(
+            "control: the two hypothetical acceptance tables are the same set, so the stageability "
+            "guard audits one tree twice -- a hypothetical derived from the live table is not a "
+            "hypothetical"
+        )
+
+
 def stage(phase: int) -> tuple[list[tuple], Ratchet, str]:
     """Build the perturbed inputs. Raises ParseError when a case cannot be staged -- see `pick`.
 
@@ -708,17 +729,31 @@ def stage(phase: int) -> tuple[list[tuple], Ratchet, str]:
         }
 
     # ---- the control must survive the phase file it audits getting CORRECT -------------------
-    # Re-derive every pool against the two acceptance tables this phase file is scheduled to become
-    # and refuse to stage if any of them empties. `complete` is the T11c‴ tree -- the table names
-    # every required ID, which is the tree that took this control from 20/20 to unstageable on
-    # 2026-07-31 -- and `retargeted` is the T11c′ tree, with the IDs 09 §6 dates after this phase
-    # gone from the table. A pool that survives both is a pool no acceptance-table edit can empty.
-    # [[LSN-053]]: a check owes the tree the next unit builds, and this is that debt paid for the
-    # two trees that were already on the ladder when the debt came due.
-    for name, tbl in (
+    # Re-derive every pool against the acceptance tables this phase file could become and refuse to
+    # stage if any of them empties. `complete` is the T11c‴ tree -- the table names every required
+    # ID, which is the tree that took this control from 20/20 to unstageable on 2026-07-31 -- and
+    # `partial` is any table naming a proper subset of the required set, which is the shape both
+    # today's tree and T11c′'s have. A pool that survives both is a pool no acceptance-table edit
+    # can empty. [[LSN-053]]: a check owes the tree the next unit builds.
+    #
+    # BOTH ARE DERIVED FROM 09, NOT FROM `table`. The first draft built the second one as
+    # "the live table minus what §6 dates after this phase", which is the same borrow-the-artifact
+    # defect this guard exists to catch, one level up: once T11c′ retargeted the real table there
+    # was nothing left to subtract, the hypothetical collapsed onto the live table, and the guard
+    # went from auditing two trees to auditing one. A hypothetical tree sampled off the real one is
+    # not a hypothetical.
+    ordered_required = sorted(required)
+    hypotheticals = (
         ("complete", set(required)),
-        ("retargeted", {c for c in table if (p := phase_of(c)) is None or p <= phase}),
-    ):
+        ("partial", set(ordered_required[::2])),
+    )
+    # The two must be DIFFERENT TABLES, and saying so is what makes the document-independence above
+    # mechanically checkable rather than a comment. Derive either one from `table` and there is a
+    # real acceptance table that collapses them onto each other -- the first draft's "the live table
+    # minus what §6 dates later" equals `complete` the moment the live table is complete -- and a
+    # guard auditing the same tree twice reports two greens and has stopped covering one of them.
+    assert_hypotheticals_distinct(hypotheticals)
+    for name, tbl in hypotheticals:
         for case, pool in victim_pools(tbl).items():
             if not pool:
                 raise ParseError(

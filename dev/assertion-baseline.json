@@ -271,8 +271,9 @@
       "test_restoring_the_main_only_push_trigger_fails",
       "test_the_acceptance_parse_expands_runs_and_stops_at_the_next_top_level_heading",
       "test_the_classifier_probe_does_not_match_the_routers_intent_classifier",
-      "test_the_control_still_stages_when_later_dated_ids_are_RETARGETED_out",
+      "test_the_control_still_stages_against_a_PARTIAL_acceptance_table",
       "test_the_control_still_stages_when_the_acceptance_table_is_COMPLETE",
+      "test_the_future_tree_fixtures_are_derived_from_09_and_not_from_the_phase_file",
       "test_the_ledgers_own_closed_row_still_matches",
       "test_the_negative_control_passes_and_covers_the_future_tree",
       "test_the_old_ratchet_arm_is_green_on_that_same_baseline",
@@ -284,6 +285,7 @@
       "test_the_skill_dropping_the_both_trees_rule_fails",
       "test_the_skill_dropping_the_negative_control_requirement_fails",
       "test_the_skill_dropping_the_rule_fails",
+      "test_the_stageability_guard_refuses_two_identical_hypothetical_tables",
       "test_the_state_this_lesson_was_found_in_fails",
       "test_the_tree_really_does_have_envtest_packages_to_protect",
       "test_the_tree_really_has_a_non_grandfathered_gate"
