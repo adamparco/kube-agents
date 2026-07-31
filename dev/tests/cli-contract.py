@@ -72,6 +72,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gitcorpus import repo_files  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
+SELF = Path(__file__).resolve()
 
 # Directories whose text is a historical record, not an instruction to a machine.
 EXCLUDED_DIRS = ("docs/build/",)
@@ -161,6 +162,12 @@ def discover_clis(repo: Path, tracked: list[str]) -> dict[str, dict]:
         if not rel.endswith(".py"):
             continue
         path = repo / rel
+        # This checker is itself an argparse CLI in the tracked tree. Probing it would run
+        # `cli-contract.py --help`, which scans again and probes itself again -- unbounded
+        # recursive spawn, each generation orphaning the next to init. Read its flags from
+        # source instead of executing it.
+        if path.resolve() == SELF:
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
@@ -247,6 +254,12 @@ def caller_files(repo: Path, tracked: list[str], cli_paths: set[str]) -> list[st
     out = []
     for rel in tracked:
         if rel in cli_paths:
+            continue
+        # Not a caller either. This file's docstring spells out example invocations
+        # (`resolver.py claim --report x`) to explain what the check does not cover; parsing
+        # them as real calls turns its own prose into findings. It was skipped here for free
+        # while it was in cli_paths -- keep that now that discovery excludes it.
+        if (repo / rel).resolve() == SELF:
             continue
         if any(rel.startswith(d) for d in EXCLUDED_DIRS):
             continue
@@ -361,6 +374,18 @@ def self_test() -> int:
 
 
 def main() -> int:
+    # This script takes no flags, so it never built a parser -- which meant `--help` fell
+    # through to a full scan rather than printing and exiting. Anything probing this tree
+    # with `--help` (including this checker) would start a recursive spawn. Answer it here.
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(
+            "usage: cli-contract.py [--help] [--self-test]\n\n"
+            "Checks that every flag a caller passes to a repo CLI is one that CLI defines.\n"
+            "Takes no other arguments; scans the tracked tree from the repo root.\n\n"
+            "  --help       show this message and exit\n"
+            "  --self-test  run the built-in controls instead of the scan\n"
+        )
+        return 0
     if "--self-test" in sys.argv:
         return self_test()
     findings, notes, scanned = run(REPO)
