@@ -487,6 +487,24 @@ that hit the gap got their evidence, through the fallback the skill itself names
 the mutants and their verdicts. What is broken is the _cost_ of doing so, and a recurring cost paid
 by the harness rather than by the product is the improvement pass's whole subject.
 
+**2026-07-31, from `P9-T11c″` — a third option the filing did not consider, and the item still
+stands.** That unit's check was the same shape: a phase-gate arm whose only catcher was its own
+`--negative-control`, so by this item's reasoning it was a third member of the corpus. It is not.
+The unit needed to assert the arm on a tree the repository has not reached yet, so it gave the
+future trees a `_control_against()` helper and two committed `unittest` cases — which moved the
+catcher **into** a unittest suite, and `verification/mutants/V-MET-014.json` then ran under the
+existing `"kind": "unittest"` at 6/6 with no runner change and no `dev/mutate.sh` fallback.
+
+What that changes for the pass is the framing, not the schedule. **A check whose only catcher is its
+own control is often a check that has not been given a catcher yet** — the control is a mode of the
+script, and a test that drives that script is an ordinary suite member. Before building
+`"kind": "command"`, the pass should ask of each corpus member whether the cheaper move is available
+to it, because a runner kind that reads a needle out of prose is a weaker contract than a test
+function: it can only assert that a string appeared, where a `unittest` case can assert the property.
+If both remaining members can take a unittest catcher the item may end up **refused with an
+argument** rather than built. The second half — the `harness-run` §5 edit — is untouched by this and
+still owed either way. The corpus is unchanged at two units: `P9-T11a-2` and `P9-T11a-3`.
+
 ### The LSN-060 gate arm keys on the control flag's spelling, so naming it in prose is a finding
 
 - **Kind:** finding

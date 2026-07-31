@@ -1,0 +1,88 @@
+{
+  "check": "V-MET-014",
+  "why": "V-MET-014 is the requirement that every check declare a negative control or an argued exemption, and `dev/tests/phase-ratchet-is-asserted.py` is the phase-gate arm whose control is the thing under test here. On 2026-07-31 that control read 20/20 and was nevertheless coupled to the document it audits: three of its five phase-filter cases picked their victim from \"required by 09 §10 and NOT named by phase-9.md's acceptance table\", so completing that table emptied the pools and the control went from 20/20 to unstageable. A control that only works while the artifact it audits stays wrong is the V-MET-014 failure mode wearing a green badge. These six mutants are about that coupling and nothing else: three restore it directly, one proves the early-warning guard is load-bearing, one proves the guard is not the only backstop, and one attacks the acceptance-section parse that the phase file's whole retarget-record structure now depends on.",
+  "suite": {
+    "kind": "unittest",
+    "dir": ".",
+    "packages": ["discover", "-p", "test_invariants_gate.py", "dev"]
+  },
+  "mutants": [
+    {
+      "id": "M1-name_in_table-prepends-instead-of-replacing",
+      "why": "The original defect, restored verbatim. Prepending leaves the live table's IDs in every synthesised tree, so `name_in_table(ids)` silently means \"ids, plus whatever phase-9.md happens to say today\". Invisible on the tree as committed -- which is exactly why it survived a 20/20 control -- and fatal on the tree the next unit builds.",
+      "catcher": "test_the_control_still_stages_when_the_acceptance_table_is_COMPLETE",
+      "edits": [
+        {
+          "file": "dev/tests/phase-ratchet-is-asserted.py",
+          "find": "        head, rest = phase_text.split(ACCEPTANCE_HEADING, 1)\n        tail = \"\\n## \" + rest.split(\"\\n## \", 1)[1] if \"\\n## \" in rest else \"\"\n        return head + ACCEPTANCE_HEADING + \"\\n\\n| \" + \" | \".join(ids) + \" |\\n\" + tail",
+          "replace": "        return phase_text.replace(\n            ACCEPTANCE_HEADING,\n            ACCEPTANCE_HEADING + \"\\n\\n| \" + \" | \".join(ids) + \" |\\n\",\n            1,\n        )"
+        }
+      ]
+    },
+    {
+      "id": "M2-push-later-reads-the-live-acceptance-table-again",
+      "why": "The term that caused it: a pool filtered by `c not in tbl`. With the stageability guard in place this must fail LOUDLY and on the ordinary run, not only on the future tree -- that is the guard's entire purpose, and a guard that only fires on a tree nobody runs is decoration.",
+      "catcher": "test_the_negative_control_passes_and_covers_the_future_tree",
+      "edits": [
+        {
+          "file": "dev/tests/phase-ratchet-is-asserted.py",
+          "find": "                if c not in ratchet.explicit and phase_of(c) is not None\n            ],",
+          "replace": "                if c not in ratchet.explicit and c not in tbl and phase_of(c) is not None\n            ],"
+        }
+      ]
+    },
+    {
+      "id": "M3-the-under-naming-case-borrows-the-live-document",
+      "why": "The subtler half of the same coupling, and the one that survived the first repair: a case whose whole claim is \"the phase file under-names its ratchet\" staged the phase file itself and relied on it being wrong by 43 IDs. It passes today and ESCAPES the moment the table is completed, reporting a hole in property 4 that is really the control describing a tree the repository has left.",
+      "catcher": "test_the_control_still_stages_when_the_acceptance_table_is_COMPLETE",
+      "edits": [
+        {
+          "file": "dev/tests/phase-ratchet-is-asserted.py",
+          "find": "            name_in_table([c for c in required if c != victim_unnamed]),\n            future,\n            \"never names\",",
+          "replace": "            phase_text,\n            future,\n            \"never names\","
+        }
+      ]
+    },
+    {
+      "id": "M4-the-guard-goes-AND-the-pool-reads-the-table",
+      "why": "M2 with the early-warning removed. This is the mutant that says which arm is the real backstop: with the guard gone the ordinary run goes green again, and only the committed future-tree test can still tell that the control has quietly stopped being stageable on the tree the ladder is heading for. If this ESCAPED, the guard would be the single point of detection and the future-tree test would be decoration -- which is the arrangement [[LSN-053]] exists to forbid.",
+      "catcher": "test_the_control_still_stages_when_the_acceptance_table_is_COMPLETE",
+      "edits": [
+        {
+          "file": "dev/tests/phase-ratchet-is-asserted.py",
+          "find": "                if c not in ratchet.explicit and phase_of(c) is not None\n            ],",
+          "replace": "                if c not in ratchet.explicit and c not in tbl and phase_of(c) is not None\n            ],"
+        },
+        {
+          "file": "dev/tests/phase-ratchet-is-asserted.py",
+          "find": "        for case, pool in victim_pools(tbl).items():\n            if not pool:",
+          "replace": "        for case, pool in victim_pools(tbl).items():\n            if False:"
+        }
+      ]
+    },
+    {
+      "id": "M5-the-acceptance-section-swallows-the-next-top-level-heading",
+      "why": "phase-9.md records the sixteen IDs it retargeted out of the phase in a SIBLING `## ` section, because `parse_acceptance_table` stops there. Stop at `### ` instead and a sibling section is inside the acceptance section again -- so the paragraph explaining that V-BRK-016 is postponed goes on requiring V-BRK-016. That is [[LSN-019]] restored, and it would silently re-inflate the required set by everything the phase file documents as out of scope.",
+      "catcher": "test_the_acceptance_parse_expands_runs_and_stops_at_the_next_top_level_heading",
+      "edits": [
+        {
+          "file": "dev/tests/phase-ratchet-is-asserted.py",
+          "find": "    for stop in (\"\\n## \",):",
+          "replace": "    for stop in (\"\\n### \",):"
+        }
+      ]
+    },
+    {
+      "id": "M6-the-ellipsis-run-stops-expanding",
+      "why": "`V-RUN-001…005` stands for five IDs, and after the retarget four of them appear nowhere else in the table. An expander that quietly matches nothing drops them from the required set, which is the silently-smaller-spec failure this whole file exists to catch ([[LSN-048]]).",
+      "catcher": "test_the_acceptance_parse_expands_runs_and_stops_at_the_next_top_level_heading",
+      "edits": [
+        {
+          "file": "dev/tests/phase-ratchet-is-asserted.py",
+          "find": "    for suite, lo, hi in re.findall(r\"V-([A-Z]{3})-(\\d{3})\\s*(?:…|\\.\\.\\.)\\s*(\\d{3})\", section):",
+          "replace": "    for suite, lo, hi in re.findall(r\"V-([A-Z]{3})-(\\d{3})\\s+(?:…|\\.\\.\\.)\\s+(\\d{3})\", section):"
+        }
+      ]
+    }
+  ]
+}

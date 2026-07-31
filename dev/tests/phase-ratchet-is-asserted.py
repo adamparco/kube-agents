@@ -559,12 +559,20 @@ def stage(phase: int) -> tuple[list[tuple], Ratchet, str]:
     # table and not about results at all. The IDs go INSIDE that section -- appending them to the end
     # of the file would satisfy a whole-file grep and not the property, which is the distinction
     # property 4 exists to draw.
+    #
+    # It REPLACES the section rather than prepending to it. Prepending leaves the real table's IDs in
+    # the synthesised text, so `name_in_table(ids)` silently means "ids, plus whatever the live
+    # document happens to say today" -- and every case built on it is then a claim about the tree the
+    # repository is in rather than the tree the case describes. Three cases below pick a victim that
+    # must be ABSENT from the staged table, and under prepending they could only ever pick from IDs
+    # the live table omits: complete that table and the pools empty, `pick` refuses, and the control
+    # stops being stageable at all the day the artifact it audits gets correct. That is what happened
+    # on 2026-07-31 ([[LSN-053]] -- a check unit owes both trees, and this one owed the tree where
+    # the acceptance table is complete).
     def name_in_table(ids: list[str]) -> str:
-        return phase_text.replace(
-            ACCEPTANCE_HEADING,
-            ACCEPTANCE_HEADING + "\n\n| " + " | ".join(ids) + " |\n",
-            1,
-        )
+        head, rest = phase_text.split(ACCEPTANCE_HEADING, 1)
+        tail = "\n## " + rest.split("\n## ", 1)[1] if "\n## " in rest else ""
+        return head + ACCEPTANCE_HEADING + "\n\n| " + " | ".join(ids) + " |\n" + tail
 
     future = _synthesise_green(required)
     future_phase_text = name_in_table(required)
@@ -649,34 +657,85 @@ def stage(phase: int) -> tuple[list[tuple], Ratchet, str]:
             return c
         raise ParseError(f"control: no victim for the {case} case -- it cannot be staged at all")
 
-    # A suite member 09 §6 dates AFTER this phase, that nothing else already requires. Pulling it
-    # forward must make the future tree red; stripping its phase cell must too.
-    victim_later = pick((c for c in ratchet.deferred if c not in set(required)), "pull-forward")
-    # A suite member 09 §6 dates at or before this phase, reachable ONLY through suite expansion.
-    # Pushing it later must make a tree that omits it go green -- the arm that proves the filter
-    # removes, not merely that it is consulted.
-    victim_due = pick(
-        (
-            c
-            for c in ratchet.required
-            if c not in ratchet.explicit and c not in table and catalog[c].phase is not None
-        ),
-        "push-later",
-    )
-    without_due = [c for c in required if c != victim_due]
     # An ID this phase's own ratchet row does not name -- it is required only because a PRIOR row is.
     prior_only = ratchet.required - parse_ratchet(only_this_phases_row(spec_text), phase, catalog).required
-    victim_prior = pick((c for c in prior_only if c not in table), "prior-row")
+
+    # 09 §6 does not index every ID it mentions: V-CMP-006 is named by this phase file's acceptance
+    # table and has no catalog row at all, so every lookup here goes through `.get`.
+    def phase_of(check_id: str) -> int | None:
+        row = catalog.get(check_id)
+        return None if row is None else row.phase
+
+    def victim_pools(tbl: set[str]) -> dict[str, list[str]]:
+        """The four victim pools, as a function of the acceptance table they are staged against.
+
+        Defined ONCE and used twice -- to pick this run's victims from the real table, and to audit
+        that the pools survive the tables this phase file is scheduled to become. An audit that
+        re-states the pools is an audit a later edit drifts away from, and drift is how three of
+        these acquired a `c not in table` term nobody noticed.
+
+        That term was never about the property. It was compensating for `name_in_table` PREPENDING,
+        which left the live table's IDs in the staged text and so could not stage a victim the live
+        document happens to name. With the section replaced, the staged table is exactly the list
+        handed in, and only `pull-forward` -- whose victim must not be required by anything yet --
+        has any business reading `tbl` at all.
+        """
+        return {
+            # A suite member 09 §6 dates AFTER this phase, that nothing else already requires.
+            # Pulling it forward must make the future tree red; stripping its phase cell must too.
+            "pull-forward": [c for c in ratchet.deferred if c not in ratchet.required | tbl],
+            # A suite member 09 §6 dates at or before this phase, reachable ONLY through suite
+            # expansion. Pushing it later must make a tree that omits it go green -- the arm that
+            # proves the filter removes, rather than merely being consulted.
+            "push-later": [
+                c
+                for c in ratchet.required
+                if c not in ratchet.explicit and phase_of(c) is not None
+            ],
+            "prior-row": sorted(prior_only),
+            # A BLOCKING-ALWAYS ID the DERIVATION requires. Property 4 counts what 09 §10 requires
+            # and the table omits, so a victim drawn from the union `ratchet.required | table` is
+            # not good enough: on an uncorrected phase-9.md the first such ID is V-BRK-001, which
+            # the table names and the derivation does not, and omitting it from a staged table
+            # moves property 4 by nothing at all.
+            "under-naming": [c for c in sorted(ratchet.required) if c[:5] in BLOCKING_ALWAYS],
+            # The sharper half of the same claim: an ID a PRIOR row's suite carries, which 09 §6
+            # dates to THIS phase. Every accumulated row must be filtered against the phase under
+            # test and not against its own -- filtering each row by its own number re-shrinks
+            # exactly the set the accumulation widened, silently, by 11 IDs at phase 9, and
+            # `prior-row` cannot see it because a phase-8 ID under a phase-8 row survives untouched.
+            "carried-forward": [c for c in prior_only if phase_of(c) == phase],
+        }
+
+    # ---- the control must survive the phase file it audits getting CORRECT -------------------
+    # Re-derive every pool against the two acceptance tables this phase file is scheduled to become
+    # and refuse to stage if any of them empties. `complete` is the T11c‴ tree -- the table names
+    # every required ID, which is the tree that took this control from 20/20 to unstageable on
+    # 2026-07-31 -- and `retargeted` is the T11c′ tree, with the IDs 09 §6 dates after this phase
+    # gone from the table. A pool that survives both is a pool no acceptance-table edit can empty.
+    # [[LSN-053]]: a check owes the tree the next unit builds, and this is that debt paid for the
+    # two trees that were already on the ladder when the debt came due.
+    for name, tbl in (
+        ("complete", set(required)),
+        ("retargeted", {c for c in table if (p := phase_of(c)) is None or p <= phase}),
+    ):
+        for case, pool in victim_pools(tbl).items():
+            if not pool:
+                raise ParseError(
+                    f"control: the {case} pool is empty against a {name} acceptance table -- the "
+                    f"control can only be staged while phase-{phase}.md stays wrong, which means "
+                    f"it stops auditing the arm on the very tree the next unit builds"
+                )
+
+    pools = victim_pools(table)
+    victim_later = pick(pools["pull-forward"], "pull-forward")
+    victim_due = pick(pools["push-later"], "push-later")
+    without_due = [c for c in required if c != victim_due]
+    victim_prior = pick(pools["prior-row"], "prior-row")
     without_prior = [c for c in required if c != victim_prior]
-    # ...and the sharper half of the same claim: an ID a PRIOR row's suite carries, which 09 §6 dates
-    # to THIS phase. Every accumulated row must be filtered against the phase under test, not against
-    # its own -- filtering each row by its own number re-shrinks exactly the set the accumulation
-    # widened, silently, by 11 IDs at phase 9, and `victim_prior` cannot see it because a phase-8 ID
-    # under a phase-8 row survives that defect untouched.
-    victim_carried = pick(
-        (c for c in prior_only if catalog[c].phase == phase and c not in table), "carried-forward"
-    )
+    victim_carried = pick(pools["carried-forward"], "carried-forward")
     without_carried = [c for c in required if c != victim_carried]
+    victim_unnamed = pick(pools["under-naming"], "under-naming")
 
     grouped = _synthesise_green_grouped(required)
     # Victims that SHARE a cell with other IDs -- the property the three grouped cases are about.
@@ -738,9 +797,14 @@ def stage(phase: int) -> tuple[list[tuple], Ratchet, str]:
             "have no `pass` row with an evidence_ref",
         ),
         (
-            "the future tree, with the phase file back to under-naming its own ratchet",
+            f"the future tree, with the phase file under-naming its own ratchet by {victim_unnamed}",
             spec_text,
-            phase_text,
+            # SYNTHESISED, not the live document. This case used to stage `phase_text` itself and
+            # rely on it under-naming the ratchet -- true on 2026-07-31 by 43 IDs, and false the
+            # moment the table is completed, at which point the case ESCAPES and reports a hole in
+            # property 4 that is really the control describing a tree the repository has left.
+            # A case about under-naming has to build the under-naming.
+            name_in_table([c for c in required if c != victim_unnamed]),
             future,
             "never names",
         ),

@@ -30,7 +30,9 @@ fail is not evidence (09 §6, V-MET-014). Run by `python3 -m unittest discover d
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import pathlib
 import subprocess
 import sys
@@ -982,13 +984,136 @@ class PhaseRatchetIsAsserted(unittest.TestCase):
         table = mod.parse_acceptance_table((gate.REPO / "docs/build/phase-9.md").read_text(), 9)
         self.assertGreater(len(catalog), 200, "the 09 §6 catalog parse collapsed")
         self.assertGreater(len(ratchet.required), 50, "the 09 §10 phase-9 ratchet parse collapsed")
-        self.assertGreater(len(table), 40, "the phase-9 acceptance table parse collapsed")
-        # V-RUN-001…006 is an ellipsis run; five of the six appear nowhere else in the table.
-        for n in range(1, 7):
-            self.assertIn(f"V-RUN-{n:03d}", table)
+        # A floor against a COLLAPSE, and deliberately nowhere near today's count. The previous
+        # floor was 40 -- one above the 39 the table legitimately holds once the sixteen IDs 09 §6
+        # dates after phase 9 are retargeted out of it. A floor set just under the current value is
+        # a fingerprint of the artifact rather than a property of the parser: it reddens on the
+        # artifact's own correction, and the cheapest way out is to retune it to whatever the
+        # document now says, which is how a check stops being evidence.
+        self.assertGreater(len(table), 10, "the phase-9 acceptance table parse collapsed")
         # V-ISO-001/002/006 is a slash run in the 09 §10 cell.
         for cid in ("V-ISO-001", "V-ISO-002", "V-ISO-006"):
             self.assertIn(cid, ratchet.required)
+
+    def _control_against(self, table_ids):
+        """Run the arm's own `--negative-control` against a phase file naming exactly `table_ids`.
+
+        `stage()` reads three files off disk, so the future tree is exhibited by giving the module a
+        temporary repository: the real 09 and the real results.csv, and a phase-9.md whose
+        acceptance section has been rewritten. Returns the control's exit code and its output.
+        """
+        mod = _load_phase_ratchet()
+        real = (gate.REPO / "docs/build/phase-9.md").read_text()
+        head, rest = real.split(mod.ACCEPTANCE_HEADING, 1)
+        tail = "\n## " + rest.split("\n## ", 1)[1] if "\n## " in rest else ""
+        synthetic = (
+            head
+            + mod.ACCEPTANCE_HEADING
+            + "\n\n| (a) | "
+            + ", ".join(sorted(table_ids))
+            + " | L0 | tree |\n"
+            + tail
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "docs/build").mkdir(parents=True)
+            (root / "docs/design").mkdir(parents=True)
+            (root / "verification").mkdir(parents=True)
+            (root / "docs/build/phase-9.md").write_text(synthetic)
+            (root / "docs/design/09-verification-and-validation.md").write_text(mod.SPEC.read_text())
+            (root / "verification/results.csv").write_text(mod.RESULTS.read_text())
+            mod.REPO = root
+            mod.SPEC = root / "docs/design/09-verification-and-validation.md"
+            mod.RESULTS = root / "verification/results.csv"
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                rc = mod.negative_control(9)
+            return rc, buf.getvalue()
+
+    def test_the_control_still_stages_when_the_acceptance_table_is_COMPLETE(self):
+        """[[LSN-053]] -- the tree the next unit builds, asserted rather than probed once.
+
+        On 2026-07-31 `P9-T11c′` set out to correct phase-9.md's acceptance table and discovered
+        that completing it took this control from 20/20 to *unstageable*:
+
+            FAIL: negative control could not be staged: control: no victim for the push-later case
+
+        Three of the five cases `P9-T11a-3` added picked their victim from "required by the
+        derivation and NOT named by the table", and completing the table empties that pool. The
+        pools only needed the term because `name_in_table` PREPENDED to the real acceptance section
+        instead of replacing it, so the live document's IDs leaked into every synthesised tree.
+
+        `P9-T11a-3` exhibited a future tree for the ratchet cases and did not exhibit one for
+        "the acceptance table is complete" -- which was the very next unit's tree. This is that
+        debt paid: the control is run against a phase file that names every required ID, and it
+        must still stage and still catch everything.
+        """
+        mod = _load_phase_ratchet()
+        spec_text = mod.SPEC.read_text()
+        catalog = mod.parse_catalog(spec_text)
+        required = mod.parse_ratchet(spec_text, 9, catalog).required
+        rc, out = self._control_against(required)
+        self.assertNotIn("could not be staged", out, out)
+        self.assertEqual(0, rc, out)
+        # ...and it must still be the whole control, not the subset that could be staged.
+        self.assertIn("20/20", out, out)
+
+    def test_the_control_still_stages_when_later_dated_ids_are_RETARGETED_out(self):
+        """The other tree on the ladder: the table keeps only what 09 §6 dates to phase 9 or before.
+
+        The complementary direction to the test above -- there the table grows to the full required
+        set, here it shrinks by the sixteen IDs 09 §6 dates to phases 10, 14 and 15. A control that
+        only works on the table as written today is a control that expires the next time the phase
+        file is corrected in either direction.
+        """
+        mod = _load_phase_ratchet()
+        spec_text = mod.SPEC.read_text()
+        catalog = mod.parse_catalog(spec_text)
+        table = mod.parse_acceptance_table((gate.REPO / "docs/build/phase-9.md").read_text(), 9)
+        kept = {
+            c
+            for c in table
+            if (row := catalog.get(c)) is None or row.phase is None or row.phase <= 9
+        }
+        self.assertLess(len(kept), len(table), "nothing to retarget -- the fixture proves nothing")
+        rc, out = self._control_against(kept)
+        self.assertNotIn("could not be staged", out, out)
+        self.assertEqual(0, rc, out)
+        self.assertIn("20/20", out, out)
+
+    def test_the_acceptance_parse_expands_runs_and_stops_at_the_next_top_level_heading(self):
+        # Both halves are asserted on a FIXTURE rather than on the live phase file, because both
+        # were previously sampled off it: the ellipsis case read V-RUN-001…006 out of the real
+        # table, and 09 §6 dates V-RUN-006 to phase 10, so correcting the phase file broke a test
+        # of the parser. A parser test that fails when the document it samples changes legitimately
+        # is a test that gets retuned instead of read.
+        mod = _load_phase_ratchet()
+        fixture = (
+            "## Acceptance → check binding\n\n"
+            "| (a) | V-RUN-001…005, V-GAT-002 |\n"
+            "| (b) | **V-BRK-022…027** |\n\n"
+            "### A subsection is still INSIDE the section\n\n"
+            "| (c) | V-CTN-004 |\n\n"
+            "## Retargeted out of Phase 9 by 09 §6\n\n"
+            "| V-BRK-016 | postponed to phase 10 |\n"
+        )
+        got = mod.parse_acceptance_table(fixture, 9)
+        self.assertEqual(
+            {f"V-RUN-{n:03d}" for n in range(1, 6)}
+            | {f"V-BRK-{n:03d}" for n in range(22, 28)}
+            | {"V-GAT-002", "V-CTN-004"},
+            got,
+        )
+        # The two properties the phase file's structure now depends on, stated separately so a
+        # failure says which one went. A `###` subsection is INSIDE -- which is why the retarget
+        # list has to be a sibling `##` and not a subsection of the acceptance section...
+        self.assertIn("V-CTN-004", got)
+        # ...and a sibling `##` is OUT, which is the only reason a phase file can carry the record
+        # of what it retargeted without going on requiring it.
+        self.assertNotIn("V-BRK-016", got)
+        # An ellipsis run wrapped in bold still expands: `**V-BRK-022…027**` is how the table
+        # writes them, and the run regex has to tolerate the markers sitting outside it.
+        self.assertIn("V-BRK-025", got)
 
     def test_the_ratchet_accumulates_prior_phases_and_honours_the_due_date(self):
         # 09 §10: "once a suite enters the ratchet it never leaves", and 09 §6's Phase column is the
