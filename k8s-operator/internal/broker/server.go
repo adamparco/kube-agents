@@ -28,6 +28,8 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/verify"
 )
 
 // The HTTP surface (08 §2.3, 03 §4.1).
@@ -132,14 +134,27 @@ func (UnavailablePipeline) Submit(context.Context, *Identity, *Envelope, *StepTr
 	}
 }
 
+// AutoPauser records the rung-5 pause request a refusal asks for (06 §4.4 row 3).
+//
+// It is `verify.Pauser`, deliberately -- the same interface and therefore the same implementation
+// (`escalate.Recorder`) that row 9 drives through the verify driver. Row 3 and row 9 are two rows of
+// one table asking for one thing, "stop this agent", and 05 §1.7's "exactly one code path that stops
+// an agent" is not honoured by two ways of asking. The alias exists only so that this package can
+// name the dependency without every reader having to know that the type lives under `verify`.
+type AutoPauser = verify.Pauser
+
 // Config assembles a Server.
 type Config struct {
 	Authenticator *Authenticator
 	Guard         *ReplayGuard
 	Pipeline      Pipeline
 	Journal       RejectionJournal
-	Security      SecuritySink
-	Log           logr.Logger
+	// Pauser carries a refusal's auto-pause. Required, like the four above it and for the same kind
+	// of reason: a broker built without one refuses correctly and silently drops the fleet-level
+	// half of 06 §4.4 row 3, which is the half nobody watching a dashboard would notice was missing.
+	Pauser   AutoPauser
+	Security SecuritySink
+	Log      logr.Logger
 	// Namespace is the agent's namespace, echoed in responses so a caller can find its record
 	// without knowing the deployment layout.
 	Namespace string
@@ -188,6 +203,8 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, errors.New("broker: a ReplayGuard is required")
 	case cfg.Journal == nil:
 		return nil, errors.New("broker: a RejectionJournal is required; refusals must be recorded")
+	case cfg.Pauser == nil:
+		return nil, errors.New("broker: an AutoPauser is required; 06 §4.4 row 3 refuses AND pauses")
 	case cfg.Pipeline == nil:
 		return nil, errors.New("broker: a Pipeline is required (use UnavailablePipeline to build without one)")
 	}
@@ -483,12 +500,21 @@ func (s *Server) refuse(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// The action id of the record the refusal was written to, empty if it was not written. It is the
+	// only handle the auto-pause below has, which is why the two are ordered this way rather than
+	// being independent side effects.
+	var recordedActionID string
 	if ref.Journal {
-		if jErr := s.cfg.Journal.Reject(ctx, id, body, ref); jErr != nil {
+		actionID, jErr := s.cfg.Journal.Reject(ctx, id, body, ref)
+		if jErr != nil {
 			// Logged, not escalated. The caller is already being refused for a reason that has
 			// nothing to do with the journal, and changing their answer would misreport why.
 			s.cfg.Log.Error(jErr, "broker: could not journal a refusal", "reason", ref.Reason)
 		}
+		recordedActionID = actionID
+	}
+	if ref.AutoPause {
+		s.autoPause(ctx, id, ref, recordedActionID)
 	}
 	if ref.SecurityEvent && s.cfg.Security != nil {
 		caller := "unauthenticated"
@@ -506,6 +532,50 @@ func (s *Server) refuse(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		})
 	}
 	s.write(w, ref)
+}
+
+// autoPause records 06 §4.4 row 3's second half: the agent is paused, not just refused.
+//
+// WHY IT RIDES THE REFUSAL RECORD. The broker cannot pause anything itself -- 06 §2.2.1 gives it
+// `get, list, watch` on `agents` and nothing more -- so a pause is a request written onto an
+// ActionRecord's `status.escalation`, which C-BR fans out (see internal/broker/escalate). Row 3
+// fires at pipeline step 5, three steps before the action's own record becomes durable at step 8, so
+// there is no action record to write it on. The refusal record is the one that exists, it names the
+// same agent, and an operator reading it finds the refusal and the pause request as one object.
+//
+// WHAT IT DOES NOT FIX, stated here because it is the honest limit of this half. Row 3 fires when
+// the brake's journal probe says the store is unreachable, and a store that cannot be listed usually
+// cannot be written either -- so the common case is that the refusal was never recorded, this
+// function has no id, and the pause request has nowhere to go. What it does catch is the case that
+// matters most in practice: the probe is a periodic observation, so it can still read unreachable
+// for up to one interval after writes recover, and in that window the record lands and the agent is
+// paused. The case it cannot catch is why 06 §4.4 also asks for `status.broker.journalReachable` --
+// a surface that does not depend on the journal being writable (P9-T9c-2).
+//
+// Failures are logged, never surfaced. The caller is being refused for a reason that has nothing to
+// do with the brake, and 06 §4.4 row 3's refusal -- the 503 and its retryAfterSeconds -- is proven
+// behaviour that must not change shape because a side effect failed.
+func (s *Server) autoPause(ctx context.Context, id *Identity, ref *Refusal, actionID string) {
+	identity := "unauthenticated"
+	if id != nil {
+		identity = id.AgentIdentity()
+	}
+	if actionID == "" {
+		s.cfg.Log.Error(errors.New("no journaled record"),
+			"broker: a refusal asked for an auto-pause and there is no record to put it on; the agent stays live",
+			"reason", ref.Reason, "agentIdentity", identity)
+		return
+	}
+	if err := s.cfg.Pauser.Pause(ctx, verify.PauseRequest{
+		ActionID:      actionID,
+		AgentIdentity: identity,
+		// The reason ends up in `Agent.spec.operations.pauseReason`, where the human unpausing reads
+		// it, so it carries the refusal's own detail rather than a restatement of the row.
+		Reason: "auto-paused on refusal " + ref.Reason + ": " + ref.Detail,
+	}); err != nil {
+		s.cfg.Log.Error(err, "broker: could not record the auto-pause for a refusal; the agent stays live",
+			"reason", ref.Reason, "actionId", actionID, "agentIdentity", identity)
+	}
 }
 
 // write renders a Refusal, or a 500 for anything else.

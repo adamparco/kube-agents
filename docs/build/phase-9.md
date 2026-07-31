@@ -96,10 +96,14 @@ derives **37 envelopes** from the 181-case classifier corpus, filtered by what t
 overlay authorizes, `--self-test` **17/17** and a new L0 chain line; V-REV-001's denominator is no
 longer 1. **`2b-ii-b` landed 2026-07-31** — `dev/verify/undo-coverage-l2.sh` submits all 37 envelopes
 through the broker's real front door and scores **V-REV-001 at 35/35 = 100% across 3 verbs**, `¬`
-**17/17**, one new line in each chain. **Resume at `P9-T9c`.** The remaining Phase 9 ladder is
-`T9c`, then `harness-milestone`. **`P9-T9c` was appended 2026-07-31** by the
+**17/17**, one new line in each chain. **`P9-T9c` was appended 2026-07-31** by the
 ORIENT drain of `BACKLOG.md` B-006 — 06 §4.4 row 3's auto-pause has no consumer; its section is at
-the end of this file.
+the end of this file. **`P9-T9c` was split at IMPLEMENT on 2026-07-31** into **`-1`** (the row-3
+auto-pause consumer) and **`-2`** (a writer for `status.broker.journalReachable`), because only the
+first had a seam to wire — see its section. **`-1` landed 2026-07-31**: the refusal that row 3
+produces now carries its own `AutoPause` to the HTTP boundary, where it is recorded on the refusal's
+own `ActionRecord` through the same `escalate.Recorder.Pause` seam row 9 uses; 4/4 mutants caught.
+**Resume at `P9-T9c-2`.** The remaining Phase 9 ladder is `T9c-2`, then `harness-milestone`.
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
 [`LEDGER.md`](LEDGER.md).
@@ -2533,6 +2537,22 @@ of its two callers was never connected.
 **What to build.** Consume `AutoPause` on the row-3 path through the same `escalate.Recorder.Pause`
 seam row 9 uses, and give `status.broker.journalReachable` a writer. Do not change the refusal: the
 503 and its `retryAfterSeconds` are proven and are what keeps this fail-closed today.
+
+**Split into `-1` and `-2` at IMPLEMENT on 2026-07-31** (`harness-run` §2 sizing). The two halves
+looked like one task and are not: the pause has a seam (`escalate.Recorder`, already built and
+already driven by row 9) and needed wiring, while `journalReachable` has no transport at all. The
+broker cannot write `Agent` status — 06 §2.2.1 gives it `get, list, watch` on `agents` — and the one
+principal that can, `agent_controller`, rebuilds `BrokerStatus` from scratch on every reconcile and
+says in its own comment that it cannot observe the value. That is a design question, not a wiring
+job, and pinning it to the same unit as the wiring would have bought a worse answer to it.
+
+- **`-1` — the row-3 auto-pause consumer.** Done, below.
+- **`-2` — a writer for `status.broker.journalReachable`.** The open question, stated so `-2` does
+  not rediscover it: what carries "the journal is unreachable" from the only process that can
+  observe it to the only principal that can write it, given that the journal itself is the surface
+  that is down? A broker answering "yes" over HTTP proves nothing about its own writes (the
+  controller's comment); a broker answering "no" is an admission against interest and is credible.
+  A fail-closed zero and a probe that can only lower the value is one shape worth costing.
 
 **Verification is bound at the improvement pass, not here.** 09 has no check ID covering row 3's
 pause. Adding one edits the conformance spec, which `harness-improve` §5 makes a pass's work rather
@@ -5435,3 +5455,71 @@ a commit touching nothing but `docs/` and `dev/` invalidates every image for eve
 come — which is the phase's own ordering rule ("L0/L1 before L2, because the tree must stop moving
 before images are built") stated from the other side. Remedied as documented, with
 `reload-images.sh operator` then `broker`, and both arms went green on the re-run.
+
+---
+
+### P9-T9c-1 — outcome, 2026-07-31
+
+**06 §4.4 row 3's second clause, wired.** The row is one sentence with an AND in it — _"Refuse to
+execute; set `status.broker.journalReachable: false`; auto-pause"_ — and only the first clause was
+true. `brake.go` set `AutoPause: true` on the row-3 decision, `pipeline.stepBrake` captured `d.Effect`
+and dropped the rest, and the caller was told _"and the agent is being paused"_ by a broker that
+paused nothing (B-006).
+
+**Where the pause goes, and why it is not a `client.Patch` on the Agent.** The broker has
+`get, list, watch` on `agents` and nothing more (06 §2.2.1, asserted by V-BRK-013, BLOCKING-ALWAYS),
+because 05 §1.7 wants "exactly one code path that stops an agent". So a pause is a _request_ written
+onto an `ActionRecord`'s `status.escalation`, which C-BR fans out into `spec.operations.paused` plus
+an Event. `internal/broker/escalate` already existed and row 9 already drove it; this unit connected
+the other caller.
+
+**The one structural problem, and its answer.** Row 3 fires at pipeline step 5. The action's own
+record is not durable until step 8. There is therefore no action record to hang the escalation on —
+so it rides the **refusal** record `server.refuse()` already writes via `ref.Journal`, which names
+the same agent and puts the refusal and the pause request on one object. `RejectionJournal.Reject`
+now returns the action id it minted; without it the boundary would have to re-derive a ULID it did
+not generate.
+
+| What changed                        | Where                                                                                           |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `Refusal.AutoPause`                 | `envelope.go` — carried like `Journal`/`SecurityEvent` are                                      |
+| `Decide` copies it onto the refusal | `brake.go` — one definition site; the decision is consumed locally, the refusal is what travels |
+| `Reject` returns the action id      | `rejection.go` — interface, Store impl, log impl                                                |
+| `Config.Pauser`, required           | `server.go` — `verify.Pauser`, the same type row 9 uses                                         |
+| `refuse()` consumes it              | `server.go` — `autoPause`, after journaling, never before                                       |
+| Wiring                              | `cmd/broker/main.go` — `&escalate.Recorder{Client: k8s, ...}`                                   |
+
+**What this half does NOT fix, and it is the reason for `-2`.** Row 3 fires when the brake's journal
+probe says the store is unreachable, and a store that cannot be listed usually cannot be written —
+so in the common case the refusal is not recorded, there is no id, and the pause request has nowhere
+to live. It is logged and the agent stays live. What it _does_ catch is the case that is most likely
+in practice: the probe is a periodic observation, so it can read unreachable for up to one interval
+after writes have recovered, and in that window the record lands and the agent is paused. The case
+it cannot catch is exactly why 06 §4.4 also asks for `status.broker.journalReachable` — a surface
+that does not depend on the journal being writable. That is `-2`.
+
+**Non-vacuity: 4 mutants, 4 caught, each by the arm that targets it** ([[LSN-035]]). Run through
+`dev/mutate.sh` — the one-off layer — rather than `dev/mutate.py`, because a sweep spec is keyed by
+check ID and 09 has no ID for row 3's pause yet (that question travels to the improvement pass with
+B-006).
+
+| Mutant                                              | Caught by                                                                                         |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `Decide` stops copying `AutoPause` onto the refusal | `TestBrakeEachRuleFiresInIsolation` (both row-3 arms) + `TestRow3RefusalAlsoRequestsTheAutoPause` |
+| `refuse()` never consumes `AutoPause`               | `TestRow3RefusalAlsoRequestsTheAutoPause` — `pause requests = 0, want 1`                          |
+| Every refusal auto-pauses                           | `TestAnOrdinaryRefusalDoesNotPause` — a bypass-key refusal is not a fleet incident                |
+| The pause is hung on an empty action id             | `TestRow3WithNoJournaledRecordCannotPause`                                                        |
+
+The second mutant is worth noting for the next person: the first form of it deleted the whole `if`
+block, which left `recordedActionID` declared-and-not-used, so Go refused to compile and the mutant
+scored as `BROKEN` rather than caught — the check was never asked anything ([[LSN-048]]). Rewritten
+as `if false && ref.AutoPause`, it compiles, runs, and fails the intended assertion.
+
+**The tests drive the real row-3 refusal**, built by `Decide(healthy())` with the journal signal
+removed, not a hand-written `Refusal`. A hand-written one would keep passing if the brake stopped
+setting the field, which is the regression most worth catching: the brake and the boundary have to
+agree about what row 3 _is_, and only one of them is under test at the boundary.
+
+**Verification.** `make -C k8s-operator test` green including the 116 s controller envtest; L0 chain
+**47/47**; invariants gate 30/30 after winding `dev/assertion-baseline.json` for the three new named
+tests (LSN-056). No check ID claimed — see the note in the task section above.

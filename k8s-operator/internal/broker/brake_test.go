@@ -412,6 +412,14 @@ func TestBrakeEachRuleFiresInIsolation(t *testing.T) {
 			if d.Refusal.Detail != d.Detail {
 				t.Error("the Refusal detail and the decision Detail must be the same sentence")
 			}
+			// The decision is consumed by the step that asked for it; the Refusal is what travels to
+			// the HTTP boundary where the pause can actually be requested. If the two disagree, the
+			// row's auto-pause is decided here and dropped there -- which is exactly how row 3
+			// shipped refusing correctly and pausing nothing (B-006).
+			if d.Refusal.AutoPause != d.AutoPause {
+				t.Errorf("Refusal.AutoPause = %v but the decision says %v; the field did not survive the return",
+					d.Refusal.AutoPause, d.AutoPause)
+			}
 		})
 	}
 }

@@ -81,6 +81,7 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/escalate"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/pipeline"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/journal"
 )
@@ -257,6 +258,11 @@ func run(ctx context.Context, o options) error {
 			AgentName:           o.agentName,
 			ActorServiceAccount: brokerServiceAccount(),
 		},
+		// 06 §4.4 row 3's auto-pause. The same recorder type the verify driver uses for row 9
+		// (wiring.go), constructed here rather than threaded out of the pipeline because it is
+		// stateless and a shared instance would only create the appearance of shared state between
+		// two rungs that never coordinate.
+		Pauser:    &escalate.Recorder{Client: k8s, Namespace: o.namespace},
 		Security:  security,
 		Log:       ctrllog.Log.WithName("broker"),
 		Namespace: o.namespace,

@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/verify"
 )
 
 // The HTTP surface, and V-BRK-021 in particular.
@@ -60,17 +63,46 @@ import (
 // to 4. That did catch a smuggled handler, but it needed editing for every legitimate route, which
 // makes it a check whose maintenance instruction is "raise the number until it passes".
 
+// testRefusalActionID is the id a successful recordingJournal hands back. A real one is a ULID and
+// the auto-pause path carries it verbatim, so a test asserting on it is asserting that the id the
+// journal minted is the id the escalation was hung on -- which is the whole content of the wiring.
+const testRefusalActionID = "01JQZK0000REFUSALRECORD01"
+
 // recordingJournal captures the refusals that were journaled.
 type recordingJournal struct {
 	refusals []*Refusal
 	bodies   [][]byte
 	err      error
+	// actionID overrides what a successful Reject returns. Empty means testRefusalActionID; set it
+	// to "-" to model a journal that succeeded without writing a record (LogRejectionJournal).
+	actionID string
 }
 
-func (j *recordingJournal) Reject(_ context.Context, _ *Identity, body []byte, ref *Refusal) error {
+func (j *recordingJournal) Reject(_ context.Context, _ *Identity, body []byte, ref *Refusal) (string, error) {
 	j.refusals = append(j.refusals, ref)
 	j.bodies = append(j.bodies, body)
-	return j.err
+	if j.err != nil {
+		return "", j.err
+	}
+	switch j.actionID {
+	case "":
+		return testRefusalActionID, nil
+	case "-":
+		return "", nil
+	default:
+		return j.actionID, nil
+	}
+}
+
+// recordingPauser is the AutoPauser seam under test: the requests it received, in order.
+type recordingPauser struct {
+	requests []verify.PauseRequest
+	err      error
+}
+
+func (p *recordingPauser) Pause(_ context.Context, r verify.PauseRequest) error {
+	p.requests = append(p.requests, r)
+	return p.err
 }
 
 func (j *recordingJournal) reasons() []string {
@@ -110,6 +142,7 @@ type harness struct {
 	server   *Server
 	guard    *ReplayGuard
 	journal  *recordingJournal
+	pauser   *recordingPauser
 	security *MemorySecuritySink
 	pipeline *stubPipeline
 	clock    *clock
@@ -129,6 +162,7 @@ func newHarnessWithLog(t *testing.T, log logr.Logger) *harness {
 	h := &harness{
 		guard:    NewReplayGuard(cl.Now),
 		journal:  &recordingJournal{},
+		pauser:   &recordingPauser{},
 		security: &MemorySecuritySink{},
 		pipeline: &stubPipeline{},
 		clock:    cl,
@@ -143,6 +177,7 @@ func newHarnessWithLog(t *testing.T, log logr.Logger) *harness {
 		Guard:         h.guard,
 		Pipeline:      h.pipeline,
 		Journal:       h.journal,
+		Pauser:        h.pauser,
 		Security:      h.security,
 		Log:           log,
 		Namespace:     testNamespace,
@@ -1068,6 +1103,7 @@ func TestUnavailablePipelineIs503(t *testing.T) {
 		Guard:         h.guard,
 		Pipeline:      UnavailablePipeline{},
 		Journal:       h.journal,
+		Pauser:        h.pauser,
 		Security:      h.security,
 		Log:           logr.Discard(),
 		Namespace:     testNamespace,
@@ -1095,6 +1131,7 @@ func TestNewServerRequiresEveryDependency(t *testing.T) {
 			Guard:         NewReplayGuard(nil),
 			Pipeline:      UnavailablePipeline{},
 			Journal:       &recordingJournal{},
+			Pauser:        &recordingPauser{},
 			Log:           logr.Discard(),
 		}
 	}
@@ -1103,6 +1140,7 @@ func TestNewServerRequiresEveryDependency(t *testing.T) {
 		"guard":         func(c *Config) { c.Guard = nil },
 		"pipeline":      func(c *Config) { c.Pipeline = nil },
 		"journal":       func(c *Config) { c.Journal = nil },
+		"pauser":        func(c *Config) { c.Pauser = nil },
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := full()
@@ -1130,6 +1168,116 @@ func TestJournalFailureDoesNotChangeTheRefusal(t *testing.T) {
 	}
 	if got := h.decode(t, w).Reason; got != ReasonBypassKey {
 		t.Fatalf("reason = %q, want %q", got, ReasonBypassKey)
+	}
+}
+
+// --- 06 §4.4 row 3: the refusal AND the pause ---------------------------------------------------
+//
+// The row is one sentence with an AND in it -- "Refuse to execute; set
+// `status.broker.journalReachable: false`; auto-pause" -- and for five phases only the first clause
+// was true. The brake set `AutoPause: true`, the reply told the caller "and the agent is being
+// paused", and no code read the field (B-006). These tests are the second clause.
+//
+// They drive the REAL row-3 refusal, the one `Decide` builds from `healthy()` with the journal
+// signal removed, rather than a hand-written Refusal. A hand-written one would still pass if the
+// brake stopped setting the field, which is the regression most worth catching: the boundary and the
+// brake have to agree about what row 3 is, and only one of them is under test here.
+
+// row3Refusal is what the brake hands the pipeline when the journal cannot be reached.
+func row3Refusal(t *testing.T) *Refusal {
+	t.Helper()
+	in := healthy()
+	in.Journal = BrakeFailed
+	d := Decide(in)
+	if d.Refusal == nil || d.Rule != BrakeRuleJournalUnreachable {
+		t.Fatalf("expected a row-3 refusal from the brake, got rule %s / refusal %+v", d.Rule, d.Refusal)
+	}
+	return d.Refusal
+}
+
+func TestRow3RefusalAlsoRequestsTheAutoPause(t *testing.T) {
+	h := newHarness(t)
+	h.pipeline.err = row3Refusal(t)
+
+	w := h.post(t, h.submittable(t, "platform.scale-deployment.json"))
+
+	// The refusal is unchanged. This is asserted FIRST and it is not a formality: P9-T9c's own
+	// instruction is "do not change the refusal", because the 503 and its retryAfterSeconds are the
+	// proven behaviour that keeps row 3 fail-closed today. A pause that arrived at the cost of the
+	// caller's answer would be a regression wearing a fix's clothes.
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	resp := h.decode(t, w)
+	if resp.Reason != ReasonJournalUnavailable {
+		t.Errorf("reason = %q, want %q", resp.Reason, ReasonJournalUnavailable)
+	}
+	if resp.RetryAfterSeconds <= 0 {
+		t.Errorf("retryAfterSeconds = %d, want a positive wait", resp.RetryAfterSeconds)
+	}
+
+	if len(h.pauser.requests) != 1 {
+		t.Fatalf("pause requests = %d, want exactly 1", len(h.pauser.requests))
+	}
+	got := h.pauser.requests[0]
+	// The id the journal minted, not one derived at the boundary. The escalation is written onto
+	// that record and nowhere else, so a different id here is an escalation on a record that does
+	// not exist -- which C-BR reads as nothing at all.
+	if got.ActionID != testRefusalActionID {
+		t.Errorf("pause ActionID = %q, want the journaled refusal's id %q", got.ActionID, testRefusalActionID)
+	}
+	if got.AgentIdentity != "platform/adamparco-kage" {
+		t.Errorf("pause AgentIdentity = %q, want the authenticated caller's identity", got.AgentIdentity)
+	}
+	// The reason ends up in `Agent.spec.operations.pauseReason`, in front of the human who has to
+	// decide whether to unpause. It has to name the cause, not the mechanism.
+	if !strings.Contains(got.Reason, ReasonJournalUnavailable) {
+		t.Errorf("pause reason = %q, want it to name %q", got.Reason, ReasonJournalUnavailable)
+	}
+}
+
+// An ordinary refusal pauses nothing. Row 3 is the only row that carries the brake, and a boundary
+// that paused on every refusal would turn a malformed envelope into a fleet incident.
+func TestAnOrdinaryRefusalDoesNotPause(t *testing.T) {
+	h := newHarness(t)
+
+	w := h.post(t, read(t, filepath.Join(fixtureRoot, "spoofing", "bypass-key.bypass.json")))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	if len(h.pauser.requests) != 0 {
+		t.Fatalf("a %s refusal requested %d pauses, want 0", ReasonBypassKey, len(h.pauser.requests))
+	}
+}
+
+// No record, no escalation -- and no change to the caller's answer either.
+//
+// This is the common case of row 3 and it is the honest limit of this half: a journal that cannot be
+// listed usually cannot be written, so the refusal is not recorded and the pause request has nowhere
+// to live. What must not happen is a pause hung on an empty id, which reaches the API server as a
+// Get on the empty name and reads, in the log, like a record somebody deleted.
+func TestRow3WithNoJournaledRecordCannotPause(t *testing.T) {
+	for name, arrange := range map[string]func(*harness){
+		"the journal write failed":       func(h *harness) { h.journal.err = errJournalDown },
+		"the journal wrote no record":    func(h *harness) { h.journal.actionID = "-" },
+		"the pause itself could not run": func(h *harness) { h.pauser.err = errPauseFailed },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			arrange(h)
+			h.pipeline.err = row3Refusal(t)
+
+			w := h.post(t, h.submittable(t, "platform.scale-deployment.json"))
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503: a side effect that failed must not change the refusal", w.Code)
+			}
+			if got := h.decode(t, w).Reason; got != ReasonJournalUnavailable {
+				t.Fatalf("reason = %q, want %q", got, ReasonJournalUnavailable)
+			}
+			if name != "the pause itself could not run" && len(h.pauser.requests) != 0 {
+				t.Fatalf("pause requests = %d with no record to put them on, want 0", len(h.pauser.requests))
+			}
+		})
 	}
 }
 
@@ -1173,3 +1321,7 @@ func TestReservedKeyOf(t *testing.T) {
 }
 
 var errJournalDown = &Refusal{Reason: ReasonJournalUnavailable, Detail: "etcd is unreachable"}
+
+// errPauseFailed is what a Pauser returns when the escalation could not be written -- a conflict on
+// the record's status, or the API server refusing the write.
+var errPauseFailed = errors.New("escalate: recording the escalation failed")

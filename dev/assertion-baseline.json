@@ -1071,6 +1071,7 @@
     "k8s-operator/internal/broker/server_test.go": [
       "TestActionsRouteMethodSet",
       "TestActionsRouteTakesNoQueryParameters",
+      "TestAnOrdinaryRefusalDoesNotPause",
       "TestBypassHeadersAreRefusedOnEveryRoute",
       "TestBypassHeadersMirrorTheReservedKeys",
       "TestCallerSuppliedIdempotencyKeyIsRefused",
@@ -1089,6 +1090,8 @@
       "TestReplayedEnvelopeIsRefusedAndJournaled",
       "TestReservedKeyOf",
       "TestResponsesAreAlwaysJSON",
+      "TestRow3RefusalAlsoRequestsTheAutoPause",
+      "TestRow3WithNoJournaledRecordCannotPause",
       "TestSpoofingFixturesAreRefusedEndToEnd",
       "TestTheMuxHasExactlyOneRegistrationPoint",
       "TestTheSubsetArmAcceptsEveryRouteTheDesignNamesAndNothingElse",
