@@ -462,3 +462,30 @@ python3 dev/tests/coverage-ratchet-holds.py
 # the floor raised above the coverage under it, the enumerator returning almost nothing, and the
 # arrival baseline emptied.
 python3 dev/tests/coverage-ratchet-holds.py --negative-control
+
+# --- V-MET-002: full coverage of the load-bearing suites ------------------------------------------
+# THE LIVE ARM IS NOT ON THIS CHAIN, and that is deliberate — the same call, for the same reason, as
+# `phase-ratchet-is-asserted.py --phase 9` above. It is RED today by construction: sixteen
+# obligations owned by V-CTN / V-BRK / V-REV / V-ISO / V-ADV have no catalog row that asserts them,
+# and closing them is a change to the 09 §6 catalog, not a curation change. This chain is a required
+# PR check, so an arm that stays red until that work lands would redden every unrelated commit and
+# destroy the per-commit attribution CHECKPOINT exists to produce ([[LSN-055]]). It runs in
+# `dev/verify/verify-phase9.sh` section K, where its redness IS the worklist and is published by ID,
+# and `invariants-gate.py` (`check_phase_gate_publishes_the_coverage_remainder`) is what stops that
+# section being deleted.
+#
+# 09 §8.1 dates the zero: the load-bearing suites "must reach zero uncovered before Phase 10 grants
+# the first write credential". So this is not a deferral and not a backlog item — it is the last of
+# the draw-down, it is scheduled inside Phase 9, and a red V-MET-002 at the milestone is a halt
+# (09 §9.6). What it is NOT is a reason to weaken the gate: the spec's own answer to "a gate that
+# always fails is a gate someone disables" was to demand full coverage here anyway and to ratchet
+# everywhere else.
+#
+# What IS chain-eligible is the control, whose BASE CASE is the future tree — the remainder closed
+# by synthesis — in which this arm must go GREEN ([[LSN-053]]). Eight mutations on top of it, each
+# naming the finding ITS property produces ([[LSN-035]]): an owned obligation losing its last check,
+# one mapped to an ID with no catalog row, V-ISO's prose source deleted so a BLOCKING-ALWAYS suite
+# owns zero sections, traceability.yaml's 05§8 bullets deleted so it owns one section and zero
+# obligations, a Source cell blanked, the enumerator returning almost nothing, the enumeration
+# artifact truncated, and the catalog itself unparseable.
+python3 dev/tests/load-bearing-coverage-is-full.py --negative-control

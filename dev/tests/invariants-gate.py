@@ -3417,6 +3417,7 @@ def check_envtest_control_planes_are_reaped() -> list[str]:
 # Repointed by dev/test_invariants_gate.py's controls, which is why they are constants.
 VERIFY_DIR = REPO / "dev" / "verify"
 RATCHET_RUNNER = REPO / "dev" / "tests" / "phase-ratchet-is-asserted.py"
+COVERAGE_RUNNER = REPO / "dev" / "tests" / "load-bearing-coverage-is-full.py"
 
 
 def check_phase_gate_runs_its_own_ratchet() -> list[str]:
@@ -3518,6 +3519,85 @@ def check_phase_gate_runs_its_own_ratchet() -> list[str]:
     return failures
 
 
+def check_phase_gate_publishes_the_coverage_remainder() -> list[str]:
+    """V-MET-002 is BLOCKING-ALWAYS, is not on `dev/L0-CHAIN.txt`, and must run somewhere.
+
+    Every other BLOCKING-ALWAYS L0 check is a chain line, so "does it run" is answered by the chain
+    file. V-MET-002 is the exception: it is red by construction until the 09 §6 catalog grows the
+    rows that assert its published remainder, and a required PR check that stays red for a phase
+    reddens every unrelated commit ([[LSN-055]]). The agreed home is `verify-phase<N>.sh`, which
+    makes that section the only place the check exists — and a section is one delete away from a
+    BLOCKING-ALWAYS check that runs nowhere and reports nothing, which is V-MET-007's failure
+    wearing a script's clothes.
+
+    The obligation is stated over every phase gate rather than over the one that has it, for the
+    reason the sibling arm above gives: the next phase's gate is written by copying this one, and
+    an obligation attached to a filename does not travel. Two properties, matching the two ways the
+    arm could be present and inert — it is invoked at all, and its red reaches `bad` rather than an
+    informational echo.
+
+    It retires the day V-MET-002 goes green and takes a line on the chain. Retiring it then is
+    correct and is not a weakening: the chain file becomes the artifact that answers "does it run",
+    which is a stronger answer than this one. Retire it in the commit that moves the line, so the
+    two never both fail to cover it.
+    """
+    failures: list[str] = []
+    runner = COVERAGE_RUNNER
+    if not runner.exists():
+        return [
+            f"{runner.relative_to(REPO)} does not exist. It is V-MET-002 — 09 §8's "
+            f"'an unmapped requirement in these categories fails the build' — and without it the "
+            f"load-bearing coverage obligation is asserted by nothing."
+        ]
+
+    # Gates written before 2026-07-31, when V-MET-002 was first implemented. Not a floor: a floor
+    # would exempt phase 16 as readily as phase 2.
+    grandfathered = {"2", "3", "4", "5", "6", "7", "8"}
+
+    gates = sorted(VERIFY_DIR.glob("verify-phase*.sh"))
+    if not gates:
+        return ["dev/verify/ has no verify-phase*.sh at all -- this check matched nothing"]
+
+    checked = 0
+    for gate in gates:
+        m = re.match(r"verify-phase(\d+)\.sh$", gate.name)
+        if not m or m.group(1) in grandfathered:
+            continue
+        checked += 1
+        phase = m.group(1)
+        lines = gate.read_text(encoding="utf-8").splitlines()
+        invocations = [
+            line
+            for line in lines
+            if "load-bearing-coverage-is-full.py" in line
+            and "--negative-control" not in line
+            and not line.lstrip().startswith("#")
+        ]
+        if not invocations:
+            failures.append(
+                f"{gate.relative_to(REPO)} never invokes dev/tests/load-bearing-coverage-is-full.py, "
+                f"so phase {phase}'s gate does not run V-MET-002. It is BLOCKING-ALWAYS and it is "
+                f"not a line on dev/L0-CHAIN.txt, so this script is the only place it runs at all -- "
+                f"a check that runs nowhere is V-MET-007, whatever the catalog says about it."
+            )
+            continue
+        window = "\n".join(lines[lines.index(invocations[0]) : lines.index(invocations[0]) + 12])
+        if "bad " not in window:
+            failures.append(
+                f"{gate.relative_to(REPO)}'s V-MET-002 invocation does not reach `bad` within twelve "
+                f"lines, so an unmapped load-bearing requirement prints and does not fail the gate. "
+                f"An arm whose red does not reach the exit code is a comment."
+            )
+
+    if not checked:
+        failures.append(
+            "every verify-phase*.sh in the tree is grandfathered out of the V-MET-002 obligation, "
+            "so this check evaluated nothing. Remove a phase from `grandfathered` or delete the "
+            "check -- a check with an empty corpus reports the same green as one that passed."
+        )
+    return failures
+
+
 CHECKS = [
     ("invariant 7 — authority never precedes machinery", check_write_verbs_have_machinery),
     ("LSN-038 — the machinery probes resolve against the tree", check_machinery_probes_resolve),
@@ -3591,6 +3671,10 @@ CHECKS = [
     (
         "planning defect 4 — every phase gate runs its own 09 §10 ratchet",
         check_phase_gate_runs_its_own_ratchet,
+    ),
+    (
+        "V-MET-002 — the phase gate publishes the load-bearing coverage remainder",
+        check_phase_gate_publishes_the_coverage_remainder,
     ),
 ]
 

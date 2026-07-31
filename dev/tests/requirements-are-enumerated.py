@@ -396,20 +396,25 @@ def dump_requirements(entries: dict[str, dict]) -> str:
 # property is literally that parked-at-zero is not wired. 08 section 2.5's label table is V-RUN-004
 # (stamped and selectable) plus, per row, the admission policy that consumes the label.
 #
-# Published gaps -- seventeen requirements deliberately left unmapped, because no catalog row
-# asserts them. Six in 06:
+# Published gaps -- sixteen requirements deliberately left unmapped, because no catalog row
+# asserts them. Five in 06:
 #   R-06.2.3-6   "developer-team actor: none in v1". Nothing asserts the ABSENCE of a
 #                developer-team actor GSA; every containment check asserts what a principal
 #                cannot do, not that a principal does not exist.
 #   R-06.4.2-17  a `fieldPaths` entry beginning with `/` is rejected at ChangePolicy admission.
 #                No check asserts ChangePolicy dialect admission at all.
-#   R-06.4.2-30  the `secret-material-egress` rule.
 #   R-06.4.2-44  the live-Secret digest comparison method,
 #                `sha256(secretNamespace || 0x1f || value)`.
 #   R-06.4.2-45  digests are never journaled or logged; `reasons[]` names the source Secret and
 #                key, never the value.
-# The last three are one hole: no check in the catalog reaches secret-material handling inside the
-# code floor. Closing it is a catalog change, not a curation change. And eleven elsewhere:
+# The last two are one hole: no check in the catalog reaches the COMPARISON METHOD behind
+# `secret-material-egress`. The rule row itself, R-06.4.2-30, is NOT part of that hole and was
+# wrongly filed inside it until 2026-07-31: it is a row of the same code-floor rule table as
+# `secret-write` and `blast-radius-cap`, `RuleSecretMaterialEgress` is a member of
+# `classify.AllFloorRuleIDs`, and the corpus carries nine cases for it -- so V-MET-005 and
+# V-GAT-001 reach it by exactly the argument that maps every one of its siblings, and singling it
+# out was a curation error, not a stricter reading. Closing 44/45 is still a catalog change.
+# And eleven elsewhere:
 #   R-03.4.3-8   no write to an `Agent` CR whose identity is an ANCESTOR of the writer's.
 #                V-CTN-007 covers the writer's OWN CR and V-CTN-025 the brake field on a child's;
 #                nothing walks `parentRef` upward on a write.

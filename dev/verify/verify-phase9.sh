@@ -231,12 +231,17 @@ while read -r c; do
     tail -12 "/tmp/p9-l0-${l0_n}.log"
   fi
 done < dev/L0-CHAIN.txt
-# 43 is the count on the day this gate was written, not a round number and not a floor with slack in
-# it. A floor below the real count tolerates exactly the change it exists to notice — L2_CHAIN_FLOOR
-# spent three phases at 6 against a 14-line chain for want of this sentence. Raise it in the same
-# commit that adds a line; lower it only in the commit that argues a line out (V-MET-014).
-if [ "$l0_n" -lt 43 ]; then
-  bad "L0-CHAIN.txt yielded only $l0_n runnable lines; there were 43 when this gate was written. The"
+# 57 is the count today, not a round number and not a floor with slack in it. A floor below the real
+# count tolerates exactly the change it exists to notice — L2_CHAIN_FLOOR spent three phases at 6
+# against a 14-line chain for want of this sentence. Raise it in the same commit that adds a line;
+# lower it only in the commit that argues a line out (V-MET-014).
+#
+# IT WAS 43 AGAINST A 56-LINE CHAIN UNTIL 2026-07-31, which is thirteen lines of slack and the exact
+# failure the sentence above describes, arriving in the file that describes it. The rule is prose,
+# and prose on the artifact is not a mechanization ([[LSN-019]]) — a lint that derives this floor
+# rather than remembering it is queued for the improvement pass.
+if [ "$l0_n" -lt 57 ]; then
+  bad "L0-CHAIN.txt yielded only $l0_n runnable lines; there were 57 when this gate was written. The"
   bad "  chain shrank, so 'L0 green' now covers less than it says (V-MET-014)."
 elif [ "$l0_bad" -eq 0 ]; then
   pass "L0 chain green — $l0_n/$l0_n (incl. classifier corpus, undo corpus, model-free classifier, pause≠scale-to-zero, scope label, one-broker-per-agent, broker supply chain, actor grant, journal/VAP parity)"
@@ -620,6 +625,24 @@ else
   bad "  the list below is the worklist, not a formatting problem. A BLOCKING-ALWAYS member may not"
   bad "  be deferred to close the phase (09 §9.6)."
   sed 's/^/    /' /tmp/p9-ratchet.log
+fi
+
+# ==== K. V-MET-002 — full coverage of the load-bearing suites =======================================
+# The one BLOCKING-ALWAYS L0 check with no line on dev/L0-CHAIN.txt, for the reason written out
+# beside its control there: it is red by construction until the 09 §6 catalog grows the rows that
+# assert the published remainder, and a required PR check that stays red for a phase reddens every
+# unrelated commit. This is where it runs instead. Section J above already reports V-MET-002 as
+# "not green" from the results file; this section is what says WHICH sixteen obligations, by ID and
+# in their own words, so the worklist is legible without opening three artifacts.
+echo; echo "== K. V-MET-002 — every load-bearing-owned requirement maps to >=1 check (09 §8) =="
+if python3 dev/tests/load-bearing-coverage-is-full.py >/tmp/p9-vmet002.log 2>&1; then
+  pass "$(tail -1 /tmp/p9-vmet002.log)"
+else
+  bad "V-MET-002 is red — obligations owned by V-CTN/V-BRK/V-REV/V-ISO/V-ADV map to no check."
+  bad "  09 §8.1 dates this to 'before Phase 10 grants the first write credential', so it is the"
+  bad "  last of the draw-down and not a deferral: a BLOCKING-ALWAYS check may not be deferred at"
+  bad "  all (09 §9.6). Close each by mapping an honest catalog row, or by adding one to 09 §6."
+  sed 's/^/    /' /tmp/p9-vmet002.log
 fi
 
 echo

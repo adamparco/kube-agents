@@ -22,8 +22,8 @@
 
 totals:
   enumerated: 853
-  covered: 340
-  uncovered: 513
+  covered: 341
+  uncovered: 512
 
 per_document:
   "01":
@@ -48,8 +48,8 @@ per_document:
     uncovered: 163
   "06":
     enumerated: 326
-    covered: 222
-    uncovered: 104
+    covered: 223
+    uncovered: 103
   "07":
     enumerated: 13
     covered: 4
@@ -506,7 +506,6 @@ uncovered:
   - R-06.3.1-10
   - R-06.3.1-11
   - R-06.4.2-17
-  - R-06.4.2-30
   - R-06.4.2-44
   - R-06.4.2-45
   - R-06.5-1
