@@ -320,3 +320,20 @@ bash dev/git-preflight.sh
 # --- the invariants gate itself (P8-T6) -----------------------------------------------------
 # Runs last: it reads this file, and several of its checks are about the chain above.
 python3 dev/tests/invariants-gate.py
+
+# --- the undo-coverage soak's envelope population (P9-T8b-4b-ii-2b-ii-a) ---------------------
+# V-REV-001 is "100% of executed non-gated ActionRecords carry a validated undo plan", and a
+# percentage is only as good as its denominator. Today's is ONE — broker-execute-l2.sh submits a
+# single hand-written envelope and its results.csv note says n=1. This fixture derives the real
+# population from verification/fixtures/classifier-corpus.yaml, filtered by what the shipped write
+# overlay actually authorizes, subresources included.
+#
+# A DERIVED corpus fails the opposite way to a listed one: it shrinks to nothing silently and prints
+# the empty result as a clean run. So the self-test carries floors (>=20 cases, >=3 verbs, >=2 kinds,
+# both non-gated classes, both seed states, no target collisions, the reject histogram summing to
+# the whole corpus) AND fires those floors against a synthesised empty selection, because a floor
+# that has never been observed to fire is a floor whose threshold is a guess. Twelve more arms mutate
+# the grant in memory — revoke `deployments` and every non-scale Deployment case must drop while the
+# `deployments/scale` case stands; make the grant read-only and every previously-selected case must
+# come back as `not-authorized`, by that name.
+python3 dev/verify/fixtures/soak_corpus.py --self-test

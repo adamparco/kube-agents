@@ -91,8 +91,11 @@ effective, made A-4 and A-5 go red by name. Its section is at the end of this fi
 
 **`P9-T8b-4b-ii-2b-ii` was split at SELECT on 2026-07-31** into **`2b-ii-a`** (the derived soak
 corpus, L0) and **`2b-ii-b`** (the soak itself, V-REV-001 at L2); the split and its reasoning are in
-its own section at the end of this file. **Resume at `P9-T8b-4b-ii-2b-ii-a`.** The remaining Phase 9
-ladder is `T8b-4b-ii-2b-ii-a` → `T8b-4b-ii-2b-ii-b` → `T9c`, then `harness-milestone`. **`P9-T9c` was appended 2026-07-31** by the
+its own section at the end of this file. **`2b-ii-a` landed 2026-07-31** — `dev/verify/fixtures/soak_corpus.py`
+derives **37 envelopes** from the 181-case classifier corpus, filtered by what the shipped write
+overlay authorizes, `--self-test` **17/17** and a new L0 chain line; V-REV-001's denominator is no
+longer 1. **Resume at `P9-T8b-4b-ii-2b-ii-b`.** The remaining Phase 9 ladder is
+`T8b-4b-ii-2b-ii-b` → `T9c`, then `harness-milestone`. **`P9-T9c` was appended 2026-07-31** by the
 ORIENT drain of `BACKLOG.md` B-006 — 06 §4.4 row 3's auto-pause has no consumer; its section is at
 the end of this file.
 
@@ -5190,10 +5193,10 @@ population, guard 3 restated as a label assertion, and both chains rewired — t
 `P9-T9b-5c`, which took a whole session and produced one suite. Carrying it forward whole is the
 shape PROTOCOL §2 names: an oversized unit is not finished late, it is checkpointed half-done.
 
-| Unit                       | What                                                                                                                                                                                              | Checks               | Level |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | ----- |
-| **P9-T8b-4b-ii-2b-ii-a**   | The soak **corpus**: derive the executable envelope population from `verification/fixtures/classifier-corpus.yaml`, filtered by what `dev/verify/fixtures/actor-tenant-write-grant.yaml` authorizes, with a `--self-test` carrying vacuity floors and negative arms. Hermetic, no cluster. | feeds **V-REV-001**  | L0    |
-| **P9-T8b-4b-ii-2b-ii-b**   | The **soak**: a corpus probe, `dev/verify/undo-coverage-l2.sh`, target seeding, journal mining over the `DryRun` population, guard 3 as a label assertion                                          | **V-REV-001**        | L2    |
+| Unit                     | What                                                                                                                                                                                                                                                                                       | Checks              | Level |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------- | ----- |
+| **P9-T8b-4b-ii-2b-ii-a** | The soak **corpus**: derive the executable envelope population from `verification/fixtures/classifier-corpus.yaml`, filtered by what `dev/verify/fixtures/actor-tenant-write-grant.yaml` authorizes, with a `--self-test` carrying vacuity floors and negative arms. Hermetic, no cluster. | feeds **V-REV-001** | L0    |
+| **P9-T8b-4b-ii-2b-ii-b** | The **soak**: a corpus probe, `dev/verify/undo-coverage-l2.sh`, target seeding, journal mining over the `DryRun` population, guard 3 as a label assertion                                                                                                                                  | **V-REV-001**       | L2    |
 
 **The split is free, and that is a fact about P1 rather than a judgement.** `_p1_build_inputs()`
 (`dev/lib/preconditions.sh:62`) maps freshness per image: `k8s-operator | kage-router | kage-broker`
@@ -5231,3 +5234,94 @@ equality assertion there would be a second V-MET-005 wearing V-REV-001's ID, and
 reasons that say nothing about undo coverage. `expect.class` is used for exactly one thing: as the
 selection filter for the **non-gated** classes, because those are the population 09 §6.3 scopes the
 check to. What the soak reads back is the class the broker actually chose.
+
+### P9-T8b-4b-ii-2b-ii-a — outcome, 2026-07-31
+
+**V-REV-001's denominator went from 1 to 37, and the number is derived rather than written down.**
+`dev/verify/fixtures/soak_corpus.py` reads `verification/fixtures/classifier-corpus.yaml` (181
+cases), filters it by what `dev/verify/fixtures/actor-tenant-write-grant.yaml` actually authorizes,
+and emits the envelope population the soak will submit: **37 cases, 4 verbs, 2 kinds, both non-gated
+classes, both seed states.** `--self-test` is **17/17** and is a new `dev/L0-CHAIN.txt` line (45 →
+46). No `results.csv` row: this unit scores no check. It builds the population `2b-ii-b` will claim
+**V-REV-001** over, and a verdict row for a fixture would be a pass with no property behind it.
+
+#### The reject table is the deliverable as much as the selection is
+
+144 of the 181 cases are excluded, and every one of them carries exactly one reason from a **closed**
+set, with `selected + rejected == total` asserted:
+
+| reason                | n   | why it is not in the soak                                                                |
+| --------------------- | --- | ---------------------------------------------------------------------------------------- |
+| `class-gated`         | 80  | 09 §6.3 scopes V-REV-001 to the non-gated population; a gated action does not execute    |
+| `class-forbidden`     | 26  | never reaches the planner                                                                |
+| `not-authorized`      | 24  | the write overlay grants configmaps, deployments and deployments/scale, and nothing else |
+| `abort`               | 4   | the envelope is refused before classification                                            |
+| `class-unstated`      | 4   | the case asserts rules only; there is no class to filter on                              |
+| `multi-op`            | 3   | one target per record, because the seeding and the journal mining are both per-target    |
+| `unnamed-target`      | 2   | the executor snapshots by ref, and a ref with no name is not one                         |
+| `verb-not-executable` | 1   | `cloud` is not in the envelope schema's `VALID_OPS`                                      |
+
+A **derived** corpus fails the opposite way to a listed one. A listed corpus goes stale loudly; a
+derived one shrinks to nothing silently and prints the empty result as a clean run. The histogram is
+what makes a shrink visible as a reason that moved rather than as a smaller number with no
+explanation — and the arithmetic assertion is what stops a case being dropped by neither path.
+
+#### The floors are fired against an empty selection, not only against today's tree
+
+`floor_problems()` is a pure function of (selected, rejected, total, grant) precisely so the
+self-test can call it twice: once on the real derivation, which must return nothing, and once on a
+**synthesised empty selection**, which must return at least five complaints. A floor that has never
+been observed to fire is a floor whose threshold is a guess, and the collision floor is the case in
+point — nothing in the real corpus produces two cases with one target name, so without the synthetic
+arm that branch would ship unexecuted. Same for `MIN_SELECTED = 20`: it is set below the measured 37
+on purpose, because 09 §7.1 lets the classifier corpus move between 120 and 200 cases and a floor
+pinned to today's exact yield fails on somebody else's legitimate edit. Low enough not to be brittle,
+high enough that **n=1 — the thing this unit exists to fix — cannot pass**.
+
+#### The filter reads the grant, and there are three arms that prove it does
+
+The tempting shape is a hardcoded `{ConfigMap, Deployment}`. It passes every test the day it is
+written and stops tracking the grant the first time the grant moves. So the authorized set is read
+out of the overlay file, and the self-test mutates that file in memory:
+
+- Revoke `deployments` → all **33** non-scale Deployment cases drop, the ConfigMap cases are
+  untouched, **and the scale case stands**, because it rides on the separate `deployments/scale`
+  rule. An arm that expected the scale case to disappear would be asserting that the reader ignores
+  subresources.
+- Revoke `deployments/scale` → the scale case drops and `patch Deployment` stands.
+- Make every verb `get/list/watch` → **every** previously-selected case comes back rejected, and
+  by the name `not-authorized` rather than something vaguer.
+
+The RBAC verbs each envelope verb needs are read off what the executor's client actually calls
+(`execute/client.go`), not off the verb's name: `apply`/`create` go through a server-side-apply
+`Patch` and therefore need **patch + create**, and `scale` is an `Update` on the **`scale`
+subresource**. `get` is deliberately absent from the requirement — every op snapshots its pre-state,
+but that read belongs to the READ overlay, and asking the write overlay for it would reject every
+case for the wrong reason.
+
+#### The grant reader refuses what it does not understand
+
+`dev/tests/yamlsubset.py` cannot read the overlay and should not: it rejects flow collections by
+design, and the overlay is written in them because it is an RBAC manifest a human applies, not a
+corpus prettier reformats. So `load_grant` is a narrow three-line-form reader — and its one
+load-bearing property is that a rule it does **not** understand is an **error**. It counts
+`- apiGroups:` lines and requires that number to equal the number of triples it matched. A
+silently-skipped rule narrows the authorized set, which narrows the corpus, which shrinks
+V-REV-001's denominator: the exact failure this module exists to prevent, arriving through its own
+input reader.
+
+#### The one assertion this file must never make
+
+**It does not assert that the live class equals `expect.class`.** The corpus cases are inputs already
+resolved against a fixture world; the live broker classifies against production namespace labels,
+live object state and a real cluster's seen/novel history — and every selected case is re-addressed
+to the one tenant namespace the suite owns, which can by itself move a case across the production
+ladder. An equality assertion there would be a second V-MET-005 wearing V-REV-001's ID, going red for
+reasons that say nothing about undo coverage. `expect.class` does exactly one job: select the
+non-gated classes. **`2b-ii-b` reads back the class the broker chose and partitions on that.**
+
+`KIND_TO_RESOURCE` holds the one remaining hand-written mapping, and it is a naming convention rather
+than a policy statement — a Kind missing from it is rejected as `not-authorized`, the conservative
+answer. The silent-shrink hole is in the other direction, so a floor closes it: **every resource the
+grant names must be reachable from some Kind in the map**, which means adding `ingresses` to the
+overlay fails this file until it learns `Ingress`.
