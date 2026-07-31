@@ -87,8 +87,9 @@ will start selecting.
 | **LSN-056** | harness, checks, ratchets, false-green, V-MET-003 | The assertion ratchet was last wound when the suite had **194** named tests in **34** files; the tree had **1290** in **137**. `check_assertion_ratchet` only fails when a *baselined* test disappears, so a baseline nobody regenerates silently narrows — it had been guarding 15% of the corpus and printing the same green as if it guarded all of it. Found while regenerating the baseline for an unrelated pass, not by any check | **closed** | Baseline wound 194 → 1290, plus `check_the_ratchet_baseline_covers_the_corpus` in `dev/tests/invariants-gate.py`: every named test in the tree must be in the baseline or in `retired`. Names, not just files — covering only files would let one file grow from 2 tests to 50 with 48 outside the ratchet. The instruction to regenerate had been in the baseline's own `_comment` the whole time, which is [[LSN-019]]: prose on the artifact is not a mechanization. Controls in `dev/test_invariants_gate.py` |
 | **LSN-057** | harness, checks, corpus-discovery, false-positive, LSN-035 | `negative-controls-name-their-rule.py` discovered its corpus as *every `dev/tests/*.py` containing the string `--negative-control`*. The moment a check appeared that SEARCHES other files for that flag — `invariants-gate.py`'s new LSN-053 arm — the substring swept the searcher in and reported it as a control file with no control. The file's own docstring had already argued **WHY BEHAVIOURAL AND NOT STRUCTURAL** for the scoring half while the discovery half stayed textual | **closed** | `dev/tests/negative-controls-name-their-rule.py` (on `dev/L0-CHAIN.txt`): discovery is now a behaviour — a file is in the corpus if its own argv handling dispatches on the flag (`"--negative-control" in argv` and its spellings, or an `add_argument`) or if a usage line offers the flag against the file's own name. Splitting the two signals bought a new property for free — a usage line that offers the flag with nothing dispatching on it is its own finding, because the documented command then runs the ordinary check and prints its ordinary PASS. Two new cases in the file's own `--negative-control`, one of them the exact searcher that caused this |
 | **LSN-058** | harness, tooling, false-red, concurrency, go | CHECKPOINT now requires both the L0 chain and `make -C k8s-operator test` ([[LSN-052]]/[[LSN-054]]), so the obvious saving is to run them at once. Doing that produced a red naming a file nobody wrote: five python suites create temp directories **inside** `k8s-operator/`, `controller-gen` runs with `paths="./..."`, and the directory is deleted while it is reading — `tmp109n_mmw/main.go:1: no such file or directory`, then `Error: not all generators ran successfully`. It points at no defect and vanishes on a serial re-run | **closed** | `dev/test_action_envelope.py`, `dev/test_envelope_wire_keys.py`, `dev/test_invariants_gate.py` (all three on `dev/L0-CHAIN.txt`): every `TemporaryDirectory(dir=…k8s-operator…)` takes `prefix="."`. Go tooling skips dot-directories under `./...`; Python globbing does not, so the suites that need to SEE the directory still do. Verified by re-running the two commands concurrently — the pairing that produced the red — and getting `GO=0 PYTHON=0` |
+| **LSN-059** | harness, tooling, resource-leak, envtest, self-reinforcing | `make -C k8s-operator test` measures **2m09s** warm against a caller whose default time bound is **two minutes**, so it is killed seconds from finishing — and envtest starts a real etcd **and** kube-apiserver per test binary, stopped in `TestMain` after `m.Run()` returns, which a `SIGKILL` never reaches. The machine accumulated **32** adopted control planes, 30 at `ppid=1`, holding **1375 MB** of 16 GB, oldest ~31h. Nothing on the machine reaps them, no exit code mentions them, and every suite stays green: the only symptom is that the machine gets slower — which makes the next run likelier to hit the same bound and abandon the next cohort | **closed** | `dev/reap-envtest.sh` — anchored at the left edge of the asset root ([[LSN-005]] applied to a process) and predicated on `ppid == 1`, so a concurrent `make test` is never touched — wired into `k8s-operator/Makefile` as a **prerequisite** of `test` (the load-bearing half: it runs after however the previous run died) plus a `trap … EXIT INT TERM` (the tidy half). `dev/tests/invariants-gate.py` (`check_envtest_control_planes_are_reaped`, L0-CHAIN) holds all five halves including the two safety predicates inside the script; `dev/test_reap_envtest.py` (18 behavioural tests on real processes, `unittest discover dev`, L0-CHAIN); controls in `dev/test_invariants_gate.py`. The caller's own timeout is **not** mechanizable from this tree — argued in the body |
 
-**Open: 0 of 58**.
+**Open: 0 of 59**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -3328,3 +3329,117 @@ lone `prefix="."` reads like a naming preference and the next refactor deletes i
 
 **Verified the way the defect was produced**, not the way it is described: the two commands were run
 concurrently again, and returned `GO=0 PYTHON=0`.
+
+---
+
+## LSN-059 — The suite was green, the machine was dying, and the harness was the thing killing it
+
+**Tags:** harness, tooling, resource-leak, envtest, self-reinforcing
+**Opened:** 2026-07-30 (BACKLOG B-004, reported by the human)
+**Status:** closed — mechanized in the same unit
+
+**What happened.** A human looked at the process table on the dev laptop with no test run in flight
+and found **sixteen `etcd` and sixteen `kube-apiserver`** processes, all of them executing out of
+`k8s-operator/bin/k8s/`, thirty of them at `ppid=1`, holding **1375 MB** on a 16 GB machine. The
+oldest was about thirty-one hours old. They had arrived in cohorts, and the cohorts matched test
+runs.
+
+`sigs.k8s.io/controller-runtime/pkg/envtest` starts a real control plane — one etcd, one
+kube-apiserver — per **test binary**, and every one of the fourteen `*_envtest_test.go` packages
+stops its own in `TestMain`, after `m.Run()` returns:
+
+```go
+code := m.Run()
+if testEnv != nil { _ = testEnv.Stop() }
+os.Exit(code)
+```
+
+A `SIGKILL` does not reach that line. `go test` dies, the control planes do not, launchd (or init)
+adopts them, and nothing on the machine has ever reaped them.
+
+**Why this is a harness defect and not only a test defect.** The harness is the thing sending the
+signal. `make -C k8s-operator test` measures **2m09s** on this machine with a warm build cache —
+`internal/controller` alone is 116s — against a caller whose default time bound is **two minutes**.
+So the command is killed a few seconds from finishing, on a run that was about to pass, and the kill
+is not an accident that happens occasionally: it is what happens every time, by construction. Then
+the loop closes. Each kill leaves a cohort. Each cohort makes the machine slower. A slower machine
+is likelier to exceed the same bound. This one runs in the wrong direction on its own, and
+[[LSN-058]] is the standing proof that this class of background interference does not stay quiet —
+it produced a red naming a file nobody wrote, at the exact moment a unit was trying to close.
+
+**The symptom is the absence of a symptom.** No exit code mentions this. Every suite is green; the
+tests that leaked are the tests that passed. Nothing in the tree is wrong. The only observable is
+that the machine gets slower, which reads as the machine getting older. That is why it took a human
+running `ps` to find it, and why it had been running for at least thirty-one hours before anyone
+did. A defect whose entire signature is "everything is fine, but slower" cannot be caught by any
+verdict the harness already collects — so the fix cannot be a verdict, it has to be a sweep.
+
+**You cannot trap a SIGKILL, so the fix cannot live in teardown.** It has to run at the START of the
+next run: that is the one moment guaranteed to occur after an abandoned cohort exists, whatever
+killed the previous one. Hence `dev/reap-envtest.sh` as a **prerequisite** of the `test` target, with
+the `trap … EXIT INT TERM` as a second, weaker line — the trap covers Ctrl-C and an ordinary
+failure, which is everything except the death that actually causes this.
+
+**Two properties make it safe to run automatically on every test invocation**, and both had to be
+designed in rather than added afterwards, because a reaper wired into `make test` is a program that
+kills processes on a developer's machine without being asked:
+
+1. **Discovery is anchored at the left edge of an absolute path.** A process is in scope iff argv[0]
+   _begins with_ the envtest asset root. This is [[LSN-005]]'s rule — the destructive guard that
+   matched a context name by substring and would have accepted `prod-scratchpad` — applied to a
+   process instead of a cluster. `pgrep etcd` would reap the etcd somebody is running for real work.
+   It is also `ps -eo args=` and not `comm`, because on Linux `comm` is a 15-character truncated
+   basename and the path this whole thing matches on would not be present at all.
+2. **Only orphans are reaped.** The default predicate is `ppid == 1`, which is precisely and only the
+   leak: a control plane with a live parent is somebody's test run in flight — including a
+   **concurrent `make test` in another terminal**. Without this, wiring the sweep into `test` makes
+   two simultaneous runs kill each other, which is a fix whose failure mode is worse than the leak.
+
+`--all` drops the second property, is deliberately not what the Makefile passes, and announces
+itself before acting.
+
+**This is a case where the substring bug was not hypothetical.** While proving the reaper worked, a
+hand-rolled `ps | grep "k8s-operator/bin/k8s/.*kube-apiserver"` written to count the processes
+matched **its own shell's argv**, which contained the pattern as a literal. The count came back
+nonzero when nothing was running, the wait loop exited immediately, and it killed a live `make` in
+the middle of `controller-gen`. Twenty minutes after writing property 1 down. `dev/test_reap_envtest.py`
+carries that exact shape as a test: a process whose argv merely _mentions_ the asset root must
+survive `--all`.
+
+**Mechanization.**
+
+- `dev/reap-envtest.sh` — the sweep, both safety properties, `--list` as a non-destructive probe
+  (exit 1 if orphans exist), and a refusal for any asset root that is relative or has fewer than
+  three path components. `--dir /` is not interpreted, it is refused: a prefix match is only as safe
+  as its prefix.
+- `k8s-operator/Makefile` — `reap-envtest` as a prerequisite of `test`, plus the trap in the recipe.
+- `dev/tests/invariants-gate.py` `check_envtest_control_planes_are_reaped` (on `dev/L0-CHAIN.txt`) —
+  the reaper exists, it is a prerequisite and not only a trap, the trap is there too, the target
+  actually runs the script, and the `ppid == 1` predicate and the left-edge anchor are both still in
+  it. Each of those can be deleted leaving a tree where `make test` still runs and still passes,
+  which is the whole reason the check enumerates them separately.
+- `dev/test_reap_envtest.py` (`python3 -m unittest discover dev`, on `dev/L0-CHAIN.txt`) — 18
+  behavioural tests against **real** processes with synthesised argv[0]s, never a stubbed `ps`. Both
+  safety properties are tested in both directions: a parented control plane survives the default
+  sweep and dies under `--all`; a sibling root sharing a name prefix, a process outside the root, and
+  a process merely mentioning the root all survive `--all`.
+
+**The caller's timeout is not mechanizable from inside this repository — an argued refusal.** The
+other half of this defect is that the harness kills the command at all, and the time bound is a
+property of the runtime invoking the harness, not of the tree. There is no file to assert about: a
+check that could see it would have to observe an invocation, and by then the cohort exists. What
+_can_ be held is the number, so `binding.md` §Build now carries the measurement and the requirement
+(≥ 5 minutes, measured 2m09s warm, cold is worse), and the gate's fifth arm asserts that warning is
+still there. This is deliberately **not** counted as closing the caller half. The reaper is what
+closes the lesson: it bounds accumulation at one run's worth however the previous run died, which
+holds even if every future invocation is killed. The §Build note only stops that one run's worth
+being manufactured on purpose, every time, forever.
+
+**Verified the way the defect was produced.** The leak was reproduced deliberately (the machine had
+rebooted between the report and the fix, taking the evidence with it): a `go test` on a single
+envtest package was SIGKILLed, and its etcd reparented from 7170 to 1. Then, with three orphans
+holding ~304 MB **and** a live `go test ./internal/broker/execute/` in flight, the default sweep
+killed exactly the three orphans and left the live pair alone — the live test finished `ok … 21.6s`.
+Finally, end to end: two orphans created, `make -C k8s-operator test` run, whose first line was
+`reap-envtest: reaped 2 envtest process(es) (~263 MB); 1 needed SIGKILL after 5s.`, the suite green,
+the exit trap reporting nothing left to reap, and `--list` afterwards returning 0.

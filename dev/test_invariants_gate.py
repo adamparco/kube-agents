@@ -737,5 +737,87 @@ class ACheckOnlyUnitExhibitsBothTrees(_PinnedProse):
         self.assertTrue(any("negative-control" in p for p in problems), problems)
 
 
+class EnvtestControlPlanesAreReaped(_PinnedProse):
+    """[[LSN-059]]: the leak is invisible — the suite is green, the machine is just slower.
+
+    Every arm below removes one piece of the fix and leaves a tree where `make test` still runs and
+    still passes. That is the whole reason the check exists: nothing about this defect shows up in
+    an exit code, so a silent deletion of the wiring reads exactly like a green.
+    """
+
+    def test_green_on_the_tree_as_it_stands(self):
+        self.assertEqual([], gate.check_envtest_control_planes_are_reaped())
+
+    def test_the_tree_really_does_have_envtest_packages_to_protect(self):
+        # Without this the arm above could be the VACUOUS branch, which is a red — but a reader
+        # skimming a green suite would not know which branch produced it.
+        self.assertTrue(gate._envtest_gated_packages())
+
+    def test_deleting_the_reaper_fails(self):
+        self._saved.setdefault("REAPER", gate.REAPER)
+        gate.REAPER = pathlib.Path(self._tmp.name) / "reap-envtest.sh"  # never created
+        problems = gate.check_envtest_control_planes_are_reaped()
+        self.assertTrue(problems)
+        self.assertTrue(any("is gone" in p for p in problems), problems)
+
+    def test_dropping_the_prerequisite_and_keeping_the_trap_fails(self):
+        # The regression that would look most reasonable: "the trap already covers it." It does not
+        # cover SIGKILL, which is the only death that causes the leak.
+        self.mutate(
+            "OPERATOR_MAKEFILE",
+            ("setup-envtest reap-envtest ## Run tests.", "setup-envtest ## Run tests."),
+        )
+        problems = gate.check_envtest_control_planes_are_reaped()
+        self.assertTrue(problems)
+        self.assertTrue(any("prerequisite" in p for p in problems), problems)
+
+    def test_dropping_the_trap_and_keeping_the_prerequisite_fails(self):
+        self.mutate("OPERATOR_MAKEFILE", ("\ttrap 'bash $(REPO_ROOT)/dev/reap-envtest.sh", "\t"))
+        problems = gate.check_envtest_control_planes_are_reaped()
+        self.assertTrue(problems)
+        self.assertTrue(any("trap" in p for p in problems), problems)
+
+    def test_pointing_the_target_at_something_else_fails(self):
+        # The prerequisite is still named, so the Makefile reads as wired. The recipe no longer
+        # sweeps anything.
+        self.mutate(
+            "OPERATOR_MAKEFILE",
+            ("\t@bash $(REPO_ROOT)/dev/reap-envtest.sh --dir", "\t@true --dir"),
+        )
+        problems = gate.check_envtest_control_planes_are_reaped()
+        self.assertTrue(problems)
+        self.assertTrue(any("does something else" in p for p in problems), problems)
+
+    def test_dropping_the_ppid_predicate_fails(self):
+        # `--all` semantics by default: the sweep the Makefile runs on every `test` would then kill
+        # a concurrent `make test` in another terminal. Worse than the leak it fixes.
+        self.mutate("REAPER", ("in_scope | awk '$2 == 1'", "in_scope"))
+        problems = gate.check_envtest_control_planes_are_reaped()
+        self.assertTrue(problems)
+        self.assertTrue(any("ppid == 1" in p for p in problems), problems)
+
+    def test_dropping_the_left_anchor_fails(self):
+        # [[LSN-005]] applied to a process: a substring match still finds every orphan, and also
+        # finds the etcd somebody is running for real work.
+        self.mutate("REAPER", ("index(argv0, root) == 1", "index(argv0, root) > 0"))
+        problems = gate.check_envtest_control_planes_are_reaped()
+        self.assertTrue(problems)
+        self.assertTrue(any("LEFT EDGE" in p for p in problems), problems)
+
+    def test_dropping_the_root_refusals_fails(self):
+        self.mutate("REAPER", ("REFUSING", "warning"))
+        problems = gate.check_envtest_control_planes_are_reaped()
+        self.assertTrue(problems)
+        self.assertTrue(any("refuses any asset root" in p for p in problems), problems)
+
+    def test_dropping_the_timeout_warning_from_binding_fails(self):
+        # The caller half. Deleting this leaves a tree where the sweep still runs and the cohort it
+        # sweeps is manufactured fresh on every single invocation.
+        self.mutate("BINDING", ("timeout", "bound"))
+        problems = gate.check_envtest_control_planes_are_reaped()
+        self.assertTrue(problems)
+        self.assertTrue(any("explicit timeout" in p for p in problems), problems)
+
+
 if __name__ == "__main__":
     unittest.main()
