@@ -48,15 +48,18 @@ An **improvement pass is due before the next unit**: `binding.md` §Thresholds s
 any halt is cleared"_. It has [[LSN-054]] and [[LSN-055]] queued, and LSN-054 is a correction to
 [[LSN-052]]'s proposed mechanization rather than an addition to it.
 
-**Resume at `P9-T9b-5b-0-ii-b`** — its section below states what it owes. In one sentence: three
-read-only per-tier actor templates carrying the READ half of 06 §2.2 ∪ §2.2.1 (profiles of 83 / 89 /
-68 triples against ceilings of 171 / 172 / 136), their bindings, and the
-`v in ['get', 'list', 'watch'] ||` disjunct in all three copies of `vap-agent-readonly` — as **one**
-unit, because 5b-0-i established that the render and the admission bound cannot be separated.
-Render **developer-team as a `Role`, never a `ClusterRole`**.
+**`P9-T9b-5b-0-ii-b` landed 2026-07-31** — the three read-only per-tier actor templates, their
+bindings, `render_actor_grant`, the wiring, and the `v in ['get', 'list', 'watch'] ||` disjunct in
+all three copies of `vap-agent-readonly`. V-BRK-013's tier arm now runs against the real tree rather
+than a synthetic, at the profiles 5b-0-ii-a computed a unit earlier (83 / 89 / 68 against ceilings of
+171 / 172 / 136), with developer-team a `Role` and never a `ClusterRole`. Its section is at the end
+of this file.
 
-V-BRK-013 is already green on both today's tree and the tree that unit will build, so its first run
-there is a real signal: if it goes red, the implementation is wrong, not the check ([[LSN-053]]).
+**Resume at `P9-T9b-5b-0-iii`** — the L2 arm. Re-run `dev/verify/broker-execute-l2.sh` against
+`gke-scratch-kube-agents-dev` past step 3, which stopped because the platform actor could not list
+Secrets, and score **V-BRK-006** (L2) and **V-REV-001**. A cluster provisioned before this unit does
+not have the grant; reprovision the identity rather than patching it, so what is scored is what the
+install path produces.
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
 [`LEDGER.md`](LEDGER.md).
@@ -4515,3 +4518,107 @@ survivor — compiles rather than runs, so it lists those six either way and sta
 - **[[LSN-055]]** — twenty-five CHECKPOINT commits, one push, one CI run, and the red belonged to a
   commit twenty back. Also establishes that LSN-052's candidate 2 (a push trigger on non-`main`
   branches) is necessary but **insufficient**: a trigger nothing triggers is still one run.
+
+---
+
+### P9-T9b-5b-0-ii-b — the read half is rendered, and admission is widened to admit it
+
+The other half of the split 5b-0-ii-a forced. That unit taught **V-BRK-013** the two shapes; this one
+builds the tree the second shape describes: three per-tier actor grants carrying the READ half of
+06 §2.2 joined with §2.2.1, their bindings, the renderer, the wiring, and the
+`v in ['get', 'list', 'watch'] ||` disjunct in all three copies of `vap-agent-readonly`. One unit,
+because either half alone is a red check — the render without the disjunct is an object no cluster
+would accept, and the disjunct without the render widens a policy nothing exercises.
+
+#### Three templates, and why they are not three copies of one shape
+
+Property 4 of V-BRK-013 holds the **union of a tier's objects** to that tier's profile, and validation
+2 of `vap-agent-readonly` denies a `ClusterRole` labelled `kube-agents/tier: developer-team`. Those
+two facts together fix the shape, and it is not uniform:
+
+| tier             | objects                                                                 | why                                                                                                                                                                                                                                                                                                   |
+| ---------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `developer-team` | one namespaced `Role` + `RoleBinding`, 89 triples                       | a namespace-scoped tier may not own a ClusterRole. Its three cluster-scoped grant rules are written out **inert** — a `Role` cannot grant `tokenreviews` — so the tier's union still equals its profile, and the tier-neutral `kubeagents-broker-operations` ClusterRole is what grants them for real |
+| `cluster-admin`  | `ClusterRole` (83 − journal) + `Role` (journal, roster) + both bindings | binding one per-tier ClusterRole cluster-wide would grant `create actionrecords` in **every** namespace, which is the fleet-wide-writer shape `agent-identity.yaml.template` already forbids and V-BRK-012 catches one layer down                                                                     |
+| `platform`       | same two-object split, 68 triples                                       | as above                                                                                                                                                                                                                                                                                              |
+
+Arithmetic, hand-checked against 06 §2.2 before anything was written and then confirmed by the check:
+developer-team 69 read + 20 grant = **89**; cluster-admin 69 + 20 − 6 overlap = **83**; platform
+54 + 20 − 6 = **68**. Exactly the numbers 5b-0-ii-a's profile computation printed a unit earlier.
+
+#### "Retire the shared pair" turned out to mean retiring one half of it
+
+The plan said retire the shared pair. Only the **namespaced** `Role kubeagents-broker-operations`
+could go: every triple of it now lands in a per-tier `Role`, stamped, and an unstamped shared object
+belongs to every tier and is therefore evidence for none of them under property 4. The **ClusterRole**
+survives, and the argument is written into its header rather than left implicit — `developer-team`
+cannot own a cluster-scoped object, so its `tokenreviews`, `fleetfreezes` and `changepolicies` can
+only come from an object wearing no tier label at all, and 06 §4.4 says a tier that cannot read
+`fleetfreezes` fails closed permanently. Dropping it would not be a narrowing; it would brick a tier.
+
+#### V-CMP-007 chose the renderer's shape
+
+`render_actor_grant <tier> <namespace> <leaf>` selects its template with a `case` over three
+**literal** filenames rather than interpolating `actor-grant-${tier}.yaml.template`. That is not
+style: V-CMP-007 property 1 requires every `*.yaml.template` basename under `k8s-operator/scripts/`
+to appear literally in text the install path executes, and a dynamic path would have made all three
+new templates read as files nothing renders — an install-path hole with a green check over it.
+
+`apply_agent_identity` now applies three streams in order (shared grant → tier grant → identity) in
+both its dry-run and live arms; `delete_agent_identity` removes all four new per-tier objects, whose
+names are a pure function of tier and leaf and would otherwise be inherited by the next install under
+the same name. `dev/lib/agent-fixtures.sh` renders the tier grant too — without it an L2 fixture would
+lose the journal `Role` entirely and the broker would fail step 11 with a 403 that looks like a bug in
+the broker.
+
+#### What the disjunct gave up, and what still holds
+
+Validation 3 now admits any read verb. 03 §4.3's obligation table assigns `vap-agent-scope` only
+_write_ obligations for actors, which is what licenses it; the read half is bounded instead by
+V-BRK-013's per-tier union equality, and by P10-T1 moving that bound into the cluster. One thing is
+genuinely conceded: a wildcard **group or resource** carrying only read verbs now passes admission,
+which 06 §2.2's platform template requires. A wildcard **verb** does not — `*` is not a read verb and
+no triple in the allow-list ends in `:*`.
+
+One negative fixture became a positive. `vap_actor_negatives.yaml` DOC 4 (`secrets` get/list/watch on
+an actor Role) asserted that the actor arm is a triple allow-list and not a write filter. That was
+right about the policy and wrong about the spec it enforces, so it moved to `vap_actor_positive.yaml`
+as DOC 5, with the flip and its replacement bound argued in the header rather than deleted — reverting
+the disjunct now fails a fixture that says which side of the change came back. The remaining docs
+renumber 5–8 → 4–7; none of them changes verdict.
+
+#### The far side of the two-trees discipline
+
+5b-0-ii-a committed negative-control rows that **synthesised** the tree this unit would build
+([[LSN-053]]). Landing it inverts them, and the inversion is where the interesting failure was: two
+rows scored `caught` for the wrong reason and one stopped firing entirely, because property 4 measures
+a **union** and a lamed synthetic beside a correct shipped template is still a complete union. Both
+missing-rule rows now perturb `actor-grant-platform.yaml.template` itself. The synthesis helper stays
+for the rows that need a **wrongly** rendered object — the whole template, a rule outside it, a
+mis-stamped tier, a namespace-scoped tier as a ClusterRole — since the shipped tree deliberately
+contains none of those. Row count unchanged at 20, no signal relaxed, and the two rows that existed
+only to describe the future tree became reachable regressions: the disjunct reverted in every copy,
+and the disjunct reverted in **one** copy while the others stay widened.
+
+#### What ran
+
+| Artifact                                           | Result                                                                                                                                        |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `actor-grant-single-sourced.py`                    | PASS — tier-stamped actor objects present for **all three** tiers, each union exactly its profile (83 / 89 / 68), 3 VAP copies `read-widened` |
+| `actor-grant-single-sourced.py --negative-control` | PASS — **20/20**, each caught by the property it targets                                                                                      |
+| `identity-has-install-path.py` (+ control)         | PASS — every roleRef resolves, 15 manifest-emitting functions reachable; **8/8** controls fire                                                |
+| `render_actor_grant` smoke                         | all three tiers render, names derived, no unsubstituted `${…}`, unknown tier exits non-zero                                                   |
+| full `dev/L0-CHAIN.txt`                            | clean (274 lines)                                                                                                                             |
+| `make -C k8s-operator test`                        | green, every package; `internal/controller` 127.0s                                                                                            |
+| `make validate`, shellcheck, prettier              | clean over the whole `origin/main...HEAD` set                                                                                                 |
+
+#### Verdicts
+
+| ID            | Level | Verdict | Note                                                                          |
+| ------------- | ----- | ------- | ----------------------------------------------------------------------------- |
+| **V-BRK-013** | L0    | `pass`  | the tier arm now runs against the real tree, not a synthetic; 20/20 control   |
+| **V-CMP-007** | L0    | `pass`  | three new templates on the install path, every roleRef resolving; 8/8 control |
+
+Now unblocked and owed by **5b-0-iii** (L2): **V-BRK-006** and **V-REV-001**. `broker-execute-l2.sh`
+stopped at step 3 because the platform actor could not list Secrets; it can now, on a cluster
+provisioned from this tree.

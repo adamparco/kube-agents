@@ -93,10 +93,10 @@ seed_agent_fixtures() {
 #   at all: the Deployment reports zero pods and nothing says why.
 #
 #   RENDERED BY THE SHIPPED RENDERER, NOT BY A COPY OF IT (LSN-024). This calls
-#   `render_broker_operations_grant` and `render_agent_identity` out of
-#   `k8s-operator/scripts/common.sh` — the same two functions the install path calls — so the
+#   `render_broker_operations_grant`, `render_actor_grant` and `render_agent_identity` out of
+#   `k8s-operator/scripts/common.sh` — the same three functions the install path calls — so the
 #   fixture carries the same `kube-agents/tier` + `kube-agents/role` labels the admission policies
-#   select on, and the same two bindings. A hand-written stand-in here (the shape
+#   select on, and the same bindings. A hand-written stand-in here (the shape
 #   `brake-fanout-l2.sh` still carries) is a fixture that can pass while the shipped identity is
 #   broken, which is scenery.
 #
@@ -167,7 +167,13 @@ seed_agent_identity() {
     cd "$(dirname "$common")" || exit 1
     # shellcheck disable=SC1090
     . "$common" >/dev/null 2>&1 || exit 1
-    render_broker_operations_grant "$ns" || exit 1
+    render_broker_operations_grant || exit 1
+    echo '---'
+    # The per-tier grant is not optional scenery for an L2 fixture: since P9-T9b-5b-0-ii-b the
+    # journal Role — `create actionrecords`, the status update — is rendered HERE and nowhere else,
+    # so a fixture that skips it seeds a broker that authenticates its caller and then fails at
+    # step 11 with a 403 that looks like a broker bug.
+    render_actor_grant "$tier" "$ns" "$leaf" || exit 1
     echo '---'
     render_agent_identity "$tier" "$ns" "$reader_ksa" "$leaf" || exit 1
   )"; then
@@ -183,7 +189,7 @@ seed_agent_identity() {
     echo "  identity: could not apply the actor identity in $ns: $out" >&2
     return 1
   fi
-  echo "  fixtures: actor identity '$actor_ksa' + the 06 §2.2.1 grant applied in $ns"
+  echo "  fixtures: actor identity '$actor_ksa' + the 06 §2.2.1 grant and the $tier read profile applied in $ns"
   return 0
 }
 

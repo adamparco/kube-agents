@@ -76,24 +76,10 @@ subjects:
   - kind: ServiceAccount
     name: ${AGENT_ACTOR_KSA}
     namespace: ${AGENT_NAMESPACE}
----
-# The namespaced half — the journal, and the only two verbs in the whole grant that change stored
-# state. Bound in this agent's namespace ONLY: an actor appends ActionRecords where it lives. A
-# ClusterRoleBinding here would make the fleet's journal writable from any tenant, which is the
+# NO SECOND BINDING HERE. The namespaced half of 06 §2.2.1 — the journal, and the only two verbs in
+# the whole grant that change stored state — moved to `actor-grant-<tier>.yaml.template` in
+# P9-T9b-5b-0-ii-b, along with the read half of that tier's 06 §2.2 template, and it is bound there
+# by a RoleBinding in this agent's namespace. The rule it follows has not changed and is worth
+# restating where the old binding used to be: an actor appends ActionRecords where it lives, and a
+# ClusterRoleBinding over the journal would make it writable from any tenant, which is the
 # fleet-wide-writer shape V-BRK-012 forbids one layer down.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: ${AGENT_READER_KSA}-broker-operations
-  namespace: ${AGENT_NAMESPACE}
-  labels:
-    kube-agents/tier: ${AGENT_TIER}
-    kube-agents/role: actor
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: kubeagents-broker-operations
-subjects:
-  - kind: ServiceAccount
-    name: ${AGENT_ACTOR_KSA}
-    namespace: ${AGENT_NAMESPACE}

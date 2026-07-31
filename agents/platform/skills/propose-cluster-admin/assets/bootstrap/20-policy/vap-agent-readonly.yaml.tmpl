@@ -71,16 +71,29 @@ spec:
           object.metadata.labels['kube-agents/tier'] == 'developer-team')
       message: "developer-team is a namespace-scoped tier and may not be granted a ClusterRole (wrong-scope, 03 §4)"
       reason: Forbidden
-    # 3) The actor allow-list — 06 §2.2.1's broker-operations grant, compiled in as literal
-    #    (apiGroup, resource, verb) triples. Twenty of them, and nothing else is admissible.
+    # 3) The actor allow-list. Read verbs pass; every WRITE verb must be one of 06 §2.2.1's
+    #    broker-operations grant, compiled in as literal (apiGroup, resource, verb) triples.
     #
-    #    This is the single most important line in the file, so it is worth saying what it forbids
-    #    rather than only what it permits. `update` and `delete` on `actionrecords` are ABSENT: the
-    #    broker appends to the journal and advances `status`, and can never rewrite or remove a
-    #    record, including its own (06 §2.2.1, §3.3 rule 4). Any tenant resource is absent, so an
-    #    actor Role that grew a `create deployments` rule is denied here even if a human approved
-    #    the PR. `*` is absent as a group, a resource and a verb, so the wildcard escape is closed
-    #    by construction rather than by a separate rule that could be forgotten.
+    #    THE LEADING READ DISJUNCT IS THE PHASE-9 RENDER'S PRICE, AND ITS BOUND IS ELSEWHERE. 06
+    #    §2.2 gives each tier a read profile far wider than this grant — 68 to 89 triples against
+    #    its 20 — and appends the grant "verbatim" to it, so the union is what the spec asks a
+    #    cluster to accept. Until P9-T9b-5b-0-ii-b nothing on any install path rendered that read
+    #    half and the disjunct would have widened nothing; three `actor-grant-<tier>` templates now
+    #    do, and without it admission rejects the very objects 06 §2.2 specifies. The reads are
+    #    bounded, just not here: `dev/tests/actor-grant-single-sourced.py` (V-BRK-013, L0) holds the
+    #    UNION of each tier's rendered actor objects to exactly that tier's profile, and 06 §2.2's
+    #    template is the ceiling that profile is filtered out of. P10-T1's `vap-agent-scope` is what
+    #    moves that bound into the cluster.
+    #
+    #    So this validation is the WRITE gate it was always described as, and the write half of 06
+    #    §2.2 stays dark because a tier's write triples are admitted by neither disjunct. `update`
+    #    and `delete` on `actionrecords` are ABSENT: the broker appends to the journal and advances
+    #    `status`, and can never rewrite or remove a record, including its own (06 §2.2.1, §3.3
+    #    rule 4). Every tenant WRITE is absent, so an actor Role that grew a `create deployments`
+    #    rule is denied here even if a human approved the PR. A wildcard VERB is absent too — `*`
+    #    is not a read verb and no triple below ends in `:*` — but a wildcard GROUP or RESOURCE
+    #    carrying only read verbs now passes, which 06 §2.2's platform template requires and which
+    #    is the one thing the disjunct genuinely gave up.
     #
     #    THE SOURCE OF TRUTH IS 06 §2.2.1, NOT THIS LIST. `dev/tests/actor-grant-single-sourced.py`
     #    parses the fenced YAML block in that section and fails if these twenty triples are not
@@ -97,6 +110,7 @@ spec:
           r.apiGroups.all(g,
             r.resources.all(res,
               r.verbs.all(v,
+                v in ['get', 'list', 'watch'] ||
                 (g + '/' + res + ':' + v) in [
                   'authentication.k8s.io/tokenreviews:create',
                   'kubeagents.x-k8s.io/actionrecords:get',
@@ -119,7 +133,7 @@ spec:
                   'kubeagents.x-k8s.io/approvalrosters:list',
                   'kubeagents.x-k8s.io/approvalrosters:watch'
                 ]))))
-      message: "actor RBAC may grant only the 06 §2.2.1 broker-operations rule set (tokenreviews:create; actionrecords get/list/watch/create; actionrecords/status get/update/patch; fleetfreezes, agents, changepolicies, approvalrosters get/list/watch) — no update/delete on actionrecords, no tenant resources, no wildcards, no nonResourceURLs (03 §4.2, 06 §2.2.1)"
+      message: "actor RBAC may grant read verbs (get/list/watch) freely, bounded by its tier's 06 §2.2 template rather than by admission, plus only the write verbs of the 06 §2.2.1 broker-operations grant (tokenreviews:create; actionrecords:create; actionrecords/status update/patch) — no update/delete on actionrecords, no tenant writes, no wildcard verbs, no nonResourceURLs (03 §4.2, 06 §2.2, §2.2.1)"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

@@ -297,8 +297,13 @@ $3|" "$WORK/shipped-role.yaml" >"$1"
     variant "$WORK/actor.yaml" kubeagents-ruling-actor '    kube-agents/role: actor'
     grep -q 'kube-agents/role: actor' "$WORK/actor.yaml" ||
       bad "L2-3 the actor label never landed in the variant — this arm would pass vacuously"
+    # The needle is the phrase common to validation 3's message before and after
+    # P9-T9b-5b-0-ii-b widened it with a read disjunct, and it still discriminates: validation 1's
+    # message says "agent RBAC", validation 2's says "wrong-scope", and only this one cites the
+    # grant. The arm's property is untouched by that widening — the fixture's rules are tenant
+    # WRITES, which no disjunct of validation 3 reaches.
     submit "$WORK/actor.yaml" deny "L2-3 the shipped write rules wearing kube-agents/role: actor" \
-      "actor RBAC may grant only the 06 §2.2.1 broker-operations rule set"
+      "the 06 §2.2.1 broker-operations grant"
 
     echo
     echo "== L2-4. the shipped fixture, wearing neither, is ADMITTED — the ruling and its cost =="

@@ -1,0 +1,128 @@
+# platform ACTOR tenant grant — the READ half of 06 §2.2's platform template, joined with 06
+# §2.2.1's broker-operations grant. THE INSTALL-PATH COPY.
+#
+# Rendered by `render_actor_grant platform <namespace> <leaf>` in common.sh. The two sibling
+# templates carry the shared argument: actor-grant-developer-team.yaml.template on what "the READ
+# half" means and why the write half is unrendered, actor-grant-cluster-admin.yaml.template on why a
+# cluster-scoped tier gets two objects rather than one and on the wildcard rules.
+#
+# ── WHAT THE READ HALF COSTS AND WHAT IT BUYS ──────────────────────────────────────────────────
+# This is the widest of the three read profiles by reach and the narrowest by count (68 triples
+# against cluster-admin's 83): `*` over three KCC groups and three policy-engine groups, cluster-wide
+# RBAC reads including `clusterroles` and `clusterrolebindings`, and `secrets` in every namespace.
+# Read authority over RBAC is what makes a platform actor able to answer "what may this identity
+# do" before proposing a change to it — and it is also exactly the reconnaissance an attacker with
+# this credential would want. Two things bound it and neither is this file: the credential lives in
+# the broker pod and never in the agent pod (06 §2, the reader/actor split), and `escalate`, `bind`
+# and `impersonate` appear in no template at any phase, so reading a binding confers no ability to
+# author one.
+#
+# ── NOT GRANTED, AND NOT MERELY UNRENDERED ─────────────────────────────────────────────────────
+# 06 §2.2's platform template omits admissionregistration.k8s.io and apiextensions.k8s.io from every
+# verb including the read verbs: the ValidatingAdmissionPolicies that bound the agents and the Agent
+# CRD itself are control plane, and 03 §3.3 rule 3 keeps them outside every tier's reach. Their
+# absence here is the template's, not this render's — read the ceiling in 06 §2.2, not the profile
+# below, to see what P10-T1 may add.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ${AGENT_ACTOR_KSA}
+  labels:
+    kube-agents/tier: platform
+    kube-agents/role: actor
+rules:
+  # ── The READ half of 06 §2.2, platform ────────────────────────────────────────────────────────
+  # Cluster + node-pool lifecycle, and project cloud resources, via KCC.
+  - apiGroups: ["container.cnrm.cloud.google.com"]
+    resources: ["containerclusters", "containernodepools"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["compute.cnrm.cloud.google.com", "iam.cnrm.cloud.google.com", "monitoring.cnrm.cloud.google.com"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  # Fleet policy for TENANTS (not for agents, and not the kube-agents VAPs).
+  - apiGroups: ["constraints.gatekeeper.sh", "templates.gatekeeper.sh", "kyverno.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  # Provisioning its children (cluster-admin Agent CRs) and their identities.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["agents"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces", "serviceaccounts", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["get", "list", "watch"]
+  # ── 06 §2.2.1, the cluster-scoped half ────────────────────────────────────────────────────────
+  # step 1: authenticate the calling agent. Creates nothing; TokenReview is a request object.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # step 5: the brake. MUST be readable by every tier (06 §4.4).
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["fleetfreezes"]
+    verbs: ["get", "list", "watch"]
+  # step 4: classification input.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["changepolicies"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ${AGENT_ACTOR_KSA}
+  labels:
+    kube-agents/tier: platform
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ${AGENT_ACTOR_KSA}
+subjects:
+  - kind: ServiceAccount
+    name: ${AGENT_ACTOR_KSA}
+    namespace: ${AGENT_NAMESPACE}
+---
+# ── 06 §2.2.1, the namespaced half ──────────────────────────────────────────────────────────────
+# The journal and the approval roster, bound in this agent's namespace only. See
+# actor-grant-cluster-admin.yaml.template for why these three rules are not in the ClusterRole above.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ${AGENT_ACTOR_KSA}
+  namespace: ${AGENT_NAMESPACE}
+  labels:
+    kube-agents/tier: platform
+    kube-agents/role: actor
+rules:
+  # step 11: the journal. `create` but never `update`/`delete` (06 §2.2.1, 03 §3.3 rule 4).
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords/status"]
+    verbs: ["get", "update", "patch"]
+  # step 7: approval input.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["approvalrosters"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ${AGENT_ACTOR_KSA}
+  namespace: ${AGENT_NAMESPACE}
+  labels:
+    kube-agents/tier: platform
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ${AGENT_ACTOR_KSA}
+subjects:
+  - kind: ServiceAccount
+    name: ${AGENT_ACTOR_KSA}
+    namespace: ${AGENT_NAMESPACE}

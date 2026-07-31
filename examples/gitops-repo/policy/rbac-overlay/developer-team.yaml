@@ -3,8 +3,13 @@
 # TWO ServiceAccounts (06 §2, the reader/actor split). The READER is NAMESPACE-scoped read-only
 # (Role, not ClusterRole), one per team namespace; a ClusterRole labeled tier=developer-team is a
 # wrong-scope grant and is rejected by vap-agent-readonly. The ACTOR is held by the broker pod and
-# carries, in phase 9, exactly 06 §2.2.1's broker-operations grant. The tenant template that lets a
-# developer-team actor touch its namespace's workloads (06 §2.2) is P10-T1.
+# carries, IN THIS OVERLAY, exactly 06 §2.2.1's broker-operations grant. On a provisioned cluster it
+# carries the READ half of 06 §2.2's developer-team template too, rendered since P9-T9b-5b-0-ii-b by
+# k8s-operator/scripts/actor-grant-developer-team.yaml.template — as a Role, for the same wrong-scope
+# reason the reader below is one, which is why that template folds the tier's cluster-scoped grant
+# rules in inert and leaves the tier-neutral ClusterRole below to carry them for real. Generating it
+# into this reference tree is P10-T1's. The write half — touching the namespace's workloads — is
+# P10-T1 as well, and admission refuses it until then.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

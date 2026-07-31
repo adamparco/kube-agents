@@ -96,3 +96,30 @@ rules:
   - apiGroups: ["", "apps"]
     resources: ["*"]
     verbs: ["get", "list", "watch"]
+---
+# DOC 5 — a tenant resource with READ verbs only. EXPECT: ADMITTED.
+# This was vap_actor_negatives.yaml's DOC 4 until P9-T9b-5b-0-ii-b, on the reading that the actor arm
+# is an allow-list over TRIPLES and not a write filter, so "an actor identity is not a reader with
+# extras". That was right about the policy as written and wrong about the spec it enforces: 06 §2.2
+# gives every actor a per-tier template whose read half is 54 to 69 triples wide, and appends
+# §2.2.1's grant to it "verbatim". An actor reading tenant Secrets is not an escape from the grant,
+# it is the platform tier's material-egress scan (06 §4.2) — which failed closed on a real cluster
+# for exactly this reason. Validation 3 now leads with `v in ['get', 'list', 'watch'] ||`.
+#
+# WHAT TOOK OVER THE BOUND IT WAS ASSERTING. The read half is held to each tier's 06 §2.2 template by
+# `dev/tests/actor-grant-single-sourced.py` (V-BRK-013, L0, BLOCKING-ALWAYS): per tier, the union of
+# the rendered actor objects must EQUAL that tier's profile, in both directions. P10-T1's
+# `vap-agent-scope` moves that bound into the cluster, where this fixture will meet it again. The doc
+# is kept rather than deleted because the flip is the load-bearing part — revert the disjunct and
+# this fixture fails, naming which side of the change came back.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vaptest-actor-tenant-read
+  namespace: team-x
+  labels:
+    kube-agents/role: actor
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"] # read, outside the grant, inside 06 §2.2 -> ADMITTED

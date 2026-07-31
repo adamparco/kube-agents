@@ -2,9 +2,12 @@
 #
 # TWO ServiceAccounts (06 §2, the reader/actor split). The READER is cluster-scoped read-only, one
 # per cluster, and is what the agent pod — the container the model runs in — is bound to. The ACTOR
-# is held by the broker pod and carries, in phase 9, exactly 06 §2.2.1's broker-operations grant:
-# journal, brake, pause state, TokenReview. The tenant template that lets a cluster-admin actor
-# create namespaces and quotas (06 §2.2) is P10-T1.
+# is held by the broker pod and carries, IN THIS OVERLAY, exactly 06 §2.2.1's broker-operations
+# grant: journal, brake, pause state, TokenReview. On a provisioned cluster it carries the READ half
+# of 06 §2.2's cluster-admin template too, rendered since P9-T9b-5b-0-ii-b by
+# k8s-operator/scripts/actor-grant-cluster-admin.yaml.template; generating that into this reference
+# tree is P10-T1's, which owns the tier templates. The write half — creating namespaces and quotas —
+# is P10-T1 as well, and admission refuses it until then.
 #
 # Controller references both, never mints (08 §4).
 apiVersion: v1
