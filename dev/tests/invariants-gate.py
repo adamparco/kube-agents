@@ -741,6 +741,104 @@ def _backlog_section(text: str, name: str) -> str | None:
 
 HARNESS_RUN_SKILL = REPO / ".claude/skills/harness-run/SKILL.md"
 
+FENCE = re.compile(r"^```.*?^```", re.M | re.S)
+ARCHIVE_SECTIONS = ("Scheduled", "Refused", "Done")
+
+
+def _heading_ids(title: str) -> list[str] | None:
+    """The ids a `### ` heading declares, or None if it declares none.
+
+    `B-007 — <title>` -> ["B-007"]; `B-001 · B-002 — <title>` -> ["B-001", "B-002"].
+    """
+    lhs, sep, rest = title.partition(" — ")
+    if not sep or not rest.strip():
+        return None
+    parts = [p.strip() for p in lhs.split("·")]
+    if not parts or not all(re.fullmatch(r"B-\d{3}", p) for p in parts):
+        return None
+    return parts
+
+
+def _backlog_structure(bodies: dict[str, str]) -> list[str]:
+    """`### ` headings carry ids outside the inbox, carry none inside it, and match the tables.
+
+    Two halves of this file are written by different authors and only one of them is indexed. The
+    tables are the index a drain writes; the `### ` subsections are where the argument lives. Left
+    unbound they drift, and every way they drift is silent:
+
+    - A subsection titled like an inbox item (`### Reap the envtest control planes …`) is
+      indistinguishable from an undrained item. Both halves of this file then read as an inbox, and
+      the one signal it exists to carry — "a human wants something" — stops being legible.
+    - An item that moves `Scheduled` -> `Done` while its reasoning stays behind leaves the file
+      asserting two states for one id. Four subsections were filed under `## Scheduled` for items
+      that had already landed or been refused before this check existed.
+    - A row with no subsection is a scheduling decision with no argument, which is the one thing
+      `## Refused` promises never to be.
+
+    So: outside `## Inbox` a heading names its ids and nothing else, inside it a heading names no
+    id (a human does not assign them), and the id sets on both sides of each section are equal.
+    """
+    failures: list[str] = []
+
+    skill = HARNESS_RUN_SKILL.read_text() if HARNESS_RUN_SKILL.exists() else ""
+    if not re.search(r"never writes to (?:the |`?## )?[Ii]nbox", skill):
+        failures.append(
+            f"{HARNESS_RUN_SKILL.relative_to(REPO)} §1 step 6 no longer tells the harness it never "
+            f"writes to the inbox. That is the sentence the loop actually reads at ORIENT; the "
+            f"inbox-side half of this check enforces it, and a gate whose procedure has been "
+            f"deleted reads as an unexplained rule."
+        )
+
+    for title in INBOX_ITEM.findall(FENCE.sub("", bodies["Inbox"])):
+        if _heading_ids(title.strip()) or re.match(r"^B-\d{3}\b", title.strip()):
+            failures.append(
+                f'inbox item "{title.strip()}" carries a `B-nnn` id. Ids are assigned by the drain, '
+                f"so an id in the inbox means either a human assigned one (and may have collided "
+                f"with a real item) or the harness filed here, which it may not do — its findings "
+                f"go to LEDGER.md and its work to a task in docs/build/phase-<N>.md."
+            )
+
+    total_subsections = 0
+    for name in ARCHIVE_SECTIONS:
+        body = FENCE.sub("", bodies[name])
+        rows = set(BACKLOG_ID.findall(body))
+        headed: set[str] = set()
+        for title in INBOX_ITEM.findall(body):
+            ids = _heading_ids(title.strip())
+            if ids is None:
+                failures.append(
+                    f'`## {name}` has a subsection "### {title.strip()}" that names no id. Every '
+                    f"`### ` heading outside `## Inbox` reads `B-nnn — <title>` (or "
+                    f"`B-nnn · B-nnn — <title>` where one argument resolves two items); a heading "
+                    f"without one is shaped exactly like an undrained inbox item."
+                )
+                continue
+            total_subsections += 1
+            headed.update(ids)
+
+        for bid in sorted(rows - headed):
+            failures.append(
+                f"{bid} has a row in `## {name}` and no `### {bid} — …` subsection there. A row is "
+                f"the index; the subsection is the argument. A decision recorded with no argument "
+                f"cannot be re-read at the next improvement pass, which is what `## Refused` "
+                f"promises and what a drain owes every item it schedules."
+            )
+        for bid in sorted(headed - rows):
+            failures.append(
+                f"{bid} has a `### ` subsection in `## {name}` and no row in that section's table. "
+                f"Either the item moved section and its reasoning stayed behind — so the file now "
+                f"asserts two states for one id — or it has fallen out of the index entirely."
+            )
+
+    if not total_subsections:
+        failures.append(
+            f"VACUOUS: no `### B-nnn — …` subsection exists anywhere in "
+            f"{BACKLOG.relative_to(REPO)}, so the row/subsection agreement above compared two "
+            f"empty sets and this check asserted nothing."
+        )
+
+    return failures
+
 
 def _drain_is_committed(text: str, inbox: str, drained_on: str) -> list[str]:
     """A drain that exists only in the working tree has not happened yet (LSN-043).
@@ -838,6 +936,9 @@ def check_backlog_is_drained() -> list[str]:
     happening), if an inbox item has no `Added` (same — an undated item can never be found stale),
     or if a `B-nnn` id appears twice across the tables (a reused id makes the trail ambiguous about
     which item actually landed).
+
+    `_backlog_structure` then holds the other half of the protocol — who writes which section, and
+    that each table agrees with the subsections beneath it.
     """
     if not BACKLOG.exists():
         return [
@@ -891,6 +992,15 @@ def check_backlog_is_drained() -> list[str]:
             )
 
     failures.extend(_drain_is_committed(text, bodies["Inbox"], drained_on))
+    failures.extend(_backlog_structure(bodies))
+
+    if "## How this file is structured" not in text:
+        failures.append(
+            f"{BACKLOG.relative_to(REPO)}: the `## How this file is structured` section is gone. "
+            f"It is where the four rules `_backlog_structure` enforces are written down for the "
+            f"human who has to satisfy them; without it the gate's failures name a convention with "
+            f"no definition site."
+        )
 
     seen = {}
     for name in ("Scheduled", "Refused", "Done"):

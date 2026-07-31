@@ -11,16 +11,20 @@ unattended, what it produced, and how to adapt the same pattern to another spec-
 
 ## 1. What it is
 
-The kube-agents harness is **not a separate application**. It is four ordinary Claude Code artifacts
+The kube-agents harness is **not a separate application**. It is five ordinary Claude Code artifacts
 wired into a loop:
 
-1. **A design set** — the source of truth (`docs/design/` 01–08), including a roadmap that splits the
+1. **A design set** — the source of truth (`docs/design/` 01–09), including a roadmap that splits the
    build into phases, each with explicit **Accept** criteria and **Verification** suites.
-2. **Skills** — reusable prompts (`/harness-run`, `/harness-verify`) that encode the per-phase loop
-   and the verification procedure.
+2. **Skills** — reusable prompts (`/harness-run`, `/harness-verify`, `/harness-milestone`,
+   `/harness-improve`) that encode the per-phase loop, the verification procedure, the phase-close
+   gate, and the pass that mechanizes lessons.
 3. **A ledger** — a single Markdown file (`docs/build/LEDGER.md`) that is the harness's memory:
    current phase, task status, verification log, decisions, deviations, blockers, halt conditions.
-4. **A gate** — an invariants checklist (`.claude/harness/invariants.md`) every change must pass
+4. **An inbox** — a single Markdown file (`docs/build/BACKLOG.md`) that is the _human's_ channel into
+   a running build: append a finding at any time, and it is picked up at the next planning moment.
+   See §2.1.
+5. **A gate** — an invariants checklist (`.claude/harness/invariants.md`) every change must pass
    before it can merge.
 
 A schedule (a durable Claude Code cron task) re-enqueues the loop on an interval so the build
@@ -68,19 +72,69 @@ The seven steps, as encoded in `harness-run`:
 explicit policy message), or was the manifest just malformed? "Verified" is never reported without a
 command, log, or PR as evidence.
 
+### 2.1 The human inbox — how a person steers a build that is already running
+
+The loop above has no seat in it. That is the point, and it is also the problem: a human who notices
+something at 2am — a leaked process, a check that is wrong, a spec sentence nobody implemented — has
+nowhere to put it. The ledger is the wrong place, because the harness reads it first and writes it
+last on every run, so an edit made mid-unit races that write and can be silently reverted.
+
+`docs/build/BACKLOG.md` is the answer, and it is one rule:
+
+> **A human writes it. The harness only drains it.**
+
+A person appends a block to `## Inbox` at any time, including mid-unit, without coordinating with
+anything. Appending at the end of one section cannot conflict with a harness write anywhere else in
+the file, so the operation is always safe. Nothing changes immediately — and **the delay is the
+feature**. A finding that redirects work the instant it is written lands mid-IMPLEMENT, when the
+harness has the least context to place it well and the most reason to place it badly.
+
+It is read at **ORIENT and only at ORIENT** — the harness's own planning moment, before it selects
+the next unit. Every item is resolved in the same ORIENT that reads it: scheduled into a task, a
+lesson, the improvement queue or a later phase; **refused with an argument**, which is a section of
+its own and not a deletion; or escalated to a halt. Then it moves out of the inbox with an ID, its
+destination and the date. Three properties make that trustworthy rather than aspirational:
+
+- **Nothing survives two ORIENTs.** An item whose `Added` date precedes `Last drained` was in the
+  inbox when the harness last looked and is still there — there is no reading of that which is not
+  "read and ignored", so `dev/tests/invariants-gate.py` fails the build on it. An inbox that
+  accumulates is a second, quieter ledger nobody reads.
+- **The drain is committed before SELECT, as its own commit.** It is the one artifact ORIENT is
+  required to _write_, and everything that follows it moves `HEAD` — a branch creation, a
+  `git stash pop`, a `gh pr merge`. One of those silently reverted a completed drain once, and the
+  reverted file passed every gate, because an empty inbox stamped with today's date is exactly what
+  a correct drain looks like ([[LSN-043]]).
+- **The harness never writes to the inbox.** Not its own findings, not a note to its next self. The
+  affordance being protected is a human's and it is destroyed by sharing: the moment the harness can
+  file there, an item in the inbox stops meaning _a person wants something_, and `Last drained`
+  stops measuring whether the harness is listening. Harness findings go to the **ledger**, and the
+  work they imply goes to a task in the **phase breakdown**. The sections below the inbox
+  (`## Scheduled`, `## Refused`, `## Done`) are the harness's half of the file and it writes those
+  freely; the same gate check enforces the split, and the structure that keeps the two halves
+  legible, in `check_backlog_is_drained`.
+
+The severity call is the harness's, not the author's. `Priority: normal` does not downgrade a
+finding that names a live security regression — that becomes the next unit, or a halt, and the drain
+says so in writing.
+
 ---
 
 ## 3. Components and where they live
 
-| Piece              | Path                                       | Role                                                                     |
-| ------------------ | ------------------------------------------ | ------------------------------------------------------------------------ |
-| Design set         | `docs/design/` (01–08)                     | Source of truth; roadmap in `07-implementation-roadmap.md`               |
-| Ledger             | `docs/build/LEDGER.md`                     | Persistent build state; read first, updated last every run               |
-| Phase breakdowns   | `docs/build/phase-<N>.md`                  | Concrete task list for a phase, created on entry                         |
-| Orchestrator skill | `.claude/skills/harness-run/SKILL.md`      | The per-phase loop (the 7 steps above)                                   |
-| Verify skill       | `.claude/skills/harness-verify/SKILL.md`   | Runs Accept + Verification suites, logs results with evidence            |
-| Invariants gate    | `.claude/harness/invariants.md`            | Load-bearing rules, checked before every merge                           |
-| Verify workflow    | `.claude/harness/verify-phase.workflow.js` | Optional parallel fan-out: one agent per suite, then adversarial confirm |
+| Piece              | Path                                        | Role                                                                     |
+| ------------------ | ------------------------------------------- | ------------------------------------------------------------------------ |
+| Design set         | `docs/design/` (01–09)                      | Source of truth; roadmap in `07-implementation-roadmap.md`               |
+| Ledger             | `docs/build/LEDGER.md`                      | Persistent build state; read first, updated last every run               |
+| **Human inbox**    | `docs/build/BACKLOG.md`                     | **The one file a person writes.** Drained at ORIENT; see §2.1            |
+| Phase breakdowns   | `docs/build/phase-<N>.md`                   | Concrete task list for a phase, created on entry                         |
+| Binding            | `.claude/harness/binding.md`                | Every project-specific value: paths, gates, commands, targets            |
+| Lesson store       | `.claude/harness/LESSONS.md`                | Each mistake already paid for, and the check that now catches it         |
+| Orchestrator skill | `.claude/skills/harness-run/SKILL.md`       | The per-phase loop (the 7 steps above)                                   |
+| Verify skill       | `.claude/skills/harness-verify/SKILL.md`    | Runs Accept + Verification suites, logs results with evidence            |
+| Milestone skill    | `.claude/skills/harness-milestone/SKILL.md` | Closes a phase: full gate, PR, merge, advance the ledger                 |
+| Improve skill      | `.claude/skills/harness-improve/SKILL.md`   | Turns open lessons into mechanized checks; drains the improvement queue  |
+| Invariants gate    | `.claude/harness/invariants.md`             | Load-bearing rules, checked before every merge                           |
+| Verify workflow    | `.claude/harness/verify-phase.workflow.js`  | Optional parallel fan-out: one agent per suite, then adversarial confirm |
 
 The **verify workflow** is an optimization: instead of running verification suites serially, it
 dispatches each suite to its own subagent (`pipeline`, no barrier), then pipes each result into a
@@ -211,13 +265,20 @@ The harness is domain-specific, but the shape is portable. To reuse it:
    blockers/halt-conditions section. This is the durable memory — treat "update the ledger" as the
    last step of every run.
 
-5. **Define halt conditions.** Decide which failures the harness must **never** auto-advance past
+5. **Create a second file the human owns, and keep the loop out of it.** The ledger is not a mailbox:
+   a person editing it mid-unit races the harness's own write. Give them an append-only inbox
+   instead, drained at the loop's planning step and nowhere else, and enforce two things
+   mechanically — that no item survives two drains, and that the harness's own findings go to the
+   ledger rather than into the inbox. Without the first, the file becomes a place findings go to be
+   ignored; without the second, "someone wants something" stops being a signal at all. See §2.1.
+
+6. **Define halt conditions.** Decide which failures the harness must **never** auto-advance past
    (for us: the two load-bearing suites and any invariant breach). Everything else it can iterate on.
 
-6. **Geofence anything destructive.** If verification includes destructive tests, add an explicit
+7. **Geofence anything destructive.** If verification includes destructive tests, add an explicit
    target guard that halts unless the context is a throwaway environment.
 
-7. **Schedule it** with a durable cron re-enqueuing the run skill, and let it go — checking the
+8. **Schedule it** with a durable cron re-enqueuing the run skill, and let it go — checking the
    ledger and open PRs, not the transcript, to see where it is.
 
 The whole point: **files carry the state, skills carry the procedure, the ledger carries the memory,

@@ -37,6 +37,16 @@ Context does not survive; files do. "I remember where I was" is false.
    `dev/tests/invariants-gate.py` fails the build on exactly that: an item added before
    `Last drained` and still sitting in the inbox.
 
+   **The harness never writes to the inbox** — it only reads and drains it. Not a finding of its
+   own, not a note to its next self, not an item it plans to drain in the same session. That channel
+   is a human's, and it is destroyed by sharing: the moment the harness can file there, an item in
+   the inbox stops meaning _a person wants something_ and `Last drained` stops measuring whether the
+   harness is listening. Harness findings are recorded in the ledger, and the work they imply is
+   scheduled as a task in the phase breakdown — the same two destinations every other harness
+   finding uses. The sections _below_ the inbox (`## Scheduled`, `## Refused`, `## Done`) are the
+   harness's half of that file and it writes them freely, following the structure rules the file
+   states.
+
    **Then commit the drain, before SELECT — its own commit, on the phase branch.** Not at
    CHECKPOINT. The drain is the one artifact ORIENT is required to _write_, and everything after it
    moves `HEAD`: a branch creation, a `git stash pop`, a `gh pr merge`. An uncommitted drain has

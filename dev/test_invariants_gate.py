@@ -1295,5 +1295,142 @@ class EnvtestControlPlanesAreReaped(_PinnedProse):
         self.assertTrue(any("explicit timeout" in p for p in problems), problems)
 
 
+class BacklogStructureIsUniform(unittest.TestCase):
+    """`_backlog_structure`: who writes which section, and each table agreeing with its subsections.
+
+    Every mutant below is a shape `docs/build/BACKLOG.md` was actually in on 2026-07-31, which is
+    why the arm exists. Four subsections sat under `## Scheduled` for items that had already landed
+    or been refused, and five more were titled exactly like undrained inbox items -- so the file's
+    two halves disagreed about the state of four ids, and a reader could not tell an archived copy
+    from a live request. Both are silent: every other backlog check was green throughout.
+    """
+
+    ROW = "| ID | Title | X | On |\n| -- | -- | -- | -- |\n"
+
+    def bodies(self, inbox="_(empty)_\n", scheduled="", refused="", done=""):
+        return {
+            "Inbox": "**Last drained:** 2026-07-31\n\n" + inbox,
+            "Scheduled": scheduled,
+            "Refused": refused,
+            "Done": done,
+        }
+
+    def one_of_each(self):
+        """A minimal well-formed file: one row and its subsection, in each archive section."""
+        return self.bodies(
+            scheduled=self.ROW + "| B-007 | a | x | 2026-07-31 |\n\n### B-007 — a\n\nwhy\n",
+            refused=self.ROW + "| B-009 | b | x | 2026-07-31 |\n\n### B-009 — b\n\nwhy\n",
+            done=self.ROW + "| B-004 | c | x | 2026-07-30 |\n\n### B-004 — c\n\nwhy\n",
+        )
+
+    def test_the_committed_file_satisfies_every_rule(self):
+        # The positive arm. Without it the mutants below could all be caught by an arm that simply
+        # always fails, which is the failure mode a suite of negative controls cannot see.
+        self.assertEqual([], gate._backlog_structure(self.one_of_each()))
+        self.assertEqual([], gate.check_backlog_is_drained())
+
+    def test_a_subsection_titled_like_an_inbox_item_is_rejected(self):
+        # The shape five subsections were in: `### Reap the envtest control planes — ...` reads as
+        # an undrained item, so the archive and the inbox stop being distinguishable.
+        b = self.one_of_each()
+        b["Scheduled"] = b["Scheduled"].replace(
+            "### B-007 — a", "### Reap the envtest control planes"
+        )
+        problems = gate._backlog_structure(b)
+        self.assertTrue(any("names no id" in p for p in problems), problems)
+
+    def test_a_subsection_left_behind_when_its_item_changed_section_is_rejected(self):
+        # B-004's reasoning stayed under `## Scheduled` after the item landed in `## Done`. Both
+        # directions fire: an orphaned heading here, and a row with no argument there.
+        b = self.one_of_each()
+        b["Scheduled"] += "\n### B-004 — c\n\nstale reasoning\n"
+        b["Done"] = b["Done"].replace("### B-004 — c\n\nwhy\n", "")
+        problems = gate._backlog_structure(b)
+        self.assertTrue(any("B-004" in p and "no row in that section" in p for p in problems), problems)
+        self.assertTrue(any("B-004" in p and "no `### B-004 — …` subsection" in p for p in problems), problems)
+
+    def test_a_row_with_no_subsection_is_rejected(self):
+        b = self.one_of_each()
+        b["Refused"] += "| B-013 | d | x | 2026-07-31 |\n"
+        problems = gate._backlog_structure(b)
+        self.assertTrue(any("B-013" in p and "no `###" in p for p in problems), problems)
+
+    def test_an_inbox_item_carrying_an_id_is_rejected(self):
+        # A human does not assign ids. An id in the inbox means either a collision with a real item
+        # or the harness filing into the one channel it may not write to.
+        b = self.one_of_each()
+        b["Inbox"] += "\n### B-014 — something the harness wants\n\n- **Added:** 2026-07-31\n"
+        problems = gate._backlog_structure(b)
+        self.assertTrue(any("carries a `B-nnn` id" in p for p in problems), problems)
+
+    def test_a_bare_id_prefix_in_the_inbox_is_rejected_too(self):
+        # `### B-014 the thing` names an id without the ` — ` separator, so `_heading_ids` returns
+        # None for it. Keying the inbox rule on that alone would let the harness file here by
+        # dropping one dash.
+        b = self.one_of_each()
+        b["Inbox"] += "\n### B-014 something the harness wants\n"
+        problems = gate._backlog_structure(b)
+        self.assertTrue(any("carries a `B-nnn` id" in p for p in problems), problems)
+
+    def test_a_joint_heading_covers_both_of_its_ids(self):
+        # `### B-001 · B-002 — ...` is legal: one argument really did resolve two items. It must
+        # satisfy both rows, and it must not satisfy a third.
+        b = self.bodies(
+            done=self.ROW
+            + "| B-001 | a | x | 2026-07-29 |\n| B-002 | b | x | 2026-07-29 |\n\n"
+            + "### B-001 · B-002 — one argument, two items\n\nwhy\n"
+        )
+        self.assertEqual([], gate._backlog_structure(b))
+        b["Done"] = b["Done"].replace(
+            "| B-002 | b | x | 2026-07-29 |\n", "| B-002 | b | x | 2026-07-29 |\n| B-003 | c | x | 2026-07-29 |\n"
+        )
+        self.assertTrue(any("B-003" in p for p in gate._backlog_structure(b)))
+
+    def test_a_fenced_example_heading_is_not_read_as_a_subsection(self):
+        # `## How to add an item` shows the block format in a fence. A fenced heading inside an
+        # archive section must not be scored as a real subsection either way.
+        b = self.one_of_each()
+        b["Done"] += "\n```markdown\n### <one-line title>\n```\n"
+        self.assertEqual([], gate._backlog_structure(b))
+
+    def test_an_empty_archive_reports_VACUOUS_rather_than_passing(self):
+        # Delete every subsection and the row/heading comparison compares two empty sets. That is
+        # not the property holding; it is the check having nothing to look at (LSN-035, LSN-038).
+        problems = gate._backlog_structure(self.bodies())
+        self.assertTrue(any(p.startswith("VACUOUS:") for p in problems), problems)
+
+    def test_it_fails_when_the_skill_stops_telling_the_harness_not_to_write_to_the_inbox(self):
+        # The procedural half. The gate and the sentence the loop reads at ORIENT move together, or
+        # the next reader of the skill learns a workflow the gate rejects.
+        original = gate.HARNESS_RUN_SKILL
+        # Inside the repo: the failure messages render paths with `.relative_to(REPO)`, so a
+        # fixture parked in /tmp makes the check raise instead of reporting.
+        with tempfile.TemporaryDirectory(dir=gate.REPO) as tmp:
+            stripped = pathlib.Path(tmp) / "SKILL.md"
+            stripped.write_text(original.read_text().replace("never writes to the inbox", "drains"))
+            gate.HARNESS_RUN_SKILL = stripped
+            try:
+                problems = gate._backlog_structure(self.one_of_each())
+            finally:
+                gate.HARNESS_RUN_SKILL = original
+        self.assertTrue(any("never writes to the inbox" in p for p in problems), problems)
+
+    def test_removing_the_structure_rules_from_the_backlog_fails_the_gate(self):
+        # `_backlog_structure`'s failures name a convention; deleting its definition site leaves
+        # them naming nothing. Asserted through the public check, which is where that half lives.
+        original = gate.BACKLOG
+        with tempfile.TemporaryDirectory(dir=gate.REPO) as tmp:
+            stripped = pathlib.Path(tmp) / "BACKLOG.md"
+            stripped.write_text(
+                original.read_text().replace("## How this file is structured", "## Notes")
+            )
+            gate.BACKLOG = stripped
+            try:
+                problems = gate.check_backlog_is_drained()
+            finally:
+                gate.BACKLOG = original
+        self.assertTrue(any("How this file is structured" in p for p in problems), problems)
+
+
 if __name__ == "__main__":
     unittest.main()
