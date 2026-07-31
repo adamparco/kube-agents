@@ -279,6 +279,38 @@ python3 dev/tests/negative-controls-name-their-rule.py --negative-control
 # in dev/L2-CHAIN.txt and needs the scratch cluster.
 bash dev/verify/broker-auth-l2.sh --negative-control
 
+# --- the auth can-i sweep's derivation, and its negative control (P9-T9b-5c) -----------------
+# Two lines for one suite, because it has two failure modes and neither one detects the other.
+#
+# FIRST: does the question table derive anything, and does it derive the RIGHT SHAPE? The sweep asks
+# the live authorizer only what this fixture computes, by importing dev/tests/actor-grant-single-
+# sourced.py's own parser of 06 §2.2/§2.2.1 — one parser in the repo, so an L2/L0 disagreement can
+# never be a spec-reading difference wearing a cluster defect's clothes. The failure that makes this
+# line necessary is silent: a parser change that returns an empty set gives a sweep that asks
+# nothing, answers nothing, and prints PROVEN. The self-test asserts row counts, three tiers, both
+# directions populated, every question kind present, and that the fleetfreezes question is asked of
+# every tier by name — V-BRK-013's sentence singles out developer-team, and a table that dropped it
+# would still look like a table.
+python3 dev/verify/fixtures/actor_grant_expectations.py --self-test
+
+# SECOND: can the assertion block tell a correct sweep from a broken one? Fourteen transcripts, one
+# correct and thirteen carrying a defect each, replayed through the same seven arms the live run
+# uses — the arms are a file, actor_grant_sweep_assert.py, precisely so that the ¬ exercises the
+# code the cluster run executes rather than a paraphrase of it. Each case names the arm that must
+# catch it, so a transcript that goes red for some OTHER reason scores as a MISS, not a catch.
+#
+# The two sharpest are `rbac-never-applied`, where every question answers `no` — the exact shape of
+# a fleet whose RBAC was never installed, and the exact shape a one-sided "no write verbs" sweep
+# calls a perfect pass — and `reader-bound-to-nothing`, where an identity that can do nothing at all
+# satisfies every negative row in the file.
+#
+# NEGATIVE CONTROL DOES NOT EXERCISE ([[LSN-060]]): the transcripts are synthesised, so identity
+# discovery, the served-resource filter, the `kubectl auth can-i` invocation itself and the fixture
+# seeding are all upstream of what this measures. The live half in dev/L2-CHAIN.txt covers those,
+# and its on-cluster ¬ — an unlabelled Role granting a real actor a write verb — is the arm that
+# proves the block can go red against an authorizer rather than against a file.
+bash dev/verify/actor-grant-sweep-l2.sh --negative-control
+
 # --- repository mechanics (LSN-012) ---------------------------------------------------------
 # Which remote carries the work, and does `main` point at it? Local main tracked `upstream/main`
 # (gke-labs) for the whole of phases 2-8: a bare `git pull` would have fetched a tree with none of

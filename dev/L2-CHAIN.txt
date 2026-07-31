@@ -326,6 +326,50 @@ bash dev/verify/broker-refuse-l2.sh gke-scratch-kube-agents-dev
 # reasons appear on the record and the suite asserts the classifier's by name.
 bash dev/verify/broker-gate-l2.sh gke-scratch-kube-agents-dev
 
+# V-BRK-013 at L2, and Phase 9's acceptance (e) — "no agent identity in the fleet holds a write
+# verb, verified by a full auth can-i sweep". The L0 half of V-BRK-013 has been green for a while
+# and is a real result; it is also, entirely, a statement about files. This is the same property
+# asked of the thing that actually decides: the API server's authorizer.
+#
+# THREE THINGS THE FILE-LEVEL HALF STRUCTURALLY CANNOT SEE, and each one is a way a fleet passes it
+# while holding write authority:
+#   1. An RBAC object with no `kube-agents/role: actor` label. That label is the L0 check's
+#      discovery key — it has to be, because it is also `vap-agent-readonly`'s own actor selector —
+#      so a Role granting `update actionrecords` and omitting it is outside the check's world, and
+#      RBAC is a union, so it grants. That object is this suite's negative control, applied to a
+#      real actor ServiceAccount on the scratch cluster and then revoked.
+#   2. A rule that was written correctly and never applied. broker-per-agent-l2.sh's header records
+#      the version of that which already happened here.
+#   3. The union across every binding, which no single file contains and which is the only thing
+#      that authorizes a request. BACKLOG.md B-007 is a live instance of an extra binding no
+#      template owns.
+#
+# TWO-SIDED, WHICH IS THE WHOLE ARGUMENT. verify-phase9.sh section F has been failing with it in
+# words: "a fleet whose RBAC failed to apply at all would pass the negative half perfectly". So the
+# same run asks both — every verb 06 §2.2.1 grants and every read 06 §2.2 grants must answer YES,
+# and the write half of each tier's template, `update`/`delete` on the record itself, and the same
+# verbs in a namespace the identity has no agent in must answer NO. The positive half is not a
+# formality: 06 §4.4 makes a tier that cannot read `fleetfreezes` fail closed permanently, so a
+# missing grant bricks a tier rather than protecting it.
+#
+# THE QUESTIONS ARE DERIVED, NOT LISTED. dev/verify/fixtures/actor_grant_expectations.py imports the
+# L0 check's own parser of 06 rather than re-reading the spec, so there is one parser in the repo
+# and a verb added to §2.2.1 is a question this suite asks on its next run — phase-9.md's "by name,
+# rather than by 'these are the ones that were there when I wrote it'". ~700 questions over three
+# tiers, both roles, asked concurrently.
+#
+# WHAT IT DOES NOT ASK, counted and printed rather than dropped: `resources: ["*"]` rows, because
+# `auth can-i <verb> '*'` is a question about a wildcard REQUEST and not the one the rule makes; and
+# rows naming resource types this API server does not serve, because `no` from an unknown type is
+# not evidence of an absent grant ([[LSN-035]]) — those are excluded from BOTH directions together,
+# so the exclusion cannot quietly satisfy the negative half.
+#
+# It is destructive-guarded and belongs on the scratch cluster for one reason above all the others:
+# its negative control hands a real agent identity write authority for a few seconds. On the live
+# install that is a test granting exactly what this phase exists to withhold. The revoke is asserted
+# in its own arm and repeated unconditionally from the EXIT trap.
+bash dev/verify/actor-grant-sweep-l2.sh gke-scratch-kube-agents-dev
+
 # --- Phase 9's gate ------------------------------------------------------------------------------
 # verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the
 # two suites P9-T9b-5 still owes, the L0 chain run as a file, and the whole prior ratchet through the

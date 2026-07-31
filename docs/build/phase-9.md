@@ -81,7 +81,15 @@ detector, **a false pass since it was written**: it discovered its claimant with
 `grep -l 'V-BRK-021' dev/verify/*-l2.sh`, and the tree's one match was `broker-refuse-l2.sh`'s
 comment saying it does _not_ carry the property. Its section is at the end of this file.
 
-**Resume at `P9-T9b-5c`.** The remaining Phase 9 ladder is `5c` →
+**`P9-T9b-5c` landed 2026-07-31** — `dev/verify/actor-grant-sweep-l2.sh` is **13/13, rc 0, PROVEN**
+(negative control 16/16): **V-BRK-013** at L2, and with it Phase 9 acceptance bullet **(e)**. 647
+questions derived from 06 by the L0 check's own parser and asked of the live authorizer over all six
+labelled identities in three tiers — **204/204** grants held, **434/434** verbs refused, in one
+transcript, because a one-sided sweep passes perfectly against a fleet whose RBAC never applied. The
+`¬` is on the cluster: an **unlabelled** Role, invisible to both the L0 check and the VAP and fully
+effective, made A-4 and A-5 go red by name. Its section is at the end of this file.
+
+**Resume at `P9-T8b-4b-ii-2b-ii`.** The remaining Phase 9 ladder is
 `T8b-4b-ii-2b-ii` → `T9c`, then `harness-milestone`. **`P9-T9c` was appended 2026-07-31** by the
 ORIENT drain of `BACKLOG.md` B-006 — 06 §4.4 row 3's auto-pause has no consumer; its section is at
 the end of this file.
@@ -5080,3 +5088,94 @@ mis-parses a heredoc nested inside a command substitution and reports the entire
 unterminated quote — `bash -n` fails at EOF and names no useful line. The verdict now travels through
 a file and the pass/fail stays in the exit status, which is also the shape the guard-1 arm below it
 already used.
+
+---
+
+## P9-T9b-5c — V-BRK-013 at L2: Accept (e)'s two-sided sweep, asked of the authorizer
+
+**Landed 2026-07-31.** `dev/verify/actor-grant-sweep-l2.sh` is **13/13, rc 0, PROVEN** on
+`gke-scratch-kube-agents-dev`; the negative control is **16/16**. **V-BRK-013** is scored `pass` at
+L2 — one row in `verification/results.csv`. Three new chain lines: the suite itself on
+`dev/L2-CHAIN.txt` (floor 20 → 21, scope floor 29 → 30) and both `--negative-control` and
+`actor_grant_expectations.py --self-test` on `dev/L0-CHAIN.txt` (now 45 lines).
+
+Phase 9 acceptance **(e)** — "no agent identity in the fleet holds a write verb, verified by a full
+two-sided `auth can-i` sweep" — is the bullet this closes.
+
+### Why the L0 half was a real result and still could not answer this
+
+V-BRK-013's L0 half went green 2026-07-28 (`results.csv` row 82) via
+`dev/tests/actor-grant-single-sourced.py`. It reads files, and three things follow from that which
+only an authorizer can settle:
+
+- **An RBAC object that omits `kube-agents/role: actor` is invisible to it and fully effective.**
+  That label is the L0 check's discovery key — because it is also `vap-agent-readonly`'s actor
+  selector — and RBAC is a union, so an unlabelled Role grants exactly as much as a labelled one.
+  This is the suite's `¬`, and it is why the `¬` had to be on a cluster.
+- **A rule written correctly and never applied reads identically at L0.** V-BRK-012's L0 half was
+  green for weeks with no broker deployed anywhere.
+- **No file holds the union across every binding**, and the union is the only thing that authorizes
+  a request.
+
+### Two-sided, because `verify-phase9.sh` §F already said so in its own failure text
+
+A one-sided "no identity holds a write verb" sweep passes perfectly against a fleet whose RBAC never
+applied — every answer is `no`, including the ones that should not be. And 06 §4.4 makes the failure
+asymmetric in the other direction too: a _missing_ `fleetfreezes` read does not fail safe, it bricks
+a tier permanently, because the tier can no longer see the freeze it is supposed to respect. So the
+sweep asserts **204 grants held** and **434 verbs refused** in the same transcript, over the same
+identities, and A-7 requires each reader to hold at least one read so that its denials are denials
+rather than absence.
+
+### The questions are derived, not listed
+
+`actor_grant_expectations.py` — the L0 check's own parser of 06 §2.2 and §2.2.1 — emits the question
+table, so there is one parser of the grant in the repository and phase-9.md's "asserts the exclusion
+set **by name** rather than by 'these are the ones that were there when I wrote it'" holds
+mechanically. 647 questions were asked. Not asked, and both counted and printed rather than dropped:
+**121** wildcard rows (a wildcard _request_ is not the question the rule makes) and **55** rows
+naming types this API server does not serve (KCC, `gateway.networking`), excluded from **both**
+directions so the negative half cannot be padded by types nobody could grant.
+
+### The fixtures seed the readers too, and that is a claim about what is measured
+
+The first live run went red on A-7 for the platform reader, and the arm was right: `platform-agent-explorer`
+was absent from the cluster, because it ships only under `examples/gitops-repo/policy/rbac-overlay/`
+and the `clusters/cluster-a/…` apply path never reaches there. Roughly sixty of that identity's
+`reader-no-write` rows were passing vacuously. The fixture now applies all three tiers' explorer
+grants out of the shipped overlays — extracting only the `-explorer` documents, so the actor
+ServiceAccount in those same files, which carries a literal `PROJECT_ID` placeholder, is never
+applied. A sweep whose answer depends on which directory somebody applied in July is not measuring
+the repository.
+
+### Three defects this unit's own machinery had
+
+- **`IFS=$'\t' read` collapses runs of tabs.** Tab is an IFS _whitespace_ character, so every query
+  row with an empty `subresource` column parsed shifted left by one field, and the sweep asked
+  `auth can-i own fleetfreezes --subresource=get -n ''`. That answers a clean `no`, and a `no` is an
+  ordinary thing for this suite to record: the only visible symptom was three tiers apparently unable
+  to read `fleetfreezes` — **a defect wearing a finding's clothes**, and it cost a full live run.
+  Fixed by splitting on `\x1f`, which is not IFS whitespace. The analyzer now also rejects any column
+  holding a value outside its own alphabet, because a field-shifted row has the right _number_ of
+  columns and the wrong values in them, and `field-shifted-parse` is `¬` case 15.
+- **`cluster-check-hygiene.py` property 1b (LSN-044) failed the script on arrival.** Hoisting the
+  query into `ask_one` makes the resource word computed, which is exactly the refactor that lesson
+  names as the evasion of 1a's static ban on a literal slash. The landing spot is the expensive one:
+  434 of the 647 questions are negative, and a slashed word answers a confident `no` about an object
+  _named_ `status`. The remedy is `resource_word`, a **named** function rather than an inline `case`
+  so `--negative-control` can fire it without a cluster — a `*/*)` arm that never triggers reads
+  exactly like one whose pattern is wrong. It is `¬` case 16, and the only one that exercises a
+  function the live path calls.
+- **The `¬`'s decoy staged a fault nobody asked about.** The first decoy Role granted
+  `create deployments.apps`, and no row of cluster-admin's derived table asks that, so one of the two
+  planted grants could not flip an answer. The decoy's rules are now derived from the victim's own
+  query rows, and S-4 requires both to flip.
+
+### What the suite states it does not claim
+
+Wildcard rows, unservable types, and anything about agent-process behaviour: `auth can-i` answers for
+a subject, not for the code that runs as it. The `NEGATIVE CONTROL DOES NOT EXERCISE:` block
+(LSN-060) names the derivation, the `can-i` invocation itself, identity discovery, the served-type
+filter, P1 and the fixtures — everything upstream of the assertion block, which the `¬` synthesises
+past. S-4 is what covers the first three, and it is live-mode only: a decoy grant is a statement
+about an authorizer, and there is no authorizer at L0.
