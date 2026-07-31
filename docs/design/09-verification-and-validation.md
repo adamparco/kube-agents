@@ -183,25 +183,28 @@ enforcement role is absorbed by the broker). C7/C8/C13 (customer CI/CD, IaC arti
 are **optional**: the harness asserts the system is fully functional with them absent, which is the
 check that proves they left the critical path.
 
-- **V-CMP-001** — every component ID in 05 §1 has all three probes recorded in the run manifest;
-  a component with `Exists: pass, Wired: fail` reports **fail**, not partial. `L2`
-- **V-CMP-002** — no first-party image referenced by any deployed manifest lacks a published build.
-  This is the check the router failed for two phases. `L0`
-- **V-CMP-003** — no shipped manifest applied by an install path contains a `REPLACE_WITH_*` or
-  `PLACEHOLDER` token. `L0`
-- **V-CMP-004** — every Deployment the design requires has `replicas > 0` in the default install; a
-  component parked at zero is reported as **not wired**. `L2`
-- **V-CMP-005** — the optional components are genuinely optional: a full install with C7/C8/C13
-  absent passes V-CTN, V-BRK, V-REV, V-GAT, V-PRO. `L2`
-- **V-CMP-006** — every MCP server whose script reads a credential from the environment declares
+Levels and due phases for the checks below are **not** repeated here — they live in their §6.15
+catalog rows, which are the single definition site for both.
+
+- `V-CMP-001` — every component ID in 05 §1 has all three probes recorded in the run manifest;
+  a component with `Exists: pass, Wired: fail` reports **fail**, not partial.
+- `V-CMP-002` — no first-party image referenced by any deployed manifest lacks a published build.
+  This is the check the router failed for two phases.
+- `V-CMP-003` — no shipped manifest applied by an install path contains a `REPLACE_WITH_*` or
+  `PLACEHOLDER` token.
+- `V-CMP-004` — every Deployment the design requires has `replicas > 0` in the default install; a
+  component parked at zero is reported as **not wired**.
+- `V-CMP-005` — the optional components are genuinely optional: a full install with C7/C8/C13
+  absent passes V-CTN, V-BRK, V-REV, V-GAT, V-PRO.
+- `V-CMP-006` — every MCP server whose script reads a credential from the environment declares
   that variable in its **own** `env:` block, asserted against the **runtime-authoritative** rendered
   ConfigMap and not the image-baked `config.yaml` (§11.3). A container that holds the secret is not
   the process that needs it: Hermes passes an MCP server only what its config declares, so a server
   with no `env:` block reads an empty value and fails closed at the first call. Reports **fail**,
   never partial — the symptom surfaces as a runtime refusal in a component whose pod is Ready and
   whose unit tests are green. Negative control: strip `API_SERVER_KEY` from a fixture's
-  `platform_control` block and confirm the check goes red. `L0`, `L2`
-- **V-CMP-007** — every identity the broker resolves by name is **created by something the install
+  `platform_control` block and confirm the check goes red.
+- `V-CMP-007` — every identity the broker resolves by name is **created by something the install
   path runs**. V-CMP-001 walks the script graph and stops there; this walks the three links beyond
   it — a template must be rendered by a step that is itself reachable, a ServiceAccount named as an
   RBAC subject or a `roleRef` must be one the install path creates, and every agent tier present in
@@ -214,8 +217,8 @@ check that proves they left the critical path.
   an identity missing them is not denied but **invisible** to the rules written to bound it. Reports
   **fail**, never partial — the symptom is a policy that matches nothing, which reports the same
   green as a policy that passes. Negative control: stop applying one tier's identity and confirm the
-  check goes red while the other two tiers still install. `L0`
-- **V-CMP-008** — the install overlay **renders**, and what it renders is **the install**. Two
+  check goes red while the other two tiers still install.
+- `V-CMP-008` — the install overlay **renders**, and what it renders is **the install**. Two
   properties, separately provable. That it renders is `make render`, a prerequisite of
   `make build` and `make test`; a `kustomize build` of the full overlay must succeed, and the
   absence of that build is how `make deploy` — and therefore
@@ -232,7 +235,7 @@ check that proves they left the critical path.
   pass: a `namePrefix` applied to the CA does not error, does not fail to apply, and surfaces only
   as brokers that never become Ready behind agent `Certificate`s that sit `Pending` forever.
   Negative control: nine mutations, one of which reintroduces the original defect verbatim by
-  moving `../mesh-ca` back under `config/default`. `L0` ¬
+  moving `../mesh-ca` back under `config/default`. ¬
 
 ### 5.2 Contract inventory (from [06](06-api-and-data-contracts.md))
 
@@ -258,25 +261,25 @@ contract (06 §2a) and the session-state contract's mem0 backing (06 §6). Absen
 asserts no type, CRD, or code path implements them — a partially-built deferral is the failure this
 row exists to catch.
 
-- **V-CMP-010** — for each contract, a **field-level diff** between the spec's schema block and the
+- `V-CMP-010` — for each contract, a **field-level diff** between the spec's schema block and the
   generated OpenAPI/type: any field in the spec and missing from the code fails; any field in the
   code and absent from the spec is reported for review (it may be a legitimate implementation
-  detail, or an authority field that must not exist). `L0`
-- **V-CMP-011** — the CRD schema contains **none** of the prohibited authority field names
+  detail, or an authority field that must not exist).
+- `V-CMP-011` — the CRD schema contains **none** of the prohibited authority field names
   (`spec.rbac`, `spec.rules`, `spec.riskClass`, `spec.scopeOverride`, `brokerServiceAccountName`,
-  `actorServiceAccountName`) and sets no `x-kubernetes-preserve-unknown-fields` on `spec`. `L0`
+  `actorServiceAccountName`) and sets no `x-kubernetes-preserve-unknown-fields` on `spec`.
 
 ### 5.3 Behaviour inventory
 
-- **V-CMP-020** — each tier's `skills/` set matches its [02](02-agent-personas.md) §2.1 row exactly
-  — no missing skill, no skill belonging to another tier. `L0`
-- **V-CMP-021** — each tier's proactive jobs and SOPs match [04](04-workflow-model.md) §4.1 and its
-  persona's responsibilities; every SOP carries its scope guard. `L0`
-- **V-CMP-022** — every trigger class in 04 §4.1 has a deployed delivery path (not a documented
-  one). `L2`
-- **V-CMP-023** — every operational verb in 06 §2b.1 is implemented on **both** the Slack `/kage`
+- `V-CMP-020` — each tier's `skills/` set matches its [02](02-agent-personas.md) §2.1 row exactly
+  — no missing skill, no skill belonging to another tier.
+- `V-CMP-021` — each tier's proactive jobs and SOPs match [04](04-workflow-model.md) §4.1 and its
+  persona's responsibilities; every SOP carries its scope guard.
+- `V-CMP-022` — every trigger class in 04 §4.1 has a deployed delivery path (not a documented
+  one).
+- `V-CMP-023` — every operational verb in 06 §2b.1 is implemented on **both** the Slack `/kage`
   grammar and `kubectl`/API, and each pair produces an identical `ActionRecord` effect. A verb
-  present on one surface only fails. `L2`
+  present on one surface only fails.
 
 ---
 
@@ -288,6 +291,14 @@ section — this table exists so a harness can enumerate, schedule, and report o
 
 **Negative controls are mandatory** for every check marked `¬`. A check that only demonstrates the
 happy path is not evidence for a security or safety property.
+
+**Two suites are catalogued where their rationale is, and both are reachable from here.** V-CMP's
+rationale is §5's three inventories, so §6.15 indexes it rather than restating it. V-MET-001…009 sit
+in the §8 table, next to the traceability obligation they police, and V-MET-010/011/012 with them;
+V-MET-013 and V-MET-014 arrived with the coverage audit and sit in §6.14. Every check ID this
+document defines is defined **once**, in exactly one of those places — `dev/tests/spec-ids.py`
+(V-MET-013) fails the build on a second definition site, which is what stops an index from becoming
+a copy that drifts.
 
 ### 6.1 V-CTN — Containment (BLOCKING-ALWAYS)
 
@@ -652,6 +663,40 @@ runnable until the named ambiguity is resolved.
 | V-BRK-026 | **The broker's own identity is resolved live, and "fleet-wide" is never a stand-in for "unknown"**: the `Agent` a `ChangePolicy`'s `agentSelector` is evaluated against is re-read on **every** poll of `policy.Source`, not pinned at construction — `spec.tier` is immutable but `spec.scope` is not, and the operator renders only `scope.Of(agent).Leaf()` into the broker Deployment, so editing a **non-leaf** level (a cluster-admin's `projectId`) changes no rendered argument, triggers no rollout, and would strand a pinned identity for the life of the pod. Because a ChangePolicy can only tighten, a binding LOST is the loosening direction, so all three loss paths are refused: a nil `Identity` is rejected at construction, an **ill-formed** own scope is refused and **discarded** (a hole in the inner scope is matched by too little, the mirror of the ill-formed policy scope that matches too much), and an **unreadable** Agent CR is **retained** and aged out on `MaxPolicyStaleness` rather than collapsed to the zero Agent. Negative control: the **zero scope is a legal identity** — a platform Agent may carry no `spec.scope` — so it classifies and binds exactly the policies that narrow nothing, which is what stops the other three from being satisfied by "refuse anything not fully narrowed" ¬                                                                                                                                                                                                                                                              | 03 §4.1, 06 §1.2                 | L1         | 9     |
 | V-BRK-027 | **The broker that ships is the broker that was tested**: the `kage-broker` binary hands `broker.NewServer` a pipeline built by `pipeline.New`, and **every** seam of `pipeline.Config` is either populated by that binary or named on a two-sided allowlist with a written reason. Enumerated by reflection over the struct, not by a hand-written assertion per field, so a seam added to `pipeline.Config` tomorrow fails this check until someone wires it or writes down why not. The allowlist **requires** its entries to be zero rather than merely permitting it, so an entry that becomes wired fails and the allowlist shrinks; an entry naming a field that no longer exists fails too, since a renamed field leaves the entry silently excusing nothing. Startup order is asserted where it is load-bearing — the brake is refreshed before the policy source, whose identity closure reads the brake's cache — as is the fact that a failed first read stops the process and leaves **no** poller running behind it. Because `run` dials a kubeconfig and a TLS keypair and is not callable from a test, the last link is closed by **parsing** the binary's own sources: the `Pipeline` field of the `broker.Config` literal must be an identifier assigned from `pipeline.New`, `broker.UnavailablePipeline` must not appear, and exactly one such literal must have been inspected. Negative control: an incomplete `brokerDeps` must refuse **by name** and return a zero `Config` — a half-built config is the one a caller might pass on to `pipeline.New` anyway. Closes [[LSN-007]] ¬ | 03 §4.1, 06 §4.1                 | L1         | 9     |
 
+### 6.15 V-CMP — Completeness (rationale in §5)
+
+The completeness suite's rationale is §5's three inventories, and this table is its index — the
+assertion in brief, the §5 subsection that owns the argument, the level, and the phase by which it
+must be green. The rows carry no rationale of their own on purpose: §5 is a single definition site,
+and a paraphrase here would be a second one.
+
+**The due phase is when the check's population is complete, not when its subject first exists.**
+V-CMP entered the ratchet at phase 8 (§10), and a suite name in §10 contributes the members §6 dates
+at or before the phase. Four of these rows are dated late for one reason, stated so it can be argued
+with: their population is the **whole** of 05 §1 or 06, and the last members of it — the mesh
+contract, the observability pipeline, the ChatOps verb surface — do not exist until phases 12, 14
+and 15. A completeness check cannot be green over a population that is still being built, and dating
+it early would buy a permanent red rather than a real obligation.
+
+| ID        | Assertion                                                                                                                                                         | Source        | Lvl    | Phase |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | ------ | ----- |
+| V-CMP-001 | All three probes — Exists, Wired, Exercised — recorded in the run manifest for **every** 05 §1 component; `Exists: pass, Wired: fail` reports **fail**            | this doc §5.1 | L2     | 14    |
+| V-CMP-002 | No first-party image referenced by a deployed manifest lacks a published build                                                                                    | this doc §5.1 | L0     | 8     |
+| V-CMP-003 | No manifest an install path applies carries a `REPLACE_WITH_*` or `PLACEHOLDER` token                                                                             | this doc §5.1 | L0     | 8     |
+| V-CMP-004 | Every Deployment the design requires has `replicas > 0` in the default install; parked at zero is **not wired**                                                   | this doc §5.1 | L2     | 14    |
+| V-CMP-005 | The optional components are genuinely optional — a full install with C7/C8/C13 absent passes V-CTN, V-BRK, V-REV, V-GAT, V-PRO                                    | this doc §5.1 | L2     | 13    |
+| V-CMP-006 | Every MCP server reading a credential from the environment declares it in its **own** `env:` block, asserted against the runtime-authoritative rendered ConfigMap | this doc §5.1 | L0, L2 | 9     |
+| V-CMP-007 | Every identity the broker resolves by name is created by something the install path runs, and the Go and shell derivations of the actor SA name agree             | this doc §5.1 | L0     | 9     |
+| V-CMP-008 | The install overlay renders, and what it renders **is** the install — no transforming kustomization reaches `config/mesh-ca` ¬                                    | this doc §5.1 | L0     | 9     |
+| V-CMP-010 | Field-level diff, per contract, between 06's schema block and the generated OpenAPI/type                                                                          | this doc §5.2 | L0     | 12    |
+| V-CMP-011 | The CRD schema holds none of the prohibited authority field names and sets no `x-kubernetes-preserve-unknown-fields` on `spec`                                    | this doc §5.2 | L0     | 8     |
+| V-CMP-020 | Each tier's `skills/` set matches its 02 §2.1 row exactly — nothing missing, nothing borrowed from another tier                                                   | this doc §5.3 | L0     | 8     |
+| V-CMP-021 | Each tier's proactive jobs and SOPs match 04 §4.1 and its persona's responsibilities; every SOP carries its scope guard                                           | this doc §5.3 | L0     | 13    |
+| V-CMP-022 | Every trigger class in 04 §4.1 has a **deployed** delivery path, not a documented one                                                                             | this doc §5.3 | L2     | 13    |
+| V-CMP-023 | Every operational verb in 06 §2b.1 is implemented on **both** the Slack `/kage` grammar and `kubectl`/API, with an identical `ActionRecord` effect                | this doc §5.3 | L2     | 15    |
+
+V-CMP-024 is in §6.14, where the coverage audit that found it put it.
+
 ---
 
 ## 7. Fixtures and golden corpora
@@ -732,8 +777,16 @@ The mapping is a generated artifact, not prose:
   result) on every full run.
 
 The meta suite is self-referential: its `Source` is a section of **this** document, because what it
-verifies is this document's own machinery. Every other suite sources a spec — a check whose Source
-cell is empty has no stated rationale anywhere, which `dev/tests/spec-ids.py` now rejects.
+verifies is this document's own machinery. So is V-CMP's, for the same reason one level down — §5's
+inventories are what "complete" means here, and they are derived from 05 and 06 rather than restated
+by them. Every other suite sources a spec, and a check whose Source cell resolves to nothing has no
+stated rationale anywhere, which `dev/tests/spec-ids.py` rejects.
+
+This table is the V-MET catalog. It carries **no phase column**, and that is the correct reading
+rather than an omission: the meta checks police the machinery every phase is graded by, so each is
+required at every phase that names the suite — which, since V-MET entered the ratchet at phase 8, is
+every phase from 8 on. The two exceptions are V-MET-013 and V-MET-014, dated to phase 9 in §6.14
+because they arrived with the coverage audit rather than with the document.
 
 | ID        | Meta-check                                                                                                                                                                                              | Source        | Lvl |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | --- |
@@ -746,6 +799,9 @@ cell is empty has no stated rationale anywhere, which `dev/tests/spec-ids.py` no
 | V-MET-005 | Classifier rules and corpus cases stay in sync (§7.1) ¬                                                                                                                                                 | this doc §7.1 | L0  |
 | V-MET-006 | Every deferred check names a blocker, an owner, and a promotion condition; none is recorded as passing ¬                                                                                                | this doc §9.6 | L0  |
 | V-MET-007 | Every BLOCKING-ALWAYS check ran in the last full run — a suite that silently skipped is a failure ¬                                                                                                     | this doc §9.5 | L0  |
+| V-MET-010 | Every check ID specs 01–08 cite is defined in §6, and every ID §6 defines traces to a spec section that exists ¬                                                                                        | this doc §14  | L0  |
+| V-MET-011 | Every bullet of every spec Verification section resolves to ≥1 check ID through the curated `verification/traceability.yaml`, asserted in **both** directions ¬                                         | this doc §14  | L0  |
+| V-MET-012 | §5.1 lists every 05 §1 component and §5.2 every 06 contract — the inventories cannot silently shrink ¬                                                                                                  | this doc §14  | L0  |
 
 ### 8.1 The coverage baseline, and why it is a ratchet
 
@@ -1043,31 +1099,36 @@ than absorbed, because an unowned requirement is exactly what §12.2 existed to 
 
 ## 14. Verification of this document
 
-- **V-MET-010** — every check ID referenced anywhere in specs 01–08 exists in §6 of this document,
-  and every §6 ID is referenced by or traceable to a spec section. `L0` — **implemented**:
+Levels and due phases are in the §8 catalog rows, with the other nine V-MET checks; §14 owns the
+argument and nothing else.
+
+- `V-MET-010` — every check ID referenced anywhere in specs 01–08 exists in §6 of this document,
+  and every §6 ID is referenced by or traceable to a spec section. **Implemented**:
   `dev/tests/spec-ids.py`, in `dev/L0-CHAIN.txt`. A check's source is read from its
   `Source` cell, or from its section preamble where the table has no such column; the target must
   resolve to a real heading (or, for `05 C15`, a real component).
-- **V-MET-011** — every bullet in every spec Verification section (02 §10, 03 §11, 04 §9, 05 §8,
-  06 §10, 08 §7) resolves to at least one §6 check ID in the generated
-  `verification/traceability.yaml`; an unmapped bullet fails the lint. The mapping is **generated,
-  not inline** — the specs stay readable prose and the harness owns the correspondence, so the two
-  cannot drift without the lint noticing. `L0` — **not implemented; scheduled as P8-T10, and it
-  gates the Phase 8 milestone.** It was written here as a deferral first, and the ledger's V-MET-006
-  lint refused the row: V-MET is BLOCKING-ALWAYS and such a check may not be deferred (§9.6). The
-  refusal is right, and the reason is worth keeping. A deferral names an **external** blocker; the
-  blocker here was "the generator has not been written", which is unwritten work wearing a
-  deferral's label — the reward hack SELF-IMPROVEMENT §4 names. The work is real and bounded: 176
-  bullets across the six Verification sections, each needing at least one check ID, and it is
-  **curated, not fuzzy-matched** — a mapping produced by text similarity would assert coverage
-  nobody established, which is V-MET-014 with extra steps.
-- **V-MET-012** — §5.1 of this document lists every component ID from
+- `V-MET-011` — every bullet in every spec Verification section (02 §10, 03 §11, 04 §9, 05 §8,
+  06 §10, 08 §7) resolves to at least one §6 check ID in the curated
+  `verification/traceability.yaml`; an unmapped bullet fails the lint, and so does a matrix key that
+  no longer names a real bullet. The mapping is **a separate artifact, not inline** — the specs stay
+  readable prose and the harness owns the correspondence, so the two cannot drift without the lint
+  noticing. **Implemented**: same script, as P8-T10, and it gated the Phase 8 milestone. It was
+  written here as a deferral first, and the ledger's V-MET-006 lint refused the row: V-MET is
+  BLOCKING-ALWAYS and such a check may not be deferred (§9.6). The refusal is right, and the reason
+  is worth keeping. A deferral names an **external** blocker; the blocker here was "the generator has
+  not been written", which is unwritten work wearing a deferral's label — the reward hack
+  SELF-IMPROVEMENT §4 names. What eventually landed is not a generator at all: 177 bullets mapped by
+  hand, because **curated, not fuzzy-matched** was the whole point — a mapping produced by text
+  similarity would assert coverage nobody established, which is V-MET-014 with extra steps.
+- `V-MET-012` — §5.1 of this document lists every component ID from
   [05](05-system-architecture.md) §1, and §5.2 lists every contract defined in
-  [06](06-api-and-data-contracts.md). `L0` — **implemented**: same script. Its first run found
+  [06](06-api-and-data-contracts.md). **Implemented**: same script. Its first run found
   `C-JR` and `C-AD` — both **New (v1, load-bearing)** in 05 §1 — absent from §5.1 entirely, and five
   06 contracts missing from §5.2. Neither gap was visible while §14 was prose.
 
 These three keep this document from drifting away from the set it verifies — the same failure mode
 as §11.7, applied to the verification layer itself. All three were unimplemented for as long as they
-existed, which is §11.7 again: the lint that polices vacuous checks was itself one. Two are now
-implemented and the third is scheduled with a phase gate rather than an excuse.
+existed, which is §11.7 again: the lint that polices vacuous checks was itself one. **All three now
+run on the L0 chain**, and each has already caught real drift — 010 the renumbered sources, 011 a
+duplicate ID pair and an imperfect transcript recovery, 012 two load-bearing components missing from
+the inventory that decides what "complete" means.
