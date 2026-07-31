@@ -90,8 +90,9 @@ will start selecting.
 | **LSN-059** | harness, tooling, resource-leak, envtest, self-reinforcing | `make -C k8s-operator test` measures **2m09s** warm against a caller whose default time bound is **two minutes**, so it is killed seconds from finishing — and envtest starts a real etcd **and** kube-apiserver per test binary, stopped in `TestMain` after `m.Run()` returns, which a `SIGKILL` never reaches. The machine accumulated **32** adopted control planes, 30 at `ppid=1`, holding **1375 MB** of 16 GB, oldest ~31h. Nothing on the machine reaps them, no exit code mentions them, and every suite stays green: the only symptom is that the machine gets slower — which makes the next run likelier to hit the same bound and abandon the next cohort | **closed** | `dev/reap-envtest.sh` — anchored at the left edge of the asset root ([[LSN-005]] applied to a process) and predicated on `ppid == 1`, so a concurrent `make test` is never touched — wired into `k8s-operator/Makefile` as a **prerequisite** of `test` (the load-bearing half: it runs after however the previous run died) plus a `trap … EXIT INT TERM` (the tidy half). `dev/tests/invariants-gate.py` (`check_envtest_control_planes_are_reaped`, L0-CHAIN) holds all five halves including the two safety predicates inside the script; `dev/test_reap_envtest.py` (18 behavioural tests on real processes, `unittest discover dev`, L0-CHAIN); controls in `dev/test_invariants_gate.py`. The caller's own timeout is **not** mechanizable from this tree — argued in the body |
 | **LSN-060** | verification, negative-control, l2, self-concealing | `broker-execute-l2.sh`'s L2-1 arm looked the ActionRecord up by raw action id. The object name is `journal.RecordName` = `"ar-" + strings.ToLower(actionID)` (06 §4.3), so the lookup **could not have found a record against any commit** — yet the suite had never reported it, because the only thing that had ever exercised that arm was `--negative-control`, which **synthesises the record document** and feeds it straight to the assertion block. The ¬ form skipped the very statement under test, so 13/13 green measured an arm that had never run | **closed** | The arm derives `record_name` from the action id and the lookup is now exercised by the live path (`dev/verify/broker-execute-l2.sh`, PASS L2-1 naming `ar-01kyv…`). `dev/tests/invariants-gate.py` (`check_negative_controls_exercise_the_statement_under_test`, L0-CHAIN) fails any `--negative-control` block that synthesises an input the live path obtains from the cluster, unless the arm names the statement it is skipping |
 | **LSN-061** | go, kubernetes, api-semantics, subresource, silent-loss | `status` is a **subresource**: a Create keeps spec and metadata and **discards the whole status block**. `journal.Store.Create` had known that since Phase 5 — it re-writes `status.phase` afterwards — and put back exactly **one field** of the block it knew had been dropped. Everything else the broker composes at 06 §4.2 step 6 went with it, including the lifecycle clock the write-ahead rule exists to make observable; and the Create's reply body **overwrote the caller's copy**, so the pipeline reached step 8 holding a nil `status.timestamps` and **panicked on a live cluster** at the one moment a failure is unrecoverable. Symmetrically, `SetPhase` re-read the record and wrote the LIVE copy, discarding every field the caller had composed | **closed** | `mergeOwnedStatus` — the six fields 06 §4.3 assigns the owning broker SA, nil-guarded per field, snapshotted **before** the Create — used by both `Create` and `SetPhase` (`k8s-operator/internal/journal/store.go`). `state.clock()` makes the pipeline's stamping nil-safe. The journal package's fake client has modelled the subresource drop since it was written (`dropStatusLikeTheApiServer`); the pipeline's fake now models it too under `dropStatusOnCreate`. `verification/mutants/V-BRK-006.json` 15/15, M13/M14/M15 targeting exactly this. Run by `make -C k8s-operator test` (the L1 half) and by `dev/verify/broker-execute-l2.sh` (L2-CHAIN line 261), whose L2-2 arm is the property itself: `creationTimestamp` from the API server against `status.timestamps.executionStarted` from the broker |
+| **LSN-062** | records, verification, orient | A harness record states that a file "does not exist", and the file is right there. `P9-T11g-2a`'s split note said `verification/traceability.yaml` did not exist. It had existed since `P8-T10` — 71 KB, 177 entries, V-MET-011's artifact, green on every run. The question actually asked was *"does 09 §8's `R-<doc>.<section>-<n>` requirement mapping exist?"* — a correct **no** — and the answer was written down against the **filename §8 happens to use for it** rather than against the question. The unit's conclusion survived; its published reason did not, and it shipped in a commit message, a phase-file row and a ledger cell before the next ORIENT caught it | **open** | Proposed for the next improvement pass: an L0 lint that reads `docs/build/*.md`, `.claude/harness/*.md` and `verification/*.yaml` headers for a repo path asserted absent ("does not exist", "is absent", "is not in the tree", "nothing at") and fails when the path is present — the claim is cheap to make, load-bearing for scheduling, and trivially checkable |
 
-**Open: 0 of 61**.
+**Open: 1 of 62**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -3547,3 +3548,43 @@ M15 (the panic itself).
 
 **Related:** [[LSN-052]] / [[LSN-054]] (a green package that ran nothing) — the same failure mode one
 layer up: the apparatus reporting success for work that did not happen.
+
+---
+
+## LSN-062 — "That file does not exist" was written about a file that does
+
+**Tags:** records, verification, orient
+**Opened:** 2026-07-31 (P9-T11g-2a → caught at P9-T11g-2b's ORIENT)
+**Status:** open — mechanization proposed, deferred to the next improvement pass under Guardrail 9
+
+**What happened.** `P9-T11g-2` was scheduled as _"one tool over `verification/traceability.yaml`, not
+four"_. Splitting it, the unit published — in a phase-file row, a ledger cell, an outcome section and
+a commit message — that `verification/traceability.yaml` **does not exist**. It has existed since
+`P8-T10` (`ead358e`): 71 KB, 177 entries, V-MET-011's artifact, green on the L0 chain every run.
+
+**How a false claim survived a unit that was otherwise careful.** The question the unit actually
+worked on was _"does 09 §8's `R-<doc>.<section>-<n>` requirement→check mapping exist?"_, and the
+answer to that is a correct and well-evidenced **no** — a repo-wide search returns two hits, both
+sentences in §8 that _define_ the scheme. The unit then wrote that answer down **against the filename
+§8 happens to use for the mapping**. Every subsequent sentence was consistent, because the reasoning
+was about the property and only the label was wrong.
+
+**The general shape.** _An absence is asserted about a NAME, but established about a PROPERTY._ The
+two coincide often enough that the substitution is invisible: here the file's existence and the
+requirement space's existence really are different facts, and only one was checked. `ls` was never
+run. The correction cost nothing and the claim cost a commit message that cannot be edited.
+
+Note the near-miss on the other side. Had the unit believed the file existed and been wrong, the
+error would have surfaced the moment something tried to read it. **Claims of absence have no such
+backstop** — nothing fails when you decline to open a file — so they are the direction that needs a
+check rather than a habit.
+
+**Proposed mechanization** (improvement pass; a check change, not this unit's): an L0 lint over
+`docs/build/*.md`, `.claude/harness/*.md` and the header comments of `verification/*.yaml` that finds
+a repo-relative path asserted absent — `does not exist`, `is absent`, `is not in the tree`,
+`nothing at` — within a sentence of a backticked path, and fails when the path is present in the
+tree. Struck-through text (`~~…~~`) is exempt, since a corrected claim is how the record is supposed
+to look. Cheap to write, and it polices exactly the class of statement that schedules work.
+
+**Related:** [[LSN-019]] (prose on the artifact is not a mechanization) — the same gap between what a
+document says and what is true, in the opposite direction.
