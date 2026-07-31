@@ -2891,6 +2891,92 @@ def check_mutation_specs_declare_required_env() -> list[str]:
     return failures
 
 
+VERIFY_DIR = REPO / "dev/verify"
+
+
+def check_negative_controls_exercise_the_statement_under_test() -> list[str]:
+    """LSN-060: a ¬ form that synthesises its input measures nothing about how the input is obtained.
+
+    `broker-execute-l2.sh` looked its ActionRecord up by the RAW action id. Object names are
+    `journal.RecordName(actionID)` = `"ar-" + lower(actionID)` (06 §4.3, lowercased because a name
+    must be a DNS subdomain and a ULID is uppercase), so that lookup could not have found a record
+    against any commit. The suite never said so: the only thing that had ever exercised the arm was
+    `--negative-control`, which synthesises thirteen record documents and feeds them straight to the
+    assertion block, never touching the lookup. 13/13 green, for a statement that had not once run.
+
+    Two properties, because the general one is a write-it-down and the specific one is a diff.
+
+    1. Every suite with a `--negative-control` mode carries a `NEGATIVE CONTROL DOES NOT EXERCISE:`
+       block naming the live statements its synthesised path bypasses. Forced, not inferred -- the
+       same move [[LSN-051]] makes for a §8.5 halt: you cannot enumerate a bypass you never looked
+       for, and being made to write the list down is where the omission becomes visible.
+
+    2. No script fetches an `actionrecord` by interpolating a bare action id. That is the exact
+       defect, it is a one-line grep, and it is the half a reviewer cannot be relied on to catch
+       because the correct and incorrect forms differ by four characters.
+    """
+    scripts = sorted(VERIFY_DIR.glob("*.sh"))
+    if not scripts:
+        return ["VACUOUS: no suites under dev/verify/"]
+
+    marker = "NEGATIVE CONTROL DOES NOT EXERCISE:"
+    # `get actionrecord "$action_id"` and friends: a lookup whose name argument is an id variable.
+    by_raw_id = re.compile(
+        # The trailing boundary is load-bearing: without it `$REC_QUIET_IDLE` matches on its `ID`
+        # and `brake-fanout-l2.sh` -- which derives its names correctly via `rec_name` -- is
+        # reported as the defect. A check whose first finding is a false positive teaches the next
+        # reader to skim its output.
+        r"""(?:get|delete|patch)\s+actionrecords?(?:\.agents\.gke\.io)?\s+"?\$\{?"""
+        r"""(\w*(?:action_?)?[iI][dD])\}?"?(?![\w-])""",
+    )
+
+    failures, saw_control = [], False
+    for path in scripts:
+        text = path.read_text(encoding="utf-8")
+        rel = path.relative_to(REPO).as_posix()
+
+        for m in by_raw_id.finditer(text):
+            line = text[: m.start()].count("\n") + 1
+            failures.append(
+                f"{rel}:{line} looks an ActionRecord up by `${m.group(1)}`. The object name is "
+                f'`journal.RecordName` = `"ar-" + lower(actionID)` (06 §4.3), so this cannot find a '
+                f"record. Derive it: `record_name=\"ar-$(printf '%s' \"$action_id\" | "
+                f'tr \'[:upper:]\' \'[:lower:]\')\"` (LSN-060).'
+            )
+
+        if "--negative-control" not in text:
+            continue
+        saw_control = True
+        if marker not in text:
+            failures.append(
+                f"{rel} has a `--negative-control` mode and no `{marker}` block. A control that "
+                f"synthesises its input proves the ASSERTIONS are not always-green and proves "
+                f"nothing about the statements it bypassed to inject that input -- which are the "
+                f"API call, the parse and the lookup, i.e. where an L2 suite actually fails. List "
+                f"them in a comment so the next reader can see what the 13/13 does not cover "
+                f"(LSN-060)."
+            )
+            continue
+        after = text.split(marker, 1)[1]
+        listed = [
+            ln.strip().lstrip("#").strip()
+            for ln in after.splitlines()[1:]
+            if ln.lstrip().startswith("#")
+        ]
+        if not any(item.startswith(("-", "*")) and len(item) > 3 for item in listed):
+            failures.append(
+                f"{rel} carries `{marker}` with no entries under it. An empty list is the claim "
+                f"that the control exercises everything, which is the claim LSN-060 was about."
+            )
+
+    if not saw_control:
+        failures.append(
+            "VACUOUS: no suite under dev/verify/ declares a `--negative-control` mode, so the "
+            "declaration half of this check measured nothing."
+        )
+    return failures
+
+
 def check_checkpoint_commits_reach_ci() -> list[str]:
     """LSN-055: one push per branch is one CI run for every commit on it.
 
@@ -3250,6 +3336,10 @@ CHECKS = [
         check_mutation_specs_declare_required_env,
     ),
     ("LSN-055 — a CHECKPOINT commit reaches CI", check_checkpoint_commits_reach_ci),
+    (
+        "LSN-060 — a negative control exercises the statement under test",
+        check_negative_controls_exercise_the_statement_under_test,
+    ),
     (
         "LSN-051 — a §8.5 halt quotes both sides of the contradiction",
         check_spec_contradiction_halts_cite_both_sides,

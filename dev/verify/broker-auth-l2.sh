@@ -101,6 +101,20 @@ set -uo pipefail
 # NOTHING: it replays the assertion block against hand-written transcripts of a broker that
 # MISBEHAVED, and requires every arm to go red. See run_negative_control below for why that is the
 # only form the `¬` can take for a suite whose every real result is a refusal.
+#
+# NEGATIVE CONTROL DOES NOT EXERCISE: (LSN-060 — a ¬ form that synthesises its input measures
+# nothing about how that input is obtained, and the statements it bypasses are exactly where an L2
+# suite fails: the API call, the parse, the lookup.)
+#   - the driver pod's construction and scheduling, and the ConfigMap that carries its code —
+#     the transcripts are hand-written, so nothing here proves the driver can be built or run
+#   - every in-cluster call the driver makes: token minting, the TLS handshake, and the HTTP
+#     request to the broker. A transcript row is a claim about a reply, not a reply
+#   - the mesh-identity setup L2-4 and L2-5 depend on (the second agent, the shared CA, the
+#     untrusted secret) — the control asserts the arms read a `foreign-caller` row correctly and
+#     says nothing about whether such a caller can be produced
+#   - the transcript's own field order and separator. It is written by the same hand that parses
+#     it here, so a change to the driver's output format is invisible to the ¬ arm and shows up
+#     only on the live run
 MODE=live
 if [ "${1:-}" = "--negative-control" ]; then
   MODE=negative-control

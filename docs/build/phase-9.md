@@ -55,11 +55,13 @@ than a synthetic, at the profiles 5b-0-ii-a computed a unit earlier (83 / 89 / 6
 171 / 172 / 136), with developer-team a `Role` and never a `ClusterRole`. Its section is at the end
 of this file.
 
-**Resume at `P9-T9b-5b-0-iii`** — the L2 arm. Re-run `dev/verify/broker-execute-l2.sh` against
-`gke-scratch-kube-agents-dev` past step 3, which stopped because the platform actor could not list
-Secrets, and score **V-BRK-006** (L2) and **V-REV-001**. A cluster provisioned before this unit does
-not have the grant; reprovision the identity rather than patching it, so what is scored is what the
-install path produces.
+**`P9-T9b-5b-0-iii` landed 2026-07-31** — `dev/verify/broker-execute-l2.sh` is **10/10, rc 0,
+PROVEN**, and **V-BRK-006** (L2 clause) and **V-REV-001** (n=1) are scored `pass` in
+`verification/results.csv`. Its section is at the end of this file. It cost three defects that had
+been invisible for five phases; see [[LSN-060]] and [[LSN-061]].
+
+**Resume at `P9-T9b-5b-ii`.** The remaining Phase 9 ladder is `5b-ii` → `5c` →
+`T8b-4b-ii-2b-ii`, then `harness-milestone`.
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
 [`LEDGER.md`](LEDGER.md).
@@ -4622,3 +4624,77 @@ and the disjunct reverted in **one** copy while the others stay widened.
 Now unblocked and owed by **5b-0-iii** (L2): **V-BRK-006** and **V-REV-001**. `broker-execute-l2.sh`
 stopped at step 3 because the platform actor could not list Secrets; it can now, on a cluster
 provisioned from this tree.
+
+---
+
+## P9-T9b-5b-0-iii — the L2 arm, and the three defects standing behind it
+
+**Landed 2026-07-31.** Commits `0fbe744`, `ce87423`. Branch `phase-9-actor-read-half`.
+
+### What was asked, and what it turned out to require
+
+The unit was one line of the ledger: re-run `broker-execute-l2.sh` past step 3 and score V-BRK-006
+and V-REV-001. Step 3 was indeed unblocked by 5b-0-ii-b's read grant. Four separate things then had
+to be true before the suite could return a verdict about the broker rather than about itself.
+
+**1 — Step 11 returned HTTP 500: `cannot update resource "actionrecords"`.** Diagnosed as an
+implementation defect and explicitly **not** a §8.5 spec contradiction. 06 §2.2.1 grants the broker
+`actionrecords get list watch create` plus `actionrecords/status get update patch`, and withholds
+`update` and `delete` on the resource itself deliberately — "the broker appends and advances
+`status`; it can never rewrite or remove a record". `journal.SetPhase` syncs a derived label index
+alongside the authoritative `status.phase`, and its own comment already promised that sync was
+best-effort. The code returned the error. So every terminal transition the broker took reported a
+500 for an action that had **already executed and already been journaled** — a false negative in the
+audit trail. Fixed by tolerating `IsForbidden` narrowly (a `Conflict` or a 500 is still returned);
+`JournalReconciler.repairStatusLabel` runs in the operator, which holds `update`, and repairs the
+index on the next reconcile. Confirmed live: the record read back with the label repaired.
+
+**2 — L2-1 could not have passed against any commit.** It asked the API server for the record by raw
+action id; object names are `journal.RecordName` = `"ar-" + lower(actionID)` (06 §4.3). The arm had
+never been measured, because the only thing exercising it was `--negative-control`, which synthesises
+the record document. Judged **not** a Guardrail 9 violation and argued in the ledger's decisions
+table: no implementation of this unit motivated the change, the arm could not have passed against any
+tree, and the fix makes an inoperative arm operative — the assertion count rises and nothing narrows.
+[[LSN-060]].
+
+**3 — `status.timestamps` had three readers and no writer.** Declared since Phase 5; read by
+`budget.go`'s window, `cooldown.go`'s `(verified, submitted)` pair and
+`JournalReconciler.exportLateness`'s four-way fallback, all of which degrade silently. V-BRK-006's L2
+clause compares `metadata.creationTimestamp` against `status.timestamps.executionStarted`, so its
+evidence had never existed. The pipeline now stamps five beats: `submitted` and `classified` on the
+write-ahead Create, `classified` taken at the **end** of step 4 so a submission refused as
+`forbidden` never claims it was classified; `executionStarted`, `executionEnded` and `verified` off
+the wall clock and never off `s.at`, which is frozen before step 3 and would fabricate a violation.
+`approved` stays nil — it belongs to the ChatOps gateway SA.
+
+**4 — and none of it would have reached etcd.** `SetPhase` re-read the record and wrote the _live_
+copy, discarding `status.applied`, `status.verification`, `status.recovery` and the clock; and
+`Store.Create` restored only `status.phase` after the API server's subresource drop, so the birth
+beats were never durable **and** the caller's copy came back nil — which panicked the broker at step
+8 on the first live run, between "the journal says `Executing`" and "anything has executed".
+`mergeOwnedStatus` carries exactly the six fields 06 §4.3 assigns the owning broker SA, nil-guarded
+per field, used by both `Create` (snapshotted _before_ the call, since the reply overwrites) and
+`SetPhase`; `state.clock()` makes the stamping nil-safe. [[LSN-061]].
+
+### Evidence
+
+| What                                                 | Result                                                                                                                                                              |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dev/verify/actor-overlay-admission-l2.sh`           | `P9-T9b-5a ruling: HOLDS` (chain order: it must precede the execute suite — the executor's step-8/9 apply uses `client.DryRunAll`)                                  |
+| `dev/verify/broker-execute-l2.sh`                    | **rc 0 · 10/10 assertions · PROVEN**. L2-2: created `06:43:23Z` (API server), execution began `06:43:23Z` (broker). L2-4: `strategy 'delete', validated, 1 step(s)` |
+| `dev/verify/broker-execute-l2.sh --negative-control` | **13/13**, run before and after every edit to the suite                                                                                                             |
+| `verification/mutants/V-BRK-006.json`                | **15/15 caught**. M9 escaped the first sweep and was closed with a new test rather than a strengthened old one                                                      |
+| `make -C k8s-operator test`                          | green, every package                                                                                                                                                |
+| `dev/L0-CHAIN.txt`                                   | green, 386 dev tests + 30 invariant checks                                                                                                                          |
+
+Images: operator `@sha256:69bedbec93b9`, broker `@sha256:85532a853384`, both `dev-ce87423`, deployed
+by digest via `dev/cluster/reload-images.sh`.
+
+### What this unit did **not** do
+
+- **V-REV-001 is n=1** — one single-target create. The wider `n` and the `undo <id>` round trip
+  (V-REV-002) are Phase 10.
+- **The write half stays dark.** Only the READ half of 06 §2.2 is rendered; `vap-agent-scope` arrives
+  with P10-T1. `actor-overlay.sh`'s four write negatives remain absolute for that reason.
+- **`status.approvals` is still written by nobody**, because its principal — the ChatOps gateway SA —
+  does not exist yet. `mergeOwnedStatus` is written to leave it alone when it does.

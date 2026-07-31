@@ -125,6 +125,20 @@ DRIVER_CM=broker-execute-l2-code
 UNTRUSTED_SECRET=broker-execute-l2-untrusted
 PROBE=dev/verify/fixtures/broker_execute_probe.py
 
+# NEGATIVE CONTROL DOES NOT EXERCISE: (LSN-060, and this suite is the lesson.) The control
+# SYNTHESISES the record document — thirteen mutated JSONs handed straight to the assertion block —
+# so everything upstream of the assertions is unmeasured by it:
+#   - the envelope build and the HTTP POST to the deployed broker (L2-0). A synthesised document
+#     is not a broker's output; the ¬ arm cannot tell a running broker from an absent one
+#   - the API-server lookup of the record by name (L2-1). This is not hypothetical: the arm asked
+#     for the RAW action id for as long as it existed, against objects named `ar-<lowercase ULID>`
+#     (`journal.RecordName`, 06 §4.3), and could not have found a record against any commit. The
+#     ¬ arm was 13/13 green throughout, because it never ran the line
+#   - the P1 digest arms and the broker's Availability, which run before either mode
+#   - the read of the TARGET object (L2-3b). The control mutates the record's own document to
+#     claim a mutation happened; it never asks the cluster whether one did
+# What it does prove, and all it proves: the assertion block is not always-green — each of the
+# thirteen defects is caught by the arm that targets it, named in the output.
 fail=0
 
 # EVERY ARM IS COUNTED, AND THE COUNT IS ASSERTED AT THE END. `broker-auth-l2.sh` carries the full

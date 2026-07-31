@@ -737,6 +737,100 @@ class ACheckOnlyUnitExhibitsBothTrees(_PinnedProse):
         self.assertTrue(any("negative-control" in p for p in problems), problems)
 
 
+class NegativeControlsExerciseTheStatementUnderTest(unittest.TestCase):
+    """[[LSN-060]]: the ¬ arm was 13/13 green for a statement that had never executed.
+
+    Every arm repoints `gate.VERIFY_DIR` at a synthetic suite, because the property is about the
+    SHAPE of a suite rather than about any file in the tree, and a control that edits a real one
+    would be measuring today's `dev/verify/` instead of the rule.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(dir=gate.REPO / "dev")
+        self.addCleanup(self._tmp.cleanup)
+        self._dir = pathlib.Path(self._tmp.name)
+        self._saved = gate.VERIFY_DIR
+        gate.VERIFY_DIR = self._dir
+        self.addCleanup(lambda: setattr(gate, "VERIFY_DIR", self._saved))
+
+    def write(self, name: str, body: str) -> None:
+        (self._dir / name).write_text(body, encoding="utf-8")
+
+    WELL_FORMED = (
+        '#!/usr/bin/env bash\n'
+        '# --negative-control replays the assertion block.\n'
+        '# NEGATIVE CONTROL DOES NOT EXERCISE:\n'
+        '#   - the HTTP POST to the broker\n'
+        '#   - the API-server lookup of the record\n'
+        'record_name="ar-$(printf \'%s\' "$action_id" | tr \'[:upper:]\' \'[:lower:]\')"\n'
+        '$K get actionrecord "$record_name" -o json\n'
+    )
+
+    def test_green_on_a_well_formed_suite(self):
+        self.write("good-l2.sh", self.WELL_FORMED)
+        self.assertEqual([], gate.check_negative_controls_exercise_the_statement_under_test())
+
+    def test_green_on_the_tree_as_it_stands(self):
+        gate.VERIFY_DIR = self._saved
+        self.assertEqual([], gate.check_negative_controls_exercise_the_statement_under_test())
+
+    def test_a_lookup_by_raw_action_id_fails(self):
+        # THE defect: `journal.RecordName` lowercases and prefixes, so this finds nothing, and the
+        # ¬ arm never ran the line because it synthesises the document.
+        self.write("bad-l2.sh", self.WELL_FORMED.replace('"$record_name"', '"$action_id"'))
+        problems = gate.check_negative_controls_exercise_the_statement_under_test()
+        self.assertTrue(problems)
+        self.assertTrue(any("looks an ActionRecord up by" in p for p in problems), problems)
+
+    def test_a_control_with_no_declaration_fails(self):
+        self.write(
+            "bare-l2.sh",
+            self.WELL_FORMED.replace("# NEGATIVE CONTROL DOES NOT EXERCISE:\n", "")
+            .replace("#   - the HTTP POST to the broker\n", "")
+            .replace("#   - the API-server lookup of the record\n", ""),
+        )
+        problems = gate.check_negative_controls_exercise_the_statement_under_test()
+        self.assertTrue(problems)
+        self.assertTrue(any("DOES NOT EXERCISE" in p for p in problems), problems)
+
+    def test_an_empty_declaration_fails(self):
+        # An empty list is the claim that the control exercises everything, which is the claim the
+        # lesson is about. A header with nothing under it must not read as compliance.
+        self.write(
+            "empty-l2.sh",
+            self.WELL_FORMED.replace("#   - the HTTP POST to the broker\n", "").replace(
+                "#   - the API-server lookup of the record\n", ""
+            ),
+        )
+        problems = gate.check_negative_controls_exercise_the_statement_under_test()
+        self.assertTrue(problems)
+        self.assertTrue(any("with no entries under it" in p for p in problems), problems)
+
+    def test_a_suite_with_no_control_needs_no_declaration(self):
+        # The declaration is owed by suites that HAVE a ¬ form. Demanding it of every script would
+        # make the marker noise, and noise is what the next reader skims.
+        self.write("plain-l2.sh", '#!/usr/bin/env bash\n$K get actionrecord "$record_name"\n')
+        self.write("good-l2.sh", self.WELL_FORMED)
+        self.assertEqual([], gate.check_negative_controls_exercise_the_statement_under_test())
+
+    def test_a_correct_derived_name_containing_id_is_not_flagged(self):
+        # `$REC_QUIET_IDLE` in brake-fanout-l2.sh is a DERIVED name that happens to contain `ID`.
+        # The first version of this check flagged it, and a check whose first finding is a false
+        # positive teaches the next reader to skim its output.
+        self.write("good-l2.sh", self.WELL_FORMED)
+        self.write(
+            "derived-l2.sh",
+            '#!/usr/bin/env bash\nREC_QUIET_IDLE="$(rec_name "$X")"\n'
+            '$K patch actionrecord "$REC_QUIET_IDLE" --subresource=status\n',
+        )
+        self.assertEqual([], gate.check_negative_controls_exercise_the_statement_under_test())
+
+    def test_a_tree_with_no_control_at_all_is_reported_as_vacuous(self):
+        self.write("plain-l2.sh", '#!/usr/bin/env bash\necho hi\n')
+        problems = gate.check_negative_controls_exercise_the_statement_under_test()
+        self.assertTrue(any("VACUOUS" in p for p in problems), problems)
+
+
 class EnvtestControlPlanesAreReaped(_PinnedProse):
     """[[LSN-059]]: the leak is invisible — the suite is green, the machine is just slower.
 

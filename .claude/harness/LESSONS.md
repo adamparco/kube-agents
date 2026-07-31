@@ -88,8 +88,10 @@ will start selecting.
 | **LSN-057** | harness, checks, corpus-discovery, false-positive, LSN-035 | `negative-controls-name-their-rule.py` discovered its corpus as *every `dev/tests/*.py` containing the string `--negative-control`*. The moment a check appeared that SEARCHES other files for that flag — `invariants-gate.py`'s new LSN-053 arm — the substring swept the searcher in and reported it as a control file with no control. The file's own docstring had already argued **WHY BEHAVIOURAL AND NOT STRUCTURAL** for the scoring half while the discovery half stayed textual | **closed** | `dev/tests/negative-controls-name-their-rule.py` (on `dev/L0-CHAIN.txt`): discovery is now a behaviour — a file is in the corpus if its own argv handling dispatches on the flag (`"--negative-control" in argv` and its spellings, or an `add_argument`) or if a usage line offers the flag against the file's own name. Splitting the two signals bought a new property for free — a usage line that offers the flag with nothing dispatching on it is its own finding, because the documented command then runs the ordinary check and prints its ordinary PASS. Two new cases in the file's own `--negative-control`, one of them the exact searcher that caused this |
 | **LSN-058** | harness, tooling, false-red, concurrency, go | CHECKPOINT now requires both the L0 chain and `make -C k8s-operator test` ([[LSN-052]]/[[LSN-054]]), so the obvious saving is to run them at once. Doing that produced a red naming a file nobody wrote: five python suites create temp directories **inside** `k8s-operator/`, `controller-gen` runs with `paths="./..."`, and the directory is deleted while it is reading — `tmp109n_mmw/main.go:1: no such file or directory`, then `Error: not all generators ran successfully`. It points at no defect and vanishes on a serial re-run | **closed** | `dev/test_action_envelope.py`, `dev/test_envelope_wire_keys.py`, `dev/test_invariants_gate.py` (all three on `dev/L0-CHAIN.txt`): every `TemporaryDirectory(dir=…k8s-operator…)` takes `prefix="."`. Go tooling skips dot-directories under `./...`; Python globbing does not, so the suites that need to SEE the directory still do. Verified by re-running the two commands concurrently — the pairing that produced the red — and getting `GO=0 PYTHON=0` |
 | **LSN-059** | harness, tooling, resource-leak, envtest, self-reinforcing | `make -C k8s-operator test` measures **2m09s** warm against a caller whose default time bound is **two minutes**, so it is killed seconds from finishing — and envtest starts a real etcd **and** kube-apiserver per test binary, stopped in `TestMain` after `m.Run()` returns, which a `SIGKILL` never reaches. The machine accumulated **32** adopted control planes, 30 at `ppid=1`, holding **1375 MB** of 16 GB, oldest ~31h. Nothing on the machine reaps them, no exit code mentions them, and every suite stays green: the only symptom is that the machine gets slower — which makes the next run likelier to hit the same bound and abandon the next cohort | **closed** | `dev/reap-envtest.sh` — anchored at the left edge of the asset root ([[LSN-005]] applied to a process) and predicated on `ppid == 1`, so a concurrent `make test` is never touched — wired into `k8s-operator/Makefile` as a **prerequisite** of `test` (the load-bearing half: it runs after however the previous run died) plus a `trap … EXIT INT TERM` (the tidy half). `dev/tests/invariants-gate.py` (`check_envtest_control_planes_are_reaped`, L0-CHAIN) holds all five halves including the two safety predicates inside the script; `dev/test_reap_envtest.py` (18 behavioural tests on real processes, `unittest discover dev`, L0-CHAIN); controls in `dev/test_invariants_gate.py`. The caller's own timeout is **not** mechanizable from this tree — argued in the body |
+| **LSN-060** | verification, negative-control, l2, self-concealing | `broker-execute-l2.sh`'s L2-1 arm looked the ActionRecord up by raw action id. The object name is `journal.RecordName` = `"ar-" + strings.ToLower(actionID)` (06 §4.3), so the lookup **could not have found a record against any commit** — yet the suite had never reported it, because the only thing that had ever exercised that arm was `--negative-control`, which **synthesises the record document** and feeds it straight to the assertion block. The ¬ form skipped the very statement under test, so 13/13 green measured an arm that had never run | **closed** | The arm derives `record_name` from the action id and the lookup is now exercised by the live path (`dev/verify/broker-execute-l2.sh`, PASS L2-1 naming `ar-01kyv…`). `dev/tests/invariants-gate.py` (`check_negative_controls_exercise_the_statement_under_test`, L0-CHAIN) fails any `--negative-control` block that synthesises an input the live path obtains from the cluster, unless the arm names the statement it is skipping |
+| **LSN-061** | go, kubernetes, api-semantics, subresource, silent-loss | `status` is a **subresource**: a Create keeps spec and metadata and **discards the whole status block**. `journal.Store.Create` had known that since Phase 5 — it re-writes `status.phase` afterwards — and put back exactly **one field** of the block it knew had been dropped. Everything else the broker composes at 06 §4.2 step 6 went with it, including the lifecycle clock the write-ahead rule exists to make observable; and the Create's reply body **overwrote the caller's copy**, so the pipeline reached step 8 holding a nil `status.timestamps` and **panicked on a live cluster** at the one moment a failure is unrecoverable. Symmetrically, `SetPhase` re-read the record and wrote the LIVE copy, discarding every field the caller had composed | **closed** | `mergeOwnedStatus` — the six fields 06 §4.3 assigns the owning broker SA, nil-guarded per field, snapshotted **before** the Create — used by both `Create` and `SetPhase` (`k8s-operator/internal/journal/store.go`). `state.clock()` makes the pipeline's stamping nil-safe. The journal package's fake client has modelled the subresource drop since it was written (`dropStatusLikeTheApiServer`); the pipeline's fake now models it too under `dropStatusOnCreate`. `verification/mutants/V-BRK-006.json` 15/15, M13/M14/M15 targeting exactly this. Run by `make -C k8s-operator test` (the L1 half) and by `dev/verify/broker-execute-l2.sh` (L2-CHAIN line 261), whose L2-2 arm is the property itself: `creationTimestamp` from the API server against `status.timestamps.executionStarted` from the broker |
 
-**Open: 0 of 59**.
+**Open: 0 of 61**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -3443,3 +3445,105 @@ killed exactly the three orphans and left the live pair alone — the live test 
 Finally, end to end: two orphans created, `make -C k8s-operator test` run, whose first line was
 `reap-envtest: reaped 2 envtest process(es) (~263 MB); 1 needed SIGKILL after 5s.`, the suite green,
 the exit trap reporting nothing left to reap, and `--list` afterwards returning 0.
+
+## LSN-060 — The negative control skipped the statement under test, so 13/13 measured nothing
+
+**Tags:** verification, negative-control, l2, self-concealing
+**Opened:** 2026-07-31 (P9-T9b-5b-0-iii)
+**Status:** closed — mechanized in the same unit
+
+**What happened.** `dev/verify/broker-execute-l2.sh`'s L2-1 arm asks the API server for the
+ActionRecord the broker just created, then hands the document to a shared assertion block that L2-2
+through L2-5 read. It looked the record up by the **raw action id**. Object names are
+`journal.RecordName(actionID)` = `"ar-" + strings.ToLower(actionID)` — 06 §4.3, lowercased because a
+name must be a DNS subdomain and a ULID is uppercase. That lookup could not have found a record
+against **any** commit in the history of the file.
+
+It had never been reported, because the only thing that had ever exercised the arm was
+`--negative-control`. The control **synthesises** the record document — thirteen mutated JSON
+documents, each fed straight to the assertion block — and never touches the lookup. So the suite had
+a green 13/13 for an arm whose live statement had not once executed, and the first live run reported
+`no such ActionRecord exists` **directly above a listing that showed the record**.
+
+**The general shape.** A negative control proves the assertion block is not always-green. It proves
+nothing about any statement it bypasses in order to inject its input, and the statements it bypasses
+are exactly the ones that acquire the thing being asserted about: the API call, the parse, the
+lookup. Those are also, in an L2 suite, where the interesting failures live — a synthesised document
+is by construction well-formed and correctly named.
+
+**An arm whose ¬ form skips the statement under test is an arm nothing has measured**, and it reads
+in the output exactly like an arm that passed.
+
+**Mechanization.** `dev/tests/invariants-gate.py` →
+`check_negative_controls_exercise_the_statement_under_test` (L0-CHAIN). It fails any suite whose
+`--negative-control` block constructs an input the live path obtains from the cluster, unless the
+arm carries a comment naming the statement it is deliberately skipping and why. The L2-1 lookup now
+derives `record_name` at the call site — derived rather than read off the broker's reply, because
+the reply is the broker's claim about where it wrote and the point of the arm is to check it — and
+the live run's PASS line names `ar-01kyveh3ngd099sz5dpntwfbyz`.
+
+**Related:** [[LSN-048]] (a `-run` pattern that matched nothing scored three mutants as survivors) —
+same family: the measurement apparatus reporting on work it never did.
+
+## LSN-061 — `status` is a subresource, and Create put back one field of the block it knew was dropped
+
+**Tags:** go, kubernetes, api-semantics, subresource, silent-loss
+**Opened:** 2026-07-31 (P9-T9b-5b-0-iii)
+**Status:** closed — mechanized in the same unit
+
+**What happened.** Three defects, one root, found in sequence over a single unit.
+
+First: `status.timestamps` had been a declared CRD field since Phase 5 with **three readers and no
+writer**. `budget.go`'s window, `cooldown.go`'s `(verified, submitted)` pair and
+`JournalReconciler.exportLateness`'s four-way fallback all degrade *silently* when it is absent, so
+nothing ever went red. V-BRK-006's L2 clause — the write-ahead record is durable **before** the
+mutation — had no `executionStarted` to compare `metadata.creationTimestamp` against, so the one
+ordering the rule exists to establish was unobservable in production.
+
+Second: `journal.SetPhase` re-reads the record into `live` and writes **that**, so everything the
+pipeline had composed on its own copy was discarded — `status.applied` from step 9,
+`status.verification` and `status.recovery` from step 11. A live record read back with a phase, a
+message and nothing else: an audit trail that said an action had happened and could not say what it
+did.
+
+Third, and the one that bit hardest: `status` is a **subresource**. The API server keeps spec and
+metadata from a Create and discards the whole status block. `Store.Create` had known that for five
+phases — there is a paragraph of comment above the line where it re-writes `status.phase` afterwards
+— and it put back exactly **one field** of the block it knew had been dropped. The birth beats
+(`submitted`, `classified`) therefore never became durable on the write-ahead record, which is
+precisely the artifact whose durability V-BRK-006 is about. And the Create's reply body **overwrote
+the caller's `ar.Status`**, so the pipeline reached step 8 holding a nil `status.timestamps` and
+stamped straight through it. The broker **panicked on `gke-scratch-kube-agents-dev`** at the one
+moment a failure is unrecoverable: the journal already said `Executing`, nothing had executed, and
+no code path will ever advance that record.
+
+**What generalises.**
+
+- **A field the API server drops is dropped in full.** Restoring the field you happened to notice
+  reads, in code review, exactly like handling the drop. The comment above the fix was *correct* and
+  the fix under it was one-sixth of the job.
+- **A degraded reader is not a failing reader.** Four-way fallbacks and zero-value windows are how a
+  never-written field survives five phases with a green suite. Every fallback is a place a missing
+  writer can hide.
+- **Fail closed means refuse, not die.** A nil dereference between "the journal is durable" and
+  "the executor ran" is strictly worse than the missing datum it crashes about.
+- **A fix and its overcorrection are the same unit of work.** Copying the caller's whole status back
+  would have blanked `approvals`, `contested` and `undoneBy` — three fields 06 §4.3 hands to *other*
+  principals — letting a phase change silently reverse a human approval. The mutation sweep's M8
+  exists because the obvious repair for M7 is the more dangerous bug.
+
+**Mechanization.** `mergeOwnedStatus` in `k8s-operator/internal/journal/store.go` carries exactly the
+six fields 06 §4.3 assigns to the owning broker SA, nil-guarded per field, and is used by **both**
+`Create` (snapshotted *before* the call, since the reply overwrites) and `SetPhase`. `state.clock()`
+in the pipeline creates the block if absent so the stamping cannot dereference nil. The journal
+package's fake client has modelled the subresource drop since it was written
+(`dropStatusLikeTheApiServer`) — that is why the journal tests could catch it; the pipeline's fake
+store now models it too, behind `dropStatusOnCreate`, defaulting off so the default fake remains the
+store's real contract. `verification/mutants/V-BRK-006.json`, **15/15 caught**: M7 (SetPhase drops
+the outcome), M8 (the wholesale overcorrection), M9 (the unguarded per-field copy, which **escaped**
+the first sweep), M13 (Create restores only the phase — the tree as it shipped), M14 (the snapshot
+taken one line too late, which restores an empty block and looks exactly like a working restore),
+M15 (the panic itself).
+
+**Related:** [[LSN-052]] / [[LSN-054]] (a green package that ran nothing) — the same failure mode one
+layer up: the apparatus reporting success for work that did not happen.
