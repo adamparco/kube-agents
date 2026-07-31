@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A negative control that only proves the suite went red proves almost nothing (LSN-035).
 
+This file is V-MET-014's implementation (09 §6.14, "negative-control discipline"), registered in
+`verification/implementations.yaml`.
+
 `¬` in 09 §6 means a negative control is mandatory: break the property, watch the check fail. What a
 negative control establishes is that the check *can* fail. What it does not establish -- and what
 everyone reads it as establishing -- is that the check fails **for the reason the mutation was

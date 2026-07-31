@@ -393,3 +393,29 @@ bash dev/verify/undo-coverage-l2.sh --negative-control
 # could not go green once the work lands makes editing the arm the cheapest diff at exactly the
 # wrong moment.
 python3 dev/tests/phase-ratchet-is-asserted.py --phase 9 --negative-control
+
+# --- V-MET-001: the catalog and the code agree about what is implemented --------------------------
+# 09 §8's row is two directions between two sets -- every check ID in §6 exists in the implemented
+# suite, and every implemented test declares a known check ID -- and until
+# `verification/implementations.yaml` there was no artifact holding the second one.
+#
+# THE COST OF NOT HAVING IT. `phase-ratchet-is-asserted.py`'s `hint: named by ...` column is a
+# `git grep <check-id>` under a footer disclaiming it in as many words. On 2026-07-31 it was read as
+# coverage anyway and P9-T11g was scheduled promising eleven runs and two builds; the tree held one
+# run and twelve builds. Nine of the eleven were "named by" a parser fixture, by binding.md and the
+# skills that REQUIRE the check, or by VAP corpora that are real, correct, and executed by nothing.
+# A grep cannot tell an assertion from a citation from a disclaimer, and a second grep will not
+# either. The registry is a human's answer; this arm is what stops it drifting from the tree.
+#
+# The forward direction is deliberately PHASE-SCOPED to required-and-green. A check with no green
+# row is the ratchet's population, not this one's -- giving one gap two gates gives it two chances
+# to be answered differently.
+python3 dev/tests/check-ids-have-implementations.py
+
+# Eight mutations, each asserting the finding ITS property produces rather than that something went
+# red ([[LSN-035]]): a registry row for an ID 09 §6 does not define, an `asserts_in` pointing at
+# nothing, an implementation that stops naming its own ID, a `runs` on neither chain, a `runs` that
+# does not reach the file it claims, a required-and-green check losing its row, a test declaring a
+# renumbered ID, and a second `unimplemented:` row smuggled past the ceiling. The fixtures are read
+# out of the tree (`_a_required_green`), not listed, so the control cannot go stale against it.
+python3 dev/tests/check-ids-have-implementations.py --negative-control

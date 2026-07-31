@@ -30,6 +30,11 @@ import (
 // V-CTR-015 (L1, 06 §4.4): the nine fail-closed rules are one decision function, each rule refuses
 // in the absence of its own input, and the absence of each input is exercised.
 //
+// V-CTR-016 (L1, 09 §6.9) is the same tests read the other way round: `C-UC`'s preconditions are
+// ONE shared predicate and every one of them refuses in isolation against a baseline that is
+// accepted -- TestBrakeHealthyBaselineAllows is that baseline, TestBrakeZeroValueRefuses is the
+// zero-valued record, and TestBrakeEachRuleFiresInIsolation is the in-isolation half.
+//
 // The tests are structured around one idea: for every rule there is a HEALTHY baseline that is
 // allowed, and the test removes exactly one input from it. That is what makes the assertions mean
 // something -- a test suite where every case refuses proves nothing, because a `Decide` that

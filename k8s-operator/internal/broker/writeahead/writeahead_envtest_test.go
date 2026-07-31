@@ -16,6 +16,11 @@ limitations under the License.
 
 package writeahead
 
+// V-BRK-023 (L1, 09 §6.14): write-ahead confirmation is a READ, not a flag -- the confirmer
+// reports durability only after reading the `ActionRecord` back and finding the uid and
+// resourceVersion the API server assigned. This is the file that asserts it; see
+// verification/implementations.yaml.
+//
 // The claims in this file are the ones a fake cannot establish, and for this package that is most
 // of the substance.
 //

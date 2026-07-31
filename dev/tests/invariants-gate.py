@@ -1515,7 +1515,8 @@ def _dagger_pass_failures(dagger: list[str]) -> list[str]:
     This arm exists because the tree had one. `results.csv` row 47 (2026-07-27, P8-T9) recorded
     `"V-CTR-002, V-CTN-021"` as **pass** at L2, on evidence -- `webhook-negatives-l2.sh` -- that
     proves V-CTR-002's property exactly and says nothing whatever about V-CTN-021's, which is
-    conformance of all 39 cells of the 02 §7 boundary matrix. There is no V-CTR-021, so it is not
+    conformance of all 39 cells of the 02 §7 boundary matrix. There is no V-CTR-021 (not-a-check-id
+    -- 09 §6 has never defined it, which is the point of the sentence), so this is not
     a one-letter slip from the neighbouring ID; the ID that got recorded exists, is BLOCKING-ALWAYS,
     and was not run. It went unnoticed for two days and it was **masking a second defect**: the
     BLOCKING-ALWAYS arm of `check_deferrals_name_blockers` short-circuits on "green somewhere", so

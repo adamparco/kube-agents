@@ -1,0 +1,368 @@
+# Implementation registry — V-MET-001.
+#
+# Check ID -> the command that asserts it, and the file that holds the assertion. 09 §6 says what
+# each check asserts; `verification/results.csv` says what a run of it produced. Neither says WHERE
+# the assertion lives, and until this file existed nothing did.
+#
+# WHY THAT GAP WAS EXPENSIVE. `dev/tests/phase-ratchet-is-asserted.py` prints a `hint: named by ...`
+# column built from `git grep <check-id>`, under a footer that disclaims it: "The `hint` column is
+# UNWEIGHTED and no property reads it. A file naming a check ID may be disclaiming it." On
+# 2026-07-31 that column was read as coverage anyway, and a task was scheduled promising "eleven
+# runs to record and two builds". The tree held one run and twelve builds. Nine of the eleven were
+# "named by" a parser fixture, by `.claude/harness/binding.md` and the skills that REQUIRE the
+# check, or by VAP corpora that are real, correct, and executed by nothing on either chain. A grep
+# cannot tell an assertion from a citation. A human can, once, and write the answer down here.
+#
+# IT IS CURATED, NOT GENERATED, for the same reason `traceability.yaml` is. Every row below was
+# decided by reading the named file against the 09 §6 assertion. A row produced by text similarity
+# would assert an implementation nobody established -- V-MET-014 with extra steps.
+#
+# WHAT A ROW MEANS. `runs` is a command that appears VERBATIM on `dev/L0-CHAIN.txt` or
+# `dev/L2-CHAIN.txt`, or is `make -C k8s-operator test` (the Go entry point `.claude/harness/
+# binding.md` §Build names, which no chain line carries because it needs envtest), or is
+# `python3 -m unittest discover dev`. An implementation nothing runs is not an implementation, and
+# that is the second half of the lesson above: the VAP corpora were correct and unreachable.
+# `asserts_in` is the file holding the assertion, and it must NAME the check ID -- so a later grep
+# tells the truth, and so the two halves of this row cannot drift apart silently.
+#
+# `unimplemented:` IS A FINDING, NOT A WAIVER. It records a check with a green results row whose
+# evidence attests to something other than the check`s stated property. The lint pins their count
+# and refuses a rise (`UNIMPLEMENTED_CEILING` in dev/tests/check-ids-have-implementations.py), the
+# same two-tier shape 09 §8.1 uses for coverage: a gate that always fails is a gate someone
+# disables, so the gap is published and ratcheted rather than tolerated or hidden.
+#
+# WHAT IS NOT HERE. A check with no green row is absent, and that is correct: it is not in the
+# implemented suite and `dev/tests/phase-ratchet-is-asserted.py` already owns the "required but not
+# green" population. Do not add a row for work you intend to do.
+#
+# Schema (see `load_registry` in dev/tests/check-ids-have-implementations.py -- strict, no PyYAML,
+# because L0 installs no dependencies): one top-level quoted check ID per entry, holding EITHER
+# `runs:` + `asserts_in:` (both JSON-encoded scalars) OR `unimplemented:` (one JSON-encoded scalar).
+# Anything else is a parse error, not a reinterpretation.
+
+"V-BRK-002":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/envelope_test.go"
+
+"V-BRK-006":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/execute/execute_envtest_test.go"
+
+"V-BRK-007":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/auth_test.go"
+
+"V-BRK-008":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/auth_test.go"
+
+"V-BRK-009":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/auth_test.go"
+
+"V-BRK-010":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/auth_test.go"
+
+"V-BRK-011":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/pipeline/pipeline_test.go"
+
+"V-BRK-012":
+  runs: "python3 dev/tests/one-broker-per-agent.py"
+  asserts_in: "dev/tests/one-broker-per-agent.py"
+
+"V-BRK-013":
+  runs: "python3 dev/tests/actor-grant-single-sourced.py"
+  asserts_in: "dev/tests/actor-grant-single-sourced.py"
+
+"V-BRK-014":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/pipeline/pipeline_test.go"
+
+"V-BRK-015":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/controller/actionrecord_cel_envtest_test.go"
+
+"V-BRK-017":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/auth_test.go"
+
+"V-BRK-018":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/execute/snapshot_test.go"
+
+"V-BRK-020":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/execute/execute_envtest_test.go"
+
+"V-BRK-021":
+  runs: "python3 dev/tests/broker-supply-chain-minimal.py"
+  asserts_in: "dev/tests/broker-supply-chain-minimal.py"
+
+"V-BRK-022":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/pipeline/verbs_test.go"
+
+"V-BRK-023":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/writeahead/writeahead_envtest_test.go"
+
+"V-BRK-024":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/pipeline/shadow_test.go"
+
+"V-BRK-025":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/pipeline/shadow_test.go"
+
+"V-BRK-026":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/policy/identity_test.go"
+
+"V-BRK-027":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/cmd/broker/wiring_test.go"
+
+"V-BRK-028":
+  runs: "python3 -m unittest discover dev"
+  asserts_in: "dev/test_action_envelope.py"
+
+"V-BRK-029":
+  runs: "python3 -m unittest discover dev"
+  asserts_in: "dev/test_apply_change_skill.py"
+
+"V-BRK-030":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/controller/broker_manifests_test.go"
+
+"V-BRK-031":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/pipeline/pipeline_test.go"
+
+"V-BRK-032":
+  runs: "python3 -m unittest discover dev"
+  asserts_in: "dev/test_broker_client.py"
+
+"V-CMP-001":
+  runs: "python3 dev/tests/identity-has-install-path.py"
+  asserts_in: "dev/tests/identity-has-install-path.py"
+
+"V-CMP-002":
+  runs: "python3 -m unittest discover dev"
+  asserts_in: "dev/test_image_provenance.py"
+
+"V-CMP-003":
+  runs: "python3 -m unittest discover dev"
+  asserts_in: "dev/test_applied_manifests.py"
+
+"V-CMP-004":
+  runs: "bash dev/verify/multi-agent-namespace-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/multi-agent-namespace-l2.sh"
+
+"V-CMP-007":
+  runs: "python3 dev/tests/identity-has-install-path.py"
+  asserts_in: "dev/tests/identity-has-install-path.py"
+
+"V-CMP-008":
+  runs: "python3 dev/tests/install-render-is-faithful.py"
+  asserts_in: "dev/tests/install-render-is-faithful.py"
+
+"V-CMP-011":
+  runs: "python3 dev/tests/crd-has-no-authority-fields.py"
+  asserts_in: "dev/tests/crd-has-no-authority-fields.py"
+
+"V-CTN-020":
+  runs: "python3 -m unittest discover dev"
+  asserts_in: "dev/test_dataplane_precondition.py"
+
+"V-CTN-037":
+  runs: "bash dev/verify/actor-overlay-admission-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/actor-overlay-admission-l2.sh"
+
+"V-CTR-001":
+  unimplemented: "No test asserts this property. The green rows' evidence_ref is `go test ./...` over every package -- which attests that the suite passes, not that every shipped `Agent` CR validates and that apply->get->re-apply is a no-op diff. There is no `k8s-operator/config/samples/`, and no test reads the shipped CRs and round-trips them. Found by P9-T11g-2a; the row needs correcting or the check needs building, and which one is a separate unit."
+
+"V-CTR-002":
+  runs: "bash dev/verify/webhook-negatives-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/webhook-negatives-l2.sh"
+
+"V-CTR-003":
+  runs: "python3 dev/tests/crd-has-no-authority-fields.py"
+  asserts_in: "dev/tests/crd-has-no-authority-fields.py"
+
+"V-CTR-005":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/envelope_roundtrip_test.go"
+
+"V-CTR-006":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/api/v1alpha1/actionrecord_phases_test.go"
+
+"V-CTR-014":
+  runs: "python3 dev/tests/closed-allowlist.py"
+  asserts_in: "dev/tests/closed-allowlist.py"
+
+"V-CTR-015":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/brake_test.go"
+
+"V-CTR-016":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/brake_test.go"
+
+"V-CTR-017":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/brake/brake_test.go"
+
+"V-CTR-018":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/brake/brake_test.go"
+
+"V-CTR-020":
+  runs: "python3 -m unittest discover dev"
+  asserts_in: "dev/test_apply_change_skill.py"
+
+"V-GAT-001":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/classify/corpus_test.go"
+
+"V-GAT-009":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/classify/stricter_test.go"
+
+"V-GAT-010":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/classify/direction_test.go"
+
+"V-GAT-011":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/classify/classify_test.go"
+
+"V-GAT-017":
+  runs: "python3 dev/tests/classifier-is-model-free.py"
+  asserts_in: "dev/tests/classifier-is-model-free.py"
+
+"V-GAT-021":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/classify/direction_test.go"
+
+"V-GAT-022":
+  runs: "bash dev/verify/classify-live-state-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/classify-live-state-l2.sh"
+
+"V-ISO-001":
+  runs: "bash dev/verify/chaos-suite.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/chaos-suite.sh"
+
+"V-ISO-002":
+  runs: "bash dev/verify/chaos-suite.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/chaos-suite.sh"
+
+"V-ISO-006":
+  runs: "bash dev/verify/broker-refuse-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/broker-refuse-l2.sh"
+
+"V-MET-001":
+  runs: "python3 dev/tests/check-ids-have-implementations.py"
+  asserts_in: "dev/tests/check-ids-have-implementations.py"
+
+"V-MET-003":
+  runs: "python3 dev/tests/invariants-gate.py"
+  asserts_in: "dev/tests/invariants-gate.py"
+
+"V-MET-004":
+  runs: "python3 dev/tests/invariants-gate.py"
+  asserts_in: "dev/tests/invariants-gate.py"
+
+"V-MET-005":
+  runs: "python3 dev/tests/classifier-corpus-lint.py"
+  asserts_in: "dev/tests/classifier-corpus-lint.py"
+
+"V-MET-006":
+  runs: "python3 dev/tests/invariants-gate.py"
+  asserts_in: "dev/tests/invariants-gate.py"
+
+"V-MET-007":
+  runs: "python3 -m unittest discover dev"
+  asserts_in: "dev/test_review_gate_paths.py"
+
+"V-MET-010":
+  runs: "python3 dev/tests/spec-ids.py"
+  asserts_in: "dev/tests/spec-ids.py"
+
+"V-MET-011":
+  runs: "python3 dev/tests/spec-ids.py"
+  asserts_in: "dev/tests/spec-ids.py"
+
+"V-MET-012":
+  runs: "python3 dev/tests/spec-ids.py"
+  asserts_in: "dev/tests/spec-ids.py"
+
+"V-MET-013":
+  runs: "python3 dev/tests/spec-ids.py"
+  asserts_in: "dev/tests/spec-ids.py"
+
+"V-MET-014":
+  runs: "python3 dev/tests/negative-controls-name-their-rule.py"
+  asserts_in: "dev/tests/negative-controls-name-their-rule.py"
+
+"V-PRO-021":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/verify/ladder_test.go"
+
+"V-PRO-027":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/probe/probe_envtest_test.go"
+
+"V-PRO-028":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/cooldown/cooldown_test.go"
+
+"V-PRO-029":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/budget/budget_test.go"
+
+"V-REV-001":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/pipeline/pipeline_test.go"
+
+"V-REV-003":
+  runs: "bash dev/verify/broker-refuse-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/broker-refuse-l2.sh"
+
+"V-REV-004":
+  runs: "python3 dev/tests/undo-corpus-lint.py"
+  asserts_in: "dev/tests/undo-corpus-lint.py"
+
+"V-REV-006":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/escalate/escalate_envtest_test.go"
+
+"V-REV-008":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/journal/retention_test.go"
+
+"V-REV-010":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/refindex/refindex_test.go"
+
+"V-REV-011":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/rollback/rollback_envtest_test.go"
+
+"V-RUN-003":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/cmd/broker/waitforbroker_test.go"
+
+"V-RUN-010":
+  runs: "python3 dev/tests/broker-supply-chain-minimal.py"
+  asserts_in: "dev/tests/broker-supply-chain-minimal.py"
+
+"V-RUN-011":
+  runs: "python3 dev/tests/scope-label-single-sourced.py"
+  asserts_in: "dev/tests/scope-label-single-sourced.py"
+
+"V-RUN-012":
+  runs: "python3 dev/tests/one-broker-per-agent.py"
+  asserts_in: "dev/tests/one-broker-per-agent.py"

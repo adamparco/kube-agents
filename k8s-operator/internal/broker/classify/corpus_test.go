@@ -12,7 +12,8 @@ import (
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/scope"
 )
 
-// The classification corpus of 09 §7.1.
+// The classification corpus of 09 §7.1 -- V-GAT-001 (L1), "classifier golden corpus passes in
+// full". Registered in verification/implementations.yaml.
 //
 // A corpus rather than more table tests, because the property being tested is not "this rule
 // works" -- classify_test.go covers that -- it is "the WHOLE evaluation order, over a wide spread
