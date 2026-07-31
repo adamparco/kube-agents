@@ -287,6 +287,10 @@
   runs: "python3 -m unittest discover dev"
   asserts_in: "dev/test_review_gate_paths.py"
 
+"V-MET-008":
+  runs: "python3 dev/tests/coverage-ratchet-holds.py"
+  asserts_in: "dev/tests/coverage-ratchet-holds.py"
+
 "V-MET-009":
   runs: "python3 dev/tests/requirements-are-enumerated.py"
   asserts_in: "dev/tests/requirements-are-enumerated.py"

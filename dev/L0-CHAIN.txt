@@ -445,3 +445,20 @@ python3 dev/tests/requirements-are-enumerated.py
 # truncated, a requirement marked covered with no check behind it, the recorded §8.1 baseline edited
 # away from the spec, and a section's ordinals made non-contiguous.
 python3 dev/tests/requirements-are-enumerated.py --negative-control
+
+# V-MET-008 -- the coverage ratchet, and the requirement-to-suite ownership both coverage gates
+# stand on. Ownership is DERIVED from 09 §6's `Source` cells rather than declared, because
+# V-MET-002 and V-MET-008 are complements of one partition and declaring a section unowned would
+# shrink the BLOCKING-ALWAYS obligation and grow the lenient one. Also asserts §8.1's arrival
+# clause over a content-digest baseline, so an inserted statement is detected by its text rather
+# than by a positional ID every insertion above it shifts.
+python3 dev/tests/coverage-ratchet-holds.py
+
+# Eleven mutations, each naming the finding ITS property produces ([[LSN-035]]): an arrival with no
+# check and no deferral, a deferral missing its owner, V-ISO's prose source deleted so a
+# BLOCKING-ALWAYS suite owns zero SECTIONS, traceability.yaml's 05§8 bullets deleted so it owns one
+# section and zero OBLIGATIONS (the same false green one level down), a Source cell blanked, a
+# recorded ownership row deleted, the load-bearing count edited, V-MET-002's worklist truncated,
+# the floor raised above the coverage under it, the enumerator returning almost nothing, and the
+# arrival baseline emptied.
+python3 dev/tests/coverage-ratchet-holds.py --negative-control
