@@ -241,7 +241,11 @@ func main() {
     def setUpClass(cls):
         if subprocess.run(["which", "go"], capture_output=True).returncode != 0:
             raise unittest.SkipTest("no go toolchain; the static join above still compares every key")
-        cls._tmp = tempfile.TemporaryDirectory(dir=REPO / "k8s-operator")
+        # `prefix="."` is load-bearing: this directory lives inside the Go module, and `./...`
+        # (controller-gen, go build, go vet) skips dot-directories. Without it a concurrent
+        # `make -C k8s-operator test` walks in, the directory is deleted underneath it, and
+        # `manifests` dies on a file nobody wrote ([[LSN-058]]). Python globbing still sees it.
+        cls._tmp = tempfile.TemporaryDirectory(dir=REPO / "k8s-operator", prefix=".")
         main = Path(cls._tmp.name) / "main.go"
         main.write_text(cls.PROGRAM)
         cls._binary = Path(cls._tmp.name) / "decode"

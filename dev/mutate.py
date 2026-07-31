@@ -49,6 +49,13 @@ So this runner refuses to produce a number it cannot back:
   6. **Restore is a byte copy** of a snapshot taken here, keyed by position, on success, on
      failure and on signal. Never `git checkout` / `git restore` / `git stash` -- see
      [[LSN-030]] and [[LSN-022]] for the two hours that rule cost.
+  7. **A spec may declare the environment its suite needs, and a missing one is BROKEN up front.**
+     Rule 5 checks catchers against `go test -list`, which COMPILES rather than runs -- so a
+     catcher inside an envtest file that `t.Skip`s itself when `KUBEBUILDER_ASSETS` is unset is
+     listed either way, and the guard that would otherwise notice is itself blind. Six mutants in
+     the V-BRK-023 sweep score ESCAPED against a suite that catches them cleanly, and the report
+     reads as six real holes ([[LSN-054]]). `suite.requires_env` closes that: the sweep refuses to
+     start rather than measuring a suite that is skipping.
 
 Three verdicts, not two:
 
@@ -69,7 +76,8 @@ Spec format:
       "suite": {
         "kind": "go",                       // or "unittest"
         "dir": "k8s-operator",              // cwd, repo-relative
-        "packages": ["./internal/broker/..."]
+        "packages": ["./internal/broker/..."],
+        "requires_env": ["KUBEBUILDER_ASSETS"]   // optional; unset => BROKEN before mutant 1
       },
       "mutants": [
         {
@@ -233,6 +241,22 @@ def load_spec(path: pathlib.Path) -> tuple[object, list[dict]]:
                 "three unevaluated mutants as survivors -- and running everything is what lets a "
                 "mutant that reddens a DIFFERENT test than it claims be seen at all."
             )
+    required_env = s.get("requires_env") or []
+    if not isinstance(required_env, list) or any(not isinstance(v, str) or not v for v in required_env):
+        raise Broken("suite.requires_env must be a list of non-empty environment variable names")
+    missing_env = [v for v in required_env if not os.environ.get(v)]
+    if missing_env:
+        raise Broken(
+            f"the spec declares {sorted(required_env)} as required and {sorted(missing_env)} "
+            f"{'is' if len(missing_env) == 1 else 'are'} unset or empty. This is BROKEN, not a "
+            f"result: a suite whose tests skip themselves for want of that variable stays green "
+            f"under every mutation, and every mutant it would have caught scores ESCAPED. Rule 5's "
+            f"catcher check cannot see it either -- `go test -list` compiles rather than runs, so "
+            f"a skipping test is still listed (LSN-054). Set it (for KUBEBUILDER_ASSETS: "
+            f"`make -C k8s-operator setup-envtest` then export the printed path, or run the sweep "
+            f"under the same shell as `make -C k8s-operator test`) and re-run."
+        )
+
     suite = SUITES[kind](REPO / s.get("dir", "."), packages)
 
     mutants = spec["mutants"]

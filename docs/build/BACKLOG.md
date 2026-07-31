@@ -115,6 +115,27 @@ turns out to be wrong is closed with a reason, not recycled.
   being scaled away or changes what "paused" costs — worth pricing that idle cost as part of the
   answer.
 
+  **(3) And a third option the first two should not foreclose: a separate, dedicated build cluster.**
+  `gke-scratch-kube-agents-dev` is available, but availability is not the same as suitability, and
+  there are three reasons it may be the wrong host for a thing whose whole value is being warm and
+  always there. It is the **destructive-test target** — the one cluster the harness is allowed to
+  break — so a builder living in it is inside the blast radius of the tests it exists to serve, and
+  a teardown script doing its job correctly can take the build path down with it. It is **paused to
+  zero between campaigns**, which is precisely when a warm cache would otherwise be earning its
+  keep, so the builder is cold exactly as often as the scratch cluster is idle. And its lifecycle is
+  owned by `dev/cluster/up.sh` — a cluster that can be recreated from scratch by design is a poor
+  place to keep the one thing that must not be.
+
+  So the measurement in (1) should also answer whether the builder wants its own home: a small,
+  long-lived, amd64, node-pool-pinned cluster (or a plain node pool with its own lifecycle, if a
+  whole cluster is not worth its floor cost) whose only job is `buildx` + the Go build cache +
+  possibly a warm envtest control plane, never a test target, never torn down by a campaign. If that
+  is the answer, it needs its own name and its own guard: the `gke-scratch-*` anchored `case` is a
+  **destructive-target allowlist**, and a build cluster is not a destructive target — it must not
+  quietly inherit the pattern that says it is safe to wipe, and `platform-agent-host` must stay
+  equally out of reach. Price all three (scratch-hosted, dedicated, Cloud-Build-as-is) against the
+  measured bill before choosing; the point of this item is the numbers, not the destination.
+
 - **Priority:** normal
 - **Added:** 2026-07-30
 

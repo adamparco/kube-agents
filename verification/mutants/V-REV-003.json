@@ -7,7 +7,8 @@
       "./internal/broker/pipeline/",
       "./internal/broker/rollback/",
       "./cmd/broker/"
-    ]
+    ],
+    "requires_env": ["KUBEBUILDER_ASSETS"]
   },
   "mutants": [
     {

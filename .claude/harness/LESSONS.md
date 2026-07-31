@@ -79,13 +79,16 @@ will start selecting.
 | **LSN-048** | mutation, tooling, checks, vacuity, false-finding | A mutation sweep names a test that does not exist, and reports the mutation as **survived** — a hole that is not there, indistinguishable from one that is | closed | `dev/mutate.py` + `dev/test_mutate_sweep.py` (L0, in `dev/L0-CHAIN.txt` via `unittest discover dev`) — a spec carrying `-run` is refused outright, every catcher is checked against `go test -list` **before the first mutation**, and a mutant the sweep could not evaluate scores `BROKEN` rather than joining the survivor count |
 | **LSN-049** | mutation, tooling, checks, vacuity, false-finding | The sweep's own shell quoting kept a mutation from ever being applied, and `rc == 0` was scored as "the suite passed with it in place" — an invented hole, reported twice | closed | `dev/mutate.py` + `dev/test_mutate_sweep.py` (L0, in `dev/L0-CHAIN.txt` via `unittest discover dev`) — needles and replacements live in JSON and are applied by `str.replace` in-process, so nothing crosses a shell parse; the applier refuses unless the needle appears exactly once, which is also how the sweep observes that the mutation LANDED; and `rc != 0` is not a catch, every row naming the test that must be in the failing set |
 | **LSN-050** | harness, checks, coverage, false-green, pre-commit | Seven L0 checks discover files with `git ls-files` and no `--others`, so the chain is blind to any file not yet `git add`ed — which is every brand-new file at the one moment the chain is documented to run | closed | `dev/tests/gitcorpus.py` + `check_l0_corpus_is_not_index_only` in `dev/tests/invariants-gate.py` (L0, in `dev/L0-CHAIN.txt`) — one `--cached --others --exclude-standard` enumerator, now used by all ten call sites, and a gate arm that AST-parses every `.py` and `.sh` under `dev/` and fails any `ls-files` argv without `--others`. The gate covers the whole tree rather than just the chain, because the failure mode is the eighth script copying the seventh |
-| **LSN-051** | harness, halts, spec-reading, PROTOCOL §8.5, rbac | A §8.5 halt was declared after comparing the broker's live reads against 06 §2.2.1, the *broker-operations* grant; the actor's authority is 06 §2.2, one level up, and it grants every read the halt said was ungranted — a subsection number reads like a refinement of its section, so having read the subsection felt like having read the section | open | *candidate:* a `harness-run` §7 rule that a §8.5 blocker row must quote **both** conflicting statements by document and section. There was only ever one here, and being made to write the second down is where the absence becomes visible. Alternatives considered and likely too narrow: a lint pairing every `NN §X.Y.Z` citation in a halt with a `NN §X.Y` citation. To be chosen at the next improvement pass |
-| **LSN-052** | harness, ci, goldens, checkpoint, binding §Build | `TestAgentsGolden` was red for three commits: the renderer gained a downward-API env var and the two golden fixtures were not regenerated. No step a unit is required to perform runs `go test` — L0 CI has no Go toolchain, `k8s-operator-test.yml` triggers only on PRs to `main` (once per phase, after dozens of commits), and CHECKPOINT §6.1's `make build` is fmt+vet+build, not test | open | *candidate:* `binding.md` §Build gains `cd k8s-operator && go test ./...` for any unit touching `k8s-operator/**`, putting it inside CHECKPOINT §6.1 where it attributes to one commit. Alternatives: a push trigger on every branch (off the local loop, does not stop the bad commit); a gate rule pairing `*_manifests.go` with `testdata/*/expected/` (third rule of that shape, subsumed). To be chosen at the next improvement pass |
-| **LSN-053** | harness, checks, guardrail-9, rbac | A check is reshaped ahead of the implementation it will judge (Guardrail 9), it is green on today's tree, and nobody establishes that it is green on the tree the *next* unit will produce — so the next unit's first run reads as "my change broke the check" and the cheapest way out is to edit the check | open | *candidate:* a `harness-run` §4 rule that a unit whose only artifact is a check change must exhibit BOTH trees — the current one and a synthesised future one — and that the future one is a negative-control row, not a `/tmp` probe. To be chosen at the next improvement pass |
-| **LSN-054** | harness, checkpoint, envtest, false-green, binding §Build, blocking-always | An envtest suite `t.Skip`s itself when `KUBEBUILDER_ASSETS` is unset, so the package reports `ok` and `go test ./...` is green over a test that is red — which is how a stale premise in a BLOCKING-ALWAYS check (**V-BRK-023**) survived to PR #83's first CI run. LSN-052's own preferred mechanization is that command, and it would have run straight past this | open | _candidate:_ `binding.md` §Build names `make -C k8s-operator test`, never bare `go test ./...`, because only the make target resolves the assets; plus inverting `requireEnv` to **fail** rather than skip unless an explicit opt-out is set, so "I did not run envtest" is loud. To be chosen at the next improvement pass |
-| **LSN-055** | harness, ci, branching, attribution, checkpoint | The phase-9 branch took 25 CHECKPOINT commits and one `git push`, so `k8s-operator-test.yml` ran once, on the PR, against all 25 at once — and the red it found belonged to a commit 20 back. One CI run per branch makes CI a phase-end audit rather than a unit-level check, and destroys the attribution CHECKPOINT exists to produce | open | _candidate:_ `binding.md` §Branching requires a push per CHECKPOINT commit, paired with a `push` trigger on `k8s-operator-test.yml` for non-`main` branches (LSN-052 candidate 2, which is necessary but insufficient alone — a trigger nothing triggers is still one run). To be chosen at the next improvement pass |
+| **LSN-051** | harness, halts, spec-reading, PROTOCOL §8.5, rbac | A §8.5 halt was declared after comparing the broker's live reads against 06 §2.2.1, the *broker-operations* grant; the actor's authority is 06 §2.2, one level up, and it grants every read the halt said was ungranted — a subsection number reads like a refinement of its section, so having read the subsection felt like having read the section | **closed** | `harness-run` §7 now requires a §8.5 halt to quote **both** statements, each by document and section — you cannot quote a sentence you never found. `dev/tests/invariants-gate.py` (`check_spec_contradiction_halts_cite_both_sides`) pins the rule in the skill AND asserts every non-withdrawn `§8.5` HALT row in the ledger carries ≥2 distinct `NN §X` citations; struck-through withdrawn rows are exempt on purpose. Candidate 2 (pairing `§X.Y.Z` with `§X.Y`) refused as too narrow: it would have passed a halt citing two subsections of the same wrong section. Controls in `dev/test_invariants_gate.py` |
+| **LSN-052** | harness, ci, goldens, checkpoint, binding §Build | `TestAgentsGolden` was red for three commits: the renderer gained a downward-API env var and the two golden fixtures were not regenerated. No step a unit is required to perform runs `go test` — L0 CI has no Go toolchain, `k8s-operator-test.yml` triggers only on PRs to `main` (once per phase, after dozens of commits), and CHECKPOINT §6.1's `make build` is fmt+vet+build, not test | **closed** | Candidate 1 adopted but **corrected by [[LSN-054]]**: the command is `make -C k8s-operator test`, never the bare `go test ./...` this row proposed, which is green over fifteen skipped envtest packages. PROTOCOL §3 done-condition 1 and `harness-run` §6 CHECKPOINT now require the §Build test entry point for every tree the unit touched; `dev/tests/invariants-gate.py` (`check_envtest_is_run_by_the_command_checkpoint_names`) asserts all four halves — the make target still resolves the assets, §Build names it and says why, CHECKPOINT names it, PROTOCOL §3 mentions tests at all. Candidate 2 was **not** an alternative and is closed separately as [[LSN-055]]. Controls in `dev/test_invariants_gate.py` |
+| **LSN-053** | harness, checks, guardrail-9, rbac | A check is reshaped ahead of the implementation it will judge (Guardrail 9), it is green on today's tree, and nobody establishes that it is green on the tree the *next* unit will produce — so the next unit's first run reads as "my change broke the check" and the cheapest way out is to edit the check | **closed** | `harness-run` §4 now requires a check-only unit split under Guardrail 9 to exhibit BOTH trees, with the future-tree evidence as a committed `--negative-control` row rather than a `/tmp` probe — a probe proves it once, to one session. `dev/tests/invariants-gate.py` (`check_a_check_only_unit_exhibits_both_trees`) pins both halves of the rule and refuses to be green if no declared chain line runs a check with `--negative-control`, so the rule cannot outlive the affordance it names. Controls in `dev/test_invariants_gate.py` |
+| **LSN-054** | harness, checkpoint, envtest, false-green, binding §Build, blocking-always | An envtest suite `t.Skip`s itself when `KUBEBUILDER_ASSETS` is unset, so the package reports `ok` and `go test ./...` is green over a test that is red — which is how a stale premise in a BLOCKING-ALWAYS check (**V-BRK-023**) survived to PR #83's first CI run. LSN-052's own preferred mechanization is that command, and it would have run straight past this | **closed** | Candidate 1 adopted, jointly with [[LSN-052]]: `binding.md` §Build names `make -C k8s-operator test` as the entry point for `k8s-operator/**` and marks the bare command as never one, and `dev/tests/invariants-gate.py` (`check_envtest_is_run_by_the_command_checkpoint_names`) pins it end to end. Candidate 2 (invert `requireEnv`) refused: it would redden every contributor's `go test ./...` to fix a harness rule, and the opt-out variable becomes the new silent skip. One level down, `dev/mutate.py` gains rule 7 (`suite.requires_env`) so a sweep over a skipping suite is BROKEN rather than nineteen verdicts — `go test -list` compiles rather than runs, so rule 5 could not see it — and `check_mutation_specs_declare_required_env` derives the requirement from the tree; it found a fifth spec (`V-REV-003`) the hand list had missed. Controls in `dev/test_invariants_gate.py` and `dev/test_mutate_sweep.py` |
+| **LSN-055** | harness, ci, branching, attribution, checkpoint | The phase-9 branch took 25 CHECKPOINT commits and one `git push`, so `k8s-operator-test.yml` ran once, on the PR, against all 25 at once — and the red it found belonged to a commit 20 back. One CI run per branch makes CI a phase-end audit rather than a unit-level check, and destroys the attribution CHECKPOINT exists to produce | **closed** | Both halves landed together: `binding.md` §Branching gains a **Push cadence** row (`git push origin HEAD` at every CHECKPOINT), `harness-run` §6 condition 4 names it, and `.github/workflows/k8s-operator-test.yml` drops its `main`-only push filter. `dev/tests/invariants-gate.py` (`check_checkpoint_commits_reach_ci`) asserts the **pair**, so neither half can be removed on the grounds that the other covers it — a cadence pushing into a filtered trigger and a wide trigger nothing pushes to are both still one CI run. The cadence arm reads a table ROW, not the section body, because the prose explaining the rule contains the same words and kept the check green over its own rationale. Controls in `dev/test_invariants_gate.py` |
+| **LSN-056** | harness, checks, ratchets, false-green, V-MET-003 | The assertion ratchet was last wound when the suite had **194** named tests in **34** files; the tree had **1290** in **137**. `check_assertion_ratchet` only fails when a *baselined* test disappears, so a baseline nobody regenerates silently narrows — it had been guarding 15% of the corpus and printing the same green as if it guarded all of it. Found while regenerating the baseline for an unrelated pass, not by any check | **closed** | Baseline wound 194 → 1290, plus `check_the_ratchet_baseline_covers_the_corpus` in `dev/tests/invariants-gate.py`: every named test in the tree must be in the baseline or in `retired`. Names, not just files — covering only files would let one file grow from 2 tests to 50 with 48 outside the ratchet. The instruction to regenerate had been in the baseline's own `_comment` the whole time, which is [[LSN-019]]: prose on the artifact is not a mechanization. Controls in `dev/test_invariants_gate.py` |
+| **LSN-057** | harness, checks, corpus-discovery, false-positive, LSN-035 | `negative-controls-name-their-rule.py` discovered its corpus as *every `dev/tests/*.py` containing the string `--negative-control`*. The moment a check appeared that SEARCHES other files for that flag — `invariants-gate.py`'s new LSN-053 arm — the substring swept the searcher in and reported it as a control file with no control. The file's own docstring had already argued **WHY BEHAVIOURAL AND NOT STRUCTURAL** for the scoring half while the discovery half stayed textual | **closed** | `dev/tests/negative-controls-name-their-rule.py` (on `dev/L0-CHAIN.txt`): discovery is now a behaviour — a file is in the corpus if its own argv handling dispatches on the flag (`"--negative-control" in argv` and its spellings, or an `add_argument`) or if a usage line offers the flag against the file's own name. Splitting the two signals bought a new property for free — a usage line that offers the flag with nothing dispatching on it is its own finding, because the documented command then runs the ordinary check and prints its ordinary PASS. Two new cases in the file's own `--negative-control`, one of them the exact searcher that caused this |
+| **LSN-058** | harness, tooling, false-red, concurrency, go | CHECKPOINT now requires both the L0 chain and `make -C k8s-operator test` ([[LSN-052]]/[[LSN-054]]), so the obvious saving is to run them at once. Doing that produced a red naming a file nobody wrote: five python suites create temp directories **inside** `k8s-operator/`, `controller-gen` runs with `paths="./..."`, and the directory is deleted while it is reading — `tmp109n_mmw/main.go:1: no such file or directory`, then `Error: not all generators ran successfully`. It points at no defect and vanishes on a serial re-run | **closed** | `dev/test_action_envelope.py`, `dev/test_envelope_wire_keys.py`, `dev/test_invariants_gate.py` (all three on `dev/L0-CHAIN.txt`): every `TemporaryDirectory(dir=…k8s-operator…)` takes `prefix="."`. Go tooling skips dot-directories under `./...`; Python globbing does not, so the suites that need to SEE the directory still do. Verified by re-running the two commands concurrently — the pairing that produced the red — and getting `GO=0 PYTHON=0` |
 
-**Open: 5 of 55**.
+**Open: 0 of 58**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2828,7 +2831,7 @@ that is asserted to exist and does not).
 ## LSN-051 — A subsection is not the section, and the halt was declared against the wrong one
 
 **Area:** harness, halts, spec-reading, PROTOCOL §8.5, rbac
-**Status:** open — mechanization candidate below; needs an improvement pass
+**Status:** closed — see the index row; mechanized 2026-07-30
 **Earned:** 2026-07-30, P9-T9b-5b-i
 
 **What happened.** `broker-execute-l2.sh` drove the first real envelope through the broker pipeline
@@ -2886,6 +2889,17 @@ Related: [[lsn-041]] (a control asserted to exist and not existing), [[lsn-035]]
 operation ran, not that it ran over the right thing), [[lsn-019]] (a mechanization off the path the
 work takes).
 
+**Mechanized 2026-07-30 (candidate 1).** `harness-run` §7 now requires a §8.5 halt to quote **both**
+statements — two citations, two verbatim quotes, in the blocker row itself. `check_spec_contradiction_halts_cite_both_sides`
+in `dev/tests/invariants-gate.py` pins the sentence in the skill and asserts the ledger obeys it:
+every row that declares a §8.5 halt carries at least two distinct `NN §X` citations. Struck-through
+withdrawn rows are exempt, deliberately — they are kept as the record of a halt that was wrong, and
+a check that re-litigates them every run becomes noise and then becomes deleted.
+
+Candidate 2 was **refused**, and the reason is worth keeping: pairing every `§X.Y.Z` with a `§X.Y`
+would have passed a halt that cited two subsections of the same wrong section. It enforces the
+shape of the mistake rather than the property, which is the [[lsn-023]] failure one level up.
+
 ---
 
 ## LSN-052 — The Go unit suite runs once per phase, so a golden was red for three commits
@@ -2942,6 +2956,18 @@ Related: [[lsn-001]] (the artifact under test not being the artifact built), [[l
 mechanization off the path the work takes), [[lsn-035]] (verifying the operation ran, not that it
 ran over the right thing).
 
+**Mechanized 2026-07-30 (candidate 1, corrected).** The command in this row is wrong and
+[[lsn-054]] is why: `cd k8s-operator && go test ./...` reports `ok` for fifteen packages whose tests
+skipped themselves. So the two lessons closed together, on `make -C k8s-operator test`. PROTOCOL §3
+done-condition 1 and `harness-run` §6 CHECKPOINT now require the §Build test entry point for every
+tree the unit touched, `binding.md` §Build names it and says why the bare command is not one, and
+`check_envtest_is_run_by_the_command_checkpoint_names` in `dev/tests/invariants-gate.py` asserts all
+four halves at once — including that the make target still resolves `KUBEBUILDER_ASSETS`, without
+which every other clause is a rule about a command that stopped doing the thing.
+
+Candidate 2 turned out not to be an alternative at all. It is a separate necessary half, and it
+closed as [[lsn-055]] the same day.
+
 ## LSN-053 — A check split off from its implementation has two trees to be green on, not one
 
 **What happened.** P9-T9b-5b-0-ii-a reshaped V-BRK-013 ahead of the render it will judge, because
@@ -2995,6 +3021,16 @@ copy inside the check that exists to forbid third copies would be its own joke.
 Related: [[lsn-035]] (an arm no input reaches is unexercised prose — this is its complement),
 [[lsn-019]] (a mechanization off the path the work takes), [[lsn-007]] (every unit test passes and
 the feature does nothing in a real install).
+
+**Mechanized 2026-07-30 (candidate 1).** `harness-run` §4 now states the rule and names the
+artifact: a check-only unit split under Guardrail 9 exhibits BOTH trees, and the future-tree
+evidence is a committed `--negative-control` row, not a `/tmp` probe. A probe proves it once, to one
+session; a control row proves it on every chain run and is the thing a reviewer can re-run when the
+next unit's result surprises them.
+
+`check_a_check_only_unit_exhibits_both_trees` pins both halves of the sentence, and refuses to be
+green if no line of the declared chains runs a check with `--negative-control` — so the rule cannot
+outlive the affordance it names, which is [[lsn-019]]'s shape applied to a rule instead of a lesson.
 
 ## LSN-054 — A skipped envtest is reported as a passing package, and `go test ./...` cannot tell
 
@@ -3060,6 +3096,24 @@ Related: [[lsn-052]] (the same blindness one level out, and the candidate this c
 still fails, and a green run is how it tells you), [[lsn-001]] (the artifact under test not being
 the artifact built).
 
+**Mechanized 2026-07-30 (candidate 1; candidate 2 refused).** Candidate 1 landed jointly with
+[[lsn-052]] — see that lesson's closure for the four clauses
+`check_envtest_is_run_by_the_command_checkpoint_names` asserts.
+
+Candidate 2, inverting `requireEnv` to fail unless an opt-out is set, was **refused**. It reddens
+every contributor's `go test ./...` to fix a rule about how the harness checkpoints, and the opt-out
+variable simply becomes the new silent skip: `KUBE_AGENTS_SKIP_ENVTEST=1` in a shell profile is
+indistinguishable, at the console, from the state this lesson is about.
+
+**One level down, and this is the part that generalizes.** `dev/mutate.py` gains rule 7,
+`suite.requires_env`: a spec declares the environment its suite needs and the sweep refuses to start
+without it, BROKEN rather than nineteen verdicts. Rule 5 could not cover this — it checks catchers
+against `go test -list`, which **compiles rather than runs**, so a catcher inside a skipping file is
+listed exactly as a running one is. The guard that should have noticed was itself blind, and six of
+nineteen mutants would have been reported as real holes in a suite that catches them cleanly.
+`check_mutation_specs_declare_required_env` derives the requirement from the tree rather than from a
+list, and on its first run it found a fifth spec — `V-REV-003` — that the hand-built list had missed.
+
 ## LSN-055 — Twenty-five commits, one push, one CI run, and the red belongs to none of the recent ones
 
 **What happened.** The `phase-9-a-real-caller-at-the-door` branch accumulated twenty-five CHECKPOINT
@@ -3103,3 +3157,174 @@ conclusion here.
 
 Related: [[lsn-052]] (the trigger half of the same property), [[lsn-054]] (the specific escape that
 exposed it), [[lsn-043]] (a branch's work is not durable until it is pushed).
+
+**Mechanized 2026-07-30 (candidate 1, both halves).** `binding.md` §Branching gains a **Push
+cadence** row — `git push origin HEAD` at every CHECKPOINT, not once per phase — `harness-run` §6
+condition 4 names it, and `.github/workflows/k8s-operator-test.yml` drops the `branches: [main]`
+filter from its `push` trigger. `check_checkpoint_commits_reach_ci` asserts the **pair**, which is
+the only reason it is a check rather than a note: a cadence pushing into a filtered trigger and a
+wide trigger nothing pushes to are both still exactly one CI run, so either half can be removed on
+the entirely reasonable-sounding grounds that the other one covers it.
+
+The cadence arm reads a table ROW rather than the §Branching body, and that correction came from its
+own negative control. A body-wide search stayed green after the rule was deleted, because the prose
+explaining the rule contains the same words — "25 CHECKPOINT commits and one push". The check was
+pinning its own rationale.
+
+---
+
+## LSN-056 — The ratchet was wound at 194 tests, the suite reached 1290, and it ticked all the way
+
+**Area:** harness, checks, ratchets, false-green, V-MET-003
+**Status:** closed — mechanized 2026-07-30, in the pass that found it
+**Earned:** 2026-07-30, improvement pass after the V-BRK-023 halt
+
+**What happened.** The improvement pass closing [[lsn-051]]–[[lsn-055]] added fifteen tests, so it
+ran `python3 dev/tests/invariants-gate.py --update-baseline` as invariant 8 requires. The diff was
+1303 lines. The committed baseline held **194** named tests across **34** files; the tree holds
+**1290** across **137**.
+
+**Why nothing noticed.** `check_assertion_ratchet` asks one question — *did a test that was in the
+baseline disappear?* — and that question is answerable, and answered correctly, by a baseline
+covering any subset of the corpus. Every run for months printed `✓ invariant 8 / V-MET-003 —
+assertion ratchet` while 85% of the suite sat outside the ratchet entirely. Deleting any of those
+1096 tests would have been green.
+
+This is [[lsn-035]] and [[lsn-038]]'s shape again — silent in the safe direction — with one extra
+turn of the screw: the safe direction *narrowed over time*. A stale probe list is wrong on the day
+it is written. A stale ratchet gets more wrong every time the project succeeds at anything.
+
+**The instruction already existed.** The baseline's own `_comment` says _"Regenerate ... ONLY when
+adding tests"_. It has said so since the file was created. That is precisely [[lsn-019]]: a
+mechanization written as prose, on the artifact, off the path the work takes. Nobody reads a
+generated JSON file's comment field while adding a test.
+
+**Mechanized in the same pass** — the pass that found it is the pass that owed the check, and
+`harness-improve` §3.2 says an escape is closed by strengthening the check that should have caught
+it. `check_the_ratchet_baseline_covers_the_corpus` fails when any named test in the tree is absent
+from both the baseline and `retired`, and its message is the command that fixes it.
+
+Names rather than files, deliberately. A file-level rule would have caught this instance and left
+the smaller version of it live: one baselined file growing from two tests to fifty, with
+forty-eight unguarded. The cost is one command in any unit that adds a test, which is the discipline
+the `_comment` was asking for and could not enforce.
+
+**A limit, recorded rather than discovered later.** The extractor keys names per file, so two tests
+with the same name in different classes of one file collapse to a single entry and deleting one is
+invisible to the ratchet. Writing `test_green_on_the_tree_as_it_stands` in a sixth class of
+`dev/test_invariants_gate.py` is what surfaced it: the corpus went up by four, not five. Left
+as-is — the fix is in `inventory()`, which is not this pass's business — but written down here so
+the next person meets it as a known limit and not as a fresh mystery.
+
+Related: [[lsn-019]] (a mechanization off the path the work takes), [[lsn-035]] and [[lsn-038]]
+(a check silent in the safe direction), [[lsn-054]] (a guard that was itself blind to the thing it
+guarded against).
+
+---
+
+## LSN-057 — The corpus was discovered by mention, so the check that talked about the convention was scored as breaking it
+
+**Tags:** harness, checks, corpus-discovery, false-positive, LSN-035
+**Opened:** 2026-07-30 (improvement pass, running the L0 chain over the pass's own changes)
+**Status:** closed — mechanized in the same pass
+
+**What happened.** The full L0 chain came back with exactly one `FAIL:`, and it was
+`dev/tests/negative-controls-name-their-rule.py` reporting that `dev/tests/invariants-gate.py`
+_"advertises `--negative-control` but defines no `negative_control()`"_. The sentence is false about
+that file. `invariants-gate.py` accepts no such flag; passing it changes nothing. What it had just
+grown, in this very pass, is `check_a_check_only_unit_exhibits_both_trees` — [[LSN-053]]'s
+mechanization — whose job is to read the declared chains and assert that **some line runs a check
+with `--negative-control`**. The string is in the file because the file is a rule _about_ the
+convention. The corpus was `"--negative-control" in p.read_text()`, so being about it and
+participating in it were the same thing.
+
+**Why it is worth a lesson and not a one-line fix.** Three reasons.
+
+First, it is [[LSN-036]] one node over. There the defect was a uniqueness lint that went red on
+correct code and whose one-line green was an allowlist entry; the rule extracted was _derive the
+corpus from structure, not from a list_. Here the corpus was derived from a **substring**, which is
+the same mistake with the list generated automatically — and the tempting one-line green was to
+spell the literal differently in `invariants-gate.py` (`"--negative" + "-control"`), which leaves the
+mine armed and buried for whoever writes the next check about the convention.
+
+Second, **the file had already won this argument in its other half.** Its docstring carries a
+paragraph headed WHY BEHAVIOURAL AND NOT STRUCTURAL, arguing that scoring a control by grepping for
+a three-element mutation tuple checks today's code shape rather than the property, and would have
+condemned the one file that got it right. Every word applies to discovery, and discovery was left as
+a grep. A file can hold the correct general principle, stated at length, and apply it to only the
+half of itself that was under discussion when it was written.
+
+Third, the fix **found a property the substring version could not state.** Splitting "mentions the
+flag" into "dispatches on it" and "offers it in a usage line" makes a third case visible: a docstring
+that promises `python3 dev/tests/foo.py --negative-control` where nothing in `foo.py` reads argv. The
+documented command then runs the ordinary check and prints its ordinary PASS, and the reader who
+followed the docs records that as the control passing. That is the same family as the lesson the file
+exists for — a green produced by not asking — and no file in the tree has it today, which is exactly
+when a guard is cheap to add.
+
+**The first fix was still a substring match, by a longer route.** `"--negative-control"\s+in\s+\w`
+matched `if "--negative-control" in body:` — a check testing for the flag inside another file's
+text — so the searcher was swept in again. The operand is the load-bearing part: the membership test
+has to be against the **command line** (`argv`, `args`, `sys.argv`), not against any string that
+happens to be in scope. The control caught it on the first run, which is the argument for writing the
+control before believing the fix.
+
+**Mechanization.** `controls()` takes a root (so the self-test can point it at a synthesized tree),
+discovery is `DISPATCHES.search(text) or _promises(path, text)`, and `score()` opens with the
+promise-without-dispatch arm. Corpus 12 → 11, all 11 discriminating; `MIN_CONTROLS = 9` unchanged and
+still the non-vacuity floor. Two new cases in the file's own `--negative-control`: a file that only
+searches other files for the flag must stay **out** of the corpus, and a file that promises it
+without implementing it must come **in** and score as a finding.
+
+**A note on what was not done.** `invariants-gate.py` genuinely does have negative controls — 59 of
+them, as unittest classes in `dev/test_invariants_gate.py`, run by the L0 chain. It has never used
+the `--negative-control` convention and does not need to; a gate with 29 arms would need a control
+entry point per arm, which is what a test module is. The finding was not "this file is missing a
+control", it was "this file was never a member of that corpus".
+
+---
+
+## LSN-058 — The two commands CHECKPOINT now requires cannot be run at the same time
+
+**Tags:** harness, tooling, false-red, concurrency, go
+**Opened:** 2026-07-30 (improvement pass, running the pass's own gates)
+**Status:** closed — mechanized in the same pass
+
+**What happened.** This pass made `make -C k8s-operator test` compulsory at CHECKPOINT alongside the
+L0 chain ([[LSN-052]], [[LSN-054]]). The chain takes minutes and the operator suite takes minutes, so
+the first thing anyone does with that pairing is run them concurrently. The operator suite then died
+in its very first target:
+
+```
+/Users/…/k8s-operator/tmp109n_mmw/main.go:1: no such file or directory   (× 5)
+Error: not all generators ran successfully
+make: *** [manifests] Error 1
+```
+
+`tmp109n_mmw` is a `tempfile.TemporaryDirectory` created by a python test — five suites make them
+**inside** `k8s-operator/`, because the code under test needs a real path in that tree. `controller-gen`
+runs as `paths="./..."`, walks in, and the directory is removed underneath it before it finishes
+reading.
+
+**Why it is a lesson and not a footnote.** A red that names a file nobody wrote, points at no defect,
+and disappears on a serial re-run is the most expensive kind. It costs a diagnosis at the exact
+moment a unit is trying to close, and what it teaches is *re-run it* — a habit that is
+indistinguishable from the habit of re-running a genuinely flaky failure until it goes away. The
+cost also lands on a rule this same pass had just written: the reader who obeys "run both at
+CHECKPOINT" is the reader who meets it.
+
+**The tempting fix was a sentence, and a sentence would not have held.** "Do not parallelize these
+two" in `binding.md` is [[LSN-019]]'s shape — prose on the artifact is not a mechanization — and the
+next person to reach for `&` will not have read it, particularly since the two commands are named in
+different sections.
+
+**Mechanization.** `prefix="."` on all five `TemporaryDirectory(dir=…)` calls inside the module. Go's
+`./...` skips directories whose names begin with `.` or `_`, so `controller-gen`, `go build` and
+`go vet` never enter them; `pathlib.rglob` has no such rule, so the suites that need the directory to
+be *visible* — `gate.discover_machinery`, `gate._invoked_by` — still see it. The two suites that
+compile a scratch `main.go` pass the file by explicit path, so they never needed `./...` to reach it
+in the first place. Each site carries a comment saying why the prefix is load-bearing, because a
+lone `prefix="."` reads like a naming preference and the next refactor deletes it.
+
+**Verified the way the defect was produced**, not the way it is described: the two commands were run
+concurrently again, and returned `GO=0 PYTHON=0`.

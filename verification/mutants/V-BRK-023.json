@@ -3,7 +3,8 @@
   "suite": {
     "kind": "go",
     "dir": "k8s-operator",
-    "packages": ["./internal/broker/writeahead/..."]
+    "packages": ["./internal/broker/writeahead/..."],
+    "requires_env": ["KUBEBUILDER_ASSETS"]
   },
   "mutants": [
     {

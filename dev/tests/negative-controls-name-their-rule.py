@@ -41,6 +41,23 @@ it would have scored `install-render-is-faithful.py` -- the one file that alread
 -- as a violation, because its breakages are numbered rather than signalled. Running the control and
 watching what it can distinguish is the property; the tuple arity is a spelling.
 
+THE CORPUS is every file that ADVERTISES the flag, and advertising it is a behaviour, not a
+substring. A file advertises `--negative-control` when its own argv handling dispatches on it, or
+when a usage line offers the flag against the file's own name. Merely CONTAINING the string is
+neither, and the first draft's `"--negative-control" in p.read_text()` had exactly one consumer of
+that distinction waiting for it: `invariants-gate.py` grew an arm that SEARCHES other files for the
+flag, on behalf of a rule requiring a check-only unit to exhibit its future tree as a committed
+control row -- and the substring corpus swept the searcher in and reported it as a control file with
+no control ([[LSN-057]]). Discovery by mention is discovery by topic. A check that talks about the
+convention is not a participant in it, and the paragraph above had already won this argument for the
+SCORING half of the file while the DISCOVERY half stayed textual.
+
+Splitting the two signals also buys a property the substring version could not state: a file whose
+usage line offers the flag while nothing dispatches on it is a finding of its own. The documented
+command then runs the ordinary check and prints its ordinary PASS, and the reader who followed the
+docstring reads that as the control passing -- a green produced by not asking, which is the whole
+family this file belongs to.
+
 THE PROBE is the function whose findings the control inspects: `check` in most files, `run` in
 `install-render-is-faithful.py`, `scan_text` in `go-build-targets-packages.py`. It is read off the
 control's OWN bytecode -- which of PROBE_NAMES does `negative_control` actually call -- rather than
@@ -67,6 +84,7 @@ import contextlib
 import importlib.util
 import io
 import pathlib
+import re
 import sys
 import types
 
@@ -84,12 +102,28 @@ SENTINEL = "SENTINEL: a constant failure that identifies no property"
 # Non-vacuity. The corpus only grows; a scan that finds less than this stopped scanning.
 MIN_CONTROLS = 9
 
+# The file dispatches on the flag itself. `argv`, `args` and `sys.argv` are all in use; what they
+# have in common is a membership test AGAINST THE COMMAND LINE, which is the moment the flag becomes
+# real for that file. The operand is load-bearing and the first draft left it as `\w`: a check that
+# tests `"--negative-control" in body` -- looking for the flag in ANOTHER file's text -- matched, and
+# the corpus was a substring match again by a longer route.
+DISPATCHES = re.compile(r'"--negative-control"\s+(?:not\s+)?in\s+(?:sys\.)?arg\w*|add_argument\(\s*"--negative-control"')
 
-def controls() -> list[pathlib.Path]:
-    return sorted(
-        p for p in TESTS.glob("*.py")
-        if p.name != SELF and "--negative-control" in p.read_text()
-    )
+
+def _promises(path: pathlib.Path, text: str) -> bool:
+    """Does a usage line offer the flag against THIS file's own name?"""
+    return re.search(r"python3?\s+\S*" + re.escape(path.name) + r"\s+--negative-control", text) is not None
+
+
+def controls(root: pathlib.Path = TESTS) -> list[pathlib.Path]:
+    found = []
+    for p in sorted(root.glob("*.py")):
+        if p.name == SELF:
+            continue
+        text = p.read_text()
+        if DISPATCHES.search(text) or _promises(p, text):
+            found.append(p)
+    return found
 
 
 def _load(path: pathlib.Path) -> types.ModuleType:
@@ -163,6 +197,13 @@ def _blind(mod: types.ModuleType, probe: str, state: dict):
 
 def score(path: pathlib.Path) -> tuple[bool, str]:
     """(discriminating, note). Blind the probe; a control that still passes is not discriminating."""
+    if not DISPATCHES.search(path.read_text()):
+        return False, (
+            "offers `--negative-control` in a usage line while nothing in the file dispatches on "
+            "it, so the documented command runs the ORDINARY check and prints its ordinary PASS. "
+            "A reader who follows the docstring reads that as the control passing"
+        )
+
     try:
         mod = _load(path)
     except Exception as exc:  # noqa: BLE001 -- an unimportable check is a finding, not a skip
@@ -268,13 +309,17 @@ def main():
         'for label, m in [("A", "bad"), ("B", "bad")]:\n        if not check(m):',
         'for label, m, sig in [("A", "bad", "property A")]:\n        if not any(sig in f for f in check(m)):',
     )
-    NO_PROBE = '"""--negative-control"""\ndef negative_control():\n    return 1\n'
+    NO_PROBE = (
+        '"""--negative-control"""\nimport sys\ndef negative_control():\n    return 1\n'
+        'def main():\n    return negative_control() if "--negative-control" in sys.argv else 0\n'
+    )
 
     # The case the emptiness-preserving blinding exists for: a control with a reject arm AND an
     # accept arm, asserting only non-emptiness on each. A blinding that substituted the constant
     # unconditionally would trip the accept arm and score this as discriminating.
     ACCEPT_REJECT = '''
 """--negative-control"""
+import sys
 def scan_text(s):
     return ["property A violated"] if "bad" in s else []
 def negative_control():
@@ -286,6 +331,8 @@ def negative_control():
         if scan_text(snippet):
             wrong += 1
     return 1 if wrong else 0
+def main():
+    return negative_control() if "--negative-control" in sys.argv else 0
 '''
 
     # The probe is read off the control's bytecode, not the module: this one defines `check` too,
@@ -298,6 +345,7 @@ def negative_control():
     # crashes on unpacking, and a crash is scored as unscoreable rather than as a verdict.
     TUPLE_FINDINGS = '''
 """--negative-control"""
+import sys
 def scan_text(s):
     return [(1, s, "cmd/main.go")] if "bad" in s else []
 def negative_control():
@@ -306,6 +354,8 @@ def negative_control():
         if operand not in named:
             return 1
     return 0
+def main():
+    return negative_control() if "--negative-control" in sys.argv else 0
 '''
 
     cases = [
@@ -317,6 +367,17 @@ def negative_control():
         ("a control whose findings are tuples, not strings", TUPLE_FINDINGS, True),
     ]
 
+    # The corpus half (LSN-057). Discovery is by BEHAVIOUR, so a file that merely talks about the
+    # flag stays out and a file that promises it without implementing it comes in as a finding.
+    TALKS_ABOUT_IT = (
+        'def check(body):\n'
+        '    return [] if "--negative-control" in body else ["no control row"]\n'
+    )
+    EMPTY_PROMISE = (
+        '"""Run:  python3 empty_promise.py --negative-control"""\n'
+        'def negative_control():\n    return 1\n'
+    )
+
     survivors = []
     with tempfile.TemporaryDirectory() as tmp:
         for label, src, expected in cases:
@@ -325,6 +386,29 @@ def negative_control():
             got, note = score(p)
             if got != expected:
                 survivors.append(f"{label}: scored discriminating={got}, expected {expected} ({note})")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        (root / "talks_about_it.py").write_text(TALKS_ABOUT_IT)
+        (root / "empty_promise.py").write_text(EMPTY_PROMISE)
+        (root / "real_control.py").write_text(cases[1][1])
+        found = {p.name for p in controls(root)}
+        if "talks_about_it.py" in found:
+            survivors.append(
+                "a file that only SEARCHES other files for `--negative-control` was swept into the "
+                "corpus -- discovery is back to a substring match (LSN-057)"
+            )
+        if "real_control.py" not in found:
+            survivors.append("a file that dispatches on the flag was not discovered at all")
+        if "empty_promise.py" not in found:
+            survivors.append("a file whose usage line offers the flag was not discovered at all")
+        else:
+            good, note = score(root / "empty_promise.py")
+            if good:
+                survivors.append(
+                    f"a usage line offering `--negative-control` with nothing dispatching on it "
+                    f"scored as discriminating ({note})"
+                )
 
     if not controls():
         survivors.append("the corpus discovery found no negative controls at all")
