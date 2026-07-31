@@ -18,11 +18,12 @@ gap sat in the repository for four days and changed nothing. This file is the ot
 WHAT IT ASSERTS. Four properties, for a phase named on the command line:
 
   1. THE REQUIRED SET IS DERIVED, AND THE DERIVATION FOUND SOMETHING. The set comes from parsing
-     09 §10's ratchet table row for the phase (expanding each suite name against the 09 §6 catalog,
-     honouring a `(Lk)` qualifier) UNION the phase file's own acceptance table. Neither source may
-     parse to nothing. A hand-written list in this file would be the same artifact that failed --
-     one more place to forget -- and a parse that silently matches nothing scores every unrun check
-     as satisfied ([[LSN-048]]).
+     09 §10's ratchet table rows for EVERY phase up to and including this one (expanding each suite
+     name against the 09 §6 catalog, honouring a `(Lk)` qualifier and the catalog's own Phase
+     column) UNION the phase file's own acceptance table. Neither source may parse to nothing. A
+     hand-written list in this file would be the same artifact that failed -- one more place to
+     forget -- and a parse that silently matches nothing scores every unrun check as satisfied
+     ([[LSN-048]]).
   2. EVERY REQUIRED CHECK HAS A GREEN ROW. A `pass` in `verification/results.csv` carrying a
      non-empty `evidence_ref`. 09 §9.4: a pass with no evidence reference is recorded as `skipped`.
   3. THE BLOCKING-ALWAYS MEMBERS ARE REPORTED SEPARATELY. 09 §9.6 forbids deferring them, so "not
@@ -35,6 +36,51 @@ WHAT IT ASSERTS. Four properties, for a phase named on the command line:
      phase, instead of at the milestone. It is orthogonal to property 2: an ID can be absent from the
      table and still green (the ratchet required it, another phase's work proved it), and an ID can
      be in the table and not green.
+
+HOW A SUITE NAME EXPANDS, AND WHY THAT TOOK TWO GOES. 09 §10's cell is one of three shapes: a bare
+suite (`V-BRK`), a suite with a prose or level qualifier (`V-CTN (read-side)`, `V-GAT (L1)`), or an
+explicit ID list (`V-ISO-001/002/006`). The first draft expanded a bare suite to EVERY member of it
+and dropped the prose qualifier as "prose that carries no ID of its own". That over-required, and
+by a lot: at phase 9 it demanded V-BRK-016 (*post-execution* journal failure -- the write lands and
+the record cannot be completed) of a phase whose definition is "no write authority anywhere"
+(07 §2), and V-RUN-014, whose own catalog row dates it to **phase 15**.
+
+The column that fixes it was there all along. 09 §6's preamble says each catalog row carries "the
+roadmap phase **by which it must be green**" -- a per-check due date, in the table 09 calls "the
+authoritative index". So a bare suite at ratchet row N means *the members of that suite due by N*,
+and three things independently confirm it:
+
+  * §10's later rows RE-NAME individual members of suites already in the ratchet -- V-REV-008 at 14,
+    V-ADV-003/005 at 13, V-CTN-010/013/018/019 at 11. Under whole-suite expansion every one of those
+    is dead text, because the suite entered at 9, 10 and 8 respectively.
+  * The Phase column reconstructs §10's own prose qualifier exactly. `V-CTN (read-side)` at 8 and
+    `V-CTN (write-side)` at 10 partition the suite; filtering V-CTN by `phase <= 8` yields precisely
+    the reader/attenuation/cardinality rows, and `phase == 10` yields precisely the actor-write and
+    forbidden-rule rows. Two encodings of one partition, and only one of them is machine-readable.
+  * `dev/verify/broker-execute-l2.sh`'s header already says a phase-10 member is unobservable here:
+    "V-BRK-019 (the field manager string) is not observable from a shadow".
+
+And the same reading fixes an UNDER-requirement in the other direction, which is why this is a
+derivation fix and not a relaxation: §10 opens with "once a suite enters the ratchet it never
+leaves", and the first draft read only the row for the phase named on the command line. Phase 9
+therefore did not require V-CTN, V-CTR, V-CMP or V-MET at all, though all four entered at phase 8.
+Rows now accumulate for every phase <= N. At phase 9 the two corrections are 21 IDs out and 31 in --
+the ratchet goes **70 -> 80**, the required set 75 -> 98, and the checks it reports as not green
+27 -> 34, of which BLOCKING-ALWAYS 11 -> 19. A change that made the gate cheaper would not have that
+shape. What comes IN is the whole of V-CTN's read side, V-CTR core, and the V-MET meta-suite, none of
+which phase 9 was asking for despite all three entering at phase 8.
+
+A catalog row with NO Phase cell -- the nine V-MET rows of §11, which are meta-checks that apply at
+every phase -- is required wherever its suite is named. That exemption is conservative (it can only
+keep a check in) and it is COUNTED AND PRINTED rather than applied in silence, because a filter that
+quietly drops what it cannot classify is the failure this whole file exists to catch.
+
+An ID §10 names OUTRIGHT is never phase-filtered. The explicit form is how §10 pulls one member of a
+suite forward or holds one back, so filtering it by the column it exists to override would make the
+explicit form unable to mean anything. At phase 9 that branch is inert -- §10's only explicit IDs by
+then are `V-ISO-001/002/006` and 09 §6 already dates all three to 9 -- so `--negative-control` cannot
+stage a case for it and does not pretend to; the first row that names a member out of phase is what
+will exercise it.
 
 WHAT IT DELIBERATELY DOES NOT DO: infer coverage from a file naming a check ID. `git grep V-ISO-001`
 finds `pair_netpol.go:68` and `pair_netpol_test.go:35`, and BOTH hits exist in order to DISCLAIM the
@@ -69,6 +115,7 @@ import pathlib
 import re
 import subprocess
 import sys
+from typing import NamedTuple
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 SPEC = REPO / "docs" / "design" / "09-verification-and-validation.md"
@@ -78,11 +125,15 @@ RESULTS = REPO / "verification" / "results.csv"
 # "required and not green" splits into two populations rather than one count.
 BLOCKING_ALWAYS = ("V-CTN", "V-BRK", "V-REV", "V-ISO", "V-ADV", "V-MET")
 
-# A row of the 09 §6 catalog: `| V-XXX-nnn | text | ... | L0, L2 | weight |`. The level cell is
-# located by shape, not by column index, because the catalog's sub-tables do not all carry the same
-# columns (some have a spec-reference cell, some do not).
+# A row of the 09 §6 catalog: `| V-XXX-nnn | text | ... | L0, L2 | 9 |`. The level cell is located
+# by shape, not by column index, because the catalog's sub-tables do not all carry the same columns
+# (some have a spec-reference cell, some do not). The PHASE cell is located by position -- it is the
+# last cell of the row and it is a bare integer -- because a shape match would also catch a digit
+# sitting anywhere else, and the whole point of the column is that it is the one the preamble calls
+# authoritative. §11's V-MET table has no phase cell at all; those rows parse to `None`.
 CATALOG_ROW = re.compile(r"^\|\s*(V-[A-Z]{3}-\d{3})\s*\|(.*)$", re.M)
 LEVEL_CELL = re.compile(r"^L\d(\s*,\s*L\d)*$")
+PHASE_CELL = re.compile(r"^\d+$")
 
 # A row of the 09 §10 ratchet table: `| **9** Broker, dark | V-BRK, V-REV, ... | notes |`.
 RATCHET_ROW = re.compile(r"^\|\s*\*\*(\d+)\*\*[^|]*\|([^|]*)\|", re.M)
@@ -106,65 +157,126 @@ class ParseError(Exception):
 # --------------------------------------------------------------------------------------------
 
 
-def parse_catalog(spec_text: str) -> dict[str, set[str]]:
-    """Every check ID in 09 §6, mapped to the levels its row declares."""
-    catalog: dict[str, set[str]] = {}
+class CatalogRow(NamedTuple):
+    """One 09 §6 row: the levels it declares, and the phase by which it must be green."""
+
+    levels: set[str]
+    phase: int | None
+
+
+def parse_catalog(spec_text: str) -> dict[str, CatalogRow]:
+    """Every check ID in 09 §6, mapped to the levels and the due phase its row declares."""
+    catalog: dict[str, CatalogRow] = {}
     for check_id, rest in CATALOG_ROW.findall(spec_text):
         cells = [c.strip() for c in rest.split("|")]
         levels = next((c for c in cells if LEVEL_CELL.match(c)), "")
-        catalog[check_id] = set(re.findall(r"L\d", levels))
+        # The last non-empty cell, and only if it is a bare integer. `cells` ends with the empty
+        # string a trailing `|` leaves behind.
+        tail = [c for c in cells if c]
+        due = int(tail[-1]) if tail and PHASE_CELL.match(tail[-1]) else None
+        catalog[check_id] = CatalogRow(set(re.findall(r"L\d", levels)), due)
     if not catalog:
         raise ParseError("the 09 §6 catalog parsed to 0 check IDs -- the row shape has changed")
     return catalog
 
 
-def parse_ratchet(spec_text: str, phase: int, catalog: dict[str, set[str]]) -> set[str]:
-    """The 09 §10 'Newly required' cell for a phase, expanded against the catalog."""
-    cell = None
-    for row_phase, newly_required in RATCHET_ROW.findall(spec_text):
-        if int(row_phase) == phase:
-            cell = newly_required
-            break
-    if cell is None:
+class Ratchet(NamedTuple):
+    """What 09 §10 requires at a phase -- and what expanding it against 09 §6 set aside.
+
+    `deferred` and `undated` exist so the phase filter is reportable. A filter that removes IDs and
+    says nothing is a silent cap, and a silent cap on a required set reads exactly like a smaller
+    spec.
+    """
+
+    required: set[str]
+    deferred: set[str]  # suite members 09 §6 dates to a phase after this one
+    undated: set[str]  # suite members whose 09 §6 row carries no phase cell at all
+    explicit: set[str]  # IDs 09 §10 names outright, which the phase filter never touches
+
+    def notes(self) -> list[str]:
+        out = []
+        if self.deferred:
+            out.append(
+                f"{len(self.deferred)} suite members are NOT required here -- 09 §6 dates them to a "
+                f"later phase: " + " ".join(sorted(self.deferred))
+            )
+        if self.undated:
+            out.append(
+                f"{len(self.undated)} suite members carry no 09 §6 phase cell and are required at "
+                f"every phase naming their suite: " + " ".join(sorted(self.undated))
+            )
+        return out
+
+
+def parse_ratchet(spec_text: str, phase: int, catalog: dict[str, CatalogRow]) -> Ratchet:
+    """09 §10's 'Newly required' cells for every phase <= this one, expanded against the catalog."""
+    rows = [(int(p), cell) for p, cell in RATCHET_ROW.findall(spec_text)]
+    if not any(p == phase for p, _ in rows):
         raise ParseError(f"09 §10 has no ratchet row for phase {phase}")
 
     required: set[str] = set()
-    # Entries are comma-separated, but a slash run (`V-ISO-001/002/006`) is one entry and a level
-    # qualifier binds to the entry it follows.
-    for entry in cell.split(","):
-        entry = entry.strip().strip("*").strip()
-        if not entry:
-            continue
-        qual = QUALIFIER.search(entry)
-        level = qual.group(1) if qual else None
+    explicit_ids: set[str] = set()
+    deferred_to_later: set[str] = set()
+    undated: set[str] = set()
 
-        explicit = CHECK_ID.findall(entry)
-        if explicit:
-            required.update(explicit)
-            # `V-ISO-001/002/006`: the trailing numbers carry the suite of the first ID.
-            head = explicit[0]
-            for tail in re.findall(r"/(\d{3})", entry):
-                required.add(f"{head[:5]}-{tail}")
+    # "Once a suite enters the ratchet it never leaves" (09 §10). Every row up to and including this
+    # phase, not only this phase's own.
+    for row_phase, cell in sorted(rows):
+        if row_phase > phase:
             continue
+        # Entries are comma-separated, but a slash run (`V-ISO-001/002/006`) is one entry and a level
+        # qualifier binds to the entry it follows.
+        for entry in cell.split(","):
+            entry = entry.strip().strip("*").strip()
+            if not entry:
+                continue
+            qual = QUALIFIER.search(entry)
+            level = qual.group(1) if qual else None
 
-        suite_match = SUITE.search(entry)
-        if not suite_match:
-            continue  # prose like "(read-side)" or "core" -- carries no ID of its own
-        suite = suite_match.group(0)
-        members = {k for k in catalog if k.startswith(suite + "-")}
-        if level:
-            members = {k for k in members if level in catalog[k]}
-        if not members:
-            raise ParseError(
-                f"09 §10 phase {phase} names {entry!r}, which expands to 0 check IDs against the "
-                f"09 §6 catalog -- a required set that matches nothing scores every unrun check as "
-                f"satisfied ([[LSN-048]])"
-            )
-        required.update(members)
+            explicit = CHECK_ID.findall(entry)
+            if explicit:
+                # An ID §10 names OUTRIGHT is required at that row's phase, whatever the catalog
+                # says. The explicit form is how §10 pulls one member of a suite forward or holds
+                # one back, so filtering it by the column it exists to override would make the
+                # explicit form unable to mean anything.
+                explicit_ids.update(explicit)
+                # `V-ISO-001/002/006`: the trailing numbers carry the suite of the first ID.
+                head = explicit[0]
+                for tail in re.findall(r"/(\d{3})", entry):
+                    explicit_ids.add(f"{head[:5]}-{tail}")
+                continue
+
+            suite_match = SUITE.search(entry)
+            if not suite_match:
+                continue  # prose like "core" -- carries no ID of its own
+            suite = suite_match.group(0)
+            members = {k for k in catalog if k.startswith(suite + "-")}
+            if level:
+                members = {k for k in members if level in catalog[k].levels}
+            if not members:
+                raise ParseError(
+                    f"09 §10 phase {row_phase} names {entry!r}, which expands to 0 check IDs "
+                    f"against the 09 §6 catalog -- a required set that matches nothing scores "
+                    f"every unrun check as satisfied ([[LSN-048]])"
+                )
+            for member in members:
+                due = catalog[member].phase
+                if due is None:
+                    undated.add(member)
+                    required.add(member)
+                elif due <= phase:
+                    required.add(member)
+                else:
+                    deferred_to_later.add(member)
+
+    # An ID some other row names explicitly outranks a phase filter that removed it elsewhere.
+    required |= explicit_ids
+    deferred_to_later -= required
 
     if not required:
-        raise ParseError(f"09 §10 phase {phase} expanded to 0 check IDs")
-    return required
+        raise ParseError(f"09 §10 phases <= {phase} expanded to 0 check IDs")
+
+    return Ratchet(required, deferred_to_later, undated, explicit_ids)
 
 
 def parse_acceptance_table(phase_text: str, phase: int) -> set[str]:
@@ -234,7 +346,7 @@ def scan_text(spec_text: str, phase_text: str, results_text: str, phase: int) ->
     table = parse_acceptance_table(phase_text, phase)
     results = parse_results(results_text)
 
-    required = sorted(ratchet | table)
+    required = sorted(ratchet.required | table)
     green = [c for c in required if is_green(results.get(c, []))]
     not_green = [c for c in required if c not in set(green)]
     undeferrable = [c for c in not_green if c[:5] in BLOCKING_ALWAYS]
@@ -244,7 +356,7 @@ def scan_text(spec_text: str, phase_text: str, results_text: str, phase: int) ->
     # describing the gap. Naming an ID in a paragraph about how it is unasserted is not binding it to
     # an acceptance bullet; counting it would be [[LSN-019]] inside the check written to end
     # [[LSN-019]]'s last recurrence.
-    unnamed_by_phase = sorted(ratchet - table)
+    unnamed_by_phase = sorted(ratchet.required - table)
 
     failures: list[str] = []
     if not_green:
@@ -270,8 +382,9 @@ def scan_text(spec_text: str, phase_text: str, results_text: str, phase: int) ->
         "not_green": not_green,
         "undeferrable": undeferrable,
         "unnamed_by_phase": unnamed_by_phase,
-        "ratchet": sorted(ratchet),
+        "ratchet": sorted(ratchet.required),
         "table": sorted(table),
+        "ratchet_notes": ratchet.notes(),
     }
     return failures, report
 
@@ -309,6 +422,13 @@ def report(phase: int, with_hints: bool) -> int:
         return 1
 
     n = len(report["required"])
+    # PRINTED on both verdicts, and printed before them. The phase filter is the one part of the
+    # derivation that makes the required set SMALLER, so it is the one part that can buy a green by
+    # being wrong; a reader who cannot see what it removed cannot audit it. Counted and named, never
+    # applied in silence.
+    for note in report["ratchet_notes"]:
+        print(f"  note: {note}", file=sys.stderr if failures else sys.stdout)
+
     if not failures:
         print(
             f"PASS: phase {phase} ratchet -- all {n} required checks are green "
@@ -417,24 +537,37 @@ def latest_phase() -> int:
     return max(phases)
 
 
-def negative_control(phase: int | None = None) -> int:
-    phase = latest_phase() if phase is None else phase
+def stage(phase: int) -> tuple[list[tuple], Ratchet, str]:
+    """Build the perturbed inputs. Raises ParseError when a case cannot be staged -- see `pick`.
+
+    Separate from `negative_control` only so the guard around it is one `try`. The loop that runs
+    the cases stays there and calls `scan_text` directly: `negative-controls-name-their-rule.py`
+    blinds a control by monkey-patching the function whose findings it inspects, and it reads which
+    one that is off `negative_control`'s own bytecode. A control that delegates its loop is a control
+    that cannot be blinded, and an unblindable control is exactly what [[LSN-035]] is about.
+    """
     spec_text = SPEC.read_text()
     phase_text = (REPO / "docs" / "build" / f"phase-{phase}.md").read_text()
     results_text = RESULTS.read_text()
 
     catalog = parse_catalog(spec_text)
-    required = sorted(parse_ratchet(spec_text, phase, catalog) | parse_acceptance_table(phase_text, phase))
-    future = _synthesise_green(required)
+    ratchet = parse_ratchet(spec_text, phase, catalog)
+    table = parse_acceptance_table(phase_text, phase)
+    required = sorted(ratchet.required | table)
+
     # The future tree also has to satisfy property 4, which is about the phase file's acceptance
     # table and not about results at all. The IDs go INSIDE that section -- appending them to the end
     # of the file would satisfy a whole-file grep and not the property, which is the distinction
     # property 4 exists to draw.
-    future_phase_text = phase_text.replace(
-        ACCEPTANCE_HEADING,
-        ACCEPTANCE_HEADING + "\n\n| " + " | ".join(required) + " |\n",
-        1,
-    )
+    def name_in_table(ids: list[str]) -> str:
+        return phase_text.replace(
+            ACCEPTANCE_HEADING,
+            ACCEPTANCE_HEADING + "\n\n| " + " | ".join(ids) + " |\n",
+            1,
+        )
+
+    future = _synthesise_green(required)
+    future_phase_text = name_in_table(required)
 
     victim_ba = next(c for c in required if c[:5] in BLOCKING_ALWAYS)
     victim_any = next(c for c in required if c[:5] not in BLOCKING_ALWAYS)
@@ -470,6 +603,80 @@ def negative_control(phase: int | None = None) -> int:
             + [", ".join(c for c in CHECK_ID.findall(r[2]) if c != check_id)]
             + r[3:],
         )
+
+    # ---- perturbing 09 §6's Phase column, and 09 §10's row list -----------------------------
+    # These five cases are the only ones that can tell a derivation which READS the Phase column from
+    # one which ignores it, and the only ones that can tell "every row up to this phase" from "this
+    # phase's row". Each asserts its edit LANDED against the parser rather than against a substring
+    # count ([[LSN-049]]): a perturbation that silently no-ops leaves an unmutated input scoring as an
+    # escape, which reads as a hole in the check instead of a hole in the control.
+
+    def set_phase(text: str, check_id: str, new: int | None) -> str:
+        """Rewrite one 09 §6 row's trailing phase cell. `new=None` removes the cell entirely."""
+        row = re.compile(rf"^\|\s*{check_id}\s*\|.*$", re.M)
+        cell = re.compile(r"\|\s*\d+\s*\|\s*$")
+        out, n = row.subn(lambda m: cell.sub("|" if new is None else f"| {new} |", m.group(0)), text)
+        if n != 1:
+            raise ParseError(f"control: {check_id} matched {n} catalog rows, not 1")
+        if parse_catalog(out)[check_id].phase != new:
+            raise ParseError(f"control: rewriting {check_id}'s phase cell to {new} did not land")
+        return out
+
+    def only_this_phases_row(text: str) -> str:
+        """Delete every 09 §10 ratchet row for a phase BEFORE this one, leaving this one's."""
+        kept = [
+            line
+            for line in text.splitlines(keepends=True)
+            if not (
+                (m := RATCHET_ROW.match(line)) is not None and int(m.group(1)) < phase
+            )
+        ]
+        out = "".join(kept)
+        if len(out) >= len(text):
+            raise ParseError(f"control: no 09 §10 ratchet row precedes phase {phase} to delete")
+        return out
+
+    def pick(pool, case: str) -> str:
+        """One victim, or a loud failure naming the case that could not be staged.
+
+        These three pools are read out of the derivation under test, deliberately -- synthesising
+        them would make the cases measure a stand-in ([[LSN-060]]). The cost is that a defect in the
+        derivation can empty a pool, and an empty pool must never quietly shrink the control to the
+        cases it can still stage. Each case gets its OWN needle here so a sweep can still tell the
+        defects apart ([[LSN-035]]).
+        """
+        for c in sorted(pool):
+            return c
+        raise ParseError(f"control: no victim for the {case} case -- it cannot be staged at all")
+
+    # A suite member 09 §6 dates AFTER this phase, that nothing else already requires. Pulling it
+    # forward must make the future tree red; stripping its phase cell must too.
+    victim_later = pick((c for c in ratchet.deferred if c not in set(required)), "pull-forward")
+    # A suite member 09 §6 dates at or before this phase, reachable ONLY through suite expansion.
+    # Pushing it later must make a tree that omits it go green -- the arm that proves the filter
+    # removes, not merely that it is consulted.
+    victim_due = pick(
+        (
+            c
+            for c in ratchet.required
+            if c not in ratchet.explicit and c not in table and catalog[c].phase is not None
+        ),
+        "push-later",
+    )
+    without_due = [c for c in required if c != victim_due]
+    # An ID this phase's own ratchet row does not name -- it is required only because a PRIOR row is.
+    prior_only = ratchet.required - parse_ratchet(only_this_phases_row(spec_text), phase, catalog).required
+    victim_prior = pick((c for c in prior_only if c not in table), "prior-row")
+    without_prior = [c for c in required if c != victim_prior]
+    # ...and the sharper half of the same claim: an ID a PRIOR row's suite carries, which 09 §6 dates
+    # to THIS phase. Every accumulated row must be filtered against the phase under test, not against
+    # its own -- filtering each row by its own number re-shrinks exactly the set the accumulation
+    # widened, silently, by 11 IDs at phase 9, and `victim_prior` cannot see it because a phase-8 ID
+    # under a phase-8 row survives that defect untouched.
+    victim_carried = pick(
+        (c for c in prior_only if catalog[c].phase == phase and c not in table), "carried-forward"
+    )
+    without_carried = [c for c in required if c != victim_carried]
 
     grouped = _synthesise_green_grouped(required)
     # Victims that SHARE a cell with other IDs -- the property the three grouped cases are about.
@@ -558,13 +765,75 @@ def negative_control(phase: int | None = None) -> int:
             demote(grouped, victim_shared_ba, "**finding**"),
             "BLOCKING-ALWAYS and may not be deferred",
         ),
+        (
+            f"09 §6 pulls {victim_later} FORWARD to phase {phase} — the future tree must go red",
+            set_phase(spec_text, victim_later, phase),
+            future_phase_text,
+            future,
+            victim_later,
+        ),
+        (
+            f"09 §6's phase cell for {victim_later} is deleted — undated means required, not exempt",
+            set_phase(spec_text, victim_later, None),
+            future_phase_text,
+            future,
+            victim_later,
+        ),
+        (
+            f"a tree green for everything EXCEPT {victim_due}, which 09 §6 dates to phase "
+            f"{catalog[victim_due].phase}",
+            spec_text,
+            name_in_table(without_due),
+            _synthesise_green(without_due),
+            victim_due,
+        ),
+        (
+            f"…the same tree, with 09 §6 pushing {victim_due} out to phase 99 — must go GREEN",
+            set_phase(spec_text, victim_due, 99),
+            name_in_table(without_due),
+            _synthesise_green(without_due),
+            None,  # the filter must REMOVE, not merely be consulted
+        ),
+        (
+            f"a tree green for this phase's own §10 row but not for {victim_prior}, which a PRIOR "
+            f"row requires",
+            spec_text,
+            name_in_table(without_prior),
+            _synthesise_green(without_prior),
+            victim_prior,
+        ),
+        (
+            f"…and not for {victim_carried}, carried by an EARLIER §10 row but dated by 09 §6 to "
+            f"phase {phase} — every accumulated row filters against {phase}, not against itself",
+            spec_text,
+            name_in_table(without_carried),
+            _synthesise_green(without_carried),
+            victim_carried,
+        ),
     ]
+    return cases, ratchet, victim_later
+
+
+def negative_control(phase: int | None = None) -> int:
+    phase = latest_phase() if phase is None else phase
+    try:
+        cases, ratchet, victim_later = stage(phase)
+    except ParseError as exc:
+        print(f"FAIL: negative control could not be staged: {exc}", file=sys.stderr)
+        return 1
 
     caught = 0
     for label, s_text, p_text, r_text, needle in cases:
         try:
-            failures, _ = scan_text(s_text, p_text, r_text, phase)
+            failures, rep = scan_text(s_text, p_text, r_text, phase)
+            # The property-2/3/4 sentences carry counts, not IDs, so a case whose whole claim is
+            # "THIS ID became required" cannot be matched against them -- and matching it on
+            # "something went red" would score every perturbation as catching every property
+            # ([[LSN-035]]). The named population `report()` prints is appended so those needles have
+            # the one thing they are about to bind to.
             message = " | ".join(failures)
+            if failures:
+                message += " || not green: " + " ".join(rep["not_green"])
         except ParseError as exc:
             message = f"property 1: {exc}"
         if needle is None:
@@ -576,7 +845,27 @@ def negative_control(phase: int | None = None) -> int:
         caught += ok
         print(f"  [{'ok' if ok else 'XX'}] {label}: {verdict}")
 
-    total = len(cases)
+    # The phase filter must also be REPORTABLE, and that cannot be asserted from `failures`: the
+    # notes are printed on a green run too, which is the run where a silent cap does its damage.
+    # Scored beside the cases because an unprinted filter is the same defect as a wrong one, arriving
+    # without a symptom.
+    unperturbed = scan_text(
+        SPEC.read_text(),
+        (REPO / "docs" / "build" / f"phase-{phase}.md").read_text(),
+        RESULTS.read_text(),
+        phase,
+    )[1]
+    notes = " ".join(unperturbed["ratchet_notes"])
+    for what, want in (
+        (f"names {victim_later}, which it removed", victim_later),
+        ("counts what it removed", f"{len(ratchet.deferred)} suite members are NOT required here"),
+        ("names the undated members it kept", f"{len(ratchet.undated)} suite members carry no"),
+    ):
+        ok = want in notes
+        caught += ok
+        print(f"  [{'ok' if ok else 'XX'}] the phase filter reports itself — it {what}")
+
+    total = len(cases) + 3
     if caught != total:
         print(f"FAIL: negative control {caught}/{total}", file=sys.stderr)
         return 1

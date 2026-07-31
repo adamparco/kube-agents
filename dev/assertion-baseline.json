@@ -274,6 +274,7 @@
       "test_the_negative_control_passes_and_covers_the_future_tree",
       "test_the_old_ratchet_arm_is_green_on_that_same_baseline",
       "test_the_probe_names_where_it_found_each_one",
+      "test_the_ratchet_accumulates_prior_phases_and_honours_the_due_date",
       "test_the_real_tree_actually_contains_a_marked_grant",
       "test_the_real_tree_is_green",
       "test_the_required_set_is_derived_and_not_a_hand_list",

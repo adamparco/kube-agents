@@ -940,6 +940,20 @@ class PhaseGateRunsItsOwnRatchet(unittest.TestCase):
         self.assertTrue(any("no verify-phase*.sh at all" in p for p in problems), problems)
 
 
+def _load_phase_ratchet():
+    """Import the ratchet arm by path -- its filename is not an identifier."""
+    sys.path.insert(0, str(gate.REPO / "dev" / "tests"))
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "phase_ratchet", gate.REPO / "dev" / "tests" / "phase-ratchet-is-asserted.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        sys.path.pop(0)
+
+
 class PhaseRatchetIsAsserted(unittest.TestCase):
     """The derived ratchet audit itself: its own negative control has to stay green and non-empty.
 
@@ -962,27 +976,44 @@ class PhaseRatchetIsAsserted(unittest.TestCase):
     def test_the_required_set_is_derived_and_not_a_hand_list(self):
         # The whole point: a hand-written list in the checker is one more place to forget, which is
         # the artifact that failed. Both sources must contribute, and neither may be empty.
-        sys.path.insert(0, str(gate.REPO / "dev" / "tests"))
-        try:
-            spec = importlib.util.spec_from_file_location(
-                "phase_ratchet", gate.REPO / "dev" / "tests" / "phase-ratchet-is-asserted.py"
-            )
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-        finally:
-            sys.path.pop(0)
+        mod = _load_phase_ratchet()
         catalog = mod.parse_catalog(mod.SPEC.read_text())
         ratchet = mod.parse_ratchet(mod.SPEC.read_text(), 9, catalog)
         table = mod.parse_acceptance_table((gate.REPO / "docs/build/phase-9.md").read_text(), 9)
         self.assertGreater(len(catalog), 200, "the 09 §6 catalog parse collapsed")
-        self.assertGreater(len(ratchet), 50, "the 09 §10 phase-9 ratchet parse collapsed")
+        self.assertGreater(len(ratchet.required), 50, "the 09 §10 phase-9 ratchet parse collapsed")
         self.assertGreater(len(table), 40, "the phase-9 acceptance table parse collapsed")
         # V-RUN-001…006 is an ellipsis run; five of the six appear nowhere else in the table.
         for n in range(1, 7):
             self.assertIn(f"V-RUN-{n:03d}", table)
         # V-ISO-001/002/006 is a slash run in the 09 §10 cell.
         for cid in ("V-ISO-001", "V-ISO-002", "V-ISO-006"):
-            self.assertIn(cid, ratchet)
+            self.assertIn(cid, ratchet.required)
+
+    def test_the_ratchet_accumulates_prior_phases_and_honours_the_due_date(self):
+        # 09 §10: "once a suite enters the ratchet it never leaves", and 09 §6's Phase column is the
+        # per-check due date the preamble calls authoritative. Asserted on named IDs rather than on
+        # counts, because a count moves every time the spec gains a row and would be rewritten to
+        # whatever the code then produced.
+        mod = _load_phase_ratchet()
+        catalog = mod.parse_catalog(mod.SPEC.read_text())
+        r = mod.parse_ratchet(mod.SPEC.read_text(), 9, catalog)
+        # Entered at phase 8 (V-CTN read-side, V-CTR core, V-MET); still required at 9.
+        for cid in ("V-CTN-001", "V-CTR-001", "V-MET-013"):
+            self.assertIn(cid, r.required, "a suite that entered at phase 8 left the ratchet")
+        # 09 §6 dates these after phase 9 -- V-RUN-014 to phase 15 -- so the shadow phase may not be
+        # asked for them. They are the reason the filter exists.
+        for cid in ("V-BRK-019", "V-RUN-014"):
+            self.assertNotIn(cid, r.required, f"{cid} is dated after phase 9 by 09 §6")
+            self.assertIn(cid, r.deferred, f"{cid} was dropped without being reported")
+        # The 09 §11 V-MET rows carry no phase cell at all; undated means required, not exempt.
+        self.assertIsNone(catalog["V-MET-001"].phase)
+        self.assertIn("V-MET-001", r.required)
+        self.assertIn("V-MET-001", r.undated)
+        # Nothing may be removed silently: everything the filter set aside is in a printable note.
+        notes = " ".join(r.notes())
+        for cid in sorted(r.deferred) + sorted(r.undated):
+            self.assertIn(cid, notes, f"{cid} was filtered out of the ratchet without a note")
 
 
 class EnvtestControlPlanesAreReaped(_PinnedProse):
