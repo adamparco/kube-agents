@@ -182,7 +182,7 @@ ownership_sections:
     section: "5.1"
     space: "requirements"
     enumerated: 17
-    checks: "V-REV-006"
+    checks: "V-REV-006 V-REV-012"
   - suite: "V-BRK"
     document: "05"
     section: "1.2"
@@ -340,7 +340,7 @@ floor:
   "03":
     covered: 53
   "04":
-    covered: 9
+    covered: 17
   "05":
     covered: 16
   "06":
@@ -1210,14 +1210,6 @@ digests:
 load_bearing_uncovered:
   - "R-03.4.3-8"
   - "R-03.4.3-9"
-  - "R-04.5.1-9"
-  - "R-04.5.1-10"
-  - "R-04.5.1-11"
-  - "R-04.5.1-12"
-  - "R-04.5.1-13"
-  - "R-04.5.1-14"
-  - "R-04.5.1-15"
-  - "R-04.5.1-16"
   - "R-05.1.2-2"
   - "R-06.2.3-6"
   - "R-06.4.2-17"

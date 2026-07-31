@@ -359,6 +359,10 @@
   runs: "make -C k8s-operator test"
   asserts_in: "k8s-operator/internal/broker/rollback/rollback_envtest_test.go"
 
+"V-REV-012":
+  runs: "python3 dev/tests/settle-windows-match-the-spec.py"
+  asserts_in: "dev/tests/settle-windows-match-the-spec.py"
+
 "V-RUN-003":
   runs: "make -C k8s-operator test"
   asserts_in: "k8s-operator/cmd/broker/waitforbroker_test.go"

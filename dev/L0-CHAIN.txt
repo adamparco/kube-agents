@@ -465,7 +465,7 @@ python3 dev/tests/coverage-ratchet-holds.py --negative-control
 
 # --- V-MET-002: full coverage of the load-bearing suites ------------------------------------------
 # THE LIVE ARM IS NOT ON THIS CHAIN, and that is deliberate — the same call, for the same reason, as
-# `phase-ratchet-is-asserted.py --phase 9` above. It is RED today by construction: sixteen
+# `phase-ratchet-is-asserted.py --phase 9` above. It is RED today by construction: eight remaining
 # obligations owned by V-CTN / V-BRK / V-REV / V-ISO / V-ADV have no catalog row that asserts them,
 # and closing them is a change to the 09 §6 catalog, not a curation change. This chain is a required
 # PR check, so an arm that stays red until that work lands would redden every unrelated commit and
@@ -489,3 +489,24 @@ python3 dev/tests/coverage-ratchet-holds.py --negative-control
 # obligations, a Source cell blanked, the enumerator returning almost nothing, the enumeration
 # artifact truncated, and the catalog itself unparseable.
 python3 dev/tests/load-bearing-coverage-is-full.py --negative-control
+
+# --- V-REV-012: the settle windows are the published ones (P9-T11g-2b-ii-2c-ii-a) -----------------
+# 04 §5.1 holds TWO per-kind tables. V-PRO-013 owns the first, the verification predicates. The
+# second — the settle windows — is here, and it exists as a check because the section says in as
+# many words why it states numbers at all: "'Bounded' on its own is unfalsifiable — any number
+# satisfies it — so the windows are stated here rather than left to the implementation." That
+# sentence is a verification instruction, and the only way to honour it is to read the durations out
+# of both artifacts and compare them. A check that waits for a rollout to settle waits SOME window;
+# it cannot fail when `verify/predicate.go`'s constant drifts from the table.
+#
+# What this does NOT assert is that the numbers are RIGHT — 09 §12's T-9 is open on whether 5m is
+# enough for a large rollout. Two artifacts agreeing is the whole property, and it is the property
+# that keeps the spec honest while T-9 stays open: change one side and the chain says so.
+python3 dev/tests/settle-windows-match-the-spec.py
+
+# Twelve mutations from BOTH ends of the drift, each naming the finding ITS property produces
+# ([[LSN-035]]): the code shortened, the code lengthened, an entry deleted, an entry added that no
+# row publishes, the whole map made unparseable, a published row's duration edited, a row deleted
+# from the table, a row inserted with no entry behind it, the ceiling constant moved off 30m, a row
+# pushed above the ceiling, the RBAC constant edited, and the default constant edited.
+python3 dev/tests/settle-windows-match-the-spec.py --negative-control

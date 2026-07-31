@@ -376,7 +376,13 @@ def negative_control() -> int:
         ),
         (
             "the enumeration artifact is truncated",
-            _mutate(base, 0, lambda t: "\n".join(t.splitlines()[:400]) + "\n"),
+            # Cut at an ENTRY boundary, not at a line number. `[:400]` held while the header was
+            # the length it was on the day this was written; the moment a curation argument was
+            # added to it the cut landed mid-entry, and the mutant tripped the parser instead of
+            # the floor -- reporting the wrong finding for a defect it did apply ([[LSN-063]] one
+            # step on: not an unapplied mutation, an applied one that stopped meaning what it said).
+            # Anchored on the key regex, truncation stays truncation however the header moves.
+            _mutate(base, 0, lambda t: t[: [m.start() for m in re.finditer(r'^"R-', t, re.M)][5]]),
             "VACUOUS: the enumeration yielded",
         ),
         (

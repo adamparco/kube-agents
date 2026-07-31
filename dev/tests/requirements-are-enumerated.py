@@ -396,8 +396,16 @@ def dump_requirements(entries: dict[str, dict]) -> str:
 # property is literally that parked-at-zero is not wired. 08 section 2.5's label table is V-RUN-004
 # (stamped and selectable) plus, per row, the admission policy that consumes the label.
 #
-# Published gaps -- sixteen requirements deliberately left unmapped, because no catalog row
-# asserts them. Five in 06:
+# 04 section 5.1 holds TWO tables and they take two different checks. The per-kind VERIFICATION
+# PREDICATES are V-PRO-013. The per-kind SETTLE WINDOWS -- R-04.5.1-9..16, a published gap until
+# 2026-07-31 -- are V-REV-012, an L0 doc-drift lint that reads the durations out of the table and
+# out of the broker's window map and compares them cell for cell. They were left unmapped for as
+# long as the only candidate was V-PRO-013, whose property is satisfied by waiting SOME window: the
+# section states the numbers precisely so that they are falsifiable, and a check that never reads
+# 5m/10m/90s/30s/15s/20m/2m cannot fail when a constant drifts from the table.
+#
+# Published gaps -- eight requirements deliberately left unmapped, because no catalog row
+# asserts them. Four in 06:
 #   R-06.2.3-6   "developer-team actor: none in v1". Nothing asserts the ABSENCE of a
 #                developer-team actor GSA; every containment check asserts what a principal
 #                cannot do, not that a principal does not exist.
@@ -414,20 +422,13 @@ def dump_requirements(entries: dict[str, dict]) -> str:
 # `classify.AllFloorRuleIDs`, and the corpus carries nine cases for it -- so V-MET-005 and
 # V-GAT-001 reach it by exactly the argument that maps every one of its siblings, and singling it
 # out was a curation error, not a stricter reading. Closing 44/45 is still a catalog change.
-# And eleven elsewhere:
+# And four elsewhere:
 #   R-03.4.3-8   no write to an `Agent` CR whose identity is an ANCESTOR of the writer's.
 #                V-CTN-007 covers the writer's OWN CR and V-CTN-025 the brake field on a child's;
 #                nothing walks `parentRef` upward on a write.
 #   R-03.4.3-9   actor writes stay inside the LIVE tier template. Both template checks
 #                (V-CTN-012, V-CTR-004) are the inlined-literal form, which is the point of 03
 #                section 4.2 -- the live-object form is a deferred capability with no check.
-#   R-04.5.1-9   the eight settle-window rows (through R-04.5.1-16). V-PRO-013 exercises the
-#                PREDICATE table of 04 section 5.1; the windows are a second table, and the
-#                section states them precisely so they are falsifiable ("bounded on its own is
-#                unfalsifiable -- any number satisfies it"). A check that never reads
-#                5m/10m/90s/30s/15s/20m/2m does not assert them. Closing this is a catalog
-#                change -- naturally an L0 doc-drift lint over the broker's per-kind window
-#                constants against the table, in the shape of V-MET-013.
 #   R-05.1.2-2   snapshots are stripped of `managedFields` and of `Secret` `data`, with a
 #                per-key digest instead of material. Same hole as R-06.4.2-44/45, one layer down.
 #   R-07.5-4     "authority never precedes machinery" -- a PRE-MERGE check must fail any change
