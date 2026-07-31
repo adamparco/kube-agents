@@ -232,6 +232,9 @@ func (s *Store) Get(ctx context.Context, namespace, actionID string) (*agentv1al
 // SetPhase writes a phase transition to status and keeps the status LABEL in step, in one call, so
 // the two cannot drift. It re-reads before writing: status conflicts are routine when the broker and
 // a controller both touch a record, and a conflict loop is far cheaper than a lost transition.
+//
+// It also carries the caller's OUTCOME -- see mergeOwnedStatus. A phase is a summary of an outcome,
+// and writing the summary while dropping the thing it summarises is what this used to do.
 func (s *Store) SetPhase(ctx context.Context, ar *agentv1alpha1.ActionRecord, phase agentv1alpha1.ActionPhase, message string) error {
 	var live agentv1alpha1.ActionRecord
 	if err := s.client.Get(ctx, client.ObjectKeyFromObject(ar), &live); err != nil {
@@ -244,6 +247,7 @@ func (s *Store) SetPhase(ctx context.Context, ar *agentv1alpha1.ActionRecord, ph
 	if err := agentv1alpha1.ValidateActionPhaseTransition(live.Status.Phase, phase); err != nil {
 		return fmt.Errorf("journal: refusing phase change on %s/%s: %w", ar.Namespace, ar.Name, err)
 	}
+	mergeOwnedStatus(&live.Status, &ar.Status)
 	live.Status.Phase = phase
 	live.Status.Message = message
 	if err := s.client.Status().Update(ctx, &live); err != nil {
@@ -294,6 +298,53 @@ func (s *Store) SetPhase(ctx context.Context, ar *agentv1alpha1.ActionRecord, ph
 	ar.Status = live.Status
 	ar.Labels = live.Labels
 	return nil
+}
+
+// mergeOwnedStatus copies the status fields the OWNING BROKER owns from the caller's copy onto the
+// freshly-read live copy, leaving every field another principal owns exactly as the server has it.
+//
+// 06 §4.3's principals table is the whole specification of this function:
+//
+//	the owning broker SA      phase, observedGeneration, applied, verification, recovery, report,
+//	                          timestamps, message
+//	the undo controller       phase (to Undone only), undoneBy, contested, message
+//	the ChatOps gateway       approvals, phase, contested (clear only)
+//	the retention controller  nothing
+//
+// So `approvals`, `contested`, `undoneBy` and `exported` are never touched here: they belong to
+// other writers, they are read fresh from the server on the line above, and copying the caller's
+// idea of them back would be this broker overwriting a decision it did not make.
+//
+// WHY THIS EXISTS. `SetPhase` re-reads the record and writes `live`, so every status field the
+// caller had composed on its own copy was silently discarded -- and the pipeline composes four of
+// them: `status.applied` at step 9, `status.verification` and `status.recovery` at step 11, and the
+// lifecycle clock throughout. Only `phase` and `message` were ever reaching etcd. A live record from
+// `broker-execute-l2.sh` on 2026-07-31 read back with `phase: DryRun`, a message, and nothing else:
+// no timestamps, no applied set, no verification block. The audit trail said an action happened and
+// could not say what it did. `status.timestamps.executionStarted` is also V-BRK-006's L2 evidence,
+// so the write-ahead ordering had nothing to compare against and the check could not run at all.
+//
+// Nil-guarded per field rather than copied wholesale: a caller that never set a field must not blank
+// what the server holds, and `SetPhase` is used for plain transitions as well as for terminal ones.
+func mergeOwnedStatus(live, caller *agentv1alpha1.ActionRecordStatus) {
+	if caller.Timestamps != nil {
+		live.Timestamps = caller.Timestamps
+	}
+	if len(caller.Applied) > 0 {
+		live.Applied = caller.Applied
+	}
+	if caller.Verification != nil {
+		live.Verification = caller.Verification
+	}
+	if caller.Recovery != nil {
+		live.Recovery = caller.Recovery
+	}
+	if caller.Report != nil {
+		live.Report = caller.Report
+	}
+	if caller.ObservedGeneration != 0 {
+		live.ObservedGeneration = caller.ObservedGeneration
+	}
 }
 
 // List returns records in a namespace matching the given label selectors. A nil selector lists all.

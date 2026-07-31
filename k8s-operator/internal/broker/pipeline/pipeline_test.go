@@ -304,6 +304,9 @@ type fakeRecords struct {
 	creates int
 	stored  []*agentv1alpha1.ActionRecord
 	phases  []agentv1alpha1.ActionPhase
+
+	// finalStatus is the record's status as step 11 handed it to the store. See SetPhase.
+	finalStatus *agentv1alpha1.ActionRecordStatus
 }
 
 func (f *fakeRecords) Create(_ context.Context, ar *agentv1alpha1.ActionRecord) error {
@@ -330,6 +333,11 @@ func (f *fakeRecords) SetPhase(_ context.Context, ar *agentv1alpha1.ActionRecord
 	}
 	ar.Status.Phase = phase
 	f.phases = append(f.phases, phase)
+	// The TERMINAL snapshot, taken here rather than at Create, because most of the status the real
+	// store persists does not exist yet when the record is born: `applied` lands at step 9,
+	// `verification` and `recovery` at step 11, and four of the six lifecycle timestamps after the
+	// Create. `stored` is a Create-time DeepCopy and therefore cannot answer anything about them.
+	f.finalStatus = ar.Status.DeepCopy()
 	return nil
 }
 
@@ -369,6 +377,13 @@ type rig struct {
 	// verifyClock is the settle window's clock, and it ADVANCES -- see newRig. The pipeline's own
 	// clock stays pinned at testClock so action timestamps remain golden.
 	verifyClock time.Time
+
+	// pipelineClock is what Config.Now returns, and pipelineTick is how far it moves per call.
+	// The tick DEFAULTS TO ZERO, which is the pinned clock every existing test was written
+	// against -- a fixed instant is what keeps the record's timestamps golden. A test that needs
+	// to observe the ORDER of two stamps sets it with withAdvancingClock.
+	pipelineClock time.Time
+	pipelineTick  time.Duration
 
 	pipeline *Pipeline
 }
@@ -543,16 +558,17 @@ func newRig(t *testing.T, tweaks ...func(*rig)) *rig {
 	t.Helper()
 
 	r := &rig{
-		t:           t,
-		verifyClock: testClock,
-		live:        &fakeLive{nsLabels: map[string]string{"env": "dev"}},
-		reader:      &fakeReader{absent: true},
-		applier:     &fakeApplier{},
-		prober:      &fakeProber{obj: liveConfigMap()},
-		rollup:      &fakeRollback{},
-		pager:       &fakePager{},
-		pauser:      &fakePauser{},
-		records:     &fakeRecords{},
+		t:             t,
+		verifyClock:   testClock,
+		pipelineClock: testClock,
+		live:          &fakeLive{nsLabels: map[string]string{"env": "dev"}},
+		reader:        &fakeReader{absent: true},
+		applier:       &fakeApplier{},
+		prober:        &fakeProber{obj: liveConfigMap()},
+		rollup:        &fakeRollback{},
+		pager:         &fakePager{},
+		pauser:        &fakePauser{},
+		records:       &fakeRecords{},
 		brake: &fakeBrake{view: BrakeView{
 			Agent:   testAgentCR(),
 			Freezes: &broker.FreezeView{ObservedAt: testClock},
@@ -602,13 +618,25 @@ func newRig(t *testing.T, tweaks ...func(*rig)) *rig {
 		Brake:      r.brake,
 		Accountant: r.budget,
 		Contested:  broker.NewContestedIndex(),
-		Now:        func() time.Time { return testClock },
+		Now: func() time.Time {
+			now := r.pipelineClock
+			r.pipelineClock = r.pipelineClock.Add(r.pipelineTick)
+			return now
+		},
 	})
 	if err != nil {
 		t.Fatalf("pipeline.New: %v", err)
 	}
 	r.pipeline = p
 	return r
+}
+
+// withAdvancingClock moves Config.Now forward by d on every call, so two stamps taken at different
+// steps are distinguishable. Only the tests about ORDER use it: for everything else a frozen clock
+// is the better fixture, because it makes an accidental extra Now() call invisible rather than
+// load-bearing.
+func withAdvancingClock(d time.Duration) func(*rig) {
+	return func(r *rig) { r.pipelineTick = d }
 }
 
 // submit runs the pipeline with steps 1 and 2 already recorded, exactly as the handler leaves them.
@@ -1713,4 +1741,118 @@ func TestLiveReadRefusalDiscriminatesRatherThanDefaulting(t *testing.T) {
 	// correct reading for a `create` whose target does not exist yet, and every other test in this
 	// file runs on exactly that path (newRig's reader is `absent: true`). Asserted there, by
 	// construction, rather than restated here as a case this helper is not the owner of.
+}
+
+// --- V-BRK-006: the lifecycle clock, and the ordering it is evidence for -------------------------
+
+// V-BRK-006's L2 clause is read off two clocks that never meet: `metadata.creationTimestamp`, which
+// the API SERVER assigns when step 8 writes the record, against
+// `status.timestamps.executionStarted`, which the BROKER stamps when step 9 issues its first
+// mutating call. A broker that journaled after executing inverts them, and nothing else in the tree
+// would notice.
+//
+// Nothing wrote `status.timestamps` at all until this test existed. The field was declared, read in
+// three places -- `budget.go`'s window, `cooldown.go`'s pair, `JournalReconciler.exportLateness`'s
+// four-way fallback -- and populated by nobody, so `broker-execute-l2.sh` reached step 11 against a
+// real cluster and had nothing to compare a creationTimestamp against.
+func TestTheLifecycleClockIsStampedAndOrdered(t *testing.T) {
+	// One second per Now() call, so the beats are distinguishable. A frozen clock would let a
+	// pipeline that stamped every field from the same variable pass the ordering assertions below.
+	r := newRig(t, withAdvancingClock(time.Second))
+	tr, _, err := r.submit(createEnvelope())
+	if err != nil {
+		t.Fatalf("submit: %v\ntrace: %s", err, tr)
+	}
+
+	st := r.records.finalStatus
+	if st == nil || st.Timestamps == nil {
+		t.Fatalf("step 11 handed the store a record with no lifecycle clock at all: %+v", st)
+	}
+	ts := st.Timestamps
+
+	for _, f := range []struct {
+		name string
+		at   *metav1.Time
+	}{
+		{"submitted", ts.Submitted},
+		{"classified", ts.Classified},
+		{"executionStarted", ts.ExecutionStarted},
+		{"executionEnded", ts.ExecutionEnded},
+		{"verified", ts.Verified},
+	} {
+		if f.at == nil {
+			t.Errorf("status.timestamps.%s is nil after a submission that reached step 11", f.name)
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	// `approved` is the ChatOps gateway's to write (06 §4.3), and this action was never gated.
+	// A broker that stamped it would be asserting an approval that never happened.
+	if ts.Approved != nil {
+		t.Errorf("status.timestamps.approved = %v on an ungated action; only the roster's SA may set it", ts.Approved)
+	}
+
+	// The order the clock is supposed to encode. Written as a chain rather than five independent
+	// comparisons so that a pipeline stamping the right fields in the wrong steps fails here.
+	beats := []struct {
+		name string
+		at   *metav1.Time
+	}{
+		{"submitted", ts.Submitted},
+		{"classified", ts.Classified},
+		{"executionStarted", ts.ExecutionStarted},
+		{"executionEnded", ts.ExecutionEnded},
+		{"verified", ts.Verified},
+	}
+	for i := 1; i < len(beats); i++ {
+		if beats[i].at.Time.Before(beats[i-1].at.Time) {
+			t.Errorf("%s (%s) is before %s (%s) -- the lifecycle clock runs backwards",
+				beats[i].name, beats[i].at.Time.Format(time.RFC3339),
+				beats[i-1].name, beats[i-1].at.Time.Format(time.RFC3339))
+		}
+	}
+
+	// THE WRITE-AHEAD ORDERING ITSELF, in the only form a unit test can put it: the record was
+	// handed to Create -- the journal write -- before the executor was called. The L2 suite asserts
+	// the same property against two real clocks; this asserts it against the call sequence, which is
+	// the thing a unit test can actually see.
+	assertBefore(t, tr, broker.StepSnapshot, broker.StepExecute)
+	if ts.ExecutionStarted.Time.Before(r.records.stored[0].CreationTimestamp.Time) {
+		t.Errorf("executionStarted %s precedes the record's creationTimestamp %s",
+			ts.ExecutionStarted.Time, r.records.stored[0].CreationTimestamp.Time)
+	}
+
+	// And the two beats that existed BEFORE the record did are durable from its first write, not
+	// only from step 11's. `stored` is the Create-time copy.
+	born := r.records.stored[0].Status.Timestamps
+	if born == nil || born.Submitted == nil || born.Classified == nil {
+		t.Errorf("the record was created without the two beats that had already happened: %+v", born)
+	}
+}
+
+// The outcome block the pipeline composes has to survive the trip to the store. Step 9 sets
+// `status.applied`, step 11 sets `status.verification` and `status.recovery`, and for as long as
+// `SetPhase` wrote only phase and message every one of them was dropped on the floor -- a live
+// record from `broker-execute-l2.sh` read back with a phase, a message, and nothing else.
+func TestStepElevenHandsTheStoreTheWholeOutcome(t *testing.T) {
+	r := newRig(t)
+	tr, _, err := r.submit(createEnvelope())
+	if err != nil {
+		t.Fatalf("submit: %v\ntrace: %s", err, tr)
+	}
+	st := r.records.finalStatus
+	if st == nil {
+		t.Fatal("step 11 handed the store no status at all")
+	}
+	if len(st.Applied) == 0 {
+		t.Errorf("status.applied is empty after an action that mutated one target")
+	}
+	if st.Verification == nil {
+		t.Errorf("status.verification is nil after a submission that ran step 10")
+	}
+	if st.Timestamps == nil {
+		t.Errorf("status.timestamps is nil")
+	}
 }

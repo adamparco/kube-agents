@@ -667,24 +667,37 @@ pass "the envelope was accepted — HTTP $sub_status, decision '$(field shadow-s
 echo
 echo "== L2-1: the ActionRecord the broker named is in the API server =="
 
+# THE OBJECT NAME IS NOT THE ACTION ID. `journal.RecordName` is `"ar-" + strings.ToLower(actionID)`
+# (06 §4.3, k8s-operator/internal/journal/ulid.go) — lowercased because an object name must be a DNS
+# subdomain, and a ULID is uppercase. This line asked for the raw id for as long as it has existed
+# and could not have found the record against ANY commit; it went unnoticed because the only thing
+# that had ever exercised it was `--negative-control`, which synthesises the record document and
+# feeds it straight to the assertion block, never touching the lookup. An arm whose ¬ form skips the
+# very statement under test is an arm nothing has measured.
+#
+# Derived here rather than read off the reply on purpose: the reply is the broker's claim, and the
+# whole point of L2-1 is to check that claim against the API server. Deriving the name the same way
+# the broker's own code derives it keeps the two joined by the rule, not by a returned string.
+record_name="ar-$(printf '%s' "$action_id" | tr '[:upper:]' '[:lower:]')"
+
 # Polled (P9). The reply is the broker's word that it wrote the record; the poll is the API server's.
 # 30s because a durable write that has not landed in half a minute is not slow, it is absent — and
 # the poll must not be generous enough to hide a broker that reports before it writes.
 RECORD=""
 deadline=$((SECONDS + 30))
 while [ "$SECONDS" -lt "$deadline" ]; do
-  RECORD="$($K -n "$record_ns" get actionrecord "$action_id" -o json 2>/dev/null)"
+  RECORD="$($K -n "$record_ns" get actionrecord "$record_name" -o json 2>/dev/null)"
   [ -n "$RECORD" ] && break
   sleep 2
 done
 
 if [ -z "$RECORD" ]; then
-  bad "the broker answered with actionId '$action_id' in namespace '$record_ns' and no such ActionRecord exists 30s later. The reply named a journal entry that was never written."
+  bad "the broker answered with actionId '$action_id' in namespace '$record_ns' and no ActionRecord named '$record_name' exists 30s later. The reply named a journal entry that was never written."
   echo
   echo "  what IS in $record_ns:"
   $K -n "$record_ns" get actionrecords 2>&1 | sed 's/^/    /'
 else
-  pass "ActionRecord $record_ns/$action_id exists — read from the API server, not from the reply body"
+  pass "ActionRecord $record_ns/$record_name exists — read from the API server, not from the reply body"
 fi
 
 # ------------------------------------------------------------------------------------------------

@@ -1,0 +1,155 @@
+{
+  "_comment": "Mutation sweep for V-BRK-006 -- the write-ahead record is durable BEFORE execution starts, and the record can prove it. Run: python3 dev/mutate.py verification/mutants/V-BRK-006.json. The check compares creationTimestamp against status.timestamps.executionStarted, so the sweep has to measure two different things: that the clock is stamped at all (it was declared and written nowhere for five phases), and that what SetPhase persists is the caller's outcome rather than just its phase (the write path that silently dropped it). Every row names the test that must fail; see dev/mutate.py for why rc != 0 is not a catch.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./internal/broker/pipeline/...", "./internal/journal/..."],
+    "requires_env": []
+  },
+  "mutants": [
+    {
+      "id": "M1-execution-started-is-never-stamped",
+      "why": "THE regression this unit exists to prevent, and the exact state the tree was in: status.timestamps is a declared field the broker never writes, so V-BRK-006's L2 arm has nothing to compare creationTimestamp against and reports a violation it cannot distinguish from the executor never running.",
+      "catcher": "TestTheLifecycleClockIsStampedAndOrdered",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\ts.record.Status.Timestamps.ExecutionStarted = ptrTime(p.cfg.Now())",
+          "replace": "\t\t_ = ptrTime"
+        }
+      ]
+    },
+    {
+      "id": "M2-execution-started-is-the-submission-instant",
+      "why": "The subtle wrong answer, and the one a reviewer would wave through: s.at is frozen before step 3, so stamping it here makes every record claim it began executing several steps before the API server had heard of the record. That is a FABRICATED V-BRK-006 violation -- the ordering arm goes red on a broker that is behaving correctly.",
+      "catcher": "TestTheLifecycleClockIsStampedAndOrdered",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\ts.record.Status.Timestamps.ExecutionStarted = ptrTime(p.cfg.Now())",
+          "replace": "\t\ts.record.Status.Timestamps.ExecutionStarted = ptrTime(s.at)"
+        }
+      ]
+    },
+    {
+      "id": "M3-the-clock-runs-backwards",
+      "why": "executionEnded stamped from the submission instant produces a record whose execution ended before it began. A monotonic chain is the only thing that makes the five beats readable as a lifecycle rather than six unrelated fields.",
+      "catcher": "TestTheLifecycleClockIsStampedAndOrdered",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\ts.record.Status.Timestamps.ExecutionEnded = ptrTime(p.cfg.Now())",
+          "replace": "\t\ts.record.Status.Timestamps.ExecutionEnded = ptrTime(s.at)"
+        }
+      ]
+    },
+    {
+      "id": "M4-verified-is-never-stamped",
+      "why": "The last beat. cooldown.go reads the (verified, submitted) pair and JournalReconciler.exportLateness falls back four ways when it is absent -- both degrade silently, which is how the whole field went five phases unnoticed.",
+      "catcher": "TestTheLifecycleClockIsStampedAndOrdered",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\ts.record.Status.Timestamps.Verified = ptrTime(p.cfg.Now())",
+          "replace": "\t\t_ = ptrTime"
+        }
+      ]
+    },
+    {
+      "id": "M5-classified-is-stamped-before-the-refusal-arms",
+      "why": "status.timestamps.classified is 'when the classifier returned' (06 §4.3). Taking it at the top of stepClassify stamps submissions that ended in `forbidden` -- a record claiming it was classified when it never got an answer.",
+      "catcher": "TestTheLifecycleClockIsStampedAndOrdered",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\ts.classifiedAt = p.cfg.Now().UTC()",
+          "replace": "\t\ts.classifiedAt = time.Time{}"
+        }
+      ]
+    },
+    {
+      "id": "M6-the-birth-beats-are-not-on-the-create",
+      "why": "submitted and classified must be on the object the broker POSTs, not added later: the write-ahead record is the durable artifact, and a record that is durable without them is durable without the half of the clock that precedes execution.",
+      "catcher": "TestTheLifecycleClockIsStampedAndOrdered",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\t\tSubmitted:  ptrTime(s.at),\n\t\t\t\tClassified: ptrTime(s.classifiedAt),",
+          "replace": "\t\t\t\tSubmitted: nil, Classified: nil,"
+        }
+      ]
+    },
+    {
+      "id": "M7-set-phase-drops-the-outcome-again",
+      "why": "The persistence half. SetPhase re-reads into `live` and writes that, so without the merge everything the pipeline composed -- the clock, status.applied at step 9, status.verification at step 11 -- is discarded and only phase and message reach etcd. A live record on 2026-07-31 read back exactly that way: an audit trail that said an action happened and could not say what it did.",
+      "catcher": "TestSetPhaseCarriesTheOutcomeTheBrokerOwns",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tmergeOwnedStatus(&live.Status, &ar.Status)",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M8-the-merge-is-wholesale",
+      "why": "The overcorrection, and the more dangerous one: copying the caller's whole status back blanks status.approvals, status.contested and status.undoneBy -- three fields 06 §4.3 hands to OTHER principals. A broker doing this silently reverses a human approval decision.",
+      "catcher": "TestSetPhaseNeverWritesAnotherPrincipalsStatus",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tmergeOwnedStatus(&live.Status, &ar.Status)",
+          "replace": "\tlive.Status = *ar.Status.DeepCopy()"
+        }
+      ]
+    },
+    {
+      "id": "M9-the-merge-blanks-what-the-caller-did-not-set",
+      "why": "Nil-guarding per field is the whole reason the merge is safe. SetPhase is used for plain transitions as well as terminal ones, and an unguarded copy lets a caller that never touched the clock erase it.",
+      "catcher": "TestSetPhaseDoesNotBlankWhatTheCallerNeverSet",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tif caller.Timestamps != nil {\n\t\tlive.Timestamps = caller.Timestamps\n\t}",
+          "replace": "\tlive.Timestamps = caller.Timestamps"
+        }
+      ]
+    },
+    {
+      "id": "M10-a-forbidden-index-write-is-fatal-again",
+      "why": "06 §2.2.1 grants the broker `actionrecords get list watch create` and no `update`, so the label sync it attempts on every terminal transition is Forbidden BY DESIGN. Treating that as fatal returned a 500 for an action that had already executed and already been journaled -- a false negative in the audit trail, and step 11 of broker-execute-l2.sh going red against a correct grant.",
+      "catcher": "TestSetPhaseSurvivesAnIndexWriteTheGrantForbids",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\t\tif apierrors.IsForbidden(err) {",
+          "replace": "\t\tif false {"
+        }
+      ]
+    },
+    {
+      "id": "M11-every-index-write-failure-is-swallowed",
+      "why": "The other side of the same narrowing. A Conflict or an etcd timeout on the index write is a transient the caller may want to see; only Forbidden is the RBAC model working as specified. Swallowing all of them makes the label silently stale for reasons the reconciler's repair loop was never argued to cover.",
+      "catcher": "TestSetPhaseStillFailsOnAnIndexWriteThatIsNotForbidden",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\t\tif apierrors.IsForbidden(err) {",
+          "replace": "\t\tif true {"
+        }
+      ]
+    },
+    {
+      "id": "M12-the-store-is-handed-a-phase-and-nothing-else",
+      "why": "Step 11 is the pipeline's only SetPhase and it is terminal -- if the record's composed status does not reach the store there, it never reaches etcd at all. This mutant severs the pipeline end of the same seam M7 severs at the store end; both must be measured, because a green suite with either one alive is how the defect survived.",
+      "catcher": "TestStepElevenHandsTheStoreTheWholeOutcome",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\ts.record.Status.Timestamps.Verified = ptrTime(p.cfg.Now())",
+          "replace": "\t\ts.record.Status = agentv1alpha1.ActionRecordStatus{Phase: s.record.Status.Phase}"
+        }
+      ]
+    }
+  ]
+}

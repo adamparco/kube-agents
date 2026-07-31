@@ -21,6 +21,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -262,6 +263,162 @@ func TestSetPhaseKeepsStatusAndLabelInStep(t *testing.T) {
 	}
 	if got.Labels[StatusLabel] != string(agentv1alpha1.PhaseVerified) {
 		t.Fatalf("%s = %q after a second transition", StatusLabel, got.Labels[StatusLabel])
+	}
+}
+
+// SetPhase re-reads the record and writes the LIVE copy, so for as long as it copied nothing across
+// from the caller, every status field the caller had composed was discarded. The pipeline composes
+// four of them — `status.applied` at step 9, `status.verification` and `status.recovery` at step 11,
+// and the lifecycle clock throughout — and only `phase` and `message` ever reached etcd. A live
+// record from `broker-execute-l2.sh` on 2026-07-31 read back with a phase, a message and nothing
+// else: the audit trail said an action had happened and could not say what it did.
+//
+// `status.timestamps.executionStarted` is also V-BRK-006's L2 evidence, so this was not only a lossy
+// record — it was a check that could not run.
+func TestSetPhaseCarriesTheOutcomeTheBrokerOwns(t *testing.T) {
+	ctx := context.Background()
+	s, c := newFakeStore(t)
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "developer-team/p/c/team-x")
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	started := metav1.NewTime(time.Date(2026, 7, 31, 5, 45, 20, 0, time.UTC))
+	ended := metav1.NewTime(time.Date(2026, 7, 31, 5, 45, 21, 0, time.UTC))
+	ar.Status.Timestamps = &agentv1alpha1.ActionTimestamps{ExecutionStarted: &started, ExecutionEnded: &ended}
+	ar.Status.Applied = []agentv1alpha1.AppliedTarget{{TargetIndex: 0, ResourceVersionAfter: "4711"}}
+	ar.Status.Verification = &agentv1alpha1.ActionVerification{Passed: true}
+	ar.Status.Recovery = &agentv1alpha1.ActionRecovery{Rung: 1}
+
+	if err := s.SetPhase(ctx, ar, agentv1alpha1.PhaseVerified, "executed"); err != nil {
+		t.Fatalf("SetPhase: %v", err)
+	}
+
+	var got agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.Timestamps == nil || got.Status.Timestamps.ExecutionStarted == nil {
+		t.Fatalf("status.timestamps.executionStarted did not survive the write: %+v", got.Status.Timestamps)
+	}
+	if !got.Status.Timestamps.ExecutionStarted.Equal(&started) {
+		t.Errorf("executionStarted = %v, want %v", got.Status.Timestamps.ExecutionStarted, started)
+	}
+	if !got.Status.Timestamps.ExecutionEnded.Equal(&ended) {
+		t.Errorf("executionEnded = %v, want %v", got.Status.Timestamps.ExecutionEnded, ended)
+	}
+	if len(got.Status.Applied) != 1 {
+		t.Errorf("status.applied = %+v, want the one target the caller composed", got.Status.Applied)
+	}
+	if got.Status.Verification == nil || !got.Status.Verification.Passed {
+		t.Errorf("status.verification = %+v", got.Status.Verification)
+	}
+	if got.Status.Recovery == nil || got.Status.Recovery.Rung != 1 {
+		t.Errorf("status.recovery = %+v", got.Status.Recovery)
+	}
+	if got.Status.Phase != agentv1alpha1.PhaseVerified || got.Status.Message != "executed" {
+		t.Errorf("phase/message = %q/%q", got.Status.Phase, got.Status.Message)
+	}
+}
+
+// The nil-guard, which is what makes the merge safe to run on EVERY transition rather than only the
+// terminal one. SetPhase is called for plain lifecycle steps too, and on those the caller's copy is
+// a record it read moments ago and never composed anything onto. An unguarded field-by-field copy
+// would let such a caller erase a clock the server already holds -- the same data loss as no merge
+// at all, arriving through the fix for it.
+func TestSetPhaseDoesNotBlankWhatTheCallerNeverSet(t *testing.T) {
+	ctx := context.Background()
+	s, c := newFakeStore(t)
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "developer-team/p/c/team-x")
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// The server holds a full outcome: the birth beats from the write-ahead Create, plus what an
+	// earlier transition persisted.
+	started := metav1.NewTime(time.Date(2026, 7, 31, 5, 45, 20, 0, time.UTC))
+	var live agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &live); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	live.Status.Timestamps = &agentv1alpha1.ActionTimestamps{ExecutionStarted: &started}
+	live.Status.Applied = []agentv1alpha1.AppliedTarget{{TargetIndex: 0, ResourceVersionAfter: "4711"}}
+	live.Status.Verification = &agentv1alpha1.ActionVerification{Passed: true}
+	if err := c.Status().Update(ctx, &live); err != nil {
+		t.Fatalf("seeding the server's outcome: %v", err)
+	}
+
+	// The caller carries a phase and nothing else -- the shape of every non-terminal SetPhase.
+	ar.Status.Timestamps = nil
+	ar.Status.Applied = nil
+	ar.Status.Verification = nil
+	if err := s.SetPhase(ctx, ar, agentv1alpha1.PhaseVerified, "verified"); err != nil {
+		t.Fatalf("SetPhase: %v", err)
+	}
+
+	var got agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.Timestamps == nil || got.Status.Timestamps.ExecutionStarted == nil {
+		t.Fatalf("status.timestamps was erased by a caller that never set it: %+v", got.Status.Timestamps)
+	}
+	if !got.Status.Timestamps.ExecutionStarted.Equal(&started) {
+		t.Errorf("executionStarted = %v, want the server's %v", got.Status.Timestamps.ExecutionStarted, started)
+	}
+	if len(got.Status.Applied) != 1 {
+		t.Errorf("status.applied was erased: %+v", got.Status.Applied)
+	}
+	if got.Status.Verification == nil || !got.Status.Verification.Passed {
+		t.Errorf("status.verification was erased: %+v", got.Status.Verification)
+	}
+}
+
+// The other half of the same rule, and the one that makes it safe: 06 §4.3 hands `approvals`,
+// `contested` and `undoneBy` to principals that are NOT this broker, and `exported` to the audit
+// exporter. SetPhase reads the record fresh and must leave every one of them exactly as the server
+// has it — a broker that copied its own stale idea of `approvals` back would be silently reversing a
+// human decision, which is the worst thing a wholesale status copy could do.
+func TestSetPhaseNeverWritesAnotherPrincipalsStatus(t *testing.T) {
+	ctx := context.Background()
+	s, c := newFakeStore(t)
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "developer-team/p/c/team-x")
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// The other writers move first, straight against the server, as they would in a cluster.
+	var live agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &live); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	live.Status.Approvals = &agentv1alpha1.ActionApprovals{Required: 2}
+	live.Status.Contested = true
+	live.Status.UndoneBy = "01JZQ8X9K7M4N2P6R8T0V3W5ZZ"
+	if err := c.Status().Update(ctx, &live); err != nil {
+		t.Fatalf("seeding another principal's status: %v", err)
+	}
+
+	// The broker's copy predates all three and disagrees about every one of them.
+	ar.Status.Approvals = nil
+	ar.Status.Contested = false
+	ar.Status.UndoneBy = ""
+	if err := s.SetPhase(ctx, ar, agentv1alpha1.PhaseVerified, "executed"); err != nil {
+		t.Fatalf("SetPhase: %v", err)
+	}
+
+	var got agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.Approvals == nil || got.Status.Approvals.Required != 2 {
+		t.Errorf("status.approvals = %+v; the broker blanked the ChatOps gateway's write", got.Status.Approvals)
+	}
+	if !got.Status.Contested {
+		t.Error("status.contested was cleared by a phase change; only the gateway and the undo controller may clear it")
+	}
+	if got.Status.UndoneBy != "01JZQ8X9K7M4N2P6R8T0V3W5ZZ" {
+		t.Errorf("status.undoneBy = %q; the undo controller's write was overwritten", got.Status.UndoneBy)
 	}
 }
 
