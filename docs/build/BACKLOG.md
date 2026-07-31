@@ -83,69 +83,17 @@ turns out to be wrong is closed with a reason, not recycled.
 
 **Last drained:** 2026-07-30
 
-### Run the builds on a provisioned, warm builder instead of standing one up per build
-
-- **Kind:** task
-- **Where:** `k8s-operator/Makefile` (`test`, `build`, `setup-envtest`), `dev/cluster/reload-images.sh`,
-  `make cloud-build-push`, `dev/L2-CHAIN.txt` — and the two clusters that already exist
-- **Why it matters:** `make -C k8s-operator test` is slow enough to be felt in every unit, and the
-  harness runs it at CHECKPOINT for any unit touching `k8s-operator/**`, so the cost is paid per
-  unit for the whole remaining build. It is not one cost either: it is `controller-gen`, then
-  `go build`, then an envtest control plane (etcd + kube-apiserver) started per package, on an arm64
-  laptop, for a project whose every deploy target is amd64. This repo already refuses host-arch
-  **image** builds for exactly that mismatch and routes them to Cloud Build; nothing has asked the
-  same question about the **test** path.
-
-  Two things are being asked, and the first should gate the second. **(1) Measure.** Split the wall
-  clock into codegen / compile / envtest-startup / test-execution, because which one is the bill
-  changes the fix — and one candidate fix is free: the harness passes `-count=1` in places, which
-  defeats Go's test cache. **(2) Then try a provisioned builder rather than a per-build one.** A
-  persistent `docker buildx` builder as a pod in `gke-scratch-kube-agents-dev` is cheap to stand up
-  (`docker buildx create --driver kubernetes`), is natively amd64 so it satisfies the host-arch
-  refusal, and keeps a warm layer cache across builds — which `cloud-build-push` cannot, since every
-  invocation starts from a cold worker. The same "already provisioned, kept warm" argument applies
-  to the envtest control plane and the Go build cache, and those may be the larger win if the
-  measurement says compile and envtest startup dominate.
-
-  Constraints to respect rather than rediscover: `gke-scratch-*` is the only legal target for
-  anything mutating (`platform-agent-host` is verification-only, and any new script needs the
-  anchored destructive-guard `case`); the builder must still push to the same Artifact Registry so
-  `reload-images.sh` can read the digest back and **deploy by digest**; and `pause.sh`/`resume.sh`
-  scale the scratch node pools to zero between campaigns, so a persistent builder either tolerates
-  being scaled away or changes what "paused" costs — worth pricing that idle cost as part of the
-  answer.
-
-  **(3) And a third option the first two should not foreclose: a separate, dedicated build cluster.**
-  `gke-scratch-kube-agents-dev` is available, but availability is not the same as suitability, and
-  there are three reasons it may be the wrong host for a thing whose whole value is being warm and
-  always there. It is the **destructive-test target** — the one cluster the harness is allowed to
-  break — so a builder living in it is inside the blast radius of the tests it exists to serve, and
-  a teardown script doing its job correctly can take the build path down with it. It is **paused to
-  zero between campaigns**, which is precisely when a warm cache would otherwise be earning its
-  keep, so the builder is cold exactly as often as the scratch cluster is idle. And its lifecycle is
-  owned by `dev/cluster/up.sh` — a cluster that can be recreated from scratch by design is a poor
-  place to keep the one thing that must not be.
-
-  So the measurement in (1) should also answer whether the builder wants its own home: a small,
-  long-lived, amd64, node-pool-pinned cluster (or a plain node pool with its own lifecycle, if a
-  whole cluster is not worth its floor cost) whose only job is `buildx` + the Go build cache +
-  possibly a warm envtest control plane, never a test target, never torn down by a campaign. If that
-  is the answer, it needs its own name and its own guard: the `gke-scratch-*` anchored `case` is a
-  **destructive-target allowlist**, and a build cluster is not a destructive target — it must not
-  quietly inherit the pattern that says it is safe to wipe, and `platform-agent-host` must stay
-  equally out of reach. Price all three (scratch-hosted, dedicated, Cloud-Build-as-is) against the
-  measured bill before choosing; the point of this item is the numbers, not the destination.
-
-- **Priority:** normal
-- **Added:** 2026-07-30
+_(empty — B-004 and B-005 drained 2026-07-30; see `## Scheduled`)_
 
 ---
 
 ## Scheduled
 
-| ID    | Title                                                                          | Kind                   | Scheduled into                                                                                                                                                                                                                                                                                                                                                     | On         |
-| ----- | ------------------------------------------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------- |
-| B-003 | Ruling on the deferred `/replay` question: reshape V-BRK-021, do not narrow it | finding (human ruling) | **`phase-9.md` P9-T7c-2c**, inserted as the next unit — ahead of the two remaining tasks, because it is L0 and Phase 9's own ordering rule puts the remaining L0 work in front of the remaining L2 work. The **implementation** of `/replay` and `/approve` is explicitly NOT in it; that stays in Phase 10 beside P10-T4 / P10-T7, as the item's own point 3 asks | 2026-07-30 |
+| ID    | Title                                                                                             | Kind                     | Scheduled into                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | On         |
+| ----- | ------------------------------------------------------------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| B-003 | Ruling on the deferred `/replay` question: reshape V-BRK-021, do not narrow it                    | finding (human ruling)   | **`phase-9.md` P9-T7c-2c**, inserted as the next unit — ahead of the two remaining tasks, because it is L0 and Phase 9's own ordering rule puts the remaining L0 work in front of the remaining L2 work. The **implementation** of `/replay` and `/approve` is explicitly NOT in it; that stays in Phase 10 beside P10-T4 / P10-T7, as the item's own point 3 asks                                                                                                                                                                                               | 2026-07-30 |
+| B-004 | Reap the envtest control planes — `make -C k8s-operator test` leaks etcd + kube-apiserver per run | finding (harness defect) | **[[LSN-059]] in `LESSONS.md`, mechanized in the same unit — and that unit is THIS one.** `Priority: now`, so by `harness-run` §2 it is the next unit and it **displaces `P9-T9b-5b-0-ii-b`**, which resumes after it. Destination is the lesson store rather than the improvement-pass queue because the fix is code — a reaper, a `Makefile` edit and a gate arm — and `harness-improve` §5 forbids implementation work in a pass                                                                                                                              | 2026-07-30 |
+| B-005 | Run the builds on a provisioned, warm builder instead of standing one up per build                | task                     | **The next improvement pass, step (1) only — the measurement.** Its steps (2) and (3) are implementation and may not be scheduled into a pass; the numbers the pass produces schedule their own unit. The item's own gate ("measure with the leak cleaned up") is satisfied for free by the ordering: the next pass fires at the Phase 9 milestone, which is after B-004. The **Spotlight sub-finding** (63 975 indexed entries under `GOCACHE`, `.metadata_never_index` as the cheap test) travels with this item, not with B-004 — the indexer orphans nothing | 2026-07-30 |
 
 **The drain's reasoning, which is scheduling and not substance — the ruling itself is the author's
 and is kept verbatim below.**
@@ -263,6 +211,168 @@ this safe too.
 L0 and L2 with only L1 evidence on file, while the deferral row records it green at L0. Those two
 readings need reconciling either way, and that reconciliation belongs to P9-T9, not here. This item
 is a spec/check reshape only.
+
+### B-004 — the drain's reasoning
+
+**Severity: not a live security regression**, classified here rather than read off the item's own
+`Priority`, because the drain protocol makes severity the harness's call. Nothing in it touches
+cluster authority, an agent identity, or a grant; the blast radius is one developer laptop. What it
+_is_ is a defect in the machinery that produces the harness's evidence, and that is why it still
+outranks a planned phase task. The loop is self-reinforcing in the wrong direction: abandoned
+control planes make the machine slower, a slower machine is likelier to hit whatever time bound is
+killing `go test`, and every kill abandons another pair. [[LSN-058]] is the standing proof that this
+class of interference does not stay quiet — it produced a **red naming a file nobody wrote**. A
+harness that cannot tell its own environment's noise from a finding is the failure the lesson store
+exists to prevent, so this is scheduled ahead of `P9-T9b-5b-0-ii-b` on the item's terms.
+
+**Why the lesson store and not the improvement-pass queue**, which is where a "harness defect"
+normally goes. Three reasons. (1) `Priority: now` is a `harness-run` §2 row of its own — _"it is the
+unit"_ — and an improvement pass is not the next unit doing this item, it is a different unit doing
+a different thing. (2) The fix is code: a reaper, a `Makefile` prerequisite, and a gate arm that
+keeps the wiring from being removed. `harness-improve` §5 forbids implementation work in a pass, so
+the pass could only have scheduled a unit anyway, one milestone later. (3) Invariant 13 requires a
+lesson to close with a **mechanization ID**, not an argument, which is exactly the shape this item
+already has: a mistake made ~30 times in two days, with two candidate fixes named. The lesson is
+[[LSN-059]] and it opens and closes in the unit this drain schedules.
+
+**One correction to the item's premise, recorded so the unit does not mistake luck for a fix.** The
+laptop rebooted at ~22:56 on 2026-07-30, between the measurement and this ORIENT, and the reboot
+reaped all 32 processes: `ps` now shows **0 etcd and 0 kube-apiserver**. That is not evidence the
+leak is gone and it is not the fix — a reboot is not a reaper — but it does mean the unit starts
+from a clean machine and must therefore **reproduce** the leak deliberately rather than observe the
+inherited one. A fix demonstrated only against processes that were already dead is not demonstrated.
+
+**What the unit inherits, and what it must not absorb.** It owes both halves the item names, because
+they fail differently: teardown that survives a hard kill (the sweep), and not hard-killing the
+target in the first place (the caller's time bound). It does **not** owe the build-cost measurement
+— that is B-005, and folding it in here is how a bounded unit stops being one.
+
+### B-005 — the drain's reasoning
+
+The item asks two things and gates the second on the first, and that gate is what decides the
+destination. Step **(1) measure** is diagnosis — split the wall clock into codegen / compile /
+envtest-startup / test-execution, and check whether `-count=1` is defeating the Go test cache for no
+reason. Diagnosis is precisely what an improvement pass does, so step (1) is scheduled there. Steps
+**(2) a warm `buildx` builder** and **(3) a dedicated build cluster** are implementation and cost
+money per hour, and `harness-improve` §5 forbids a pass from doing either. So the pass produces the
+numbers and a costed comparison of all three candidates (scratch-hosted, dedicated,
+Cloud-Build-as-is) and **stops**; whichever the numbers favour becomes its own unit with its own
+guard work. Pre-deciding that in the drain would be answering the question the item exists to ask.
+
+The item's closing constraints are carried forward verbatim rather than re-derived: `gke-scratch-*`
+stays the only legal mutating target; anything new pushes to the same Artifact Registry so
+`reload-images.sh` can still read the digest back and **deploy by digest**; and if the answer is a
+dedicated build cluster, it needs its own name and its own guard, because the `gke-scratch-*`
+anchored `case` is a **destructive-target allowlist** and a build cluster is not a destructive
+target. Inheriting that pattern would quietly mark the one machine that must not be wiped as safe to
+wipe.
+
+**The Spotlight sub-finding rides with this item, not with B-004.** 63 975 indexed entries under
+`~/Library/Caches/go-build` means every build feeds `mdworker_shared` thousands of files, and the
+cheap test is a `.metadata_never_index` marker in `GOCACHE` and possibly `k8s-operator/bin`. It is
+filed here because it is a **build-cost** finding: the indexer orphans nothing and reaps its workers
+correctly, which the item established and recorded so the unit would not re-investigate it. B-004 is
+about processes that outlive their parent; this is about work the machine is doing on purpose.
+
+**Kept verbatim below**, both items, because the measurements are the author's.
+
+### Reap the envtest control planes — `make -C k8s-operator test` leaks etcd + kube-apiserver per run
+
+- **Kind:** finding
+- **Where:** `k8s-operator/internal/controller/*_envtest_test.go` (`testEnv.Stop()` / `TestMain`
+  teardown), `k8s-operator/bin/k8s/1.31.0-darwin-arm64/{etcd,kube-apiserver}`, and whatever the
+  harness uses to run and time-bound that target
+- **Why it matters:** Every `make -C k8s-operator test` that does not exit cleanly leaves a live
+  etcd **and** a live kube-apiserver behind, and nothing ever reaps them. Measured on the dev
+  laptop on 2026-07-30, with no test run in flight: **16 etcd + 16 kube-apiserver, 30 of them
+  orphaned to `ppid=1`**, holding **1375 MB RSS on a 16 GB machine** (313 MB etcd + 982 MB
+  kube-apiserver), against 718 370 pageouts and 32% free. They arrive in cohorts that match test
+  runs — twelve from Jul 29 15:59–17:19, six from Jul 30 20:12–20:32 — and the oldest had been
+  running **~31 hours**. One leaked control plane per interrupted run, accumulating across days and
+  surviving every session boundary.
+
+  The mechanism to confirm: envtest starts the pair per test binary and stops it in deferred
+  teardown, so any `SIGKILL` of the `go test` process — a harness timeout, a killed background
+  task, a `^C`, a concurrent-run collision — skips the stop and launchd adopts the children. That
+  makes it a **harness** defect as much as a test defect: the harness is the thing killing those
+  processes. Two candidate fixes, and they are not exclusive: make teardown survive a hard kill
+  (process-group kill, or a `bin/k8s` pidfile sweep at the start and end of the target), and stop
+  the harness from hard-killing the target in the first place.
+
+  This compounds the warm-builder item above rather than duplicating it: a chunk of "`make test` is
+  slow" is a laptop that has been swapping under a gigabyte of abandoned control planes since
+  yesterday, so **measure with the leak cleaned up**, or step (1) there measures the leak instead of
+  the build.
+
+  Two things that look like this and are **not** leaks, checked at the same time, recorded so the
+  unit does not re-investigate them: **`python3.12`** — transient, every instance had a live parent
+  and an `etime` under one second, count fell to zero on recheck. **`mdworker_shared`** — 11 live,
+  but all under 3½ minutes old, ~151 MB total, and `ppid=1` is normal for a launchd XPC service
+  rather than evidence of orphaning; they are reaped correctly. They are, however, a real background
+  drag with a separate cause worth its own look: Spotlight is indexing the Go build cache —
+  **63 975 indexed entries under `~/Library/Caches/go-build`** — so every build feeds the indexer
+  thousands of files. A `.metadata_never_index` marker in `GOCACHE` (and possibly `k8s-operator/bin`)
+  is the cheap test of that.
+
+- **Priority:** now
+- **Added:** 2026-07-30
+- **Source:** reported by the human operator in-session; measurements gathered on request.
+
+### Run the builds on a provisioned, warm builder instead of standing one up per build
+
+- **Kind:** task
+- **Where:** `k8s-operator/Makefile` (`test`, `build`, `setup-envtest`), `dev/cluster/reload-images.sh`,
+  `make cloud-build-push`, `dev/L2-CHAIN.txt` — and the two clusters that already exist
+- **Why it matters:** `make -C k8s-operator test` is slow enough to be felt in every unit, and the
+  harness runs it at CHECKPOINT for any unit touching `k8s-operator/**`, so the cost is paid per
+  unit for the whole remaining build. It is not one cost either: it is `controller-gen`, then
+  `go build`, then an envtest control plane (etcd + kube-apiserver) started per package, on an arm64
+  laptop, for a project whose every deploy target is amd64. This repo already refuses host-arch
+  **image** builds for exactly that mismatch and routes them to Cloud Build; nothing has asked the
+  same question about the **test** path.
+
+  Two things are being asked, and the first should gate the second. **(1) Measure.** Split the wall
+  clock into codegen / compile / envtest-startup / test-execution, because which one is the bill
+  changes the fix — and one candidate fix is free: the harness passes `-count=1` in places, which
+  defeats Go's test cache. **(2) Then try a provisioned builder rather than a per-build one.** A
+  persistent `docker buildx` builder as a pod in `gke-scratch-kube-agents-dev` is cheap to stand up
+  (`docker buildx create --driver kubernetes`), is natively amd64 so it satisfies the host-arch
+  refusal, and keeps a warm layer cache across builds — which `cloud-build-push` cannot, since every
+  invocation starts from a cold worker. The same "already provisioned, kept warm" argument applies
+  to the envtest control plane and the Go build cache, and those may be the larger win if the
+  measurement says compile and envtest startup dominate.
+
+  Constraints to respect rather than rediscover: `gke-scratch-*` is the only legal target for
+  anything mutating (`platform-agent-host` is verification-only, and any new script needs the
+  anchored destructive-guard `case`); the builder must still push to the same Artifact Registry so
+  `reload-images.sh` can read the digest back and **deploy by digest**; and `pause.sh`/`resume.sh`
+  scale the scratch node pools to zero between campaigns, so a persistent builder either tolerates
+  being scaled away or changes what "paused" costs — worth pricing that idle cost as part of the
+  answer.
+
+  **(3) And a third option the first two should not foreclose: a separate, dedicated build cluster.**
+  `gke-scratch-kube-agents-dev` is available, but availability is not the same as suitability, and
+  there are three reasons it may be the wrong host for a thing whose whole value is being warm and
+  always there. It is the **destructive-test target** — the one cluster the harness is allowed to
+  break — so a builder living in it is inside the blast radius of the tests it exists to serve, and
+  a teardown script doing its job correctly can take the build path down with it. It is **paused to
+  zero between campaigns**, which is precisely when a warm cache would otherwise be earning its
+  keep, so the builder is cold exactly as often as the scratch cluster is idle. And its lifecycle is
+  owned by `dev/cluster/up.sh` — a cluster that can be recreated from scratch by design is a poor
+  place to keep the one thing that must not be.
+
+  So the measurement in (1) should also answer whether the builder wants its own home: a small,
+  long-lived, amd64, node-pool-pinned cluster (or a plain node pool with its own lifecycle, if a
+  whole cluster is not worth its floor cost) whose only job is `buildx` + the Go build cache +
+  possibly a warm envtest control plane, never a test target, never torn down by a campaign. If that
+  is the answer, it needs its own name and its own guard: the `gke-scratch-*` anchored `case` is a
+  **destructive-target allowlist**, and a build cluster is not a destructive target — it must not
+  quietly inherit the pattern that says it is safe to wipe, and `platform-agent-host` must stay
+  equally out of reach. Price all three (scratch-hosted, dedicated, Cloud-Build-as-is) against the
+  measured bill before choosing; the point of this item is the numbers, not the destination.
+
+- **Priority:** normal
+- **Added:** 2026-07-30
 
 ---
 
