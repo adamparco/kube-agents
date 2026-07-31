@@ -24,6 +24,16 @@ found in this pass are ordering or scoping problems that would otherwise have su
 
 ## ▶️ RUNNING AGAIN, STILL OPEN — read this before resuming
 
+> **2026-07-31, the current state.** The **task ladder is finished** — 72 leaf units, 2 moved out of
+> the phase, 70 in-phase, all 70 done — and **the phase still cannot close.** `harness-milestone` was
+> invoked and stopped at its §1: **14 of the 55 required Phase 9 checks are asserted by nothing in
+> this tree**, 7 of them BLOCKING-ALWAYS. That is planning defect 4 arriving exactly as it predicted,
+> because its declared resolution ("`verify-phase9.sh` runs the ratchet, not the Accept list") was
+> written into the acceptance table and never into the script. The audit, the fourteen IDs and the
+> four units that close them are the last section of this file: **§ Milestone audit 2026-07-31**.
+> **Resume at `harness-run`, unit `P9-T11a`.** Do not re-run `harness-milestone` until T11a–T11d are
+> green.
+
 **Phase 9 is OPEN.** It was stopped here on 2026-07-30 by an explicit human instruction, after the
 unit `P9-T9b-5b-0-ii-a`, and **not** because the phase closed. The same person lifted the stop later
 the same day — _"run the harness until completion, start with the failed PR #83"_ — which also
@@ -107,7 +117,9 @@ own `ActionRecord` through the same `escalate.Recorder.Pause` seam row 9 uses; 4
 only principal that may, since no broker grant reaches `agents/status` — from three conjoined
 observations against the etcd 05 §1.2 puts the journal in, refreshed on a 60 s clock because the
 field has no watch behind it; 8/8 mutants caught. B-006 is closed on both halves.
-**Resume at `harness-milestone`.** `P9-T9c` was the last task in the Phase 9 ladder.
+`P9-T9c` was the last task in the ladder as planned — and the ladder was not the whole phase.
+`harness-milestone` ran, stopped at §1, and opened **`P9-T11a`–`d`**. **Resume at `harness-run`,
+unit `P9-T11a`** (§ Milestone audit 2026-07-31, at the end of this file).
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
 [`LEDGER.md`](LEDGER.md).
@@ -5625,3 +5637,122 @@ V-RUN-012 and its negative control (8/8 breakages caught); invariants gate **30/
 binds verification at the improvement pass. **The L2 opportunity to record there:**
 `dev/verify/broker-refuse-l2.sh` already induces exactly this condition, so an assertion on
 `status.broker.journalReachable` could ride it without new setup.
+
+---
+
+## Milestone audit 2026-07-31 — the ladder finished, the ratchet did not
+
+`harness-milestone` was invoked for Phase 9 and **stopped at §1**. Its four conditions were not all
+proven, and §1's instruction when any is unproven is _"stop and return to `harness-run`"_. No gate
+was run: §1 gates §2, and no amount of cluster time can change a fact established by reading the
+scripts. What follows is that reading.
+
+### The arithmetic first — the ladder really is done
+
+The ledger's Phase 9 row carried a stale leaf count (`56 of 60`) and said so. Reconciled by parsing
+every `P9-T…` ID in this file's task sections and reducing each to its parent, so that `T7c-2a`
+rolls up to `T7c-2` and not to `T7c`:
+
+|                                  |                                                                                        |
+| -------------------------------- | -------------------------------------------------------------------------------------- |
+| Leaf units in the Phase 9 ladder | **72**                                                                                 |
+| Moved out of the phase           | **2** — `T7c-2b` → Phase 10 (the `/replay` deferral, human-owned), `T8b-3b` → `P10-T3` |
+| In-phase leaves                  | **70**                                                                                 |
+| Done                             | **70**                                                                                 |
+
+So the _task ladder_ is complete. That is what made the stale count worth reconciling, and it is
+also why the next paragraph is the finding rather than a footnote: a finished ladder is exactly the
+condition under which a phase looks closeable.
+
+### The finding — 14 of the 55 required checks are asserted by nothing
+
+Every check ID in the "Acceptance → check binding" table above (Accept (a)–(e), the four ratchet-only
+rows, and the carried V-CMP-006) — 55 unique IDs — was audited against `verification/results.csv`
+and against every file in the tree that names it. Three populations came out:
+
+|                          | Count  | Meaning                                                                                                                                                            |
+| ------------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Green**                | 22     | a `pass` row with an `evidence_ref` (09 §9.4)                                                                                                                      |
+| **Asserted, unrecorded** | 19     | a test, script or policy in the tree names the ID; a gate run produces the row. Includes V-GAT-001 (only a `correction` row) and V-REV-007 (only a `decision` row) |
+| **Asserted by nothing**  | **14** | no `dev/` script, no Go test, no policy, no results row. Nothing in this tree can produce a verdict for these IDs                                                  |
+
+The fourteen, with the seven **BLOCKING-ALWAYS** ones in bold (09 §5: V-BRK, V-REV and V-ISO are
+BLOCKING-ALWAYS suites, and 09 §9.6 forbids deferring any of their members):
+
+| Check         | L      | 09 §6 text                                                                                                            |
+| ------------- | ------ | --------------------------------------------------------------------------------------------------------------------- |
+| **V-BRK-001** | L2     | From inside the agent container, a direct API write with the pod token fails ¬                                        |
+| **V-BRK-004** | L2     | A write with the `kube-agents/action-id` annotation stripped is rejected at admission ¬                               |
+| **V-BRK-016** | L2     | Post-execution journal failure — write lands, record cannot be completed: roll back, `RolledBack`, auto-pause, page ¬ |
+| **V-REV-009** | L2     | A destructive undo is itself gated — undoing a `create` whose plan deletes a bound PVC parks ¬                        |
+| **V-ISO-001** | L2     | CH1 controller down — agents **and brokers** keep executing; no new reconciles                                        |
+| **V-ISO-002** | L2     | CH2 controller up after loss — relaunches **both** workloads, rebinds **both** SAs                                    |
+| **V-ISO-006** | L2     | CH6 journal down — broker refuses to execute ¬                                                                        |
+| V-RUN-001     | L2     | Exactly two workloads per `Agent` CR, both owner-referenced; no third, no minted SA ¬                                 |
+| V-RUN-002     | L2     | Correct identity on each; neither settable to the other's value ¬                                                     |
+| V-RUN-004     | L2     | Labels `tier`/`scope`/`parent`/`role` on Deployments, pods and Services, and selectable                               |
+| V-RUN-005     | L2     | Startup ordering safe both directions; broker-first and agent-first both converge                                     |
+| V-RUN-006     | L2     | Agent with no broker fails closed into observe-and-report; no direct-write fallback ¬                                 |
+| V-RUN-009     | L2     | Deleting the CR removes both workloads and leaves both SAs intact                                                     |
+| V-RUN-014     | L0, L2 | One Socket Mode connection, fleet-wide; no agent pod holds an app token ¬                                             |
+
+Two of these need the record straightened rather than merely built:
+
+- **V-ISO-001/002 are cited in `pair_netpol.go` and `pair_netpol_test.go`, and both citations are
+  disclaimers.** `pair_netpol_test.go:35` says _"V-ISO-001/002 ask whether a packet is DROPPED, which
+  is L2 and belongs to P9-T9"_; `pair_netpol.go:68` records the same. A grep for the ID finds a file;
+  the file says it is not the assertion. That is the correct thing for those comments to say, and it
+  is why the audit had to read every hit rather than count them.
+- **`dev/verify/chaos-suite.sh` contains the word "broker" zero times.** Its C1 asserts that a
+  stand-in pod stays Ready, that the agent Deployment is not recreated, and that reconcile resumes.
+  Every one of those is about the agent. V-ISO-001's property is _"agents **and brokers**"_ and
+  V-ISO-002's is _"**both** workloads … **both** SAs"_. The suite predates the pair; it was never
+  wrong, it was written when there was one workload.
+
+### This is planning defect 4, arriving exactly as it predicted
+
+Defect 4, written at PLAN on 2026-07-27, says the ratchet contains _"seventeen ratchet checks unrun"_
+that no Accept bullet names, and declares the resolution: **"`verify-phase9.sh` runs the ratchet, not
+the Accept list."** The acceptance table above was amended with four ratchet-only rows, which is half
+the resolution. The other half was never built. `dev/verify/verify-phase9.sh` has sections A–I:
+A is the L0 chain, B–F are Accept (a)–(e), G is the phase's own unfinished work, H is _prior_
+regression via `verify-phase8.sh`, and I prints deferrals. **There is no section for V-ISO at all**,
+and the script names 18 check IDs in total against a ratchet of 55.
+
+This is [[LSN-019]]'s shape once more: prose on the artifact is not a mechanization. The resolution
+was written into a table a human reads and not into a script a machine runs, so the phase's own
+prediction of its own gap sat in the file the whole time and changed nothing. The count matching
+(17 predicted, 14 unasserted plus the 3 the disclaimers cover) is not a coincidence — it is the same
+list.
+
+### What the milestone did NOT do, deliberately
+
+- **No gate run.** `harness-milestone` §1 gates §2. Running the full gate would have consumed roughly
+  an hour of scratch-cluster time to rediscover, from a red section, what reading the scripts already
+  established — and it could not have discovered the 14, because a gate that never names an ID cannot
+  go red for it.
+- **No section-H back-fill, no ratchet extension, no `L2_CHAIN_FLOOR` move.** Same reason the
+  2026-07-30 merge did not: they would be unearned.
+- **No deferral rows.** Seven of the fourteen are BLOCKING-ALWAYS and 09 §9.6 forbids deferring them.
+  The other seven are ordinary scheduled work, not blocked on anything external.
+
+Precondition P1 was satisfied on the way in and is not wasted: all seven first-party images were
+rebuilt from `895aaf3` through Cloud Build and deployed **by digest** to `gke-scratch-kube-agents-dev`
+(`dev/cluster/reload-images.sh all`, exit 0). The cluster is at HEAD for whichever unit runs next.
+
+### The ladder this opens — P9-T11
+
+Four units, ordered so the gap becomes **detected** before it is closed. `T11a` is a check-only unit
+and is red by construction on today's tree; that is the point, and it is the same "detected rather
+than remembered" shape section G already uses. Guardrail 9 is satisfied structurally: `T11a` ships no
+implementation, and `T11b`–`T11d` ship no change to `T11a`'s arm.
+
+| Task        | What to build                                                                                                                                                                                                                                                                                                                                                         | Spec                      | Files                                                                               | Check IDs                                                                   | Weight |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------ |
+| **P9-T11a** | The ratchet arm planning defect 4 declared and never built. A new section in `verify-phase9.sh` that derives the Phase 9 ratchet from 09 §10 + the acceptance table and **fails on any member with no green `results.csv` row** — so the gate reports the gap instead of omitting it. Prints the three populations above. Red today, and its redness IS the worklist. | 09 §10; planning defect 4 | `dev/verify/verify-phase9.sh` · possibly `dev/tests/` for the L0 half               | V-MET-013, V-MET-014 (the arm is itself a check about checks)               | small  |
+| **P9-T11b** | V-ISO-001/002/006 — chaos for the **pair**. C1 and C2 currently assert the agent workload only; extend both to the broker Deployment, both ServiceAccounts and both rebinds. Add the CH6 arm: journal down → broker refuses to execute, which `dev/verify/broker-refuse-l2.sh` already induces.                                                                       | 05 §8; 03 §4.1            | `dev/verify/chaos-suite.sh` · `dev/verify/broker-refuse-l2.sh`                      | **V-ISO-001**, **V-ISO-002**, **V-ISO-006**                                 | large  |
+| **P9-T11c** | The four unasserted BLOCKING-ALWAYS broker/undo L2s: the pod-token direct write (V-BRK-001), the stripped-`action-id` admission rejection (V-BRK-004), post-execution journal failure → rollback + `RolledBack` + auto-pause + page (V-BRK-016), and the destructive-undo gate (V-REV-009).                                                                           | 03 §4.1, §4.3, §6, §11    | `dev/verify/` (new or extended L2 script) · the tenant overlay of planning defect 2 | **V-BRK-001**, **V-BRK-004**, **V-BRK-016**, **V-REV-009**                  | large  |
+| **P9-T11d** | The workload pair at L2: two workloads owner-referenced and no third, non-interchangeable identities, the four labels selectable, both startup orders converging, agent-without-broker failing closed, CR deletion removing workloads and sparing SAs, and one fleet-wide Socket Mode connection.                                                                     | 08 §2.4, §7; 05 §8, C15   | `dev/verify/` (new pair suite) · `dev/L2-CHAIN.txt`                                 | V-RUN-001, V-RUN-002, V-RUN-004, V-RUN-005, V-RUN-006, V-RUN-009, V-RUN-014 | large  |
+
+**Resume at `harness-run`, unit `P9-T11a`.** Phase 9 does not close until the fourteen are green;
+seven of them may not be deferred to make it close.
