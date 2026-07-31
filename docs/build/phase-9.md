@@ -59,8 +59,11 @@ found in this pass are ordering or scoping problems that would otherwise have su
 > it was reverted and **`T11c″` landed first**: three of the control's phase-filter cases picked
 > their victim from _"required but not named by the table"_ and went unstageable the moment the table
 > moved. A check split off under Guardrail 9 goes **before** the artifact that motivated it, not
-> after. **Resume at `harness-run`, unit `P9-T11c‴`** — complete the table with the 43. Then `T11f`,
-> `T11g`, `T11d`. Do not re-run `harness-milestone` until the T11 ladder is green.
+> after. **`P9-T11c‴` is done** — the other half of the same correction: the 43 IDs 09 §10 requires
+> at phase 9 that the table never named are now eight themed _(ratchet only)_ rows, property 4 is
+> silent, and the required set did not move (82 → 82) because nothing was added to the gate, the gate
+> was written down. **Resume at `harness-run`, unit `P9-T11f`** — the 17 check IDs with no 09 §6
+> catalog row. Then `T11g`, `T11d`. Do not re-run `harness-milestone` until the T11 ladder is green.
 
 **Phase 9 is OPEN.** It was stopped here on 2026-07-30 by an explicit human instruction, after the
 unit `P9-T9b-5b-0-ii-a`, and **not** because the phase closed. The same person lifted the stop later
@@ -147,9 +150,9 @@ observations against the etcd 05 §1.2 puts the journal in, refreshed on a 60 s 
 field has no watch behind it; 8/8 mutants caught. B-006 is closed on both halves.
 `P9-T9c` was the last task in the ladder as planned — and the ladder was not the whole phase.
 `harness-milestone` ran, stopped at §1, and opened **`P9-T11a`–`d`**; `T11a`, `T11b-1`, `T11a-2`,
-`T11b-2`, `T11a-3`, `T11c″` and `T11c′` all closed the same day, and `T11c′` opened four more —
-`T11c″` (which it then had to wait for), `T11c‴`, `T11f` and `T11g`. **Resume at `harness-run`, unit
-`P9-T11c‴`**
+`T11b-2`, `T11a-3`, `T11c″`, `T11c′` and `T11c‴` all closed the same day, and `T11c′` opened four
+more — `T11c″` (which it then had to wait for), `T11c‴`, `T11f` and `T11g`. **Resume at
+`harness-run`, unit `P9-T11f`**
 (§ Milestone audit 2026-07-31, at the end of this file).
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
@@ -351,11 +354,14 @@ Two smaller notes in the same family:
 Every bullet binds to at least one check ID. No bullet is unbound. The rows below the Accept bullets
 are ratchet obligations with no corresponding Accept bullet — see planning defect 4.
 
-**Corrected 2026-07-31 by `P9-T11c′`, against 09 §6's Phase column.** The table's first draft was
-wrong in both directions: it named sixteen IDs that 09 §6 dates to phase 10, 14 or 15, and it omits
+**Corrected 2026-07-31, in two units, against 09 §6's Phase column.** The table's first draft was
+wrong in both directions: it named sixteen IDs that 09 §6 dates to phase 10, 14 or 15, and it omitted
 forty-three that 09 §10 requires at phase 9. Neither was visible while the required set was a hand
-list. **This unit fixes the first half only** — the second is `P9-T11c‴`, and the reason for the
-split is in [_P9-T11c′_](#p9-t11c--the-sixteen-that-were-not-phase-9s--2026-07-31-) below.
+list. `P9-T11c′` removed the sixteen; **`P9-T11c‴` added the forty-three, and the table is now
+complete** — `dev/tests/phase-ratchet-is-asserted.py --phase 9` reports property 4 silent, and the
+required set did not move (82 before, 82 after), because every one of the forty-three was already in
+the ratchet and only the phase file's own account of it was short. The reason the two halves are two
+units is in [_P9-T11c′_](#p9-t11c--the-sixteen-that-were-not-phase-9s--2026-07-31-) below.
 
 The sixteen are recorded, individually and with their due phase, in
 [_Retargeted out of Phase 9_](#retargeted-out-of-phase-9-by-09-6) immediately below; they are named
@@ -365,18 +371,26 @@ own postponement would go on being demanded by the paragraph ([[LSN-019]]'s shap
 `P9-T11a` fell into once already). Removing them does not unbind a single Accept bullet: (a), (b),
 (d) and (e) each keep three or more checks.
 
-| Accept                                                                                                            | Check IDs                                                            | Level      | Target                          |
-| ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- | ---------- | ------------------------------- |
-| **(a)** an envelope flows end-to-end in shadow mode → well-formed `ActionRecord` + valid undo plan                | V-CTR-005, V-REV-001, V-REV-004, V-BRK-015                           | L1, L2     | dev                             |
-| **(b)** classifier matches the fixture corpus (all four classes); `ChangePolicy` tightens, provably cannot loosen | V-GAT-001, V-GAT-002, V-GAT-009, V-GAT-010, V-GAT-017                | L0, L1, L2 | dev                             |
-| **(c)** an envelope claiming a scope other than the caller's is rejected                                          | **V-BRK-002**, V-BRK-007, V-BRK-008, V-BRK-009, V-BRK-010, V-BRK-017 | L1, L2     | dev                             |
-| **(d)** `pause`/`freeze` work with inference down; broker refuses when the journal is unavailable                 | **V-BRK-005**, V-RUN-007, V-RUN-008, V-RUN-012, **V-ISO-006**        | L0, L2     | dev                             |
-| **(e)** no agent identity in the fleet holds a write verb — full `auth can-i` sweep                               | **V-CTN-004**, **V-BRK-013**, V-BRK-012                              | L0, L2     | dev + live (sweep is read-only) |
-| _(ratchet only)_ the workload pair, its identities, labels, hardening, ordering                                   | V-RUN-001…005, V-RUN-009, V-RUN-010, V-RUN-011                       | L0, L2     | dev                             |
-| _(ratchet only)_ journal integrity, write-ahead, pipeline order and non-skippability                              | **V-BRK-006**, **V-BRK-011**, **V-BRK-014**, **V-BRK-021**           | L0, L1, L2 | dev (+ overlay)                 |
-| _(ratchet only)_ reversibility beyond coverage: undo-plan correctness                                             | **V-REV-003**                                                        | L1, L2     | dev (+ overlay)                 |
-| _(ratchet only)_ failure isolation with the pair deployed                                                         | **V-ISO-001**, **V-ISO-002**                                         | L2         | dev                             |
-| _(carried, not ratchet)_ the inter-agent credential seam                                                          | **V-CMP-006**                                                        | L0, L2, L3 | dev + live                      |
+| Accept                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Check IDs                                                                                                               | Level      | Target                          |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------- |
+| **(a)** an envelope flows end-to-end in shadow mode → well-formed `ActionRecord` + valid undo plan                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | V-CTR-005, V-REV-001, V-REV-004, V-BRK-015                                                                              | L1, L2     | dev                             |
+| **(b)** classifier matches the fixture corpus (all four classes); `ChangePolicy` tightens, provably cannot loosen                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | V-GAT-001, V-GAT-002, V-GAT-009, V-GAT-010, V-GAT-017                                                                   | L0, L1, L2 | dev                             |
+| **(c)** an envelope claiming a scope other than the caller's is rejected                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | **V-BRK-002**, V-BRK-007, V-BRK-008, V-BRK-009, V-BRK-010, V-BRK-017                                                    | L1, L2     | dev                             |
+| **(d)** `pause`/`freeze` work with inference down; broker refuses when the journal is unavailable                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | **V-BRK-005**, V-RUN-007, V-RUN-008, V-RUN-012, **V-ISO-006**                                                           | L0, L2     | dev                             |
+| **(e)** no agent identity in the fleet holds a write verb — full `auth can-i` sweep                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | **V-CTN-004**, **V-BRK-013**, V-BRK-012                                                                                 | L0, L2     | dev + live (sweep is read-only) |
+| _(ratchet only)_ the workload pair, its identities, labels, hardening, ordering                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | V-RUN-001…005, V-RUN-009, V-RUN-010, V-RUN-011                                                                          | L0, L2     | dev                             |
+| _(ratchet only)_ journal integrity, write-ahead, pipeline order and non-skippability                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | **V-BRK-006**, **V-BRK-011**, **V-BRK-014**, **V-BRK-021**                                                              | L0, L1, L2 | dev (+ overlay)                 |
+| _(ratchet only)_ reversibility beyond coverage: undo-plan correctness                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | **V-REV-003**                                                                                                           | L1, L2     | dev (+ overlay)                 |
+| _(ratchet only)_ failure isolation with the pair deployed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | **V-ISO-001**, **V-ISO-002**                                                                                            | L2         | dev                             |
+| _(ratchet only)_ the broker pipeline's own properties: every verb of the closed enum end to end, write-ahead as a read rather than a flag, novelty that cannot be switched off by omission, shadow mode that actually shadows, an identity resolved live, and the binary that ships being the one that was tested                                                                                                                                                                                                                                                                                                        | **V-BRK-022**, **V-BRK-023**, **V-BRK-024**, **V-BRK-025**, **V-BRK-026**, **V-BRK-027**                                | L1         | dev                             |
+| _(ratchet only)_ the agent↔broker seam: the idempotency key the agent computes, the single write path it is given, the identity it is told it will assume, and the keys a closed decoder accepts                                                                                                                                                                                                                                                                                                                                                                                                                         | **V-BRK-028**, **V-BRK-029**, **V-BRK-030**, **V-BRK-032**                                                              | L0, L1     | tree + dev                      |
+| _(ratchet only)_ refusal beats partial work: a permission boundary answers instead of crashing, and a snapshot-persist failure applies neither target                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | **V-BRK-018**, **V-BRK-031**                                                                                            | L1, L2     | dev                             |
+| _(ratchet only)_ reversibility beyond the undo plan: a `recreate` downgrade decided from live cluster state, and a rollback that replays the pre-state or refuses                                                                                                                                                                                                                                                                                                                                                                                                                                                        | **V-REV-010**, **V-REV-011**                                                                                            | L1, L2     | dev                             |
+| _(ratchet only)_ containment, carried in by 09 §10's phase-8 row: tier-scoped reads, attenuation, `(tier, scope)` cardinality, developer-team placement, a controller that mints no RBAC, and egress default-deny under Workload Identity                                                                                                                                                                                                                                                                                                                                                                                | **V-CTN-001**, **V-CTN-012**, **V-CTN-015**, **V-CTN-016**, **V-CTN-017**, **V-CTN-020**                                | L0, L2, L3 | dev + live                      |
+| _(ratchet only)_ a test-only RBAC grant never leaves `dev/`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | **V-CTN-037**                                                                                                           | L0         | tree                            |
+| _(ratchet only)_ the CRD contract and the brake: shipped CRs validate and re-apply clean, V-1…V-10 each carry a field-path negative, no authority fields in the schema, the `ActionRecord` lifecycle, the brake fail-closed on an unreadable `FleetFreeze`, 06 §4.4's nine rules as one decision function that refuses on absent input, `C-UC`'s preconditions as one shared predicate, an input source that tells the truth about what it could not read, row 7 asked about the action, no `*_ALLOW_ALL_USERS` escape hatch anywhere in the tree, and an `apply-change` skill that describes the write path that exists | V-CTR-001, V-CTR-002, V-CTR-003, V-CTR-006, V-CTR-007, V-CTR-014, V-CTR-015, V-CTR-016, V-CTR-017, V-CTR-018, V-CTR-020 | L0, L1, L2 | tree + dev                      |
+| _(ratchet only)_ the measurement suite — the checks that keep the other checks honest: ID coverage both ways, the coverage and assertion ratchets, no reuse or renumbering, classifier/corpus sync, deferrals that name a blocker, no silently-skipped BLOCKING-ALWAYS run, the uncovered list published, the gated-rule set defined once, and negative-control discipline                                                                                                                                                                                                                                               | **V-MET-001…009**, **V-MET-013**, **V-MET-014**                                                                         | L0         | tree                            |
+| _(carried, not ratchet)_ the inter-agent credential seam                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | **V-CMP-006**                                                                                                           | L0, L2, L3 | dev + live                      |
 
 "dev" is `gke-scratch-kube-agents-dev` — the only destructive-test target. "live" is
 `platform-agent-host`, verification only. "overlay" is the test-only tenant grant of planning
@@ -387,12 +401,13 @@ V-CTN, V-BRK, V-REV, V-ISO, V-ADV and V-MET are **BLOCKING-ALWAYS**: not one of 
 as `deferred` (09 §9.6). V-GAT, V-RUN, V-CTR and V-CMP are BLOCKING-PHASE and gate the milestone.
 
 **The required set: 82.** `dev/tests/phase-ratchet-is-asserted.py --phase 9` derives it as 80 (09
-§10, every row ≤ 9, each suite expanded against §6 and filtered by its member's own due date) ∪ 39
+§10, every row ≤ 9, each suite expanded against §6 and filtered by its member's own due date) ∪ 82
 (this table). Exactly two IDs come from the table alone: **V-GAT-002**, which Accept (b) binds and
 which no §10 suite name reaches at phase 9, and **V-CMP-006**, which has **no 09 §6 catalog row at
-all** — see [the catalog finding](#the-catalog-gap-this-unit-found) below. The table still
-**under-names** the ratchet by 43, which is the arm's property 4 and is still red on purpose:
-completing it is `P9-T11c‴`.
+all** — see [the catalog finding](#the-catalog-gap-this-unit-found) below. **The table no longer
+under-names the ratchet**: property 4 is silent, and the union is now the table plus nothing, which
+is the state planning defect 4 asked for — a phase file that names every obligation it is closed
+against, rather than one that names the subset 07 chose to call "Accept".
 
 ---
 
@@ -5859,16 +5874,18 @@ implementation, and `T11b`–`T11d` ship no change to `T11a`'s arm.
 | **P9-T11b-2** ✅ | V-ISO-006 — CH6, journal down → broker refuses to execute. Arm B was bound to the ID it already proved, and **arm C was added**: CH6's last clause — restoring the journal restores service _without a broker restart_ — separates a broker that refuses from one that bricks, and arm B passes either way. Cross-reference added in `chaos-suite.sh` instead of a second, thinner CH6.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | 03 §4.1; 06 §4.4 row 3    | `dev/verify/broker-refuse-l2.sh` · `dev/verify/chaos-suite.sh`           | **V-ISO-006**                                                                                      | small  |
 | **P9-T11c′** ✅  | **This file's own acceptance table demanded 16 IDs 09 §6 dates after phase 9** — V-BRK-001/003/004/016, V-GAT-019/021/022, V-REV-002/005/006/007/008/009, V-RUN-006/013/014. The required set is the UNION of §10 and this table, so the table kept every one of them required. Retargeted to the phase §6 names, recorded in their own `##` section so the record and the requirement do not share a parse. Required **98 → 82**, not green **34 → 22**, BLOCKING-ALWAYS **19 → 11**. Split out of `T11a-3` under Guardrail 9: that unit moved the measurement, this one moves the verdict.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | 09 §6; 09 §10             | `docs/build/phase-9.md`                                                  | V-MET-013                                                                                          | small  |
 | **P9-T11c″** ✅  | **The control was coupled to the document it audits, in three places, and read 20/20 throughout.** `stage()`'s `name_in_table` PREPENDED instead of replacing; three victim pools filtered on _"not named by the table"_; and the under-naming case staged the live document. Completing the table took the control from 20/20 to **unstageable**. Repaired: one `victim_pools()` definition site for staging and audit, a stageability guard that re-runs the pools against a complete and a retargeted table on every ordinary run, and `_control_against()` in the unit suite so both future trees are committed cases rather than a `/tmp` probe ([[LSN-053]]). Check-only, no artifact change — and **landed before `T11c′`**, which is the unit's own finding. Followed by **`P9-T11c″-b`**: the repair had the same coupling in it, one level up — both future-tree fixtures and the guard derived their hypothetical table from the live one, so `T11c′` collapsed it. Fixed to derive from 09 alone, detector lifted out and tested; sweep 6/6 → **9/9**. | [[LSN-053]]               | `dev/tests/phase-ratchet-is-asserted.py`, `dev/test_invariants_gate.py`  | V-MET-013, V-MET-014                                                                               | small  |
-| **P9-T11c‴**     | **Complete the acceptance table**: name the 43 IDs 09 §10 requires at phase 9 that it never mentions (V-BRK-018, V-BRK-022…032, V-CTN-001/012/015/016/017/020/037, V-CTR-001/002/003/006/007/014/015/016/017/018/020, V-MET-001…009/013/014, V-REV-010/011). Does not move the required set — every one is already in the ratchet — but closes property 4, which is the phase file's own completeness. Was blocked on `T11c″`; unblocked 2026-07-31.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | 09 §10                    | `docs/build/phase-9.md`                                                  | V-MET-013                                                                                          | small  |
+| **P9-T11c‴** ✅  | **The acceptance table named 39 of the 82 obligations the phase is closed against.** The other 43 (V-BRK-018, V-BRK-022…032, V-CTN-001/012/015/016/017/020/037, V-CTR-001/002/003/006/007/014/015/016/017/018/020, V-MET-001…009/013/014, V-REV-010/011) reached the required set only through 09 §10's suite names, so the phase file both was and was not the record of what it owed. Added as eight themed _(ratchet only)_ rows, each carrying its level and target from 09 §6. **The required set did not move — 82 before, 82 after** — which is the whole point: nothing was added to the gate, the gate was written down. Property 4 silent; the union is now the table plus nothing.                                                                                                                                                                                                                                                                                                                                                                      | 09 §10                    | `docs/build/phase-9.md`                                                  | V-MET-013                                                                                          | small  |
 | **P9-T11f**      | **17 of the 251 check IDs 09 mentions have no 09 §6 catalog row** — 14 V-CMP (001–008, 010, 011, 020–023, prose bullets in §5) and **V-MET-010/011/012** (§14). §6 calls itself _"the authoritative index"_; a check absent from it is a check no suite-name expansion can reach, and both suites are in the phase-8 ratchet row. Three are BLOCKING-ALWAYS. All three are implemented — the hole is in the index, not the work — but a gate that cannot see a BLOCKING-ALWAYS check cannot fail on it. Give each a §6 row with its level and due phase.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | 09 §5, §6, §14            | `docs/design/09-verification-and-validation.md`                          | V-MET-010, V-MET-013                                                                               | medium |
 | **P9-T11g**      | **Ten required checks have no row in `verification/results.csv` at all** — V-CTN-001/004/012/015/016/017, V-CTR-003, V-MET-001/008/009; nine are BLOCKING-ALWAYS and every one entered the ratchet at **phase 8**, which closed. They are asserted (VAP tests, `dev/tests/` lints, `invariants-gate.py` arms) but never recorded, and 09 §9.4 makes the record the evidence. **Runs to be made, not rows to be written.** Must land before the milestone.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | 09 §9.4; 09 §10           | `verification/results.csv` · `dev/verify/verify-phase9.sh`               | V-CTN-001/004/012/015/016/017, V-CTR-003, V-MET-001/008/009                                        | medium |
 | ~~**P9-T11c**~~  | **Dissolved — `T11c′` landed.** All four of its check IDs carry 09 §6 Phase **10**: V-BRK-001 (pod-token direct write), V-BRK-004 (stripped `action-id` — its `vap-agent-scope`-class policy does not exist until P10-T1), V-BRK-016 (post-execution journal failure — the write lands, which phase 9 has no authority to do) and V-REV-009 (destructive-undo gate). None is a phase-9 obligation; each is a phase-10 one, and `T11c′` removed them from the required set on 2026-07-31. Do not build.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 03 §4.1, §4.3, §6, §11    | —                                                                        | all four → phase 10                                                                                | —      |
 | **P9-T11d**      | The workload pair at L2: two workloads owner-referenced and no third, non-interchangeable identities, the four labels selectable, both startup orders converging, agent-without-broker failing closed, CR deletion removing workloads and sparing SAs, and one fleet-wide Socket Mode connection.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 08 §2.4, §7; 05 §8, C15   | `dev/verify/` (new pair suite) · `dev/L2-CHAIN.txt`                      | V-RUN-001, V-RUN-002, V-RUN-004, V-RUN-005, V-RUN-009 (V-RUN-006 → phase 10, V-RUN-014 → phase 15) | large  |
 
-**Resume at `harness-run`, unit `P9-T11c‴`** (this section was written at `T11a` and said
-`P9-T11a`; `T11a`, `T11a-2`, `T11a-3`, `T11b-1`, `T11b-2`, `T11c″` and `T11c′` have closed since). The "fourteen" this
+**Resume at `harness-run`, unit `P9-T11f`** (this section was written at `T11a` and said
+`P9-T11a`; `T11a`, `T11a-2`, `T11a-3`, `T11b-1`, `T11b-2`, `T11c″`, `T11c′` and `T11c‴` have closed
+since). The "fourteen" this
 section counted was itself a measurement of the uncorrected arm. After `T11a-3` fixed the derivation
-and `T11c′` fixed the table, the figure is **22 not green of 82 required, 11 BLOCKING-ALWAYS** — and
+and `T11c′`/`T11c‴` fixed the table, the figure is **22 not green of 82 required, 11
+BLOCKING-ALWAYS** — and
 ten of the twenty-two are checks that are asserted somewhere and recorded nowhere (`P9-T11g`), not
 checks that are unbuilt.
 
@@ -6614,7 +6631,9 @@ three units for one paste:
 - **`P9-T11c″`** repaired the control, check-only, green on today's tree and on two synthesised
   future ones. ✅ — **landed before this unit**, which is the point: a check split off under
   Guardrail 9 goes _first_, or its only available tree is the red one.
-- **`P9-T11c‴`** completes the table, against a control that can already stage on it. Unblocked.
+- **`P9-T11c‴`** completes the table, against a control that can already stage on it. ✅ — landed
+  the same day, and the control that `T11c″` had already taught to stage a complete table stayed at
+  20/20 through it, which is what a correctly-ordered split buys.
 
 That is the price of the guardrail, and the guardrail is right: the alternative is a session in
 which the control was edited to accommodate the artifact and nobody can afterwards say which one was
@@ -6665,7 +6684,83 @@ so this unit's artifact change cannot quietly re-couple the control to the docum
 `T11c″`'s two committed future-tree tests were written against **exactly this artifact** and were
 green before it landed — which is the whole reason it could land at all.
 
-**Resume at `harness-run`, unit `P9-T11c‴`** — complete the acceptance table with the 43 IDs 09 §10
-requires at phase 9 that it never names. Then `P9-T11f` (the 17 unindexed checks), `P9-T11g` (the
-ten unrecorded phase-8 ratchet members), and `P9-T11d` (the workload pair at L2, which must start by
-pointing the fixture at an agent image this repository actually builds).
+`P9-T11c‴` — the other half of this correction — is written up immediately below.
+
+---
+
+## P9-T11c‴ — the forty-three the table owed and never named · 2026-07-31 · ✅
+
+The third rung of the ladder, and the one the other two were built to make safe. `T11a-3` corrected
+the derivation, `T11c″` decoupled the control from the document, `T11c′` removed the sixteen IDs the
+table demanded too early — and this unit adds the forty-three it required and never wrote down.
+
+### What the defect actually was
+
+Not a missing check. Every one of the forty-three was **already required and already gated**: they
+reach the required set through 09 §10's suite names, which is why the arm's `required` figure is
+unchanged at **82** across this commit. What was missing is the phase file's own account of them. A
+required set assembled as `ratchet ∪ table` where the table names 39 of 82 leaves the phase file
+saying two different things about what the phase owes, depending on which half you read — and the
+half a human reads is the table.
+
+That is planning defect 4 restated at the level of the artifact rather than the plan. §4's original
+form was _"Accept (a)–(e) does not cover the ratchet"_, answered by adding explicit ratchet-only
+rows. The answer was right and incomplete: nine rows were added and forty-three obligations were
+not, and nothing measured the gap until `T11a` built property 4.
+
+### What changed
+
+Eight themed `_(ratchet only)_` rows, each carrying the level and target 09 §6 gives its members:
+
+| Row                                             | IDs    | Level      |
+| ----------------------------------------------- | ------ | ---------- |
+| the broker pipeline's own properties            | 6      | L1         |
+| the agent↔broker seam                           | 4      | L0, L1     |
+| refusal beats partial work                      | 2      | L1, L2     |
+| reversibility beyond the undo plan              | 2      | L1, L2     |
+| containment, carried in by 09 §10's phase-8 row | 6      | L0, L2, L3 |
+| a test-only RBAC grant never leaves `dev/`      | 1      | L0         |
+| the CRD contract and the brake                  | 11     | L0, L1, L2 |
+| the measurement suite                           | 11     | L0         |
+| **total**                                       | **43** |            |
+
+Themed rather than one flat list, because the rows are what a reader uses to understand what the
+phase is closed against, and forty-three IDs in one cell is a list, not an account. The grouping is
+09 §6's own — each row's members share a spec section and a level.
+
+**`V-MET-001…009` is written as an ellipsis run**, which `parse_acceptance_table` expands
+deliberately (the same handling `V-RUN-001…005` already relies on). The bold markers sit outside the
+run — `**V-MET-001…009**`, never `**V-MET-001**…**009**` — because the expansion regex matches
+`V-MET-001…009` as one token and the second form silently contributes only the two endpoints. Seven
+IDs would have vanished into a formatting choice, and property 4 would have gone on naming them
+while the table appeared to carry them.
+
+### What did not change, and why that is the result
+
+|                                  | Before | After  |
+| -------------------------------- | ------ | ------ |
+| required (ratchet ∪ table)       | 82     | **82** |
+| not green                        | 22     | **22** |
+| of those, BLOCKING-ALWAYS        | 11     | **11** |
+| table under-names the ratchet by | 43     | **0**  |
+| table names                      | 39     | **82** |
+
+A unit whose entire artifact is documentation and whose gate figures are unchanged is exactly what
+"the table was short and the ratchet was not" predicts. If any of the first three numbers had moved,
+the claim would have been false and the paste wrong.
+
+### Gate
+
+`python3 dev/tests/phase-ratchet-is-asserted.py --phase 9 --negative-control` → **20/20**, rc 0 —
+unchanged through the artifact edit, which is `T11c″`'s stageability guard doing the job it was built
+for. The live arm → rc 1, **22 of 82 not green, 11 BLOCKING-ALWAYS, property 4 silent**; rc 1 is
+correct and expected, and it is properties 2 and 3 that keep it red — those are `P9-T11g`'s and
+`P9-T11d`'s work, not this unit's.
+
+`dev/tests/invariants-gate.py` **31/31** · `python3 -m unittest discover dev` **OK** · full
+`dev/L0-CHAIN.txt` clean · prettier over the branch diff.
+
+**Resume at `harness-run`, unit `P9-T11f`** — the 17 check IDs 09 mentions with no §6 catalog row,
+three of them BLOCKING-ALWAYS. Then `P9-T11g` (the ten unrecorded phase-8 ratchet members) and
+`P9-T11d` (the workload pair at L2, which must start by pointing the fixture at an agent image this
+repository actually builds).
