@@ -66,9 +66,14 @@ found in this pass are ordering or scoping problems that would otherwise have su
 > §6.15 for the fourteen V-CMP, three appended to the §8 V-MET table), and this time the required set
 > **did** move: **82 → 91** required, not green **22 → 26**, BLOCKING-ALWAYS not green **11 → 13** —
 > and the unit's own V-MET-010 run then closed one of the four it exposed, ending at **25 not green,
-> 12 BLOCKING-ALWAYS**. **Resume at `harness-run`, unit `P9-T11g`** — now thirteen checks with no
-> green results row, eleven of them runs to record and two (V-CMP-011, V-CMP-020) genuinely unbuilt.
-> Then `T11d`. Do not re-run `harness-milestone` until the T11 ladder is green.
+> 12 BLOCKING-ALWAYS**. **`P9-T11g-1` is done** — and it found that `T11g`'s premise was wrong.
+> `T11g` was scheduled as _"eleven runs to record and two builds"_; auditing all thirteen showed
+> **one run and twelve builds**. Only V-MET-012 was implemented-and-unrecorded. `T11g-1` recorded it,
+> built the CRD-authority lint that closes **V-CTR-003 and V-CMP-011** together, and split the rest
+> into `T11g-2/3/4`: **25 → 22 not green, 12 → 11 BLOCKING-ALWAYS**. **Resume at `harness-run`, unit
+> `P9-T11g-2`** — the V-MET measurement family (V-MET-001, 002, 008, 009), all four BLOCKING-ALWAYS
+> and none of them implemented. Then `T11g-3`, `T11g-4`, `T11d`. Do not re-run `harness-milestone`
+> until the T11 ladder is green.
 
 **Phase 9 is OPEN.** It was stopped here on 2026-07-30 by an explicit human instruction, after the
 unit `P9-T9b-5b-0-ii-a`, and **not** because the phase closed. The same person lifted the stop later
@@ -155,9 +160,10 @@ observations against the etcd 05 §1.2 puts the journal in, refreshed on a 60 s 
 field has no watch behind it; 8/8 mutants caught. B-006 is closed on both halves.
 `P9-T9c` was the last task in the ladder as planned — and the ladder was not the whole phase.
 `harness-milestone` ran, stopped at §1, and opened **`P9-T11a`–`d`**; `T11a`, `T11b-1`, `T11a-2`,
-`T11b-2`, `T11a-3`, `T11c″`, `T11c′`, `T11c‴` and `T11f` all closed the same day, and `T11c′` opened
-four more — `T11c″` (which it then had to wait for), `T11c‴`, `T11f` and `T11g`. **Resume at
-`harness-run`, unit `P9-T11g`**
+`T11b-2`, `T11a-3`, `T11c″`, `T11c′`, `T11c‴`, `T11f` and `T11g-1` all closed the same day, and
+`T11c′` opened four more — `T11c″` (which it then had to wait for), `T11c‴`, `T11f` and `T11g`.
+`T11g` then split at ORIENT into `T11g-1`–`-4`, because its audit found twelve builds where the row
+had promised eleven runs. **Resume at `harness-run`, unit `P9-T11g-2`**
 (§ Milestone audit 2026-07-31, at the end of this file).
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
@@ -5891,17 +5897,23 @@ implementation, and `T11b`–`T11d` ship no change to `T11a`'s arm.
 | **P9-T11c″** ✅  | **The control was coupled to the document it audits, in three places, and read 20/20 throughout.** `stage()`'s `name_in_table` PREPENDED instead of replacing; three victim pools filtered on _"not named by the table"_; and the under-naming case staged the live document. Completing the table took the control from 20/20 to **unstageable**. Repaired: one `victim_pools()` definition site for staging and audit, a stageability guard that re-runs the pools against a complete and a retargeted table on every ordinary run, and `_control_against()` in the unit suite so both future trees are committed cases rather than a `/tmp` probe ([[LSN-053]]). Check-only, no artifact change — and **landed before `T11c′`**, which is the unit's own finding. Followed by **`P9-T11c″-b`**: the repair had the same coupling in it, one level up — both future-tree fixtures and the guard derived their hypothetical table from the live one, so `T11c′` collapsed it. Fixed to derive from 09 alone, detector lifted out and tested; sweep 6/6 → **9/9**. | [[LSN-053]]               | `dev/tests/phase-ratchet-is-asserted.py`, `dev/test_invariants_gate.py`       | V-MET-013, V-MET-014                                                                               | small  |
 | **P9-T11c‴** ✅  | **The acceptance table named 39 of the 82 obligations the phase is closed against.** The other 43 (V-BRK-018, V-BRK-022…032, V-CTN-001/012/015/016/017/020/037, V-CTR-001/002/003/006/007/014/015/016/017/018/020, V-MET-001…009/013/014, V-REV-010/011) reached the required set only through 09 §10's suite names, so the phase file both was and was not the record of what it owed. Added as eight themed _(ratchet only)_ rows, each carrying its level and target from 09 §6. **The required set did not move — 82 before, 82 after** — which is the whole point: nothing was added to the gate, the gate was written down. Property 4 silent; the union is now the table plus nothing.                                                                                                                                                                                                                                                                                                                                                                      | 09 §10                    | `docs/build/phase-9.md`                                                       | V-MET-013                                                                                          | small  |
 | **P9-T11f** ✅   | **17 of the 251 check IDs 09 mentions have no 09 §6 catalog row** — 14 V-CMP (001–008, 010, 011, 020–023, prose bullets in §5) and **V-MET-010/011/012** (§14). §6 calls itself _"the authoritative index"_; a check absent from it is a check no suite-name expansion can reach, and both suites are in the phase-8 ratchet row. Three are BLOCKING-ALWAYS. All three are implemented — the hole is in the index, not the work — but a gate that cannot see a BLOCKING-ALWAYS check cannot fail on it. Catalogued: a new **§6.15** for the fourteen V-CMP, three rows appended to the §8 V-MET table, and every §5/§14 prose bullet de-bolded so each ID keeps one definition site. Required **82 → 91**, not green **22 → 26**, BLOCKING-ALWAYS not green **11 → 13**; the unit's own V-MET-010 run then closed one, ending at **25 / 12**.                                                                                                                                                                                                                      | 09 §5, §6, §14            | `docs/design/09-verification-and-validation.md` · `docs/build/phase-9.md`     | V-MET-010, V-MET-013                                                                               | medium |
-| **P9-T11g**      | **Thirteen required checks have no green `verification/results.csv` row** — the original ten with no row at all (V-CTN-001/004/012/015/016/017, V-CTR-003, V-MET-001/008/009; nine BLOCKING-ALWAYS, every one in the ratchet since **phase 8**, which closed), plus the three `T11f` made visible and did not itself close (V-CMP-011, V-CMP-020, V-MET-012; one BLOCKING-ALWAYS). Eleven are **runs to be made, not rows to be written** — asserted by VAP tests, `dev/tests/` lints and `invariants-gate.py` arms, and 09 §9.4 makes the record the evidence; V-MET-012 is `dev/tests/spec-ids.py` and passes today. **V-CMP-011** (the CRD schema holds no prohibited authority field name and sets no `x-kubernetes-preserve-unknown-fields` on `spec`) and **V-CMP-020** (each tier's `skills/` set matches its 02 §2.1 row exactly) have **no implementation anywhere in the tree** — those two are builds. Must land before the milestone.                                                                                                                  | 09 §9.4; 09 §10           | `verification/results.csv` · `dev/verify/verify-phase9.sh` · new `dev/` lints | V-CTN-001/004/012/015/016/017, V-CTR-003, V-MET-001/008/009, V-CMP-011, V-CMP-020, V-MET-012       | medium |
+| ~~**P9-T11g**~~  | **Split at ORIENT on 2026-07-31 into `-1`…`-4`, because its premise was wrong.** The row promised _"eleven runs to be made, not rows to be written"_ and two builds. Auditing all thirteen against the tree found **one run and twelve builds**: only V-MET-012 was implemented-and-unrecorded. It also found a **fourteenth** not-green BLOCKING-ALWAYS check, **V-MET-002**, which this file names nowhere and which reaches the required set only through `T11c‴`'s themed `V-MET-001…009` ratchet row. Full audit in § `P9-T11g-1` below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 09 §9.4; 09 §10           | —                                                                             | → `T11g-1`…`T11g-4`                                                                                | —      |
+| **P9-T11g-1** ✅ | **The audit, the re-split, and the one artifact that closed two IDs.** Established for each of the thirteen whether its property is asserted anywhere: V-MET-012 is `dev/tests/spec-ids.py` and green on every run (recorded); everything else is unbuilt. Built `dev/tests/crd-has-no-authority-fields.py`, which closes **V-CTR-003 and V-CMP-011** together because 06 §10 states them in one sentence — five properties (no prohibited name at any depth under `spec`, no `x-kubernetes-preserve-unknown-fields` at any depth, a non-vacuity floor, **the Go source's JSON tags** since no PR check regenerates the CRD, and the L2 V-9 pruning arm still existing), `--negative-control` 6/6. Required 91 unchanged; not green **25 → 22**, BLOCKING-ALWAYS **12 → 11**.                                                                                                                                                                                                                                                                                      | 06 §10; 09 §6.5, §6.15    | `dev/tests/crd-has-no-authority-fields.py` · `dev/L0-CHAIN.txt`               | V-CTR-003, V-CMP-011, V-MET-012                                                                    | medium |
+| **P9-T11g-2**    | **The measurement family — four BLOCKING-ALWAYS checks about the check set itself, none implemented.** **V-MET-001** (every §6 ID exists in the implemented suite, and every implemented test declares a known ID), **V-MET-002** (full coverage of the load-bearing suites: every normative requirement owned by V-CTN/V-BRK/V-REV/V-ISO/V-ADV maps to ≥1 check, and an unmapped one fails the build), **V-MET-008** (coverage elsewhere may not fall below the §8.1 baseline), **V-MET-009** (the uncovered list is _published_ on every full run, not merely counted). One tool over `verification/traceability.yaml`, not four. `dev/tests/spec-ids.py` already proves §6 ↔ the specs; this is §6 ↔ the implemented suite, which is the direction nothing checks. Note **V-MET-002 was not in `T11g`'s thirteen** — it is the fourteenth, found by this audit.                                                                                                                                                                                                 | 09 §8, §8.1, §9.4         | `verification/traceability.yaml` · new `dev/tests/` tool · `dev/L0-CHAIN.txt` | V-MET-001, V-MET-002, V-MET-008, V-MET-009                                                         | large  |
+| **P9-T11g-3**    | **The three remaining L0 arms, all unbuilt.** **V-CMP-020** — each tier's `skills/` set matches its 02 §2.1 row exactly, nothing missing and nothing borrowed from another tier. **V-CTN-004** (L0 arm) — the reader SA holds no write verb on anything, universally; parse the rendered `Role`/`ClusterRole`, allow-list the verbs, never deny-list them (09 §11.4: a deny-list once admitted `impersonate`). **V-CTN-017** (L0 arm) — the controller mints no RBAC; parse its ClusterRole rather than reading it. The two V-CTN arms are BLOCKING-ALWAYS and their L2 halves belong to `T11g-4`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | 02 §2.1; 03 §11; 08 §7    | new `dev/tests/` lints · `dev/L0-CHAIN.txt`                                   | V-CMP-020, V-CTN-004 (L0), V-CTN-017 (L0)                                                          | medium |
+| **P9-T11g-4**    | **The L2 containment arms on `gke-scratch-kube-agents-dev`.** **V-CTN-001** (reader SA reads only within tier scope; `no` in any other namespace/cluster/project), **V-CTN-012** (a `Role`/`ClusterRole` exceeding its tier template is denied by `vap-agent-scope` — the corpora at `examples/gitops-repo/policy/tests/vap_actor_{positive,negatives}.yaml` exist and **nothing on either chain runs them**, which is the finding), **V-CTN-015** (a duplicate `(tier, scope)` `Agent` CR is rejected), **V-CTN-016** (developer-team `metadata.namespace` must equal `spec.scope.namespace`), plus the L2 halves of **V-CTN-004** and **V-CTN-017**. All BLOCKING-ALWAYS. New `dev/verify/` script + `dev/L2-CHAIN.txt` line; L3 arm of V-CTN-001 is a deferral, not a pass.                                                                                                                                                                                                                                                                                     | 03 §4.2, §11; 08 §7       | new `dev/verify/*-l2.sh` · `dev/L2-CHAIN.txt`                                 | V-CTN-001, V-CTN-004 (L2), V-CTN-012, V-CTN-015, V-CTN-016, V-CTN-017 (L2)                         | large  |
 | ~~**P9-T11c**~~  | **Dissolved — `T11c′` landed.** All four of its check IDs carry 09 §6 Phase **10**: V-BRK-001 (pod-token direct write), V-BRK-004 (stripped `action-id` — its `vap-agent-scope`-class policy does not exist until P10-T1), V-BRK-016 (post-execution journal failure — the write lands, which phase 9 has no authority to do) and V-REV-009 (destructive-undo gate). None is a phase-9 obligation; each is a phase-10 one, and `T11c′` removed them from the required set on 2026-07-31. Do not build.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 03 §4.1, §4.3, §6, §11    | —                                                                             | all four → phase 10                                                                                | —      |
 | **P9-T11d**      | The workload pair at L2: two workloads owner-referenced and no third, non-interchangeable identities, the four labels selectable, both startup orders converging, agent-without-broker failing closed, CR deletion removing workloads and sparing SAs, and one fleet-wide Socket Mode connection.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 08 §2.4, §7; 05 §8, C15   | `dev/verify/` (new pair suite) · `dev/L2-CHAIN.txt`                           | V-RUN-001, V-RUN-002, V-RUN-004, V-RUN-005, V-RUN-009 (V-RUN-006 → phase 10, V-RUN-014 → phase 15) | large  |
 
-**Resume at `harness-run`, unit `P9-T11g`** (this section was written at `T11a` and said
-`P9-T11a`; `T11a`, `T11a-2`, `T11a-3`, `T11b-1`, `T11b-2`, `T11c″`, `T11c′`, `T11c‴` and `T11f` have
-closed since). The "fourteen" this
+**Resume at `harness-run`, unit `P9-T11g-2`** (this section was written at `T11a` and said
+`P9-T11a`; `T11a`, `T11a-2`, `T11a-3`, `T11b-1`, `T11b-2`, `T11c″`, `T11c′`, `T11c‴`, `T11f` and
+`T11g-1` have closed since). The "fourteen" this
 section counted was itself a measurement of the uncorrected arm. After `T11a-3` fixed the derivation,
-`T11c′`/`T11c‴` fixed the table and `T11f` catalogued the seventeen, the figure is **25 not green of
-91 required, 12 BLOCKING-ALWAYS** — and thirteen of the twenty-five are `P9-T11g`'s, of which eleven
-are asserted somewhere and recorded nowhere and only **two** (V-CMP-011, V-CMP-020) are unbuilt.
+`T11c′`/`T11c‴` fixed the table, `T11f` catalogued the seventeen and `T11g-1` closed three, the
+figure is **22 not green of 91 required, 11 BLOCKING-ALWAYS**. Eleven of the twenty-two are the
+`T11g` ladder's (`-2`, `-3`, `-4`), six are `T11d`'s V-RUN pair, and the sentence this section used
+to carry — _"eleven are asserted somewhere and recorded nowhere and only two are unbuilt"_ — was
+false. `T11g-1` audited it: **one** was asserted and unrecorded, twelve were unbuilt.
 
 ---
 
@@ -6905,6 +6917,130 @@ because nothing was added: seventeen definitions moved from prose into rows.
 full `dev/L0-CHAIN.txt` clean · prettier over the whole `origin/main...HEAD` changed set.
 
 **Resume at `harness-run`, unit `P9-T11g`** — now thirteen required checks with no green results row.
-Eleven are runs to be made; **V-CMP-011** and **V-CMP-020** are builds, and they are the only two
-obligations of this phase with no implementation at all. Then `P9-T11d` (the workload pair at L2,
-which must start by pointing the fixture at an agent image this repository actually builds).
+~~Eleven are runs to be made; **V-CMP-011** and **V-CMP-020** are builds, and they are the only two
+obligations of this phase with no implementation at all.~~ **Wrong, and `T11g-1` found out how
+wrong: one run and twelve builds.** This sentence was written from the ratchet's `hint` column, which
+lists files that _name_ a check ID — and the column's own footer says it is unweighted and that a
+file naming an ID may be disclaiming it. Nine of the eleven were named only by parser fixtures, by
+`binding.md`, or by the skills that talk about the check. See § `P9-T11g-1`. Then `P9-T11d` (the
+workload pair at L2, which must start by pointing the fixture at an agent image this repository
+actually builds).
+
+---
+
+## P9-T11g-1 — the audit that found twelve builds where the row promised eleven runs · 2026-07-31 · ✅
+
+### What the row said, and what was actually there
+
+`P9-T11g` was scheduled by `T11f` with this text:
+
+> Eleven are **runs to be made, not rows to be written** — asserted by VAP tests, `dev/tests/` lints
+> and `invariants-gate.py` arms, and 09 §9.4 makes the record the evidence.
+
+That is a claim about the tree, and it was made without reading it. ORIENT read it instead. For each
+of the thirteen the question was the same — _name the artifact that asserts this property_ — and the
+answers were:
+
+| Check                           | Asserted by                                                                                                             | Verdict |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------- |
+| V-MET-012                       | `dev/tests/spec-ids.py`, two arms, green on the L0 chain since PR #29                                                   | **run** |
+| V-CTR-003, V-CMP-011            | nothing                                                                                                                 | build   |
+| V-CMP-020                       | nothing                                                                                                                 | build   |
+| V-MET-001, V-MET-008, V-MET-009 | nothing — their only hits are `binding.md`, the milestone/improve skills, and ratchet-parser fixtures                   | build   |
+| V-CTN-004, V-CTN-012, V-CTN-017 | nothing on either chain. No RBAC-parsing lint exists at L0; the VAP corpora that would cover 012 are **run by nothing** | build   |
+| V-CTN-001, V-CTN-015, V-CTN-016 | nothing — no `dev/verify/*-l2.sh` names or asserts any of the three                                                     | build   |
+
+**One run. Twelve builds.** And a fourteenth check nobody had listed: **V-MET-002**, BLOCKING-ALWAYS,
+not green, named nowhere in this file. It reaches the required set only through `T11c‴`'s themed
+`V-MET-001…009` ratchet row — which is the row working correctly, and is precisely why a themed row
+needs a task to answer it.
+
+### Where the wrong premise came from
+
+The ratchet arm prints a `hint: named by …` column, and the eleven-runs sentence is what that column
+looks like if you read it as coverage. The column's own footer says not to:
+
+> The `hint` column is UNWEIGHTED and no property reads it. A file naming a check ID may be
+> disclaiming it: `pair_netpol_test.go:35` names V-ISO-001/002 to say they are L2 and belong
+> elsewhere. Only a results row is evidence (09 §9.4).
+
+Every one of the nine mis-scheduled checks is a case of that. `V-CTN-004`'s hint names
+`.claude/harness/verify-phase.workflow.js` (a workflow that would run the check if it existed),
+`dev/test_invariants_gate.py` (a fixture string), and
+`examples/gitops-repo/policy/tests/vap_actor_negatives.yaml` — a corpus that is real, correct, and
+**executed by nothing**: grep finds it referenced only by `LEDGER.md`, this file, and itself.
+`V-MET-008`'s hint names `binding.md` and `harness-milestone/SKILL.md`, which are the two documents
+that _require_ the check. A check is not implemented by the sentence demanding it ([[LSN-019]]).
+
+### What was built
+
+`dev/tests/crd-has-no-authority-fields.py`, closing **V-CTR-003 and V-CMP-011 with one artifact**.
+09 states them separately — §6.5 as _"No authority fields in the CRD schema"_ citing 06 §10, §6.15 as
+_"holds none of the prohibited authority field names and sets no `x-kubernetes-preserve-unknown-fields`
+on `spec`"_ — but 06 §10 writes the property once, and V-MET-013 forbids two **definition sites** in
+09, not two IDs sharing an **implementation**. Two files reading the same YAML would give one
+sentence two chances to drift.
+
+Five properties, and three of them exist because the obvious version of this check is a grep that
+passes for the wrong reason:
+
+1. **Depth.** `spec.rbac` is the spelling review catches; `spec.security.rbac` is the one that merges.
+   The walk covers the whole `spec` subtree, 271 property names deep.
+2. **The schema stays closed.** One `x-kubernetes-preserve-unknown-fields` anywhere under `spec` and
+   pruning stops — at which point property 1 is asserting that a name is absent from a schema that no
+   longer decides what is present. Scoped to the Agent CRD deliberately: `actionrecords.yaml`
+   legitimately carries two, for the opaque payload and patch.
+3. **Non-vacuity.** The `spec` node must exist, be `type: object`, and carry at least 50 property
+   names. Six absent strings pass just as happily against a file the walk failed to read ([[LSN-035]]).
+4. **The Go source.** `config/crd/bases` is generated and **no PR check runs `make manifests` and
+   diffs the result** — verified, not assumed. So between adding `ScopeOverride string` to a type and
+   remembering to regenerate, properties 1–3 read the old bytes and pass. This is the arm with the
+   most reach and it is the one a grep-shaped check would not have.
+5. **The L2 arm still exists.** This check asserts a shape and cannot observe pruning;
+   `webhook-negatives-l2.sh`'s V-9 arm applies `spec.rbac` against a real API server and asserts it
+   comes back gone. Deleting the half that proves the mechanism must not be silent.
+
+The reader is a dependency-free structural walk, for the reason `spec-ids.py` and `yamlsubset.py`
+each have one: L0 installs nothing. `yamlsubset` itself cannot read a CRD — controller-gen folds Go
+doc comments into multi-line plain scalars, outside its accepted subset — and widening a parser two
+corpus lints depend on, to read a seventh file, is a change to **their** blast radius, not to this
+check's. A line the walk cannot classify raises rather than being skipped, because a walk that
+silently stops covering a region still returns a plausible-looking list of keys.
+
+### What moved
+
+|                           | before |  after |
+| ------------------------- | -----: | -----: |
+| required                  |     91 |     91 |
+| green                     |     66 |     69 |
+| not green                 |     25 | **22** |
+| of those BLOCKING-ALWAYS  |     12 | **11** |
+| property 4 (under-naming) |      0 |      0 |
+
+Three closed: V-MET-012 (BLOCKING-ALWAYS, a row it had been owed since PR #29), V-CTR-003 and
+V-CMP-011 (built here). The required set did not move, which is correct — nothing was added to the
+gate and nothing retargeted out of it.
+
+### Gate
+
+`python3 dev/tests/crd-has-no-authority-fields.py` → rc 0 · `--negative-control` → **6/6**, rc 0.
+Two of the six mutations differ only in depth (`properties.rbac` vs
+`properties.security.properties.actorServiceAccountName`), because a control that asks only _"did
+anything fail"_ cannot tell whether the nested arm executes at all ([[LSN-035]]) — and nested is the
+arm that would rot.
+
+`python3 dev/tests/negative-controls-name-their-rule.py` → PASS, and the new control is in its corpus.
+`python3 dev/tests/spec-ids.py` → rc 0, 8/8, **251 check IDs unchanged**.
+`dev/tests/invariants-gate.py` **31/31** · `python3 -m unittest discover dev` **414 OK** ·
+full `dev/L0-CHAIN.txt` clean · prettier over the whole `origin/main...HEAD` changed set.
+`phase-ratchet-is-asserted.py --phase 9` → rc 1 (**22 of 91 not green, 11 BLOCKING-ALWAYS**, property
+4 silent); rc 1 is correct and expected, and properties 2 and 3 are `T11g-2/3/4`'s and `T11d`'s work.
+`--negative-control` → **20/20**, rc 0.
+
+### Resume
+
+**`harness-run`, unit `P9-T11g-2`** — the measurement family: V-MET-001, **V-MET-002**, V-MET-008,
+V-MET-009. Four BLOCKING-ALWAYS checks about the check set itself, none implemented, and one tool
+over `verification/traceability.yaml` rather than four. Then `T11g-3` (V-CMP-020 and the L0 arms of
+V-CTN-004/017), `T11g-4` (the L2 containment arms on `gke-scratch-kube-agents-dev`, including a
+runner for the VAP corpora that nothing runs today), then `P9-T11d`.

@@ -110,6 +110,20 @@ python3 dev/tests/pause-is-not-scale-to-zero.py --negative-control
 python3 dev/tests/scope-label-single-sourced.py
 python3 dev/tests/scope-label-single-sourced.py --negative-control
 
+# V-CTR-003 and V-CMP-011, which are 06 §10's one sentence read from the contract side and the
+# completeness side: the `Agent` CRD schema declares none of `rbac`, `rules`, `riskClass`,
+# `scopeOverride`, `brokerServiceAccountName` or `actorServiceAccountName`, and sets no
+# `x-kubernetes-preserve-unknown-fields` under `spec`. 03 §4.2 mints authority from (tier, scope) and
+# never from the CR, and each of those six is the obvious field to add the first time someone needs an
+# exception. Two arms carry the weight. Depth: `spec.rbac` is the spelling review catches and
+# `spec.security.rbac` is the one that merges. And the GO SOURCE, because config/crd/bases is
+# generated and no PR check regenerates it -- between adding the field and running `make manifests`
+# the schema on disk keeps passing. The pruning itself is behaviour, proven at L2 by
+# webhook-negatives-l2.sh's V-9 arm, which this check asserts still exists.
+# `--negative-control` is the `¬` of 09 §6; two of its six mutations differ only in depth.
+python3 dev/tests/crd-has-no-authority-fields.py
+python3 dev/tests/crd-has-no-authority-fields.py --negative-control
+
 # --- the broker pair (P9-T7b) ---------------------------------------------------------------
 # V-BRK-012's source half: one broker per Agent CR, and no way to render half a pair. 08 §2.4 makes
 # the broker per-agent because the actor credential IS the boundary -- a broker serving two agents
