@@ -437,6 +437,10 @@
     "dev/verify/broker-execute-l2.sh": [
       "$target_exists"
     ],
+    "dev/verify/broker-refuse-l2.sh": [
+      "$a_status",
+      "$b_status"
+    ],
     "dev/verify/egress-enforcement-l2.sh": [
       "169.254.169.252/32",
       "169.254.169.254/32"

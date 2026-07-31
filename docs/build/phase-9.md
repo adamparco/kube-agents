@@ -60,7 +60,12 @@ PROVEN**, and **V-BRK-006** (L2 clause) and **V-REV-001** (n=1) are scored `pass
 `verification/results.csv`. Its section is at the end of this file. It cost three defects that had
 been invisible for five phases; see [[LSN-060]] and [[LSN-061]].
 
-**Resume at `P9-T9b-5b-ii`.** The remaining Phase 9 ladder is `5b-ii` → `5c` →
+**`P9-T9b-5b-ii-a` landed 2026-07-31** — `dev/verify/broker-refuse-l2.sh` is **14/14, rc 0,
+PROVEN**: V-BRK-018 at L2 and the journal half of acceptance (d). `T9b-5b-ii` was split at SELECT
+into `ii-a` (the two refusals) and `ii-b` (V-REV-003 and V-BRK-021's surface scan); its section is
+at the end of this file.
+
+**Resume at `P9-T9b-5b-ii-b`.** The remaining Phase 9 ladder is `5b-ii-b` → `5c` →
 `T8b-4b-ii-2b-ii`, then `harness-milestone`.
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
@@ -4698,3 +4703,84 @@ by digest via `dev/cluster/reload-images.sh`.
   with P10-T1. `actor-overlay.sh`'s four write negatives remain absolute for that reason.
 - **`status.approvals` is still written by nobody**, because its principal — the ChatOps gateway SA —
   does not exist yet. `mergeOwnedStatus` is written to leave it alone when it does.
+
+---
+
+## P9-T9b-5b-ii-a — V-BRK-018 at L2, and the two objects that were not the grant
+
+**Landed 2026-07-31.** `dev/verify/broker-refuse-l2.sh` is **14/14, rc 0, PROVEN** on
+`gke-scratch-kube-agents-dev`. V-BRK-018 is scored `pass` at L2 and so is the journal half of
+Phase 9 acceptance (d). Two rows in `verification/results.csv`.
+
+### The split, recorded at SELECT
+
+`T9b-5b-ii` carried three subjects, the same way `T9b-5b` carried three before it: a snapshot-failure
+refusal, a journal-unavailable refusal, and V-BRK-021's surface scan. The first two are the same
+fixture with a different fault and read back through the same journal; the third is a scan of the
+served HTTP surface and shares nothing with them but the pod. So:
+
+| Unit            | What it is                                                                                             | Checks                                  | Level |
+| --------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------- | ----- |
+| **T9b-5b-ii-a** | `broker-refuse-l2.sh` — two refusals: a split snapshot and a journal revoked out from under the broker | V-BRK-018 (L2), Accept (d) journal half | L2    |
+| **T9b-5b-ii-b** | V-REV-003 (no generatable undo plan ⇒ reclassified gated) and V-BRK-021's L2 surface scan              | V-REV-003, V-BRK-021 (L2)               | L2    |
+
+### How V-BRK-018 is made non-vacuous under shadow mode
+
+The row says a snapshot-persist failure must refuse and leave **neither target applied**. Everything
+in Phase 9 is a server-side dry run, so neither target was ever going to exist and the two NotFounds
+that look like the assertion prove nothing. The property is carried by the **journal** instead:
+
+- a submission that gets **past** step 3 leaves a write-ahead record naming both real targets, with
+  captured pre-state;
+- a submission stopped **at** step 3 leaves exactly one record — `rejection.go`'s — whose
+  `spec.targets` is the single `refused-before-target-resolution` sentinel, with no `spec.preState`
+  and no `status.applied`.
+
+Those two worlds are distinguishable in the API server, which is where A-6 asserts. A-7's NotFound
+pair stays as the cheap direct half and does not carry the row.
+
+Finding the record needed a second decision: a refusal reply carries **no `actionId`**, so there is
+no handle to look one up by. The suite lists ActionRecords and matches `spec.trace.traceId`, which
+`rejection.go`'s `traceFromBody` copies off the caller's own envelope — and **A-2 asserts the
+missing `actionId`**, so the method's own premise is under test rather than assumed.
+
+### The fault that would not stage
+
+Scenario B revokes `actionrecords` from the actor while the broker is running. The first
+implementation stripped the two objects `actor-grant-platform.yaml.template` renders — the actor
+ClusterRole and the per-tier namespaced Role — and the authorizer still said `yes` after 60s. The
+suite deferred, correctly, rather than submitting into a healthy journal and reporting a 503 that was
+never coming.
+
+The cluster also carried `Role/kubeagents-broker-operations` and
+`RoleBinding/platform-agent-broker-operations` in `kubeagents-system`, granting the same verbs.
+**No current template renders either** — they are residue from before the split moved the namespaced
+verbs onto the per-tier Role, and `kubectl apply` does not delete what it stopped rendering. So the
+strip is now **discovery-based**: walk the actor's ClusterRoleBindings and RoleBindings, take every
+`roleRef` that carries `actionrecords`, snapshot each object, strip it. Three objects on this
+cluster; zero would be a deferral, because nothing to revoke is no fault to stage. Restore is the
+snapshots **and** a re-seed, in that order — a re-seed alone re-renders only the shipped objects, so
+an unowned object stripped here would have stayed stripped.
+
+Filed as a backlog finding rather than fixed here: the residue itself is a provisioning-lifecycle
+problem (a `teardown_NN` reaps what its own `provision_NN` created, never what a previous generation
+of the template created), and the live install should be **checked** for the same objects.
+
+### `verify-phase9.sh` section E was a false pass
+
+The Accept (d) arm tested `[ -f dev/verify/broker-execute-l2.sh ]` and, on finding it, reported the
+journal half proven — on the strength of a comment claiming that file "carries the journal-unavailable
+refusal", which it does not and never did. [[LSN-060]]'s shape through a different door: an artifact
+detector that names the wrong artifact is a detector of nothing. It now requires the file to exist,
+to appear in a live line of `dev/L2-CHAIN.txt`, **and** runs it.
+
+Retargeting a detector in the same unit that builds the artifact it detects is **Guardrail 9
+adjacent and deliberately on the right side of it**: the old arm passed unconditionally, the new one
+can fail, and no assertion was weakened to make anything green.
+
+### What this unit does not claim
+
+Row 3's **auto-pause**. `brake.go` sets `AutoPause: true` and the 503 the caller receives says "and
+the agent is being paused", but nothing consumes the field and `status.broker.journalReachable` has
+no writer. Row 9's auto-pause is wired, which is what makes this a gap rather than unbuilt scope.
+Backlog finding, 2026-07-31; not asserted by any arm here.

@@ -83,7 +83,29 @@ turns out to be wrong is closed with a reason, not recycled.
 
 **Last drained:** 2026-07-30
 
-_(empty — B-004 and B-005 drained 2026-07-30; see `## Scheduled`)_
+### 06 §4.4 row 3 promises an auto-pause the broker never performs
+
+- **Kind:** finding
+- **Where:** `k8s-operator/internal/broker/brake.go:456` and `:547` (`AutoPause: true`), no consumer in `internal/broker/pipeline/`, `server.go` or `cmd/broker/`; `status.broker.journalReachable` has no writer (`agent_controller.go:402`)
+- **Why it matters:** `broker-refuse-l2.sh` proved the journal-unavailable refusal live on 2026-07-31 (503, `journal-unavailable`, nothing journaled, nothing executed) — the refusal half of row 3 is real. The **pause** half is not: the brake sets `AutoPause: true` and the reply the caller receives says _"and the agent is being paused"_, but nothing reads the field and nothing writes the status condition, so an agent whose journal has failed keeps being asked and keeps refusing one submission at a time. Row 9's auto-pause **is** wired (`verify/driver.go:400` → `escalate.Recorder.Pause`), which is what makes this a gap rather than unbuilt scope. The user-visible message asserting a thing that does not happen is the sharp end: a caller reading it will not go looking for the pause that never came.
+- **Priority:** normal
+- **Added:** 2026-07-31
+
+### A retired grant's residue on the scratch cluster still confers the journal verbs
+
+- **Kind:** finding
+- **Where:** `gke-scratch-kube-agents-dev` — `Role/kubeagents-broker-operations` and `RoleBinding/platform-agent-broker-operations` in `kubeagents-system`; no current template renders either (`k8s-operator/scripts/broker-operations-grant.yaml.template` is a ClusterRole only, and `agent-identity.yaml.template` binds only to that ClusterRole)
+- **Why it matters:** those two objects grant the actor `actionrecords get/list/watch/create` and `actionrecords/status get/update/patch` — the same verbs the per-tier Role grants — from an object **no template owns**. They are residue from before the split moved the namespaced verbs onto the per-tier Role, and `kubectl apply` does not delete what it stopped rendering. It was invisible until a suite tried to **revoke** the grant: stripping both shipped objects left the authorizer still saying `yes`. Three consequences worth scheduling against, in order of severity: (1) an unowned RBAC object cannot be revoked by re-provisioning, so any future narrowing of the actor grant is silently a no-op on this cluster; (2) **the live `platform-agent-host` install should be checked for the same residue** — verification only, no destructive action; (3) `teardown_NN_*.sh` reaps what its `provision_NN_*.sh` created, which by construction is never the objects a _previous generation_ of the template created, so this class of residue has no owner at all. The immediate hole is closed — `broker-refuse-l2.sh` now discovers grant holders by walking the bindings instead of naming objects — but that is a test working around the residue, not the residue being gone.
+- **Priority:** normal
+- **Added:** 2026-07-31
+
+### A negative control cannot see the probe→suite line-tag contract
+
+- **Kind:** finding
+- **Where:** `dev/verify/broker-refuse-l2.sh --negative-control` and `dev/verify/fixtures/broker_refuse_probe.py`; the same shape applies to `broker_probe.py` / `broker_execute_probe.py` and their suites
+- **Why it matters:** the control synthesises the probe's transcript, so it asserts the suite's arms against tuples the suite itself spells — and passes 25/25 while the real probe emits **different line tags** than the ones the suite reads. That is exactly what happened on 2026-07-31: `emit_reply(scenario, …)` tagged the reply line `split-snapshot` where `field()` looks for `submit`, the control was green, and the live run deferred with "the probe emitted no trace id". The suite deferring rather than passing is correct behaviour and is why this is a finding and not an incident. But it is [[LSN-060]] arriving through a third door, and the cheap mechanization is a no-cluster contract check: the set of tags the probe can emit must equal the set the suite reads. Both facts are greppable from the two files, so this is an L0 line, not a cluster run.
+- **Priority:** normal
+- **Added:** 2026-07-31
 
 ---
 

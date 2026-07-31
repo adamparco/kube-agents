@@ -254,11 +254,41 @@ bash dev/verify/actor-overlay-admission-l2.sh gke-scratch-kube-agents-dev
 # record until export confirms, so a suite that tore its namespace down would hang forever on its own
 # evidence.
 #
-# WHAT IT DOES NOT CLAIM, so the next reader does not go looking: V-BRK-018 and V-REV-003 are fault
-# injection and belong to P9-T9b-5b-ii; V-REV-002 needs an undo executed; V-BRK-019's field-manager
-# string is unreadable from a shadow because a server-side dry-run persists no managedFields. The
-# suite's own header carries the full accounting.
+# WHAT IT DOES NOT CLAIM, so the next reader does not go looking: V-REV-003 is fault injection and
+# belongs to P9-T9b-5b-ii-b; V-REV-002 needs an undo executed; V-BRK-019's field-manager string is
+# unreadable from a shadow because a server-side dry-run persists no managedFields. V-BRK-018 is the
+# next line's. The suite's own header carries the full accounting.
 bash dev/verify/broker-execute-l2.sh gke-scratch-kube-agents-dev
+
+# V-BRK-018 at L2 and the journal half of Phase 9 acceptance bullet (d) — the same submission path as
+# the line above, run at the two ways it can refuse. A two-target envelope with one unreadable target
+# (06 §4.4 row 4: the snapshot is all-or-nothing), and an ordinary envelope submitted while the
+# actor's actionrecords grant is revoked out from under the running broker (row 3: nothing executes
+# unjournaled).
+#
+# It goes AFTER broker-execute-l2.sh, and the dependency is diagnostic rather than mechanical. Both
+# suites need the same fixtures, but this one's whole subject is a refusal — so if the accepting path
+# is broken, every arm here goes red for a reason that has nothing to do with refusing, and the run
+# above is what tells the two apart. Ordered this way, a red here is a red about V-BRK-018.
+#
+# IT IS THE MOST DESTRUCTIVE LINE IN THIS FILE and the guard is the reason it is allowed to be:
+# for the ~35 seconds of scenario B it strips `actionrecords` from the actor's ClusterRole AND its
+# namespaced Role — both, because the shipped ClusterRole grants the read cluster-wide and stripping
+# only the Role leaves the brake's probe satisfied and stages no fault at all — which leaves the
+# deployed broker unable to journal anything. The grant is restored from an EXIT trap by re-seeding
+# the identity, so a killed run repairs itself. On the live install this would be a test blinding the
+# fleet's audit trail; the anchored gke-scratch-* case in the suite is what stops that, and it must
+# stay anchored.
+#
+# It leaves both namespaces and the rejection ActionRecord standing, for broker-execute-l2.sh's
+# reason ([[LSN-045]]).
+#
+# WHAT IT DOES NOT CLAIM: the AUTO-PAUSE half of 06 §4.4 row 3. `brake.go` sets `AutoPause` on that
+# branch and nothing consumes it — no reader in internal/broker/pipeline/, server.go or cmd/broker/,
+# and status.broker.journalReachable has no writer at all. Filed as a finding; the refusal half, which
+# is the part that fails closed, is fully asserted. Rows 1, 2, 5, 6 and 9 belong elsewhere and the
+# suite's header says where.
+bash dev/verify/broker-refuse-l2.sh gke-scratch-kube-agents-dev
 
 # --- Phase 9's gate ------------------------------------------------------------------------------
 # verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the

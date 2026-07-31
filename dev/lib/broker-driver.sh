@@ -88,6 +88,22 @@ BROKER_DRIVER_PROBE_NAME="broker_probe.py"
 # not — `broker_probe.py` targets its own namespace and ignores this.
 BROKER_DRIVER_TENANT_NS="${BROKER_DRIVER_TENANT_NS:-}"
 
+# WHAT ELSE THE PROBE IS TOLD (P9-T9b-5b-ii-a)
+#   Newline-separated `NAME=VALUE`, appended to the pod's env and empty by default. It exists
+#   because `broker_refuse_probe.py` runs the SAME probe twice against two different cluster states
+#   and has to be told which run it is on — a knob that is genuinely the caller's, not the driver's.
+#
+#   Additive rather than a replacement for the fixed list above, and that is the point: every
+#   variable a probe needs to reach the broker at all is derived from the rendered Deployment (P6),
+#   and a caller able to override those could hand the pod an endpoint the controller never
+#   rendered and get a green run against a broker nobody deployed. This list is read AFTER them and
+#   cannot displace them — a duplicate key in a Kubernetes env list is a validation error, so an
+#   attempt to shadow one fails loudly at apply time instead of quietly at the door.
+#
+#   `BROKER_DRIVER_TENANT_NS` stays a named variable rather than folding into this. It has three
+#   callers and a documented meaning; demoting it to a string in a list would make it unfindable.
+BROKER_DRIVER_EXTRA_ENV="${BROKER_DRIVER_EXTRA_ENV:-}"
+
 # broker_driver_use_probe <path-relative-to-repo-root>
 #   Both halves at once. rc 1 if the file is not there, which is the whole reason this is a function
 #   and not two assignments: a typo'd path would otherwise surface as a pod that exits 2 with
@@ -219,6 +235,40 @@ broker_driver_run() {
     return 1
   fi
 
+  # `BROKER_DRIVER_EXTRA_ENV`, rendered. Validated rather than interpolated blind: the heredoc below
+  # is unquoted, so a value carrying a `"` would close the YAML string and a value carrying a `$`
+  # would be expanded by the shell before the API server ever saw it. Both produce a pod that is
+  # wrong in a way the logs do not explain, so both are refused here with the offending line named.
+  local extra_yaml="" kv
+  while IFS= read -r kv; do
+    case "$kv" in '' | \#*) continue ;; esac
+    case "$kv" in
+      [A-Za-z_]*=*) ;;
+      *)
+        echo "broker_driver_run: BROKER_DRIVER_EXTRA_ENV line is not NAME=VALUE: $kv" >&2
+        return 1
+        ;;
+    esac
+    case "${kv%%=*}" in
+      *[!A-Za-z0-9_]*)
+        echo "broker_driver_run: BROKER_DRIVER_EXTRA_ENV name is not an env identifier: ${kv%%=*}" >&2
+        return 1
+        ;;
+    esac
+    case "${kv#*=}" in
+      *['"$\`']*)
+        echo "broker_driver_run: BROKER_DRIVER_EXTRA_ENV value for ${kv%%=*} carries a quote, dollar or backslash;" >&2
+        echo "  the pod manifest is a shell heredoc and cannot carry one safely." >&2
+        return 1
+        ;;
+    esac
+    extra_yaml="$extra_yaml
+        - name: ${kv%%=*}
+          value: \"${kv#*=}\""
+  done <<EOF
+$BROKER_DRIVER_EXTRA_ENV
+EOF
+
   $K -n "$ns" delete pod "$pod" --ignore-not-found --wait=true >/dev/null 2>&1
 
   # `restartPolicy: Never` and no retries: a probe that ran twice would present the same nonce
@@ -287,7 +337,7 @@ spec:
         - name: PROBE_DEFAULT_AUDIENCE_TOKEN_FILE
           value: /var/run/secrets/kubernetes.io/serviceaccount/token
         - name: PROBE_FOREIGN_TOKEN
-          value: "$foreign_token"
+          value: "$foreign_token"$extra_yaml
       volumeMounts:
         - name: code
           mountPath: $BROKER_DRIVER_CODE_MOUNT

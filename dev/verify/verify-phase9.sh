@@ -32,7 +32,8 @@
 #      BLOCKING-ALWAYS, which is why this section has no deferral arm that reaches a green.
 #   E. Accept (d) — pause and freeze with the inference stack down; refusal with no journal --------
 #      brake-fanout-l2.sh (V-REV-006) is the brake half and it is live. The journal-unavailable half
-#      is the broker's, and it lands with broker-execute-l2.sh; detected by artifact, like B.
+#      is the broker's: broker-refuse-l2.sh revokes the actionrecords grant out from under a running
+#      broker and reads the 503. Detected by artifact AND by chain membership, then run.
 #   F. Accept (e) — no agent identity anywhere in the fleet holds a write verb --------------------
 #      A full two-sided `auth can-i` sweep, which is actor-grant-sweep-l2.sh, T9b-5's. The L0 half —
 #      that the grant has exactly one definition site — is actor-grant-single-sourced.py in
@@ -299,14 +300,29 @@ if p1_gated E "an operator build nobody can name"; then
   run_l2 brake-fanout dev/verify/brake-fanout-l2.sh "$DEV_CTX" \
     "pause and freeze fan out to every agent in scope and take effect with the inference stack down (V-REV-006)"
 fi
-# The second half of (d) is the broker's, not the brake's, and it is the same artifact as section B.
-if [ -f "$EXEC" ]; then
-  pass "Accept (d) journal half: $EXEC exists and carries the journal-unavailable refusal (run in section B)"
-else
-  bad "Accept (d) HALF UNPROVEN: 'the broker refuses to act when the journal is unavailable' has no"
-  bad "  L2 instance. V-BRK-023 proved at L1+envtest that a Confirmer refuses all four flavours of"
-  bad "  unavailable, but nothing has yet taken the journal away from a RUNNING broker and watched it"
-  bad "  decline. That arm belongs to $EXEC (P9-T9b-5)."
+# The second half of (d) is the broker's, not the brake's: taking the journal away from a RUNNING
+# broker and watching it decline.
+#
+# THIS ARM POINTED AT THE WRONG FILE UNTIL 2026-07-31, AND PASSED. It tested `[ -f "$EXEC" ]` and
+# then asserted, in its own PASS line, that broker-execute-l2.sh "carries the journal-unavailable
+# refusal" — which that suite does not and never claimed to: it submits one envelope that WORKS and
+# says so in its own header ("Nothing here fails, on purpose"). A detector aimed at the wrong
+# artifact reads exactly like a detector that is satisfied, which is [[LSN-060]]'s shape arriving
+# through a different door. Retargeted at the suite that actually carries the property, in the same
+# unit that built it, and strengthened while it was open: existence alone was never enough, because
+# a suite in no chain line is evidence nobody gathers (section G's argument, applied here).
+REFUSE="dev/verify/broker-refuse-l2.sh"
+if [ ! -f "$REFUSE" ]; then
+  bad "Accept (d) HALF UNPROVEN: there is no $REFUSE. V-BRK-023 proved at L1+envtest that a Confirmer"
+  bad "  refuses all four flavours of unavailable, but nothing has yet taken the journal away from a"
+  bad "  RUNNING broker and watched it decline. brake-fanout-l2.sh above is the BRAKE half of (d) and"
+  bad "  does not reach the broker; broker-execute-l2.sh is the accepting path and refuses nothing."
+elif ! grep -qF "$REFUSE" dev/L2-CHAIN.txt; then
+  bad "Accept (d) journal half: $REFUSE exists but is in no live line of dev/L2-CHAIN.txt, so nothing"
+  bad "  runs it as part of an L2 run. Evidence that is not in the chain is evidence nobody gathers."
+elif p1_gated E "an operator build nobody can name"; then
+  run_l2 broker-refuse "$REFUSE" "$DEV_CTX" \
+    "the actionrecords grant is revoked out from under a RUNNING broker and it refuses 503 journal-unavailable rather than executing unjournaled; and a two-target envelope with one unreadable target applies neither (Accept d journal half, V-BRK-018)"
 fi
 
 # ==== F. Accept (e) — no agent identity anywhere in the fleet holds a write verb ====================
