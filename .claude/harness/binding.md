@@ -85,6 +85,17 @@ gap let `TestAgentsGolden` stay red for three commits (LSN-052) and a stale prem
 BLOCKING-ALWAYS check survive to a phase's final CI run (LSN-054). The two failures are the same
 shape one level apart: a green that was produced by not asking.
 
+⚠️ **`make -C k8s-operator test` needs an explicit timeout of at least 5 minutes.** Measured on the
+dev laptop, 2026-07-30, warm Go build cache: **2m09s** wall clock, of which `internal/controller` is
+116s and `internal/router` 8s; a cold cache is several minutes more. That is _just over_ the two
+minutes a caller with a default bound allows, so the command is killed a few seconds from finishing
+— and each kill abandons one etcd and one kube-apiserver **per envtest package**, because `TestMain`
+stops them after `m.Run()` returns and a `SIGKILL` never reaches that line. Thirty such orphans were
+holding 1375 MB on this machine when the leak was found (LSN-059). `make test` now sweeps them
+before it starts, so the accumulation is bounded at one run's worth however the previous run died;
+the timeout is what stops that run's worth being manufactured in the first place. `bash
+dev/reap-envtest.sh --list` reports orphans without killing anything (exit 1 if any exist).
+
 ---
 
 ## §Test

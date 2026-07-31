@@ -6,6 +6,11 @@ ROUTER_IMG ?= ghcr.io/gke-labs/kube-agents/kage-router:v0.1.0
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
+# Where the repository root is, resolved from THIS FILE's path rather than from `pwd`. Recipes that
+# shell out to `dev/` scripts need it, and deriving it from the working directory would give a
+# different answer to `make -C k8s-operator test` than to `cd k8s-operator && make test`.
+REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))..)
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -101,8 +106,28 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
+# Sweep abandoned envtest control planes (LSN-059). Fourteen `*_envtest_test.go` packages each start
+# an etcd AND a kube-apiserver and stop them in TestMain AFTER `m.Run()` returns, so any hard kill of
+# `go test` -- a caller's timeout, a `^C`, a killed background task -- skips the stop and init adopts
+# the children. Nothing reaped them: 16 pairs, 1375 MB, the oldest 31 hours old, measured on
+# 2026-07-30.
+#
+# You cannot trap a SIGKILL, so this cannot be teardown. It has to be a sweep, and it has to run
+# BEFORE the tests -- the start of the next run is the one moment guaranteed to happen after an
+# abandoned cohort exists. That is why this is a PREREQUISITE and not only a trap: the prerequisite
+# bounds accumulation at one run's worth however the previous run died, and the trap below (which
+# covers every death except SIGKILL) is the tidy half, not the load-bearing one.
+#
+# Safe to run on every test invocation because the reaper takes only `ppid == 1` processes whose
+# argv[0] is anchored at $(LOCALBIN)/k8s -- a control plane with a live parent is somebody's run in
+# flight, including a concurrent `make test`. See dev/reap-envtest.sh for both properties.
+.PHONY: reap-envtest
+reap-envtest: ## Reap envtest control planes orphaned by a killed test run.
+	@bash $(REPO_ROOT)/dev/reap-envtest.sh --dir "$(LOCALBIN)/k8s"
+
 .PHONY: test
-test: manifests generate fmt vet render setup-envtest ## Run tests.
+test: manifests generate fmt vet render setup-envtest reap-envtest ## Run tests.
+	trap 'bash $(REPO_ROOT)/dev/reap-envtest.sh --dir "$(LOCALBIN)/k8s"' EXIT INT TERM; \
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 ##@ Build

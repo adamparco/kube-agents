@@ -2736,6 +2736,8 @@ BINDING = REPO / ".claude/harness/binding.md"
 PROTOCOL = REPO / ".claude/harness/PROTOCOL.md"
 OPERATOR_TEST_CMD = "make -C k8s-operator test"
 ENVTEST_ENV = "KUBEBUILDER_ASSETS"
+OPERATOR_MAKEFILE = REPO / "k8s-operator/Makefile"
+REAPER = REPO / "dev/reap-envtest.sh"
 
 
 def _envtest_gated_packages() -> set[Path]:
@@ -3068,6 +3070,132 @@ def check_a_check_only_unit_exhibits_both_trees() -> list[str]:
     return failures
 
 
+def check_envtest_control_planes_are_reaped() -> list[str]:
+    """LSN-059: a hard-killed `go test` abandons one etcd and one kube-apiserver per package.
+
+    envtest starts a real control plane per test BINARY and stops it in `TestMain` after `m.Run()`
+    returns. A SIGKILL never reaches that line, launchd/init adopts the children, and nothing on the
+    machine ever reaps them. Measured on the dev laptop on 2026-07-30 with no test run in flight: 32
+    processes, 30 of them at `ppid=1`, holding 1375 MB, the oldest ~31 hours old.
+
+    It is a HARNESS defect and not only a test defect because the harness is the killer. A
+    time-bounded caller kills `go test`, a cohort is abandoned, the machine gets slower, a slower
+    machine is likelier to hit the same bound. LSN-058 is the standing proof that this class of
+    interference does not stay quiet.
+
+    You cannot trap a SIGKILL, so the fix is a SWEEP at the START of the next run — the one moment
+    guaranteed to happen after an abandoned cohort exists. Four things are asserted, and each covers
+    a different way the fix could be present but inert:
+
+      1. The reaper exists. Everything below is a rule about a file.
+      2. It is a PREREQUISITE of `test`, not only a trap. The prerequisite is the load-bearing half:
+         it bounds accumulation at one run's worth however the PREVIOUS run died. A trap alone
+         covers every death except the only one that causes the leak.
+      3. The trap is there too, on EXIT/INT/TERM — the tidy half, which keeps an ordinary Ctrl-C
+         from leaving a cohort behind until the next run.
+      4. `binding.md` §Build still carries the timeout the caller needs. The sweep bounds the leak
+         at one run's worth however the previous run died; it does not stop that run's worth being
+         MADE, and what makes it is a default two-minute bound around a 2m09s command. No check in
+         this tree can read the caller's timeout, so the number being written down is the most that
+         can be held — and it is worth holding, because it is the difference between a leak that is
+         cleaned up and a leak that is not created.
+      5. The two safety properties inside the reaper are intact: selection anchored at the LEFT EDGE
+         of the asset root (LSN-005's rule applied to a process — a name match would reap somebody's
+         real etcd, silently, from a Makefile) and the `ppid == 1` predicate (without it, wiring the
+         sweep into `test` makes two concurrent `make test` runs kill each other, a fix whose
+         failure mode is worse than the leak). Deleting either one leaves a script that still runs,
+         still prints, and still exits 0.
+    """
+    gated = _envtest_gated_packages()
+    if not gated:
+        return [
+            f"VACUOUS: nothing under k8s-operator/ mentions {ENVTEST_ENV}, so no test starts a "
+            f"control plane and there is nothing to leak. Either envtest was removed — retire this "
+            f"check and the Makefile wiring with it — or the assets are resolved some other way now "
+            f"and this check went quiet, which reads exactly like a pass (LSN-035, LSN-038)."
+        ]
+
+    failures = []
+
+    reaper = REAPER
+    if not reaper.exists():
+        return failures + [
+            f"{reaper.name} is gone. It is the only thing that reaps a control plane whose "
+            f"`go test` was killed before TestMain could stop it, and the {len(gated)} envtest "
+            f"packages each abandon two processes per killed run (LSN-059)."
+        ]
+
+    makefile = OPERATOR_MAKEFILE
+    mk = makefile.read_text(encoding="utf-8") if makefile.exists() else ""
+    target = re.search(r"^test:(?P<prereqs>.*)\n(?P<recipe>(?:\t.*\n)+)", mk, re.M)
+    if not target:
+        failures.append(f"{makefile.relative_to(REPO)} has no `test` target to read")
+    else:
+        if "reap-envtest" not in target.group("prereqs"):
+            failures.append(
+                f"{makefile.relative_to(REPO)}'s `test` target no longer takes `reap-envtest` as a "
+                f"prerequisite. That is the load-bearing half: it runs BEFORE the tests, which is "
+                f"the only moment guaranteed to happen after the previous run was SIGKILLed. A "
+                f"trap cannot cover the death that causes the leak (LSN-059)."
+            )
+        recipe = target.group("recipe")
+        if not re.search(r"trap\s+.*reap-envtest.*EXIT", recipe):
+            failures.append(
+                f"{makefile.relative_to(REPO)}'s `test` recipe no longer traps the reaper on EXIT. "
+                f"The before-sweep bounds the leak at one run's worth; the trap is what keeps an "
+                f"ordinary Ctrl-C from producing that run's worth in the first place (LSN-059)."
+            )
+
+    if not re.search(r"^reap-envtest:.*\n(?:\t.*\n)*\t.*reap-envtest\.sh", mk, re.M):
+        failures.append(
+            f"{makefile.relative_to(REPO)} has no `reap-envtest` target that runs "
+            f"{reaper.relative_to(REPO)}. A prerequisite naming a target that does something else "
+            f"is a green produced by not asking (LSN-059)."
+        )
+
+    body = reaper.read_text(encoding="utf-8")
+    if "$2 == 1" not in body:
+        failures.append(
+            f"{reaper.relative_to(REPO)} no longer selects on `ppid == 1`. That predicate is "
+            f"precisely and only the leak: a control plane with a live parent is somebody's test "
+            f"run in flight, including a CONCURRENT `make test`. Without it, the sweep the "
+            f"Makefile runs on every `test` kills the other terminal's suite (LSN-059)."
+        )
+    if not re.search(r"index\(\s*argv0\s*,\s*root\s*\)\s*==\s*1", body):
+        failures.append(
+            f"{reaper.relative_to(REPO)} no longer anchors its match at the LEFT EDGE of the asset "
+            f"root. A substring or name match (`pgrep etcd`) reaps the etcd somebody is running for "
+            f"real work — from a Makefile, silently, on every test run. This is LSN-005's rule "
+            f"applied to a process instead of a cluster."
+        )
+    if "REFUSING" not in body:
+        failures.append(
+            f"{reaper.relative_to(REPO)} no longer refuses any asset root. A prefix match is only "
+            f"as safe as the prefix, and `--dir /` puts every process on the machine in scope of a "
+            f"script whose job is to kill what is in scope (LSN-059)."
+        )
+
+    # The caller half. The sweep bounds the leak at one run's worth however the previous run died;
+    # it does not stop that run's worth being MADE. What makes it is a caller whose default time
+    # bound is two minutes running a command measured at 2m09s, and no check in this tree can see
+    # the caller's timeout — so what is asserted is that the number a caller needs is still written
+    # down where the caller's operator will read it.
+    binding = BINDING.read_text(encoding="utf-8") if BINDING.exists() else ""
+    build = re.search(r"^## §Build\s*$\n(?P<body>(?:(?!^## ).*\n)*)", binding, re.M)
+    if not build:
+        failures.append(f"{BINDING.relative_to(REPO)} has no §Build section to read")
+    elif not re.search(r"\btimeout\b", build.group("body"), re.I):
+        failures.append(
+            f"{BINDING.relative_to(REPO)} §Build no longer warns that "
+            f"`{OPERATOR_TEST_CMD}` must be given an explicit timeout. It was measured at 2m09s "
+            f"against a two-minute default, so a caller that does not raise the bound kills it a "
+            f"few seconds from the end and abandons a control plane per envtest package — every "
+            f"run, forever (LSN-059)."
+        )
+
+    return failures
+
+
 CHECKS = [
     ("invariant 7 — authority never precedes machinery", check_write_verbs_have_machinery),
     ("LSN-038 — the machinery probes resolve against the tree", check_machinery_probes_resolve),
@@ -3129,6 +3257,10 @@ CHECKS = [
     (
         "LSN-053 — a check split from its implementation is green on both trees",
         check_a_check_only_unit_exhibits_both_trees,
+    ),
+    (
+        "LSN-059 — a killed test run's control planes are reaped by the next one",
+        check_envtest_control_planes_are_reaped,
     ),
 ]
 
