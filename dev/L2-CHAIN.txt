@@ -290,6 +290,42 @@ bash dev/verify/broker-execute-l2.sh gke-scratch-kube-agents-dev
 # suite's header says where.
 bash dev/verify/broker-refuse-l2.sh gke-scratch-kube-agents-dev
 
+# V-REV-003 at L2 — the third outcome the pipeline has, and the only one the two lines above cannot
+# reach. broker-execute-l2.sh submits an envelope that works; broker-refuse-l2.sh submits two that
+# are refused at the door or at the journal. This one submits an envelope that is legitimate in
+# every way — real credential, well-formed body, caller in scope, every verb authorized — and is
+# PARKED anyway, because 06 §4.3.1's strategy table cannot produce an inverse for it.
+#
+# IT IS TWO SUBMISSIONS AND THE ROW IS THE DIFFERENCE BETWEEN THEM. A broker that gated everything
+# would satisfy V-REV-003's sentence perfectly and be worthless, and that is not hypothetical:
+# three places in this pipeline downgrade a plan to `none` when they meet an error, each failing
+# closed and correctly, and each would make a one-submission suite green while proving nothing
+# about reclassification. So the fault (patch an absent Deployment, whose restore step needs a
+# pre-state that does not exist) runs against a control (apply an absent ConfigMap, whose inverse
+# is a delete) over the same credential and namespace, seconds apart.
+#
+# IT IS THE ONLY LINE IN THIS FILE THAT SENDS `dryRun: false`, and that is forced rather than
+# chosen: 06 §4.2 step 6's rule is `!dryRun && !undoPlanPresent`, so a dry-run envelope SUPPRESSES
+# the no-undo-plan gate and would score this row on the brake's row 5 instead of on the rule 03
+# §4.1 names. What makes it safe is that the suite patches `spec.operations.dryRunOnly: true` onto
+# the Agent CR and READS IT BACK before submitting: `mayExecute = !env.DryRun && !shadowed(view)`
+# is a one-way composition no caller can clear, so the worst case of a broker that failed to gate
+# is a server-side dry run. A read-back that disagrees is rc 3 and nothing is submitted. On the
+# live install this would be a test reconfiguring the fleet's brake; the anchored gke-scratch-*
+# case in the suite is what stops that, and it must stay anchored.
+#
+# It goes AFTER broker-refuse-l2.sh for that line's own reason, one step further along: a gate is
+# neither an acceptance nor a refusal, so a red here is only about reclassification once both of
+# its neighbours are green. It runs in the terminal group with them — it deletes and re-applies the
+# platform-agent CR — and leaves its tenant namespace and both ActionRecords standing ([[LSN-045]]).
+#
+# WHAT IT DOES NOT CLAIM: the APPROVAL path. This parks an action and leaves it parked; approving
+# it, re-snapshotting and executing on the approval is 06 §4.3's surface, needs an ApprovalRoster
+# with a decision in it, and is V-REV-004's — Phase 10. Nor does it separately score 06 §4.4 row 5,
+# which raises the same envelope for the same reason from the brake instead of the classifier; both
+# reasons appear on the record and the suite asserts the classifier's by name.
+bash dev/verify/broker-gate-l2.sh gke-scratch-kube-agents-dev
+
 # --- Phase 9's gate ------------------------------------------------------------------------------
 # verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the
 # two suites P9-T9b-5 still owes, the L0 chain run as a file, and the whole prior ratchet through the

@@ -437,6 +437,11 @@
     "dev/verify/broker-execute-l2.sh": [
       "$target_exists"
     ],
+    "dev/verify/broker-gate-l2.sh": [
+      "$c_status",
+      "$f_decision",
+      "$f_status"
+    ],
     "dev/verify/broker-refuse-l2.sh": [
       "$a_status",
       "$b_status"

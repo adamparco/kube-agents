@@ -65,7 +65,13 @@ PROVEN**: V-BRK-018 at L2 and the journal half of acceptance (d). `T9b-5b-ii` wa
 into `ii-a` (the two refusals) and `ii-b` (V-REV-003 and V-BRK-021's surface scan); its section is
 at the end of this file.
 
-**Resume at `P9-T9b-5b-ii-b`.** The remaining Phase 9 ladder is `5b-ii-b` → `5c` →
+**`P9-T9b-5b-ii-b-1` landed 2026-07-31** — `dev/verify/broker-gate-l2.sh` is **16/16, rc 0,
+PROVEN** (negative control 39/39): **V-REV-003** at L2, the gated outcome neither the accepting line
+nor the refusing one can reach. `ii-b` was split at SELECT into `ii-b-1` (V-REV-003) and `ii-b-2`
+(V-BRK-021's surface scan **plus** the `verify-phase9.sh` §G retarget, which is a false pass today);
+its section is at the end of this file.
+
+**Resume at `P9-T9b-5b-ii-b-2`.** The remaining Phase 9 ladder is `5b-ii-b-2` → `5c` →
 `T8b-4b-ii-2b-ii` → `T9c`, then `harness-milestone`. **`P9-T9c` was appended 2026-07-31** by the
 ORIENT drain of `BACKLOG.md` B-006 — 06 §4.4 row 3's auto-pause has no consumer; its section is at
 the end of this file.
@@ -4822,3 +4828,116 @@ Row 3's **auto-pause**. `brake.go` sets `AutoPause: true` and the 503 the caller
 the agent is being paused", but nothing consumes the field and `status.broker.journalReachable` has
 no writer. Row 9's auto-pause is wired, which is what makes this a gap rather than unbuilt scope.
 Backlog finding, 2026-07-31; not asserted by any arm here.
+
+---
+
+## P9-T9b-5b-ii-b-1 — V-REV-003 at L2: the third outcome, and the control that gives it meaning
+
+**Landed 2026-07-31.** `dev/verify/broker-gate-l2.sh` is **16/16, rc 0, PROVEN** on
+`gke-scratch-kube-agents-dev`; the negative control is **39/39**. **V-REV-003** is scored `pass` at
+L2 — one row in `verification/results.csv`. `dev/L2-CHAIN.txt` gains a line and both L2 ratchet
+floors move in the same commit (`L2_CHAIN_FLOOR` 19→20, `L2_SCOPE_FLOOR` 28→29).
+
+### The ii-b split, recorded at SELECT
+
+`T9b-5b-ii-b` carried two subjects and they share almost nothing. V-BRK-021 is a scan of the served
+HTTP surface and needs only a driver pod with credentials. V-REV-003 is fault injection and needs a
+tenant namespace, a write overlay, a shadow-mode patch on the Agent CR and a two-scenario probe. A
+unit that built both would spend its fixture budget twice over on a shared pod. So:
+
+| Unit              | What it is                                                                                              | Checks    |
+| ----------------- | ------------------------------------------------------------------------------------------------------- | --------- |
+| **T9b-5b-ii-b-1** | `broker-gate-l2.sh` — an envelope with no generatable undo plan, against a control whose plan generates | V-REV-003 |
+| **T9b-5b-ii-b-2** | V-BRK-021's L2 surface scan, added to `broker-auth-l2.sh`, **plus** retargeting `verify-phase9.sh` §G   | V-BRK-021 |
+
+`ii-b-2` owns the section G retarget because that detector is a **false pass today**: its only match
+in the tree is `broker-refuse-l2.sh`'s "does not claim" note about V-BRK-021, so it reports a
+claimant that does not exist. There is no V-REV-003 detector in section G at all, so this unit had
+no Guardrail-9 entanglement — nothing here changes a check to make anything green.
+
+### Two submissions, because the row is a difference
+
+A broker that gated **everything** satisfies V-REV-003's sentence perfectly and is worthless, and
+that is not hypothetical. Three places in this pipeline downgrade a plan to `none` on an error —
+`checkRecreatable` when the reference index cannot answer, `undo.Validate` with no dry-run client
+wired, `generateOne` on a missing snapshot. Each fails closed, correctly, and each would have made a
+one-submission suite green while proving nothing about reclassification. So there are two:
+
+- **F**, `patch` an `apps/v1 Deployment` **that does not exist**. `undo.StrategyFor` maps `patch` to
+  `restore` for either existence; `execute.capture` narrows the NotFound to `Existed: false` with a
+  nil pre-state; `generateOne`'s restore arm refuses on exactly that. Gated at step 7.
+- **C**, `apply` an absent ConfigMap. Its inverse is a `delete` step, `PlanDryRunner` treats a delete
+  step's NotFound as "would apply", the plan validates, the action is accepted and shadow-executed.
+
+**D-1 asserts the difference itself**, as its own arm rather than as an inference a reader makes from
+F-1 and C-1 sitting near each other. The two failures a per-scenario arm cannot see are "everything
+is gated" and "nothing is".
+
+### Three design choices that cost something
+
+**The fault is a Deployment, not a ConfigMap.** `classify/floor.go`'s `statefulKinds` contains
+`{Group:"", Kind:"ConfigMap"}`, so any ConfigMap operation able to produce this refusal would also be
+gated by `RuleDestructiveStatefulDelete` or a neighbour. A gate with two independent causes cannot
+attribute itself to either, and **F-5** — the arm that reads `spec.classification.reasons[]` and
+requires `no-undo-plan` among them — is the one that would have gone quiet. The patch body is one
+annotation for the same reason: a patch touching `securityContext`, `serviceAccountName` or a
+pod-security label draws `RuleSecurityLoosen` in alongside it. (The live run confirms the concern is
+real: the record's reasons are `no-undo-plan novel-action undo-plan-unusable` — three rules on an
+envelope chosen to minimise them.)
+
+**The control differs in verb and kind, which is a real cost.** The tightest control would be the
+same `patch` over a Deployment that _does_ exist — one variable. Rejected on the code: that plan's
+step is a server-side apply of the captured pre-state under the **agent's** field manager, over an
+object this suite created with `kubectl apply` and therefore owned by a different one.
+`PlanDryRunner.dryRunApply` passes no force flag, so a field-ownership conflict would downgrade the
+plan and gate the control — for an artifact of how the fixture was made. A control that can gate for
+a reason unrelated to the experiment is worse than one that differs in verb. `apply` an absent
+ConfigMap is borrowed from `broker_execute_probe` instead: the one operation already **proven** to
+reach the accepting path on this cluster, which is the point of it being a control.
+
+**The envelope sends `dryRun: false`, and this is the unit's one sharp edge.** 06 §4.2 step 6's rule
+is `UndoPlanGateApplies(dryRun, present) = !dryRun && !present` — **a dry run suppresses the
+no-undo-plan gate**, deliberately, and `pipeline.go` step 4 feeds it the envelope's own value rather
+than the effective one for that reason. A `dryRun: true` submission would still come back gated, via
+the brake's row 5 (`BrakeRuleUndoPlanUnusable`), and the suite would be scoring V-REV-003 on a rule
+03 §4.1 does not name. Sending false also makes "never auto-executes" a real request: the caller is
+asking the broker to execute, and the only thing between the ask and a write is the gate.
+
+What keeps it safe is **structural, not a promise**. The suite patches
+`spec.operations.dryRunOnly: true` onto the Agent CR and **reads it back from the API server** before
+either submission; `mayExecute = !env.DryRun && !shadowed(view)` is a one-way composition no caller
+can clear. A read-back that disagreed would have been rc 3 with nothing submitted. Because the broker
+starts from a CR carrying no `spec.operations` at all, the suite also waits **three brake cache TTLs
+(15s)** so the first envelope cannot be answered from a view filled before the patch landed. Phase 9's
+shape — "no write authority anywhere; the broker runs every action in dry-run" (07 §2) — is preserved.
+
+### What the suite states it does not claim
+
+- **The fault target's continued absence is over-determined.** Shadow mode alone produces it, and so
+  does the gate, and the two are indistinguishable from outside. "Never auto-executes" is carried by
+  **F-6** — no `status.applied`, no `spec.preState` — which is a claim about how far the _pipeline_
+  got and is false for any broker that reached step 8. F-7 is kept as the cheap direct half because a
+  gated action that created its target is a live safety defect worth a line.
+- **The approval path is not exercised.** This parks an action and leaves it parked. 06 §4.3's
+  surface needs an ApprovalRoster with a decision in it — Phase 10, V-REV-004.
+- **`status.operations.dryRunOnly` is not read, because nothing writes it.** `OperationsStatus`
+  exists in the API type and no controller populates it — the same gap `status.broker.journalReachable`
+  has. The read-back is against `spec`, which is also what `pipeline.shadowed` consults.
+- **06 §4.4 row 5 is not separately scored.** Both paths raise the same envelope and both reasons land
+  on the record; F-5 asserts the classifier's rule by name rather than the brake's absence.
+
+### P1 refused the first run, correctly
+
+The first live attempt failed at P1: the deployed operator was `dev-0ea4235-dirty`, two commits
+behind a tree at `9cb7465`. Neither commit touched Go — the binary was almost certainly identical —
+and P1 refused to guess anyway, which is the whole design. `dev/cluster/reload-images.sh all` rebuilt
+and deployed by digest; the scored run is at `dev-9cb7465-dirty-1785488736` on **both** pods.
+
+### A finding, not this unit's
+
+`kubeagents-router` is in `CrashLoopBackOff` on the scratch cluster —
+`missing required --project-id / KAGE_PROJECT_ID` — and has been since before this unit: every prior
+ReplicaSet is `0/0 created`. It is scratch-cluster configuration drift, not a regression this unit
+caused and not something any L2 chain line asserts. Recorded in the ledger's findings; it needs a
+ruling before the Phase 9 milestone, because a milestone run on a cluster with a dead router should
+say so out loud rather than not notice.

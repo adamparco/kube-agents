@@ -83,7 +83,20 @@ turns out to be wrong is closed with a reason, not recycled.
 
 **Last drained:** 2026-07-31
 
-_(empty — B-006, B-007 and B-008 drained 2026-07-31; see `## Scheduled`)_
+### `kubeagents-router` has been in CrashLoopBackOff on the scratch cluster for at least four days
+
+- **Kind:** finding
+- **Where:** `deploy/kubeagents-router` on `gke-scratch-kube-agents-dev`; `k8s-operator/cmd/router/main.go:71`; whatever provisioning step is supposed to set `KAGE_PROJECT_ID`
+- **Why it matters:** the pod dies on `missing required --project-id / KAGE_PROJECT_ID` and every
+  ReplicaSet back to the deployment's creation is `0/0 created`, so the router has **never** run on
+  this cluster. Nothing in `dev/L2-CHAIN.txt` asserts router readiness, which is why four days
+  passed without a red line — `reload-images.sh all` reports it as a NOTE and returns rc 5, and rc 5
+  is not a value anything reads. Two questions for the drain: whether the missing variable is a
+  scratch-cluster provisioning gap or a defect in the deployment the operator ships (**the live
+  install should be looked at, read-only, for the same thing**), and whether "the ChatOps front door
+  is up" belongs in the L2 chain before the Phase 9 milestone runs on this cluster.
+- **Priority:** normal
+- **Added:** 2026-07-31
 
 ---
 
