@@ -419,3 +419,29 @@ python3 dev/tests/check-ids-have-implementations.py
 # renumbered ID, and a second `unimplemented:` row smuggled past the ceiling. The fixtures are read
 # out of the tree (`_a_required_green`), not listed, so the control cannot go stale against it.
 python3 dev/tests/check-ids-have-implementations.py --negative-control
+
+# --- V-MET-009: the uncovered requirement list is published, not merely counted -------------------
+# 09 §8 says "every normative requirement in 01-08 maps to at least one check ID", and until
+# `verification/requirements.yaml` that sentence had no denominator in the tree. The file often
+# mistaken for one, `verification/traceability.yaml`, maps the 177 bullets of the six spec
+# Verification sections; that is V-MET-011's property over a different and much smaller population.
+# So 09 §8.1's "roughly 45% uncovered" was a percentage with no list behind it -- the exact shape
+# V-MET-009 exists to forbid.
+#
+# WHY BOTH BASELINES ARE RECORDED. §8.1's audit is reproducible for 02 (148 published, 147 by these
+# rules) and is NOT uniformly reproducible: 78 for 05 against ~204, "96 (groups)" for 06 against
+# ~374. That audit grouped some documents and enumerated others, so the spec's numbers and this
+# enumeration are different populations. Both are recorded in `verification/coverage.yaml` -- the
+# audit asserted cell-for-cell against the spec so it cannot drift, the enumeration's own count
+# beside it -- because V-MET-008's ratchet needs a baseline in the units it measures in.
+#
+# `checks:` IS CURATED AND `--emit` MERGES. The enumeration is generated and must not be
+# hand-edited; the mapping is a human's answer and regenerating never discards it.
+python3 dev/tests/requirements-are-enumerated.py
+
+# Eight mutations, each naming the finding ITS property produces ([[LSN-035]]): a spec statement
+# left unenumerated, an enumerated one deleted, one silently reworded (the edit that would re-point
+# a mapping at a sentence that is gone), the uncovered list replaced by its count, the list
+# truncated, a requirement marked covered with no check behind it, the recorded §8.1 baseline edited
+# away from the spec, and a section's ordinals made non-contiguous.
+python3 dev/tests/requirements-are-enumerated.py --negative-control
