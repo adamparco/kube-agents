@@ -74,12 +74,44 @@ limitations under the License.
 // objects against a journal entry that carries no snapshot and therefore no undo plan. That is the
 // write-ahead rule failing in the only direction that matters.
 //
-// This arm makes that future fail closed instead of silently. It is deliberately a check on the
-// LABEL and not on status.phase: ActionRecord has a status subresource, so client.Create drops
-// status entirely and a freshly created record's status.phase is empty on the server no matter what
-// the caller set. journal.Labels reads the caller's phase at Create time and writes it into
-// metadata, which does survive. Reading status.phase here would have looked more correct and would
-// have been vacuous -- it is empty for every record this function will ever see.
+// This arm makes that future fail closed instead of silently.
+//
+// # The arm reads BOTH copies, and that is a correction
+//
+// It used to read the metadata LABEL alone, on a premise that was true when it was written and is
+// not true now. ActionRecord has a status subresource, so client.Create drops status entirely; at
+// the time, journal.Store.Create stopped there, and a freshly created record's status.phase was
+// empty on the server no matter what the caller set. Reading status.phase would have been vacuous.
+//
+// `304c1d5` fixed that, and fixed it correctly: 06 §4.3 makes status.phase AUTHORITATIVE and the
+// label a DERIVED INDEX, and leaving status empty inverted the two, so Create now follows itself
+// with a Status().Update. TestCreateWritesBothThePhaseAndItsLabel measures the new ground truth
+// against a real API server, which is what turned the stale premise into a red test rather than a
+// silent one.
+//
+// What the correction exposed is worse than a stale assertion. journal.Store.SetPhase writes status
+// FIRST and the label SECOND, and says so: the label write is "best-effort ordering, never
+// best-effort truth ... the reconciler repairs the label if this second write is lost". So there is
+// a window -- and, if the second write is lost, an unbounded one -- in which status.phase is
+// Rejected and the label still reads Executing. An arm reading the label alone reads the
+// non-authoritative copy and ADMITS the action. A fail-open window inside a fail-closed arm.
+//
+// So the arm reads both and refuses on either:
+//
+//   - DIVERGENCE is a refusal in its own right. When the authoritative copy and its index disagree
+//     there is no single answer to "what phase is this record in", and the write-ahead rule does not
+//     recognise "probably Executing" any more than it recognises "probably journaled". Refusing is
+//     also strictly more than picking the authoritative copy would be: it fails closed on the
+//     SetPhase window in BOTH directions, including the one where the label is ahead of status.
+//   - Past that, the agreed phase must be Executing or unset. Empty is still allowed on both copies
+//     together -- journal.Labels omits the label when the phase is unset and Create returns before
+//     the status write, so "no phase at all" is a shape a caller can legitimately produce, and it is
+//     the two-empties case rather than a half-written record.
+//
+// Nothing here trusts one copy over the other, which is deliberate: the reason to read status.phase
+// is that 06 §4.3 makes it authoritative, and the reason to keep reading the label is that this arm
+// is the last thing standing between a parked record and a live mutation. Requiring both costs one
+// extra assertion; choosing between them would trade one of these guarantees for the other.
 package writeahead
 
 import (
@@ -166,10 +198,18 @@ func (c *Confirmer) ConfirmDurable(ctx context.Context, actionID string) error {
 			"%w: the record at %s/%s carries spec.actionId %q, not %q -- the derived name and the content disagree, so this is some other action's journal entry",
 			ErrNotDurable, c.Namespace, journal.RecordName(actionID), ar.Spec.ActionID, actionID)
 	}
-	if phase := ar.Labels[journal.StatusLabel]; phase != "" && phase != string(agentv1alpha1.PhaseExecuting) {
+	// The phase arm. Both copies, and the disagreement between them is its own refusal -- see the
+	// package doc for why neither one alone is enough.
+	statusPhase, labelPhase := string(ar.Status.Phase), ar.Labels[journal.StatusLabel]
+	if statusPhase != labelPhase {
+		return fmt.Errorf(
+			"%w: the record for %s carries status.phase %q and the %s label %q -- the authoritative phase and its index disagree, so there is no phase this record is in and executing against it would be a guess",
+			ErrNotDurable, actionID, statusPhase, journal.StatusLabel, labelPhase)
+	}
+	if statusPhase != "" && statusPhase != string(agentv1alpha1.PhaseExecuting) {
 		return fmt.Errorf(
 			"%w: the durable record for %s is in phase %q, not %q -- executing against it would apply changes the record does not describe",
-			ErrNotDurable, actionID, phase, agentv1alpha1.PhaseExecuting)
+			ErrNotDurable, actionID, statusPhase, agentv1alpha1.PhaseExecuting)
 	}
 	return nil
 }

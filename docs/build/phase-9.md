@@ -22,17 +22,31 @@ found in this pass are ordering or scoping problems that would otherwise have su
 
 ---
 
-## ⛔ STOPPED OPEN — read this before resuming
+## ▶️ RUNNING AGAIN, STILL OPEN — read this before resuming
 
-**Phase 9 is OPEN.** The harness was stopped here on 2026-07-30 by an explicit human instruction,
-after the unit `P9-T9b-5b-0-ii-a`, and **not** because the phase closed. Nothing halted, nothing is
-red, no check is deferred.
+**Phase 9 is OPEN.** It was stopped here on 2026-07-30 by an explicit human instruction, after the
+unit `P9-T9b-5b-0-ii-a`, and **not** because the phase closed. The same person lifted the stop later
+the same day — _"run the harness until completion, start with the failed PR #83"_ — which also
+cleared the one thing that had gone red in the interim.
+
+**What went red, and what cleared it.** PR #83's first CI run turned **V-BRK-023** (L1,
+BLOCKING-ALWAYS) red: `TestCreateDropsStatusAndKeepsThePhaseLabel` asserted a premise about
+`client.Create` that a later commit correctly made false. That was an open halt, and a halt is
+cleared by a human, never by the harness. The instruction above is the clearance; the fix is
+`P9-T9b-5b-0-ii-a-fix`, in which `writeahead.Confirmer`'s phase arm reads **both** `status.phase` and
+its label and refuses their divergence as a state of its own. Full narrative in the Halt row of
+[`LEDGER.md`](LEDGER.md) and in `verification/results.csv` rows 146 (the fail) and 147 (the
+correction). Nothing is red now, nothing is deferred.
 
 The `phase-9-a-real-caller-at-the-door` branch was pushed and merged so that a large body of
 verified work would not sit stranded on a branch. **A merged phase branch is the normal signal that
 a phase closed, and here it means nothing of the kind.** `harness-milestone` was deliberately not
 invoked, so the 09 §10 phase ratchet and the `L2_CHAIN_FLOOR` lowering are both unmoved and both
 unearned. Do not back-fill them.
+
+An **improvement pass is due before the next unit**: `binding.md` §Thresholds schedules one _"after
+any halt is cleared"_. It has [[LSN-054]] and [[LSN-055]] queued, and LSN-054 is a correction to
+[[LSN-052]]'s proposed mechanization rather than an addition to it.
 
 **Resume at `P9-T9b-5b-0-ii-b`** — its section below states what it owes. In one sentence: three
 read-only per-tier actor templates carrying the READ half of 06 §2.2 ∪ §2.2.1 (profiles of 83 / 89 /
@@ -4397,3 +4411,107 @@ the namespace-scoped tier as a ClusterRole; and a copy losing its wrong-scope va
 | **V-BRK-013** | L0    | `pass`  | strictly more asserted; 20/20 control; green on today's tree **and** on 5b-0-ii-b's tree |
 
 Still blocked on 5b-0-ii-b: **V-BRK-006** (L2) and **V-REV-001**.
+
+---
+
+### P9-T9b-5b-0-ii-a-fix — the phase arm reads both copies (halt cleared)
+
+**Out of sequence, and it has to be.** This unit is not part of the 5b-0-ii-\* ladder; it exists
+because PR #83's first CI run turned **V-BRK-023** (L1, **BLOCKING-ALWAYS**) red and a
+BLOCKING-ALWAYS failure halts everything until a human clears it. The clearance came as
+_"run the harness until completion, start with the failed PR #83"_ (2026-07-30). The halt is closed;
+the ladder resumes at `5b-0-ii-b`, unchanged.
+
+#### What was wrong, in the order it has to be read
+
+Nothing about V-BRK-023's 2026-07-29 pass was untrue when it was written. `ActionRecord` carries
+`+kubebuilder:subresource:status`, so `client.Create` drops the status block, so a freshly created
+record's `status.phase` was empty **on the server** no matter what the caller set. The confirmer's
+phase arm therefore read the `kube-agents/status` **label**, and said so at length, on the explicit
+ground that reading `status.phase` "would have looked more correct and would have been vacuous".
+
+`304c1d5` then made that premise false, correctly. 06 §4.3 makes `status.phase` **authoritative** and
+the label a **derived index**; leaving status empty inverted the two, and every parked record read
+back an empty phase behind a label claiming otherwise. `journal.Store.Create` now follows itself with
+a `Status().Update`. `TestCreateDropsStatusAndKeepsThePhaseLabel` went red at that commit saying
+exactly this, in a failure message that named the remedy — which is the whole reason it asserted a
+premise rather than trusting one, and the reason the diagnosis cost one reading of the log instead of
+a bisect.
+
+**What the correction exposed is worse than a stale assertion, and is the actual finding.**
+`journal.Store.SetPhase` writes status **first** and the label **second**, and documents the second
+as _"best-effort ordering, never best-effort truth … the reconciler repairs the label if this second
+write is lost"_. So there is a window — unbounded, if that write is lost — in which `status.phase` is
+`Rejected` and the label still reads `Executing`. An arm reading the label alone reads the
+**non-authoritative** copy and **admits** the action. A fail-open window inside a fail-closed arm,
+in the last thing standing between a parked record and a live mutation.
+
+#### The fix, and why (b) rather than (a) or (c)
+
+The halt posed three options and named (b) as _"the only one that is strictly fail-closed in the
+divergence window"_. `ConfirmDurable` now reads both copies and refuses in two steps:
+
+1. **Divergence is a refusal in its own right.** When the authoritative copy and its index disagree
+   there is no single answer to "what phase is this record in", and the write-ahead rule does not
+   recognise _"probably Executing"_ any more than it recognises _"probably journaled"_. This is
+   strictly more than option (a) would give: it fails closed on the `SetPhase` window in **both**
+   directions, including the one where the label is ahead of status.
+2. **Past that, the agreed phase must be `Executing` or unset.** Both-empty still confirms —
+   `journal.Labels` omits the label when the phase is unset and `Create` returns before the status
+   write, so "no phase at all" is a shape a caller can legitimately produce, and it is the
+   two-empties case rather than a half-written record.
+
+Choosing either copy alone trades one guarantee for the other. Requiring both costs one assertion.
+
+#### Guardrail 9 and §10.2, argued rather than waived
+
+- **§10.2** (narrowing a BLOCKING-ALWAYS check is itself a halt) does not engage: the arm refuses a
+  strict superset of what it refused before.
+- **Guardrail 9** (a check may not change in the same unit as the implementation whose failure
+  motivated it) holds on three independent grounds. The replaced test exercises `journal.Store.Create`
+  and **not** the confirmer, so changing the arm does nothing to make it green — the
+  edit-the-check-to-green-the-implementation shape is structurally absent, not merely resisted. The
+  implementation whose failure motivated the test change is `304c1d5`, a **prior committed unit**. And
+  the assertion count goes **up**: 17 test functions / 30 cases → 19 / 38.
+
+#### What landed in the tests
+
+`TestCreateDropsStatusAndKeepsThePhaseLabel` is **replaced** by
+`TestCreateWritesBothThePhaseAndItsLabel`, which measures the new ground truth against a real API
+server and asserts three things: status carries the phase, the label carries it, and the two agree.
+Added alongside it:
+
+- `TestARecordWhoseStatusMovedWithoutItsLabelDoesNotConfirm` — reproduces the `SetPhase` window by
+  issuing `Status().Update` **directly**, deliberately not through `SetPhase`, precisely so the label
+  is left behind; asserts the half-written state really is on the server before confirming.
+- `TestEveryPhaseSurvivesLabelEncodingUnchanged` — the divergence arm compares byte-for-byte, so a
+  future phase name that `journal.labelValue` rewrites (a slash, a space, 64 bytes) would refuse
+  **every action of that phase**. Discovered by asking what the new arm's inputs are, not by a
+  failure.
+- Six divergence subtests in `TestEveryRefusalIsNotDurable`, plus an `atPhase()` fixture helper that
+  sets **both** copies, so the divergence arm and the phase arm can never cover for each other by
+  accident.
+
+#### Verdicts
+
+| ID            | Level | Verdict | Note                                                                                                                |
+| ------------- | ----- | ------- | ------------------------------------------------------------------------------------------------------------------- |
+| **V-BRK-023** | L1    | `pass`  | halt cleared; 19 functions / 38 cases, 0 skipped; 100.0% of statements; 19/19 mutants caught; `results.csv` row 147 |
+
+Non-vacuity is `verification/mutants/V-BRK-023.json`, committed here for the first time — the
+2026-07-29 sweep for this ID ran through the superseded `dev/mutate.sh` and left nothing behind to
+re-run. Its first key is a warning rather than a mechanism, and that gap is [[LSN-054]]: six of the
+nineteen mutants are caught only by envtest tests and score **ESCAPED** if `KUBEBUILDER_ASSETS` is
+unset, and `go test -list` — the guard [[lsn-048]] added so a missing catcher cannot read as a
+survivor — compiles rather than runs, so it lists those six either way and stays silent.
+
+#### Lessons opened
+
+- **[[LSN-054]]** — an envtest suite `t.Skip`s itself when the assets are unset, so the package prints
+  `ok` over a red test. Fifteen `*_envtest_test.go` files here behave identically. The sharp part is
+  that **[[LSN-052]]'s own preferred mechanization, `go test ./...`, is green on this failure**: a
+  mechanization that would not have caught the escape that motivated it is [[lsn-019]] arriving inside
+  the fix for LSN-052. The corrected candidate names `make -C k8s-operator test`.
+- **[[LSN-055]]** — twenty-five CHECKPOINT commits, one push, one CI run, and the red belonged to a
+  commit twenty back. Also establishes that LSN-052's candidate 2 (a push trigger on non-`main`
+  branches) is necessary but **insufficient**: a trigger nothing triggers is still one run.

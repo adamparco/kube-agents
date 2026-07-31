@@ -57,7 +57,10 @@ func (f *fakeReader) Get(_ context.Context, namespace, actionID string) (*agentv
 }
 
 // durable is a record shaped the way a real server hands one back: server-assigned identity, the
-// action id in spec, and the Executing status label journal.Labels writes at Create time.
+// action id in spec, and the phase in BOTH places journal.Store.Create leaves it -- `status.phase`,
+// which 06 §4.3 makes authoritative, and the metadata label, which is its index. The fixture
+// carries both because a real Create now produces both; TestCreateWritesBothThePhaseAndItsLabel is
+// where that is measured against an API server rather than asserted here.
 func durable(opts ...func(*agentv1alpha1.ActionRecord)) *agentv1alpha1.ActionRecord {
 	ar := &agentv1alpha1.ActionRecord{
 		ObjectMeta: metav1.ObjectMeta{
@@ -69,10 +72,28 @@ func durable(opts ...func(*agentv1alpha1.ActionRecord)) *agentv1alpha1.ActionRec
 		},
 		Spec: agentv1alpha1.ActionRecordSpec{ActionID: testID},
 	}
+	ar.Status.Phase = agentv1alpha1.PhaseExecuting
 	for _, o := range opts {
 		o(ar)
 	}
 	return ar
+}
+
+// atPhase sets BOTH copies, which is what an agreed phase means. Refusal cases that want the phase
+// arm rather than the divergence arm go through this, so that the two arms can never cover for each
+// other by accident.
+func atPhase(p agentv1alpha1.ActionPhase) func(*agentv1alpha1.ActionRecord) {
+	return func(a *agentv1alpha1.ActionRecord) {
+		a.Status.Phase = p
+		if p == "" {
+			delete(a.Labels, journal.StatusLabel)
+			return
+		}
+		if a.Labels == nil {
+			a.Labels = map[string]string{}
+		}
+		a.Labels[journal.StatusLabel] = string(p)
+	}
 }
 
 func confirmer(ar *agentv1alpha1.ActionRecord, err error) (*Confirmer, *fakeReader) {
@@ -99,21 +120,40 @@ func TestADurableRecordConfirms(t *testing.T) {
 	}
 }
 
-// The phase label is absent on any record whose caller did not set a phase before Create, and that
-// is not an error. Only a NAMED and different phase is.
-func TestAnUnlabelledRecordConfirms(t *testing.T) {
-	ar := durable(func(a *agentv1alpha1.ActionRecord) { delete(a.Labels, journal.StatusLabel) })
-	c, _ := confirmer(ar, nil)
+// A record with no phase at all is not an error: journal.Labels omits the label when the phase is
+// unset and Create returns before the status write, so BOTH copies empty is a shape a caller can
+// legitimately produce. Only a NAMED and different phase is a refusal -- and only when the two
+// copies agree on it, which is the case below this one.
+func TestARecordWithNoPhaseAtAllConfirms(t *testing.T) {
+	c, _ := confirmer(durable(atPhase("")), nil)
 	if err := c.ConfirmDurable(context.Background(), testID); err != nil {
-		t.Fatalf("an absent status label is not a phase mismatch; got %v", err)
+		t.Fatalf("neither copy carrying a phase is not a phase mismatch; got %v", err)
 	}
 }
 
-func TestANilLabelMapConfirms(t *testing.T) {
-	ar := durable(func(a *agentv1alpha1.ActionRecord) { a.Labels = nil })
+func TestANilLabelMapWithNoPhaseConfirms(t *testing.T) {
+	ar := durable(atPhase(""), func(a *agentv1alpha1.ActionRecord) { a.Labels = nil })
 	c, _ := confirmer(ar, nil)
 	if err := c.ConfirmDurable(context.Background(), testID); err != nil {
 		t.Fatalf("a record with no labels at all must not panic or refuse; got %v", err)
+	}
+}
+
+// Every phase name must survive journal.Labels unchanged, or the divergence arm refuses records
+// that are perfectly consistent. journal.labelValue rewrites anything outside [A-Za-z0-9._-] and
+// truncates at 63 bytes; the arm compares the label byte-for-byte against string(status.phase), so
+// a phase added later with a slash or a space in it would make the two copies differ by
+// construction and take every action of that phase down the divergence path. Asserted here rather
+// than trusted, because the failure is total, silent at compile time, and lands on whichever phase
+// somebody adds next.
+func TestEveryPhaseSurvivesLabelEncodingUnchanged(t *testing.T) {
+	for _, p := range agentv1alpha1.AllActionPhases() {
+		ar := &agentv1alpha1.ActionRecord{}
+		ar.Status.Phase = p
+		got := journal.Labels(ar)[journal.StatusLabel]
+		if got != string(p) {
+			t.Errorf("phase %q encodes to label %q; the confirmer's divergence arm compares them byte-for-byte and would refuse every record in this phase", p, got)
+		}
 	}
 }
 
@@ -170,24 +210,66 @@ func TestEveryRefusalIsNotDurable(t *testing.T) {
 		},
 		{
 			name: "the durable record is parked for approval",
-			ar: durable(func(a *agentv1alpha1.ActionRecord) {
-				a.Labels[journal.StatusLabel] = string(agentv1alpha1.PhasePendingApproval)
-			}),
+			ar:   durable(atPhase(agentv1alpha1.PhasePendingApproval)),
 			want: `is in phase "PendingApproval"`,
 		},
 		{
 			name: "the durable record was already rejected",
-			ar: durable(func(a *agentv1alpha1.ActionRecord) {
-				a.Labels[journal.StatusLabel] = string(agentv1alpha1.PhaseRejected)
-			}),
+			ar:   durable(atPhase(agentv1alpha1.PhaseRejected)),
 			want: `is in phase "Rejected"`,
 		},
 		{
 			name: "the durable record is already finished",
+			ar:   durable(atPhase(agentv1alpha1.PhaseVerified)),
+			want: `is in phase "Verified"`,
+		},
+
+		// The divergence arm. Every one of these was ADMITTED before 2026-07-30, because the arm
+		// read the label alone and the label is the copy 06 §4.3 calls derived. The first is the
+		// SetPhase window reproduced by hand -- status has moved on, the label write has not landed
+		// yet or was lost -- and it is the fail-open hole this arm closes.
+		{
+			name: "status has moved to Rejected and the label still says Executing",
+			ar: durable(func(a *agentv1alpha1.ActionRecord) {
+				a.Status.Phase = agentv1alpha1.PhaseRejected
+			}),
+			want: `status.phase "Rejected" and the kube-agents/status label "Executing"`,
+		},
+		{
+			name: "the label has moved and status has not",
 			ar: durable(func(a *agentv1alpha1.ActionRecord) {
 				a.Labels[journal.StatusLabel] = string(agentv1alpha1.PhaseVerified)
 			}),
-			want: `is in phase "Verified"`,
+			want: `status.phase "Executing" and the kube-agents/status label "Verified"`,
+		},
+		{
+			name: "the authoritative copy is empty and the index names a phase",
+			ar: durable(func(a *agentv1alpha1.ActionRecord) {
+				a.Status.Phase = ""
+			}),
+			want: `status.phase "" and the kube-agents/status label "Executing"`,
+		},
+		{
+			name: "the index is missing and the authoritative copy names a phase",
+			ar: durable(func(a *agentv1alpha1.ActionRecord) {
+				delete(a.Labels, journal.StatusLabel)
+			}),
+			want: `status.phase "Executing" and the kube-agents/status label ""`,
+		},
+		{
+			name: "no labels at all, and status names a phase",
+			ar: durable(func(a *agentv1alpha1.ActionRecord) {
+				a.Labels = nil
+			}),
+			want: `status.phase "Executing" and the kube-agents/status label ""`,
+		},
+		{
+			name: "both copies name a phase and they are different non-Executing phases",
+			ar: durable(func(a *agentv1alpha1.ActionRecord) {
+				a.Status.Phase = agentv1alpha1.PhasePendingApproval
+				a.Labels[journal.StatusLabel] = string(agentv1alpha1.PhaseRejected)
+			}),
+			want: `status.phase "PendingApproval" and the kube-agents/status label "Rejected"`,
 		},
 	}
 	for _, tc := range cases {

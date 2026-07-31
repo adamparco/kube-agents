@@ -82,8 +82,10 @@ will start selecting.
 | **LSN-051** | harness, halts, spec-reading, PROTOCOL §8.5, rbac | A §8.5 halt was declared after comparing the broker's live reads against 06 §2.2.1, the *broker-operations* grant; the actor's authority is 06 §2.2, one level up, and it grants every read the halt said was ungranted — a subsection number reads like a refinement of its section, so having read the subsection felt like having read the section | open | *candidate:* a `harness-run` §7 rule that a §8.5 blocker row must quote **both** conflicting statements by document and section. There was only ever one here, and being made to write the second down is where the absence becomes visible. Alternatives considered and likely too narrow: a lint pairing every `NN §X.Y.Z` citation in a halt with a `NN §X.Y` citation. To be chosen at the next improvement pass |
 | **LSN-052** | harness, ci, goldens, checkpoint, binding §Build | `TestAgentsGolden` was red for three commits: the renderer gained a downward-API env var and the two golden fixtures were not regenerated. No step a unit is required to perform runs `go test` — L0 CI has no Go toolchain, `k8s-operator-test.yml` triggers only on PRs to `main` (once per phase, after dozens of commits), and CHECKPOINT §6.1's `make build` is fmt+vet+build, not test | open | *candidate:* `binding.md` §Build gains `cd k8s-operator && go test ./...` for any unit touching `k8s-operator/**`, putting it inside CHECKPOINT §6.1 where it attributes to one commit. Alternatives: a push trigger on every branch (off the local loop, does not stop the bad commit); a gate rule pairing `*_manifests.go` with `testdata/*/expected/` (third rule of that shape, subsumed). To be chosen at the next improvement pass |
 | **LSN-053** | harness, checks, guardrail-9, rbac | A check is reshaped ahead of the implementation it will judge (Guardrail 9), it is green on today's tree, and nobody establishes that it is green on the tree the *next* unit will produce — so the next unit's first run reads as "my change broke the check" and the cheapest way out is to edit the check | open | *candidate:* a `harness-run` §4 rule that a unit whose only artifact is a check change must exhibit BOTH trees — the current one and a synthesised future one — and that the future one is a negative-control row, not a `/tmp` probe. To be chosen at the next improvement pass |
+| **LSN-054** | harness, checkpoint, envtest, false-green, binding §Build, blocking-always | An envtest suite `t.Skip`s itself when `KUBEBUILDER_ASSETS` is unset, so the package reports `ok` and `go test ./...` is green over a test that is red — which is how a stale premise in a BLOCKING-ALWAYS check (**V-BRK-023**) survived to PR #83's first CI run. LSN-052's own preferred mechanization is that command, and it would have run straight past this | open | _candidate:_ `binding.md` §Build names `make -C k8s-operator test`, never bare `go test ./...`, because only the make target resolves the assets; plus inverting `requireEnv` to **fail** rather than skip unless an explicit opt-out is set, so "I did not run envtest" is loud. To be chosen at the next improvement pass |
+| **LSN-055** | harness, ci, branching, attribution, checkpoint | The phase-9 branch took 25 CHECKPOINT commits and one `git push`, so `k8s-operator-test.yml` ran once, on the PR, against all 25 at once — and the red it found belonged to a commit 20 back. One CI run per branch makes CI a phase-end audit rather than a unit-level check, and destroys the attribution CHECKPOINT exists to produce | open | _candidate:_ `binding.md` §Branching requires a push per CHECKPOINT commit, paired with a `push` trigger on `k8s-operator-test.yml` for non-`main` branches (LSN-052 candidate 2, which is necessary but insufficient alone — a trigger nothing triggers is still one run). To be chosen at the next improvement pass |
 
-**Open: 3 of 53**.
+**Open: 5 of 55**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -2993,3 +2995,111 @@ copy inside the check that exists to forbid third copies would be its own joke.
 Related: [[lsn-035]] (an arm no input reaches is unexercised prose — this is its complement),
 [[lsn-019]] (a mechanization off the path the work takes), [[lsn-007]] (every unit test passes and
 the feature does nothing in a real install).
+
+## LSN-054 — A skipped envtest is reported as a passing package, and `go test ./...` cannot tell
+
+**What happened.** `TestCreateDropsStatusAndKeepsThePhaseLabel` asserted a premise about the
+platform — that `client.Create` drops `status` on a subresource-bearing type, so a freshly created
+`ActionRecord` reads back with an empty `status.phase`. The premise was true when written and
+`304c1d5` deliberately made it false: 06 §4.3 makes `status.phase` authoritative and the label a
+derived index, so `journal.Store.Create` now follows itself with a `Status().Update`. The test went
+red at that commit. It was **discovered** twenty commits later, on PR #83's first CI run, as a
+BLOCKING-ALWAYS failure against **V-BRK-023** — the write-ahead confirmation, which is the last
+thing between a parked record and a live mutation.
+
+**Why nothing local caught it.** `writeahead_envtest_test.go` gates every test on `requireEnv(t)`,
+which calls `t.Skip` when `KUBEBUILDER_ASSETS` is unset. A skip is not a failure. `go test ./...`
+prints `ok github.com/.../internal/broker/writeahead` and exits 0 over a test that is red, and does
+it identically for the **fifteen** `*_envtest_test.go` files in this tree. Only
+`make -C k8s-operator test` runs them, because only the make target has `setup-envtest` as a
+prerequisite and exports the resolved path.
+
+**Why this is worth its own row rather than a note on [[lsn-052]].** LSN-052 is the same shape one
+level out — the Go suite runs once per phase, so a golden was red for three commits — and its
+**preferred mechanization is `cd k8s-operator && go test ./...` in `binding.md` §Build**. That
+command, adopted exactly as written, is green on this failure. The lesson is not "run the tests";
+it is that the command a mechanization names has to be the one that runs the tests, and the two
+differ here by an environment variable that no reader of the diff would notice. A mechanization that
+would not have caught the escape that motivated it is [[lsn-019]] arriving inside the fix for
+[[lsn-052]].
+
+There is a second, sharper reading. The skip is not a bug — envtest assets are a heavy dependency
+and skipping without them is why `go test ./...` is usable at all. What is wrong is that the
+**default is quiet**. A suite that cannot run says so in a line nobody reads, in a run whose exit
+code says everything is fine, and the cost is paid by whoever reads the CI failure three weeks
+later.
+
+**What the test itself did right, and is worth copying.** It asserted a *premise* rather than
+trusting one, and its failure message named the remedy. That is why the fix took one reading of the
+output instead of a bisect: the check had already written down what its own falsification would
+mean. A test that encodes "this is what the platform does, and here is what to do if it stops" is
+strictly better than a comment saying the same thing, because the comment cannot go red.
+
+**Mechanization candidates**, for the next improvement pass:
+
+1. _(preferred)_ `binding.md` §Build names **`make -C k8s-operator test`** for any unit touching
+   `k8s-operator/**` — never bare `go test ./...`. This supersedes LSN-052 candidate 1 rather than
+   sitting beside it, and both lessons close on the same edit.
+2. Invert the default in `requireEnv`: **fail** when the assets are missing, and skip only when an
+   explicit `KUBE_AGENTS_SKIP_ENVTEST=1` is set. Makes "I did not run envtest" a decision somebody
+   took rather than a condition nobody observed. Wider blast radius — fifteen files, and it makes
+   bare `go test ./...` red for everyone — so it wants pairing with 1, not instead of it.
+3. An L0 gate arm that every `*_envtest_test.go` skip-guard is reachable only from a command
+   `binding.md` actually names. General, and the most work; it is really a lint for candidate 1
+   having been done.
+
+Also worth recording as a hazard for `dev/mutate.py`: a spec whose catcher is an envtest test scores
+**ESCAPED** when the assets are unset, and `go test -list` — the guard [[lsn-048]] added precisely so
+a missing catcher cannot be read as a survivor — compiles rather than runs, so it lists the test
+either way and stays silent. `verification/mutants/V-BRK-023.json` carries that warning as the first
+key in the file, which is a comment, not a mechanism. The runner has no way to declare required
+environment; giving it one is a candidate in its own right.
+
+Related: [[lsn-052]] (the same blindness one level out, and the candidate this corrects),
+[[lsn-019]] (a mechanization off the path the work takes), [[lsn-038]] (a guard that fails safe
+still fails, and a green run is how it tells you), [[lsn-001]] (the artifact under test not being
+the artifact built).
+
+## LSN-055 — Twenty-five commits, one push, one CI run, and the red belongs to none of the recent ones
+
+**What happened.** The `phase-9-a-real-caller-at-the-door` branch accumulated twenty-five CHECKPOINT
+commits and was pushed once, at the end. `k8s-operator-test.yml` triggers on pull requests to `main`,
+so the suite ran for the first time on PR #83 — against all twenty-five at once. It was red, and the
+commit responsible was `304c1d5`, twenty back. See [[lsn-054]] for the specific test.
+
+**Why it matters beyond one bisect.** CHECKPOINT's product is *attribution*: one commit, one set of
+checks, one claim about what is true after it. A branch pushed once at its end converts that into a
+phase-end audit. Every check that only runs remotely is answered once, for a range, and the range is
+the whole phase — so a failure carries no information about which unit caused it, and the harness
+learns about it at the moment its context for the responsible unit is coldest. The cost is not the
+`git bisect`; it is that twenty units were each declared complete against evidence that had not yet
+been produced.
+
+**Why this is not just [[lsn-052]] again.** LSN-052's candidate 2 is a `push` trigger on every
+branch, and it is necessary — but it is not sufficient, and this row exists to say why. A push
+trigger fires per push. With one push per branch, adding the trigger changes one CI run into one CI
+run. The trigger and the push cadence are two separate facts and fixing either alone leaves the
+property broken; that is exactly the kind of thing that gets half-mechanized and then believed.
+
+**The counter-argument, recorded because it is real.** Pushing per commit means CI runs on
+work-in-progress, burns minutes on commits nobody will ever look at, and produces red runs that are
+expected — which is its own way of teaching people to ignore CI. The answer is probably that CI red
+on a pushed branch is *already* how this harness is supposed to learn, since it has no other remote
+signal, and that "expected red" is a symptom of the local chain being weaker than the remote one
+rather than an argument for pushing less. That is a judgement for the improvement pass, not a
+conclusion here.
+
+**Mechanization candidates**, for the next improvement pass:
+
+1. _(preferred)_ `binding.md` §Branching gains "push after every CHECKPOINT commit", **paired with**
+   LSN-052 candidate 2 (a `push` trigger on `k8s-operator-test.yml` for non-`main` branches). Both
+   halves or neither.
+2. Push at every CHECKPOINT but keep the PR-only trigger, relying on the local chain for
+   attribution. Cheaper, and it makes the push a durability measure ([[lsn-043]]) rather than a
+   verification one — which is worth something on its own, but does not fix this.
+3. Nothing, on the argument that [[lsn-054]] candidate 1 moves the missing check local, so remote
+   cadence stops mattering. Tempting and probably wrong: it is only true for the checks that *can*
+   run locally, and the ones that cannot are the ones this row is about.
+
+Related: [[lsn-052]] (the trigger half of the same property), [[lsn-054]] (the specific escape that
+exposed it), [[lsn-043]] (a branch's work is not durable until it is pushed).

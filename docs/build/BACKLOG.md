@@ -83,7 +83,40 @@ turns out to be wrong is closed with a reason, not recycled.
 
 **Last drained:** 2026-07-30
 
-_(empty — append new items here, below this line)_
+### Run the builds on a provisioned, warm builder instead of standing one up per build
+
+- **Kind:** task
+- **Where:** `k8s-operator/Makefile` (`test`, `build`, `setup-envtest`), `dev/cluster/reload-images.sh`,
+  `make cloud-build-push`, `dev/L2-CHAIN.txt` — and the two clusters that already exist
+- **Why it matters:** `make -C k8s-operator test` is slow enough to be felt in every unit, and the
+  harness runs it at CHECKPOINT for any unit touching `k8s-operator/**`, so the cost is paid per
+  unit for the whole remaining build. It is not one cost either: it is `controller-gen`, then
+  `go build`, then an envtest control plane (etcd + kube-apiserver) started per package, on an arm64
+  laptop, for a project whose every deploy target is amd64. This repo already refuses host-arch
+  **image** builds for exactly that mismatch and routes them to Cloud Build; nothing has asked the
+  same question about the **test** path.
+
+  Two things are being asked, and the first should gate the second. **(1) Measure.** Split the wall
+  clock into codegen / compile / envtest-startup / test-execution, because which one is the bill
+  changes the fix — and one candidate fix is free: the harness passes `-count=1` in places, which
+  defeats Go's test cache. **(2) Then try a provisioned builder rather than a per-build one.** A
+  persistent `docker buildx` builder as a pod in `gke-scratch-kube-agents-dev` is cheap to stand up
+  (`docker buildx create --driver kubernetes`), is natively amd64 so it satisfies the host-arch
+  refusal, and keeps a warm layer cache across builds — which `cloud-build-push` cannot, since every
+  invocation starts from a cold worker. The same "already provisioned, kept warm" argument applies
+  to the envtest control plane and the Go build cache, and those may be the larger win if the
+  measurement says compile and envtest startup dominate.
+
+  Constraints to respect rather than rediscover: `gke-scratch-*` is the only legal target for
+  anything mutating (`platform-agent-host` is verification-only, and any new script needs the
+  anchored destructive-guard `case`); the builder must still push to the same Artifact Registry so
+  `reload-images.sh` can read the digest back and **deploy by digest**; and `pause.sh`/`resume.sh`
+  scale the scratch node pools to zero between campaigns, so a persistent builder either tolerates
+  being scaled away or changes what "paused" costs — worth pricing that idle cost as part of the
+  answer.
+
+- **Priority:** normal
+- **Added:** 2026-07-30
 
 ---
 
