@@ -337,3 +337,29 @@ python3 dev/tests/invariants-gate.py
 # `deployments/scale` case stands; make the grant read-only and every previously-selected case must
 # come back as `not-authorized`, by that name.
 python3 dev/verify/fixtures/soak_corpus.py --self-test
+
+# --- the undo-coverage soak's assertion block (P9-T8b-4b-ii-2b-ii-b) -------------------------
+# The other half of the pair above: the corpus is the population, this is the suite that submits it
+# and scores V-REV-001 over what comes back. Its live line is in dev/L2-CHAIN.txt.
+#
+# Seventeen synthesised populations replayed through assert_population, the same six arms the
+# cluster run executes. Each case names the arm that must catch it and matches on that arm's own
+# needle, so a population that goes red for some other reason scores MISS rather than a catch
+# ([[LSN-035]]). The four V-REV-001 failure categories are separate cases -- `no-undo-plan`,
+# `strategy-none-on-non-gated`, `unvalidated-plan`, `stepless-plan` -- because they are four
+# different defects in the undo planner and a suite that reports them as one number cannot say
+# which one it found.
+#
+# THE DEFER CASES ARE THE POINT. A soak whose population arrived empty, or fell below the accept
+# floor, or covered a single verb, must not print a green 100%: 100% of zero is arithmetically
+# perfect and evidentially nothing. Those three cases assert `DEFER:` and a named blocker, and the
+# live run exits 3 on any of them ([[LSN-060]]'s sibling failure -- a suite that cannot run its
+# property reports `deferred`, never `pass`).
+#
+# NEGATIVE CONTROL DOES NOT EXERCISE ([[LSN-060]]): the populations are synthesised, so everything
+# upstream of the assertion block is untested here -- deriving the table from soak_corpus.py,
+# base64ing it through BROKER_DRIVER_EXTRA_ENV, the probe's per-envelope nonce fetch and envelope
+# construction, seeding the 37 targets and the two bulk reads that snapshot them, mining the journal
+# and deriving `ar-<lowercase-actionId>`, and both P1 arms plus the broker Availability check. Only
+# the live line proves those, and only against a cluster.
+bash dev/verify/undo-coverage-l2.sh --negative-control

@@ -370,6 +370,42 @@ bash dev/verify/broker-gate-l2.sh gke-scratch-kube-agents-dev
 # in its own arm and repeated unconditionally from the EXIT trap.
 bash dev/verify/actor-grant-sweep-l2.sh gke-scratch-kube-agents-dev
 
+# V-REV-001 at L2 at POPULATION scale — "100% of executed non-gated ActionRecords carry a validated
+# undo plan". broker-execute-l2.sh already scores V-REV-001 and its row is a real result; it is also
+# a result at n=1, on one hand-written apply of one ConfigMap. 100% of one is a number that cannot
+# distinguish a working undo planner from a planner that happens to know one verb.
+#
+# THIS RUNS THE WHOLE SOAK CORPUS. dev/verify/fixtures/soak_corpus.py --table is the population;
+# dev/verify/fixtures/undo_coverage_probe.py submits one envelope per row from inside the cluster,
+# on the agent's own reader identity, through the broker's real front door — a fresh nonce per
+# envelope, because nonces are single-use. The corpus supplies shape and target; the payload is
+# synthesised, so a row is a real create/apply/patch/scale/delete against a real seeded object and
+# not a replay of a recorded body. Everything is dry-run: Phase 9's defining constraint (07 §2) is
+# that the entire safety machinery is exercised with no write authority anywhere.
+#
+# WHAT "EXECUTED" MEANS HERE is the broker's own stamp, status.timestamps.executionStarted — the
+# moment it issued the first mutating call — rather than a guessed-at set of phase strings. A record
+# the classifier gated never gets one and is correctly outside the denominator; on the run recorded
+# in verification/results.csv that is exactly the two `delete Deployment` rows, PendingApproval,
+# class gated, strategy none, which is the classifier doing its job.
+#
+# FOUR WAYS A NON-GATED EXECUTED RECORD FAILS, each scored by name rather than as one lump: no undo
+# plan at all (`no-undo-plan`), a plan whose strategy is `none` (`strategy-none-on-non-gated` —
+# StrategyFor's own closing comment is "anything else ⇒ none ⇒ gated", so none on a record that was
+# NOT gated is the two halves disagreeing), a plan that is present and unvalidated
+# (`unvalidated-plan`), and a validated plan with zero steps (`stepless-plan`). An executed record
+# carrying no risk class at all is `unclassified-executed-record` and fails too, rather than
+# quietly leaving the denominator.
+#
+# ATTRIBUTION IS AN ARM, NOT AN ASSUMPTION. The tenant namespace is this suite's own and it is left
+# standing between runs ([[LSN-045]]), so the journal accumulates: A-5 intersects every mined record
+# against THIS run's actionId set and prints the count it left outside. Without it the denominator
+# grows every run and a stale 100% reads like coverage improving.
+#
+# AND THE SHADOW MUST HOLD. A-6 re-reads all 37 seeded targets after the run and fails on any
+# create, mutation or delete. A dry-run soak that quietly wrote would still score V-REV-001 green.
+bash dev/verify/undo-coverage-l2.sh gke-scratch-kube-agents-dev
+
 # --- Phase 9's gate ------------------------------------------------------------------------------
 # verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the
 # two suites P9-T9b-5 still owes, the L0 chain run as a file, and the whole prior ratchet through the

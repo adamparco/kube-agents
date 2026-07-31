@@ -1613,7 +1613,11 @@ CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
 # acceptance (e). The first line in the chain whose subject is the API server's AUTHORIZER rather
 # than a workload — everything above asks what some pod did with the authority it holds, and this
 # one asks what authority exists. Same commit as the line, same rule.
-L2_CHAIN_FLOOR = 21
+# Raised 21 -> 22 on 2026-07-31 (P9-T8b-4b-ii-2b-ii-b): undo-coverage-l2.sh, V-REV-001 at population
+# scale. The line above it already scores V-REV-001 and is green; this one is the same check with a
+# denominator of 35 instead of 1, which is the difference between "the undo planner worked once" and
+# "the undo planner covers the corpus". Same commit as the line, same rule.
+L2_CHAIN_FLOOR = 22
 # How many scripts the TRANSITIVE scope held when it was widened (2026-07-25, P8-T8). A separate
 # ratchet from the one above because the two guard different things: L2_CHAIN_FLOOR notices a line
 # leaving L2-CHAIN.txt, this one notices a claim-making script leaving the closure — including one
@@ -1635,7 +1639,9 @@ L2_CHAIN_FLOOR = 21
 # Raised 29 -> 30 on 2026-07-31 (P9-T9b-5c): actor-grant-sweep-l2.sh. It joins the closure twice over
 # — named on an L2 chain line AND reached from verify-phase9.sh section F, which has been detecting
 # it by artifact and failing while it was absent. A fifth time together.
-L2_SCOPE_FLOOR = 30
+# Raised 30 -> 31 on 2026-07-31 (P9-T8b-4b-ii-2b-ii-b): undo-coverage-l2.sh, named on an L2 chain
+# line. A sixth time together.
+L2_SCOPE_FLOOR = 31
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:

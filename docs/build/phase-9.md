@@ -94,8 +94,10 @@ corpus, L0) and **`2b-ii-b`** (the soak itself, V-REV-001 at L2); the split and 
 its own section at the end of this file. **`2b-ii-a` landed 2026-07-31** — `dev/verify/fixtures/soak_corpus.py`
 derives **37 envelopes** from the 181-case classifier corpus, filtered by what the shipped write
 overlay authorizes, `--self-test` **17/17** and a new L0 chain line; V-REV-001's denominator is no
-longer 1. **Resume at `P9-T8b-4b-ii-2b-ii-b`.** The remaining Phase 9 ladder is
-`T8b-4b-ii-2b-ii-b` → `T9c`, then `harness-milestone`. **`P9-T9c` was appended 2026-07-31** by the
+longer 1. **`2b-ii-b` landed 2026-07-31** — `dev/verify/undo-coverage-l2.sh` submits all 37 envelopes
+through the broker's real front door and scores **V-REV-001 at 35/35 = 100% across 3 verbs**, `¬`
+**17/17**, one new line in each chain. **Resume at `P9-T9c`.** The remaining Phase 9 ladder is
+`T9c`, then `harness-milestone`. **`P9-T9c` was appended 2026-07-31** by the
 ORIENT drain of `BACKLOG.md` B-006 — 06 §4.4 row 3's auto-pause has no consumer; its section is at
 the end of this file.
 
@@ -5325,3 +5327,111 @@ than a policy statement — a Kind missing from it is rejected as `not-authorize
 answer. The silent-shrink hole is in the other direction, so a floor closes it: **every resource the
 grant names must be reachable from some Kind in the map**, which means adding `ingresses` to the
 overlay fails this file until it learns `Ingress`.
+
+### P9-T8b-4b-ii-2b-ii-b — outcome, 2026-07-31
+
+**V-REV-001 now has a denominator of 35 instead of 1, and the 100% means something it did not mean
+yesterday.** `dev/verify/undo-coverage-l2.sh` submits the whole derived corpus — **37 envelopes, one
+per row of `soak_corpus.py --table`** — from inside the cluster on the platform agent's own reader
+identity, through the broker's real front door, all dry-run. **35/35 = 100%** of executed non-gated
+`ActionRecord`s carry a validated undo plan, across **3 verbs**. `--negative-control` is **17/17**.
+Both chains gained a line (L0 46 → 47, L2 21 → 22) and both floors moved in this commit.
+
+Live run, `gke-scratch-kube-agents-dev`, rc 0, 9/9 assertions, banner PROVEN, on
+`k8s-operator@sha256:69bedbec93b9` and `kage-broker@sha256:85532a853384` with both P1 arms green:
+
+| arm     | property                           | result                                              |
+| ------- | ---------------------------------- | --------------------------------------------------- |
+| A-1     | submission floor                   | 37 of 37 accepted (floor 20)                        |
+| A-2     | every accepted action is journaled | 37/37 mined as `ar-<lowercase actionId>`            |
+| **A-3** | **V-REV-001**                      | **35/35 = 100%**, all four failure categories zero  |
+| A-4     | non-vacuity                        | 35 records, 3 verbs — above the 20/2 floors         |
+| A-5     | attribution                        | 37/37 attributed; 30 of the namespace's 67 excluded |
+| A-6     | the shadow held                    | all 37 seeded targets byte-identical                |
+
+#### The two records that are not in the denominator are the classifier working
+
+35, not 37. The missing pair is `gat-005` and `gat-100`, both `delete Deployment`, both
+`PendingApproval`, class **gated**, strategy `none`. A gated action never executes, so it never gets
+a `status.timestamps.executionStarted`, so it is correctly outside a claim scoped to _executed_
+records. That is the shape the suite has to be able to distinguish from the failure that looks
+identical from one field away — a record that executed and got `none` anyway — which is why
+`strategy-none-on-non-gated` is its own FAIL category rather than folded into "no plan".
+
+#### "Executed" is the broker's own stamp, not a guessed-at set of phase strings
+
+`status.timestamps.executionStarted != ""` is the moment the broker issued its first mutating call.
+The alternative — enumerating the phase values that mean executed — is a list that has to be kept in
+step with a state machine in the product, and the failure mode is that a renamed phase silently
+empties the denominator and prints 100% of nothing. Hence the DEFER arms: an empty executed
+population, a submission count below the accept floor, or a single-verb population all exit **3**
+with a named blocker. Three of the 17 `¬` cases assert exactly those, because a floor that has never
+been observed to fire is a guess.
+
+#### Four failure categories, scored separately, one of them derived from the product's own comment
+
+`no-undo-plan`, `strategy-none-on-non-gated`, `unvalidated-plan`, `stepless-plan` — plus
+`unclassified-executed-record`, which **fails** rather than quietly leaving the denominator. The
+second one is not a rule this suite invented: `undo.StrategyFor`'s closing comment is _"anything
+else ⇒ none ⇒ gated"_, so `none` on a record the classifier did **not** gate is the planner and the
+classifier disagreeing about the same action. A suite reporting one aggregate number could say a
+plan was missing but not which of the four ways it was missing, and those are four different bugs in
+four different places.
+
+#### Guard 3 could not be a label, and what replaced it is stronger
+
+The plan said _"guard 3 as a label assertion"_ — tag this run's records and mine by the tag. It is
+not available. `pipeline.chainID(env, actionID)` returns `undoOf(env)` or the actionId and **ignores
+the envelope's own `trigger.chainId`** for non-undo actions, and `journal.Labels()` writes only tier,
+scope, risk-class, trigger, chain-id, status and undo-of — **nothing a submitter chose**. So a
+suite cannot label a broker-written record at all.
+
+A-5 is set intersection on actionIds instead, and it names the failure better than the label would
+have. The tenant namespace is this suite's own and it is deliberately left standing between runs
+([[LSN-045]] — a namespace holding an `ActionRecord` is undeletable), so the journal accumulates:
+the run that produced this row found **67** records in `kubeagents-system` and put **30** of them
+outside the denominator by name. Without that arm the denominator grows every run and a stale 100%
+reads like coverage improving.
+
+#### The corpus supplies shape and target; the payload is synthesised
+
+A soak that replayed recorded bodies would be measuring the fixture. `undo_coverage_probe.py` takes
+the row's verb, kind and target from the corpus and **builds** the operation: a ConfigMap or
+Deployment desired-state for `create`/`apply`, a deterministic three-way rotation for `patch`, a
+replica count for `scale`. Deriving patch bodies from the corpus's `touchedPaths` was rejected —
+only 3 of the 37 rows carry one, and `gat-066`'s is the immutable `/spec/selector`. One op per
+envelope, one object per op, because both the seeding and the journal mining are per-target.
+
+Each envelope fetches its **own** nonce; they are single-use (`broker/antireplay.go`), so a shared
+one would have made the run a 1-accept, 36-replay-refusal transcript. A failed case emits its row
+and continues rather than aborting, so one bad envelope costs one row of the denominator instead of
+the whole population — and A-1's floor is what stops that degradation from passing quietly.
+
+#### A-6 exists because a dry-run soak that wrote would still score V-REV-001 green
+
+Everything above is a claim about records. None of it would notice the broker actually mutating the
+cluster. The suite snapshots all 37 seeded targets with two bulk reads before the run and two after,
+and fails on any create, mutation or delete — the same shadow property Phase 9's whole premise
+rests on (07 §2: the entire safety machinery exercised **with no write authority anywhere**).
+
+#### What this does not claim
+
+The plans are read, never **executed**. Correctness of an undo plan is V-REV-002 and the approval
+round trip is V-REV-004, both Phase 10; 09 §11.11 separates them from this one _"precisely because
+the first is cheap and reassuring and the second is the one that matters"_. This row is the cheap
+and reassuring one, and it is now cheap and reassuring about 35 records instead of one. Nor does the
+gated pair's exclusion assert that gating a `delete Deployment` is correct — `broker-gate-l2.sh`
+owns that property. And the suite never compares the live class to the corpus's `expect.class`, for
+the reason `2b-ii-a`'s section gives: every case is re-addressed to one tenant namespace, which can
+by itself move a case across the production ladder.
+
+#### One thing worth carrying forward: P1's commit half is HEAD-exact
+
+The first live run failed P1 with the deployed tag at `dev-0ea4235-dirty-*` against a tree at
+`cdad3b1`, and `git log 0ea4235..HEAD -- k8s-operator/` showed **zero** commits. That is not a bug.
+`_p1_build_inputs()` scopes only the **dirty-file** half of the check; `_p1_assert_tag_is_current`
+compares the deployed sha against `git rev-parse --short HEAD` and fails on any mismatch at all. So
+a commit touching nothing but `docs/` and `dev/` invalidates every image for every L2 suite still to
+come — which is the phase's own ordering rule ("L0/L1 before L2, because the tree must stop moving
+before images are built") stated from the other side. Remedied as documented, with
+`reload-images.sh operator` then `broker`, and both arms went green on the re-run.
