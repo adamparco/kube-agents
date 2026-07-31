@@ -66,7 +66,9 @@ into `ii-a` (the two refusals) and `ii-b` (V-REV-003 and V-BRK-021's surface sca
 at the end of this file.
 
 **Resume at `P9-T9b-5b-ii-b`.** The remaining Phase 9 ladder is `5b-ii-b` → `5c` →
-`T8b-4b-ii-2b-ii`, then `harness-milestone`.
+`T8b-4b-ii-2b-ii` → `T9c`, then `harness-milestone`. **`P9-T9c` was appended 2026-07-31** by the
+ORIENT drain of `BACKLOG.md` B-006 — 06 §4.4 row 3's auto-pause has no consumer; its section is at
+the end of this file.
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
 [`LEDGER.md`](LEDGER.md).
@@ -2475,6 +2477,42 @@ if the same envelope succeeds when the journal is there, and 5b-ii's fixture is 
 one thing broken.
 
 **The denominator moves by one more.**
+
+---
+
+### P9-T9c — the auto-pause 06 §4.4 row 3 promises and nobody performs
+
+**Scheduled 2026-07-31 at ORIENT from [`BACKLOG.md`](BACKLOG.md) **B-006**.** Appended to the end of
+the Phase 9 ladder rather than inserted, so it displaces nothing: `5b-ii-b` → `5c` →
+`T8b-4b-ii-2b-ii` → **`T9c`** → `harness-milestone`.
+
+**What is wrong.** `broker-refuse-l2.sh` proved the journal-unavailable refusal live on 2026-07-31 —
+503, `reason: journal-unavailable`, zero `ActionRecord`s over 20 s, no object applied. That is the
+refusal half of 06 §4.4 row 3 and it is real. The **pause** half is not. `internal/broker/brake.go`
+sets `AutoPause: true` on the row-3 decision (`:456` and `:547`) and the reply the caller receives
+says _"and the agent is being paused"_ — but nothing in `internal/broker/pipeline/`, `server.go` or
+`cmd/broker/` reads the field, and `status.broker.journalReachable` has no writer
+(`agent_controller.go:402`). An agent whose journal has failed therefore keeps being asked and keeps
+refusing, one submission at a time, with no fleet-level signal that it has gone dark.
+
+**Why this is a gap and not unbuilt scope.** Row 9's auto-pause **is** wired —
+`internal/broker/verify/driver.go:400` calls `escalate.Recorder.Pause`. The mechanism exists and one
+of its two callers was never connected.
+
+**What to build.** Consume `AutoPause` on the row-3 path through the same `escalate.Recorder.Pause`
+seam row 9 uses, and give `status.broker.journalReachable` a writer. Do not change the refusal: the
+503 and its `retryAfterSeconds` are proven and are what keeps this fail-closed today.
+
+**Verification is bound at the improvement pass, not here.** 09 has no check ID covering row 3's
+pause. Adding one edits the conformance spec, which `harness-improve` §5 makes a pass's work rather
+than a unit's, so this task is written against a spec sentence (06 §4.4 row 3) and B-006's check
+question travels separately. Recorded here so that P9-T9c's PLAN does not rediscover it.
+
+**Severity, classified at the drain: not a live security regression.** The absent behaviour fails
+open in availability terms and closed in safety terms — nothing executes, every submission is
+already refused. What is lost is observability and the truthfulness of the caller-facing message. It
+lands in Phase 9 rather than Phase 10 because the brake is P9-T6 and this phase's whole thesis is
+landing the safety machinery while the worst possible bug is still a no-op.
 
 ---
 

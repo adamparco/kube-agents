@@ -81,31 +81,9 @@ turns out to be wrong is closed with a reason, not recycled.
 
 ## Inbox
 
-**Last drained:** 2026-07-30
+**Last drained:** 2026-07-31
 
-### 06 §4.4 row 3 promises an auto-pause the broker never performs
-
-- **Kind:** finding
-- **Where:** `k8s-operator/internal/broker/brake.go:456` and `:547` (`AutoPause: true`), no consumer in `internal/broker/pipeline/`, `server.go` or `cmd/broker/`; `status.broker.journalReachable` has no writer (`agent_controller.go:402`)
-- **Why it matters:** `broker-refuse-l2.sh` proved the journal-unavailable refusal live on 2026-07-31 (503, `journal-unavailable`, nothing journaled, nothing executed) — the refusal half of row 3 is real. The **pause** half is not: the brake sets `AutoPause: true` and the reply the caller receives says _"and the agent is being paused"_, but nothing reads the field and nothing writes the status condition, so an agent whose journal has failed keeps being asked and keeps refusing one submission at a time. Row 9's auto-pause **is** wired (`verify/driver.go:400` → `escalate.Recorder.Pause`), which is what makes this a gap rather than unbuilt scope. The user-visible message asserting a thing that does not happen is the sharp end: a caller reading it will not go looking for the pause that never came.
-- **Priority:** normal
-- **Added:** 2026-07-31
-
-### A retired grant's residue on the scratch cluster still confers the journal verbs
-
-- **Kind:** finding
-- **Where:** `gke-scratch-kube-agents-dev` — `Role/kubeagents-broker-operations` and `RoleBinding/platform-agent-broker-operations` in `kubeagents-system`; no current template renders either (`k8s-operator/scripts/broker-operations-grant.yaml.template` is a ClusterRole only, and `agent-identity.yaml.template` binds only to that ClusterRole)
-- **Why it matters:** those two objects grant the actor `actionrecords get/list/watch/create` and `actionrecords/status get/update/patch` — the same verbs the per-tier Role grants — from an object **no template owns**. They are residue from before the split moved the namespaced verbs onto the per-tier Role, and `kubectl apply` does not delete what it stopped rendering. It was invisible until a suite tried to **revoke** the grant: stripping both shipped objects left the authorizer still saying `yes`. Three consequences worth scheduling against, in order of severity: (1) an unowned RBAC object cannot be revoked by re-provisioning, so any future narrowing of the actor grant is silently a no-op on this cluster; (2) **the live `platform-agent-host` install should be checked for the same residue** — verification only, no destructive action; (3) `teardown_NN_*.sh` reaps what its `provision_NN_*.sh` created, which by construction is never the objects a _previous generation_ of the template created, so this class of residue has no owner at all. The immediate hole is closed — `broker-refuse-l2.sh` now discovers grant holders by walking the bindings instead of naming objects — but that is a test working around the residue, not the residue being gone.
-- **Priority:** normal
-- **Added:** 2026-07-31
-
-### A negative control cannot see the probe→suite line-tag contract
-
-- **Kind:** finding
-- **Where:** `dev/verify/broker-refuse-l2.sh --negative-control` and `dev/verify/fixtures/broker_refuse_probe.py`; the same shape applies to `broker_probe.py` / `broker_execute_probe.py` and their suites
-- **Why it matters:** the control synthesises the probe's transcript, so it asserts the suite's arms against tuples the suite itself spells — and passes 25/25 while the real probe emits **different line tags** than the ones the suite reads. That is exactly what happened on 2026-07-31: `emit_reply(scenario, …)` tagged the reply line `split-snapshot` where `field()` looks for `submit`, the control was green, and the live run deferred with "the probe emitted no trace id". The suite deferring rather than passing is correct behaviour and is why this is a finding and not an incident. But it is [[LSN-060]] arriving through a third door, and the cheap mechanization is a no-cluster contract check: the set of tags the probe can emit must equal the set the suite reads. Both facts are greppable from the two files, so this is an L0 line, not a cluster run.
-- **Priority:** normal
-- **Added:** 2026-07-31
+_(empty — B-006, B-007 and B-008 drained 2026-07-31; see `## Scheduled`)_
 
 ---
 
@@ -115,6 +93,57 @@ turns out to be wrong is closed with a reason, not recycled.
 | ----- | ---------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | B-003 | Ruling on the deferred `/replay` question: reshape V-BRK-021, do not narrow it     | finding (human ruling) | **`phase-9.md` P9-T7c-2c**, inserted as the next unit — ahead of the two remaining tasks, because it is L0 and Phase 9's own ordering rule puts the remaining L0 work in front of the remaining L2 work. The **implementation** of `/replay` and `/approve` is explicitly NOT in it; that stays in Phase 10 beside P10-T4 / P10-T7, as the item's own point 3 asks                                                                                                                                                                                               | 2026-07-30 |
 | B-005 | Run the builds on a provisioned, warm builder instead of standing one up per build | task                   | **The next improvement pass, step (1) only — the measurement.** Its steps (2) and (3) are implementation and may not be scheduled into a pass; the numbers the pass produces schedule their own unit. The item's own gate ("measure with the leak cleaned up") is satisfied for free by the ordering: the next pass fires at the Phase 9 milestone, which is after B-004. The **Spotlight sub-finding** (63 975 indexed entries under `GOCACHE`, `.metadata_never_index` as the cheap test) travels with this item, not with B-004 — the indexer orphans nothing | 2026-07-30 |
+| B-006 | 06 §4.4 row 3 promises an auto-pause the broker never performs                     | finding                | **`phase-9.md` P9-T9c**, appended to the Phase 9 ladder ahead of `harness-milestone` — it displaces nothing, because it is added at the end rather than inserted. The **check** question travels separately to the next improvement pass: 09 has no ID covering row 3's pause, and adding one is a spec edit a pass makes, not a unit                                                                                                                                                                                                                            | 2026-07-31 |
+| B-007 | A retired grant's residue on the scratch cluster still confers the journal verbs   | finding                | **The next improvement pass**, all three of its consequences. The mechanization is a check ("no RBAC object outside the rendered set grants an agent identity the journal verbs") and a provisioning-lifecycle rule, which is a pass's subject and not a unit's. The **live-install look** rides with it as a read-only `auth can-i` / `get role` comparison against `platform-agent-host` — verification only                                                                                                                                                   | 2026-07-31 |
+| B-008 | A negative control cannot see the probe→suite line-tag contract                    | finding                | **The next improvement pass.** An L0 line asserting that the tag set `broker_refuse_probe.py` can emit equals the tag set `broker-refuse-l2.sh` reads, generalised across all three probe/suite pairs. A check change, added to `dev/L0-CHAIN.txt` at its one definition site                                                                                                                                                                                                                                                                                    | 2026-07-31 |
+
+**The 2026-07-31 drain — three items the HARNESS wrote to its own inbox, and why that is not a
+protocol violation.** This file's rule is that humans write it and the harness drains it. All three
+items below were written by `harness-run` during `P9-T9b-5b-ii-a`, which needs saying out loud. The
+alternative was the ledger, and the ledger is where a finding goes to be _recorded_; the inbox is
+where one goes to be _scheduled_. Three properties of the inbox are exactly what these findings
+needed and the ledger does not offer: they are placed at a planning moment rather than mid-unit,
+each gets an argued destination rather than a paragraph, and `invariants-gate.py` will fail the
+build if any of them is still sitting here at the next ORIENT. A finding recorded in the ledger has
+none of those guarantees. Written 2026-07-31, drained 2026-07-31, by the same skill on either side
+of a CHECKPOINT — the delay this file's preamble calls "the feature" is genuinely present, because
+the drain happened at ORIENT with the unit closed and pushed.
+
+**Severity, classified by the harness rather than read off `Priority: normal`, as the drain protocol
+requires.**
+
+- **B-006 is not a live security regression.** The missing behaviour is a _pause_, and its absence
+  fails **open in availability terms and closed in safety terms**: every submission into a broker
+  with an unreachable journal is already refused 503, one at a time, forever. Nothing executes. What
+  is lost is the fleet-level signal — an operator does not learn from
+  `status.broker.journalReachable` that an agent has gone dark, and the caller is told it is being
+  paused when it is not. That is a correctness and observability defect in Phase 9's own deliverable
+  (P9-T6, the brake), which is why it goes to Phase 9 rather than to the phase where it first hurts.
+- **B-007 is not a live security regression either, and the argument is the one that matters.** The
+  residue grants the actor **exactly the verbs the shipped per-tier Role already grants it** —
+  `actionrecords get/list/watch/create` and `actionrecords/status get/update/patch`. No authority is
+  conferred that a correct install does not confer, so nothing is over-permissioned today. What is
+  broken is **revocability**: an object no template renders cannot be narrowed by re-provisioning,
+  so the first future attempt to tighten the actor grant will be a silent no-op wherever this
+  residue lives. It becomes a regression the day someone tries; it is not one now. Recorded this
+  precisely because "an unowned RBAC object grants the journal verbs" reads like a `now` at a
+  glance, and the drain protocol says the harness must say which it is.
+- **B-008 is a check gap and nothing else.** The suite it concerns **deferred** rather than passing,
+  which is the correct verdict for a property that could not be evaluated.
+
+**Why B-006 lands in Phase 9 and not Phase 10**, which is the defensible alternative — an auto-pause
+that never fires matters far more once the broker can write, and Phase 9's acceptance (d) asks only
+that the broker "refuses to act when the journal is unavailable", which is proven. Against that:
+Phase 9's stated goal is to "build the entire safety machinery … while the worst possible bug is
+still a no-op", and the brake is P9-T6. Deferring a brake behaviour to the phase where it first
+causes harm is precisely the shape this phase exists to prevent. It is also cheap now and expensive
+later: the code that must consume `AutoPause` is code Phase 9 wrote and Phase 9 has an L2 harness
+pointed at it.
+
+**What the drain deliberately does NOT do.** It does not add a check ID for row 3's pause. 09 has
+none, adding one edits the conformance spec, and `harness-improve` §5 makes that a pass's work
+rather than a unit's — so P9-T9c will be implemented against a spec sentence (06 §4.4 row 3) with
+its verification bound at the pass. That is recorded here rather than discovered at P9-T9c's PLAN.
 
 **The drain's reasoning, which is scheduling and not substance — the ruling itself is the author's
 and is kept verbatim below.**
