@@ -829,6 +829,11 @@ def negative_control() -> int:
     does not have: an arrival, and a deferral missing its owner. The floor clause is no longer in
     that category -- document 06's curation raised it off zero -- but its mutation is kept, because
     a floor that stops being asserted reads exactly like a floor that holds.
+
+    Every mutation must therefore be written to survive the tree moving under it, and the loop below
+    fails a mutation that turns out to be a no-op rather than scoring it MISS. The floor mutation
+    was the one that did move: it rewrote the literal `covered: 0`, curation replaced that zero, and
+    the row reported MISS -- indistinguishable from the check having gone quiet ([[LSN-063]]).
     """
     base = _inputs()
     if check(*base):
@@ -897,7 +902,15 @@ def negative_control() -> int:
         ),
         (
             "the floor is raised above the coverage under it",
-            _mutate(base, 0, lambda t: t.replace('  "02":\n    covered: 0', '  "02":\n    covered: 9', 1)),
+            # Raise whatever document 02's floor is, rather than rewriting a literal it once held:
+            # a mutation keyed to `covered: 0` stops applying the day curation moves the floor off
+            # zero, and a no-op mutation scores MISS -- the verdict for "the check let the defect
+            # through" -- over a defect that was never applied ([[LSN-063]]).
+            _mutate(base, 0, lambda t: re.sub(
+                r'^(  "02":\n    covered: )(\d+)$',
+                lambda m: f"{m.group(1)}{int(m.group(2)) + 9}",
+                t, count=1, flags=re.M,
+            )),
             "the floor fell: document 02",
         ),
         (
@@ -914,6 +927,16 @@ def negative_control() -> int:
 
     failures = 0
     for name, args, needle in mutations:
+        # A mutation that did not change its input cannot be evaluated. Without this arm the
+        # unmutated tree is re-checked, comes back clean, and the row prints MISS -- which reads as
+        # "the check let the defect through" when what happened is that the defect was never
+        # applied. A no-op is how a mutation keyed to a literal from the tree dies the day the tree
+        # moves past it ([[LSN-063]]).
+        if args == base:
+            failures += 1
+            print(f"  BROKEN  {name}")
+            print("           the mutation did not change its input; nothing was evaluated")
+            continue
         findings = check(*args)
         hit = any(needle in f for f in findings)
         print(f"  {'caught ' if hit else 'MISS   '} {name}")

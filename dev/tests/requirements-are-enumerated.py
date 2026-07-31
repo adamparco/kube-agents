@@ -378,8 +378,26 @@ def dump_requirements(entries: dict[str, dict]) -> str:
 # covers exactly R-06.4.4-9..17. Schema field tables throughout take V-CMP-010, the field-level diff
 # between 06's schema block and the generated OpenAPI/type.
 #
-# Published gaps in 06 -- five requirements deliberately left unmapped, because no catalog row
-# asserts them:
+# Documents 01-05, 07 and 08 -- the V-MET-002 worklist, section by section. This pass took the 135
+# requirements coverage-ratchet.yaml lists as load-bearing-and-uncovered, not the whole document:
+# those are the ones an unmapped entry fails V-MET-002 over. Grid and table sections resolve as a
+# unit where a single check asserts the whole grid -- 02 section 7's 39 capability cells are
+# V-CTN-021, which asserts every cell with its own expected outcome, and 03 section 3.2's three tier
+# rows are the same grid seen per tier, so they carry V-CTN-021 plus the containment checks for the
+# "never" column. 03 section 4.3 splits along its own argument: the VAP-affordable obligations take
+# V-CTN-004/012/003/005/007/008/025, the cross-object ones V-CTN-013 and V-CTN-014, the journal
+# table's `create`/`update`/`patch` row V-BRK-004 (rejected at admission) and its four detect-only
+# rows V-BRK-003 (journal reconciliation), and the compromised-controller argument V-CTN-032, which
+# runs exactly that adversary -- as the controller SA -- and asserts rules 2 and 3 still hold. 03
+# section 9's summary table is one row per control family and is mapped to the family's checks
+# rather than to a single row-level check. 05 section 1.2's four TTL rows and the reversibility
+# horizon are V-REV-008, which asserts the class-based TTL and that a record is not GC'd before
+# export confirms. 05 section 7's "the router is parked at zero replicas" is V-CMP-004, whose
+# property is literally that parked-at-zero is not wired. 08 section 2.5's label table is V-RUN-004
+# (stamped and selectable) plus, per row, the admission policy that consumes the label.
+#
+# Published gaps -- seventeen requirements deliberately left unmapped, because no catalog row
+# asserts them. Six in 06:
 #   R-06.2.3-6   "developer-team actor: none in v1". Nothing asserts the ABSENCE of a
 #                developer-team actor GSA; every containment check asserts what a principal
 #                cannot do, not that a principal does not exist.
@@ -391,7 +409,26 @@ def dump_requirements(entries: dict[str, dict]) -> str:
 #   R-06.4.2-45  digests are never journaled or logged; `reasons[]` names the source Secret and
 #                key, never the value.
 # The last three are one hole: no check in the catalog reaches secret-material handling inside the
-# code floor. Closing it is a catalog change, not a curation change.
+# code floor. Closing it is a catalog change, not a curation change. And eleven elsewhere:
+#   R-03.4.3-8   no write to an `Agent` CR whose identity is an ANCESTOR of the writer's.
+#                V-CTN-007 covers the writer's OWN CR and V-CTN-025 the brake field on a child's;
+#                nothing walks `parentRef` upward on a write.
+#   R-03.4.3-9   actor writes stay inside the LIVE tier template. Both template checks
+#                (V-CTN-012, V-CTR-004) are the inlined-literal form, which is the point of 03
+#                section 4.2 -- the live-object form is a deferred capability with no check.
+#   R-04.5.1-9   the eight settle-window rows (through R-04.5.1-16). V-PRO-013 exercises the
+#                PREDICATE table of 04 section 5.1; the windows are a second table, and the
+#                section states them precisely so they are falsifiable ("bounded on its own is
+#                unfalsifiable -- any number satisfies it"). A check that never reads
+#                5m/10m/90s/30s/15s/20m/2m does not assert them. Closing this is a catalog
+#                change -- naturally an L0 doc-drift lint over the broker's per-kind window
+#                constants against the table, in the shape of V-MET-013.
+#   R-05.1.2-2   snapshots are stripped of `managedFields` and of `Secret` `data`, with a
+#                per-key digest instead of material. Same hole as R-06.4.2-44/45, one layer down.
+#   R-07.5-4     "authority never precedes machinery" -- a PRE-MERGE check must fail any change
+#                granting an agent identity a write verb before the broker, classifier, journal
+#                and undo path exist. V-CTN-004 asserts the reader holds no write verb; no check
+#                asserts the ORDERING gate itself.
 #
 # {len(entries)} requirements.
 

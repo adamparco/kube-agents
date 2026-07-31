@@ -55,8 +55,26 @@
 # covers exactly R-06.4.4-9..17. Schema field tables throughout take V-CMP-010, the field-level diff
 # between 06's schema block and the generated OpenAPI/type.
 #
-# Published gaps in 06 -- five requirements deliberately left unmapped, because no catalog row
-# asserts them:
+# Documents 01-05, 07 and 08 -- the V-MET-002 worklist, section by section. This pass took the 135
+# requirements coverage-ratchet.yaml lists as load-bearing-and-uncovered, not the whole document:
+# those are the ones an unmapped entry fails V-MET-002 over. Grid and table sections resolve as a
+# unit where a single check asserts the whole grid -- 02 section 7's 39 capability cells are
+# V-CTN-021, which asserts every cell with its own expected outcome, and 03 section 3.2's three tier
+# rows are the same grid seen per tier, so they carry V-CTN-021 plus the containment checks for the
+# "never" column. 03 section 4.3 splits along its own argument: the VAP-affordable obligations take
+# V-CTN-004/012/003/005/007/008/025, the cross-object ones V-CTN-013 and V-CTN-014, the journal
+# table's `create`/`update`/`patch` row V-BRK-004 (rejected at admission) and its four detect-only
+# rows V-BRK-003 (journal reconciliation), and the compromised-controller argument V-CTN-032, which
+# runs exactly that adversary -- as the controller SA -- and asserts rules 2 and 3 still hold. 03
+# section 9's summary table is one row per control family and is mapped to the family's checks
+# rather than to a single row-level check. 05 section 1.2's four TTL rows and the reversibility
+# horizon are V-REV-008, which asserts the class-based TTL and that a record is not GC'd before
+# export confirms. 05 section 7's "the router is parked at zero replicas" is V-CMP-004, whose
+# property is literally that parked-at-zero is not wired. 08 section 2.5's label table is V-RUN-004
+# (stamped and selectable) plus, per row, the admission policy that consumes the label.
+#
+# Published gaps -- seventeen requirements deliberately left unmapped, because no catalog row
+# asserts them. Six in 06:
 #   R-06.2.3-6   "developer-team actor: none in v1". Nothing asserts the ABSENCE of a
 #                developer-team actor GSA; every containment check asserts what a principal
 #                cannot do, not that a principal does not exist.
@@ -68,7 +86,26 @@
 #   R-06.4.2-45  digests are never journaled or logged; `reasons[]` names the source Secret and
 #                key, never the value.
 # The last three are one hole: no check in the catalog reaches secret-material handling inside the
-# code floor. Closing it is a catalog change, not a curation change.
+# code floor. Closing it is a catalog change, not a curation change. And eleven elsewhere:
+#   R-03.4.3-8   no write to an `Agent` CR whose identity is an ANCESTOR of the writer's.
+#                V-CTN-007 covers the writer's OWN CR and V-CTN-025 the brake field on a child's;
+#                nothing walks `parentRef` upward on a write.
+#   R-03.4.3-9   actor writes stay inside the LIVE tier template. Both template checks
+#                (V-CTN-012, V-CTR-004) are the inlined-literal form, which is the point of 03
+#                section 4.2 -- the live-object form is a deferred capability with no check.
+#   R-04.5.1-9   the eight settle-window rows (through R-04.5.1-16). V-PRO-013 exercises the
+#                PREDICATE table of 04 section 5.1; the windows are a second table, and the
+#                section states them precisely so they are falsifiable ("bounded on its own is
+#                unfalsifiable -- any number satisfies it"). A check that never reads
+#                5m/10m/90s/30s/15s/20m/2m does not assert them. Closing this is a catalog
+#                change -- naturally an L0 doc-drift lint over the broker's per-kind window
+#                constants against the table, in the shape of V-MET-013.
+#   R-05.1.2-2   snapshots are stripped of `managedFields` and of `Secret` `data`, with a
+#                per-key digest instead of material. Same hole as R-06.4.2-44/45, one layer down.
+#   R-07.5-4     "authority never precedes machinery" -- a PRE-MERGE check must fail any change
+#                granting an agent identity a write verb before the broker, classifier, journal
+#                and undo path exist. V-CTN-004 asserts the reader holds no write verb; no check
+#                asserts the ORDERING gate itself.
 #
 # 853 requirements.
 
@@ -83,10 +120,13 @@
   checks: []
 "R-01.3-1":
   text: "So the shape of the agent fleet is a consequence of the shape of the infrastructure, not a separate thing to keep in sync with it: a new cluster arrives already administered, a new namespace arrives already owned, and there is never a scope with no agent or an agent with no scope."
-  checks: []
+  checks:
+    - V-CTN-035
+    - V-CTN-036
 "R-01.3-2":
   text: "The callee always re-authorizes the request in its own scope ([02](02-agent-personas.md) §2.3)."
-  checks: []
+  checks:
+    - V-MSH-002
 "R-01.4-1":
   text: "**Intent:** the core concepts — agent personas, brokered imperative action, tenancy isolation, skill-based capability, the agent-orchestration/runtime model — are **Kubernetes-generic** and must not assume a specific cloud."
   checks: []
@@ -362,7 +402,9 @@
   checks: []
 "R-02.4-1":
   text: "**Must delegate or escalate, not do:** it does **not** operate workloads inside a namespace — it provisions and bounds the namespace, then delegates the tenant's work to the Developer Team Agent."
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-MSH-002
 "R-02.5-1":
   text: "**Must escalate, not attempt:** cluster- or project-level configuration, cross-namespace dependencies, node capacity, cluster add-ons."
   checks: []
@@ -371,82 +413,138 @@
   checks: []
 "R-02.6-1":
   text: "| Platform Agent → a **cluster** in its project | the **Cluster Admin Agent** for that cluster | that one cluster |"
-  checks: []
+  checks:
+    - V-CTN-035
 "R-02.6-2":
   text: "| Cluster Admin Agent → a **namespace** in its cluster | the **Developer Team Agent** for that namespace | that one namespace |"
-  checks: []
+  checks:
+    - V-CTN-035
 "R-02.6-3":
   text: "**No scope without an agent.** A cluster with no `cluster-admin` agent, or a namespace with no `developer-team` agent, is a defect the tier above detects on its proactive loop (§2.2) and remediates by creating the missing agent — it is not a configuration someone forgot to fill in."
-  checks: []
+  checks:
+    - V-CTN-035
+    - V-CTN-036
 "R-02.6-4":
   text: "| **Template rendering** | The parent supplies only `(tier, scope, parentRef)`; rule bodies come from a constant template, so an over-grant cannot be _expressed_. |"
-  checks: []
+  checks:
+    - V-CTR-004
+    - V-CTN-023
 "R-02.6-5":
   text: "| **`vap-agent-scope`** (admission, CEL) | Denies any `Role`/`ClusterRole` naming an agent identity whose rules exceed its tier template, grant an escalation verb, or grant cluster scope to a namespace tier. |"
-  checks: []
+  checks:
+    - V-CTN-012
+    - V-CTN-028
+    - V-CTN-023
 "R-02.6-6":
   text: "| **Cross-object child ⊆ parent webhook** | Denies a child whose scope is not a **strict subset** of the parent's actual scope. **Required in v1** — promoted from deferred hardening by the inversion, because a parent now holds real authority to create children. |"
-  checks: []
+  checks:
+    - V-CTN-013
+    - V-CTN-023
 "R-02.6-7":
   text: "The parent never hand-authors RBAC rules, the controller mints no identity, and the parent's actor SA has no authority over RBAC naming any agent identity other than a templated child's."
-  checks: []
+  checks:
+    - V-CTN-017
+    - V-CTN-005
+    - V-CTR-004
 "R-02.6-8":
   text: "Cascading cleanup follows the `kube-agents/parent` label and owner references (§6.1), so removing a parent never leaves unparented agents holding authority."
-  checks: []
+  checks:
+    - V-CTN-024
 "R-02.7-1":
   text: "| **Platform** | Its one project: clusters, fleet, cloud | Cluster lifecycle; fleet-wide policy and tenant RBAC; project-scoped cloud resources; provisioning Cluster Admin Agents | Cluster internals → Cluster Admin Agent; namespace workloads → down the chain | Cluster/node-pool deletion; project IAM; weakening fleet policy; cross-tenant change; production traffic shift; deprovisioning a child | Any other project; the forbidden set ([03](03-security-model.md) §3.3); operating another tier's objects directly |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
+    - V-CTN-009
 "R-02.7-2":
   text: "| **Cluster Admin** | Its one cluster | Node pools, add-ons, cluster-scoped policy and quota, namespace + tenant provisioning, provisioning Developer Team Agents | Workload operations → Developer Team Agent; project-scope needs → **escalate** to the Platform Agent | Namespace deletion; node-pool deletion/production drain; loosening cluster policy or PSA; deleting storage; cluster ingress routing | Any other cluster; project scope; `kube-system` beyond its declared add-on allowlist; the forbidden set |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
+    - V-CTN-009
 "R-02.7-3":
   text: "| **Developer Team** | Its one namespace | Everything inside its namespace: workloads, config, scaling, rollouts, its own quota-bounded resources | Anything beyond the namespace edge → **escalate** to the Cluster Admin Agent | PVC/stateful deletion; loosening a NetworkPolicy; exposing a Service publicly; production traffic shifts | Any other namespace; cluster or project scope; cluster-scoped objects; the forbidden set |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
+    - V-CTN-009
 "R-02.7-4":
   text: "| Provision / upgrade clusters | ✅ | ❌ | ❌ |"
-  checks: []
+  checks:
+    - V-CTN-021
 "R-02.7-5":
   text: "| Manage node pools / cluster add-ons | ➡️ sets policy | ✅ | ❌ |"
-  checks: []
+  checks:
+    - V-CTN-021
 "R-02.7-6":
   text: "| Create namespaces & tenancy isolation | ➡️ defines model | ✅ | ❌ |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-CTN-035
 "R-02.7-7":
   text: "| Operate workloads in a namespace | ⤵️ delegates | ⤵️ delegates | ✅ (own ns) |"
-  checks: []
+  checks:
+    - V-CTN-021
 "R-02.7-8":
   text: "| Provision the agent one layer down | ✅ Cluster Admin | ✅ Developer Team | ❌ |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-CTN-035
 "R-02.7-9":
   text: "| Tighten a security control in scope | ✅ | ✅ | ✅ |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-010
 "R-02.7-10":
   text: "| Loosen a control / delete stateful data | 🔒 | 🔒 | 🔒 |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
+    - V-GAT-009
 "R-02.7-11":
   text: "| Delete a cluster, node pool, or namespace | 🔒 | 🔒 (in-cluster) | ❌ |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
 "R-02.7-12":
   text: "| Deprovision the agent one layer down | 🔒 | 🔒 | ❌ |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
 "R-02.7-13":
   text: "| Call its parent / its direct child | n/a · ✅ | ✅ · ✅ | ✅ · n/a |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-MSH-001
 "R-02.7-14":
   text: "| Call a sibling, grandparent, or grandchild | ❌ | ❌ | ❌ |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-MSH-001
+    - V-MSH-008
 "R-02.7-15":
   text: "| Cross another agent's scope | ❌ | ❌ | ❌ |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-CTN-009
 "R-02.7-16":
   text: "| Write outside the broker | ❌ | ❌ | ❌ |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-BRK-029
+    - V-CTN-004
 "R-02.7-17":
   text: "| Modify any agent identity, CR, or the journal | ❌ | ❌ | ❌ |"
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-CTN-005
+    - V-CTN-007
+    - V-CTN-008
 "R-02.7-18":
   text: "Legend: ✅ acts autonomously (in scope, reversible, journaled) · 🔒 acts only after a human approves the gated action ([03](03-security-model.md) §5) · ➡️ sets the policy the layer below applies · ⤵️ must delegate to the tier that owns the scope (§2.3) · ❌ forbidden — refused by the broker, and again by admission if the broker is bypassed."
-  checks: []
+  checks:
+    - V-CTN-021
+    - V-GAT-014
 "R-02.8-1":
   text: "| **Agent pod** | Reader SA (`<tier>-agent`) | Hermes harness, `SOUL.md`, skills, MCP clients | The LLM and all untrusted input live here, with **no** write credential |"
   checks: []
@@ -473,7 +571,10 @@
   checks: []
 "R-03.1-1":
   text: "The threat model treats **all model output and all external input as untrusted**: model output is never a trusted identity, authorization, or risk signal, and content read from the cluster, tools, or chat is untrusted input, not instructions."
-  checks: []
+  checks:
+    - V-ADV-006
+    - V-ADV-007
+    - V-ADV-009
 "R-03.2-1":
   text: "| Human → Agent | Authenticated user → agent chat | Impersonation, unauthorized intent | Authenticated chat (`allowedUsers`) enforced by the ChatOps router **before** dispatch; per-audience entrypoints ([02](02-agent-personas.md) §2.4). Routing is not an authz signal (§4a) |"
   checks: []
@@ -506,58 +607,106 @@
   checks: []
 "R-03.3.1-1":
   text: "| **Reader** — `<tier>-agent` | The **agent pod** (Hermes) | **Read-only**, scoped to the tier. No write verb on anything, ever. | The LLM runs here. Give it no write credential and a prompt-injected model has nothing to forge a write with. |"
-  checks: []
+  checks:
+    - V-CTN-004
+    - V-CTN-001
+    - V-CTN-030
+    - V-BRK-001
 "R-03.3.1-2":
   text: "| **Actor** — `<tier>-<scope>-actor` | The **Action Broker** pod | **Read-write within the tier's scope**, minus the forbidden set (§3.3) | Deterministic code runs here. It writes only what it has classified, gated, snapshotted, and journaled. |"
-  checks: []
+  checks:
+    - V-CTN-002
+    - V-CTN-003
+    - V-CTN-026
+    - V-CTN-027
 "R-03.3.2-1":
   text: "| **Platform Agent** (1/project) | Its one project — clusters, fleet, cloud | Cluster lifecycle, fleet-wide policy/RBAC for **tenants**, project-scoped cloud resources, provisioning Cluster Admin Agents | Any other project; operating tenant workloads directly (delegate to the tier that owns them); the forbidden set |"
-  checks: []
+  checks:
+    - V-CTN-003
+    - V-CTN-009
+    - V-CTN-021
+    - V-CTN-027
+    - V-CTN-035
 "R-03.3.2-2":
   text: "| **Cluster Admin Agent** (1/cluster) | Its one cluster | Node pools, add-ons, cluster-scoped policy/quota, namespace + tenant provisioning, provisioning Developer Team Agents | Any other cluster; project scope; another cluster's tenants; the forbidden set |"
-  checks: []
+  checks:
+    - V-CTN-003
+    - V-CTN-009
+    - V-CTN-021
+    - V-CTN-027
+    - V-CTN-035
 "R-03.3.2-3":
   text: "| **Developer Team Agent** (1/namespace) | Its one namespace | Everything inside its namespace: workloads, config, scaling, rollouts, its own quota-bounded resources | Any other namespace; cluster or project scope; cluster-scoped objects; the forbidden set |"
-  checks: []
+  checks:
+    - V-CTN-003
+    - V-CTN-009
+    - V-CTN-021
+    - V-CTN-027
 "R-03.3.3-1":
   text: "**The escalation verbs** — `escalate`, `bind`, and `impersonate`, on any resource, always."
-  checks: []
+  checks:
+    - V-CTN-006
+    - V-CTN-028
+    - V-CTN-029
 "R-03.3.3-2":
   text: "Enforced field-level, against whole-object replacement as well as merge patches, so it cannot be evaded by rewriting the CR with another field also changed. `resume` is a roster action ([06](06-api-and-data-contracts.md) §4.4), never an agent one."
-  checks: []
+  checks:
+    - V-CTN-025
+    - V-CTR-011
 "R-03.4.1-1":
   text: "The broker derives `(tier, scope)` from the **authenticated identity**, never from a field in the request."
-  checks: []
+  checks:
+    - V-BRK-002
 "R-03.4.1-2":
   text: "An envelope claiming a different scope is rejected, not honoured."
-  checks: []
+  checks:
+    - V-BRK-002
 "R-03.4.2-1":
   text: "When a parent provisions a child ([02](02-agent-personas.md) §6), it creates the child `Agent` CR **plus** the child's reader/actor identities, rendered from the child's `tier` + `scope` via the **tier template** — the parent never hand-authors RBAC rules."
-  checks: []
+  checks:
+    - V-CTN-035
+    - V-CTN-005
+    - V-CTR-004
 "R-03.4.2-2":
   text: '"Exceeds its tier template" is decidable in CEL **only because the template is compiled into the policy as a literal allow-list**, generated from the same source as the rendered manifests; the policy never reads a template object at admission time, because it cannot. §4.3 tabulates which obligations this affords the VAP and which fall to the webhook.'
-  checks: []
+  checks:
+    - V-CTN-012
+    - V-CTR-004
 "R-03.4.3-1":
   text: "The backstop is **two objects, not one** ([05](05-system-architecture.md) `C-AS`), and the split is not an implementation detail: **in-tree CEL cannot read another object.** Every obligation below that needs a second object — an ancestry walk up `parentRef`, a tier-template lookup, an `OwnerReference` chain — is therefore **not expressible in a `ValidatingAdmissionPolicy`** and must live in the controller's validating webhook."
-  checks: []
+  checks:
+    - V-CTN-012
+    - V-CTN-013
+    - V-CTN-023
 "R-03.4.3-2":
   text: "| Reader SAs may not write **anything** | `vap-agent-scope` (in-tree CEL) | Single-object: verb + authenticated user |"
-  checks: []
+  checks:
+    - V-CTN-004
 "R-03.4.3-3":
   text: "| Actor SAs may write only within their **declared scope** (namespace/cluster/project of the request) | `vap-agent-scope` | Single-object: the request's namespace vs the scope encoded in the SA name |"
-  checks: []
+  checks:
+    - V-CTN-003
+    - V-CTN-009
 "R-03.4.3-4":
   text: "| Actor SAs may write only resources **in their tier template** | `vap-agent-scope`, from an **inlined** template | Needs the template. Expressible **only** if the template is compiled into the policy as a literal allow-list, regenerated with it — never read from a ConfigMap at admission time |"
-  checks: []
+  checks:
+    - V-CTN-012
+    - V-CTR-004
 "R-03.4.3-5":
   text: "| No RBAC/IAM object **naming an agent identity** may be created or modified outside the attenuation rules | `vap-agent-scope` | Single-object: the rules are in the submitted object |"
-  checks: []
+  checks:
+    - V-CTN-005
+    - V-CTN-028
 "R-03.4.3-6":
   text: "| No write to control-plane or journal objects (§3.3 rules 3–4), including the brake-field carve-out | `vap-agent-scope` | Single-object, field-level |"
-  checks: []
+  checks:
+    - V-CTN-007
+    - V-CTN-008
+    - V-CTN-025
 "R-03.4.3-7":
   text: "| **Child `Agent` scope ⊆ parent's** (§4.2) | **Controller validating webhook** | Requires reading the parent `Agent` CR |"
-  checks: []
+  checks:
+    - V-CTN-013
 "R-03.4.3-8":
   text: "| **No write to an `Agent` CR whose identity is an ancestor of the writer's** | **Controller validating webhook** | Requires walking `parentRef` to the root — an unbounded cross-object traversal |"
   checks: []
@@ -566,37 +715,55 @@
   checks: []
 "R-03.4.3-10":
   text: "| **Pod → actor SA binding** (below) | **Controller validating webhook** | Requires resolving the pod's `OwnerReference` chain to an `Agent` CR |"
-  checks: []
+  checks:
+    - V-CTN-014
+    - V-CTN-032
 "R-03.4.3-11":
   text: "**Journal enforcement: what admission covers, and what it does not.** Writes by an actor SA must carry the `kube-agents/action-id` annotation."
-  checks: []
+  checks:
+    - V-BRK-004
 "R-03.4.3-12":
   text: "| `create` / `update` / `patch` of the primary resource | **Rejected at admission** — hard, synchronous, pre-persistence | The request carries the object, so the annotation is present and checkable |"
-  checks: []
+  checks:
+    - V-BRK-004
 "R-03.4.3-13":
   text: "| `delete` | **Detected by reconciliation** (`C-JR`) — not preventable | A `DELETE` admission request carries **no client-supplied object**. There is nothing to annotate and nothing to read |"
-  checks: []
+  checks:
+    - V-BRK-003
 "R-03.4.3-14":
   text: "| `deletecollection` | **Detected by reconciliation** (`C-JR`) | Same, and the affected set is not enumerated in the request at all |"
-  checks: []
+  checks:
+    - V-BRK-003
 "R-03.4.3-15":
   text: "| Subresource writes (`/scale`, `/status`, `/eviction`, `/exec`) | **Detected by reconciliation** (`C-JR`) | The submitted object is the subresource, not the annotated parent; annotating it does not annotate the object changed |"
-  checks: []
+  checks:
+    - V-BRK-003
 "R-03.4.3-16":
   text: "| Cloud API mutations | **Detected by reconciliation** (`C-JR`) from Cloud Audit Logs | Outside Kubernetes admission entirely |"
-  checks: []
+  checks:
+    - V-BRK-003
 "R-03.4.3-17":
   text: "Three further controls bound the detect-only class independently: destructive deletes are `gated` and so never autonomous (§5.2), `ActionRecord`s are themselves in the forbidden set so the evidence cannot be erased (§3.3 rule 4), and the actor's scope still bounds _what_ can be deleted."
-  checks: []
+  checks:
+    - V-GAT-001
+    - V-CTN-008
+    - V-CTN-009
+    - V-BRK-013
 "R-03.4.3-18":
   text: 'A compromised controller therefore satisfies rule 1 for free — it writes the labels that the check reads — and the "smuggled pod is rejected at admission" mitigation evaporates against precisely the adversary it was written for.'
-  checks: []
+  checks:
+    - V-CTN-032
 "R-03.4.3-19":
   text: "Rules 2 and 3 do not have that property: the controller can create an `Agent` CR, but the ceiling and cardinality webhooks constrain what CRs may exist, and an ownership chain terminating at a _real_ `Agent` CR means the SA it binds is that CR's own — so a compromised controller reaches only identities already delegated to existing agents, never a fabricated pairing."
-  checks: []
+  checks:
+    - V-CTN-013
+    - V-CTN-015
+    - V-CTN-032
 "R-03.4.3-20":
   text: "Rule 3 removes the last degree of freedom: whatever pod it stands up must run the deterministic broker binary — no shell, no model, no arbitrary payload — so the credential is bound to code that classifies, gates, snapshots and journals."
-  checks: []
+  checks:
+    - V-CTN-032
+    - V-RUN-010
 "R-03.5.1-1":
   text: "| **routine** | In scope, reversible, low blast radius, non-production or non-critical | Execute immediately. Journal. Report in the periodic digest. |"
   checks: []
@@ -620,22 +787,39 @@
   checks: []
 "R-03.6-1":
   text: "All three controls live in the controller and broker, never in a skill or a prompt, and all three must function when the LLM, the router, and the inference stack are unavailable."
-  checks: []
+  checks:
+    - V-RUN-008
+    - V-RUN-013
+    - V-CTR-011
 "R-03.6-2":
   text: "| **`pause`** | One agent | `spec.operations.paused: true` on the `Agent` CR (also a chat command and a `kubectl` one-liner) | The broker refuses new envelopes immediately. The in-flight action completes or rolls back — never left half-applied. The work queue is preserved. |"
-  checks: []
+  checks:
+    - V-ISO-008
+    - V-RUN-007
+    - V-RUN-012
+    - V-NFR-004
+    - V-CMP-023
 "R-03.6-3":
   text: "| **`freeze`** | A scope or the fleet | A cluster-scoped `FleetFreeze` object the broker consults on **every** envelope, **fail-closed** if it cannot be read | Nothing executes anywhere in the frozen scope. Intended for incidents. Undo and rollback still work. |"
-  checks: []
+  checks:
+    - V-ISO-009
+    - V-CTR-007
 "R-03.6-4":
   text: "| **`undo <action-id>`** | One action | Replays the recorded undo plan through the broker as a first-class action — itself classified, journaled, and attributed | Restores pre-state. If the undo is itself destructive (rare), it is gated like any other action. |"
-  checks: []
+  checks:
+    - V-REV-002
+    - V-REV-005
+    - V-REV-009
 "R-03.6-5":
   text: "| **`contested`** | One target | Set automatically when a human undoes or manually reverts an agent action | The agent **must not redo** the same change to that target without explicit human instruction. Prevents human-vs-agent fights ([04](04-workflow-model.md) §4.2). |"
-  checks: []
+  checks:
+    - V-PRO-006
+    - V-BRK-019
 "R-03.6-6":
   text: "Fail-closed is always the default: **if the broker cannot journal, it does not act.**"
-  checks: []
+  checks:
+    - V-BRK-005
+    - V-ISO-006
 "R-03.7-1":
   text: '**What changes.** Every check that treats "the agent SA has no write verb" as the pass condition must be re-pointed, or it will report the whole system as critical-severity broken:'
   checks: []
@@ -653,55 +837,114 @@
   checks: []
 "R-03.8-1":
   text: "| **Prompt injection** | All external input is untrusted **data**, never instructions; model output is never an authz, scope, or risk signal. The broker re-derives scope from the authenticated caller and classifies in code, so an injected instruction can only ever request an action the agent was already permitted to take — bounded further by gates, budgets, and undo (§8.1) | `review-security-k8s-agents-prompt-injection` |"
-  checks: []
+  checks:
+    - V-ADV-001
+    - V-ADV-002
+    - V-ADV-003
+    - V-ADV-004
+    - V-GAT-017
+    - V-BRK-002
 "R-03.8-2":
   text: "| **Data exfiltration** | Default-deny egress allowlisted to inference, cloud APIs, the journal, and required MCP endpoints; **and** the write-side exfil paths are gated: exposing a Service publicly, loosening a NetworkPolicy, or copying Secret material into a non-Secret object are all `gated` or blocked | `review-security-k8s-agents-data-exfil`, `-firewall` |"
-  checks: []
+  checks:
+    - V-CTN-020
+    - V-GAT-021
 "R-03.8-3":
   text: "| **Credential compromise** | No long-lived static creds; short-lived brokered tokens (Minty + KMS); cloud identity via Workload Identity. The agent pod holds **no write credential at all**, so the high-value target is the broker — hardened, minimal, no LLM, no untrusted input parsing, one scope | `review-security-k8s-agents-credentials` |"
-  checks: []
+  checks:
+    - V-BRK-001
+    - V-CTN-004
+    - V-CTN-018
+    - V-BRK-012
+    - V-RUN-010
 "R-03.8-4":
   text: "| **Untrusted code execution** | Control loop separated from any execution sandbox; gVisor `RuntimeClass` when the capability lands. **Deferred** with the capability itself — v1 agents don't run untrusted code ([08](08-agent-runtime-and-identity.md) §5.1) | `review-security-k8s-agents-sandbox` |"
-  checks: []
+  checks:
+    - V-RUN-010
+    - V-CTR-012
 "R-03.8-5":
   text: "| **Insufficient attribution** | Trace/session IDs + authenticated requester carried from chat through the envelope into the `ActionRecord` and the audit log | `review-security-k8s-agents-audit-logs`, `docs/designs/audit-logging-user-attribution.md` |"
-  checks: []
+  checks:
+    - V-OBS-005
+    - V-OBS-007
+    - V-MSH-003
 "R-03.8-6":
   text: "| **Autonomy failure** (new) | Verify-then-rollback, initiative budgets, flap detection, blast-radius caps, `contested` markers, auto-brake (§5, §6, [04](04-workflow-model.md) §4.2, §5) | _new sub-skill:_ `review-security-k8s-agents-autonomy` |"
-  checks: []
+  checks:
+    - V-PRO-003
+    - V-PRO-004
+    - V-PRO-006
+    - V-PRO-015
+    - V-GAT-011
+    - V-ADV-005
 "R-03.9-1":
   text: "The allowlist must never omit MCP endpoints needed for grounding on live docs, and — on GKE — must not accidentally deny the metadata server that Workload Identity depends on."
-  checks: []
+  checks:
+    - V-CTN-020
 "R-03.9-2":
   text: "| Identity | Split reader/actor SAs per agent; per-tier Workload Identity; least-privilege cloud SA with scope conditions |"
-  checks: []
+  checks:
+    - V-RUN-001
+    - V-RUN-002
+    - V-CTN-018
 "R-03.9-3":
   text: "| Authorization | Read-only reader; scope-templated write for the actor; forbidden set; downward attenuation enforced by template + VAP + cross-object webhook |"
-  checks: []
+  checks:
+    - V-CTN-004
+    - V-CTN-002
+    - V-CTN-023
+    - V-CTN-027
 "R-03.9-4":
   text: "| Write path | **Action Broker is the sole writer** — classify → gate → snapshot → execute → verify → journal, outside the LLM loop; unjournaled create/update/patch rejected at admission, unjournaled deletes/subresource/cloud writes detected by `C-JR` within the §4.3 SLO |"
-  checks: []
+  checks:
+    - V-BRK-011
+    - V-BRK-001
+    - V-BRK-004
+    - V-BRK-003
+    - V-BRK-014
 "R-03.9-5":
   text: "| Human→agent | Trusted-human access (`allowedUsers`, checked before dispatch); gated class routed to an approval roster; routing is never an authz signal |"
-  checks: []
+  checks:
+    - V-CTR-019
+    - V-GAT-005
+    - V-GAT-013
+    - V-GAT-023
 "R-03.9-6":
   text: "| Human control | `pause` / `freeze` / `undo` / `contested`, effective with inference down; auto-brake on anomaly |"
-  checks: []
+  checks:
+    - V-RUN-008
+    - V-ISO-009
+    - V-REV-007
+    - V-PRO-006
+    - V-ADV-005
 "R-03.9-7":
   text: "| Network | Default-deny NetworkPolicy; allowlisted egress; control-loop/sandbox split |"
-  checks: []
+  checks:
+    - V-CTN-020
+    - V-MSH-008
 "R-03.9-8":
   text: "| Runtime | Hardened pod-security context (v1); gVisor `RuntimeClass` deferred with untrusted code execution |"
-  checks: []
+  checks:
+    - V-RUN-003
 "R-03.9-9":
   text: "| Secrets | Brokered short-lived tokens (Minty + KMS), no static creds, no write credential in the agent pod |"
-  checks: []
+  checks:
+    - V-BRK-001
+    - V-CTN-004
+    - V-BRK-008
 "R-03.9-10":
   text: "| Change | Brokered, classified, snapshotted, verified, journaled, reversible |"
-  checks: []
+  checks:
+    - V-BRK-011
+    - V-BRK-006
+    - V-REV-001
 "R-03.9-11":
   text: "| Assurance | Continuous security-review suite; four SLIs off the audit log and journal ([01](01-vision-scope.md) §7) |"
-  checks: []
+  checks:
+    - V-OBS-001
+    - V-OBS-002
+    - V-OBS-003
+    - V-OBS-004
 "R-03.10-1":
   text: "Give humans a brake that always works."
   checks: []
@@ -824,28 +1067,37 @@
   checks: []
 "R-04.5.1-1":
   text: "| Deployment / StatefulSet | `observedGeneration` caught up, desired replicas Available, **no new restarts** across the settle window |"
-  checks: []
+  checks:
+    - V-PRO-013
+    - V-PRO-027
 "R-04.5.1-2":
   text: "| DaemonSet | Desired == ready on all eligible nodes |"
-  checks: []
+  checks:
+    - V-PRO-013
 "R-04.5.1-3":
   text: "| Service / Ingress / Gateway | Endpoints populated and the programmed address resolvable |"
-  checks: []
+  checks:
+    - V-PRO-013
 "R-04.5.1-4":
   text: "| NetworkPolicy | An affirmative connectivity probe — allowed path reachable, denied path refused |"
-  checks: []
+  checks:
+    - V-PRO-013
 "R-04.5.1-5":
   text: "| ResourceQuota / LimitRange | Object present and admission observably enforcing it |"
-  checks: []
+  checks:
+    - V-PRO-013
 "R-04.5.1-6":
   text: "| Node pool / cluster (cloud) | Provider reports the target state **and** nodes register Ready |"
-  checks: []
+  checks:
+    - V-PRO-013
 "R-04.5.1-7":
   text: "| RBAC | A `SubjectAccessReview` returns the intended answer |"
-  checks: []
+  checks:
+    - V-PRO-013
 "R-04.5.1-8":
   text: "| Custom resource | The owning controller's `Ready` condition where one exists; otherwise object presence only |"
-  checks: []
+  checks:
+    - V-PRO-013
 "R-04.5.1-9":
   text: "| Deployment / StatefulSet | 5m / 10m — a StatefulSet rolls one pod at a time |"
   checks: []
@@ -872,7 +1124,10 @@
   checks: []
 "R-04.5.1-17":
   text: "The agent may diagnose further; it may not immediately try again."
-  checks: []
+  checks:
+    - V-PRO-005
+    - V-PRO-017
+    - V-PRO-028
 "R-04.6-1":
   text: "| **`off`** | No mirroring. The cluster is authoritative and no repo is in the loop. | No IaC, or IaC that describes only initial provisioning. |"
   checks: []
@@ -1058,37 +1313,50 @@
   checks: []
 "R-05.1.2-1":
   text: "Any external database would add a second thing that must be up for a pod to be restarted — and it would need its own credential, its own backup story, and its own network path through a default-deny egress policy. etcd is already required and already up."
-  checks: []
+  checks:
+    - V-ISO-004
+    - V-ISO-006
 "R-05.1.2-2":
   text: "Snapshots are stripped of `managedFields` and of `Secret` `data` (a Secret's pre-state is recorded as a per-key digest, never as material — undoing a Secret change restores from the digest-matched value only if the broker still holds it in the sink under the sink's own encryption)."
   checks: []
 "R-05.1.2-3":
   text: "This is a _reversibility_ horizon, and it is always **shorter** than the record's TTL."
-  checks: []
+  checks:
+    - V-REV-008
 "R-05.1.2-4":
   text: "| `routine` | 7 days | 30 days |"
-  checks: []
+  checks:
+    - V-REV-008
 "R-05.1.2-5":
   text: "| `elevated` | 30 days | 90 days |"
-  checks: []
+  checks:
+    - V-REV-008
 "R-05.1.2-6":
   text: "| `gated` | 90 days | 365 days |"
-  checks: []
+  checks:
+    - V-REV-008
 "R-05.1.2-7":
   text: "| `Rejected` (forbidden) | n/a — nothing executed | 365 days |"
-  checks: []
+  checks:
+    - V-REV-008
 "R-05.1.2-8":
   text: "The **export is the durable record**: every phase transition is emitted as a structured audit log entry (Cloud Logging → a retention-locked bucket / BigQuery, or any customer sink) within 60 s, so etcd garbage collection never destroys the audit trail and the four SLIs (§5) can be computed over a longer window than the cluster keeps."
-  checks: []
+  checks:
+    - V-REV-008
+    - V-OBS-005
 "R-05.1.2-9":
   text: "The journal must survive the agent and broker pods, and it does: records are owned by the `Agent` CR only for _labelling_, never by `ownerReferences`, so deleting an agent does not cascade-delete its history."
-  checks: []
+  checks:
+    - V-REV-007
 "R-05.1.3-1":
   text: '`undo <action-id>` must work when the agent that made the change is paused, asleep, or deleted — otherwise "humans hold the brake" is conditional on the thing being braked cooperating. `C-UC` is therefore a controller in the kube-agents control plane, **not** a skill and not an agent behavior.'
-  checks: []
+  checks:
+    - V-REV-007
+    - V-ISO-009
 "R-05.1.3-2":
   text: 'Undo is never a raw `kubectl apply` of a stored snapshot: routing it through the broker is what keeps the "every mutation is brokered and journaled" invariant true of undos as well.'
-  checks: []
+  checks:
+    - V-REV-005
 "R-05.1.4-1":
   text: "The mesh carries **intent between agents** — never authority and never a pre-approved action."
   checks: []
@@ -1430,22 +1698,32 @@
   checks: []
 "R-05.7-1":
   text: "Retention is class-based with a confirmed export to the audit sink before garbage collection, so etcd never becomes the long-term store (§1.2)."
-  checks: []
+  checks:
+    - V-REV-008
 "R-05.7-2":
   text: "**Brokers must keep executing during a hub outage.** No component on the write path — credential, API server, journal, brake object — is hub-hosted."
-  checks: []
+  checks:
+    - V-ISO-004
 "R-05.7-3":
   text: "A hub loss degrades _reasoning_ (inference, cross-cluster routing, fleet-wide coordination), never _acting_, _journaling_, _braking_, or _undoing_ in a spoke."
-  checks: []
+  checks:
+    - V-ISO-004
+    - V-ISO-009
 "R-05.7-4":
   text: "**Consequence worth stating: this is what makes the router run in production.** `kage-router` is parked at **zero replicas** today precisely because it ingests only Chat while the live install is Slack-only, so the component has never carried production traffic."
-  checks: []
+  checks:
+    - V-CMP-004
+    - V-CMP-001
 "R-05.7-5":
   text: "A human can always apply `FleetFreeze` directly in any cluster (§1.5)."
-  checks: []
+  checks:
+    - V-CTR-007
+    - V-ISO-009
+    - V-RUN-013
 "R-05.7-6":
   text: "A mirror failure never blocks, delays, or rolls back an action, and §8 verifies the system with the mirror removed entirely."
-  checks: []
+  checks:
+    - V-CMP-005
 "R-06.2b-1":
   text: "| `platform` | `@platform-<project>` | — | `(platform, project)` |"
   checks: []
@@ -2892,19 +3170,27 @@
   checks: []
 "R-07.5-1":
   text: "**[09](09-verification-and-validation.md) is the authoritative conformance specification**: it assigns each check a stable ID, a level (L0 static → L4 soak), and a gate class, defines the fixtures, and carries the **phase ratchet** (09 §10) that says which suites must be green at the end of each phase below and stay green thereafter."
-  checks: []
+  checks:
+    - V-MET-001
+    - V-MET-004
+    - V-MET-010
 "R-07.5-2":
   text: "**Replace tests, never delete them.** A check that asserts read-only-ness is removed only in the same commit that adds its imperative counterpart, and the phase notes must name the pair."
-  checks: []
+  checks:
+    - V-MET-004
+    - V-MET-003
 "R-07.5-3":
   text: "**Containment never goes red.** Scope ceiling, no self-escalation, no cross-tenant reach: green from the first commit to the last."
-  checks: []
+  checks:
+    - V-MET-003
+    - V-MET-007
 "R-07.5-4":
   text: "**Authority never precedes machinery.** A pre-merge check must fail any change that grants an agent identity a write verb before the broker, classifier, journal, and undo path are present and tested (P8-T6)."
   checks: []
 "R-07.5-5":
   text: "**Deferred, never faked.** If a check cannot run, record it as deferred with the blocker named — never assert it green."
-  checks: []
+  checks:
+    - V-MET-006
 "R-07.6-1":
   text: "**Promoted out of deferral by the inversion:** the **cross-object child ⊆ parent admission webhook** was deferred hardening in the read-only design and is a **v1 requirement** here (P11-T2) — when a parent can only propose a child, an over-grant is caught in review; when a parent can create one, it must be caught in admission."
   checks: []
@@ -2934,7 +3220,9 @@
   checks: []
 "R-08.2.3-1":
   text: "An envelope from any other caller is rejected as `forbidden` and raises a security event."
-  checks: []
+  checks:
+    - V-BRK-010
+    - V-ADV-008
 "R-08.2.4-1":
   text: "An `Agent` never reaches `Ready` with only one of the two present; the CR's status carries separate `BrokerReady` and `AgentReady` conditions, and `Ready` is their conjunction."
   checks: []
@@ -2955,22 +3243,36 @@
   checks: []
 "R-08.2.5-1":
   text: "| `kube-agents/tier` | `platform` \\| `cluster-admin` \\| `developer-team` | Per-tier egress NetworkPolicy; `vap-agent-scope` RBAC selection ([03](03-security-model.md) §4.2) |"
-  checks: []
+  checks:
+    - V-RUN-004
+    - V-CTN-020
+    - V-CTN-012
 "R-08.2.5-2":
   text: "| `kube-agents/scope` | DNS-safe rendering of the scope key (`<project>.<cluster>.<ns>`, truncated + hash-suffixed when long) | Per-scope network and quota policy; operator queries; journal correlation |"
-  checks: []
+  checks:
+    - V-RUN-004
+    - V-RUN-011
 "R-08.2.5-3":
   text: "| `kube-agents/parent` | `parentRef.name` (empty for platform) | Provisioning lineage; the attenuation/ceiling checks; blast-radius queries |"
-  checks: []
+  checks:
+    - V-RUN-004
+    - V-CTN-013
 "R-08.2.5-4":
   text: "| **`kube-agents/role`** | **`reader` \\| `actor`** | **The admission policies.** `vap-agent-pod-hardening` uses it to assert that a pod bound to an actor SA carries `role: actor` (and vice-versa); `vap-agent-scope` uses it to distinguish reader RBAC from actor RBAC ([03](03-security-model.md) §4.2, §4.3) |"
-  checks: []
+  checks:
+    - V-RUN-004
+    - V-CTN-014
+    - V-CTN-031
 "R-08.2.5-5":
   text: '| `kube-agents/agent` | the `Agent` CR name | Pairing an agent to its broker: Service selector, NetworkPolicy, "show me both halves" queries |'
-  checks: []
+  checks:
+    - V-RUN-004
+    - V-RUN-001
 "R-08.2.5-6":
   text: "The full, unnormalized scope stays authoritative in `spec.scope`; the label is a selector, never an authorization input."
-  checks: []
+  checks:
+    - V-CTN-031
+    - V-RUN-011
 "R-08.2.6-1":
   text: "The broker is always co-located with its agent in the same namespace — cross-namespace ownership breaks garbage collection, and a namespaced SA can only be bound to a pod in its own namespace."
   checks: []
