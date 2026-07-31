@@ -9,10 +9,13 @@ one file proves nothing about [[LSN-047]], whose whole content is that two files
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import pathlib
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 _SPEC = importlib.util.spec_from_file_location(
     "mutate_py", pathlib.Path(__file__).resolve().parent / "mutate.py"
@@ -321,6 +324,113 @@ class SpecShape(unittest.TestCase):
         with self.assertRaises(mutate.Broken) as cm:
             self._load('{"suite": {"kind": "go", "dir": ".", "packages": ["./p"]}, "mutants": []}')
         self.assertIn("0/0", str(cm.exception))
+
+
+class RequiredEnvironment(unittest.TestCase):
+    """Rule 7 (LSN-054): a suite that skips itself measures nothing, and looks like a full report.
+
+    `requireEnv(t)` in every `*_envtest_test.go` calls `t.Skip` when `KUBEBUILDER_ASSETS` is unset.
+    A skipped test is not a failing test, so the package stays green under every mutation and each
+    mutant whose catcher lives there scores ESCAPED — six of nineteen, in the sweep that produced
+    this rule. Rule 5's catcher check does not save it: `go test -list` compiles rather than runs,
+    so the skipping catchers are listed exactly as the running ones are.
+
+    So the refusal has to come from the spec declaring what it needs, and it has to be BROKEN
+    rather than a verdict — an ESCAPED row invites the plausible wrong action (go strengthen the
+    test), which passes on the first run and leaves the mutant unmeasured forever.
+    """
+
+    _SUITE = '"kind": "go", "dir": ".", "packages": ["./p"]'
+    _MUTANTS = (
+        '"mutants": [{"id": "M1", "why": "w", "catcher": "TestX",'
+        ' "edits": [{"file": "a", "find": "x", "replace": "y"}]}]'
+    )
+
+    def _load(self, requires: str, env: dict):
+        with tempfile.TemporaryDirectory() as td:
+            spec = pathlib.Path(td) / "s.json"
+            spec.write_text(
+                '{"suite": {%s, "requires_env": %s}, %s}' % (self._SUITE, requires, self._MUTANTS)
+            )
+            with unittest.mock.patch.dict(os.environ, env, clear=False):
+                return mutate.load_spec(spec)
+
+    def test_a_declared_variable_that_is_unset_is_BROKEN_before_the_first_mutation(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("KUBE_AGENTS_TEST_ENVTEST_ASSETS", None)
+            with self.assertRaises(mutate.Broken) as cm:
+                self._load('["KUBE_AGENTS_TEST_ENVTEST_ASSETS"]', {})
+        self.assertIn("KUBE_AGENTS_TEST_ENVTEST_ASSETS", str(cm.exception))
+        self.assertIn("LSN-054", str(cm.exception))
+
+    def test_a_declared_variable_set_to_the_empty_string_is_also_BROKEN(self):
+        """Exporting the variable from a `$(...)` that produced nothing is the realistic failure."""
+        with self.assertRaises(mutate.Broken) as cm:
+            self._load('["KUBE_AGENTS_TEST_ENVTEST_ASSETS"]', {"KUBE_AGENTS_TEST_ENVTEST_ASSETS": ""})
+        self.assertIn("unset or empty", str(cm.exception))
+
+    def test_a_declared_variable_that_is_set_loads_normally(self):
+        suite, mutants = self._load(
+            '["KUBE_AGENTS_TEST_ENVTEST_ASSETS"]', {"KUBE_AGENTS_TEST_ENVTEST_ASSETS": "/tmp/bin"}
+        )
+        self.assertEqual([m["id"] for m in mutants], ["M1"])
+
+    def test_the_key_is_optional_so_every_pre_existing_spec_still_loads(self):
+        with tempfile.TemporaryDirectory() as td:
+            spec = pathlib.Path(td) / "s.json"
+            spec.write_text('{"suite": {%s}, %s}' % (self._SUITE, self._MUTANTS))
+            suite, mutants = mutate.load_spec(spec)
+        self.assertEqual([m["id"] for m in mutants], ["M1"])
+
+    def test_a_non_list_declaration_is_refused_rather_than_iterated_as_characters(self):
+        """`"requires_env": "KUBEBUILDER_ASSETS"` would otherwise check 19 one-letter variables."""
+        with self.assertRaises(mutate.Broken) as cm:
+            self._load('"KUBE_AGENTS_TEST_ENVTEST_ASSETS"', {})
+        self.assertIn("list of non-empty", str(cm.exception))
+
+
+class EveryGoSpecOverEnvtestDeclaresIt(unittest.TestCase):
+    """The committed specs, not the runner: rule 7 only helps a spec that uses it.
+
+    This is the same property `check_mutation_specs_declare_required_env` asserts in the invariants
+    gate, kept here too because this file is where someone adding a mutant spec is already looking.
+    """
+
+    def test_committed_specs_covering_an_envtest_package_declare_the_variable(self):
+        repo = pathlib.Path(__file__).resolve().parents[1]
+        gated = {
+            p.parent
+            for p in (repo / "k8s-operator").rglob("*_test.go")
+            if "KUBEBUILDER_ASSETS" in p.read_text(encoding="utf-8")
+        }
+        self.assertTrue(gated, "no envtest-gated package found; this test stopped checking")
+        for spec_path in sorted((repo / "verification/mutants").glob("*.json")):
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            s = spec.get("suite", {})
+            if s.get("kind") != "go":
+                continue
+            root = (repo / s.get("dir", ".")).resolve()
+            covered = [
+                d
+                for d in gated
+                if any(_pkg_covers(root, pkg, d) for pkg in s.get("packages", []))
+            ]
+            if covered:
+                self.assertIn(
+                    "KUBEBUILDER_ASSETS",
+                    s.get("requires_env") or [],
+                    f"{spec_path.name} runs {sorted(d.name for d in covered)}, whose tests skip "
+                    f"themselves without KUBEBUILDER_ASSETS, and does not declare it (LSN-054)",
+                )
+
+
+def _pkg_covers(root: pathlib.Path, pkg: str, pkgdir: pathlib.Path) -> bool:
+    """Does the Go package pattern `pkg`, relative to `root`, select the package in `pkgdir`?"""
+    if not pkg.startswith("./"):
+        return False
+    recursive = pkg.endswith("/...")
+    base = (root / pkg[2:].removesuffix("/...").rstrip("/")).resolve()
+    return pkgdir == base or (recursive and base in pkgdir.parents)
 
 
 if __name__ == "__main__":

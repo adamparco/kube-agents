@@ -642,7 +642,11 @@ func main() {
     def go_key(self, identity: str, envelope: dict[str, Any]) -> str:
         import tempfile
 
-        with tempfile.TemporaryDirectory(dir=REPO / "k8s-operator") as tmp:
+        # `prefix="."` is load-bearing: this directory lives inside the Go module, and `./...`
+        # (controller-gen, go build, go vet) skips dot-directories. Without it a concurrent
+        # `make -C k8s-operator test` walks in, the directory is deleted underneath it, and
+        # `manifests` dies on a file nobody wrote ([[LSN-058]]). Python globbing still sees it.
+        with tempfile.TemporaryDirectory(dir=REPO / "k8s-operator", prefix=".") as tmp:
             main = Path(tmp) / "main.go"
             main.write_text(self.PROGRAM)
             result = subprocess.run(

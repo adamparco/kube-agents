@@ -435,6 +435,55 @@ def check_assertion_ratchet() -> list[str]:
     return failures
 
 
+def check_the_ratchet_baseline_covers_the_corpus() -> list[str]:
+    """LSN-056: a ratchet that was last wound in April protects April's tests and prints today's tick.
+
+    `check_assertion_ratchet` above compares the tree against `dev/assertion-baseline.json` and
+    fails when a baselined test disappears. It says nothing about tests the baseline never knew, so
+    a baseline that is never regenerated silently narrows: on 2026-07-30 it held **194** names
+    across **34** files and the tree had **1290** across **137**. The ratchet had been guarding 15%
+    of the suite and reporting the same green as if it guarded all of it, for months.
+
+    The instruction to regenerate has been sitting in the baseline's own `_comment` the whole time
+    ("Regenerate ... ONLY when adding tests"). Prose on the artifact is not a mechanization — that
+    is [[LSN-019]] — so this is the arm that makes it one.
+
+    Deliberately strict about names, not just files. Covering only files would let a file grow from
+    two tests to fifty with forty-eight outside the ratchet, which is the same escape at a smaller
+    scale and would be harder to see the second time. The cost is one command in any unit that adds
+    a test, and the failure message is that command.
+    """
+    base = load_baseline()
+    if not base:
+        return []  # check_assertion_ratchet owns the missing-baseline case
+    old, retired = base.get("inventory", {}), base.get("retired", {})
+    new = inventory()
+    if not new:
+        return [
+            "VACUOUS: the inventory extractor found no named tests at all, so this check compared "
+            "nothing. The tree has thousands; the extractor stopped matching a file format."
+        ]
+
+    unratcheted = sorted(
+        f"{rel}::{name}"
+        for rel, names in new.items()
+        for name in set(names) - set(old.get(rel, []))
+        if f"{rel}::{name}" not in retired
+    )
+    if not unratcheted:
+        return []
+
+    files = sorted({k.split("::")[0] for k in unratcheted})
+    shown = unratcheted[:8]
+    more = f" (+{len(unratcheted) - len(shown)} more)" if len(unratcheted) > len(shown) else ""
+    return [
+        f"{len(unratcheted)} named test(s) across {len(files)} file(s) exist in the tree and not "
+        f"in {BASELINE.relative_to(REPO)}, so the ratchet does not protect them: {shown}{more}. "
+        f"Wind it: `python3 dev/tests/invariants-gate.py --update-baseline`. A test outside the "
+        f"baseline can be deleted with every gate green, which is what the ratchet exists to stop."
+    ]
+
+
 def check_retirements_name_replacements() -> list[str]:
     """V-MET-004. A retirement with an empty replacement is a deletion with extra steps."""
     base = load_baseline()
@@ -2679,10 +2728,354 @@ def check_test_only_grants_are_confined() -> list[str]:
     return failures
 
 
+# ---------------------------------------------------------------------------------------------
+# LSN-052 / LSN-054 — a green produced by not asking
+# ---------------------------------------------------------------------------------------------
+
+BINDING = REPO / ".claude/harness/binding.md"
+PROTOCOL = REPO / ".claude/harness/PROTOCOL.md"
+OPERATOR_TEST_CMD = "make -C k8s-operator test"
+ENVTEST_ENV = "KUBEBUILDER_ASSETS"
+
+
+def _envtest_gated_packages() -> set[Path]:
+    """Directories holding a Go test that skips itself when `KUBEBUILDER_ASSETS` is unset."""
+    return {
+        p.parent
+        for p in (REPO / "k8s-operator").rglob("*_test.go")
+        if ENVTEST_ENV in p.read_text(encoding="utf-8", errors="replace")
+    }
+
+
+def check_envtest_is_run_by_the_command_checkpoint_names() -> list[str]:
+    """LSN-054: a skipped envtest is reported as a passing package, and `go test ./...` agrees.
+
+    `requireEnv(t)` calls `t.Skip` when `KUBEBUILDER_ASSETS` is unset. A skipped test is not a
+    failing test, so the package prints `ok` and the bare command is green over a suite that never
+    ran. That is how a stale premise inside a BLOCKING-ALWAYS check (V-BRK-023) survived every local
+    run of a 25-commit phase branch and surfaced on its final CI run.
+
+    The sharp part is that LSN-052 -- the lesson that a unit runs no Go tests at all -- proposed
+    `cd k8s-operator && go test ./...` as its mechanization, and that command walks straight past
+    this. So the two close together or neither does, and the property here is not "tests are run"
+    but "the command that is named is the one that resolves the assets".
+
+    Four things have to hold at once, because each is load-bearing for a different reader:
+
+      1. The make target really does resolve the assets. If it stops, everything below is a rule
+         about a command that no longer does the thing, which is worse than no rule.
+      2. `binding.md` §Build names it as the entry point, and says why the bare command is not one.
+      3. `harness-run` §6 CHECKPOINT names it too. §Build is a table a reader consults; CHECKPOINT
+         is the list they walk. A rule in only the first is a rule at the wrong moment.
+      4. PROTOCOL §3's done-condition 1 mentions tests at all. It said "build/format/lint" and a
+         unit that satisfied it exactly had still never run a test.
+    """
+    gated = _envtest_gated_packages()
+    if not gated:
+        return [
+            f"VACUOUS: no `*_test.go` under k8s-operator/ mentions {ENVTEST_ENV}, so this check has "
+            f"nothing to protect and cannot fail. Either envtest was removed -- in which case "
+            f"retire this check and the binding rows it pins -- or the skip guard was renamed and "
+            f"this check went quiet, which reads exactly like a pass (LSN-035, LSN-038)."
+        ]
+
+    failures = []
+    makefile = REPO / "k8s-operator/Makefile"
+    mk = makefile.read_text(encoding="utf-8") if makefile.exists() else ""
+    target = re.search(r"^test:.*\n(?:\t.*\n)+", mk, re.M)
+    if not target or ENVTEST_ENV not in target.group(0):
+        failures.append(
+            f"{makefile.relative_to(REPO)}'s `test` target no longer sets {ENVTEST_ENV}. That is "
+            f"the premise every rule below rests on: without it `{OPERATOR_TEST_CMD}` skips the "
+            f"same {len(gated)} packages the bare command does, and the harness is following a "
+            f"rule that buys nothing."
+        )
+
+    binding = BINDING.read_text(encoding="utf-8") if BINDING.exists() else ""
+    build = re.search(r"^## §Build\s*$\n(?P<body>(?:(?!^## ).*\n)*)", binding, re.M)
+    if not build:
+        failures.append(f"{BINDING.relative_to(REPO)} has no §Build section to read")
+    else:
+        body = build.group("body")
+        if OPERATOR_TEST_CMD not in body:
+            failures.append(
+                f"{BINDING.relative_to(REPO)} §Build no longer names `{OPERATOR_TEST_CMD}`. It is "
+                f"the only command that runs envtest; naming anything else names a green that was "
+                f"produced by not asking (LSN-054)."
+            )
+        if ENVTEST_ENV not in body:
+            failures.append(
+                f"{BINDING.relative_to(REPO)} §Build names the command but no longer explains that "
+                f"{ENVTEST_ENV} is what makes it different from `go test ./...`. The next reader "
+                f"sees two rows that look interchangeable and picks the faster one."
+            )
+
+    skill = HARNESS_RUN_SKILL.read_text(encoding="utf-8") if HARNESS_RUN_SKILL.exists() else ""
+    checkpoint = re.search(r"^## 6\. CHECKPOINT\s*$\n(?P<body>(?:(?!^## ).*\n)*)", skill, re.M)
+    if not checkpoint:
+        failures.append(f"{HARNESS_RUN_SKILL.relative_to(REPO)} has no §6 CHECKPOINT to read")
+    elif OPERATOR_TEST_CMD not in checkpoint.group("body"):
+        failures.append(
+            f"{HARNESS_RUN_SKILL.relative_to(REPO)} §6 CHECKPOINT no longer names "
+            f"`{OPERATOR_TEST_CMD}`. §Build is a table a reader consults; CHECKPOINT is the list "
+            f"they walk before calling a unit done. The rule has to be in the list."
+        )
+
+    protocol = PROTOCOL.read_text(encoding="utf-8") if PROTOCOL.exists() else ""
+    unit = re.search(r"^## 3\. The unit of work\s*$\n(?P<body>(?:(?!^## ).*\n)*)", protocol, re.M)
+    if not unit:
+        failures.append(f"{PROTOCOL.relative_to(REPO)} has no §3 to read")
+    elif not re.search(r"\btests?\b", unit.group("body"), re.I):
+        failures.append(
+            f"{PROTOCOL.relative_to(REPO)} §3's done-conditions no longer mention tests. They read "
+            f"'build/format/lint' until 2026-07-30, and a unit that satisfied them exactly had "
+            f"still never run one (LSN-052)."
+        )
+
+    return failures
+
+
+def check_mutation_specs_declare_required_env() -> list[str]:
+    """LSN-054, one level down: a mutation sweep over a skipping suite reports holes that are not.
+
+    `dev/mutate.py` rule 5 checks every catcher against `go test -list` so a misremembered name is a
+    refusal rather than a survivor. That guard is blind here: `-list` COMPILES rather than runs, so
+    a catcher inside a file that `t.Skip`s itself is listed exactly as a running one is. The suite
+    then stays green under every mutation and each such mutant scores ESCAPED -- six of nineteen, in
+    the sweep that produced this lesson, every one of them against a test that catches it cleanly.
+
+    Rule 7 gives a spec `suite.requires_env`, and this asserts the committed specs use it: any
+    `go` spec whose package patterns cover an envtest-gated directory must declare the variable.
+    Derived from the tree rather than from a list, so a new spec over `./internal/controller/...`
+    is caught the day it lands and not the day its report is believed.
+    """
+    specs = sorted((REPO / "verification/mutants").glob("*.json"))
+    if not specs:
+        return ["VACUOUS: no mutation specs found under verification/mutants/"]
+    gated = _envtest_gated_packages()
+    if not gated:
+        return [f"VACUOUS: nothing under k8s-operator/ gates on {ENVTEST_ENV}"]
+
+    def covers(root: Path, pattern: str, pkgdir: Path) -> bool:
+        if not pattern.startswith("./"):
+            return False
+        recursive = pattern.endswith("/...")
+        base = (root / pattern[2:].removesuffix("/...").rstrip("/")).resolve()
+        return pkgdir == base or (recursive and base in pkgdir.parents)
+
+    failures = []
+    for path in specs:
+        try:
+            spec = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            failures.append(f"{path.relative_to(REPO)}: unreadable ({exc})")
+            continue
+        suite = spec.get("suite") or {}
+        if suite.get("kind") != "go":
+            continue
+        root = (REPO / suite.get("dir", ".")).resolve()
+        hit = sorted(
+            d.relative_to(REPO).as_posix()
+            for d in gated
+            if any(covers(root, p, d) for p in suite.get("packages") or [])
+        )
+        if hit and ENVTEST_ENV not in (suite.get("requires_env") or []):
+            failures.append(
+                f"{path.relative_to(REPO)} sweeps {hit}, whose tests skip themselves when "
+                f"{ENVTEST_ENV} is unset, and does not declare `\"requires_env\": "
+                f"[\"{ENVTEST_ENV}\"]`. Run without it and every mutant those packages would catch "
+                f"scores ESCAPED against a suite that catches them cleanly (LSN-054)."
+            )
+    return failures
+
+
+def check_checkpoint_commits_reach_ci() -> list[str]:
+    """LSN-055: one push per branch is one CI run for every commit on it.
+
+    The phase-9 branch took 25 CHECKPOINT commits and a single `git push`, so
+    `k8s-operator-test.yml` ran once -- on the PR, against all 25 at once -- and the red it found
+    belonged to a commit twenty back. CHECKPOINT exists to attribute a verdict to one unit; a
+    once-per-branch CI run destroys exactly that.
+
+    The fix has two halves and each is useless alone, which is the only reason this check exists
+    rather than a note. A push cadence with a `main`-only trigger pushes into silence. A wide
+    trigger with no cadence is still triggered once. So the pair is asserted together, and neither
+    can be dropped on the grounds that the other one covers it.
+    """
+    failures = []
+
+    binding = BINDING.read_text(encoding="utf-8") if BINDING.exists() else ""
+    branching = re.search(r"^## §Branching\s*$\n(?P<body>(?:(?!^## ).*\n)*)", binding, re.M)
+    if not branching:
+        failures.append(f"{BINDING.relative_to(REPO)} has no §Branching section to read")
+    else:
+        # A TABLE ROW, not the section body. The prose below the table explains the rule and
+        # necessarily contains both words ("25 CHECKPOINT commits and one push"), so a body-wide
+        # search stays green after the rule itself is deleted -- which is how a check ends up
+        # pinning its own rationale instead of its rule.
+        rows = [r for r in branching.group("body").splitlines() if r.startswith("|")]
+        if not any("push" in r.lower() and "every CHECKPOINT" in r for r in rows):
+            failures.append(
+                f"{BINDING.relative_to(REPO)} §Branching has no row requiring a push at every "
+                f"CHECKPOINT. Without the cadence the trigger below fires once per phase and CI is "
+                f"an end-of-phase audit against commits nobody can still attribute (LSN-055)."
+            )
+
+    skill = HARNESS_RUN_SKILL.read_text(encoding="utf-8") if HARNESS_RUN_SKILL.exists() else ""
+    checkpoint = re.search(r"^## 6\. CHECKPOINT\s*$\n(?P<body>(?:(?!^## ).*\n)*)", skill, re.M)
+    if checkpoint and "git push" not in checkpoint.group("body"):
+        failures.append(
+            f"{HARNESS_RUN_SKILL.relative_to(REPO)} §6 CHECKPOINT no longer tells the unit to push. "
+            f"The cadence lives in binding.md, but CHECKPOINT is the list that gets walked."
+        )
+
+    wf = WORKFLOWS / "k8s-operator-test.yml"
+    if not wf.exists():
+        return failures + [
+            f"VACUOUS: {wf.relative_to(REPO)} is gone, so the trigger half of this check did not "
+            f"run. If operator tests moved, repoint this check at their workflow; a missing file "
+            f"is not a pass."
+        ]
+    text = wf.read_text(encoding="utf-8")
+    on = re.search(r"^on:\s*$\n(?P<body>(?:^[ \t].*\n|^\s*\n)*)", text, re.M)
+    if not on:
+        failures.append(f"{wf.relative_to(REPO)}: could not parse the `on:` block")
+    else:
+        push = re.search(r"^  push:\s*$\n(?P<body>(?:^ {4,}.*\n)*)", on.group("body"), re.M)
+        if not push:
+            failures.append(
+                f"{wf.relative_to(REPO)} has no `push:` trigger, so a CHECKPOINT push runs nothing "
+                f"and the operator suite is only ever exercised by the phase's PR (LSN-055)."
+            )
+        elif re.search(r"branches(-ignore)?:", push.group("body")):
+            failures.append(
+                f"{wf.relative_to(REPO)}'s `push:` trigger is branch-filtered "
+                f"({push.group('body').strip()!r}). Phase branches are where CHECKPOINT commits "
+                f"live; a filter that excludes them means the cadence pushes into silence and the "
+                f"suite still runs once, on the PR (LSN-055)."
+            )
+
+    return failures
+
+
+def check_spec_contradiction_halts_cite_both_sides() -> list[str]:
+    """LSN-051: a contradiction is a relation between two sentences, and one halt carried one.
+
+    A PROTOCOL §8.5 halt was declared against 06 §2.2.1 -- the *broker-operations* grant -- when the
+    authority in question is 06 §2.2, one level up, which grants every read the halt called
+    ungranted. A subsection number reads like a refinement of its section, so having read §2.2.1
+    felt like having read §2.2. A session was spent, and the contradiction did not exist.
+
+    Being made to write the second citation down is where the absence becomes visible: you cannot
+    quote a sentence you never found. So the rule is procedural -- it belongs in the skill -- and
+    this asserts both that the skill still carries it and that the ledger's §8.5 rows obey it. The
+    ledger half is what makes this more than a lint on prose; the skill half is what stops the
+    ledger half reading as an unexplained rule the next time someone meets it (the shape
+    `_drain_is_committed` uses).
+    """
+    failures = []
+
+    skill = HARNESS_RUN_SKILL.read_text(encoding="utf-8") if HARNESS_RUN_SKILL.exists() else ""
+    halts = re.search(r"^## 7\. Halt conditions.*$\n(?P<body>(?:(?!^## ).*\n)*)", skill, re.M)
+    if not halts:
+        failures.append(f"{HARNESS_RUN_SKILL.relative_to(REPO)} has no §7 halt-conditions section")
+    elif not re.search(r"§8\.5.{0,400}both", halts.group("body"), re.I | re.S):
+        failures.append(
+            f"{HARNESS_RUN_SKILL.relative_to(REPO)} §7 no longer requires a §8.5 halt to quote "
+            f"BOTH conflicting statements by document and section. That sentence is the procedure "
+            f"the ledger arm below enforces; without it the arm reads as an arbitrary citation "
+            f"count (LSN-051)."
+        )
+
+    if not LEDGER.exists():
+        return failures + [f"VACUOUS: {LEDGER.relative_to(REPO)} not found"]
+
+    # Only rows that DECLARE a halt, not rows that discuss one. A withdrawn row is struck through
+    # with `~~` and is deliberately left in place as a record; re-litigating it every run would
+    # make the check noisy in exactly the way that gets a check deleted.
+    citation = re.compile(r"\b0[1-9]\s*§\s*\d+(?:\.\d+)*")
+    rows = 0
+    for n, line in enumerate(LEDGER.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.startswith("|") or "§8.5" not in line:
+            continue
+        if not re.search(r"\bHALTED\b|\bHALT\b", line) or "~~" in line:
+            continue
+        rows += 1
+        cites = {re.sub(r"\s+", "", c) for c in citation.findall(line)}
+        if len(cites) < 2:
+            failures.append(
+                f"{LEDGER.relative_to(REPO)}:{n} declares a PROTOCOL §8.5 halt and cites "
+                f"{sorted(cites) or 'no spec section'}. A contradiction is a relation between two "
+                f"statements; a row carrying fewer than two citations is not describing one. Quote "
+                f"both, each by document and section — that is where LSN-051's missing half would "
+                f"have become visible before the session was spent."
+            )
+    if rows == 0 and not failures:
+        # Not a failure. Recorded so a reader of the output knows this arm found nothing to judge
+        # rather than judging and approving.
+        pass
+    return failures
+
+
+def check_a_check_only_unit_exhibits_both_trees() -> list[str]:
+    """LSN-053: a check split off from its implementation has two trees to be green on.
+
+    Guardrail 9 forbids changing a check in the same unit as the implementation whose failure
+    motivated it, so checks get reshaped one unit AHEAD of what they will judge. Such a unit is
+    green on today's tree by construction. If nobody establishes it is also green on the tree the
+    next unit will build, the next unit's first run reads as "my implementation broke the check" and
+    the cheapest diff to green is to edit the check -- Guardrail 9's own pressure, arriving one unit
+    later in disguise.
+
+    That is not a hypothetical risk: probing the future tree is what caught a false negative on
+    2026-07-30, where a whole tier returned zero findings because the property only knew about one
+    of the two admission validations that tree would hit.
+
+    Mechanizing "did you check the other tree" directly would need a check that knows what the next
+    unit will build. What CAN be asserted is the artifact the rule demands: the future-tree evidence
+    is a committed `--negative-control` row rather than a `/tmp` probe, so it re-runs on every chain
+    run instead of once, in one session, for one reader.
+    """
+    failures = []
+
+    skill = HARNESS_RUN_SKILL.read_text(encoding="utf-8") if HARNESS_RUN_SKILL.exists() else ""
+    impl = re.search(r"^## 4\. IMPLEMENT\s*$\n(?P<body>(?:(?!^## ).*\n)*)", skill, re.M)
+    if not impl:
+        failures.append(f"{HARNESS_RUN_SKILL.relative_to(REPO)} has no §4 IMPLEMENT section")
+    else:
+        body = impl.group("body")
+        if not re.search(r"both\b.{0,60}\btrees?\b", body, re.I | re.S):
+            failures.append(
+                f"{HARNESS_RUN_SKILL.relative_to(REPO)} §4 no longer requires a check-only unit to "
+                f"exhibit BOTH trees — today's and the one the next unit will build (LSN-053)."
+            )
+        if "negative-control" not in body:
+            failures.append(
+                f"{HARNESS_RUN_SKILL.relative_to(REPO)} §4 no longer says the future-tree evidence "
+                f"is a committed `--negative-control` row. A `/tmp` probe proves it once, to one "
+                f"session; the point of the rule is that it re-runs (LSN-053)."
+            )
+
+    # The rule is only worth stating if the repo actually has the affordance it names.
+    chain = regress_chain_text()
+    if "--negative-control" not in chain:
+        failures.append(
+            "no line of the declared chains runs a check with `--negative-control`, so §4's rule "
+            "names an affordance this repo does not have. Either the controls stopped being wired "
+            "into a chain — in which case the future-tree evidence is not re-running either — or "
+            "the flag was renamed and this check went quiet."
+        )
+    return failures
+
+
 CHECKS = [
     ("invariant 7 — authority never precedes machinery", check_write_verbs_have_machinery),
     ("LSN-038 — the machinery probes resolve against the tree", check_machinery_probes_resolve),
     ("invariant 8 / V-MET-003 — assertion ratchet", check_assertion_ratchet),
+    (
+        "LSN-056 — the ratchet baseline covers the whole corpus",
+        check_the_ratchet_baseline_covers_the_corpus,
+    ),
     ("V-MET-004 — retirements name replacements", check_retirements_name_replacements),
     ("LSN-005 — destructive-test guards stay anchored", check_destructive_guards_are_anchored),
     ("LSN-018 — build targets name their cluster", check_make_targets_are_context_explicit),
@@ -2720,6 +3113,23 @@ CHECKS = [
     ),
     ("the metrics table's rows carry every column", check_metrics_rows_are_complete),
     ("V-CTN-037 — a test-only RBAC grant never leaves dev/", check_test_only_grants_are_confined),
+    (
+        "LSN-052/054 — the test entry point CHECKPOINT names is the one that runs envtest",
+        check_envtest_is_run_by_the_command_checkpoint_names,
+    ),
+    (
+        "LSN-054 — a mutation spec over an envtest package declares the env it needs",
+        check_mutation_specs_declare_required_env,
+    ),
+    ("LSN-055 — a CHECKPOINT commit reaches CI", check_checkpoint_commits_reach_ci),
+    (
+        "LSN-051 — a §8.5 halt quotes both sides of the contradiction",
+        check_spec_contradiction_halts_cite_both_sides,
+    ),
+    (
+        "LSN-053 — a check split from its implementation is green on both trees",
+        check_a_check_only_unit_exhibits_both_trees,
+    ),
 ]
 
 

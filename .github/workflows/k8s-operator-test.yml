@@ -1,10 +1,15 @@
 name: Operator Tests
 
+# Runs on EVERY branch push, not only `main`. A phase branch accumulates dozens of CHECKPOINT
+# commits before its PR opens; with a main-only push trigger this job ran once per phase, against
+# all of them at once, and the red it found belonged to a commit twenty back (LSN-055). The
+# `paths-filter` step below keeps the cost of the wider trigger near zero for non-operator pushes.
+# `binding.md` §Branching pins the other half — a push at every CHECKPOINT — and
+# `dev/tests/invariants-gate.py` asserts the pair, because either half alone is still one CI run.
 on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:

@@ -110,6 +110,19 @@ task list into the ledger.
   replacement, which must exist first.
 - A destructive test outside a sanctioned ephemeral target is a halt, not a judgement call.
 
+**A check split off from its implementation has two trees to be green on, not one.** When
+Guardrail 9 forces a check change into its own unit, that unit's verification is incomplete until it
+exhibits **both** trees: today's, and a synthesised one carrying the artifact the next unit will
+build. Green-on-one presents the next unit's first run as _"my implementation broke the check"_, and
+the cheapest diff to green is to edit the check — Guardrail 9's exact pressure, arriving one unit
+later wearing a different face. The future tree is also where a check is likeliest to be wrong: on
+2026-07-30 a probe of it returned **zero** findings for a whole tier, because the property under
+test only knew about one of the two admission validations that tree would hit ([[LSN-053]]).
+
+The future tree is asserted as a committed **`--negative-control` row**, not a `/tmp` probe. A probe
+proves it once, to one session; a control row proves it on every chain run, and it is the artifact a
+reviewer can re-run when the next unit's result surprises them.
+
 ---
 
 ## 5. VERIFY
@@ -142,12 +155,22 @@ looks exactly like the fix, and leaves the mutant unmeasured.
 
 A unit is done only when all four hold (PROTOCOL §3):
 
-1. Build, format, and lint pass.
+1. Build, format, and lint pass — **and so does the test entry point `binding.md` §Build names for
+   every tree the unit touched.** For `k8s-operator/**` that is **`make -C k8s-operator test`**,
+   never a bare `cd k8s-operator && go test ./...`. The bare command is not a faster version of the
+   same thing: fifteen `*_envtest_test.go` files call `requireEnv(t)`, which `t.Skip`s without
+   `KUBEBUILDER_ASSETS`, and a skipped test reports its package `ok` ([[LSN-054]]). Nor is
+   `make build` a substitute — it is `manifests generate fmt vet build` and never compiles a test
+   file, which is how a golden stayed red for three commits ([[LSN-052]]).
 2. Every claimed check ID ran and is green, each with an `evidence_ref`.
 3. The ledger is updated: task status, verification log rows, decisions, any lesson opened.
    If this unit closed a scheduled backlog item, that item moves to `## Done` in
    `docs/build/BACKLOG.md` with what it landed as.
-4. Work is committed on the phase branch, Conventional Commits, scoped staging.
+4. Work is committed on the phase branch, Conventional Commits, scoped staging, **and pushed** —
+   `git push origin HEAD`, here, not at the end of the phase (`binding.md` §Branching). Some checks
+   run nowhere but CI, and a branch that pushes once gets one CI run for all of its commits: that
+   is a phase-end audit, and when it goes red the failure belongs to none of the commits you can
+   still remember ([[LSN-055]]).
 
 Then stop. If the phase is now complete, hand to **`harness-milestone`** — do not merge from here.
 
@@ -168,6 +191,16 @@ Stop and surface. Do not retry around, do not switch to other work, do not clear
 
 Record in the ledger: trigger, what was tried, believed cause, and **the narrowest question a human
 could answer to unblock it**.
+
+**A §8.5 spec-contradiction halt must quote BOTH statements, each by document and section.** Two
+citations, two verbatim quotes, in the blocker row itself — a contradiction is a relation between
+two sentences, and a row that carries one sentence is not describing one. This is not a formatting
+rule: on 2026-07-30 a §8.5 halt was declared, a session was spent, and the contradiction did not
+exist. The halt had compared the broker's live reads against 06 **§2.2.1**, the _broker-operations_
+grant; the actor's authority is 06 **§2.2**, one level up, and it grants every read the halt called
+ungranted. A subsection number reads like a refinement of its section, so having read §2.2.1 felt
+like having read §2.2 ([[LSN-051]]). Being made to write the second quote down is where the absence
+becomes visible — you cannot quote a sentence you never found.
 
 ---
 

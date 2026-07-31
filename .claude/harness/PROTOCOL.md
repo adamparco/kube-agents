@@ -68,10 +68,16 @@ one session** with margin to spare. In practice: one task from the current phase
 
 A unit is **done** when all of these hold — not when the code is written:
 
-1. The implementation exists and the project's build/format/lint pass (`binding.md` §Build).
+1. The implementation exists and the project's build/format/lint pass (`binding.md` §Build), as
+   does the **test entry point §Build names for every tree the unit touched**. Not a nearby command
+   that looks equivalent: §Build names one per tree precisely because a substitute can be green
+   over a suite that never ran.
 2. Every check ID the task claims is **run** and **green**, with an evidence reference recorded.
 3. The ledger is updated: task status, verification log rows, any decision or lesson.
-4. Work is committed on the phase branch.
+4. Work is committed on the phase branch **and pushed** (`binding.md` §Branching). A commit that
+   has not reached the remote has not reached CI, and a branch that pushes once has one CI run for
+   all of its commits — which is an end-of-phase audit, not a per-unit check, and it destroys the
+   attribution this list exists to produce.
 
 **Prefer finishing an in-progress unit over starting a new one.** A half-finished unit is the one
 thing that does not survive a session boundary cleanly.

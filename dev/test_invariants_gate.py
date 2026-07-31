@@ -122,7 +122,11 @@ class MachineryProbeNegativeControls(unittest.TestCase):
         # Invariant 7 says the machinery must "exist and be tested", so a package with source and
         # no test does not satisfy it. Asserted against a real directory rather than a mock,
         # because the predicate reads files.
-        with tempfile.TemporaryDirectory(dir=gate.REPO / "k8s-operator/internal") as tmp:
+        # `prefix="."` is load-bearing: this directory lives inside the Go module, and `./...`
+        # (controller-gen, go build, go vet) skips dot-directories. Without it a concurrent
+        # `make -C k8s-operator test` walks in, the directory is deleted underneath it, and
+        # `manifests` dies on a file nobody wrote ([[LSN-058]]). Python globbing still sees it.
+        with tempfile.TemporaryDirectory(dir=gate.REPO / "k8s-operator/internal", prefix=".") as tmp:
             d = pathlib.Path(tmp)
             (d / "undo.go").write_text("package undo\n\nfunc Undo() {}\n")
             gate.MACHINERY[:] = [
@@ -165,7 +169,7 @@ class InvokedByGoTests(unittest.TestCase):
         self.assertFalse(gate._invoked_by("no_such_thing_test.go", self.CHAIN))
 
     def test_a_go_file_with_no_test_function_is_not_invoked(self):
-        with tempfile.TemporaryDirectory(dir=gate.REPO / "k8s-operator/internal") as tmp:
+        with tempfile.TemporaryDirectory(dir=gate.REPO / "k8s-operator/internal", prefix=".") as tmp:
             f = pathlib.Path(tmp) / "helpers_only_test.go"
             f.write_text("package x\n\nfunc helper() {}\n")
             self.assertFalse(gate._invoked_by("helpers_only_test.go", self.CHAIN))
@@ -175,7 +179,7 @@ class InvokedByGoTests(unittest.TestCase):
     def test_an_e2e_test_is_not_invoked_because_make_test_filters_it_out(self):
         # `go test $(go list ./... | grep -v /e2e)`. Counting an e2e test would close a lesson
         # against something no required check runs.
-        with tempfile.TemporaryDirectory(dir=gate.REPO / "k8s-operator/internal") as tmp:
+        with tempfile.TemporaryDirectory(dir=gate.REPO / "k8s-operator/internal", prefix=".") as tmp:
             d = pathlib.Path(tmp) / "e2e"
             d.mkdir()
             (d / "smoke_e2e_test.go").write_text("package e2e\n\nfunc TestSmoke() {}\n")
@@ -393,6 +397,344 @@ class TestOnlyGrantsAreConfined(unittest.TestCase):
         )
         self.assertTrue(problems)
         self.assertIn("VACUOUS", problems[0])
+
+
+# ==================================================================================================
+# The 2026-07-30 improvement pass: LSN-051 through LSN-055
+#
+# All five of these arms pin PROSE — a row in `binding.md`, a sentence in a skill, a trigger in a
+# workflow. That is a shape worth being suspicious of, because a check that greps a document is one
+# rewording away from being green over nothing, and it fails silent in the safe direction exactly
+# like the two arms at the top of this file did. So every arm below gets the same treatment: green
+# on the tree as it stands, and red on a tree where the thing it names has been removed.
+#
+# The mutations are applied to COPIES in a temp directory, with the gate's path constant repointed
+# at them. Not to the real files: a mutation test that edits the repo and restores it is the
+# LSN-022 shape, and the restore is the half that fails.
+# ==================================================================================================
+
+
+class _PinnedProse(unittest.TestCase):
+    """Base for the five arms: repoint one of the gate's path constants at a mutated copy."""
+
+    def setUp(self):
+        # Inside the repo, because every failure message the gate builds ends in
+        # `.relative_to(REPO)`. A copy under /tmp makes the check raise instead of reporting, and
+        # `main()` turns a raise into GATE ERROR — which is a different outcome from the red these
+        # controls are asserting. Untracked, so no corpus-reading arm sees it.
+        self._tmp = tempfile.TemporaryDirectory(dir=gate.REPO / "dev")
+        self.addCleanup(self._tmp.cleanup)
+        self._saved: dict[str, object] = {}
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(gate, name, value)
+
+    def mutate(self, const: str, *replacements: tuple[str, str]) -> None:
+        """Copy the file at `gate.<const>`, apply `find -> replace`, and repoint the constant.
+
+        Each needle must appear at least once; a mutation that lands nowhere produces a green run
+        that reads as "the check caught it" and is the [[LSN-048]] shape one layer up.
+        """
+        original = getattr(gate, const)
+        self._saved.setdefault(const, original)
+        text = original.read_text(encoding="utf-8")
+        for find, replace in replacements:
+            self.assertIn(find, text, f"stale needle for {const}: {find!r}")
+            text = text.replace(find, replace)
+        copy = pathlib.Path(self._tmp.name) / original.name
+        copy.write_text(text, encoding="utf-8")
+        setattr(gate, const, copy)
+
+
+class EnvtestIsRunByTheCommandCheckpointNames(_PinnedProse):
+    """[[LSN-054]]: a skipped envtest reports `ok`, so the rule is about WHICH command is named."""
+
+    def test_green_on_the_tree_as_it_stands(self):
+        self.assertEqual([], gate.check_envtest_is_run_by_the_command_checkpoint_names())
+
+    def test_the_tree_really_does_have_envtest_packages_to_protect(self):
+        # Without this the arm above is VACUOUS-but-green-looking on a tree that dropped envtest.
+        self.assertTrue(gate._envtest_gated_packages())
+
+    def test_binding_dropping_the_make_target_fails(self):
+        self.mutate("BINDING", ("make -C k8s-operator test", "go test ./..."))
+        problems = gate.check_envtest_is_run_by_the_command_checkpoint_names()
+        self.assertTrue(problems)
+        self.assertTrue(any("§Build" in p for p in problems), problems)
+
+    def test_binding_keeping_the_command_but_dropping_the_reason_fails(self):
+        # The subtler regression: two rows that look interchangeable, and the faster one wins.
+        self.mutate("BINDING", ("KUBEBUILDER_ASSETS", "the envtest binaries"))
+        problems = gate.check_envtest_is_run_by_the_command_checkpoint_names()
+        self.assertTrue(problems)
+        self.assertTrue(any("interchangeable" in p or "explains" in p for p in problems), problems)
+
+    def test_checkpoint_dropping_the_make_target_fails(self):
+        self.mutate("HARNESS_RUN_SKILL", ("make -C k8s-operator test", "go test ./..."))
+        problems = gate.check_envtest_is_run_by_the_command_checkpoint_names()
+        self.assertTrue(problems)
+        self.assertTrue(any("CHECKPOINT" in p for p in problems), problems)
+
+    def test_protocol_dropping_tests_from_the_done_conditions_fails(self):
+        self.mutate(
+            "PROTOCOL",
+            ("## 3. The unit of work", "## 3. The unit of work\n\n<!--STRIP-->"),
+        )
+        # Strip §3 down to what it said before this pass: build/format/lint, no mention of a test.
+        p = getattr(gate, "PROTOCOL")
+        body = p.read_text(encoding="utf-8")
+        head, _, rest = body.partition("<!--STRIP-->")
+        _, _, after = rest.partition("\n## 4.")
+        p.write_text(head + "\n1. The implementation exists and build/format/lint pass.\n"
+                     "2. Every check ID is run and green.\n3. The ledger is updated.\n"
+                     "4. Work is committed on the phase branch.\n\n## 4." + after,
+                     encoding="utf-8")
+        problems = gate.check_envtest_is_run_by_the_command_checkpoint_names()
+        self.assertTrue(problems)
+        self.assertTrue(any("PROTOCOL" in p for p in problems), problems)
+
+
+class MutationSpecsDeclareRequiredEnv(_PinnedProse):
+    """[[LSN-054]] one level down: `go test -list` compiles, so rule 5 cannot see a skipping test."""
+
+    def test_green_on_the_tree_as_it_stands(self):
+        self.assertEqual([], gate.check_mutation_specs_declare_required_env())
+
+    def test_a_spec_over_an_envtest_package_without_the_declaration_fails(self):
+        import json
+
+        with tempfile.TemporaryDirectory(dir=gate.REPO / "verification/mutants") as tmp:
+            # A spec in a subdirectory is not globbed, so write it beside the real ones instead and
+            # remove it in the same block. glob("*.json") is non-recursive, hence the explicit path.
+            stray = gate.REPO / "verification/mutants" / f"{pathlib.Path(tmp).name}.json"
+            stray.write_text(
+                json.dumps(
+                    {
+                        "suite": {
+                            "kind": "go",
+                            "dir": "k8s-operator",
+                            "packages": ["./internal/controller/..."],
+                        },
+                        "mutants": [],
+                    }
+                )
+            )
+            try:
+                problems = gate.check_mutation_specs_declare_required_env()
+            finally:
+                stray.unlink()
+        self.assertTrue(problems)
+        self.assertIn("requires_env", problems[0])
+
+    def test_a_spec_over_a_package_with_no_envtest_is_not_asked_for_one(self):
+        import json
+
+        with tempfile.TemporaryDirectory(dir=gate.REPO / "verification/mutants") as tmp:
+            stray = gate.REPO / "verification/mutants" / f"{pathlib.Path(tmp).name}.json"
+            stray.write_text(
+                json.dumps(
+                    {
+                        "suite": {
+                            "kind": "go",
+                            "dir": "k8s-operator",
+                            "packages": ["./internal/agentlabels/"],
+                        },
+                        "mutants": [],
+                    }
+                )
+            )
+            try:
+                self.assertEqual([], gate.check_mutation_specs_declare_required_env())
+            finally:
+                stray.unlink()
+
+
+class CheckpointCommitsReachCI(_PinnedProse):
+    """[[LSN-055]]: two halves, each useless alone, so the check asserts the pair."""
+
+    def test_green_on_the_tree_as_it_stands(self):
+        self.assertEqual([], gate.check_checkpoint_commits_reach_ci())
+
+    def test_dropping_the_push_cadence_fails(self):
+        self.mutate(
+            "BINDING",
+            ("`git push origin HEAD` at every CHECKPOINT", "`git push origin HEAD` before the PR"),
+        )
+        problems = gate.check_checkpoint_commits_reach_ci()
+        self.assertTrue(problems)
+        self.assertTrue(any("§Branching" in p for p in problems), problems)
+
+    def test_checkpoint_not_naming_the_push_fails(self):
+        self.mutate("HARNESS_RUN_SKILL", ("git push origin HEAD", "commit"))
+        problems = gate.check_checkpoint_commits_reach_ci()
+        self.assertTrue(problems)
+        self.assertTrue(any("no longer tells the unit to push" in p for p in problems), problems)
+
+    def test_restoring_the_main_only_push_trigger_fails(self):
+        # The exact configuration that produced the lesson: 25 CHECKPOINT commits, one CI run.
+        self._saved.setdefault("WORKFLOWS", gate.WORKFLOWS)
+        tmp = pathlib.Path(self._tmp.name) / "workflows"
+        tmp.mkdir()
+        src = gate.WORKFLOWS / "k8s-operator-test.yml"
+        (tmp / "k8s-operator-test.yml").write_text(
+            src.read_text(encoding="utf-8").replace("  push:\n", "  push:\n    branches: [main]\n"),
+            encoding="utf-8",
+        )
+        gate.WORKFLOWS = tmp
+        problems = gate.check_checkpoint_commits_reach_ci()
+        self.assertTrue(problems)
+        self.assertTrue(any("branch-filtered" in p for p in problems), problems)
+
+    def test_removing_the_push_trigger_entirely_fails(self):
+        self._saved.setdefault("WORKFLOWS", gate.WORKFLOWS)
+        tmp = pathlib.Path(self._tmp.name) / "workflows2"
+        tmp.mkdir()
+        src = gate.WORKFLOWS / "k8s-operator-test.yml"
+        (tmp / "k8s-operator-test.yml").write_text(
+            src.read_text(encoding="utf-8").replace("  push:\n", ""), encoding="utf-8"
+        )
+        gate.WORKFLOWS = tmp
+        problems = gate.check_checkpoint_commits_reach_ci()
+        self.assertTrue(problems)
+        self.assertTrue(any("no `push:` trigger" in p for p in problems), problems)
+
+    def test_a_missing_workflow_is_vacuous_not_green(self):
+        self._saved.setdefault("WORKFLOWS", gate.WORKFLOWS)
+        gate.WORKFLOWS = pathlib.Path(self._tmp.name) / "gone"
+        problems = gate.check_checkpoint_commits_reach_ci()
+        self.assertTrue(problems)
+        self.assertIn("VACUOUS", problems[-1])
+
+
+class TheRatchetBaselineCoversTheCorpus(_PinnedProse):
+    """[[LSN-056]]: the ratchet was wound at 194 tests, the suite reached 1290, and it kept ticking."""
+
+    def test_green_on_the_tree_as_it_stands(self):
+        self.assertEqual([], gate.check_the_ratchet_baseline_covers_the_corpus())
+
+    def _with_baseline(self, payload: dict) -> list[str]:
+        import json
+
+        self._saved.setdefault("BASELINE", gate.BASELINE)
+        f = pathlib.Path(self._tmp.name) / "assertion-baseline.json"
+        f.write_text(json.dumps(payload), encoding="utf-8")
+        gate.BASELINE = f
+        return gate.check_the_ratchet_baseline_covers_the_corpus()
+
+    def test_the_state_this_lesson_was_found_in_fails(self):
+        # A baseline holding a strict subset of the corpus: exactly what was committed on
+        # 2026-07-30, and exactly what `check_assertion_ratchet` reports as green.
+        full = gate.inventory()
+        one_file = sorted(full)[0]
+        problems = self._with_baseline({"inventory": {one_file: full[one_file]}, "retired": {}})
+        self.assertTrue(problems)
+        self.assertIn("--update-baseline", problems[0])
+        self.assertIn("does not protect them", problems[0])
+
+    def test_the_old_ratchet_arm_is_green_on_that_same_baseline(self):
+        # The point of the new arm. If this ever starts failing, the two arms have converged and
+        # one of them is redundant -- which is a finding, not a reason to delete this test.
+        full = gate.inventory()
+        one_file = sorted(full)[0]
+        self._saved.setdefault("BASELINE", gate.BASELINE)
+        import json
+
+        f = pathlib.Path(self._tmp.name) / "subset.json"
+        f.write_text(json.dumps({"inventory": {one_file: full[one_file]}, "retired": {}}))
+        gate.BASELINE = f
+        self.assertEqual([], gate.check_assertion_ratchet())
+
+    def test_a_retired_test_is_not_demanded_back(self):
+        full = gate.inventory()
+        rel = sorted(full)[0]
+        name = full[rel][0]
+        trimmed = {k: (v if k != rel else v[1:]) for k, v in full.items()}
+        problems = self._with_baseline(
+            {"inventory": trimmed, "retired": {f"{rel}::{name}": "replaced by something"}}
+        )
+        self.assertEqual([], problems)
+
+    def test_an_empty_extractor_is_vacuous_not_green(self):
+        self._saved.setdefault("inventory", gate.inventory)
+        gate.inventory = lambda: {}
+        problems = gate.check_the_ratchet_baseline_covers_the_corpus()
+        self.assertTrue(problems)
+        self.assertIn("VACUOUS", problems[0])
+
+
+class SpecContradictionHaltsCiteBothSides(_PinnedProse):
+    """[[LSN-051]]: a contradiction is a relation between two sentences; one halt carried one."""
+
+    def test_green_on_the_tree_as_it_stands(self):
+        self.assertEqual([], gate.check_spec_contradiction_halts_cite_both_sides())
+
+    def test_the_skill_dropping_the_rule_fails(self):
+        self.mutate(
+            "HARNESS_RUN_SKILL",
+            ("must quote BOTH statements", "should be recorded carefully"),
+            ("Two\ncitations, two verbatim quotes", "One\ncitation, one verbatim quote"),
+        )
+        problems = gate.check_spec_contradiction_halts_cite_both_sides()
+        self.assertTrue(problems)
+        self.assertTrue(any("BOTH" in p for p in problems), problems)
+
+    def test_a_halt_row_citing_one_section_fails(self):
+        self._saved.setdefault("LEDGER", gate.LEDGER)
+        led = pathlib.Path(self._tmp.name) / "LEDGER.md"
+        led.write_text(
+            "| 2026-07-30 | 9 | **T HALTED (PROTOCOL §8.5)** — 06 §2.2.1's grant cannot run "
+            "the gates it is required to run. |\n",
+            encoding="utf-8",
+        )
+        gate.LEDGER = led
+        problems = gate.check_spec_contradiction_halts_cite_both_sides()
+        self.assertTrue(problems)
+        self.assertIn("fewer than two citations", problems[-1])
+
+    def test_a_halt_row_citing_both_sections_passes(self):
+        self._saved.setdefault("LEDGER", gate.LEDGER)
+        led = pathlib.Path(self._tmp.name) / "LEDGER2.md"
+        led.write_text(
+            "| 2026-07-30 | 9 | **T HALTED (PROTOCOL §8.5)** — 06 §2.2 says _\"a\"_ and "
+            "03 §4.2 says _\"not a\"_. |\n",
+            encoding="utf-8",
+        )
+        gate.LEDGER = led
+        self.assertEqual([], gate.check_spec_contradiction_halts_cite_both_sides())
+
+    def test_a_withdrawn_halt_row_is_left_alone(self):
+        # Struck-through rows are kept deliberately as a record of a halt that was wrong. Judging
+        # them every run is how a check becomes noise and then becomes deleted.
+        self._saved.setdefault("LEDGER", gate.LEDGER)
+        led = pathlib.Path(self._tmp.name) / "LEDGER3.md"
+        led.write_text(
+            "| ~~2026-07-30~~ | ~~9~~ | ~~**T HALTED (PROTOCOL §8.5)** — 06 §2.2.1.~~ **WITHDRAWN** |\n",
+            encoding="utf-8",
+        )
+        gate.LEDGER = led
+        self.assertEqual([], gate.check_spec_contradiction_halts_cite_both_sides())
+
+
+class ACheckOnlyUnitExhibitsBothTrees(_PinnedProse):
+    """[[LSN-053]]: green on one tree presents the next unit as the thing that broke the check."""
+
+    def test_green_on_the_tree_as_it_stands(self):
+        self.assertEqual([], gate.check_a_check_only_unit_exhibits_both_trees())
+
+    def test_the_skill_dropping_the_both_trees_rule_fails(self):
+        self.mutate("HARNESS_RUN_SKILL", ("exhibits **both** trees", "is verified"))
+        problems = gate.check_a_check_only_unit_exhibits_both_trees()
+        self.assertTrue(problems)
+        self.assertTrue(any("BOTH trees" in p for p in problems), problems)
+
+    def test_the_skill_dropping_the_negative_control_requirement_fails(self):
+        # Demoting the evidence back to a `/tmp` probe is the regression that matters: the rule
+        # still reads as satisfied, and the proof stops re-running.
+        self.mutate("HARNESS_RUN_SKILL", ("`--negative-control` row", "one-off probe"))
+        problems = gate.check_a_check_only_unit_exhibits_both_trees()
+        self.assertTrue(problems)
+        self.assertTrue(any("negative-control" in p for p in problems), problems)
 
 
 if __name__ == "__main__":
