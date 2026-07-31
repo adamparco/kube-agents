@@ -44,6 +44,15 @@
 #   H. The ratchet — full prior regression --------------------------------------------------------
 #      verify-phase8.sh on the same cluster => phases 2–7, chaos C1–C4, 03 §11 negatives, goldens,
 #      `go test ./...`, the phase-7 seam artifacts and all six Phase-8 suites.
+#   J. THIS phase's ratchet, derived rather than remembered ---------------------------------------
+#      Sections B–F run the Accept list. Section H runs the PRIOR ratchet. Until 2026-07-31 nothing
+#      ran Phase 9's OWN ratchet, and 23 of its 75 required check IDs — 8 BLOCKING-ALWAYS — had never
+#      been run at all while every section above stayed green. This is planning defect 4, whose
+#      declared resolution ("verify-phase9.sh runs the ratchet, not the Accept list") went into the
+#      acceptance table and never into this script. Section J is that resolution, and it derives the
+#      required set from 09 §10 + the phase file rather than from a list in here, because a list in
+#      here is one more place to forget. It is RED today by construction, exactly as B, E, F and G
+#      are, and its redness IS the worklist. See dev/tests/phase-ratchet-is-asserted.py.
 #
 # DEFERRED, NOT FAKED (recorded, never asserted green): printed in section I, and each one is a row
 # in docs/build/LEDGER.md with a named external blocker. Nothing in section I is counted as a pass,
@@ -600,6 +609,18 @@ defer "P9-T7d-4 — the broker's egress to the API server has no NetworkPolicy o
 echo "           finding, not a deferral with an external blocker: it is unscheduled work, and it is"
 echo "           recorded in the ledger as such. Named here because a reader of a green Phase-9 gate"
 echo "           would otherwise reasonably conclude the broker's network surface had been examined."
+
+# ==== J. This phase's own ratchet, derived from 09 §10 ==============================================
+echo; echo "== J. 09 §10 phase-9 ratchet — every required check ID has a green results row (09 §9.4) =="
+if python3 dev/tests/phase-ratchet-is-asserted.py --phase 9 >/tmp/p9-ratchet.log 2>&1; then
+  pass "$(tail -3 /tmp/p9-ratchet.log | tr -d '\n')"
+else
+  bad "the Phase 9 ratchet is not asserted — required check IDs have no green row in"
+  bad "  verification/results.csv. This is the section that would have caught planning defect 4;"
+  bad "  the list below is the worklist, not a formatting problem. A BLOCKING-ALWAYS member may not"
+  bad "  be deferred to close the phase (09 §9.6)."
+  sed 's/^/    /' /tmp/p9-ratchet.log
+fi
 
 echo
 echo "===================================================================="

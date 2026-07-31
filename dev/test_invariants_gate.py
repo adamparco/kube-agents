@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -829,6 +831,158 @@ class NegativeControlsExerciseTheStatementUnderTest(unittest.TestCase):
         self.write("plain-l2.sh", '#!/usr/bin/env bash\necho hi\n')
         problems = gate.check_negative_controls_exercise_the_statement_under_test()
         self.assertTrue(any("VACUOUS" in p for p in problems), problems)
+
+
+class PhaseGateRunsItsOwnRatchet(unittest.TestCase):
+    """Planning defect 4: the gate that would have caught the gap had no arm for it.
+
+    The controls here all leave a tree where `verify-phase9.sh` still runs, still has sections A-I,
+    and still reports a coherent verdict. That is the shape of the defect being prevented: nothing
+    about a gate that omits its own ratchet looks wrong from the outside, which is how 23 unrun
+    required checks -- 8 of them BLOCKING-ALWAYS -- sat under a phase whose task ladder was 70/70.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(dir=gate.REPO / "dev")
+        self.addCleanup(self._tmp.cleanup)
+        self._saved: dict[str, object] = {}
+        self._dir = pathlib.Path(self._tmp.name) / "verify"
+        self._dir.mkdir()
+        self._real = gate.REPO / "dev" / "verify" / "verify-phase9.sh"
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(gate, name, value)
+
+    def repoint(self, name: str, value) -> None:
+        self._saved.setdefault(name, getattr(gate, name))
+        setattr(gate, name, value)
+
+    def stage(self, *replacements: tuple[str, str], name: str = "verify-phase9.sh") -> None:
+        """Copy the real phase-9 gate into a scratch dir, mutate it, and point the check there."""
+        text = self._real.read_text(encoding="utf-8")
+        for find, replace in replacements:
+            self.assertIn(find, text, f"stale needle: {find!r}")
+            text = text.replace(find, replace)
+        (self._dir / name).write_text(text, encoding="utf-8")
+        self.repoint("VERIFY_DIR", self._dir)
+
+    def test_green_on_the_tree_as_it_stands(self):
+        self.assertEqual([], gate.check_phase_gate_runs_its_own_ratchet())
+
+    def test_the_tree_really_has_a_non_grandfathered_gate(self):
+        # Without this, the arm above could be the "everything is grandfathered" branch -- which is
+        # itself a red, but a reader skimming a green suite would not know which branch produced it.
+        gates = sorted((gate.REPO / "dev" / "verify").glob("verify-phase*.sh"))
+        self.assertTrue([g for g in gates if g.name not in {f"verify-phase{n}.sh" for n in range(2, 9)}])
+
+    def test_a_gate_with_no_ratchet_arm_fails(self):
+        self.stage(("python3 dev/tests/phase-ratchet-is-asserted.py", "true #"))
+        problems = gate.check_phase_gate_runs_its_own_ratchet()
+        self.assertTrue(problems)
+        self.assertTrue(any("never invokes" in p for p in problems), problems)
+
+    def test_a_commented_out_ratchet_arm_does_not_count(self):
+        # The regression that looks least like one: somebody comments the line out to get a green
+        # gate for an unrelated PR and never puts it back.
+        self.stage(
+            (
+                "if python3 dev/tests/phase-ratchet-is-asserted.py",
+                "# if python3 dev/tests/phase-ratchet-is-asserted.py\nif true;",
+            )
+        )
+        problems = gate.check_phase_gate_runs_its_own_ratchet()
+        self.assertTrue(problems)
+        self.assertTrue(any("never invokes" in p for p in problems), problems)
+
+    def test_auditing_the_wrong_phase_fails(self):
+        # One character. A phase-9 gate that audits phase 8's ratchet passes on a phase-8 tree
+        # forever, and its own phase is never checked at all.
+        self.stage(("--phase 9", "--phase 8"))
+        problems = gate.check_phase_gate_runs_its_own_ratchet()
+        self.assertTrue(problems)
+        self.assertTrue(any("--phase 9" in p and "one character" in p for p in problems), problems)
+
+    def test_a_prefix_match_on_the_phase_number_is_not_enough(self):
+        # `--phase 90` contains `--phase 9`. A substring test would accept it ([[LSN-005]]).
+        self.stage(("--phase 9 ", "--phase 90 "))
+        problems = gate.check_phase_gate_runs_its_own_ratchet()
+        self.assertTrue(problems)
+        self.assertTrue(any("one character" in p for p in problems), problems)
+
+    def test_an_arm_whose_red_never_reaches_the_exit_code_fails(self):
+        # The subtlest one: the invocation is there, with the right phase, and its failure branch
+        # only prints. A gate section that cannot fail the gate is a comment.
+        text = self._real.read_text(encoding="utf-8")
+        start = text.index("# ==== J.")
+        end = text.index("echo\necho \"====", start)
+        section = text[start:end]
+        (self._dir / "verify-phase9.sh").write_text(
+            text[:start] + section.replace("bad ", "echo ") + text[end:], encoding="utf-8"
+        )
+        self.repoint("VERIFY_DIR", self._dir)
+        problems = gate.check_phase_gate_runs_its_own_ratchet()
+        self.assertTrue(problems)
+        self.assertTrue(any("is a comment" in p for p in problems), problems)
+
+    def test_deleting_the_runner_fails(self):
+        self.repoint("RATCHET_RUNNER", pathlib.Path(self._tmp.name) / "gone.py")
+        problems = gate.check_phase_gate_runs_its_own_ratchet()
+        self.assertTrue(problems)
+        self.assertTrue(any("does not exist" in p for p in problems), problems)
+
+    def test_an_empty_corpus_is_a_failure_and_not_a_green(self):
+        # A check whose corpus is empty prints the same green as one that passed. This is the arm
+        # that stops "grandfather everything" from being the cheapest route to a quiet gate.
+        self.repoint("VERIFY_DIR", self._dir)  # empty
+        problems = gate.check_phase_gate_runs_its_own_ratchet()
+        self.assertTrue(problems)
+        self.assertTrue(any("no verify-phase*.sh at all" in p for p in problems), problems)
+
+
+class PhaseRatchetIsAsserted(unittest.TestCase):
+    """The derived ratchet audit itself: its own negative control has to stay green and non-empty.
+
+    The check is RED on today's tree by construction, so the suite cannot assert its exit code. What
+    it can assert is that the machinery still evaluates something -- including the FUTURE tree case,
+    which is the one that proves the arm can go green once T11b-d land ([[LSN-053]]).
+    """
+
+    def test_the_negative_control_passes_and_covers_the_future_tree(self):
+        proc = subprocess.run(
+            [sys.executable, "dev/tests/phase-ratchet-is-asserted.py", "--phase", "9", "--negative-control"],
+            cwd=gate.REPO,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("FUTURE TREE", proc.stdout)
+        self.assertIn("PASS as required", proc.stdout)
+
+    def test_the_required_set_is_derived_and_not_a_hand_list(self):
+        # The whole point: a hand-written list in the checker is one more place to forget, which is
+        # the artifact that failed. Both sources must contribute, and neither may be empty.
+        sys.path.insert(0, str(gate.REPO / "dev" / "tests"))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "phase_ratchet", gate.REPO / "dev" / "tests" / "phase-ratchet-is-asserted.py"
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        finally:
+            sys.path.pop(0)
+        catalog = mod.parse_catalog(mod.SPEC.read_text())
+        ratchet = mod.parse_ratchet(mod.SPEC.read_text(), 9, catalog)
+        table = mod.parse_acceptance_table((gate.REPO / "docs/build/phase-9.md").read_text(), 9)
+        self.assertGreater(len(catalog), 200, "the 09 §6 catalog parse collapsed")
+        self.assertGreater(len(ratchet), 50, "the 09 §10 phase-9 ratchet parse collapsed")
+        self.assertGreater(len(table), 40, "the phase-9 acceptance table parse collapsed")
+        # V-RUN-001…006 is an ellipsis run; five of the six appear nowhere else in the table.
+        for n in range(1, 7):
+            self.assertIn(f"V-RUN-{n:03d}", table)
+        # V-ISO-001/002/006 is a slash run in the 09 §10 cell.
+        for cid in ("V-ISO-001", "V-ISO-002", "V-ISO-006"):
+            self.assertIn(cid, ratchet)
 
 
 class EnvtestControlPlanesAreReaped(_PinnedProse):

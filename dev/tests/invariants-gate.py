@@ -3303,6 +3303,110 @@ def check_envtest_control_planes_are_reaped() -> list[str]:
     return failures
 
 
+# Repointed by dev/test_invariants_gate.py's controls, which is why they are constants.
+VERIFY_DIR = REPO / "dev" / "verify"
+RATCHET_RUNNER = REPO / "dev" / "tests" / "phase-ratchet-is-asserted.py"
+
+
+def check_phase_gate_runs_its_own_ratchet() -> list[str]:
+    """Planning defect 4 / LSN-019: every `verify-phase<N>.sh` runs the 09 §10 ratchet for ITS phase.
+
+    On 2026-07-31 `harness-milestone` was invoked for Phase 9 with all 70 in-phase leaf units done,
+    and stopped at §1: **23 of the 75 check IDs the phase requires had never been run**, 8 of them
+    from BLOCKING-ALWAYS suites. Every section of `verify-phase9.sh` was passing or failing for
+    reasons unrelated to them, because the script names 18 check IDs and has no V-ISO section at
+    all. A gate that never names an ID cannot go red for it.
+
+    The gap had been PREDICTED. `docs/build/phase-9.md` § "Planning defect 4", written 2026-07-27,
+    counts seventeen unrun ratchet checks and declares the resolution: *"verify-phase9.sh runs the
+    ratchet, not the Accept list."* The acceptance table was amended, which is half of it. The
+    script was not, which is the half that runs. [[LSN-019]] again -- prose on the artifact is not a
+    mechanization, and here the prose was a correct description of a live defect.
+
+    So the mechanization has to be about the SCRIPT, and it has to be about every phase gate rather
+    than the one that got caught, because the next phase's gate is written by copying this one.
+    Three things, each covering a different way the arm could be present and inert:
+
+      1. Every `dev/verify/verify-phase<N>.sh` invokes `phase-ratchet-is-asserted.py`.
+      2. It passes `--phase <N>` matching the script's OWN number. A gate that audits phase 8's
+         ratchet is a gate that passes while its own phase is unproven, and the two lines differ by
+         one character.
+      3. The invocation's failure is a `bad`/failure, not a bare informational echo. An arm whose
+         red does not reach the exit code is a comment.
+
+    Phases before the arm existed are exempt by an explicit list rather than by a floor: a floor
+    silently exempts every phase added below it, and the whole point is that a new gate inherits
+    the obligation. Adding a phase to that list is a conversation, which is what it should be.
+    """
+    failures: list[str] = []
+    runner = RATCHET_RUNNER
+    if not runner.exists():
+        return [
+            f"{runner.relative_to(REPO)} does not exist. It is the derived form of the 09 §10 "
+            f"ratchet, and without it every phase gate is back to a hand-written check list "
+            f"(planning defect 4)."
+        ]
+
+    # Gates written before 2026-07-31, when this obligation did not exist. Not a floor: a floor
+    # would exempt phase 16 as readily as phase 2.
+    grandfathered = {"2", "3", "4", "5", "6", "7", "8"}
+
+    gates = sorted(VERIFY_DIR.glob("verify-phase*.sh"))
+    if not gates:
+        return ["dev/verify/ has no verify-phase*.sh at all -- this check matched nothing"]
+
+    checked = 0
+    for gate in gates:
+        m = re.match(r"verify-phase(\d+)\.sh$", gate.name)
+        if not m or m.group(1) in grandfathered:
+            continue
+        checked += 1
+        phase = m.group(1)
+        text = gate.read_text(encoding="utf-8")
+        invocations = [
+            line
+            for line in text.splitlines()
+            if "phase-ratchet-is-asserted.py" in line and not line.lstrip().startswith("#")
+        ]
+        if not invocations:
+            failures.append(
+                f"{gate.relative_to(REPO)} never invokes dev/tests/phase-ratchet-is-asserted.py, so "
+                f"nothing in it checks phase {phase}'s OWN 09 §10 ratchet. Sections that run the "
+                f"Accept list and the PRIOR ratchet both stay green while required check IDs go "
+                f"unrun -- that is exactly how planning defect 4 survived to the milestone."
+            )
+            continue
+        if not any(re.search(rf"--phase\s+{phase}(\s|$)", line) for line in invocations):
+            failures.append(
+                f"{gate.relative_to(REPO)} invokes phase-ratchet-is-asserted.py but not with "
+                f"`--phase {phase}`. A gate that audits another phase's ratchet passes while its "
+                f"own is unproven, and the two lines differ by one character."
+            )
+        # 3. The red has to reach the exit code. The gate scripts report failure through `bad`.
+        window = "\n".join(
+            text.splitlines()[
+                max(0, text.splitlines().index(invocations[0]) - 2) : text.splitlines().index(
+                    invocations[0]
+                )
+                + 12
+            ]
+        )
+        if "bad " not in window:
+            failures.append(
+                f"{gate.relative_to(REPO)}'s ratchet invocation does not reach `bad` within twelve "
+                f"lines, so a failed ratchet audit prints and does not fail the gate. An arm whose "
+                f"red does not reach the exit code is a comment."
+            )
+
+    if not checked:
+        failures.append(
+            "every verify-phase*.sh in the tree is grandfathered out of the ratchet obligation, so "
+            "this check evaluated nothing. Remove a phase from `grandfathered` or delete the check "
+            "-- a check with an empty corpus reports the same green as one that passed."
+        )
+    return failures
+
+
 CHECKS = [
     ("invariant 7 — authority never precedes machinery", check_write_verbs_have_machinery),
     ("LSN-038 — the machinery probes resolve against the tree", check_machinery_probes_resolve),
@@ -3372,6 +3476,10 @@ CHECKS = [
     (
         "LSN-059 — a killed test run's control planes are reaped by the next one",
         check_envtest_control_planes_are_reaped,
+    ),
+    (
+        "planning defect 4 — every phase gate runs its own 09 §10 ratchet",
+        check_phase_gate_runs_its_own_ratchet,
     ),
 ]
 

@@ -363,3 +363,19 @@ python3 dev/verify/fixtures/soak_corpus.py --self-test
 # and deriving `ar-<lowercase-actionId>`, and both P1 arms plus the broker Availability check. Only
 # the live line proves those, and only against a cluster.
 bash dev/verify/undo-coverage-l2.sh --negative-control
+
+# --- The phase ratchet, derived rather than remembered (planning defect 4) ------------------------
+# The CHECK ITSELF is not on this chain, and that is deliberate. `phase-ratchet-is-asserted.py
+# --phase 9` is RED today by construction: 38 of Phase 9's 75 required check IDs have no green row
+# yet. The chain is a required PR check, so an arm that stays red until an entire phase closes would
+# redden every unrelated commit and destroy the per-commit attribution CHECKPOINT exists to produce
+# ([[LSN-055]]). It runs in `dev/verify/verify-phase9.sh` section J, and `invariants-gate.py`
+# (`check_phase_gate_runs_its_own_ratchet`, above) is what stops that section being removed.
+#
+# What IS chain-eligible is the control, which is green today and green after the phase closes. It
+# exercises the real 09 §10 + phase-file derivation in every case -- only the answer table is varied
+# ([[LSN-060]]) -- and one of its eight cases is the FUTURE tree, in which every required check is
+# green and the arm must go GREEN ([[LSN-053]]). That case is the one that matters: an arm that
+# could not go green once the work lands makes editing the arm the cheapest diff at exactly the
+# wrong moment.
+python3 dev/tests/phase-ratchet-is-asserted.py --phase 9 --negative-control

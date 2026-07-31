@@ -31,8 +31,10 @@ found in this pass are ordering or scoping problems that would otherwise have su
 > because its declared resolution ("`verify-phase9.sh` runs the ratchet, not the Accept list") was
 > written into the acceptance table and never into the script. The audit, the fourteen IDs and the
 > four units that close them are the last section of this file: **§ Milestone audit 2026-07-31**.
-> **Resume at `harness-run`, unit `P9-T11a`.** Do not re-run `harness-milestone` until T11a–T11d are
-> green.
+> **`P9-T11a` is done (2026-07-31)** — the ratchet arm exists, and deriving the requirement properly
+> from 09 §10 rather than from the hand-written table restates the gap as **38 of 75 not green, 17
+> BLOCKING-ALWAYS, 4 never named by this file**. **Resume at `harness-run`, unit `P9-T11b`.** Do not
+> re-run `harness-milestone` until T11b–T11d are green.
 
 **Phase 9 is OPEN.** It was stopped here on 2026-07-30 by an explicit human instruction, after the
 unit `P9-T9b-5b-0-ii-a`, and **not** because the phase closed. The same person lifted the stop later
@@ -118,8 +120,8 @@ only principal that may, since no broker grant reaches `agents/status` — from 
 observations against the etcd 05 §1.2 puts the journal in, refreshed on a 60 s clock because the
 field has no watch behind it; 8/8 mutants caught. B-006 is closed on both halves.
 `P9-T9c` was the last task in the ladder as planned — and the ladder was not the whole phase.
-`harness-milestone` ran, stopped at §1, and opened **`P9-T11a`–`d`**. **Resume at `harness-run`,
-unit `P9-T11a`** (§ Milestone audit 2026-07-31, at the end of this file).
+`harness-milestone` ran, stopped at §1, and opened **`P9-T11a`–`d`**; `T11a` closed the same day.
+**Resume at `harness-run`, unit `P9-T11b`** (§ Milestone audit 2026-07-31, at the end of this file).
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
 [`LEDGER.md`](LEDGER.md).
@@ -5747,12 +5749,99 @@ and is red by construction on today's tree; that is the point, and it is the sam
 than remembered" shape section G already uses. Guardrail 9 is satisfied structurally: `T11a` ships no
 implementation, and `T11b`–`T11d` ship no change to `T11a`'s arm.
 
-| Task        | What to build                                                                                                                                                                                                                                                                                                                                                         | Spec                      | Files                                                                               | Check IDs                                                                   | Weight |
-| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------ |
-| **P9-T11a** | The ratchet arm planning defect 4 declared and never built. A new section in `verify-phase9.sh` that derives the Phase 9 ratchet from 09 §10 + the acceptance table and **fails on any member with no green `results.csv` row** — so the gate reports the gap instead of omitting it. Prints the three populations above. Red today, and its redness IS the worklist. | 09 §10; planning defect 4 | `dev/verify/verify-phase9.sh` · possibly `dev/tests/` for the L0 half               | V-MET-013, V-MET-014 (the arm is itself a check about checks)               | small  |
-| **P9-T11b** | V-ISO-001/002/006 — chaos for the **pair**. C1 and C2 currently assert the agent workload only; extend both to the broker Deployment, both ServiceAccounts and both rebinds. Add the CH6 arm: journal down → broker refuses to execute, which `dev/verify/broker-refuse-l2.sh` already induces.                                                                       | 05 §8; 03 §4.1            | `dev/verify/chaos-suite.sh` · `dev/verify/broker-refuse-l2.sh`                      | **V-ISO-001**, **V-ISO-002**, **V-ISO-006**                                 | large  |
-| **P9-T11c** | The four unasserted BLOCKING-ALWAYS broker/undo L2s: the pod-token direct write (V-BRK-001), the stripped-`action-id` admission rejection (V-BRK-004), post-execution journal failure → rollback + `RolledBack` + auto-pause + page (V-BRK-016), and the destructive-undo gate (V-REV-009).                                                                           | 03 §4.1, §4.3, §6, §11    | `dev/verify/` (new or extended L2 script) · the tenant overlay of planning defect 2 | **V-BRK-001**, **V-BRK-004**, **V-BRK-016**, **V-REV-009**                  | large  |
-| **P9-T11d** | The workload pair at L2: two workloads owner-referenced and no third, non-interchangeable identities, the four labels selectable, both startup orders converging, agent-without-broker failing closed, CR deletion removing workloads and sparing SAs, and one fleet-wide Socket Mode connection.                                                                     | 08 §2.4, §7; 05 §8, C15   | `dev/verify/` (new pair suite) · `dev/L2-CHAIN.txt`                                 | V-RUN-001, V-RUN-002, V-RUN-004, V-RUN-005, V-RUN-006, V-RUN-009, V-RUN-014 | large  |
+| Task           | What to build                                                                                                                                                                                                                                                                                                                                                         | Spec                      | Files                                                                               | Check IDs                                                                   | Weight |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------ |
+| **P9-T11a** ✅ | The ratchet arm planning defect 4 declared and never built. A new section in `verify-phase9.sh` that derives the Phase 9 ratchet from 09 §10 + the acceptance table and **fails on any member with no green `results.csv` row** — so the gate reports the gap instead of omitting it. Prints the three populations above. Red today, and its redness IS the worklist. | 09 §10; planning defect 4 | `dev/verify/verify-phase9.sh` · possibly `dev/tests/` for the L0 half               | V-MET-013, V-MET-014 (the arm is itself a check about checks)               | small  |
+| **P9-T11b**    | V-ISO-001/002/006 — chaos for the **pair**. C1 and C2 currently assert the agent workload only; extend both to the broker Deployment, both ServiceAccounts and both rebinds. Add the CH6 arm: journal down → broker refuses to execute, which `dev/verify/broker-refuse-l2.sh` already induces.                                                                       | 05 §8; 03 §4.1            | `dev/verify/chaos-suite.sh` · `dev/verify/broker-refuse-l2.sh`                      | **V-ISO-001**, **V-ISO-002**, **V-ISO-006**                                 | large  |
+| **P9-T11c**    | The four unasserted BLOCKING-ALWAYS broker/undo L2s: the pod-token direct write (V-BRK-001), the stripped-`action-id` admission rejection (V-BRK-004), post-execution journal failure → rollback + `RolledBack` + auto-pause + page (V-BRK-016), and the destructive-undo gate (V-REV-009).                                                                           | 03 §4.1, §4.3, §6, §11    | `dev/verify/` (new or extended L2 script) · the tenant overlay of planning defect 2 | **V-BRK-001**, **V-BRK-004**, **V-BRK-016**, **V-REV-009**                  | large  |
+| **P9-T11d**    | The workload pair at L2: two workloads owner-referenced and no third, non-interchangeable identities, the four labels selectable, both startup orders converging, agent-without-broker failing closed, CR deletion removing workloads and sparing SAs, and one fleet-wide Socket Mode connection.                                                                     | 08 §2.4, §7; 05 §8, C15   | `dev/verify/` (new pair suite) · `dev/L2-CHAIN.txt`                                 | V-RUN-001, V-RUN-002, V-RUN-004, V-RUN-005, V-RUN-006, V-RUN-009, V-RUN-014 | large  |
 
 **Resume at `harness-run`, unit `P9-T11a`.** Phase 9 does not close until the fourteen are green;
 seven of them may not be deferred to make it close.
+
+---
+
+## P9-T11a — the ratchet arm, built · 2026-07-31 · ✅
+
+Planning defect 4's unbuilt half, shipped. `dev/tests/phase-ratchet-is-asserted.py` derives the
+phase's required check set instead of remembering it, and asks `verification/results.csv` for a green
+row per member.
+
+**The denominator was wrong, and the check is what corrected it.** The audit above counted against
+phase-9.md's own hand-written 55-ID acceptance table and reported **14 unasserted, 7
+BLOCKING-ALWAYS**. Deriving the requirement properly — expanding each suite named in 09 §10's phase-9
+row against the §6 catalog, honouring the `(L1)` qualifier on V-GAT — yields **70** IDs, and the
+union with the table yields **75**. Against that denominator the gap is:
+
+| Population                                                       | Count  |
+| ---------------------------------------------------------------- | ------ |
+| Required by 09 §10 ∪ phase-9.md                                  | **75** |
+| Green (`**pass**` with a non-empty `evidence_ref`)               | 37     |
+| Not green                                                        | **38** |
+| …of those, BLOCKING-ALWAYS (09 §9.6 forbids deferral)            | **17** |
+| Required by 09 §10 and absent from phase-9.md's acceptance table | **20** |
+
+The twenty the acceptance table omits are V-BRK-018/019/020/022/023/024/025/026/027/028/029/030/031/032, V-GAT-005, V-GAT-011, V-GAT-014, V-GAT-016, V-REV-010 and V-REV-011 — planning
+defect 4's exact shape, one phase later, found by the check written to end it. That is property 4,
+and it is the reason the check reads 09 §10 rather than trusting the acceptance table: a table can
+only omit what nobody re-derives. **Property 4 is orthogonal to property 2** — 15 of the 20 are
+already green, proved by work no Accept bullet ever named — so it measures the acceptance table's
+completeness, not the phase's. The five that are both omitted and not green are V-BRK-019,
+V-GAT-005, V-GAT-011, V-GAT-014 and V-GAT-016.
+
+**Property 4 read the whole file for one draft, and the control caught it.** The first implementation
+computed `ratchet - CHECK_ID.findall(phase_text)` and reported **4**, because sixteen of the twenty
+happen to be mentioned somewhere in this file's prose. Writing _this section_ — a paragraph naming
+four of them while explaining that nothing asserts them — then took the count to zero and turned control
+case 8 red. An ID named in a paragraph about how it is unasserted is not an ID bound to an acceptance
+bullet, and counting it would have been [[LSN-019]] committed inside the check written to end
+[[LSN-019]]'s previous recurrence. The property now reads the acceptance table, and the future-tree
+case injects its IDs **inside** that section rather than appending them to the file, because
+appending would satisfy a whole-file grep and not the property.
+
+**What it asserts.** Four properties, all in `scan_text()`: (1) the required set is derived and both
+sources parsed to something — a parse that silently matches nothing scores every unrun check as
+satisfied ([[LSN-048]]); (2) every member has a `pass` row carrying an `evidence_ref`, because 09
+§9.4 records a pass without one as `skipped`; (3) BLOCKING-ALWAYS members are counted separately,
+because "not green" and "not green and undeferrable" are different facts and one number hides the
+second inside the first; (4) the phase file's acceptance **table** does not under-name its own ratchet.
+
+**What it refuses to do is the load-bearing part.** It does not infer coverage from a file naming a
+check ID. `git grep V-ISO-001` finds `pair_netpol.go:68` and `pair_netpol_test.go:35`, and **both
+hits exist to disclaim the check** — they say V-ISO-001/002 ask whether a packet is dropped, which is
+L2 and belongs to P9-T9. A grep-based notion of "asserted" would have counted them as coverage and
+scored the gap smaller than it is. The naming scan survives only as an explicitly unweighted `hint`
+column that no verdict reads.
+
+**Where it runs.** Section **J** of `dev/verify/verify-phase9.sh`. Deliberately **not** on
+`dev/L0-CHAIN.txt`: the chain is a required PR check, and an arm that stays red until an entire phase
+closes reddens every unrelated commit's CI, destroying the per-commit attribution CHECKPOINT exists
+to produce ([[LSN-055]]). What keeps it from being quietly dropped is the pair — the `--negative-control`
+**is** on the chain (line 48), and `invariants-gate.py`'s new
+`check_phase_gate_runs_its_own_ratchet` asserts at L0 that every non-grandfathered
+`verify-phase<N>.sh` invokes the runner, with `--phase <N>` matching its own number, on an
+uncommented line, reaching a `bad ` arm within twelve lines. `grandfathered` is an explicit list of
+phases 2–8, not a floor, so phase 10's gate is covered the day its file is created.
+
+**The future tree ([[LSN-053]]).** This is a check split from the implementation whose absence
+motivated it, so green-on-today is half the evidence. Control case 5 synthesises the tree T11b–T11d
+will build — every required ID green, the phase file naming all 75 — and asserts the check **passes**
+there. Cases 6–8 then perturb that future tree one property at a time: a BLOCKING-ALWAYS demotion, an
+emptied `evidence_ref`, and a phase file back to under-naming. Without them, T11d's first green run
+would arrive looking like "my implementation broke the check", and the cheapest diff to green would
+be to edit the check.
+
+| Artifact                                 | State                                                              |
+| ---------------------------------------- | ------------------------------------------------------------------ |
+| `dev/tests/phase-ratchet-is-asserted.py` | new · `--phase 9` → **rc 1**, the worklist above · control **8/8** |
+| `dev/verify/verify-phase9.sh`            | section J wired, `bash -n` clean                                   |
+| `dev/tests/invariants-gate.py`           | `check_phase_gate_runs_its_own_ratchet` → **31/31**                |
+| `dev/test_invariants_gate.py`            | +11 named tests (9 gate-arm, 2 runner) → **88 OK**                 |
+| `dev/L0-CHAIN.txt`                       | 47 → **48** lines — the control, not the check                     |
+| `dev/assertion-baseline.json`            | wound for the 11 new tests ([[LSN-056]])                           |
+
+Guardrail 9 holds structurally: this unit ships no implementation, and T11b–T11d ship no change to
+this arm. Its redness is not a defect to fix — it is the worklist, and it goes green when the
+worklist is done.
+
+**Resume at `harness-run`, unit `P9-T11b`.**
