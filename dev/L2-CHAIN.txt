@@ -406,6 +406,25 @@ bash dev/verify/actor-grant-sweep-l2.sh gke-scratch-kube-agents-dev
 # create, mutation or delete. A dry-run soak that quietly wrote would still score V-REV-001 green.
 bash dev/verify/undo-coverage-l2.sh gke-scratch-kube-agents-dev
 
+# chaos-suite.sh is a Phase 6 artifact and it is listed here for the first time in Phase 9, because
+# P9-T11b gave it two of Phase 9's BLOCKING-ALWAYS rows: V-ISO-001 (CH1, "agents AND BROKERS keep
+# executing") and V-ISO-002 (CH2, "relaunches BOTH workloads, rebinds BOTH SAs"). Before that unit it
+# knew only about the agent workload — the word "broker" did not appear in it — so it was a suite
+# that could not have failed on the clauses those two rows are about.
+#
+# THE OMISSION IS THE INTERESTING PART. 09 §10 puts V-ISO-001/002/006 in Phase 9's ratchet, a ratchet
+# is the promise that a suite which entered it never leaves, and the only suite that could keep that
+# promise for CH1 and CH2 was on no chain at all. It ran when somebody remembered it. A green result
+# from a suite nothing re-runs is a claim about one afternoon, and the ratchet is a claim about every
+# commit after it — those are different claims and only one of them was being made.
+#
+# Ordered after the broker suites and before the gate because it needs the pair actually deployed:
+# C1's continuity claim pins the BROKER pod and asserts it stays Ready across the outage, which is
+# not observable until the broker Deployment has an available replica. It scales the controller to
+# zero and back and deletes both halves of the pair — reversible, single-object, and restored by an
+# EXIT trap, but not something to run against anything but a scratch cluster.
+bash dev/verify/chaos-suite.sh gke-scratch-kube-agents-dev
+
 # --- Phase 9's gate ------------------------------------------------------------------------------
 # verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the
 # two suites P9-T9b-5 still owes, the L0 chain run as a file, and the whole prior ratchet through the
