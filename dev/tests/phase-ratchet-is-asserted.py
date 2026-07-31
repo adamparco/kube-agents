@@ -190,15 +190,30 @@ def parse_acceptance_table(phase_text: str, phase: int) -> set[str]:
 
 
 def parse_results(results_text: str) -> dict[str, list[tuple[str, str]]]:
-    """check_id -> [(normalised result, evidence_ref)]. Results are written `**pass**` in the CSV."""
+    """check_id -> [(normalised result, evidence_ref)]. Results are written `**pass**` in the CSV.
+
+    THE CELL IS NOT THE KEY. A `check_id` cell routinely names several IDs -- one suite run proves
+    several catalog rows and gets one row citing one evidence reference -- and 36 of the 160 rows in
+    `verification/results.csv` are written that way. It is the file's dominant convention for a suite
+    run, not an anomaly. Keying on the raw cell filed `V-ISO-001, V-ISO-002` under that literal
+    string, where it matched neither ID, and this check reported both as never asserted: **38 not
+    green / 17 BLOCKING-ALWAYS** against a true 28 / 12, with 10 IDs falsely accused. A check written
+    to find unrun work that invents ten pieces of it is worse than no check, because the ten are
+    indistinguishable from the twenty-eight that are real.
+
+    Splitting on the ID pattern also strips the two suffixes the file carries. `¬` is 09 §6's
+    "negative control mandatory" marker copied off the catalog row -- a property of the CHECK, not a
+    statement that the row records only a control run -- so `V-CTR-002 ¬` is a row about V-CTR-002.
+    `(regression)` likewise. A cell naming no ID at all (`(L0 mechanization)`) contributes nothing,
+    which is what it did before under a key nothing could ever look up.
+    """
     rows: dict[str, list[tuple[str, str]]] = {}
     for row in csv.DictReader(io.StringIO(results_text)):
-        check_id = (row.get("check_id") or "").strip()
-        if not check_id:
-            continue
         result = (row.get("result") or "").strip().strip("*").lower()
         evidence = (row.get("evidence_ref") or "").strip()
-        rows.setdefault(check_id, []).append((result, evidence))
+        # dict.fromkeys, not set(): a cell repeating an ID must not multiply its row.
+        for check_id in dict.fromkeys(CHECK_ID.findall(row.get("check_id") or "")):
+            rows.setdefault(check_id, []).append((result, evidence))
     return rows
 
 
@@ -350,11 +365,38 @@ def _synthesise_green(required: list[str]) -> str:
     the arm could not go green after the work lands, the cheapest diff at that moment would be to
     edit the arm.
     """
+    return _write_rows([[c] for c in required])
+
+
+def _synthesise_green_grouped(required: list[str], per_row: int = 4) -> str:
+    """The same future tree, written the way `verification/results.csv` is ACTUALLY written.
+
+    One row per suite run, several check IDs in the cell, one evidence reference for all of them --
+    36 of the file's 160 rows. Every case above this one synthesises a row per ID, and that is
+    precisely why the control was blind to the cell-is-the-key defect for the whole of T11a: the
+    perturbations exercised a shape the real input does not predominantly have.
+    """
+    groups = [required[i : i + per_row] for i in range(0, len(required), per_row)]
+    return _write_rows(groups)
+
+
+def _write_rows(groups: list[list[str]]) -> str:
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(["date", "phase", "check_id", "level", "target", "result", "evidence_ref", "notes"])
-    for c in required:
-        w.writerow(["2026-08-01", "9", c, "L2", "gke-scratch-kube-agents-dev", "**pass**", "`synthetic`", ""])
+    for ids in groups:
+        w.writerow(
+            [
+                "2026-08-01",
+                "9",
+                ", ".join(ids),
+                "L2",
+                "gke-scratch-kube-agents-dev",
+                "**pass**",
+                "`synthetic`",
+                "",
+            ]
+        )
     return out.getvalue()
 
 
@@ -397,18 +439,46 @@ def negative_control(phase: int | None = None) -> int:
     victim_ba = next(c for c in required if c[:5] in BLOCKING_ALWAYS)
     victim_any = next(c for c in required if c[:5] not in BLOCKING_ALWAYS)
 
-    def demote(text: str, check_id: str, to: str) -> str:
-        return re.sub(rf"(,{re.escape(check_id)},[^\n]*?,)\*\*pass\*\*(,)", rf"\1{to}\2", text)
+    # Both helpers locate their victim by "this row's cell NAMES the ID", not by "this row's cell IS
+    # the ID", so the same perturbation lands on a single-ID row and on a grouped one. Matching on
+    # equality would have silently no-opped against the grouped cases below -- an unperturbed input
+    # scores as an escape, which reads as a hole in the check rather than a hole in the control.
+    def _names(cell: str, check_id: str) -> bool:
+        return check_id in CHECK_ID.findall(cell)
 
-    def strip_evidence(text: str, check_id: str) -> str:
-        rows = list(csv.reader(io.StringIO(text)))
+    def _rewrite(text: str, check_id: str, edit) -> str:
         out = io.StringIO()
         w = csv.writer(out)
-        for r in rows:
-            if len(r) > 6 and r[2] == check_id:
-                r = r[:6] + [""] + r[7:]
+        for r in csv.reader(io.StringIO(text)):
+            if len(r) > 6 and _names(r[2], check_id):
+                r = edit(list(r))
             w.writerow(r)
         return out.getvalue()
+
+    def demote(text: str, check_id: str, to: str) -> str:
+        return _rewrite(text, check_id, lambda r: r[:5] + [to] + r[6:])
+
+    def strip_evidence(text: str, check_id: str) -> str:
+        return _rewrite(text, check_id, lambda r: r[:6] + [""] + r[7:])
+
+    def drop_from_group(text: str, check_id: str) -> str:
+        """Remove one ID from the grouped cell that names it, leaving the row otherwise green."""
+        return _rewrite(
+            text,
+            check_id,
+            lambda r: r[:2]
+            + [", ".join(c for c in CHECK_ID.findall(r[2]) if c != check_id)]
+            + r[3:],
+        )
+
+    grouped = _synthesise_green_grouped(required)
+    # Victims that SHARE a cell with other IDs -- the property the three grouped cases are about.
+    # Picking `victim_ba` for them would work by accident and stop working the day the sort order
+    # puts it alone in the last, short group.
+    cells = [CHECK_ID.findall(r[2]) for r in list(csv.reader(io.StringIO(grouped)))[1:]]
+    shared = [cell for cell in cells if len(cell) > 1]
+    victim_shared = shared[0][0]
+    victim_shared_ba = next((c for cell in shared for c in cell if c[:5] in BLOCKING_ALWAYS), victim_ba)
 
     cases = [
         (
@@ -466,6 +536,27 @@ def negative_control(phase: int | None = None) -> int:
             phase_text,
             future,
             "never names",
+        ),
+        (
+            "THE FUTURE TREE AS THE FILE ACTUALLY WRITES IT — one row per suite run, IDs grouped",
+            spec_text,
+            future_phase_text,
+            grouped,
+            None,  # this one must PASS
+        ),
+        (
+            f"a grouped row that keeps {victim_shared}'s cellmates green and drops {victim_shared}",
+            spec_text,
+            future_phase_text,
+            drop_from_group(grouped, victim_shared),
+            "have no `pass` row with an evidence_ref",
+        ),
+        (
+            f"a grouped row demoted to a finding, taking BLOCKING-ALWAYS {victim_shared_ba} with it",
+            spec_text,
+            future_phase_text,
+            demote(grouped, victim_shared_ba, "**finding**"),
+            "BLOCKING-ALWAYS and may not be deferred",
         ),
     ]
 

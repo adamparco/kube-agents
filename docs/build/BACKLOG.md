@@ -83,7 +83,22 @@ turns out to be wrong is closed with a reason, not recycled.
 
 **Last drained:** 2026-07-31
 
-_(empty)_
+### `dev/mutate.py` has no suite kind for a check whose catcher is its own `--negative-control`
+
+- **Kind:** finding
+- **Where:** `dev/mutate.py` — `GoSuite` / `UnittestSuite`, and the `"kind"` field of
+  `verification/mutants/<CHECK-ID>.json`
+- **Why it matters:** `harness-run` §5 requires a non-vacuity sweep to be _configured_ through
+  `dev/mutate.py` against a committed spec, and names `dev/mutate.sh` as the fallback for a one-off.
+  But the runner only knows two suites, `go` and `unittest`, and the harness's dominant affordance
+  for a `dev/tests/*.py` check is that check's own `--negative-control` — which is neither. So every
+  check-only unit is pushed onto the fallback and hand-writes an applier: `P9-T11b-1` did it for the
+  broker SA, `P9-T11a-2` did it again the next unit for `parse_results`. Two in two units is the
+  re-authoring LSN-047, LSN-048 and LSN-049 were each paid for once. The missing piece is small — a
+  `"kind": "command"` whose catch condition is a needle in the command's output, which is exactly
+  what rule 5 (`rc != 0` is not a catch) already demands of the Go path.
+- **Priority:** normal
+- **Added:** 2026-07-31
 
 ---
 

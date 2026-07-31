@@ -31,17 +31,16 @@ found in this pass are ordering or scoping problems that would otherwise have su
 > because its declared resolution ("`verify-phase9.sh` runs the ratchet, not the Accept list") was
 > written into the acceptance table and never into the script. The audit, the fourteen IDs and the
 > four units that close them are the last section of this file: **§ Milestone audit 2026-07-31**.
-> **`P9-T11a` and `P9-T11b-1` are done (2026-07-31)** — the ratchet arm exists, and deriving the
-> requirement properly from 09 §10 rather than from the hand-written table restated the gap against a
-> denominator of **75**. `T11b-1` then took **V-ISO-001** and **V-ISO-002** green at L2 and, in doing
-> so, found that the arm **under-counts green**: `parse_results` keys on the raw `check_id` cell, and
-> **38 of 159 rows in `results.csv` name more than one ID**, so every grouped row is invisible to it.
-> The arm prints **38 not green / 17 BLOCKING-ALWAYS**; the true figure is **28 / 12**, and **10 IDs
-> are falsely reported unasserted** — V-BRK-002, V-BRK-015, V-GAT-001, V-GAT-010, V-GAT-011,
-> V-GAT-017, V-GAT-021, V-ISO-001, V-ISO-002, V-REV-008. Scheduled as **`P9-T11a-2`** and _not_ fixed
-> in `T11b-1`: two of the ten are `T11b-1`'s own rows, so fixing the check in the unit whose result it
-> would credit is Guardrail 9 exactly. **Resume at `harness-run`, unit `P9-T11a-2`.** Do not re-run
-> `harness-milestone` until the T11 ladder is green.
+> **`P9-T11a`, `P9-T11b-1` and `P9-T11a-2` are done (2026-07-31)** — the ratchet arm exists, and
+> deriving the requirement properly from 09 §10 rather than from the hand-written table restated the
+> gap against a denominator of **75**. `T11b-1` then took **V-ISO-001** and **V-ISO-002** green at L2
+> and, in doing so, found that the arm **under-counted green**: `parse_results` keyed on the raw
+> `check_id` cell, and **36 of the 160 rows in `results.csv` name more than one ID**, so every grouped
+> row was invisible to it — 10 IDs falsely reported unasserted, two of them `T11b-1`'s own, which is
+> why the fix was split out under Guardrail 9. `T11a-2` split the cell on the ID pattern and gave the
+> control the grouped-row cases it had never had: the arm now prints **28 not green / 12
+> BLOCKING-ALWAYS**, and that figure is the real worklist. **Resume at `harness-run`, unit
+> `P9-T11b-2`.** Do not re-run `harness-milestone` until the T11 ladder is green.
 
 **Phase 9 is OPEN.** It was stopped here on 2026-07-30 by an explicit human instruction, after the
 unit `P9-T9b-5b-0-ii-a`, and **not** because the phase closed. The same person lifted the stop later
@@ -127,9 +126,9 @@ only principal that may, since no broker grant reaches `agents/status` — from 
 observations against the etcd 05 §1.2 puts the journal in, refreshed on a 60 s clock because the
 field has no watch behind it; 8/8 mutants caught. B-006 is closed on both halves.
 `P9-T9c` was the last task in the ladder as planned — and the ladder was not the whole phase.
-`harness-milestone` ran, stopped at §1, and opened **`P9-T11a`–`d`**; `T11a` and `T11b-1` closed the
-same day. **Resume at `harness-run`, unit `P9-T11b-2`** (§ Milestone audit 2026-07-31, at the end of
-this file).
+`harness-milestone` ran, stopped at §1, and opened **`P9-T11a`–`d`**; `T11a`, `T11b-1` and `T11a-2`
+closed the same day. **Resume at `harness-run`, unit `P9-T11b-2`** (§ Milestone audit 2026-07-31, at
+the end of this file).
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
 [`LEDGER.md`](LEDGER.md).
@@ -5757,15 +5756,15 @@ and is red by construction on today's tree; that is the point, and it is the sam
 than remembered" shape section G already uses. Guardrail 9 is satisfied structurally: `T11a` ships no
 implementation, and `T11b`–`T11d` ship no change to `T11a`'s arm.
 
-| Task             | What to build                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Spec                      | Files                                                                               | Check IDs                                                                   | Weight |
-| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------ |
-| **P9-T11a** ✅   | The ratchet arm planning defect 4 declared and never built. A new section in `verify-phase9.sh` that derives the Phase 9 ratchet from 09 §10 + the acceptance table and **fails on any member with no green `results.csv` row** — so the gate reports the gap instead of omitting it. Prints the three populations above. Red today, and its redness IS the worklist.                                                                                                                                                                                          | 09 §10; planning defect 4 | `dev/verify/verify-phase9.sh` · possibly `dev/tests/` for the L0 half               | V-MET-013, V-MET-014 (the arm is itself a check about checks)               | small  |
-| **P9-T11a-2**    | **The ratchet arm under-counts green.** `parse_results` keys on the raw `check_id` cell, so a row naming `V-ISO-001, V-ISO-002` is filed under that literal string and matches neither ID. 38 of 159 rows group IDs that way — it is the file's dominant convention for a suite proving several rows at once, not an anomaly. Split the cell on the `V-XXX-nnn` pattern already in the module as `CHECK_ID`. Add a `--negative-control` case for a grouped row, since the current control only ever synthesises single-ID rows and is therefore blind to this. | 09 §9.4                   | `dev/tests/phase-ratchet-is-asserted.py` · `dev/test_invariants_gate.py`            | V-MET-013, V-MET-014                                                        | small  |
-| ~~**P9-T11b**~~  | **Split on 2026-07-31 into T11b-1 and T11b-2** (`harness-run` §2 Sizing — the row was weighted `large` and carries two independent suites, each needing its own destructive L2 run against the scratch cluster).                                                                                                                                                                                                                                                                                                                                               | 05 §8; 03 §4.1            | —                                                                                   | —                                                                           | large  |
-| **P9-T11b-1** ✅ | V-ISO-001/002 — chaos for the **pair**. C1 and C2 asserted the agent workload only; extend both to the broker Deployment, both ServiceAccounts and both rebinds. Put `chaos-suite.sh` on `dev/L2-CHAIN.txt`, which it had never been on.                                                                                                                                                                                                                                                                                                                       | 05 §8                     | `dev/verify/chaos-suite.sh` · `dev/L2-CHAIN.txt`                                    | **V-ISO-001**, **V-ISO-002**                                                | medium |
-| **P9-T11b-2**    | V-ISO-006 — CH6, journal down → broker refuses to execute. `dev/verify/broker-refuse-l2.sh` arm B **already induces the exact fault and asserts the exact property**; what is missing is that nothing binds arm B to the ID, so the row has no claimant and no `results.csv` row. Bind it, add the CH6 cross-reference in `chaos-suite.sh`, run and record.                                                                                                                                                                                                    | 03 §4.1; 06 §4.4 row 3    | `dev/verify/broker-refuse-l2.sh` · `dev/verify/chaos-suite.sh`                      | **V-ISO-006**                                                               | small  |
-| **P9-T11c**      | The four unasserted BLOCKING-ALWAYS broker/undo L2s: the pod-token direct write (V-BRK-001), the stripped-`action-id` admission rejection (V-BRK-004), post-execution journal failure → rollback + `RolledBack` + auto-pause + page (V-BRK-016), and the destructive-undo gate (V-REV-009).                                                                                                                                                                                                                                                                    | 03 §4.1, §4.3, §6, §11    | `dev/verify/` (new or extended L2 script) · the tenant overlay of planning defect 2 | **V-BRK-001**, **V-BRK-004**, **V-BRK-016**, **V-REV-009**                  | large  |
-| **P9-T11d**      | The workload pair at L2: two workloads owner-referenced and no third, non-interchangeable identities, the four labels selectable, both startup orders converging, agent-without-broker failing closed, CR deletion removing workloads and sparing SAs, and one fleet-wide Socket Mode connection.                                                                                                                                                                                                                                                              | 08 §2.4, §7; 05 §8, C15   | `dev/verify/` (new pair suite) · `dev/L2-CHAIN.txt`                                 | V-RUN-001, V-RUN-002, V-RUN-004, V-RUN-005, V-RUN-006, V-RUN-009, V-RUN-014 | large  |
+| Task             | What to build                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Spec                      | Files                                                                               | Check IDs                                                                   | Weight |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------ |
+| **P9-T11a** ✅   | The ratchet arm planning defect 4 declared and never built. A new section in `verify-phase9.sh` that derives the Phase 9 ratchet from 09 §10 + the acceptance table and **fails on any member with no green `results.csv` row** — so the gate reports the gap instead of omitting it. Prints the three populations above. Red today, and its redness IS the worklist.                                                                                                                                                                                     | 09 §10; planning defect 4 | `dev/verify/verify-phase9.sh` · possibly `dev/tests/` for the L0 half               | V-MET-013, V-MET-014 (the arm is itself a check about checks)               | small  |
+| **P9-T11a-2** ✅ | **The ratchet arm under-counts green.** `parse_results` keys on the raw `check_id` cell, so a row naming `V-ISO-001, V-ISO-002` is filed under that literal string and matches neither ID. 36 of the 160 rows group IDs that way — it is the file's convention for a suite proving several rows at once, not an anomaly. Split the cell on the `V-XXX-nnn` pattern already in the module as `CHECK_ID`. Add a `--negative-control` case for a grouped row, since the current control only ever synthesises single-ID rows and is therefore blind to this. | 09 §9.4                   | `dev/tests/phase-ratchet-is-asserted.py`                                            | V-MET-013, V-MET-014                                                        | small  |
+| ~~**P9-T11b**~~  | **Split on 2026-07-31 into T11b-1 and T11b-2** (`harness-run` §2 Sizing — the row was weighted `large` and carries two independent suites, each needing its own destructive L2 run against the scratch cluster).                                                                                                                                                                                                                                                                                                                                          | 05 §8; 03 §4.1            | —                                                                                   | —                                                                           | large  |
+| **P9-T11b-1** ✅ | V-ISO-001/002 — chaos for the **pair**. C1 and C2 asserted the agent workload only; extend both to the broker Deployment, both ServiceAccounts and both rebinds. Put `chaos-suite.sh` on `dev/L2-CHAIN.txt`, which it had never been on.                                                                                                                                                                                                                                                                                                                  | 05 §8                     | `dev/verify/chaos-suite.sh` · `dev/L2-CHAIN.txt`                                    | **V-ISO-001**, **V-ISO-002**                                                | medium |
+| **P9-T11b-2**    | V-ISO-006 — CH6, journal down → broker refuses to execute. `dev/verify/broker-refuse-l2.sh` arm B **already induces the exact fault and asserts the exact property**; what is missing is that nothing binds arm B to the ID, so the row has no claimant and no `results.csv` row. Bind it, add the CH6 cross-reference in `chaos-suite.sh`, run and record.                                                                                                                                                                                               | 03 §4.1; 06 §4.4 row 3    | `dev/verify/broker-refuse-l2.sh` · `dev/verify/chaos-suite.sh`                      | **V-ISO-006**                                                               | small  |
+| **P9-T11c**      | The four unasserted BLOCKING-ALWAYS broker/undo L2s: the pod-token direct write (V-BRK-001), the stripped-`action-id` admission rejection (V-BRK-004), post-execution journal failure → rollback + `RolledBack` + auto-pause + page (V-BRK-016), and the destructive-undo gate (V-REV-009).                                                                                                                                                                                                                                                               | 03 §4.1, §4.3, §6, §11    | `dev/verify/` (new or extended L2 script) · the tenant overlay of planning defect 2 | **V-BRK-001**, **V-BRK-004**, **V-BRK-016**, **V-REV-009**                  | large  |
+| **P9-T11d**      | The workload pair at L2: two workloads owner-referenced and no third, non-interchangeable identities, the four labels selectable, both startup orders converging, agent-without-broker failing closed, CR deletion removing workloads and sparing SAs, and one fleet-wide Socket Mode connection.                                                                                                                                                                                                                                                         | 08 §2.4, §7; 05 §8, C15   | `dev/verify/` (new pair suite) · `dev/L2-CHAIN.txt`                                 | V-RUN-001, V-RUN-002, V-RUN-004, V-RUN-005, V-RUN-006, V-RUN-009, V-RUN-014 | large  |
 
 **Resume at `harness-run`, unit `P9-T11a`.** Phase 9 does not close until the fourteen are green;
 seven of them may not be deferred to make it close.
@@ -5982,3 +5981,91 @@ this.
 
 **Resume at `harness-run`, unit `P9-T11a-2`** — then `P9-T11b-2` (V-ISO-006, binding
 `broker-refuse-l2.sh` arm B to the ID it already proves).
+
+---
+
+## P9-T11a-2 — the cell is not the key · 2026-07-31 · ✅
+
+**V-MET-013, V-MET-014 at L0.** One line of the fix, and the whole of the unit is why it was not one
+line of `T11a`.
+
+`parse_results` filed each results row under its raw `check_id` cell. **36 of the 160 rows name more
+than one ID** — one suite run proves several catalog rows and gets one row citing one evidence
+reference, which is the file's convention for a suite run and not an anomaly. So
+`"V-ISO-001, V-ISO-002"` became a key that matched neither ID, and the arm reported both as never
+asserted on the morning after they went green at L2.
+
+| Population               | Printed | True   |
+| ------------------------ | ------- | ------ |
+| required (75)            | 75      | 75     |
+| green                    | 37      | **47** |
+| not green                | 38      | **28** |
+| of those BLOCKING-ALWAYS | 17      | **12** |
+
+The ten it had accused — V-BRK-002, V-BRK-015, V-GAT-001, V-GAT-010, V-GAT-011, V-GAT-017,
+V-GAT-021, V-ISO-001, V-ISO-002, V-REV-008 — are green and always were. **A check written to find
+unrun work that invents ten pieces of it is worse than no check**, because the ten are
+indistinguishable from the twenty-eight that are real, and the natural response to the list is to go
+and re-run things that have already been run.
+
+**What the fix decides, beyond splitting the cell.** Two suffixes appear in that column and they are
+not the same kind of thing. `(regression)` marks a re-run; `¬` is 09 §6's _negative-control
+mandatory_ marker, copied off the catalog row — a property of the **check**, not a claim that the
+row records only a control run. Both are stripped by the ID pattern, and for `V-CTR-002 ¬` that is
+correct: it is a result row for V-CTR-002. A cell naming no ID at all (`(L0 mechanization)`)
+contributes nothing, which is exactly what it did before under a key nothing could look up.
+
+**Why the control could not see this, which is the more interesting half.** All eight of `T11a`'s
+cases synthesised **one ID per row**. The control was therefore auditing the check against a shape
+its real input predominantly does not have — [[LSN-060]]'s family (the control skipped the statement
+under test), arriving through the _synthesiser_ rather than through a skipped statement. Three cases
+added, 8 → **11**, all three built on a `_synthesise_green_grouped` that writes the future tree the
+way `results.csv` is actually written, four IDs to a cell:
+
+| #   | Case                                                                      | Requires                                           |
+| --- | ------------------------------------------------------------------------- | -------------------------------------------------- |
+| 9   | the future tree, IDs grouped one row per suite run                        | **PASS** — a grouped row credits every ID it names |
+| 10  | one ID dropped from a grouped cell, cellmates untouched                   | caught by property 2                               |
+| 11  | a grouped row demoted to `**finding**`, taking its BLOCKING-ALWAYS member | caught by property 3                               |
+
+Case 10 is the guard against over-correcting: a split that credited by suite prefix, or that read
+the whole row, would pass 9 and fail 10.
+
+**The control's own victim locator had to change with it,** and that is a finding in miniature.
+`demote` and `strip_evidence` matched their victim by `r[2] == check_id`. Against a grouped cell that
+comparison is simply false, so cases 10 and 11 would have perturbed **nothing** and scored their
+untouched input as an escape — a hole reported in the check that is really a hole in the control.
+Both now locate by _the cell names this ID_.
+
+**Non-vacuity, and it is discrimination rather than detection.** `dev/mutate.sh` with the mutator in
+a file ([[LSN-049]]), each mutant caught by its own case and by no other:
+
+| Mutant                                                                    | Result                                                                        |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| **M1** `parse_results` back to keying on the raw cell                     | **10/11** — case 9 alone reddens; 1–8, 10, 11 unmoved                         |
+| **M2** the victim locator back to `==` instead of `in CHECK_ID.findall()` | **9/11** — cases 10 and 11 ESCAPE on an unperturbed input; case 9 stays green |
+
+**And the sweep could not be configured, only run.** `harness-run` §5 wants it through
+`dev/mutate.py` against a committed `verification/mutants/<CHECK-ID>.json`; that runner knows two
+suite kinds, `go` and `unittest`, and the catcher here is the check's own `--negative-control`, which
+is neither. So this unit fell back to `dev/mutate.sh` and hand-wrote an applier — the second unit in
+two to do so, after `T11b-1`'s broker-SA mutant. That is the re-authoring LSN-047, LSN-048 and
+LSN-049 were each paid for once, so it is **an inbox item rather than a paragraph** (`BACKLOG.md`,
+added 2026-07-31): a `"kind": "command"` suite whose catch condition is a needle in the command's
+output, which is what rule 5 already demands of the Go path.
+
+**Guardrail 9 held on both sides.** `T11b-1` found this and did not fix it, because two of the ten
+were its own rows. `T11a-2` fixes it and ships no implementation, so nothing in this unit can be
+credited by the arm it repairs.
+
+That last clause is measured, not asserted, because this unit's own results row is itself a grouped
+cell (`V-MET-013, V-MET-014`) and is therefore exactly the shape the fix makes readable. Re-scanning
+with the row removed gives the identical verdict — **28 not green, 12 BLOCKING-ALWAYS**, both IDs
+green either way — because prior rows had already proved them. The fix credits nothing of its own.
+
+Gate: control **11/11** · live arm rc 1 printing **28 / 12** (by construction — 28 checks are
+genuinely unrun, and its redness is the T11b–T11d worklist) · `invariants-gate.py` 31/31 ·
+`unittest discover dev` 397 OK · L0 chain 48/48.
+
+**Resume at `harness-run`, unit `P9-T11b-2`** — V-ISO-006, binding `broker-refuse-l2.sh` arm B to the
+ID it already proves.
