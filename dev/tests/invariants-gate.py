@@ -39,7 +39,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gitcorpus import repo_files  # noqa: E402
+from gitcorpus import read_repo_files, repo_files  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 LESSONS = REPO / ".claude/harness/LESSONS.md"
@@ -1546,13 +1546,32 @@ CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
 # here because the first version's floor was 5 against a 6-line chain, so deleting a line from the
 # chain left the check green over the remaining five. A floor below the real count is a check that
 # tolerates exactly the change it exists to notice.
-L2_CHAIN_FLOOR = 6
+# Raised 6 -> 16 on 2026-07-30 (P9-T9b-4), in the same commit that grew the chain, because the
+# docstring above is an instruction and it had not been followed since the check was written: the
+# floor sat at 6 against a 14-line chain, so eight lines could have left without a word. Phase 9's
+# milestone will collapse its seven lines into verify-phase9.sh and this number must come down in
+# THAT commit, deliberately, which is the whole point of it being here.
+# Raised 16 -> 17 on 2026-07-30 (P9-T9b-5a): actor-overlay-admission-l2.sh, the line that executes
+# the phase's admission ruling. Moved in the same commit as the line it counts, which is the only
+# way this ratchet is ever allowed to move upward.
+# Raised 17 -> 18 on 2026-07-30 (P9-T9b-5b-i): broker-execute-l2.sh, acceptance bullet (a). Same
+# commit as the line, same rule.
+L2_CHAIN_FLOOR = 18
 # How many scripts the TRANSITIVE scope held when it was widened (2026-07-25, P8-T8). A separate
 # ratchet from the one above because the two guard different things: L2_CHAIN_FLOOR notices a line
 # leaving L2-CHAIN.txt, this one notices a claim-making script leaving the closure — including one
 # that leaves by being un-called, or by renaming its verdict functions, neither of which touches the
 # chain file at all.
-L2_SCOPE_FLOOR = 16
+# Raised 16 -> 25 on 2026-07-30 (P9-T9b-4), same argument as the line above. The two scripts that
+# joined the closure that day are verify-phase8.sh and verify-phase9.sh — the Phase 8 gate had been
+# outside it for three phases because the standing chain line was a phase behind, so the one script
+# that renders Phase 8's verdict was never asked which artifact it was judging.
+# Raised 25 -> 26 on 2026-07-30 (P9-T9b-5a): actor-overlay-admission-l2.sh. It joins by being named
+# on a chain line rather than by being reached from one, so both floors move together this time —
+# they will not always, and the day they diverge is the day one of the two is doing work.
+# Raised 26 -> 27 on 2026-07-30 (P9-T9b-5b-i): broker-execute-l2.sh, also named on a chain line, so
+# both floors move together a second time.
+L2_SCOPE_FLOOR = 27
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:
@@ -2497,6 +2516,169 @@ def check_metrics_rows_are_complete() -> list[str]:
     return failures
 
 
+# ---------------------------------------------------------------------------------------------
+# V-CTN-037 — a test-only RBAC grant never leaves dev/
+# ---------------------------------------------------------------------------------------------
+
+# The label that says "this grant exists so a suite can observe something, and for no other
+# reason". Discovery is BY THIS MARKER, not by a path or a filename: a rule keyed to
+# `dev/verify/fixtures/actor-tenant-grant.yaml` is a headcount of one ([[LSN-036]]) and says
+# nothing about the second fixture, which is the one nobody reviews.
+TEST_ONLY_MARKER = "kube-agents/test-only-grant"
+RBAC_KIND = re.compile(
+    r"^kind:\s*(Role|ClusterRole|RoleBinding|ClusterRoleBinding)\s*$", re.MULTILINE
+)
+# Cluster-scoped RBAC cannot be confined to a test namespace by construction, so a test-only grant
+# may not be either of these — there is no teardown that makes a ClusterRole safe to have existed.
+CLUSTER_SCOPED_RBAC = {"ClusterRole", "ClusterRoleBinding"}
+# [[LSN-004]]'s list, and the reason invariant 7 uses an allow-list. None of these is a "write" and
+# every one of them is worse than most writes: `escalate` lifts the RBAC escalation-prevention
+# check, `bind` grants any Role the holder can name, `impersonate` is every identity at once, and
+# `*` is all three plus whatever the next API group adds.
+ESCALATION_VERBS = {"escalate", "bind", "impersonate", "*"}
+RBAC_API_GROUP = "rbac.authorization.k8s.io"
+
+
+# What a `kubectl apply -f` will take as a manifest. `.template`/`.tmpl` are included for the same
+# reason `agent_rbac_documents` includes them: a verb that only appears after envsubst is still a
+# granted verb, and the templates are what provisioning actually applies.
+YAML_SUFFIXES = (".yaml", ".yml", ".yaml.template", ".yaml.tmpl")
+
+
+def _rbac_documents(corpus: dict[str, str]) -> list[tuple[str, int, str, str]]:
+    """(repo-relative path, doc index, kind, document text) for every RBAC document in a manifest.
+
+    Subset by suffix rather than by a second `git ls-files` pass: the corpus is already the whole
+    worktree, and two enumerations of the same tree are two chances for them to disagree.
+    """
+    out = []
+    for rel, text in corpus.items():
+        if not rel.endswith(YAML_SUFFIXES):
+            continue
+        for n, doc in enumerate(_yaml_docs(text)):
+            m = RBAC_KIND.search(doc)
+            if m:
+                out.append((rel, n, m.group(1), doc))
+    return out
+
+
+def check_test_only_grants_are_confined() -> list[str]:
+    """V-CTN-037. A grant that exists only for a test may exist only where tests live.
+
+    P9-T8b-4b-ii-2a had to give the deployed actor identity real authority over real objects on a
+    real cluster, because the shipped 06 §2.2.1 grant deliberately gives it none and every envelope
+    therefore died at step 3 with a 403 — which meant steps 4 through 9 of the broker pipeline had
+    never once run against a live API server, and V-REV-001's "shadow mode never mutates" had L1
+    evidence and nothing above it. Proving a system does not mutate requires first letting it get
+    far enough to try.
+
+    So the fixture is legitimate and the risk is entirely about WHERE IT ENDS UP. A test-only grant
+    that drifts into an install path is the single worst outcome available here: it is a real
+    over-grant, on every cluster the provisioning scripts touch, wearing a filename that says it is
+    only for tests. Nobody would review it again, because it was reviewed once, in a test.
+
+    Five properties, all derived from the marker rather than from a path:
+
+      P1  the marker appears only under `dev/`, or in prose (`.md`)
+      P2  every RBAC document in a YAML under `dev/` carries it — so P1 cannot be dodged by
+          simply leaving the next fixture unmarked
+      P3  nothing outside `dev/` (prose aside) so much as names a file containing one
+      P4  no marked document is cluster-scoped; a ClusterRole is not confinable to a test namespace
+          and no teardown makes one safe to have existed
+      P5  no marked Role reaches `escalate`/`bind`/`impersonate`/`*`, or the RBAC API group itself
+
+    P4 and P5 are the ones that matter if P1 through P3 ever fail: they bound the blast radius of a
+    fixture that HAS escaped to the authority a namespaced read-mostly Role can hold.
+
+    WHAT THIS DOES NOT COVER, AND WHY IT IS A FILE-SHAPED RULE. RBAC written as a heredoc inside a
+    `dev/**.sh` is out of scope, and that is a stated non-claim rather than an oversight. A
+    heredoc's disposition is not statically derivable: `dev/verify/brake-fanout-l2.sh` applies one
+    and keeps it, and `dev/tests/negative-attenuation.sh` applies four of which three are SUPPOSED
+    to be denied — one of them a ClusterRole granting `impersonate`, which is an adversarial input
+    proving the VAP rejects it, not a grant. Marking that would be a lie and exempting it by helper
+    name would be an enumeration. The consequence is worth naming in the other direction too: the
+    confinement rule is enforceable on files and not on heredocs, so the fixture was made a FILE in
+    order to be inside it. Closing the heredoc half needs a way to tell an applied grant from an
+    adversarial input, which is an improvement pass, not this unit.
+    """
+    try:
+        corpus = read_repo_files(REPO)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return [f"VACUOUS: could not enumerate the worktree ({exc}); nothing was scanned."]
+
+    rbac = _rbac_documents(corpus)
+    marked = [d for d in rbac if TEST_ONLY_MARKER in d[3]]
+    if not marked:
+        return [
+            f"VACUOUS: no YAML in the tree carries a {TEST_ONLY_MARKER!r} RBAC document. Either "
+            f"the marker was renamed — in which case every property below silently stopped being "
+            f"checked, which is the whole of [[LSN-038]] — or the last test-only grant was "
+            f"removed, in which case delete this check rather than leaving it green over nothing."
+        ]
+
+    failures: list[str] = []
+    marked_files = {rel for rel, _, _, _ in marked}
+
+    # P1 — the marker itself is confined. Prose may discuss it: 09 §6, invariants.md and the phase
+    # breakdown all name it, and a rule that forbade that would be a rule against documenting it.
+    for rel, text in corpus.items():
+        if TEST_ONLY_MARKER not in text or rel.startswith("dev/") or rel.endswith(".md"):
+            continue
+        failures.append(
+            f"{rel} carries the {TEST_ONLY_MARKER!r} marker and is not under dev/. A test-only "
+            f"grant outside dev/ is an over-grant on every cluster this path is applied to."
+        )
+
+    # P2 — no unmarked RBAC under dev/. Without this, P1 is dodged by writing the next fixture
+    # without the marker, and the check reports green over the file it exists to find.
+    for rel, n, kind, doc in rbac:
+        if rel.startswith("dev/") and TEST_ONLY_MARKER not in doc:
+            failures.append(
+                f"{rel} document {n} is a {kind} under dev/ and carries no "
+                f"{TEST_ONLY_MARKER!r} label. Every RBAC document in dev/ is a test-only grant "
+                f"by definition; an unmarked one is invisible to every property above."
+            )
+
+    # P3 — nothing outside dev/ references a file that holds one. The marker travelling is one way
+    # a fixture escapes; an install script pointing at where it already lives is the other, and it
+    # leaves the fixture itself looking untouched.
+    basenames = {rel.rsplit("/", 1)[-1]: rel for rel in marked_files}
+    for rel, text in corpus.items():
+        if rel.startswith("dev/") or rel.endswith(".md") or rel in marked_files:
+            continue
+        for base, src in basenames.items():
+            if base in text:
+                failures.append(
+                    f"{rel} references {base!r} ({src}), a file holding a test-only grant. "
+                    f"Reachable only from dev/ means reachable only from dev/."
+                )
+
+    # P4/P5 — the blast radius of a fixture that did escape.
+    for rel, n, kind, doc in marked:
+        if kind in CLUSTER_SCOPED_RBAC:
+            failures.append(
+                f"{rel} document {n} is a {kind}. A test-only grant must be namespaced: a "
+                f"cluster-scoped one cannot be confined to a test namespace, and its teardown "
+                f"cannot undo the window in which it existed."
+            )
+        if kind not in ("Role", "ClusterRole"):
+            continue  # bindings carry no rules; their roleRef.apiGroup is legitimately RBAC's
+        for line, verb in _verbs_in(doc):
+            if verb in ESCALATION_VERBS:
+                failures.append(
+                    f"{rel} document {n} line {line} grants {verb!r}. [[LSN-004]]: this is not a "
+                    f"write verb and it is worse than one — a test-only grant may never hold it."
+                )
+        rules = doc.split("rules:", 1)
+        if len(rules) == 2 and RBAC_API_GROUP in rules[1]:
+            failures.append(
+                f"{rel} document {n} grants a resource in {RBAC_API_GROUP!r}. A grant over RBAC "
+                f"itself is authority to widen every other grant, whatever verbs it names."
+            )
+
+    return failures
+
+
 CHECKS = [
     ("invariant 7 — authority never precedes machinery", check_write_verbs_have_machinery),
     ("LSN-038 — the machinery probes resolve against the tree", check_machinery_probes_resolve),
@@ -2537,6 +2719,7 @@ CHECKS = [
         check_lesson_status_matches_its_index_row,
     ),
     ("the metrics table's rows carry every column", check_metrics_rows_are_complete),
+    ("V-CTN-037 — a test-only RBAC grant never leaves dev/", check_test_only_grants_are_confined),
 ]
 
 

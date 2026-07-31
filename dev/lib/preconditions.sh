@@ -360,6 +360,72 @@ p1_assert_build_under_test() {
   return 0
 }
 
+# --- P2 ------------------------------------------------------------------------------------------
+# p2_assert_policy_live <kubectl-cmd> <policy-name> <probe-file> [timeout-seconds]
+#
+# 09 §9.3.2 / binding.md P2, given its first executable form on 2026-07-30 (P9-T9b-5a). It was the
+# only precondition in the table with no `p*_` function and no lesson beside it, which is a pair of
+# facts with one cause: nothing had yet needed it, because until this unit every admission claim in
+# the tree was a claim that something was DENIED, and a denial is self-witnessing. A policy that is
+# not live cannot deny.
+#
+# The direction that needs the precondition is the other one. P9-T9b-5a's ruling turns on an arm
+# that asserts an object IS ADMITTED — that the test-only write overlay, wearing neither
+# `kube-agents/tier` nor `kube-agents/role`, falls outside `kube-agents-agent-readonly`'s match
+# condition and is therefore governed by no admission rule at all. That green is indistinguishable
+# from the green a cluster with no policy installed produces, from the green a policy whose binding
+# has not activated produces, and from the green a policy someone deleted an hour ago produces. It
+# is the exact shape of LSN-006 aimed at admission instead of at the dataplane: the API server
+# accepts the YAML either way and the check reports the security property ABSENT as if it had
+# measured it.
+#
+# So the assertion is an EXPERIMENT and not a lookup. `<probe-file>` is a manifest the policy MUST
+# reject; it is applied with `--dry-run=server`, which runs the full admission chain and persists
+# nothing, and the precondition holds only once the API server actually refuses it. Reading
+# `.spec.validations` off the policy object, or checking the binding exists, would answer a question
+# about stored YAML — which is the thing being ruled out.
+#
+# Polls, because a freshly-applied ValidatingAdmissionPolicyBinding has an activation delay and the
+# window is exactly when a suite that just ran `dev/cluster/up.sh` asks. A `sleep` here would be
+# LSN-024.
+#
+# rc 0 = the policy is live and enforcing · rc 3 = it never rejected within the timeout, which is
+# could-not-run and never a failed property: a policy that is not installed is not a policy that
+# was violated. Never rc 1, for the same reason P4 and P10 are never rc 1.
+P2_POLICY_ACTIVATION_TIMEOUT="${P2_POLICY_ACTIVATION_TIMEOUT:-60}"
+
+p2_assert_policy_live() {
+  local K="$1" policy="$2" probe="$3" timeout="${4:-$P2_POLICY_ACTIVATION_TIMEOUT}"
+  local waited=0 out=""
+
+  if ! $K get validatingadmissionpolicy "$policy" >/dev/null 2>&1; then
+    echo "DEFERRED (P2): ValidatingAdmissionPolicy '$policy' is not installed on this cluster."
+    echo "  Every 'this object was admitted' result below would be a statement about an absent"
+    echo "  policy. Install it: kubectl apply -f examples/gitops-repo/policy/ (dev/cluster/up.sh"
+    echo "  does this at line 234)."
+    return 3
+  fi
+
+  while [ "$waited" -lt "$timeout" ]; do
+    # Server dry-run: the full admission chain runs and nothing is written. A client dry-run would
+    # never reach the policy at all and would report a live policy as dead.
+    if ! out="$($K apply --dry-run=server -f "$probe" 2>&1)"; then
+      echo "P2 ok: '$policy' is live — it rejected the probe after ${waited}s"
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  echo "DEFERRED (P2): '$policy' exists but ADMITTED the probe that it must reject, for ${waited}s."
+  echo "  probe:  $probe"
+  echo "  answer: ${out:-<no output>}"
+  echo "  Either the binding has not activated, or its validationActions do not include Deny, or the"
+  echo "  deployed policy is an older generation than the tree's. An admission claim judged now"
+  echo "  would be measuring the API server's willingness to persist YAML (LSN-006, one layer up)."
+  return 3
+}
+
 # --- P4 ------------------------------------------------------------------------------------------
 # p4_assert_enforcing_dataplane <kubectl-cmd>
 #

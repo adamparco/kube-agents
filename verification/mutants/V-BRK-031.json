@@ -1,0 +1,121 @@
+{
+  "_comment": "Mutation sweep for V-BRK-031 -- a failure of one of step 3's three live reads comes back as a typed *broker.Refusal, and is typed by whether retrying could ever help: an RBAC denial is 403 target-forbidden with no Retry-After, an API-server fault is 503 snapshot-failed with one, and both are journaled. Run: python3 dev/mutate.py verification/mutants/V-BRK-031.json. Every row names the test that must fail; see dev/mutate.py for why rc != 0 is not a catch. The rows come in two families -- M1/M7 are 'the refusal is not produced at all' (the state the repo was in, and its half-fixed sibling), M2..M6/M8 are 'a refusal is produced and says the wrong thing'. The second family is the one worth the file: those all answer a *Refusal, so a check that only asserted 'not a 500' would be green on every one of them.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./internal/broker/pipeline/..."]
+  },
+  "mutants": [
+    {
+      "id": "M1-none-of-the-three-reads-is-typed",
+      "why": "The state the repo was in before this unit, and the reason it exists. All three sites return a bare fmt.Errorf; server.go's refuse type-asserts for a *Refusal, does not find one, and answers 500 internal-error. In shadow mode that is EVERY action, because the phase-9 actor holds the 06 SS2.2.1 grant and no tenant authority at all -- so the pipeline reported itself as crashing while behaving exactly as designed, and, because Journal and SecurityEvent ride ON the Refusal, the envelope's disposition was recorded nowhere.",
+      "catcher": "TestALiveReadFailureIsTypedByWhetherItCanEverSucceed",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\treturn \"\", liveReadRefusal(err,\n\t\t\t\tfmt.Sprintf(\"step 3: capturing pre-state for %d targets\", len(targets)))",
+          "replace": "\t\t\treturn \"\", fmt.Errorf(\"step 3: capturing pre-state for %d targets: %w\", len(targets), err)"
+        },
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\treturn \"\", liveReadRefusal(err,\n\t\t\t\tfmt.Sprintf(\"step 3: capturing pre-action restart baselines for %d targets\", len(targets)))",
+          "replace": "\t\t\treturn \"\", fmt.Errorf(\"step 3: capturing pre-action restart baselines for %d targets: %w\",\n\t\t\t\tlen(targets), err)"
+        },
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\treturn \"\", liveReadRefusal(err,\n\t\t\t\tfmt.Sprintf(\"step 3: resolving %d operations against live state\", len(raws)))",
+          "replace": "\t\t\treturn \"\", fmt.Errorf(\"step 3: resolving %d operations against live state: %w\", len(raws), err)"
+        }
+      ]
+    },
+    {
+      "id": "M2-everything-is-typed-as-the-case-that-motivated-the-fix",
+      "why": "The likeliest wrong fix, and the reason the negative control exists. The RBAC denial is what anyone debugging this sees, so the helper gets written to answer target-forbidden for anything non-nil. Every envelope then gets 403 and no Retry-After -- a recoverable API-server outage reads to the whole fleet as a permanent authority boundary, and the retry that would have worked never happens.",
+      "catcher": "TestLiveReadRefusalDiscriminatesRatherThanDefaulting",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\tif apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {",
+          "replace": "\tif apierrors.IsForbidden(err) || err != nil {"
+        }
+      ]
+    },
+    {
+      "id": "M3-the-discrimination-tests-a-predicate-that-is-never-true-here",
+      "why": "M2's mirror: the helper looks correct, discriminates on the wrong predicate, and collapses to the transient arm. IsNotFound never fires at this site -- CaptureAll turns a NotFound into a create's empty pre-state and CaptureRestartBaselines baselines it at zero -- so every RBAC denial comes back 503 snapshot-failed with a Retry-After, and an agent probing a permission boundary is told sixty times a minute to try again.",
+      "catcher": "TestALiveReadFailureIsTypedByWhetherItCanEverSucceed",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\tif apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {",
+          "replace": "\tif apierrors.IsNotFound(err) {"
+        }
+      ]
+    },
+    {
+      "id": "M4-the-permanent-arm-becomes-retryable",
+      "why": "The reason ReasonTargetForbidden was added rather than folding this into ReasonSnapshotFailed. Every other field is right, the reason string is right, and the caller is still told to wait and try again against a boundary that does not move -- Refusal's own comment says zero means do not retry and that this is the right answer for every authorization refusal. A check that asserted only the status and the reason would be green here.",
+      "catcher": "TestALiveReadFailureIsTypedByWhetherItCanEverSucceed",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\tDetail:  what + \": \" + err.Error(),\n\t\t\tJournal: true,\n\t\t}",
+          "replace": "\t\t\tDetail:            what + \": \" + err.Error(),\n\t\t\tJournal:           true,\n\t\t\tRetryAfterSeconds: broker.PausedRetryAfterSeconds,\n\t\t}"
+        }
+      ]
+    },
+    {
+      "id": "M5-the-permanent-arm-is-not-journaled",
+      "why": "The half of the original defect that survives a fix aimed only at the status code. The caller now gets a correct 403, and the envelope's disposition is still recorded nowhere -- so an agent enumerating what it may touch leaves no trace, which is precisely what 06 SS4.1's per-reason table exists to guarantee and what makes a probing pattern findable by analysis afterwards.",
+      "catcher": "TestALiveReadFailureIsTypedByWhetherItCanEverSucceed",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\tDetail:  what + \": \" + err.Error(),\n\t\t\tJournal: true,\n\t\t}",
+          "replace": "\t\t\tDetail:  what + \": \" + err.Error(),\n\t\t\tJournal: false,\n\t\t}"
+        }
+      ]
+    },
+    {
+      "id": "M6-the-permanent-arm-raises-a-security-event",
+      "why": "The over-correction, and the one mutant here that a reviewer might defend. It is wrong for a reason the check has to hold: in shadow mode the actor has no tenant authority at all, so this alarms on every single action, and an alarm that fires on everything is an alarm that gets muted -- including for the identity violations 03 SS6's events actually exist for. forbidden-caller (V-BRK-010) remains the case that alarms; this is an authorization outcome for a correctly authenticated caller.",
+      "catcher": "TestALiveReadFailureIsTypedByWhetherItCanEverSucceed",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\tDetail:  what + \": \" + err.Error(),\n\t\t\tJournal: true,\n\t\t}",
+          "replace": "\t\t\tDetail:        what + \": \" + err.Error(),\n\t\t\tJournal:       true,\n\t\t\tSecurityEvent: true,\n\t\t}"
+        }
+      ]
+    },
+    {
+      "id": "M7-only-the-read-that-motivated-the-fix-is-typed",
+      "why": "The partial fix, and the reason the check tables all three reads rather than the snapshot alone. The pre-state capture is the site the 500 was traced to, so it gets the helper and the other two do not -- and a Deployment whose restart baseline is denied, or a resolve whose label read is denied, still answers 500 with no journal entry. The three reads are made with the same actor identity and fail for the same reason.",
+      "catcher": "TestALiveReadFailureIsTypedByWhetherItCanEverSucceed",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\treturn \"\", liveReadRefusal(err,\n\t\t\t\tfmt.Sprintf(\"step 3: capturing pre-action restart baselines for %d targets\", len(targets)))",
+          "replace": "\t\t\treturn \"\", fmt.Errorf(\"step 3: capturing pre-action restart baselines for %d targets: %w\",\n\t\t\t\tlen(targets), err)"
+        },
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\treturn \"\", liveReadRefusal(err,\n\t\t\t\tfmt.Sprintf(\"step 3: resolving %d operations against live state\", len(raws)))",
+          "replace": "\t\t\treturn \"\", fmt.Errorf(\"step 3: resolving %d operations against live state: %w\", len(raws), err)"
+        }
+      ]
+    },
+    {
+      "id": "M8-a-rejected-credential-falls-through-to-the-transient-arm",
+      "why": "The narrow miss. IsForbidden alone is the obvious reading of 'an RBAC denial', and a 401 is equally permanent from the caller's side and equally not a broker fault -- an expired or rejected actor credential does not become valid by waiting sixty seconds. Dropping the second clause leaves a whole class of authority answers advertising themselves as retryable.",
+      "catcher": "TestALiveReadFailureIsTypedByWhetherItCanEverSucceed",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\tif apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {",
+          "replace": "\tif apierrors.IsForbidden(err) {"
+        }
+      ]
+    }
+  ]
+}

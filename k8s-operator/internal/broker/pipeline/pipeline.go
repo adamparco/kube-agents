@@ -40,6 +40,7 @@ import (
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
@@ -136,18 +137,27 @@ func (s StaticClassifier) Current() (*classify.Classifier, error) {
 	return s.C, nil
 }
 
-// Planner produces the undo plan for an envelope's operations. undo.Generate is the implementation;
-// the interface exists so that the failure mode is injectable -- see Config.Planner.
+// Planner produces the undo plan for an envelope's operations AND validates it.
+// undo.GenerateAndValidate is the implementation; the interface exists so that the failure mode is
+// injectable -- see Config.Planner.
+//
+// The dry-runner is a parameter rather than something the implementation closes over, and that is
+// the whole correction of P9-T8b-4b-ii-2b-i. The seam used to be `Generate` alone, defaulted to
+// `undo.Generate`, and `undo.GenerateAndValidate` -- whose own doc comment reads "the call the
+// broker actually makes at step 6" -- had no caller outside its tests. Every ActionRecord the
+// broker wrote therefore carried `undoPlan.validated: false`, and undo.ValidateReplayable refuses
+// on exactly that field, so both replay paths refused every plan ever journaled. A signature that
+// cannot express "generate without validating" is what stops that returning.
 type Planner interface {
-	Generate(ctx context.Context, req undo.Request, idx undo.ReferenceIndex) (*undo.Result, error)
+	Generate(ctx context.Context, req undo.Request, idx undo.ReferenceIndex, dr undo.DryRunner) (*undo.Result, error)
 }
 
-// PlannerFunc adapts a function to Planner. undo.Generate satisfies it directly.
-type PlannerFunc func(ctx context.Context, req undo.Request, idx undo.ReferenceIndex) (*undo.Result, error)
+// PlannerFunc adapts a function to Planner. undo.GenerateAndValidate satisfies it directly.
+type PlannerFunc func(ctx context.Context, req undo.Request, idx undo.ReferenceIndex, dr undo.DryRunner) (*undo.Result, error)
 
 // Generate calls f.
-func (f PlannerFunc) Generate(ctx context.Context, req undo.Request, idx undo.ReferenceIndex) (*undo.Result, error) {
-	return f(ctx, req, idx)
+func (f PlannerFunc) Generate(ctx context.Context, req undo.Request, idx undo.ReferenceIndex, dr undo.DryRunner) (*undo.Result, error) {
+	return f(ctx, req, idx, dr)
 }
 
 // ApprovalNotifier tells the humans on the roster that a gated action is waiting (04 §3).
@@ -170,12 +180,29 @@ type Config struct {
 	Classifier ClassifierSource
 	Live       classify.LiveState
 	Refs       undo.ReferenceIndex
-	// Planner generates the undo plan. Defaults to undo.Generate; it is a seam for the same reason
-	// every other dependency here is one. Whether a plan could be produced is a gating input
-	// (06 §4.2 rule 6, 06 §4.4 row 5), and a pipeline whose planner cannot be made to fail is a
-	// pipeline whose behaviour on an unplannable action is untested -- which is precisely the
-	// behaviour that decides between "gated" and "executed with no way back".
-	Planner   Planner
+	// Planner generates the undo plan and validates it. Defaults to undo.GenerateAndValidate; it is
+	// a seam for the same reason every other dependency here is one. Whether a plan could be
+	// produced is a gating input (06 §4.2 rule 6, 06 §4.4 row 5), and a pipeline whose planner
+	// cannot be made to fail is a pipeline whose behaviour on an unplannable action is untested --
+	// which is precisely the behaviour that decides between "gated" and "executed with no way back".
+	Planner Planner
+
+	// DryRunner yields the plan-time dry-run client for one submission's identity, which is
+	// 06 §4.3.1's "validated by dry-running each step against the API server".
+	//
+	// A function of the identity rather than a fixed object, because the dry run has to be issued
+	// with the SAME field manager the replay would use. Server-side apply reports a conflict for
+	// every field owned by a different manager, and the fields an undo restores are frequently the
+	// ones this agent set in an earlier action -- so a dry run under any other name would report
+	// conflicts the real replay never hits, downgrade a working plan, and gate the action for a
+	// reason that is an artifact of the check.
+	//
+	// REQUIRED, and it is the one seam in this Config whose absence is silent rather than loud. A
+	// nil Executor 500s on the first action; a nil DryRunner produces a broker that serves every
+	// request, journals every record with `validated: false`, and has a dead undo path that nobody
+	// discovers until a human is trying to reverse an outage. New refuses it for that reason.
+	DryRunner func(agentIdentity string) undo.DryRunner
+
 	Reader    execute.Reader
 	BodyStore execute.BodyStore
 	Executor  *execute.Executor
@@ -229,12 +256,14 @@ func New(cfg Config) (*Pipeline, error) {
 		return nil, errors.New("pipeline: an Accountant is required; broker.BrakeInputs treats nil as nobody-counting, which refuses every action -- 04 §4.2 budgets are not optional and a broker must not be constructible without row 7")
 	case cfg.Contested == nil:
 		return nil, errors.New("pipeline: a ContestedIndex is required; broker.BrakeInputs treats nil as unavailable, which refuses every action")
+	case cfg.DryRunner == nil:
+		return nil, errors.New("pipeline: a DryRunner is required; 06 §4.3.1 validates each undo step against the API server before the action runs, and a broker without one journals `undoPlan.validated: false` on every record -- which undo.ValidateReplayable refuses, so nothing it ever did could be rolled back")
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
 	if cfg.Planner == nil {
-		cfg.Planner = PlannerFunc(undo.Generate)
+		cfg.Planner = PlannerFunc(undo.GenerateAndValidate)
 	}
 	return &Pipeline{cfg: cfg}, nil
 }
@@ -425,10 +454,12 @@ func (p *Pipeline) step(tr *broker.StepTrace, id broker.Step, fn func() (string,
 func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, error) {
 	tr := s.tr
 	return nil, p.step(tr, broker.StepResolveScope, func() (string, error) {
+		ag := p.cfg.Brake.Observe(ctx).Agent
 		s.caller = classify.Caller{
-			Name:  p.cfg.AgentName,
-			Tier:  string(s.id.Tier),
-			Scope: p.callerScope(ctx),
+			Name:           p.cfg.AgentName,
+			Tier:           string(s.id.Tier),
+			Scope:          scope.Of(ag),
+			ServingCluster: servingCluster(ag),
 		}
 		if !s.caller.Scope.IsWellFormed() {
 			return "", &broker.Refusal{
@@ -451,7 +482,8 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 			// V-BRK-018: all snapshots or none. CaptureAll already refuses to return a partial set;
 			// what this branch adds is that a failure here stops the pipeline at step 3, so no
 			// classification, no plan and no execution ever sees a half-read cluster.
-			return "", fmt.Errorf("step 3: capturing pre-state for %d targets: %w", len(targets), err)
+			return "", liveReadRefusal(err,
+				fmt.Sprintf("step 3: capturing pre-state for %d targets", len(targets)))
 		}
 		s.snaps = snaps
 
@@ -461,8 +493,8 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 		// it is captured here, next to the snapshots, and refuses on the same all-or-nothing terms.
 		baselines, err := verify.CaptureRestartBaselines(ctx, p.cfg.Verifier.Prober, targets)
 		if err != nil {
-			return "", fmt.Errorf("step 3: capturing pre-action restart baselines for %d targets: %w",
-				len(targets), err)
+			return "", liveReadRefusal(err,
+				fmt.Sprintf("step 3: capturing pre-action restart baselines for %d targets", len(targets)))
 		}
 		s.baselines = baselines
 
@@ -474,7 +506,8 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 
 		resolved, err := classify.Resolve(ctx, p.cfg.Live, s.caller, raws)
 		if err != nil {
-			return "", fmt.Errorf("step 3: resolving %d operations against live state: %w", len(raws), err)
+			return "", liveReadRefusal(err,
+				fmt.Sprintf("step 3: resolving %d operations against live state", len(raws)))
 		}
 		s.resolved = resolved
 
@@ -482,13 +515,82 @@ func (p *Pipeline) stepResolve(ctx context.Context, s *state) (*broker.Result, e
 	})
 }
 
-// callerScope derives the caller's authority ceiling from the Agent CR this broker serves.
+// liveReadRefusal types a failure of one of step 3's live reads. V-BRK-031.
 //
-// From the CR, never from the envelope: 03 §4.1 step 1 says the broker derives (tier, scope) from
-// the authenticated identity. The authenticator has already established that the caller IS this
-// broker's agent, so the CR is the authenticated answer to "what is its scope".
-func (p *Pipeline) callerScope(ctx context.Context) scope.Scope {
-	return scope.Of(p.cfg.Brake.Observe(ctx).Agent)
+// All three reads above are made with the ACTOR identity, so "the read failed" has two entirely
+// different meanings and only one of them is transient. An API-server timeout or a 500 may well
+// succeed a minute later, which is what `snapshot-failed` and its Retry-After are for. An RBAC
+// denial will not: the actor's tier template does not reach this object and will not reach it in a
+// minute, so telling the caller to wait and retry is telling a loop to run forever against a
+// permission boundary. `Refusal.RetryAfterSeconds` documents that split as a rule of the type --
+// "zero means do not retry, which is the right answer for every schema and authorization refusal"
+// -- and this is the site that was not honouring it.
+//
+// BEFORE THIS EXISTED, NEITHER ANSWER WAS GIVEN. The error went back as a bare `fmt.Errorf`,
+// `server.go`'s `refuse` looked for a `*Refusal`, did not find one, and answered 500
+// `internal-error` with a stack trace in the broker log. Two consequences, and the second is the
+// one that matters:
+//
+//   - A caller could not tell its own authority ceiling from a broken broker. In shadow mode that
+//     is EVERY action, because the phase-9 actor holds the 06 §2.2.1 grant and no tenant authority
+//     at all -- so the entire pipeline reported itself as crashing while behaving exactly as
+//     designed.
+//   - `Journal` and `SecurityEvent` are carried ON the Refusal, so with no Refusal there is no
+//     journal entry and no event. The envelope's disposition was recorded NOWHERE. An agent
+//     enumerating what it may touch left no trace at all -- which is the opposite of what 06 §4.1's
+//     per-reason table exists to guarantee.
+//
+// The forbidden arm journals and does NOT raise a security event, deliberately. The journal is the
+// complete record of every envelope's disposition, and that is what makes a probing pattern findable
+// by analysis. A security event is an alarm, and in shadow mode an alarm on every single action is
+// an alarm that gets muted -- which would cost more than it buys, including for the events that do
+// matter. 03 §6's security events are for identity violations: a caller that is not who it says it
+// is. This is an authorization outcome for a correctly authenticated caller, and
+// `forbidden-caller` (V-BRK-010) remains the identity case that alarms.
+//
+// `what` names WHICH of the three reads failed. A refusal that says only "the pre-action read
+// failed" sends a human to the wrong object, which is the same argument `CaptureAll` makes about
+// naming the target index.
+func liveReadRefusal(err error, what string) error {
+	if err == nil {
+		return nil
+	}
+	// IsUnauthorized alongside IsForbidden because an expired or rejected credential is equally
+	// permanent from the caller's side and equally not a broker fault; both are answers about
+	// authority, and neither becomes true by waiting.
+	if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+		return &broker.Refusal{
+			Status:  http.StatusForbidden,
+			Reason:  broker.ReasonTargetForbidden,
+			Detail:  what + ": " + err.Error(),
+			Journal: true,
+		}
+	}
+	return &broker.Refusal{
+		Status:            http.StatusServiceUnavailable,
+		Reason:            broker.ReasonSnapshotFailed,
+		Detail:            what + ": " + err.Error(),
+		Journal:           true,
+		RetryAfterSeconds: broker.PausedRetryAfterSeconds,
+	}
+}
+
+// servingCluster reads the cluster this broker is installed in off the Agent CR it serves.
+//
+// From the same CR as the caller's scope, and for the same reason (03 §4.1 step 1: the broker
+// derives its caller from the authenticated identity, never from the envelope), but from a
+// different field. `spec.scope.clusterName` is the authority ceiling and is empty for the platform
+// tier by design; `spec.harness.clusterName` is where the agent runs and is populated for every
+// tier by the install template. classify.ScopeOfTarget documents why the target scope needs the
+// second one and what happens when it is missing.
+//
+// Nil-tolerant in both steps: a broker whose brake has not yet observed an Agent gets "", which
+// fails closed at the ownership lookup rather than panicking mid-envelope.
+func servingCluster(agent *agentv1alpha1.Agent) string {
+	if agent == nil || agent.Spec.Harness == nil {
+		return ""
+	}
+	return agent.Spec.Harness.ClusterName
 }
 
 // --- step 4: classify ------------------------------------------------------------------------
@@ -510,10 +612,16 @@ func (p *Pipeline) stepClassify(ctx context.Context, s *state) (*broker.Result, 
 		// whichever step first needs the answer -- which is this one. Step 6 keeps the part of 03
 		// §4.1's step 6 that is genuinely a step: attaching the plan to the record, and re-checking
 		// that the class never fell.
+		// Validated here too, in the same call, because the validation VERDICT is a classification
+		// input: a step that will not apply downgrades the plan to `none`, which is what makes
+		// UndoPlanPresent false below, which is what raises the action to gated. 06 §4.3.1 says so
+		// directly -- "if generation or validation fails, the action is raised to gated" -- and
+		// there is no later step at which that could still be arranged, because by step 6 the class
+		// is already fixed.
 		plan, err := p.cfg.Planner.Generate(ctx, undo.Request{
 			Operations:  undoOps(s.env, s.snaps),
 			GeneratedAt: metav1.NewTime(s.at),
-		}, p.cfg.Refs)
+		}, p.cfg.Refs, p.cfg.DryRunner(agentIdentity(s.id)))
 		if err != nil {
 			return "", fmt.Errorf("step 4: generating the undo plan: %w", err)
 		}
@@ -654,13 +762,34 @@ func (p *Pipeline) stepUndoPlan(ctx context.Context, s *state) (*broker.Result, 
 		if s.plan == nil || s.plan.Plan == nil {
 			return "", fmt.Errorf("step 6: no undo plan object reached this step; step 4 did not run or did not record one")
 		}
-		if !s.plan.Undoable() && s.class.Class < classify.ClassGated {
+		// VALIDATED, not merely Undoable, and the difference is the property this guard now carries.
+		//
+		// The classifier is fed `Undoable()`, because "is there a plan" is the input 06 §4.2 step 6
+		// names. This asks the stronger question -- was every step of it dry-run and would it apply
+		// -- and the two answers are identical only if something actually validated the plan.
+		// Nothing did, for five phases: the seam was generate-only and every record shipped with
+		// `validated: false` while ValidateReplayable, the front door of both replay paths, refuses
+		// on exactly that field. Asking here means a planner that skips validation cannot reach
+		// execution, whoever wired it, rather than producing an action whose rollback is already
+		// known to be unusable and saying nothing.
+		//
+		// The dry-run suppression is classify.UndoPlanGateApplies rather than a second `!DryRun`
+		// written out here. A dry-run envelope mutates nothing and terminates at PhaseDryRun, so
+		// the classifier deliberately excuses it from the undo-plan floor, and one predicate is how
+		// two sites stay unable to disagree about when it applies.
+		//
+		// It is shared for that reason and not because today's behaviour needs it: the brake's
+		// 06 §4.4 row 5 -- a THIRD spelling, which does not suppress for dry runs -- has already
+		// raised the class by the time this runs, so the second conjunct below is false whichever
+		// way the first is written. That third site is the outstanding one; see
+		// TestADryRunWhoseUndoPlanWouldNotApplyIsNotAServerFault.
+		if classify.UndoPlanGateApplies(s.env.DryRun, s.plan.Validated()) && s.class.Class < classify.ClassGated {
 			return "", fmt.Errorf(
-				"step 6: the envelope has no usable undo plan (%s) but is classified %s; 06 §4.2 step 6 requires at least gated, so the classification and the plan disagree and the action does not run",
-				strings.Join(s.plan.Refusals, "; "), s.class.Class)
+				"step 6: the envelope has no validated undo plan (strategy=%s validated=%t; %s) but is classified %s; 06 §4.2 step 6 requires at least gated, so the classification and the plan disagree and the action does not run",
+				s.plan.Plan.Strategy, s.plan.Plan.Validated, strings.Join(s.plan.Refusals, "; "), s.class.Class)
 		}
 		s.record = p.buildRecord(s)
-		return fmt.Sprintf("strategy=%s undoable=%t", s.plan.Plan.Strategy, s.plan.Undoable()), nil
+		return fmt.Sprintf("strategy=%s undoable=%t validated=%t", s.plan.Plan.Strategy, s.plan.Undoable(), s.plan.Validated()), nil
 	})
 }
 

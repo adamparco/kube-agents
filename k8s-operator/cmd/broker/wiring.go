@@ -32,6 +32,15 @@ limitations under the License.
 // second definition site for a value whose whole purpose is to be compared against a limit
 // declared next to it, and the two copies drift in the direction nobody notices: the one that
 // still says "fresh".
+//
+// A CLIENT is not a number, and the distinction cost five phases. This same sentence used to cover
+// the undo dry-runner, which is not a policy choice but the only thing that can answer "would this
+// step apply against a real API server" -- so leaving it unset did not defer a decision to the
+// owning package, it deleted the check. The pipeline defaulted to the generate-only half of the
+// planner, every ActionRecord shipped with `undoPlan.validated: false`, and undo.ValidateReplayable
+// refuses on exactly that field, so the entire undo path was dead in a broker that started clean
+// and passed every test. `pipeline.New` now refuses a nil DryRunner. Defaults belong to the owning
+// package; wiring belongs here, and a seam that reaches the cluster is wiring.
 package main
 
 import (
@@ -58,6 +67,7 @@ import (
 	brokerprobe "github.com/gke-labs/kube-agents/k8s-operator/internal/broker/probe"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/refindex"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/rollback"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/undo"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/verify"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/writeahead"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/journal"
@@ -183,6 +193,19 @@ func pipelineConfig(ctx context.Context, d brokerDeps) (pipeline.Config, []start
 	reader := &execute.ClientReader{Client: d.Client}
 	applier := &execute.ClientApplier{Client: d.Client}
 
+	// One replayer, used by the verify driver at rung 2 AND by plan-time validation at step 6. The
+	// same sharing argument as the applier, one level up: 06 §4.3.1's dry run is asking "would the
+	// replayer's own calls succeed", and a validator holding a second Replayer configured slightly
+	// differently would be answering about a program that never runs.
+	replayer := &rollback.Replayer{
+		Writer: applier,
+		Reader: reader,
+		// Nil for the same reason BodyStore is nil, and legal by the field's own doc: "a broker
+		// with no store configured can still replay every inline step, and a step that needs it
+		// then refuses by name rather than by nil dereference".
+		Sink: nil,
+	}
+
 	// --- step 5: the brake ----------------------------------------------------------------------
 	//
 	// Built first because the policy source's identity closure reads through it.
@@ -266,6 +289,16 @@ func pipelineConfig(ctx context.Context, d brokerDeps) (pipeline.Config, []start
 		Refs:       &refindex.Source{Client: d.Client, Discovery: disc},
 		Reader:     reader,
 
+		// 06 §4.3.1's "validated by dry-running each step against the API server". Per identity,
+		// because the dry run must carry the field manager the replay would -- see the field's doc
+		// in pipeline.Config. This is the seam whose absence was invisible: the pipeline used to
+		// default its planner to the generate-only half, so the broker ran, served, and journaled
+		// `undoPlan.validated: false` on every record it wrote, and undo.ValidateReplayable refuses
+		// on that field, so nothing it did could ever be rolled back. It is required now.
+		DryRunner: func(agentIdentity string) undo.DryRunner {
+			return &rollback.PlanDryRunner{Replayer: replayer, AgentIdentity: agentIdentity}
+		},
+
 		// BodyStore is DELIBERATELY nil, and it is the one seam in this file that is a gap rather
 		// than a choice. `bodystore.Journal` is the production execute.BodyStore and it needs a
 		// `journal.BlobSink` behind it; no production BlobSink exists -- the package ships the
@@ -286,15 +319,9 @@ func pipelineConfig(ctx context.Context, d brokerDeps) (pipeline.Config, []start
 		},
 		Verifier: &verify.Driver{
 			Prober: &brokerprobe.Source{Client: d.Client},
-			// Same applier as the executor: see above.
-			Rollback: &rollback.Replayer{
-				Writer: applier,
-				Reader: reader,
-				// Nil for the same reason BodyStore is nil, and legal by the field's own doc: "a
-				// broker with no store configured can still replay every inline step, and a step
-				// that needs it then refuses by name rather than by nil dereference".
-				Sink: nil,
-			},
+			// Same applier as the executor, via the same replayer plan-time validation uses: see
+			// above.
+			Rollback: replayer,
 			Pager:    &escalate.Recorder{Client: d.Client, Namespace: d.Namespace},
 			Pauser:   &escalate.Recorder{Client: d.Client, Namespace: d.Namespace},
 			Cooldown: cooldownSrc,

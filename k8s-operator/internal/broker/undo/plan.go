@@ -88,6 +88,19 @@ func (r *Result) Undoable() bool {
 	return r != nil && r.Plan != nil && r.Plan.Strategy != agentv1alpha1.UndoNone
 }
 
+// Validated reports whether every step of the plan was dry-run against the API server and would
+// apply. It is strictly stronger than Undoable: Validate sets the flag only on a plan it did not
+// downgrade, and a downgrade sets the strategy to `none`, so Validated implies Undoable and the
+// gap between them is exactly "a plan that exists and nothing checked".
+//
+// That gap is the one the broker shipped in for five phases. `Undoable` was the only question the
+// pipeline asked, `Validate` was never called, and every record carried `validated: false` while
+// `ValidateReplayable` -- the front door of both replay paths -- refuses precisely on that field.
+// The plans were fine. Nothing could replay one.
+func (r *Result) Validated() bool {
+	return r != nil && r.Plan != nil && r.Plan.Validated
+}
+
 // Generate produces the inverse of an envelope, before the envelope runs.
 //
 // ALL-OR-NOTHING, and that is a decision rather than an implementation convenience. 06 §4.1 makes

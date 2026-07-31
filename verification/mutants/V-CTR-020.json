@@ -1,5 +1,5 @@
 {
-  "_comment": "V-CTR-020 -- the agent's instructions for writing describe the write path that exists. Eleven of the twelve mutants edit all three tier copies so the byte-parity arm can never be the catcher for a content defect; M12 drifts exactly one tier as that arm's control. M1, M2, M3 and M9 are the joins: each is a defect only relative to the MCP server's AST, and none of them is visible by reading the skill alone -- which is the argument for checking prose against code rather than proofreading it. Run with `python3 dev/mutate.py verification/mutants/V-CTR-020.json`.",
+  "_comment": "V-CTR-020 -- the agent's instructions for writing describe the write path that exists. Thirteen of the fourteen mutants edit all three tier copies so the byte-parity arm can never be the catcher for a content defect; M12 drifts exactly one tier as that arm's control. M1, M2, M3 and M9 are the joins: each is a defect only relative to the MCP server's AST, and none of them is visible by reading the skill alone -- which is the argument for checking prose against code rather than proofreading it. Run with `python3 dev/mutate.py verification/mutants/V-CTR-020.json`.",
   "suite": {
     "kind": "unittest",
     "dir": ".",
@@ -13,17 +13,17 @@
       "edits": [
         {
           "file": "agents/platform/skills/apply-change/SKILL.md",
-          "find": "| `submit_action(intent, operations)` | The same envelope, executed",
+          "find": "| `submit_action(intent, operations, trigger_source)` | The same envelope, executed",
           "replace": "| `apply_manifest(obj)` | The same envelope, executed"
         },
         {
           "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
-          "find": "| `submit_action(intent, operations)` | The same envelope, executed",
+          "find": "| `submit_action(intent, operations, trigger_source)` | The same envelope, executed",
           "replace": "| `apply_manifest(obj)` | The same envelope, executed"
         },
         {
           "file": "agents/developer-team/skills/apply-change/SKILL.md",
-          "find": "| `submit_action(intent, operations)` | The same envelope, executed",
+          "find": "| `submit_action(intent, operations, trigger_source)` | The same envelope, executed",
           "replace": "| `apply_manifest(obj)` | The same envelope, executed"
         }
       ]
@@ -57,18 +57,18 @@
       "edits": [
         {
           "file": "agents/platform/scripts/platform_mcp_server.py",
-          "find": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False) -> str:",
-          "replace": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False, scope: str = \"\") -> str:"
+          "find": "    trigger_detail: str = \"\",\n    rationale: str = \"\",\n    require_approval: bool = False,\n) -> str:",
+          "replace": "    trigger_detail: str = \"\",\n    rationale: str = \"\",\n    require_approval: bool = False,\n    scope: str = \"\",\n) -> str:"
         },
         {
           "file": "agents/cluster-admin/scripts/platform_mcp_server.py",
-          "find": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False) -> str:",
-          "replace": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False, scope: str = \"\") -> str:"
+          "find": "    trigger_detail: str = \"\",\n    rationale: str = \"\",\n    require_approval: bool = False,\n) -> str:",
+          "replace": "    trigger_detail: str = \"\",\n    rationale: str = \"\",\n    require_approval: bool = False,\n    scope: str = \"\",\n) -> str:"
         },
         {
           "file": "agents/developer-team/scripts/platform_mcp_server.py",
-          "find": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False) -> str:",
-          "replace": "def submit_action(intent: str, operations: list[dict], rationale: str = \"\", require_approval: bool = False, scope: str = \"\") -> str:"
+          "find": "    trigger_detail: str = \"\",\n    rationale: str = \"\",\n    require_approval: bool = False,\n) -> str:",
+          "replace": "    trigger_detail: str = \"\",\n    rationale: str = \"\",\n    require_approval: bool = False,\n    scope: str = \"\",\n) -> str:"
         }
       ]
     },
@@ -145,25 +145,25 @@
       "edits": [
         {
           "file": "agents/platform/skills/apply-change/SKILL.md",
-          "find": "then report the `actionId` and the undo handle to whoever asked.",
-          "replace": "then report the `actionId` and the undo handle to whoever asked.\n\nIf it is refused, open a pull request instead:\n\n```bash\ngh pr create --title \"proposed change\"\n```"
+          "find": "undo handle to whoever asked.\n",
+          "replace": "undo handle to whoever asked.\n\nIf it is refused, open a pull request instead:\n\n```bash\ngh pr create --title \"proposed change\"\n```\n"
         },
         {
           "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
-          "find": "then report the `actionId` and the undo handle to whoever asked.",
-          "replace": "then report the `actionId` and the undo handle to whoever asked.\n\nIf it is refused, open a pull request instead:\n\n```bash\ngh pr create --title \"proposed change\"\n```"
+          "find": "undo handle to whoever asked.\n",
+          "replace": "undo handle to whoever asked.\n\nIf it is refused, open a pull request instead:\n\n```bash\ngh pr create --title \"proposed change\"\n```\n"
         },
         {
           "file": "agents/developer-team/skills/apply-change/SKILL.md",
-          "find": "then report the `actionId` and the undo handle to whoever asked.",
-          "replace": "then report the `actionId` and the undo handle to whoever asked.\n\nIf it is refused, open a pull request instead:\n\n```bash\ngh pr create --title \"proposed change\"\n```"
+          "find": "undo handle to whoever asked.\n",
+          "replace": "undo handle to whoever asked.\n\nIf it is refused, open a pull request instead:\n\n```bash\ngh pr create --title \"proposed change\"\n```\n"
         }
       ]
     },
     {
       "id": "M8-the-required-arguments-go-undocumented",
       "why": "`intent` is what a human reads at 3am on the record. A skill that stops naming it gets envelopes whose intent is the tool call restated, and the journal becomes unreadable exactly when it matters.",
-      "catcher": "test_the_skill_names_intent_and_operations_because_they_are_required",
+      "catcher": "test_the_skill_names_every_parameter_the_tool_requires",
       "edits": [
         {
           "file": "agents/platform/skills/apply-change/SKILL.md",
@@ -245,6 +245,50 @@
           "file": "agents/developer-team/skills/apply-change/SKILL.md",
           "find": "name: apply-change",
           "replace": "name: apply_change"
+        }
+      ]
+    },
+    {
+      "id": "M13-the-required-origin-goes-undocumented",
+      "why": "The third required parameter, added by T8b-4d. The catcher used to be a hardcoded `(\"intent\", \"operations\")`, which meant the arm went on passing while the skill said nothing at all about the one parameter the model could not guess. This is the worst of the three shapes this file covers: not a missing tool and not a parameter that does not exist, but a call the model cannot form, discovered the first time it tries to change something.",
+      "catcher": "test_the_skill_names_every_parameter_the_tool_requires",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "- **`trigger_source`** \u2014 what caused _you_ to act.",
+          "replace": "- **the third argument** \u2014 what caused _you_ to act."
+        },
+        {
+          "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
+          "find": "- **`trigger_source`** \u2014 what caused _you_ to act.",
+          "replace": "- **the third argument** \u2014 what caused _you_ to act."
+        },
+        {
+          "file": "agents/developer-team/skills/apply-change/SKILL.md",
+          "find": "- **`trigger_source`** \u2014 what caused _you_ to act.",
+          "replace": "- **the third argument** \u2014 what caused _you_ to act."
+        }
+      ]
+    },
+    {
+      "id": "M14-one-value-of-the-closed-enum-is-missing-from-the-table",
+      "why": "`escalation` drops out of the table the model picks from. Every other arm passes: the parameter is named, the tools exist, nothing is promised that does not exist. An agent that was escalated to would pick the nearest word it can see -- most likely `chat`, which says a human asked. The 01 SS7 autonomy counts then lean human-driven, in the direction that flatters the platform, with nothing anywhere reading as an error.",
+      "catcher": "test_the_skill_names_every_value_of_the_closed_enum_it_asks_the_agent_to_pick_from",
+      "edits": [
+        {
+          "file": "agents/platform/skills/apply-change/SKILL.md",
+          "find": "| something was escalated to you              | `escalation`     |\n",
+          "replace": "| something was escalated to you              | that same word   |\n"
+        },
+        {
+          "file": "agents/cluster-admin/skills/apply-change/SKILL.md",
+          "find": "| something was escalated to you              | `escalation`     |\n",
+          "replace": "| something was escalated to you              | that same word   |\n"
+        },
+        {
+          "file": "agents/developer-team/skills/apply-change/SKILL.md",
+          "find": "| something was escalated to you              | `escalation`     |\n",
+          "replace": "| something was escalated to you              | that same word   |\n"
         }
       ]
     },

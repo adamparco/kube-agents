@@ -70,6 +70,10 @@ type write struct {
 	replicas int32
 	opts     execute.DeleteOpts
 	ref      agentv1alpha1.TargetRef
+	// dryRun records the flag the caller passed. Recorded rather than ignored because the replayer
+	// and the plan-time validator share this Writer and differ in exactly this bit: one of them
+	// must never mutate anything, and the only way to see that from here is to look.
+	dryRun bool
 }
 
 type fakeWriter struct {
@@ -83,20 +87,20 @@ func (w *fakeWriter) record(x write) error {
 	return w.errs[x.kind]
 }
 
-func (w *fakeWriter) Create(_ context.Context, obj *unstructured.Unstructured, fm string) (*unstructured.Unstructured, error) {
-	return obj, w.record(write{kind: wroteCreate, manager: fm, obj: obj})
+func (w *fakeWriter) Create(_ context.Context, obj *unstructured.Unstructured, fm string, dry bool) (*unstructured.Unstructured, error) {
+	return obj, w.record(write{kind: wroteCreate, manager: fm, obj: obj, dryRun: dry})
 }
 
-func (w *fakeWriter) Apply(_ context.Context, obj *unstructured.Unstructured, fm string, _ bool) (*unstructured.Unstructured, error) {
-	return obj, w.record(write{kind: wroteApply, manager: fm, obj: obj})
+func (w *fakeWriter) Apply(_ context.Context, obj *unstructured.Unstructured, fm string, dry bool) (*unstructured.Unstructured, error) {
+	return obj, w.record(write{kind: wroteApply, manager: fm, obj: obj, dryRun: dry})
 }
 
-func (w *fakeWriter) Scale(_ context.Context, ref agentv1alpha1.TargetRef, replicas int32, fm string, _ bool) (*unstructured.Unstructured, error) {
-	return nil, w.record(write{kind: wroteScale, manager: fm, replicas: replicas, ref: ref})
+func (w *fakeWriter) Scale(_ context.Context, ref agentv1alpha1.TargetRef, replicas int32, fm string, dry bool) (*unstructured.Unstructured, error) {
+	return nil, w.record(write{kind: wroteScale, manager: fm, replicas: replicas, ref: ref, dryRun: dry})
 }
 
-func (w *fakeWriter) Delete(_ context.Context, ref agentv1alpha1.TargetRef, opts execute.DeleteOpts, _ bool) error {
-	return w.record(write{kind: wroteDelete, opts: opts, ref: ref})
+func (w *fakeWriter) Delete(_ context.Context, ref agentv1alpha1.TargetRef, opts execute.DeleteOpts, dry bool) error {
+	return w.record(write{kind: wroteDelete, opts: opts, ref: ref, dryRun: dry})
 }
 
 func (w *fakeWriter) kinds() []writeKind {

@@ -34,18 +34,40 @@ request in this path. You are not writing a suggestion for someone to apply late
 
 ## The two tools
 
-| Tool                                | What it does                                                                                                    |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `plan_action(intent, operations)`   | Everything except the execution: the risk classification, the blast radius, and the undo plan. Changes nothing. |
-| `submit_action(intent, operations)` | The same envelope, executed — subject to classification, the brake, gating and verification.                    |
+| Tool                                                | What it does                                                                                                    |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `plan_action(intent, operations, trigger_source)`   | Everything except the execution: the risk classification, the blast radius, and the undo plan. Changes nothing. |
+| `submit_action(intent, operations, trigger_source)` | The same envelope, executed — subject to classification, the brake, gating and verification.                    |
 
-Both take the same two things:
+Both take the same three things:
 
 - **`intent`** — one sentence, written for a human, saying what this change is _for_. It is stored
   on the record and it is what a person reads at 3am. "Raise the memory limit on `api` in `team-x`
   so it stops OOMKilling" is an intent. "Apply the manifest" is not.
 - **`operations`** — the list of concrete changes. Each has an `op` — one of `create`, `apply`,
   `patch`, `delete`, `scale` — and exactly one of `target`, `targetSelector`, or `cloudTarget`.
+- **`trigger_source`** — what caused _you_ to act. Not what the change does; what put you in motion.
+  It is required, and it is one of exactly seven words:
+
+  | You are acting because…                     | `trigger_source` |
+  | ------------------------------------------- | ---------------- |
+  | a human asked you, in conversation          | `chat`           |
+  | a human asked you to reverse something      | `undo`           |
+  | you saw an object change and decided to act | `watch`          |
+  | an alert fired                              | `alert`          |
+  | a schedule ran you                          | `cron`           |
+  | another agent asked you to do this          | `delegation`     |
+  | something was escalated to you              | `escalation`     |
+
+  The first two mean **a human asked**. The other five mean **you decided**. That line is the one
+  this field exists to record: it is what the platform's autonomy reporting counts, and it is the
+  answer to "how much of what happened here did the agents choose?" — a question nobody can
+  reconstruct afterwards from the change itself. Say which is actually true. There is no penalty for
+  `watch`, and an autonomous action filed as `chat` is a false statement about a human.
+
+  Optionally, `trigger_ref` (what to look at: the alert name, the object, the action id you were
+  delegated) and `trigger_detail` (one line about the trigger — the reason for the _change_ is
+  `intent`).
 
 `submit_action` also takes `rationale` (optional reasoning; recorded, and never treated as a risk
 signal) and `require_approval` (ask for a human even when the classifier would not).
@@ -99,6 +121,8 @@ An OOMKilling workload in a namespace you are responsible for:
 ```
 plan_action(
   intent="Raise the memory limit on the api Deployment in team-x so it stops OOMKilling",
+  trigger_source="alert",
+  trigger_ref="KubePodCrashLooping/team-x/api",
   operations=[{
     "op": "patch",
     "target": {"group": "apps", "version": "v1", "kind": "Deployment",
@@ -109,5 +133,11 @@ plan_action(
 )
 ```
 
-Read the classification. If it is what you expected, call `submit_action` with the same arguments,
-then report the `actionId` and the undo handle to whoever asked.
+The example is triggered by an alert, so `trigger_source` is `alert` and not `chat` — nobody asked;
+the alert fired and you decided. If a human had said "the api pods are OOMKilling, fix it", the same
+change would be `chat`. The operations are identical and the origin is not, which is exactly why the
+field is a parameter rather than something the tool guesses.
+
+Read the classification. If it is what you expected, call `submit_action` with the same arguments —
+including the same `trigger_source`, since it is the same act — then report the `actionId` and the
+undo handle to whoever asked.

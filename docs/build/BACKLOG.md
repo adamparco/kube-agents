@@ -83,16 +83,165 @@ turns out to be wrong is closed with a reason, not recycled.
 
 **Last drained:** 2026-07-30
 
-_(empty — append new items here, below this line)_
+### Run the builds on a provisioned, warm builder instead of standing one up per build
+
+- **Kind:** task
+- **Where:** `k8s-operator/Makefile` (`test`, `build`, `setup-envtest`), `dev/cluster/reload-images.sh`,
+  `make cloud-build-push`, `dev/L2-CHAIN.txt` — and the two clusters that already exist
+- **Why it matters:** `make -C k8s-operator test` is slow enough to be felt in every unit, and the
+  harness runs it at CHECKPOINT for any unit touching `k8s-operator/**`, so the cost is paid per
+  unit for the whole remaining build. It is not one cost either: it is `controller-gen`, then
+  `go build`, then an envtest control plane (etcd + kube-apiserver) started per package, on an arm64
+  laptop, for a project whose every deploy target is amd64. This repo already refuses host-arch
+  **image** builds for exactly that mismatch and routes them to Cloud Build; nothing has asked the
+  same question about the **test** path.
+
+  Two things are being asked, and the first should gate the second. **(1) Measure.** Split the wall
+  clock into codegen / compile / envtest-startup / test-execution, because which one is the bill
+  changes the fix — and one candidate fix is free: the harness passes `-count=1` in places, which
+  defeats Go's test cache. **(2) Then try a provisioned builder rather than a per-build one.** A
+  persistent `docker buildx` builder as a pod in `gke-scratch-kube-agents-dev` is cheap to stand up
+  (`docker buildx create --driver kubernetes`), is natively amd64 so it satisfies the host-arch
+  refusal, and keeps a warm layer cache across builds — which `cloud-build-push` cannot, since every
+  invocation starts from a cold worker. The same "already provisioned, kept warm" argument applies
+  to the envtest control plane and the Go build cache, and those may be the larger win if the
+  measurement says compile and envtest startup dominate.
+
+  Constraints to respect rather than rediscover: `gke-scratch-*` is the only legal target for
+  anything mutating (`platform-agent-host` is verification-only, and any new script needs the
+  anchored destructive-guard `case`); the builder must still push to the same Artifact Registry so
+  `reload-images.sh` can read the digest back and **deploy by digest**; and `pause.sh`/`resume.sh`
+  scale the scratch node pools to zero between campaigns, so a persistent builder either tolerates
+  being scaled away or changes what "paused" costs — worth pricing that idle cost as part of the
+  answer.
+
+- **Priority:** normal
+- **Added:** 2026-07-30
 
 ---
 
 ## Scheduled
 
-| ID  | Title | Kind | Scheduled into | On  |
-| --- | ----- | ---- | -------------- | --- |
+| ID    | Title                                                                          | Kind                   | Scheduled into                                                                                                                                                                                                                                                                                                                                                     | On         |
+| ----- | ------------------------------------------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------- |
+| B-003 | Ruling on the deferred `/replay` question: reshape V-BRK-021, do not narrow it | finding (human ruling) | **`phase-9.md` P9-T7c-2c**, inserted as the next unit — ahead of the two remaining tasks, because it is L0 and Phase 9's own ordering rule puts the remaining L0 work in front of the remaining L2 work. The **implementation** of `/replay` and `/approve` is explicitly NOT in it; that stays in Phase 10 beside P10-T4 / P10-T7, as the item's own point 3 asks | 2026-07-30 |
 
-_(empty — B-001 and B-002 landed 2026-07-29; see `## Done`.)_
+**The drain's reasoning, which is scheduling and not substance — the ruling itself is the author's
+and is kept verbatim below.**
+
+**Severity: not a live security regression**, classified here rather than read off `Priority: normal`,
+because the drain protocol makes severity the harness's call. Nothing shipped is weaker than 03 §4.1
+requires: the server has one mutating route today, and the reshaped row is satisfied by that server
+unchanged. What is wrong is a **check's restatement of a spec**, which costs nothing until a second
+route is legitimately added — which is exactly when it was found.
+
+**Why Phase 9 and not the improvement-pass queue**, which the item offers as an equally good home.
+Three reasons, and the third is the one that decides it. (1) The 2026-07-29 deferral row is a
+**Phase 9** row whose promotion condition is one sentence — _"this row closes when 09 or 05 is
+edited"_ — and it is now unblocked; carrying an unblocked deferral across a milestone is the shape
+`harness-improve` §3.3 exists to prevent. (2) The reshape needs Go code (`MutatingRoutes()` derived
+rather than declared), and `harness-improve` §5 forbids implementation work in a pass — it would
+have to schedule a task anyway, one phase later than the row it belongs to. (3) **P9-T9b authors the
+consolidated Phase 9 gate.** An improvement pass fires at the milestone, i.e. _after_ that gate. So
+deferring the reshape means the phase's own gate certifies a row that this ruling has already
+established is wrong, and then the row changes under it. Landing the reshape first costs the gate
+nothing; landing it after costs the gate an edit and a re-run.
+
+**Why this is not a PROTOCOL §10.2 halt**, which it would be on any other day. V-BRK is
+BLOCKING-ALWAYS, and the new form does permit something the old forbade — three mutating routes
+where the old wording allowed one. §10.2 forbids the harness from making that trade _autonomously_,
+"however good the argument", and the mechanism it prescribes is a halt **for human review**. That
+review has happened: the deferral row asked for one of exactly two rulings, and this item is a human
+choosing (a) by name. The harness is executing a ruling, not weighing one. Recorded explicitly
+because a future reader finding a BLOCKING-ALWAYS row loosened in a phase branch should be able to
+find the authorization in one hop.
+
+**And the reshape is a net strengthening in every dimension but the count.** The old row asserts a
+number and nothing else. The new one asserts, for the first time, that the declared mutating set
+_equals_ the registered handler set less an allowlist — so a smuggled handler fails — that it is a
+_subset_ of 05 §1.3's table, that every declared route traverses 03 §4.1's six non-skippable steps,
+and that a re-entry route carries no caller-supplied operations. The property being given up was
+never in the source; the properties being gained are.
+
+**One thing the drain does not absorb**, per the item's closing paragraph: V-BRK-021's L0-vs-L2
+evidence gap (the P9-T9 recon records it needing both with only L1 on file; the deferral row records
+it green at L0) stays with **P9-T9b**. P9-T7c-2c reshapes the assertion; it does not get to declare
+the level question answered by having touched the row.
+
+### Ruling on the deferred `/replay` question: reshape V-BRK-021, do not narrow it
+
+- **Kind:** finding (a human ruling on an open deferral row — the row named this as the thing that closes it)
+- **Where:** [09](../design/09-verification-and-validation.md) §6 (the **V-BRK-021** row),
+  [05](../design/05-system-architecture.md) §1.3 (the three-route table),
+  [03](../design/03-security-model.md) §4.1 (the cited source),
+  `LEDGER.md` §Deferrals row dated 2026-07-29, `phase-9.md` P9-T7c-2b
+- **Why it matters:** the deferral row asks for one of two rulings and says "promotion is the ruling,
+  not the code". This is **option (a)**. It matters now rather than whenever `/replay` is picked up,
+  because `/approve` is equally unimplemented and **Phase 10 Accept (g) requires it** — a roster
+  member approving from Slack and from `kubectl`. Phase 9 could defer its route; Phase 10 cannot
+  defer an acceptance bullet, so the identical wall arrives mid-phase-10 with less room to walk
+  around it.
+- **Priority:** normal — **explicitly not `now`**. Do not disturb the P9-T9 gate work. Schedule this
+  wherever it fits (the improvement-pass queue and the Phase 10 PLAN both look right); the ruling
+  below is stable and does not expire.
+- **Added:** 2026-07-30
+
+**The ruling: 03 §4.1 is authoritative, and it never said "one route".** 09 §6 cites 03 §4.1 as
+V-BRK-021's source. What 03 §4.1 actually requires is _"Every mutation... passes through exactly this
+sequence... **There is no other write path**"_ and _"Steps 1, 3, 4, 5, 6 and 11 are **not skippable by
+any caller**"_. That is a property of the **pipeline**. "One mutating route" is the check's own
+paraphrase — a faithful proxy while exactly one route existed, and wrong the moment a second door
+opens into the same corridor. 05 §1.3 designs `/replay` as exactly that: 05 §271 says it _"runs the
+recorded plan through the **full pipeline** — re-authenticated, re-scope-checked, re-classified,
+re-journaled"_. A route built that way does not violate 03 §4.1 in any respect. There is no security
+contradiction here; there is a contradiction between a spec and a check's restatement of it, and the
+restatement is the thing that is wrong.
+
+**Why not option (b).** Collapsing replay onto `/v1alpha1/actions` with `spec.trigger.undoOf` was
+already judged worse for the right reason — it forces `Authenticator.ExpectedCaller` to accept C-UC
+submitting caller-supplied operations on the agent's own submission route. Apply the same logic to
+`/approve` when Phase 10 needs it and the end state is **three caller identities multiplexed onto one
+route, discriminated by a body field**. That trades a countable property for an authentication
+surface with no clean statement, and the count it preserves was never the property.
+
+**This is a strengthening, which is what makes it a ruling and not a §10.2 weakening.** The current
+row asserts a number. The replacement asserts, for the first time, the thing 03 §4.1 actually
+requires — that no route reaches the executor without traversing the six non-skippable steps. The
+route count stops being the assertion and conformance to the 05 §1.3 table takes its place. Note
+also that the reshape **fixes the miscitation**: the row currently sources a phrase to a section that
+does not contain it.
+
+**Drafted replacement row** (columns are `ID | Assertion | Source | Lvl | Phase`; wording is a draft,
+the ruling is the substance — sharpen the prose to house style if it helps):
+
+```markdown
+| V-BRK-021 | **Non-skippability**: one listening port; and the mutating surface is proven by construction, not counted. `Server.MutatingRoutes()` is **equal to** the registered handler set less a declared non-mutating allowlist (`/healthz`, `/v1alpha1/nonce`, the `/` catch-all) — so a handler registered without being declared **fails**, and the declaration cannot drift from the server it describes — and is a **subset of the 05 §1.3 route table**, so a route the design does not name cannot exist while a route it does name may. **Every** declared mutating route enters the pipeline at step 1 and traverses 03 §4.1's non-skippable steps 1, 3, 4, 5, 6 and 11, asserted over the call graph rather than by probing a running process. A **re-entry** route (`approve`, `replay`) carries an action ID and **no caller-supplied operations**, and re-classifies rather than inheriting the record's class. Debug routes, override query params and bypass headers all 404/405; no build-tag-guarded skip path in the shipped image ¬ | 03 §4.1, 05 §1.3 | L0, L2 | 9 |
+```
+
+**Phase stays 9 and the check stays green throughout.** The new form is satisfied by today's
+one-route server, by a two-route server, and by the full three — and goes red the instant a fourth
+route appears or the declaration diverges from the handlers. Nothing about this ruling turns
+V-BRK-021 red at any point, which is the property that made the 2026-07-29 deferral safe and keeps
+this safe too.
+
+**What the implementing task inherits.** Three concrete things, all small:
+
+1. `MutatingRoutes()` at `k8s-operator/internal/broker/server.go:177` is a hand-written literal
+   `[]string{ActionsPath}` with a doc comment reading "Exactly one, and asserted." It has to become
+   derived from, or cross-checked against, the registered set — that equality is the clause doing the
+   real work above.
+2. `server_test.go:433` pins `strings.Count(src, "s.mux.HandleFunc(") != 4`. That guard is real and
+   catches a smuggled handler, but it is the same brittleness in a second place and needs editing for
+   every legitimate route addition. Keep it if it earns its place, but it must stop being the thing
+   the property rests on.
+3. `/replay` (P9-T7c-2b, currently deferred) and `/approve` (P10-T4 / P10-T7) are **one unit's worth
+   of work against one reshaped check.** Scheduling them separately means litigating the same row
+   twice.
+
+**Do not let this absorb the L2 gap.** The 2026-07-29 P9-T9 recon recorded V-BRK-021 as needing both
+L0 and L2 with only L1 evidence on file, while the deferral row records it green at L0. Those two
+readings need reconciling either way, and that reconciliation belongs to P9-T9, not here. This item
+is a spec/check reshape only.
 
 ---
 

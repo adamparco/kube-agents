@@ -30,9 +30,14 @@ package writeahead
 //     the confirmer refuses every real action and every hermetic test above still passes.
 //   - a record that was never created is NotFound, not some other error, so the "never landed" arm
 //     is the one that fires in the case it was written for.
-//   - client.Create DROPS status because ActionRecord has a status subresource, while journal.Labels
-//     carries the phase into metadata, which survives. The phase arm reads the label for exactly
-//     this reason, and this test is what makes that reason a measurement instead of a belief.
+//   - journal.Store.Create leaves the phase in BOTH places -- status.phase, which 06 §4.3 makes
+//     authoritative, and the metadata label, which is its index -- and leaves them AGREEING. The
+//     phase arm reads both and refuses on divergence, so all three are properties of a real server
+//     rather than beliefs about one. (It once asserted the opposite of the first: `client.Create`
+//     drops status because ActionRecord has a status subresource, and until `304c1d5` Create
+//     stopped there. That is exactly the premise this file exists to keep measuring.)
+//   - the window journal.Store.SetPhase opens between its status write and its label write leaves
+//     the two copies disagreeing on a real server, and the confirmer refuses it.
 //   - a deleted record stops confirming.
 //
 // envtest is L1 by binding.md §Targets: a real API server, process-local, no cluster.
@@ -235,10 +240,19 @@ func TestARecordInAnotherNamespaceDoesNotConfirm(t *testing.T) {
 	}
 }
 
-// The measurement the phase arm is built on. Both halves are asserted, because the arm is only
-// correct if BOTH are true: status is dropped (so reading status.phase would be vacuous) and the
-// label survives (so reading the label is not).
-func TestCreateDropsStatusAndKeepsThePhaseLabel(t *testing.T) {
+// The measurement the phase arm is built on. All three halves are asserted, because the arm reads
+// both copies and refuses when they disagree: status.phase must survive Create (or reading the
+// authoritative copy would be vacuous), the label must survive it (or reading the index would be),
+// and the two must AGREE (or a correct record takes the divergence path and no action ever runs).
+//
+// This test replaces TestCreateDropsStatusAndKeepsThePhaseLabel, which asserted the opposite of the
+// first half and was right to when it was written: `status` is a subresource, so `client.Create`
+// dropped it and journal.Store.Create stopped there. `304c1d5` gave Create a following
+// Status().Update, because 06 §4.3 makes status.phase authoritative and the label derived, and
+// leaving status empty inverted the two. The old assertion went red on the next CI run and its
+// failure message said what to do about it -- which is the whole reason it asserted a premise
+// rather than trusting one.
+func TestCreateWritesBothThePhaseAndItsLabel(t *testing.T) {
 	requireEnv(t)
 	ctx := context.Background()
 	ns := newNS(t, ctx)
@@ -252,12 +266,70 @@ func TestCreateDropsStatusAndKeepsThePhaseLabel(t *testing.T) {
 		t.Fatalf("read back: %v", err)
 	}
 
-	if got.Status.Phase != "" {
-		t.Errorf("status.phase survived Create as %q; if that is now true the phase arm should read status, not the label", got.Status.Phase)
+	if got.Status.Phase != agentv1alpha1.PhaseExecuting {
+		t.Errorf("status.phase read back as %q, want %q; 06 §4.3 makes this the authoritative copy and the phase arm refuses any record whose copies disagree",
+			got.Status.Phase, agentv1alpha1.PhaseExecuting)
 	}
 	if got.Labels[journal.StatusLabel] != string(agentv1alpha1.PhaseExecuting) {
-		t.Errorf("the %s label is %q, want %q; the phase arm reads this label and would be vacuous without it",
+		t.Errorf("the %s label is %q, want %q; the phase arm reads this index as well and would refuse the record without it",
 			journal.StatusLabel, got.Labels[journal.StatusLabel], agentv1alpha1.PhaseExecuting)
+	}
+	if string(got.Status.Phase) != got.Labels[journal.StatusLabel] {
+		t.Errorf("a record a real Create produced has status.phase %q and label %q; if the two disagree on the happy path the divergence arm refuses every action",
+			got.Status.Phase, got.Labels[journal.StatusLabel])
+	}
+}
+
+// The fail-open window, reproduced against a real API server rather than argued about.
+//
+// journal.Store.SetPhase writes status first and the label second, in two calls, and documents the
+// second as "best-effort ordering ... the reconciler repairs the label if this second write is
+// lost". Between them -- and for as long as a lost second write goes unrepaired -- status.phase is
+// the new phase and the label is still the old one. Until 2026-07-30 the confirmer read the label
+// alone, so a record the broker had already REJECTED confirmed as durable and executed.
+//
+// The status write is issued directly here, not through SetPhase, precisely so the label is left
+// behind: driving SetPhase would perform both writes and close the window this test is about.
+func TestARecordWhoseStatusMovedWithoutItsLabelDoesNotConfirm(t *testing.T) {
+	requireEnv(t)
+	ctx := context.Background()
+	ns := newNS(t, ctx)
+
+	store := journal.NewStore(k8s, nil)
+	if err := store.Create(ctx, liveRecord(ns, testID, agentv1alpha1.PhaseExecuting)); err != nil {
+		t.Fatalf("create record: %v", err)
+	}
+	c := &Confirmer{Records: store, Namespace: ns}
+	if err := c.ConfirmDurable(ctx, testID); err != nil {
+		t.Fatalf("precondition: the record must confirm while the two copies agree; got %v", err)
+	}
+
+	live, err := store.Get(ctx, ns, testID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	live.Status.Phase = agentv1alpha1.PhaseRejected
+	if err := k8s.Status().Update(ctx, live); err != nil {
+		t.Fatalf("half of a SetPhase: %v", err)
+	}
+
+	// The half-written state the window actually leaves on the server, asserted before the
+	// confirmation, so a server that somehow synced the label cannot let this test pass vacuously.
+	after, err := store.Get(ctx, ns, testID)
+	if err != nil {
+		t.Fatalf("read back after the status write: %v", err)
+	}
+	if after.Status.Phase != agentv1alpha1.PhaseRejected || after.Labels[journal.StatusLabel] != string(agentv1alpha1.PhaseExecuting) {
+		t.Fatalf("the window did not open: status.phase=%q label=%q, want Rejected/Executing -- this test proves nothing unless the two copies really do disagree on the server",
+			after.Status.Phase, after.Labels[journal.StatusLabel])
+	}
+
+	err = c.ConfirmDurable(ctx, testID)
+	if err == nil {
+		t.Fatal("a record the broker had already rejected confirmed as durable, because the label had not caught up")
+	}
+	if !strings.Contains(err.Error(), `status.phase "Rejected" and the kube-agents/status label "Executing"`) {
+		t.Fatalf("the refusal must name both copies it read; got %v", err)
 	}
 }
 

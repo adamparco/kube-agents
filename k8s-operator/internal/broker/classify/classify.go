@@ -163,7 +163,7 @@ func (c *Classifier) Classify(in *Input) (*Classification, error) {
 	// for the envelope (P9-T4). An action that cannot be undone is one whose only remedy is a human
 	// noticing in time, which is precisely the situation a gate exists for -- so the floor here is
 	// gated even when every other input says routine.
-	if !in.DryRun && !hasUndoPlan(in) {
+	if UndoPlanGateApplies(in.DryRun, hasUndoPlan(in)) {
 		if out.Class < ClassGated {
 			out.Class = ClassGated
 			out.Reasons = append(out.Reasons, Reason{
@@ -437,3 +437,12 @@ func policyPtrs(ps []RuleSet) []*RuleSet {
 // hasUndoPlan reports whether an undo plan exists for the envelope. Until P9-T4 lands the generator,
 // this reads the flag the broker sets; the corpus supplies it directly.
 func hasUndoPlan(in *Input) bool { return in.UndoPlanPresent }
+
+// UndoPlanGateApplies is 06 §4.2 step 6 as a predicate: an envelope with no usable undo plan is
+// raised to at least gated, unless it is a dry run.
+//
+// Exported because the pipeline asks the SAME question a second time at 03 §4.1 step 6, where it
+// re-checks that the class did not fall away from the plan. Two spellings of one rule is how a
+// pipeline ends up 500-ing on the envelopes the classifier deliberately excused: the dry-run
+// suppression lives in this line and nowhere else, so a step 6 that forgets it cannot exist.
+func UndoPlanGateApplies(dryRun, undoPlanPresent bool) bool { return !dryRun && !undoPlanPresent }

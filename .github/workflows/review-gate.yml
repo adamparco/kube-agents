@@ -34,6 +34,11 @@ on:
       - "k8s-operator/config/**" # RBAC, webhook, VAP, router manifests
       - "k8s-operator/test/**" # the L2 suites that assert the negatives
       - "examples/**" # NetworkPolicies and RBAC overlays people apply verbatim
+      # A test-only RBAC grant is still a grant, and V-CTN-037's whole premise is that this is the
+      # one directory it is allowed to live in — so it is also the one directory where a change to
+      # it must be reviewed. A directory glob, not the filename: nothing outside `dev/` may name a
+      # file holding a test-only grant, and this workflow is outside `dev/`.
+      - "dev/verify/fixtures/**" # the read-only actor tenant overlay (V-CTN-037)
       # Not named by the derivation — judgement, in the over-trigger direction:
       - "k8s-operator/api/**" # the CRD types every webhook validates against
       - "deploy/**" # shipped defaults and the image build context

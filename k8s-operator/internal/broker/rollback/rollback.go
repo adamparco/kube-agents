@@ -86,7 +86,7 @@ import (
 // what keeps it and the production client from drifting apart.
 type Writer interface {
 	// Create makes the object, failing with IsAlreadyExists if the name is taken.
-	Create(ctx context.Context, obj *unstructured.Unstructured, fieldManager string) (*unstructured.Unstructured, error)
+	Create(ctx context.Context, obj *unstructured.Unstructured, fieldManager string, dryRun bool) (*unstructured.Unstructured, error)
 	// Apply performs a server-side apply.
 	Apply(ctx context.Context, obj *unstructured.Unstructured, fieldManager string, dryRun bool) (*unstructured.Unstructured, error)
 	// Scale sets replicas through the scale subresource.
@@ -281,7 +281,7 @@ func (r *Replayer) replayCreate(ctx context.Context, step agentv1alpha1.UndoStep
 	if err != nil {
 		return err
 	}
-	if _, err := r.Writer.Create(ctx, obj, fieldManager); err != nil {
+	if _, err := r.Writer.Create(ctx, obj, fieldManager, false); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf(
 				"recreating %s %s/%s: something already holds that name, and it is not the object this action deleted (its uid died with it); refusing rather than overwriting it: %w",

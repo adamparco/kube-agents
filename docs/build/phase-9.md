@@ -22,6 +22,47 @@ found in this pass are ordering or scoping problems that would otherwise have su
 
 ---
 
+## ▶️ RUNNING AGAIN, STILL OPEN — read this before resuming
+
+**Phase 9 is OPEN.** It was stopped here on 2026-07-30 by an explicit human instruction, after the
+unit `P9-T9b-5b-0-ii-a`, and **not** because the phase closed. The same person lifted the stop later
+the same day — _"run the harness until completion, start with the failed PR #83"_ — which also
+cleared the one thing that had gone red in the interim.
+
+**What went red, and what cleared it.** PR #83's first CI run turned **V-BRK-023** (L1,
+BLOCKING-ALWAYS) red: `TestCreateDropsStatusAndKeepsThePhaseLabel` asserted a premise about
+`client.Create` that a later commit correctly made false. That was an open halt, and a halt is
+cleared by a human, never by the harness. The instruction above is the clearance; the fix is
+`P9-T9b-5b-0-ii-a-fix`, in which `writeahead.Confirmer`'s phase arm reads **both** `status.phase` and
+its label and refuses their divergence as a state of its own. Full narrative in the Halt row of
+[`LEDGER.md`](LEDGER.md) and in `verification/results.csv` rows 146 (the fail) and 147 (the
+correction). Nothing is red now, nothing is deferred.
+
+The `phase-9-a-real-caller-at-the-door` branch was pushed and merged so that a large body of
+verified work would not sit stranded on a branch. **A merged phase branch is the normal signal that
+a phase closed, and here it means nothing of the kind.** `harness-milestone` was deliberately not
+invoked, so the 09 §10 phase ratchet and the `L2_CHAIN_FLOOR` lowering are both unmoved and both
+unearned. Do not back-fill them.
+
+An **improvement pass is due before the next unit**: `binding.md` §Thresholds schedules one _"after
+any halt is cleared"_. It has [[LSN-054]] and [[LSN-055]] queued, and LSN-054 is a correction to
+[[LSN-052]]'s proposed mechanization rather than an addition to it.
+
+**Resume at `P9-T9b-5b-0-ii-b`** — its section below states what it owes. In one sentence: three
+read-only per-tier actor templates carrying the READ half of 06 §2.2 ∪ §2.2.1 (profiles of 83 / 89 /
+68 triples against ceilings of 171 / 172 / 136), their bindings, and the
+`v in ['get', 'list', 'watch'] ||` disjunct in all three copies of `vap-agent-readonly` — as **one**
+unit, because 5b-0-i established that the render and the admission bound cannot be separated.
+Render **developer-team as a `Role`, never a `ClusterRole`**.
+
+V-BRK-013 is already green on both today's tree and the tree that unit will build, so its first run
+there is a real signal: if it goes red, the implementation is wrong, not the check ([[LSN-053]]).
+
+The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
+[`LEDGER.md`](LEDGER.md).
+
+---
+
 ## Survey of the current state — Phase 9 is greenfield
 
 Unlike Phase 8, which repaired things that existed and were wrong, Phase 9 builds things that do not
@@ -706,7 +747,28 @@ type safety over a value nothing in this process reads. They are rendered as `un
       **V-BRK-021 is _not_ deferred and stays green.** It is BLOCKING-ALWAYS, and a BLOCKING-ALWAYS
       check may never be deferred. What is deferred is the _task_; the check continues to assert what
       it asserts over the routes that exist. This distinction is the whole reason the ruling was
-      safe to take.
+      safe to take. **The blocker CLOSED 2026-07-30** — 09 §6 was edited by T7c-2c
+      below, which is exactly the promotion condition the deferral row named. The task itself moves
+      to Phase 10, where it is one unit with `/approve` against the one reshaped check.
+
+    - **P9-T7c-2c** — **done 2026-07-30. The ruling arrived, and it is option (a): reshape
+      V-BRK-021.** Re-records **V-BRK-021** at L0 over the new form; sweep 10/10. Scheduled
+      2026-07-30 from `BACKLOG.md` **B-003**, a human ruling on the deferral row 2b opened. The row's
+      promotion condition was one sentence — _"this row closes when 09 or 05 is edited"_ — so this
+      task is what closes it. **`todo`, and it is the next unit**, ahead of T8b-4b-ii-2b and T9b,
+      because it is L0 and this phase's own ordering rule puts the remaining L0 work in front of the
+      remaining L2 work. Three things, all small: rewrite 09 §6's V-BRK-021 row so the assertion is
+      **an equality against the registered handler set** rather than a count; make
+      `Server.MutatingRoutes()` derived from, or cross-checked against, that registered set instead
+      of the hand-written `[]string{ActionsPath}` at `server.go:177`; and stop
+      `server_test.go:433`'s `strings.Count(src, "s.mux.HandleFunc(") != 4` being the thing the
+      property rests on. **What it is not:** it does not implement `/replay` or `/approve`. Those
+      stay in Phase 10 beside P10-T4 / P10-T7, where the item asks for them to be one unit against
+      one reshaped check. It also does not settle V-BRK-021's L0-vs-L2 evidence gap — that is T9b's.
+      **Why this is not a PROTOCOL §10.2 halt** even though the new form admits three mutating routes
+      where the old admitted one: §10.2's remedy is a halt _for human review_, and the review has
+      already happened — the deferral row named exactly two admissible rulings and a human picked (a)
+      by name. The argument is recorded in full in `BACKLOG.md` §Scheduled under B-003.
   - **P9-T7c-3** — **the runtime wiring.** Real client-backed adapters for the twelve seams
     `pipeline.Config` takes — `LiveState`, `Applier`, `Reader`, `BodyStore`, `Prober`,
     `Rollbacker`, `Pager`, `Pauser`, the cooldown registry, `ActionHistory`, `ReferenceIndex`,
@@ -2023,16 +2085,21 @@ deliverables wearing one name, and two of them cannot be checkpointed in a sessi
 
 The remaining two halves are hermetic and each is a unit. The split:
 
-| Unit             | What                                                                                                                                                                                | Checks                                   | Blocked on             |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ---------------------- |
-| **P9-T8b-1**     | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic   | **V-BRK-028** (new)                      | nothing                |
-| **P9-T8b-2**     | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering | **V-BRK-029** (new)                      | T8b-1                  |
-| ~~**P9-T8b-3**~~ | ~~The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)~~ — **split, see below**: the skill is Phase 9's, the retirement is Phase 10's     | ~~V-GAT-019 (phase **10**)~~ — mis-bound | —                      |
-| **P9-T8b-3a**    | The `apply-change` skill in all three tiers, alongside `submit-suggestion` — **done 2026-07-30**                                                                                    | **V-CTR-020** (new)                      | T8b-2b                 |
-| **P9-T8b-3b**    | `submit-suggestion`'s retirement — **deferred into Phase 10 as P10-T3**                                                                                                             | —                                        | Phase 10               |
-| ~~**P9-T8b-4**~~ | ~~The L2 shadow soak with journal mining~~ — **split, see below**: the broker has no deployment path, so there is nothing to soak yet                                               | ~~V-REV-001 (L2)~~                       | —                      |
-| **P9-T8b-4a**    | The broker's deployment path, and the L2 claim it makes checkable                                                                                                                   | **V-BRK-012 (L2)**                       | a live scratch cluster |
-| **P9-T8b-4b**    | The L2 shadow soak with journal mining                                                                                                                                              | V-REV-001 (L2)                           | T8b-4a                 |
+| Unit               | What                                                                                                                                                                                                  | Checks                                                                       | Blocked on             |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ---------------------- |
+| **P9-T8b-1**       | The agent-side **envelope builder**: JCS, the §4.3.1 sanitizer, the 06 §4.1 operation sort, and the `idempotencyKey` — in Python, byte-identical across all three tiers, hermetic                     | **V-BRK-028** (new)                                                          | nothing                |
+| **P9-T8b-2**       | `submit_action` / `plan_action` as MCP tools on top of the builder: nonce fetch, mTLS + projected-token transport, `trace`/`requester` from the session, `ActionResponse` rendering                   | **V-BRK-029** (new)                                                          | T8b-1                  |
+| ~~**P9-T8b-3**~~   | ~~The `apply-change` skill in all three tiers, and `submit-suggestion`'s retirement (06 §9, §10)~~ — **split, see below**: the skill is Phase 9's, the retirement is Phase 10's                       | ~~V-GAT-019 (phase **10**)~~ — mis-bound                                     | —                      |
+| **P9-T8b-3a**      | The `apply-change` skill in all three tiers, alongside `submit-suggestion` — **done 2026-07-30**                                                                                                      | **V-CTR-020** (new)                                                          | T8b-2b                 |
+| **P9-T8b-3b**      | `submit-suggestion`'s retirement — **deferred into Phase 10 as P10-T3**                                                                                                                               | —                                                                            | Phase 10               |
+| ~~**P9-T8b-4**~~   | ~~The L2 shadow soak with journal mining~~ — **split, see below**: the broker has no deployment path, so there is nothing to soak yet                                                                 | ~~V-REV-001 (L2)~~                                                           | —                      |
+| **P9-T8b-4a**      | The broker's deployment path, and the L2 claim it makes checkable                                                                                                                                     | **V-BRK-012 (L2)**                                                           | a live scratch cluster |
+| ~~**P9-T8b-4b**~~  | ~~The L2 shadow soak with journal mining~~ — **split again, see below**: nothing in `dev/` can present a credential to a broker, so there is no caller to soak with                                   | ~~V-REV-001 (L2)~~                                                           | —                      |
+| **P9-T8b-4b-i**    | The in-cluster envelope driver, and the five transport checks it makes answerable — **done 2026-07-30**                                                                                               | **V-BRK-007/008/009/010/017 (L2)**                                           | T8b-4a                 |
+| **P9-T8b-4b-ii-1** | Step 3's live reads answer a typed refusal, split by whether retrying can help                                                                                                                        | V-BRK-031 (L1, L2)                                                           | T8b-4b-i               |
+| **P9-T8b-4b-ii-2** | The L2 shadow soak with journal mining, over the read-only tenant overlay                                                                                                                             | V-REV-001 (L2)                                                               | T8b-4b-ii-1            |
+| **P9-T8b-4c**      | `session_trace()` emits `parentSpanId`, which the broker's closed schema refuses; fix the shipped client across all three tiers and add the assertion that would have caught it — **done 2026-07-30** | **V-BRK-032** (new, 09 §6.14) + **V-BRK-028** and **V-BRK-029** strengthened | —                      |
+| **P9-T8b-4d**      | `trigger` becomes a parameter of `submit_action`/`plan_action` per 06 §9, across the three tiers' MCP tools and the `apply-change` skill that teaches them — **done 2026-07-30**                      | **V-CTR-020** and **V-BRK-029** strengthened; **V-BRK-032** extended         | T8b-4c                 |
 
 **Why T8b-1 is the first half and not an arbitrary slice.** Everything downstream is transport and
 prose; this is the only part with a _correctness_ obligation the broker will enforce. The broker
@@ -2208,12 +2275,36 @@ is counted as a pass; counting it as a retraction gives 36 / 20 / 16.
 - **V-BRK-021 needs both L0 and L2**; its only evidence is L1. Its L0 half is a lint over the shipped
   image, and it is entangled with the unresolved P9-T7c-2b halt.
 
+> **Superseded 2026-07-30 by P9-T9b-4** — the V-BRK-021 bullet only. It was accurate on 2026-07-29
+> and both halves of it are now wrong, which is the reconciliation T9b-4 owed; the full argument is
+> in "P9-T9b-4 — outcome" below. Short form: the L0 half went green that morning under P9-T7c-2c
+> (`results.csv` row 138) after the row was reshaped away from a route count, so "its only evidence
+> is L1" describes a file that no longer exists. And the L1 row (row 54) was never one of the
+> required levels — 09 §6 lists V-BRK-021 as **L0, L2** — so it neither discharged anything nor
+> constituted the gap. The real gap is the **L2** half and only that, and it is not "a lint over the
+> shipped image": a lint is what the L0 half already is. The L2 half is a probe of a **running**
+> broker, which is the only thing that can distinguish what the tree says from what was shipped.
+> The other two bullets stand as written and both were closed by T9b-1/2/3.
+
 **Two of planning defect 2's three guards are not in the state that paragraph assumes.**
 
 1. **Guard 1 does not exist.** `invariants-gate.py` has 18 `check_*` functions and none mentions the
    test-only overlay. The lint that refuses an overlay reference under `k8s-operator/scripts/`,
    `deploy/` or `config/` still has to be written — and it is the one guard the paragraph itself
    calls "the single worst outcome of this decision".
+
+   > **Closed 2026-07-30 by P9-T8b-4b-ii-2a**, and confirmed by T9b-4's gate arm.
+   > `check_test_only_grants_are_confined` (**V-CTN-037**) exists, is registered, and runs on every
+   > PR through `dev/L0-CHAIN.txt`. It is also stronger than the bullet asked for: rather than
+   > refusing an overlay reference under three named install-path roots, it discovers **by the
+   > marker** `kube-agents/test-only-grant` and asserts five properties — the marker appears only
+   > under `dev/` or in prose, every RBAC document under `dev/` carries it, nothing outside `dev/`
+   > names a file containing one, no marked document is cluster-scoped, and no marked Role reaches
+   > `escalate`/`bind`/`impersonate`/`*` or the RBAC API group. Discovery by marker rather than by
+   > path is what keeps it from being a headcount of the one fixture anybody remembers ([[LSN-036]]).
+   > Its stated non-claim stands: RBAC written as a heredoc inside a `dev/**.sh` is out of scope,
+   > because a heredoc's disposition is not statically derivable.
+
 2. **Guard 3 collides with [[LSN-045]], which was learned after it was written.** "The L2 script
    asserts the namespace is empty of `ActionRecord`s at teardown" cannot be satisfied by deleting the
    namespace — `kube-agents-journal-retention` denies DELETE and strands it `Terminating` permanently
@@ -2296,6 +2387,465 @@ in a unit that would be reviewing itself.
 
 ---
 
+### P9-T9b splits into five: T9b-1 … T9b-5
+
+**Recorded 2026-07-30, at SELECT, under `harness-run` §2 sizing.** T9b as written is not one unit.
+Its recon says "None of the five deliverables exist"; since then guard 1 has landed as
+**V-CTN-037**, and `broker-auth-l2.sh` with `fixtures/actor-tenant-grant.yaml` has landed too, so
+the residual is smaller than the row but still five separable pieces of work with different levels,
+different preconditions, and no dependency between the first three.
+
+Split, in the order they will be done. **The ordering is the phase's own rule, not a preference:**
+every commit invalidates P1 for every L2 suite still to come, so all remaining L0/L1 work goes in
+front of all remaining L2 work.
+
+| Unit      | What it is                                                                                                                                                     | Checks                                            | Level | Blocker                       |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ----- | ----------------------------- |
+| **T9b-1** | The `ActionRecord` phase lifecycle as enforced data, at the journal's two write points                                                                         | V-CTR-006                                         | L1    | —                             |
+| **T9b-2** | Envelope schema round-trip; refused keys ignored or rejected, never honoured (06 §4.1, `¬`)                                                                    | V-CTR-005                                         | L1    | —                             |
+| **T9b-3** | Broker supply-chain minimality: no LLM SDK, plugin loader, interpreter or shell in the SBOM; no `/bin/sh` in the image; one listening socket; two mounts (`¬`) | V-RUN-010                                         | L0    | —                             |
+| **T9b-4** | `dev/verify/verify-phase9.sh`, its `dev/L0-CHAIN.txt` / `dev/L2-CHAIN.txt` lines, and the V-BRK-021 L0-vs-L2 evidence reconciliation                           | (the gate itself)                                 | L0    | T9b-1..3 landed               |
+| **T9b-5** | `broker-execute-l2.sh`, `actor-grant-sweep-l2.sh`, the tenant overlay's **write** half and the admission ruling it needs                                       | V-BRK-006/018/019, V-REV-002, V-REV-003 (L2 half) | L2    | P1 — images built after T9b-4 |
+
+T9b-5 is also what unblocks **P9-T8b-4b-ii-2b-ii** (the envelope corpus soak, journal mining, guard
+3 as a label assertion per [[LSN-045]], and V-REV-001 at L2), which is why that unit sits behind it
+rather than beside it.
+
+**The denominator moves by four**, not by five: T9b was already counted once.
+
+#### T9b-5 splits again into three: T9b-5a … T9b-5c
+
+**Recorded 2026-07-30, at SELECT, under `harness-run` §2 sizing.** The row above bundles three
+things that are separable, have different subjects, and — the deciding argument — have a strict
+dependency order that the bundle hides. `broker-execute-l2.sh` cannot reach step 8 without a write
+authority the actor does not have: `execute/client.go` issues real API calls with
+`client.DryRunAll`, and a server-side dry-run is **authorized normally** before it is dry-run, so
+the API server refuses `patch deployments` for the phase-9 actor exactly as it refuses a live one.
+Every envelope in P9-T8b-4b-ii-1 died at step 3 for the read half of that same reason. Writing the
+suite first and the overlay second would mean writing 700 lines that cannot run.
+
+| Unit       | What it is                                                                                              | Checks                                           | Level |
+| ---------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------ | ----- |
+| **T9b-5a** | The tenant overlay's **write** half, and the admission ruling it needs — executed, not read off the CEL | (enabling; V-CTN-037 stays green)                | L2    |
+| **T9b-5b** | `broker-execute-l2.sh` — Accept (a) end to end, Accept (d)'s journal half, and V-BRK-021's L2 half      | V-BRK-006/018/019/021, V-REV-002, V-REV-003 (L2) | L2    |
+| **T9b-5c** | `actor-grant-sweep-l2.sh` — Accept (e)'s two-sided `auth can-i` sweep over every agent identity         | V-BRK-013 (L2 half)                              | L2    |
+
+**5a claims no check ID, deliberately.** It is enabling work, in the same sense T9b-4 was: the
+breakdown row names the checks that the thing it enables will carry, and inventing an ID for the
+enabler would put a row in `results.csv` for a property nothing measured. What it does instead is
+_execute the three premises the ruling rests on_, which until now existed only as a paragraph in
+`dev/verify/fixtures/actor-tenant-grant.yaml`'s header reading CEL and predicting what the API
+server would do with it.
+
+**The denominator moves by two more.**
+
+#### T9b-5b splits in two: T9b-5b-i and T9b-5b-ii
+
+**Recorded 2026-07-30, at SELECT, under `harness-run` §2 sizing.** The row above bundles three
+subjects that share only the fact that they all point at a running broker. Accept (a) is a
+**positive**: submit one well-formed envelope and read back what the journal recorded. Accept (d)'s
+journal half is a **fault injection**: take the journal away from a broker that is already serving
+and watch it decline. V-BRK-021's L2 half is a **surface scan**: debug routes, override parameters,
+the ten bypass headers, one listening port, no build-tag skip path. Three different fixtures, three
+different failure modes, and only the first of them establishes the submission path the other two
+need to be interesting.
+
+| Unit          | What it is                                                                                                    | Checks                                                                       | Level |
+| ------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ----- |
+| **T9b-5b-i**  | `broker-execute-l2.sh` — one envelope: submit → classify → journal → shadow-execute, and the record read back | V-BRK-006 (L2 clause), V-REV-001 (n=1) — **revised at IMPLEMENT, see below** | L2    |
+| **T9b-5b-ii** | The journal-unavailable refusal (Accept (d)'s half) and V-BRK-021's L2 surface scan, on the same driver       | V-BRK-021, V-BRK-018, V-REV-003, Accept (d) journal half                     | L2    |
+
+**Why the positive goes first, and alone.** `verify-phase9.sh` section B says in its own words that
+"an envelope flows end-to-end in shadow mode and produces a well-formed `ActionRecord` with a valid
+undo plan" **has never been executed once against a cluster** — four suites prove the undo machinery
+and not one of them submits an envelope. That sentence is the phase's largest unmeasured claim, and
+it is worth landing on its own rather than as the first third of a unit whose other two thirds are
+fault injection. It is also the strict prerequisite: a journal-unavailable refusal is only evidence
+if the same envelope succeeds when the journal is there, and 5b-ii's fixture is 5b-i's fixture with
+one thing broken.
+
+**The denominator moves by one more.**
+
+---
+
+### P9-T9b-1 — outcome, 2026-07-30
+
+**V-CTR-006** — "`ActionRecord` lifecycle: every legal transition succeeds, every illegal one is
+rejected (06 §4.3)". The check was scheduled as test-writing over an existing rule. There was no
+rule. Two defects in shipped code, both found by trying to write the check:
+
+1. **Nothing enforced the lifecycle anywhere.** `journal.Store.SetPhase` accepted `Verified →
+Pending`, `Rejected → Executing`, and `"" → Undone`. The lifecycle existed as an ASCII diagram in
+   a doc comment on `ActionPhase`, which is a statement of intent rather than a property of the
+   system. 06 §4.3's status-RBAC table then rests on that lifecycle — the ChatOps gateway is
+   permitted `PendingApproval → Pending/Rejected` **and nothing else**, the undo controller `→
+Undone` **only** — so both rows were unenforceable in the direction admission cannot cover: not
+   "who may write the field" but "what may the field become".
+2. **`status.phase` was never populated at creation.** `status` is a subresource, so `client.Create`
+   sent the block and the API server dropped it; only `Labels[kube-agents/status]` landed. Every
+   record read back `status.phase: ""` while its label named a phase — the exact inversion of 06
+   §4.3, which makes the field authoritative and the label a derived index. A parked record
+   therefore had no `PendingApproval` for the gateway's one permitted transition to leave from.
+   `rejection.go:156-158` carries a comment asserting "the status subresource is set by the
+   reconciler"; no such reconciler exists.
+
+**The ruling the table needed, which is not a halt.** 06 §4.3's diagram draws `Failed ──▶
+RolledBack`. The same section's phase table marks `Failed` terminal, and `verify/driver.go`
+implements the table: 04 §5.1 rung 3 succeeding writes `RolledBack`, rung 5 (rollback itself failed)
+writes `Failed` and pages. Rather than pick between a picture and a column, the edge was settled
+from the spec's own **principal list**: the four writers of `status.phase` are the owning broker,
+the undo controller (`→ Undone` only), the ChatOps gateway, and the exporter (which deliberately
+cannot touch `phase`). **No principal can write `Failed → RolledBack`.** That is an
+invariant-preserving resolution derived from the finer of two statements in the same section, so it
+is a decision, not a §8.5 contradiction. `Verified → Undone` survives the same test for the opposite
+reason: "terminal" is a claim about the broker's pipeline stopping, and `Undone` is a different
+principal, later. Both arguments live in `actionrecord_phases.go`'s file comment and in the ledger's
+decisions table.
+
+**The check is a closed truth table, not a list of remembered edges.** 121 ordered pairs (ten phases
+plus the empty from-phase), with the expected answer transcribed from 06 §4.3 a **second** time
+rather than read out of the production map — a test that iterates the map to decide what to expect
+asserts that the map equals itself, and stays green through deleting every entry. Vacuity guards pin
+27 legal cells and 94 refused. Alongside it: the CRD enum is read out of `actionrecord_types.go` as
+data and cross-joined against the table in both directions; reachability is a real BFS from the
+creation set, so orphaning a phase fails; and `Successors()` is asserted to hand back a copy.
+
+**The escape the sweep found, and what it says about the fake client.** The first sweep ran 11/12.
+`M10` — restoring defect (2) exactly — survived. The reason is that **controller-runtime's fake
+client does not model the status subresource on `Create`**: `withStatusSubresource` is consulted in
+`tracker.update` and not in `fakeClient.Create`, so the fake keeps a status block that every real
+API server discards. The test asserting `status.phase` came back was green because the fake never
+dropped it, and would have stayed green against a `Create` that wrote no status at all. That is the
+mechanism by which the defect survived five phases under a green suite. Fixed at the helper rather
+than in the one test that noticed: `newFakeStore` now installs a `Create` interceptor that zeroes
+`Status` before delegating, so the whole package is measured against the cluster it will run on.
+Second sweep: **12/12 caught**.
+
+**Findings filed, not fixed.** (a) The ASCII lifecycle diagram in `06-api-and-data-contracts.md`,
+reproduced verbatim in `actionrecord_types.go`, still draws `Failed ──▶ RolledBack` and still says
+DryRun is "reached from Pending" — a spec-art correction for the next improvement pass, not a
+behaviour change. (b) `rejection.go:156-158`'s "the status subresource is set by the reconciler" is
+now moot for `phase` and the sentence is still wrong. (c) A candidate gate rule with a wider blast
+radius than either: **a fake-client helper that models a subresource on `Update` and not on
+`Create` is a suite that cannot see its own most likely defect** — every `WithStatusSubresource`
+call site in this repository is a candidate, and none of the others has been audited.
+
+Evidence: **V-CTR-006 (L1) pass** — `verification/results.csv`, `verification/mutants/V-CTR-006.json`
+at 12/12.
+
+---
+
+### P9-T9b-2 — outcome, 2026-07-30
+
+**V-CTR-005 — "Envelope schema round-trip; refused keys are ignored or rejected, never honoured"
+(06 §4.1, L1, `¬`) — recorded at L1 for the first time.** New:
+`k8s-operator/internal/broker/envelope_roundtrip_test.go`, two valid fixtures, and
+`verification/mutants/V-CTR-005.json` at **13/13 caught**.
+
+**No defect in shipped code this time. The defect was in what the corpus could see.** The round-trip
+property itself — decode → marshal → decode — already held over every valid fixture and was simply
+unasserted. What was not true is the thing an unasserted round-trip is usually assumed to imply:
+that the corpus exercises the schema. Reflecting over `Envelope` yields **57 declared JSON paths**,
+and **12 of them appeared in no valid fixture at all**:
+
+| Uncovered path                                                                       | Why it mattered                                                                                             |
+| ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `dryRun`                                                                             | It is inside the idempotency key (`keyInput`). Every dry-run key in the product was unpinned on both sides. |
+| `operations.cloudTarget` + `.provider` `.service` `.resource` `.method`              | The entire non-Kubernetes target shape, including its own leg of `operationSortKey`.                        |
+| `operations.delete.gracePeriodSeconds`, `.preconditions` + `.uid` `.resourceVersion` | The "delete this object, not the one that replaced it" guard.                                               |
+| `requester.assertion`                                                                | The field whose absence is what makes a record `attributionUnverified`.                                     |
+| `trace.threadId`                                                                     | Correlation back to a chat thread.                                                                          |
+
+Every one of those is legal per `Operation.validate`, handled by the Python builder's `_CLOUD_FIELDS`
+/ `_DELETE_FIELDS` / `_PRECONDITION_FIELDS` projections, and reachable from the MCP tool — they were
+simply never written down in an artifact anything asserts against. A decoder that dropped any of
+them would have left `TestFixtureCorpus`, `TestValidFixtureIdempotencyKeys` and the whole V-BRK-028
+Python↔Go join green.
+
+**So the first test in the file is a coverage assertion, not a round-trip.**
+`TestEveryDeclaredSchemaPathIsExercisedBySomeValidFixture` walks the Go type for declared paths,
+walks the corpus for observed ones, and fails on the difference. It is the vacuity guard the
+round-trip needs, and it is self-maintaining in the direction that matters: **adding a field to the
+wire schema now fails until some fixture carries it.** Path walking stops at `desiredState` and
+`patch.body` in both directions — they are deliberately open (`TestPatchBodyTypeIsNotClosed`), and
+without the stop a `desiredState` containing a key named `scale` would read as coverage of
+`operations.scale`.
+
+Two fixtures close the twelve:
+
+- **`platform.cloud-nodepool-resize.json`** — a `scale` op against a GKE node pool `cloudTarget`,
+  under `dryRun: true`. Its key had to be computed fresh, because `dryRun` is in `keyInput`.
+- **`cluster-admin.delete-with-preconditions.json`** — a single-object `delete` carrying
+  `propagationPolicy`, `gracePeriodSeconds` and both preconditions, from a human requester with a
+  router-signed `assertion` and a `trace.threadId`.
+
+Both were added to `identities.json`, so they join the Python↔Go idempotency comparison
+automatically; `dev/test_action_envelope.py` went from six shapes to eight with no edit to the test.
+The four docstrings that said "the same six envelopes" now name no count at all and point at
+V-CTR-005 as the reason the corpus grows — **a count in prose is stale by construction**, which is
+the same failure mode as the "next free ID" lines already filed in this file.
+
+**The other half — "never honoured".** `TestFixtureCorpus` already proves the reserved-key refusal
+fires. "Never honoured" is a stronger claim: that the value could not reach a decision even if the
+scan were removed. Two mechanisms, asserted separately:
+
+1. **No field of `Envelope` is spelled with a reserved name.** Today the scan runs before strict
+   decoding so such a field would be unreachable — but that ordering is a two-line edit, and every
+   other test in the package would survive reversing it (M10).
+2. **Every reserved name is also an unknown field to a bare strict decoder.** Strip the scan and the
+   closed schema still refuses all fourteen, losing the security event and never honouring the
+   value.
+
+**And the list is joined to the spec.** `TestTheReservedKeyListIsTheOneTheSpecPublishes` parses
+06 §4.1's "What the broker ignores — and what it refuses" table as data and compares rows 1–4 to
+`ReservedKeys` in both directions, per [[LSN-040]]/[[LSN-041]] — two definition sites of a security
+rule are only allowed here when something mechanically compares them. The table is parsed
+positionally, so its **shape** is asserted before its contents: eight data rows, row 5 the
+anti-replay row, row 6 the closed-schema catch-all. A reordered table fails loudly rather than
+silently redefining which rows are the reserved ones. `bypassFamily` is asserted as a **superset**
+of row 3, not an equal: the code also puts `approved` and `undoPlan` in it, a widening the row
+boundaries do not express and the prose does support.
+
+**The sweep is the reason to believe any of it.** 13/13, and three of the mutants exist only because
+a test that reads prose as data is one silent parse failure away from asserting nothing (LSN-048).
+**M12 renames the spec heading by two characters** and must turn the suite red; **M13 deletes
+`severity` from the published table while the broker goes on refusing it** — the drift that actually
+happens, invisible from the code side. **M5 and M6 add an undocumented field** to `Envelope` and to
+`CloudTarget`: they are not defects in the guard, they are the defect the guard is _for_.
+
+Findings filed, not fixed:
+
+- **`TestFixtureCorpus`'s doc comment claims to be V-CTR-005** and is not — it is the corpus decode
+  and the V-BRK-002 refusal half. The round-trip and coverage halves did not exist until now. That
+  is the **fifth** wrong or over-claiming `V-*` binding filed in this phase, after V-BRK-020's
+  citation, `execute/apply.go` citing V-REV-002 for V-BRK-006, T8b-3's row binding V-GAT-019, and
+  V-BRK-008 ≡ V-BRK-017. **A class, and overdue for the improvement pass**: a candidate gate rule
+  that every `V-*` mentioned in a Go or Python doc comment names a check whose 09 §6 statement the
+  test actually asserts.
+- The reserved-key table's **rows 7 and 8** ("recorded and ignored", "recorded, not trusted") are
+  not joined to anything. `rationale` never reaching the classifier is a V-BRK-surface property and
+  `attributionUnverified` is a journal one; neither is this check's, and neither is asserted from
+  the table.
+
+Evidence: **V-CTR-005 (L1) pass** — `verification/results.csv`, `verification/mutants/V-CTR-005.json`
+at 13/13.
+
+---
+
+### P9-T9b-3 — outcome, 2026-07-30
+
+**V-RUN-010 — "Broker supply-chain minimality" (08 §2.1, §2.6, L0, `¬`) — recorded for the first
+time.** New: `dev/tests/broker-supply-chain-minimal.py`, two lines in `dev/L0-CHAIN.txt`, negative
+control **15/15**.
+
+**The unit found three real defects, all of them shipped, all of them invisible to the review that
+would normally be trusted for this property.** Writing the check is what found them; none was
+suspected going in.
+
+1. **`os/exec` was in the broker binary via first-party code.** `internal/journal/auditsource.go`
+   held `CloudLoggingSource`, which runs `exec.CommandContext(ctx, c.bin(), "logging", "read", …)`
+   where `c.bin()` defaults to `"gcloud"` and is a settable struct field. `internal/journal` is
+   linked into `cmd/broker` both directly and through `internal/broker`. It was unreachable —
+   nothing outside its own tests constructs one — which is precisely why nothing noticed, and it was
+   one call site from reachable inside the only process in the mesh whose ServiceAccount can write.
+   Fixed by extracting it to **`internal/journal/cloudaudit`**, a package whose consumer is the
+   V-BRK-003 reconciler in the operator and never the broker. The package boundary is the
+   enforcement; the doc comment says so, and `var _ journal.AuditSource = (*Source)(nil)` sits at
+   the boundary so the split implementation cannot drift from the interface silently.
+2. **A plugin loader was registered on purpose.** `cmd/broker/main.go` carried kubebuilder's
+   scaffolded `_ "k8s.io/client-go/plugin/pkg/client/auth"`. That import's entire job is to register
+   out-of-process credential providers so a kubeconfig may name a binary for the client to fork. The
+   broker authenticates exactly one way, with the projected token the kubelet mounts. Deleted.
+3. **`net/http/pprof` was linked in, and the file's own doc comment said it was not.**
+   `ctrl "sigs.k8s.io/controller-runtime"` is a facade over `pkg/manager`, `pkg/builder` and
+   `pkg/controller` — an entire controller runtime in a process that runs no controller — and
+   `pkg/manager` imports `net/http/pprof`, whose package init registers `/debug/pprof` on
+   `http.DefaultServeMux`. main.go's package doc has claimed "No metrics listener, no pprof, no
+   admin socket, no second Service" since the file was written. Replaced with the four narrow
+   subpackages (`pkg/client`, `pkg/client/config`, `pkg/log`, `pkg/log/zap`, `pkg/manager/signals`),
+   four call-site renames, no behaviour change. `go list -deps ./cmd/broker` went from
+   `{os/exec, runtime/pprof, net/http/pprof}` to `{os/exec}`.
+
+**Why the import graph is the load-bearing property and the image is not.** The broker image was
+already `gcr.io/distroless/static:nonroot` — no shell, no package manager, non-root, read-only root.
+Every one of the three defects survived that, an SBOM diff and an RBAC review, because a Go binary's
+shell is `os/exec`, not `/bin/sh`: the image can be shell-free while the process retains the ability
+to fork one, and that is the half an image scan structurally cannot see. So P1 walks the first-party
+import graph textually from `cmd/broker` (23 packages today, with a floor and three must-reach
+packages as the [[LSN-035]] non-vacuity arm) and forbids shells, plugin loaders, interpreters,
+inference clients and debug HTTP surfaces in **any** of them. Textually because L0 CI has Python
+3.12 and no Go toolchain by design; a graph walk rather than a scan of the entry package because all
+three defects were a package or more away from `main`.
+
+**Stated non-claim, recorded rather than waved away.** `k8s.io/client-go/rest` imports
+`plugin/pkg/client/auth/exec` unconditionally, and `k8s.io/apiserver` brings
+`github.com/google/cel-go`. Both are in the indirect closure of having a Kubernetes client at all
+and no import discipline in this repository removes either. P2 therefore scopes to **direct**
+requires — the set this repository actually chooses — and the residue is named in the check's
+docstring and moved to an L2 SBOM scan of the built image, which is where a module graph exists.
+P1 still catches the case that matters: a `cel-go` import in `internal/broker` fails on the line it
+is written.
+
+**The negative control earned its place twice, against the check rather than the code.**
+(a) The base allowlist matched by prefix, so `gcr.io/distroless/static:debug` passed — same
+repository, plus a busybox shell at `/busybox/sh`, and the exact tag someone reaches for at 3am
+trying to get a prompt inside the broker. Now matched on repository exactly, with a separate tag
+scan. (b) The `Volumes:` extractor was a lazy regex terminating on `\n\t+\},\n\t+\}`, which matched
+the end of the nested `SecretVolumeSource` instead of the end of the slice; P6 read only the first
+volume and would have gone on passing had the two been declared the other way round. Replaced with a
+brace-depth matcher. Nested Go composite literals are not a regular language.
+
+**Filed, not fixed** — for P9-T9b-4 or the next improvement pass:
+
+- **08 §2.6 says two mounts and the renderer makes three.** The third is a `/tmp` `emptyDir` whose
+  stated justification ("Go's TLS stack and the client-go transport both want a temp dir") is
+  unverified and only testable against a running broker. It is carried as the one named, reasoned
+  entry in `ALLOWED_MOUNTS`, and pinned to **be** an anonymous `EmptyDir` so the same mount name
+  cannot quietly become a Secret, ConfigMap, hostPath or PVC. The spec sentence is deliberately not
+  edited here: PROTOCOL §10 forbids resolving a check's own failure by editing the thing it checks
+  in the same unit. Resolution is either an L2 probe that removes the mount and watches the broker,
+  or a sentence in 08 §2.6 recording the ephemeral scratch.
+- **A doc comment asserted a security property the build contradicted** (defect 3 above). This is
+  another instance of the class already carried from T9b-1 and T9b-2 — the candidate gate rule that
+  every `V-*` or posture claim in a Go or Python doc comment must name something mechanically
+  asserted. It is now the sixth instance in this phase, and the first where the claim was not a
+  `V-*` ID but a plain-English list of what the binary does not contain.
+
+Evidence: **V-RUN-010 (L0) pass** — `verification/results.csv`; the check replayed against
+`git show HEAD:` content for `cmd/broker/main.go` and `internal/journal/auditsource.go` with the new
+`cloudaudit` package removed reports all three shipped defects, which is the evidence that it would
+have caught them.
+
+---
+
+### P9-T9b-4 — outcome, 2026-07-30
+
+Three deliverables: `dev/verify/verify-phase9.sh`, its chain lines, and the V-BRK-021 L0-vs-L2
+reconciliation. All three landed. Two of them turned up something the unit was not looking for.
+
+**The gate itself.** `verify-phase9.sh` follows `verify-phase8.sh` exactly where the template is
+load-bearing — no default target, an anchored `gke-scratch-*` `case`, P10 first as a hard `exit 2`
+(could-not-run, never 1), P1 with the three-state `dev_ok`, section A running `dev/L0-CHAIN.txt` **as
+a file** with a shrink guard, one `run_l2` as the only place a sub-suite's rc is interpreted
+(`0` pass · `3` defer, never a pass · `2` could-not-run · `*` fail), and a final section that prints
+deferrals without asserting them. Sections A–I bind to Accept (a)–(e), the ratchet and the
+deferrals. Two departures, both argued in the file: the three-state P1 read is a function
+(`p1_gated`) rather than a block copied into each section, because Phase 9 has six cluster-bound
+sections to Phase 8's four and the copies had already drifted in wording; and `cd "$REPO_ROOT"`
+carries `|| exit 2`, because section A runs 43 commands relative to it and a failed `cd` would
+produce 43 wrong answers rather than one.
+
+**Five artifact arms, four of them red today, and that is the deliverable.** Accept (a)
+(`broker-execute-l2.sh`),
+Accept (d)'s journal half (same artifact), Accept (e) (`actor-grant-sweep-l2.sh`), V-BRK-021's L2
+claimant, and planning defect 2's guard 1 are all detected **by artifact** — a file that must exist,
+a check function that must be registered, an ID that must be claimed by a script that is in the
+chain. None of them is a comment saying "T9b-5 pending". The gate therefore goes green on its own
+when the work lands and cannot be talked into it before, which is the one property of
+`verify-phase8.sh` section E worth copying. The shape is worth stating once: **Accept (a) — "an
+envelope flows end-to-end in shadow mode and produces a well-formed `ActionRecord` with a valid undo
+plan" — has never been executed once against a cluster.** Four suites prove the undo machinery (the
+index resolves, the prober reads back, the replayer restores) and not one of them submits an
+envelope.
+
+**The fifth artifact arm went green, and the first version of it was right by accident.** Section G
+also looks for planning defect 2's guard 1, which the 2026-07-29 recon recorded as not existing. It
+does now — `check_test_only_grants_are_confined` (V-CTN-037) landed the same day under
+P9-T8b-4b-ii-2a — so the recon bullet is annotated closed above. The detector, though, was written to
+match a **function name** containing `test_only` or `overlay`, and it passed on the first run because
+the name and the truth happened to coincide. Telling those two apart is the entire job of section G,
+so the arm was rewritten to assert the property: a check whose body references the marker
+`kube-agents/test-only-grant` — **resolved through the constant, not accepting its spelling** — that
+is registered in the gate's `CHECKS` table, in a gate that is a live line of `L0-CHAIN.txt`. Six
+mutants against it: de-register the check, delete it, hollow the marker constant's value, drop the
+gate from the chain, comment the gate's chain line out — all five caught. The sixth ("the body stops
+using the marker") scored **BROKEN**, not escaped: five other references to the constant survived the
+edit, so the mutant never made the change it claimed to (LSN-048). The intermediate version, which
+also accepted the bare identifier `TEST_ONLY_MARKER`, let the hollowed-constant mutant through — a
+name match one level up from the one it replaced.
+
+**The L2-CHAIN decision, and the drift it exposed.** The standing regression line said
+`verify-phase7.sh`. Phase 8 closed on 2026-07-27. So for three phases the standing baseline was a
+phase behind, and the six Phase-8 suites were run as Phase 8's own evidence rather than as the floor
+every later phase clears — the same commands, a different claim. That is the visible half. The
+invisible half is why this is recorded rather than just fixed: `invariants-gate.py` derives the set
+of scripts it lints for declared preconditions from the **transitive closure of `L2-CHAIN.txt`**
+(`_l2_scripts_in_scope`). A phase gate in no chain line, called by nothing, is outside that closure.
+**`verify-phase8.sh` — the single script that renders Phase 8's verdict — was never once asked which
+artifact it was judging.** It happens to declare its preconditions correctly; nothing checked, and
+the only way to discover that was to ask why the standing line was stale.
+
+Resolution: the standing line advances to `verify-phase8.sh`, and `verify-phase9.sh` is added under
+its own heading **while the phase is open and while it is red**. The argument for listing a red gate
+is that a gate added only once it passes has never told anyone something they did not already know;
+the artifact arms are worth having in an L2 run now, not at the milestone. At Phase 9's milestone it
+becomes the standing line and the seven Phase-9 lines collapse into it.
+
+**The correction that came from running the gate: a check I was about to call coarse was right.**
+Advancing the standing line and dropping the `verify-phase7.sh` line turned
+`check_closed_lessons_are_executable` red within one run — LSN-013 and LSN-028 are both closed
+naming `verify-phase7.sh` as their mechanizing artifact, and that check resolves chain lines
+**literally**, unlike `_l2_scripts_in_scope` four hundred lines away in the same file. The first
+instinct was that the two resolvers should agree and that this one should follow delegation. It
+should not. `verify-phase8.sh` runs `verify-phase7.sh` only when P1 resolves, so a delegated call is
+a **conditional** one; "named by a chain line" means "runs every time the chain runs", which is
+strictly stronger than "is reachable". A lesson mechanized by an artifact that runs only when a
+precondition happens to hold is a lesson that can stop being mechanized on a cluster with a stale
+image, silently. So `verify-phase7.sh` keeps its own line, and the same argument is now written
+above the Phase-8 block, which is also conditionally reached and also stays listed.
+
+**Two floors raised, in the commit that moved the chain, because their own docstrings say to.**
+`L2_CHAIN_FLOOR` sat at **6** against a 14-line chain and `L2_SCOPE_FLOOR` at **16** against a
+23-script closure. Both comments say in as many words that a floor below the real count tolerates
+exactly the change it exists to notice; neither had been moved since it was written. Now 16 and 25.
+This is a strengthening, not a check edit motivated by a failing implementation — the checks were
+green before and after — and the milestone that collapses Phase 9's lines will have to lower
+`L2_CHAIN_FLOOR` deliberately, which is the point of the number being there.
+
+**The V-BRK-021 reconciliation.** The 2026-07-29 recon bullet read "V-BRK-021 needs both L0 and L2;
+its only evidence is L1". Both halves are now false and the bullet is annotated superseded in place
+rather than rewritten, because it was accurate when written.
+
+| Level | 09 §6 requires it | Evidence on file                                                     |
+| ----- | ----------------- | -------------------------------------------------------------------- |
+| L0    | **yes**           | `results.csv` row 138, 2026-07-30, P9-T7c-2c — **pass**, sweep 10/10 |
+| L1    | no                | `results.csv` row 54, 2026-07-27, P9-T2 — pass                       |
+| L2    | **yes**           | **none**                                                             |
+
+So the L1 row was never load-bearing: it neither discharged the requirement nor constituted the gap,
+and reading it as "the only evidence" made an unrequired level look like partial credit toward two
+required ones. The gap is the **L2 half and only that**. It is also not, as the bullet said, "a lint
+over the shipped image" — a lint is what the L0 half already is, and the L0 half is a source
+derivation (`MutatingRoutes()` equals `Registered()` less a declared allowlist, one registration call
+site, every mutating route reaching the authenticator and the pipeline over the call graph). The L2
+half is the clause a source scan cannot reach: debug routes, override query params and the ten
+`X-Kube-Agents-*` bypass headers all 404/405 against a **running** broker, exactly one listening port
+on the pod, and no build-tag-guarded skip path in the image the controller actually handed out. A
+lint proves what the tree says; only a probe proves what was shipped. V-BRK is BLOCKING-ALWAYS, so
+this may not be deferred — section G of the gate is red until an `*-l2.sh` claims the ID **and** that
+script is a live line of `L2-CHAIN.txt`. Both conjuncts matter: a script claiming the ID from outside
+the chain is evidence nobody gathers.
+
+**Filed, not fixed.**
+
+1. `check_closed_lessons_are_executable` and `_l2_scripts_in_scope` both answer "is this script run
+   by the chain" and give different answers. Both are right for their own purpose, and nothing says
+   so — a future reader will reasonably conclude one is a bug. Candidate: name the two properties
+   apart in the source (`run_unconditionally` vs `reachable`) so the divergence is a decision rather
+   than an accident.
+2. The Phase-8 suites are now run twice per L2 chain pass — once through the standing line
+   conditionally, once as their own unconditional lines. Accepted deliberately (the conditional
+   caller argument above), but it is real cluster time, and the same duplication is about to double
+   for Phase 9. Candidate for the milestone: a gate that takes `--already-regressed` rather than a
+   chain that runs the same suite twice.
+3. **The candidate gate rule this unit most wants mechanized:** _the standing regression line of
+   `dev/L2-CHAIN.txt` names the most recently closed phase's gate._ It is derivable — the ledger
+   knows the last closed phase, `dev/verify/verify-phase<N>.sh` is a naming convention the repo
+   already relies on, and the drift went three phases unnoticed. This is `harness-improve`'s, not
+   this unit's.
+
+---
+
 ### P9-T8b-4 splits: 4a is the deployment path, 4b is the soak
 
 **Recorded 2026-07-30, at SELECT.** T8b-4 is "the L2 shadow soak with journal mining". Surveying
@@ -2323,7 +2873,7 @@ defect.
 | Unit          | What                                                                                                                                                                                     | Checks             | Blocked on                           |
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------ |
 | **P9-T8b-4a** | `deploy_broker`; the `kage-broker` P1 mapping; the actor identity as a dev fixture rendered by the shipped renderer; `dev/verify/broker-per-agent-l2.sh` and its `dev/L2-CHAIN.txt` line | **V-BRK-012 (L2)** | a live scratch cluster               |
-| **P9-T8b-4b** | The shadow soak proper: drive envelopes at the deployed broker and mine the journal                                                                                                      | V-REV-001 (L2)     | T8b-4a — nothing to drive until then |
+| **P9-T8b-4b** | The shadow soak proper: drive envelopes at the deployed broker and mine the journal — **split again into 4b-i and 4b-ii below**                                                          | V-REV-001 (L2)     | T8b-4a — nothing to drive until then |
 
 **Why V-BRK-012 and not a new ID.** 09 §6.2 gives V-BRK-012 as `L0, L2` and `verification/results.csv`
 records only the L0 row (2026-07-28, P9-T7b), whose own note ends "the lint reads source, so it says
@@ -2355,6 +2905,717 @@ paraphrase of them (LSN-024).
    here and both are asserted: the controller pod (which chose the image) and the broker pod (which
    is running it). A cluster where those two disagree is one where the rendered Deployment is a
    generation behind the env var, and every claim below it would be about the previous build.
+
+---
+
+### P9-T8b-4b splits again: 4b-i is a caller that can get in, 4b-ii is the soak
+
+**Recorded 2026-07-30, at SELECT.** 4a made the broker _exist_ on a cluster. Sizing 4b — "drive
+envelopes at the deployed broker and mine the journal" — turned up that the sentence hides two
+different units, and the first one is not the soak:
+
+- **Nothing in `dev/` can speak to a broker.** Not the shell, not a probe, not a fixture. The broker
+  requires mutual TLS with a certificate this cluster's `kubeagents-mesh-ca` signed, a projected
+  ServiceAccount token carrying audience `kubeagents-broker`, and the two bound to each other
+  through a SPIFFE URI. `broker-per-agent-l2.sh` deliberately said so: it proves each broker pod
+  _runs_, and states as a non-claim that it does not prove the broker _serves_, "because no client
+  here holds a certificate".
+- **The obvious shortcut does not work, and the reason is a finding.** Driving the shipped
+  `broker_client.py` from the working tree over `kubectl port-forward` looked viable because the
+  module's own docstring says "The server certificate is verified against `KUBEAGENTS_BROKER_SAN`,
+  not against the host in the URL." It is not. `cfg.san` is read from the environment, required by
+  `BrokerConfig.require()`, and then **never used again** — `build_ssl_context` sets
+  `check_hostname = True` and `urllib` derives `server_hostname` from the URL, so the name actually
+  verified is the endpoint's host. The two strings are equal today, so nothing is broken; the
+  docstring describes an intent no code implements. Filed as a finding, not fixed here — fixing it
+  is a change to shipped agent code and belongs in its own unit.
+- So the caller has to be **in the cluster**, which is the honest arrangement anyway: it goes
+  through the real Service, the real `<agent>-broker-ingress` NetworkPolicy and the real
+  `<agent>-to-broker` egress hop, none of which a port-forward touches.
+
+**What that unlocks is bigger than the soak.** Five checks in 09 §6.2 are the transport, every one
+of them `L2`, phase 9, BLOCKING-ALWAYS, and carrying the mandatory `¬` — and **not one has a single
+row in `verification/results.csv`**:
+
+| ID            | Property                                                                                  | State before 4b-i |
+| ------------- | ----------------------------------------------------------------------------------------- | ----------------- |
+| **V-BRK-007** | mTLS is required — a plaintext or wrong-CA client is refused ¬                            | no evidence       |
+| **V-BRK-008** | The projected token must carry audience `kubeagents-broker` ¬                             | no evidence       |
+| **V-BRK-009** | Neither layer alone suffices ¬                                                            | no evidence       |
+| **V-BRK-010** | A foreign agent's reader SA is refused **and raises a security event** ¬                  | no evidence       |
+| **V-BRK-017** | The default-audience token is refused — `TokenReview` says `authenticated: true` for it ¬ | no evidence       |
+
+They are the whole of acceptance bullet (c)'s L2 half, they were scheduled onto P9-T2 and never
+gathered, and every one of them is a question about a **credential presented to a running broker**.
+A driver that can present one answers all five; the soak needs the same driver and nothing more.
+
+**The split.**
+
+| Unit             | What                                                                                                               | Checks                                                                | Blocked on |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- | ---------- |
+| **P9-T8b-4b-i**  | The in-cluster envelope driver — a real reader identity at the broker's door — and `dev/verify/broker-auth-l2.sh`  | **V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017**, all L2 | T8b-4a     |
+| **P9-T8b-4b-ii** | The shadow soak proper: a corpus of envelopes through the driver, then journal mining over the `DryRun` population | **V-REV-001 (L2)**                                                    | 4b-i       |
+
+> **Split again — see "P9-T8b-4b-ii splits" below.** 4b-ii-1 types step 3's refusals (V-BRK-031);
+> 4b-ii-2 is the soak, which needs the read-only tenant overlay before its population is non-empty.
+
+**Why the driver is a pod and what that costs.** The three agent images in Artifact Registry are
+stale (2026-07-24 to 2026-07-27) and build `FROM nousresearch/hermes-agent`, so rebuilding them to
+get a Python interpreter next to the shipped scripts is a slow build for a fixture. Instead the pod
+runs a stock `python:3.12-slim` and the **shipped** `broker_client.py` and `action_envelope.py`
+arrive in a ConfigMap generated from the working tree — so the code under test is byte-for-byte the
+file this repo ships, and only the interpreter around it is a fixture. Its environment is read off
+the **rendered agent Deployment** (P6), never reconstructed from the naming functions, so a driver
+pointed at the wrong endpoint is a driver that fails rather than one that quietly proves nothing.
+
+**Name resolution is short-circuited, deliberately, and it is a non-claim.** The pod carries
+`hostAliases` mapping the broker's SAN to the broker Service's ClusterIP. `<agent>-to-broker` makes
+every reader-labelled pod default-deny on egress and opens exactly one hole — TCP 8443 to the actor
+half of its own pair — with no DNS rule anywhere in it (the real agent pod gets DNS from the
+per-tier egress policy, which is an install-time artifact this cluster does not carry). Resolving
+the name locally means the driver reaches the broker through **precisely** the allowance the pair
+policy grants and nothing else, which is a sharper demonstration than a working DNS lookup would
+be. What it does not demonstrate is that cluster DNS publishes that name; that is
+`broker-per-agent-l2.sh`'s L2-3, which reads the Endpoints the API server computed.
+
+**A second finding, filed while writing the probe: `session_trace()` can build an envelope the
+broker must refuse.** `broker_client.py:367` adds `parentSpanId` to the trace whenever `SPAN_ID` is
+set in the agent's environment. `broker.Trace` has `traceId`, `spanId`, `sessionId` and `threadId`
+and no such field, and `DecodeEnvelope` runs `dec.DisallowUnknownFields()` — so an agent in a traced
+session has **every** mutation refused with a 400 `unknown-field`, and the refusal names a trace
+field rather than anything the agent did. Nothing in the repo sets `SPAN_ID` today, so it is latent;
+it is also exactly the shape of defect that only appears once tracing is wired, at which point it
+looks like the broker rejecting everything. Not fixed here: it is one line in shipped agent code
+that all three tiers carry byte-identically, so the fix is a `dev/test_agent_script_parity.py`-scoped
+edit plus a test asserting the client's trace keys are a subset of `broker.Trace`'s JSON tags — the
+mirror image of the `RESPONSE_FIELDS` assertion `dev/test_broker_client.py` already makes about the
+reply, which is a check that exists in one direction only and is why this was never caught.
+**Scheduled as P9-T8b-4c**, with its check ID to be assigned by that unit against 09 §6.2 rather
+than guessed here. The driver pod leaves
+`SPAN_ID` unset and says so in a comment, because setting it would be measuring the bug from the
+fixture that discovered it.
+
+### P9-T8b-4b-i — outcome, 2026-07-30
+
+**Green: 14 PASS / 0 FAIL, rc 0, three consecutive runs.** All five rows now have their first
+`verification/results.csv` entry. The `¬` is `broker-auth-l2.sh --negative-control` — three
+transcripts of a misbehaving broker replayed through the identical assertion block, 8 of 8
+credential arms red on all three — and it addresses no cluster, so it is a line in `dev/L0-CHAIN.txt`
+rather than an L2-only ceremony.
+
+**Five things the first run found, all of them in the fixture or in the spec, none in the broker.**
+The broker was correct on every scenario from the first request it ever served.
+
+1. The probe died at the plaintext scenario. `exc.read()` inside the `HTTPError` handler raised
+   `ConnectionResetError`, which escaped and took four scenarios with it. Bodies are now read
+   through a helper that cannot raise and reports the unreadable body as itself.
+2. `trigger.source: "verification"` is not in the Go closed set of seven, so the baseline envelope
+   was a 400. Fixed to `cron`; the 400 arm is now a loud failure rather than something tolerated,
+   because it means the envelope never reached the pipeline and 4b-ii's soak would be built on the
+   assumption that it did.
+3. Plaintext is not a transport error. `net/http`'s TLS listener answers with a bare `400` before any
+   handler — so the arm asserts _no handler answered_ (no `reason` field), not _no answer_.
+4. The audience arm was red for 200 characters of display truncation. See the V-BRK-008 row.
+5. `V-BRK-017`'s stated mechanism does not happen against a real API server. See the V-BRK-017 row.
+
+**Findings filed, not fixed — none of them this unit's.**
+
+- **An RBAC denial inside the pipeline surfaces as a 500 `internal-error` with a stack trace.** The
+  baseline envelope is authenticated, decoded and classified, and then step 3 fails:
+  `configmaps "..." is forbidden: User "system:serviceaccount:kubeagents-system:platform-<scope>-actor"
+cannot get resource "configmaps"`. That is an entirely expected, caller-visible condition in dark
+  mode — the actor is bound to no tenant authority by design — and `server.go`'s `refuse`/`write`
+  have no typed `*Refusal` for it, so it falls through to the unclassified arm. A caller cannot tell
+  a permission boundary from a broker bug. **P9-T8b-4b-ii cannot be built on this** and it is that
+  unit's first order of business: either the pre-state snapshot's `Forbidden` becomes a typed
+  refusal, or the soak fixture grants the platform actor read on its own namespace, and the
+  distinction between those two is a real design question rather than a fixture detail.
+- **`invariants-gate.py`'s LSN-005 check reads the FIRST `case "$CTX" in` in a file, including one
+  inside a comment.** Found by walking into it: this suite briefly wrote its guard as
+  `case "$MODE:$CTX"`, which is equally correct and which the gate cannot parse, and the comment
+  explaining the fix then contained the literal idiom and shadowed the real guard below it. The
+  false-positive direction cost ten minutes. The **false-negative** direction is the one that
+  matters and it is live: a script whose comment shows a well-formed anchored guard and whose actual
+  guard is a substring match would pass, which is LSN-005 itself, wearing a comment. For
+  `harness-improve`.
+- **Three `V-*` rows overlap and none of them says so.** `V-BRK-008` and `V-BRK-017` state the same
+  property under two IDs; 09 §6 gives the plaintext arm to **both** `V-BRK-007` ("a plaintext or
+  wrong-CA client is refused") and `V-BRK-009` ("valid token over plaintext"). Shared evidence is
+  recorded as shared in the results rows rather than double-counted. Retire-never-delete applies, so
+  this is §3.4 pruning work, not something to act on mid-unit.
+- **`V-BRK-017`'s 09 §6 wording needs to say which level owns which clause** — the mechanism it
+  names is unreachable at L2 by construction. Written out in full in its results row.
+
+**One defect this unit introduced and then mechanized.** Extracting the eight credential assertions
+into a function left the call site unwritten for exactly one commit. The suite ran, printed six green
+lines, printed `PROVEN: V-BRK-007 · V-BRK-008 · V-BRK-009 · V-BRK-010 · V-BRK-017 at L2`, and exited
+0 — having asserted none of them. Nothing could have caught it: `fail` stays 0 when no assertion
+runs, and the `¬` mode calls the extracted function directly, so it was green too. The suite now
+counts its own arms and fails the run if the count disagrees with `EXPECTED_ASSERTIONS`; that guard
+was itself verified by temporarily setting it to 15 and watching the run go red. **A suite that
+reports a verdict it did not compute is worse than a suite that fails**, and this is a general shape
+— worth taking to `harness-improve` as a candidate rule for every `dev/verify/*.sh`, not just this
+one.
+
+### P9-T8b-4b-ii splits: 4b-ii-1 is a typed refusal, 4b-ii-2 is the soak
+
+4b-i's first filed finding said the 500-on-RBAC-denial was 4b-ii's **first order of business, and
+that the choice between typing the refusal and granting the actor a read was a real design question
+rather than a fixture detail**. Investigating it answered the question and also showed that 4b-ii
+was two units, not one.
+
+**The design ruling: type the refusal. Both, in fact, but this one first and on its own.**
+
+`k8s-operator/scripts/agent-identity.yaml.template` is unambiguous — _"Phase 9's actor authority is
+the broker-operations grant and nothing else, and binding a cloud-write credential to it now would
+hand the actor months of authority ahead of the controls that are supposed to bound it (P10-T1 owns
+that)."_ So the shipped actor genuinely cannot read a tenant ConfigMap, and 06 §4.4's fail-closed
+table already has the row: **cannot persist a pre-state snapshot → refuse that envelope.** What the
+table does not say is _which_ refusal, and there turn out to be two, distinguished by whether
+retrying could ever help. That is the whole of V-BRK-031.
+
+Three things made it worse than a cosmetic status code, and the third is the one that decided it:
+
+1. `ReasonSnapshotFailed` already existed and was wired only for the **persist** half at brake row
+   4, never for the **capture** half at step 3. Half a reason code, in production, for a phase.
+2. `Refusal.RetryAfterSeconds`'s own comment says _"zero means do not retry, which is the right
+   answer for every schema and authorization refusal"_ — and this was the site not honouring it. A
+   fleet told to wait sixty seconds and try again spends the rest of the phase retrying a permission
+   boundary.
+3. **`Journal` and `SecurityEvent` are fields ON the `Refusal`.** With no `Refusal`, there is no
+   journal entry and no event: the envelope's disposition was recorded **nowhere**. An agent
+   enumerating what it may touch left no trace at all, which is the exact opposite of what 06 §4.1's
+   per-reason table exists to guarantee, and it is what makes a probing pattern findable afterwards.
+
+The forbidden arm therefore journals and deliberately does **not** alarm. 03 §6's security events
+are for identity violations — a caller that is not who it says it is — and `forbidden-caller`
+(V-BRK-010) remains that case. This is an authorization outcome for a correctly authenticated
+caller, and in shadow mode it fires on **every single action**, so an alarm here is an alarm that
+gets muted, at a cost paid by the events that do matter.
+
+**Why the soak could not simply follow in the same unit.** Because the same reading kills the naive
+soak too. With the shipped grant, no envelope targeting a tenant resource reaches step 4 — so the
+`DryRun` population is **empty**, and this file's own argument against a vacuous V-REV-001 (_"a check
+over an empty population is a check that cannot fail (V-MET-014), and shipping one is worse than
+shipping none"_) applies to the shadow instance exactly as it does to the executed one. The soak
+needs planning defect 2's **read-only** tenant overlay, which does not exist yet. That overlay is
+not a security weakening — invariant 7's mechanized allow-list is `get`/`list`/`watch`, and read
+verbs are explicitly _not_ authority; it is the **write** half, owned by P9-T9b, that needs all
+three guards.
+
+| Unit               | What                                                                                                                                         | Checks                | Blocked on |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- | ---------- |
+| **P9-T8b-4b-ii-1** | Step 3's three live reads answer a typed `*Refusal`, split by whether retrying can help                                                      | **V-BRK-031** (L1+L2) | 4b-i       |
+| **P9-T8b-4b-ii-2** | The read-only tenant overlay `dev/verify/fixtures/actor-tenant-grant.yaml`, planning defect 2's guard 1, the envelope corpus, journal mining | **V-REV-001** (L2)    | 4b-ii-1    |
+
+4b-ii-1's L2 evidence is free: `broker-auth-l2.sh` already drives an envelope past authentication
+into step 3 with the shipped actor, which _is_ the condition. Its 5xx arm was already reporting it.
+
+### P9-T8b-4b-ii-1 — outcome, 2026-07-30
+
+**Green at both levels.** L1: the 3 × 3 table over `{pre-state snapshot, restart baseline,
+live-state resolve} × {Forbidden, Unauthorized, transient}` plus the negative control, in
+`internal/broker/pipeline/pipeline_test.go`. L2: `broker-auth-l2.sh` at 14 PASS / 0 FAIL, rc 0,
+where the **real** API server denied the **real** actor and the broker answered
+`403 target-forbidden`, `retryAfterSeconds: 0` — where the run three days ago answered
+`500 internal-error`.
+
+**The `¬` is on the discrimination, not on the happy arm**, and that is the point. A check asserting
+only "step 3 produces a refusal" passes on an implementation that answers 403 for everything, which
+is precisely how this gets written wrong — the RBAC denial is what anyone debugging it sees. So
+`TestLiveReadRefusalDiscriminatesRatherThanDefaulting` asserts against `liveReadRefusal` directly
+that the two classes differ in reason, differ in status, and that exactly one is retryable.
+`verification/mutants/V-BRK-031.json` scores **8/8 caught**, and its rows are chosen so that six of
+the eight produce a perfectly well-formed `*Refusal` that says the wrong thing — a check that only
+looked for "not a 500" would be green on every one of them.
+
+**A `NotFound` is not in the table on purpose.** `CaptureAll` swallows it as a create's legal empty
+pre-state and `CaptureRestartBaselines` baselines it at zero; the rig's default reader is
+`absent: true`, so every other test in that file already runs that path. Restating it here would be
+a case this helper does not own.
+
+**The L2-0 arm now discriminates on the reason, not the status.** It read
+`401 | 403) bad "refused at the AUTH layer"`, which was correct while `forbidden-caller` was the only
+403 the actions route could produce. There are now two, and they are opposites: one is the
+authenticator saying _this caller is not this broker's agent_, the other is the broker's own actor
+identity hitting its ceiling. Leaving the arm alone would have turned a green suite red on a broker
+doing exactly the right thing (halt condition 2). Guardrail 9 does not bite — the arm was
+**passing** the 500 with a NOTE, so this is not a check edited to let a failing implementation
+through — and the amendment is a strict **narrowing**: every reason that failed before still fails,
+one previously-impossible reason is now named, and five new `¬` rows in the L0-runnable
+`--negative-control` mode pin it, including _"a genuine auth refusal is still a failure"_ so the
+narrowing cannot swallow the case the arm originally existed for. Its 5xx arm also stops
+passing-with-a-note: the defect it was tolerating is closed, and tolerating it again would mean the
+arm can no longer tell the tracked defect from a new one.
+
+**Findings filed, not fixed.**
+
+- **The scratch cluster's actor is `platform-your-gcp-project-id-actor`.** The scope leaf is the
+  literal placeholder string from `vars.sh`, and it has been baked into a real ServiceAccount name,
+  a real RoleBinding, and every RBAC denial message the broker logs. Harmless on scratch and wrong
+  everywhere: the identity a write is attributed to is derived from it, so an install that never
+  edited `vars.sh` would attribute every action to `your-gcp-project-id`. Nothing validates that a
+  scope leaf is not a template default. A candidate gate rule for `harness-improve`, and it belongs
+  with the existing `<scope>`-segment ambiguity already open in the ledger.
+- **The probe's 400-character detail cap truncated the denial mid-namespace-name.** This is the same
+  shape as 4b-i's finding 4, where a 200-character display cap cut the substring an assertion was
+  reading. It is not load-bearing _yet_ — V-BRK-031's assertions read the reason, the status and the
+  retry, none of which are in the detail — but the projector already caps at 1000 and the probe caps
+  again at 400, so there are two caps and only one of them is documented as dangerous. For
+  `harness-improve`, with 4b-i's finding.
+
+### P9-T8b-4b-ii-2 splits: 2a is the overlay and its lint, 2b is the soak
+
+Oversized on inspection, so split per `harness-run` §2. **2a** — the read-only tenant overlay and
+planning defect 2's guard 1 — is hermetic L0 and depends on no cluster. **2b** — the envelope
+corpus, journal mining and V-REV-001 at L2 — is a new L2 suite with a corpus and a `¬` mode. The
+order follows this phase's own recorded rule that all remaining L0 work goes in front of the
+remaining L2 work, so the images are built once against a tree that has stopped moving (every commit
+invalidates P1).
+
+| Unit                | What                                                                                        | Checks             | Blocked on |
+| ------------------- | ------------------------------------------------------------------------------------------- | ------------------ | ---------- |
+| **P9-T8b-4b-ii-2a** | The read-only tenant overlay, its applier, and the lint that confines it to `dev/`          | **V-CTN-037** (L0) | 4b-ii-1    |
+| **P9-T8b-4b-ii-2b** | The envelope corpus soak over the overlay, journal mining, and guard 3 as a label assertion | **V-REV-001** (L2) | 2a         |
+
+### P9-T8b-4b-ii-2a — outcome, 2026-07-30
+
+**Green.** `dev/verify/fixtures/actor-tenant-grant.yaml` grants the deployed actor `get`/`list`/
+`watch` on six workload kinds in one tenant namespace; `dev/lib/actor-overlay.sh` renders it,
+applies it, and does not return until the API server's own authorizer agrees — and, in the same
+breath, that the actor still cannot write there and still cannot read `kube-system`.
+`check_test_only_grants_are_confined` (**V-CTN-037**, new in `invariants-gate.py`, 22/22 green) is
+guard 1, with 12 negative controls in `dev/test_invariants_gate.py`.
+
+**The labels were the whole design, and reading `vap-agent-readonly.yaml` settled them.** The
+overlay carries `kube-agents/tier: platform` and deliberately **not** `kube-agents/role: actor`:
+
+- `kube-agents/role: actor` is V-BRK-013's discovery key, and that check asserts every object
+  wearing it equals 06 §2.2.1's twenty triples **exactly**. A fixture wearing it turns a green
+  BLOCKING-ALWAYS check red — correctly — and the one-line green is an exception in the check.
+- `kube-agents/tier` is `is-agent-rbac`'s predicate, so the overlay's read-onlyness is enforced at
+  admission by the shipped policy rather than merely asserted by the file granting it. It is also
+  invariant 7's predicate, which puts the overlay **inside** that invariant's population rather than
+  beside it. Read verbs are explicitly not authority there, so nothing is weakened.
+
+**A design question for T9b, surfaced here and not answerable here.** A **write** overlay cannot
+wear `kube-agents/tier` — validation 1 denies it — and without the label it is governed by no
+admission rule at all: `vap-agent-scope` does not exist until P10-T1, and `vap-agent-readonly`'s
+`matchConstraints` cover `roles`/`clusterroles` but not `rolebindings`. T9b has to rule. Until it
+does, guard 1 is the only thing between a test fixture and a real over-grant, which is exactly the
+weight planning defect 2 assigned it.
+
+**Guard 3 costs nothing because teardown never deletes a namespace.** The applier creates-or-reuses
+the tenant namespace and `actor_overlay_revoke` deletes only the Role and the RoleBinding — revoking
+the authority, which is the point. No script deletes a namespace, so `cluster-check-hygiene.py`
+property 2 ([[LSN-045]]) is never engaged. Guard 3 becomes a label assertion in 2b.
+
+**The lint is derived from a marker, and its scope limit is stated rather than silent.** Discovery
+is by `kube-agents/test-only-grant`, never by a path — a rule keyed to one filename is a headcount
+of one ([[LSN-036]]). Heredoc RBAC inside a `dev/**.sh` is **out of scope and said so in the
+docstring**: a heredoc's disposition is not statically derivable, and `negative-attenuation.sh`
+applies a ClusterRole granting `impersonate` on purpose, as an adversarial input proving the VAP
+rejects it. Marking that would be a lie and exempting it by helper name would be an enumeration. The
+consequence runs the other way too — the rule is enforceable on files and not on heredocs, so the
+fixture was made a **file** in order to be inside it.
+
+**`dev/test_review_gate_paths.py` caught the fixture on the first full chain run.** A file that
+decides authority and does not trigger the security review gate is exactly what V-MET-007 derives,
+and it named the new fixture within seconds of it existing. A `dev/verify/fixtures/**` glob — a
+directory, not the filename, because nothing outside `dev/` may name such a file — was added to
+`review-gate.yml`. This is the harness catching the harness, and it is worth recording as a
+non-defect.
+
+**Then the new check caught its own evidence row.** The first `verification/results.csv` row written
+for V-CTN-037 quoted the marker verbatim and named the fixture by basename, and P1 and P3 both fired
+on it: a CSV outside `dev/` is not prose, and the check does not know the difference between a
+record of a grant and a path that applies one. The temptation was to add `verification/` to the
+allow-list beside `.md` — which is a check edit in the unit that authored the check, and a widening
+of exactly the kind [[LSN-036]] warns about, since every future evidence row would inherit the hole.
+The row was reworded instead: it describes the marker rather than spelling it and points at
+`dev/verify/fixtures/` rather than the filename. Cost: one sentence. The standing rule that follows
+is worth more than the row — **evidence about a test-only grant describes it, it does not quote it**,
+and the check enforces that for free.
+
+**Findings filed, not fixed.**
+
+- **`dev/assertion-baseline.json` is stale by roughly 1 000 assertions.** The committed baseline
+  holds **34 files / 194 named tests**; the tree today yields **131 / 1 209**. The ratchet
+  (V-MET-003, BLOCKING-ALWAYS) therefore has a floor 84 % below the actual assertion count and would
+  not notice a thousand assertions being deleted. It is passing — `inventory() ⊇ baseline` — which
+  is why nothing has said so. This unit regenerated it, saw the size of the jump, and **reverted**:
+  raising a security ratchet by 1 015 names is a review event that deserves its own commit and its
+  own reasoning, not a ride-along in a fixture unit. The ratchet is no weaker than it was this
+  morning. For `harness-improve`, and it is the highest-value item on that list.
+- **The heredoc half of V-CTN-037.** Closing it needs a way to tell an applied grant from an
+  adversarial input. Two scripts already grant that way: `brake-fanout-l2.sh` applies and keeps a
+  Role with `create`/`patch`/`update` on ActionRecords, and `negative-attenuation.sh` applies four
+  documents of which three are supposed to be denied. For `harness-improve`.
+- **`actionlint` is not installed on this host**, so the `review-gate.yml` edit was checked by
+  prettier and by `dev/test_review_gate_paths.py` (which parses the workflow and reads
+  `on.pull_request.paths`) rather than by the linter CLAUDE.md names. The edit is one entry appended
+  to an existing list. A candidate precondition for `binding.md`: a workflow edit with no actionlint
+  available is a stated gap, not a silent one.
+
+### P9-T8b-4c — outcome, 2026-07-30
+
+**Green: `dev.test_action_envelope` 44 tests, `dev.test_envelope_wire_keys` 6 tests, both exit 0;
+full `dev/L0-CHAIN.txt` clean; `invariants-gate.py` 22/22; `spec-ids.py` OK at 251 IDs. Mutation:
+V-BRK-028 20/20 caught (grown from 16), V-BRK-032 6/6 caught.**
+
+The scheduled finding was one word: `session_trace()` put `parentSpanId` on the wire and
+`broker.Trace` has no parent. The fix is `spanId`, which **preserves the information rather than
+dropping it** — `ActionRecord.SpanID`'s own doc comment reads "the originating span", which is
+exactly what the agent runtime's `SPAN_ID` is, and 06 §4.1's "a genuine retry necessarily carries a
+fresh nonce and a fresh `spanId`" reads the same way. Discarding the value would have been the
+cheaper diff and the wrong one.
+
+**The defect had a parent, and the parent is a hole in a check.** `envelope.go` declares **six**
+closed enums. `action_envelope.py` mirrored **three**. And `TestEnumsMatchTheBroker` — the class
+whose entire job is "the two sides agree on the closed sets" — was three hand-written tests naming
+those same three. **The set under test was the set that agreed.** The class could not have failed on
+the three missing mirrors, because it did not know they existed.
+
+That same hole had already fired live and been misread. `trigger.source: "verification"` came back
+`400` during P9-T8b-4b-i and was written up as a fixture typo. It was not: nothing agent-side knew
+`trigger.source` was closed, so nothing agent-side could refuse it, and because `DecodeEnvelope`
+runs `DisallowUnknownFields` the broker's answer is total rather than field-scoped. Two symptoms,
+one structure.
+
+**So the response is `harness-improve` §3.2: strengthen the check that should have caught it.**
+`TestEnumsMatchTheBroker` no longer names anything. It discovers every `valid<Name> =
+map[string]bool{…}` in the Go source, maps each to its Python mirror by name, and asserts the two
+**name sets** are equal in both directions before comparing members. Adding a fourth hand-written
+test beside the other three would have closed today's gap and left the seventh enum exactly as
+invisible as the fourth, fifth and sixth were this morning — and it would have read as progress.
+
+**The vacuity guard is the equality, not a count.** The first draft asserted
+`len(found) >= 6`, which is an enumeration of a number and goes stale the moment a seventh enum
+lands. Two-directional name-set equality cannot pass vacuously: zero discovered enums is six
+unexplained `VALID_*` constants on the Python side, and it also fails on a Python constant naming an
+enum the broker does not have. It earned its keep immediately — the first discovery regex found five
+of six, because `validRequesterKinds` is a one-line literal whose lazy DOTALL body ran past its own
+closing brace and swallowed `validPlatforms` whole. That surfaced as a vacuity trip, **not** as a
+member mismatch. A check whose failure mode is "I found fewer things than exist" is a check that
+needs an arm looking at the count of things it found.
+
+**The empty string is a member, not a falsy value.** `validPlatforms` and `validPropagation` both
+carry `""`. A mirror that filtered on truthiness would reject every envelope omitting an optional
+field — so the derivation copies members verbatim and never interprets them.
+
+**V-BRK-032 is a second ID because it is a second property, and the split is declared.** The enum
+join stays under V-BRK-028, whose file owns it. V-BRK-032 is the direction nothing covered: _every
+key the agent builds is a key the decoder accepts_, and every key the decoder requires is one some
+builder emits. It is asserted structurally over the builders' ASTs and then **measured against the
+real `broker.DecodeEnvelope`**, compiled once and run on a maximal envelope from each tier. This
+phase's findings list already carries three `V-*` rows that overlap without saying so; that is why
+the split is written down rather than assumed.
+
+**Two of this unit's own mistakes, both about the harness voting.** An unused `encoding/json` import
+made the first decode program fail to compile — `rc 1`, indistinguishable from "the broker refused",
+and green for the wrong reason. It was caught only because
+`test_the_decoder_is_the_strict_one_this_check_assumes` demands the refusal **name** `parentSpanId`.
+The build now happens once in `setUpClass` behind a loud assert, so a harness that does not compile
+cannot produce a verdict at all ([[LSN-048]], [[LSN-049]]). And
+`test_the_trace_key_the_defect_was_is_not_back` went red on the docstring explaining why
+`parentSpanId` is gone — [[LSN-023]] in miniature — now scoped to AST string literals minus
+docstrings: prose may discuss it, nothing may build it.
+
+**M19 escaped the first sweep and the escape was real.** The consulted-ness test was a substring
+search over `_check_client_side`, and every one of these constants is also interpolated into the
+`EnvelopeError` it raises — so the check passed for a validator that inlines the members and
+mentions the constant only when explaining the refusal. Rewritten to walk `ast.Compare` operands.
+The mutant was rewritten to match: it swaps the comparison's operand for an inline `frozenset`
+literal and leaves the error message referencing the constant, so behaviour is identical, every
+other test stays green, and only the consulted-ness arm can catch it.
+
+**Then the new enforcement found a third instance, and it was the worst one.** With
+`VALID_TRIGGER_SOURCES` enforced client-side, `dev/test_broker_client.py` went red — eleven arms,
+all reporting "nothing was POSTed". The cause is one line of shipped code:
+`submit_action` passed `trigger or {"source": "agent"}`, and **`agent` is not one of the seven.**
+Not a latent defect like `parentSpanId`, which needed `SPAN_ID` set, and not a fixture typo like
+`trigger.source: "verification"`. This is the **default**, on the one mutation tool, reachable only
+through an MCP server whose `submit_action` has no `trigger` parameter at all — so **every write
+every agent could make was a `400 invalid-envelope`**, and had been since the file was written. It
+survived because nothing has yet driven the MCP tool against a live broker: T8b-4b-i's driver builds
+envelopes directly, and it uses `cron`.
+
+A red sibling suite is halt condition 2, and this one is not a halt: the suite went red because the
+implementation is wrong, the diagnosis is complete, and the fix is in the implementation. Nothing
+about the check moved.
+
+**The default is now `chat`, and the choice is not arbitrary.** 06 §4.1 splits the autonomy buckets
+exactly at the interactive line — `humanRequested ∈ {chat, undo}`,
+`selfInitiated ∈ {watch, alert, cron, delegation, escalation}` — and this function's only caller is
+the MCP tool, which is reachable only from an interactive session. Defaulting to `watch` would file
+human-requested work under autonomy in the metrics 01 §7 counts. Every autonomous origin arrives
+through a caller that knows which one it is.
+
+**But a default is still a default, and 06 §9 says the tool _takes_ `trigger`.** Making it a real
+parameter touches three tiers' MCP tools and the `apply-change` skill that teaches them, which is
+its own unit: **scheduled as P9-T8b-4d**.
+
+**V-BRK-029 gains the arm that would have caught it**, in
+`TestTheGoSideIsTheDefinition` — the class whose stated job is "every value Python restates is read
+back out of Go and compared". It walks the `build_envelope` call, unwraps the `x or {…}` idiom the
+defaults are written in, and asserts every literal landing in a closed-enum field is a member.
+Nothing else could have: the enum mirror agrees with Go (V-BRK-028), every wire key is decodable
+(V-BRK-032), the transport is correct (the rest of that file) — and a default is none of those
+things. It is a **value**, and until this arm the only values under assertion were the ones the
+tests themselves supplied. Sweep grown 15 → 18, **18/18 caught**: M16 restores `agent`, M17 does the
+same to `requester.kind` so the scan is not a special case for one field, and M18 renames the call
+target so the AST walk finds nothing — caught by the `checked` floor, not by any subTest.
+
+**Findings filed, not fixed.** The escape itself — three hand-written tests where the source had six
+enums — belongs on the next improvement pass as an escape, alongside the substring-search shape that
+its own error messages satisfied. Both are instances of a check reading a name rather than a
+structure. A third, sharper one joins them: **three defects of one class in three units**
+(`trigger.source: "verification"`, `parentSpanId`, the `agent` default), and the class is _an
+agent-side value the broker's closed schema refuses_. What they have in common is not the enum — it
+is that the agent side had **no** local enforcement of anything the broker validates, so every such
+defect could only be discovered by a live 400, one value at a time. That is now three mirrors and
+three enforcements, and the general question for the improvement pass is whether the remaining
+`envelope.go` validations (`hex32Re` on `traceId`, the required-field set, the per-op target
+exclusivity) deserve the same treatment or whether the line is drawn correctly where it is.
+
+### P9-T8b-4d — outcome, 2026-07-30
+
+**`trigger` is a parameter now, and the argument for that is not tidiness.** 06 §9's tool table says
+`submit_action` "takes `intent` + `operations` + `trigger`, fills `trace`/`requester` from the
+session", and the tool took two of the three. T8b-4c could only replace a wrong default with a right
+one, which fixes the 400 and leaves the actual problem: **`trigger.source` is the field 01 §7
+counts.** It is what splits 06 §4.1's two autonomy buckets, so whatever a default says, it says it
+for every caller that did not think about the question — and the direction it is wrong in is the
+flattering one. An autonomous action filed as `chat` is a false statement about a human, the
+quarter's answer to "how much of this did the agents decide on their own?" comes out too low, and
+nothing anywhere reads as an error, because a defaulted enum member is a perfectly legal envelope.
+The parameter is **required**, in the client and in both MCP tools: the caller states the origin or
+there is no call.
+
+**Flat strings, not a dict, and the reason is two constraints meeting.** V-BRK-029 requires each
+`@mcp.tool()` body to be exactly one `return broker_client.<name>(…)` statement — logic in that
+module is logic no L0 check can execute ([[LSN-007]]) — so a `{source, ref, detail}` dict cannot be
+assembled inside the tool. And the schema the model reads is generated from the signature, so three
+flat parameters (`trigger_source`, `trigger_ref`, `trigger_detail`) put the closed enum in the place
+the model actually looks. `broker_client` assembles the dict, dropping `ref` and `detail` when empty
+because both are `omitempty` on `broker.Trigger` and a blank string is a claim that there was
+nothing to look at. The old `trigger: dict | None = None` was **removed** rather than kept beside
+the new parameters — two ways to say the same thing is [[LSN-041]], and one of them would have gone
+untested.
+
+**Four arms added to V-BRK-029, and one of them exists because the unit deleted the surface the last
+one watched.** T8b-4c's scan was pinned to `build_envelope`'s keyword defaults, which is where that
+defect happened to live; T8b-4d removed the default, so the scan would have walked zero literals and
+gone on reporting green. It now walks **every dict literal in the module** — the property was always
+"no closed-enum value originates in this file unless it is a member", and `session_requester`'s two
+`kind`s are inside it for the same reason the trigger was. Beside it: the origin is read back **off
+the wire** for both tools in all three tiers (the first assertion anywhere that `trigger` survives
+the trip), `trigger_source` is asserted to be in the no-default set of all four functions, and each
+MCP tool's declared parameters are compared against what its one statement forwards — **by name**,
+so `trigger_ref=trigger_detail` is caught too. Sweep grown 18 → 22, **22/22 caught**, with M16
+rewritten to re-add a default whose value is _correct_, because the shape is the defect.
+
+**V-CTR-020's two new mutants escaped on the first sweep, and this unit's own prose is why.** The arm
+that guards required parameters asserted only that the backticked name appeared _somewhere_ in the
+skill. The mutants delete a parameter's **definition** — and the paragraphs T8b-4d added to the
+worked example mention both `intent` and `trigger_source` in passing, which kept the arm green over
+a skill that no longer explains a required parameter. Being mentioned is not being documented; it is
+[[LSN-023]] at one remove, a check satisfied by prose about the thing rather than by the thing. The
+arm now requires the definitional bullet the file already uses for all three (`- **`name`** — …`),
+which a cross-reference does not have. The second new mutant, M14, drops `escalation` out of the
+seven-row table: every other arm passes on it, and an agent that was escalated to would pick the
+nearest word it can see.
+
+**Findings filed, not fixed.** The forwarding arm covers the MCP tools only; `plan_action` in
+`broker_client.py` delegates in exactly the same shape and is covered only behaviourally (M21).
+Generalizing "a single-statement delegation forwards every parameter it declares, under its own
+name" to the whole write path is an improvement-pass item. And three needles in V-CTR-020 and two in
+V-BRK-029 went `BROKEN` when the signatures and the skill text moved — not findings ([[LSN-048]]),
+but five in one unit is the first time a spec's needles have been this brittle, and needles anchored
+on a signature line are the pattern.
+
+### P9-T7c-2c — outcome, 2026-07-30
+
+**The number was never in the source.** V-BRK-021 asserted "one listening port, **one mutating
+route**" and cited 03 §4.1. 03 §4.1 contains no route count. What it contains is _"there is no other
+write path"_ and _"steps 1, 3, 4, 5, 6 and 11 are not skippable by any caller"_ — properties of the
+**pipeline**, not of an integer. "One mutating route" was a faithful proxy while exactly one route
+existed and became wrong the moment 05 §1.3's `replay` opened a second door into the same corridor,
+which is what halted T7c-2b on 2026-07-29. A human ruled option (a) — reshape the check — and this
+is that reshape. It is recorded as a **strengthening**, and PROTOCOL §10.2 is satisfied by the ruling
+rather than argued around: §10.2's remedy for weakening a BLOCKING-ALWAYS check is a halt for human
+review, and the review is the thing that scheduled this task ([`BACKLOG.md`](BACKLOG.md) B-003).
+
+**The shape.** `MutatingRoutes()` was `[]string{ActionsPath}` with a doc comment reading "Exactly
+one, and asserted." It is now `Registered()` less a declared non-mutating allowlist, where
+`Registered()` is written by `handle` — the single function that touches the mux. The subtraction
+runs in that direction on purpose: **the small set is the declared one**, so a route someone adds
+and forgets to think about lands in the _mutating_ set, where the 05 §1.3 subset assertion refuses
+it. Declaring the mutating routes and treating the remainder as harmless makes forgetting invisible,
+which is precisely what the hand-written literal did.
+
+**Four properties replaced one number**, and the count they replaced is now a consequence rather
+than an assertion: equality against the registered set, subset of the design table, an allowlist
+bounded to the three genuinely inert paths, and — new, and the clause that makes "non-skippability"
+mean what 03 §4.1 says — every mutating route reaches `Authenticator.Authenticate` and
+`Pipeline.Submit`, read off the call graph. A handler that answers 202 without touching the pipeline
+is a write with no journal entry and looks like success to its caller; nothing before this looked
+for it.
+
+**Two escapes, and the reason is general enough to be worth the paragraph.** The first sweep caught
+8 of 10. M3 rewrote `MutatingRoutes()` back into a literal and M4 rewrote `Registered()` into one —
+and every set relation in the new test still held, because **on a server with one mutating route a
+correct literal and a real derivation return the same answer**. "Derived, not declared" is not a
+property of a single observation; it is a property of how the reporter responds when the input
+changes, and a test that observes one server can never see it. Closed by building a second server
+that registers a path nothing else knows about: a literal cannot mention it. The same blindness
+applies to any check of the form "the accessor agrees with the facts" where the facts have only ever
+had one shape — and it is the second time in three units that a new check's first sweep found it
+weaker than its author believed, which is the argument for the sweep being part of VERIFY rather
+than a flourish.
+
+**One hole the sweep found in the design, not just the check.** M2 adds a route _and_ declares it
+non-mutating: it never enters the set the equality and subset arms measure, so both hold. The first
+draft's M2 was caught only because it happened to use a path `TestNoDebugRoutes` probes by name —
+caught by a guess, which is not caught. The real closure is the third arm: `nonMutatingPaths` may
+name only `/healthz`, `/v1alpha1/nonce` and the catch-all. A route excusing itself into the
+allowlist now fails on the allowlist.
+
+**What this did not do.** It did not implement `/replay` or `/approve` — those stay in Phase 10
+beside P10-T4/T7, as one unit against one reshaped check, and the T7c-2b deferral row closes on the
+09 edit exactly as its promotion condition said. It did not settle V-BRK-021's **L2** half: the
+2026-07-29 P9-T9 recon records it needing L0+L2 with only L1 evidence on file while the deferral row
+records it green at L0, and that reconciliation is **T9b's**. Touching a row does not earn the right
+to answer a question about it. The re-entry clause is in the row as a conditional over an **empty**
+population, and the suite logs it as empty rather than satisfied.
+
+**Retired with it:** `strings.Count(src, "s.mux.HandleFunc(") != 4`. It did catch a smuggled
+handler, and it also went red on every legitimate route, so its maintenance instruction was "raise
+the number until it passes" — a check you edit to make it pass is a check that will one day be
+edited past a real finding. Its replacement asserts that the count of _registration points_ is one,
+which no legitimate route addition changes.
+
+### P9-T8b-4b-ii-2b splits again: 2b-i wires the validator, 2b-ii is the soak
+
+**The fifth time surveying the soak turned up a defect in shipped code rather than a gap in the test
+scaffolding.** 4a found `KUBEAGENTS_BROKER_IMAGE` set nowhere; 4b-i found no client that could hold
+a certificate; 4b-ii-1 found an RBAC denial surfacing as a 500; 2a found a write overlay with no
+admission rule to govern it. This one is larger than all four.
+
+**`undo.GenerateAndValidate` has no non-test caller.** The function whose own doc comment reads "the
+call the broker actually makes at step 6" is called by nothing outside its own tests.
+`pipeline.Config.Planner` is a `Generate`-only seam that defaults to `undo.Generate`;
+`cmd/broker/wiring.go` leaves it unset and says so in its header — "the undo planner … is left unset
+so the owning package supplies it" — and the owning package supplies the half that does not
+validate. There is no `undo.DryRunner` implementation anywhere in the tree outside `undo`'s own
+tests. Consequences, each read off the code rather than inferred:
+
+- Every `ActionRecord` the shipped broker has ever written carries `undoPlan.validated: false`.
+- `undo.ValidateReplayable` refuses on exactly that field — _"the undo plan was never dry-run against
+  the API server, so nothing has checked that its steps would apply"_ — and it is the front door of
+  both replay paths (`verify/driver.go` and `rollback.Rollback`). **Undo is non-functional end to
+  end**, and the way a human would find that out is by trying to undo an outage.
+- 06 §4.3.1 is normative that validation happens and that failing it raises to `gated`. That arm
+  cannot fire at all today.
+- **V-REV-001 at L2 is therefore 0 %, not 100 %** — which is the exact property 2b was built to
+  measure. Running the soak first would have produced a red with no diagnosis attached.
+
+The escape shape is 09 §11.9, _component built, never wired_. V-REV-003's L1 row (2026-07-27, P9-T4)
+proved that `Validate` **downgrades correctly when the dry-runner is nil**. It proved the function
+and never the wiring, and its own evidence note says so without noticing: "an unwired dry-runner …
+each is a downgrade, not an error."
+
+| Unit                  | What                                                                                                                               | Checks             | Blocked on                           |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------ |
+| **P9-T8b-4b-ii-2b-i** | Wire the validator: a required `DryRunner` on the pipeline, a real one over the actor's client, step 6 refuses an unvalidated plan | **V-REV-003** (L1) | —                                    |
+| **2b-ii**             | The envelope corpus soak, journal mining, guard 3 as a label assertion, **V-REV-001** at L2                                        | **V-REV-001** (L2) | T9b's **write** overlay + its ruling |
+
+2b-i goes first under this phase's own L0-before-L2 rule, and it is unblocked. **2b-ii is blocked and
+the blocker is structural, not scheduling.** A server-side dry-run write is authorized as the write
+verb, so under the read-only tenant overlay every undo step's dry-run is a 403, every plan downgrades
+to `none`, and every action gates — a correct broker reporting 0 % coverage for a reason that has
+nothing to do with undo. The last mile is the **write** overlay, which is T9b's and which is itself
+waiting on the admission ruling 2a surfaced.
+
+### P9-T8b-4b-ii-2b-i — outcome, 2026-07-30
+
+**Undo is wired. `undoPlan.validated` is now a fact rather than a field.**
+
+What landed, in the order the seam runs:
+
+- **`pipeline.Config.DryRunner`** — a **required** `func(agentIdentity string) undo.DryRunner`.
+  Required, so a broker with nothing to validate with refuses to start rather than serving every
+  request and journalling `validated: false`. A **factory** keyed by identity, not a fixed object,
+  because server-side apply reports a conflict for every field owned by a different manager and an
+  undo commonly restores fields this agent set earlier — a dry run under any other name manufactures
+  conflicts the real replay never hits, downgrades working plans, and gates the fleet for a reason
+  that is an artifact of the check.
+- **`Planner` gained a fourth parameter** and the default moved from `undo.Generate` to
+  `undo.GenerateAndValidate`. A signature that cannot express "generate without validating" is what
+  stops that returning.
+- **`rollback.PlanDryRunner`** — the production `undo.DryRunner`, built **on the `Replayer`** rather
+  than beside it. The question plan-time validation asks is not "is this plan well-formed" but
+  "would the calls the replayer is going to make succeed", and only the replayer knows which calls
+  those are. A validator with its own op table would answer a question about a different program.
+- **`ClientApplier.Create` / `rollback.Writer.Create` gained `dryRun bool`**, so the validator goes
+  through the one client this broker has instead of opening a second one (LSN-040).
+- **`cmd/broker/wiring.go`** hoists the replayer beside the applier and hands the same object to the
+  verifier's rollbacker and to the validator's factory.
+
+**The design question 06 §4.3.1 does not answer, and the ruling taken.** An undo plan describes the
+world **after** the action and is validated **before** it, so two of the four steps address an object
+whose existence is exactly what the action is about to change: the `delete` that reverses a create
+gets a NotFound, the `create` that reverses a delete gets an AlreadyExists. Read literally, validation
+would downgrade both and gate every create and every delete in the fleet. The ruling: **the dry run
+asks "would the API server accept this step from this identity", and those two answers are positive
+evidence.** Kubernetes authorizes before it looks the object up — a caller without the verb gets 403,
+not 404 — and a create clears mutating and validating admission before storage. Everything else (403,
+Invalid, a webhook rejection, a missing scale target, a body `hydrate` refuses) is a failure that
+downgrades to `none`, which the 06 §4.2 step 6 floor raises to gated. The one honest gap, DELETE-time
+admission running after the fetch, is named in `dryrun.go` rather than papered over.
+
+**A side effect worth having.** Reusing `Replayer.hydrate` moves the redacted-Secret refusal — the
+worst thing in this package's blast radius — from replay time, during an incident, to generation
+time, where it is a downgrade and the action gates before mutating anything.
+
+**Three sites ask "is there a usable undo plan", not two.** classify's 06 §4.2 step 6 floor, the
+pipeline's step 6 re-check, and the brake's 06 §4.4 row 5. Only the first suppresses for a dry run.
+The first two now read one predicate, `classify.UndoPlanGateApplies`, so they cannot drift; be precise
+about what that buys, because the tempting claim is bigger than the truth — mutating step 6 back to
+its own spelling does **not** fail anything, since the brake has already raised the class by the time
+step 6 looks. It is a structural fix, and it is asserted directly rather than through behaviour.
+**The brake is the outstanding one and is filed, not fixed**: it raises a dry run whose plan cannot be
+validated to gated, so it parks for approval instead of previewing. Over-gating, safe, and a row in
+the 06 §4.4 table — V-BRK surface, and changing a brake row is a unit of its own rather than something
+folded into the unit whose wiring surfaced it.
+
+**A second escape found while verifying this one, and this one is not small.**
+`internal/broker/rollback`'s `TestMain` did `os.Exit(0)` when `KUBEBUILDER_ASSETS` was unset. That is
+a package-wide skip wearing the word `ok`: **the entire hermetic half of the package — including the
+refusal that stops a redacted Secret being written back as sixty-four characters of hex — had never
+run under `go test ./...`, which is what the L0 chain and PR CI execute.** The package reported `ok`
+in 1.3 seconds while asserting nothing, and it was found only because `dev/mutate.py` refused the
+sweep: `go test -list` returned no names, so the catchers "did not exist". LSN-048's guard caught a
+defect it was not written for. Fixed to the shape escalate, history and writeahead already use — the
+environment is optional, the six envtest tests skip individually via `requireEnv`. `probe` still has
+the old shape; it has no hermetic tests today, so it costs nothing yet, and it is filed.
+
+**Findings filed, not fixed** — three, and the first two are named above. (a) The brake's 06 §4.4 row 5
+is the third spelling of the undo-plan gate and does not suppress for dry runs. (b) `internal/broker/probe`'s
+`TestMain` still carries the `os.Exit(0)` shape. (c) New, and adjacent to (a): `BrakeInputs.UndoPlan` is fed
+`signal(s.plan.Undoable())` at [pipeline.go:708](../../k8s-operator/internal/broker/pipeline/pipeline.go#L708)
+and [:852](../../k8s-operator/internal/broker/pipeline/pipeline.go#L852) — the **weaker** predicate, the one
+step 6 stopped asking in this unit. It cannot under-gate today, because `Undoable()` is implied by
+`Validated()` and the brake only raises, so a plan that is undoable-but-unvalidated already reaches the brake
+as `true` and step 6 catches it after. But it means the brake's view of "is there a usable undo plan" and the
+pipeline's are two different questions wearing one field name, and the next person to add a lowering rule to
+the 06 §4.4 table inherits that. Same V-BRK surface as (a) and the same unit.
+
+Evidence: **V-REV-003 (L1) pass** — 13 new assertions across
+`internal/broker/pipeline`, `internal/broker/rollback` and `cmd/broker`; mutation sweep
+`verification/mutants/V-REV-003.json` **12/12 caught**, including two vacuity controls, with the
+mutants aimed at the **wiring** (the required-field arm, the default planner, the composition root,
+the identity threading) rather than at the function the old L1 row already proved.
 
 ---
 
@@ -2404,3 +3665,853 @@ BLOCKING-ALWAYS rule is about a check having no evidence at all, not about its d
 - **`ChangePolicy` cannot loosen, and that is structural, not validated-then-trusted**: there is no
   `allow`, no `maxClass`, no `exempt`, no downgrade path in the schema, _and_ the broker takes the
   maximum over all sources regardless. Both halves get a test; either alone is a convention.
+
+### P9-T9b-5a — outcome, 2026-07-30
+
+The unit was scoped as "the tenant overlay's write half, and the admission ruling it needs". Both
+landed. The ruling is the interesting half, and it is the first thing this phase has decided that no
+check ID covers.
+
+**The question, restated.** `dev/verify/fixtures/actor-tenant-grant.yaml` — the READ overlay, written
+in P9-T7d-3 — ends its header by handing T9b something it could not answer at the time: a write
+grant for the actor identity is denied by `vap-agent-readonly` validation 1 if it wears
+`kube-agents/tier`, denied by validation 3 if it wears `kube-agents/role: actor` (tenant resources
+are absent from the twenty-triple 06 §2.2.1 allow-list), and governed by nothing at all if it wears
+neither. Three doors, two locked and one that is not a door.
+
+**The ruling: step outside the population, do not bend the policy.** The tempting move is a
+carve-out — an exempt label, a namespace exclusion, a `!has(object.metadata.labels['test-only'])`
+clause in the match condition. Every form of it is a hole in the one runtime backstop that rejects
+bad agent RBAC _after_ human review has already passed it, and the hole is shaped exactly like the
+thing an attacker wants: a label that turns the policy off. It is also, mechanically, a weakening of
+a BLOCKING-ALWAYS surface, which PROTOCOL §10.2 makes a halt rather than a judgement call — so the
+question was never actually open. The fixture wears neither label and is outside `is-agent-rbac` on
+purpose.
+
+**The cost is conceded in writing, in the fixture's own header.** The read overlay is bounded by
+V-CTN-037, by the two library functions that apply and revoke it, _and_ by the cluster's admission
+policy. The write overlay is bounded by the first three and not the fourth. That is a genuinely
+weaker position and the header says so in those words rather than presenting the ruling as free.
+P10-T1's `vap-agent-scope` is named as what closes it: once an actor's tenant template is a compiled
+allow-list, this fixture can wear `kube-agents/role: actor`, be selected by validation 3, and be
+bounded by the cluster again. The header is the thing to re-read on the day that lands.
+
+**What makes it a fact rather than a reading.** Until this unit every clause above was a prediction
+about what an API server would do, made by reading CEL in a file. `actor-overlay-admission-l2.sh`
+submits all three label variants to a real one and records the answers. The three variants are
+**derived from the shipped fixture**, not re-typed: the Role document is rendered exactly as
+`actor_overlay_apply_write` renders it and each variant is that document with one label line spliced
+in. A hand-written stand-in would make all three arms true of a rule set nobody grants, and would
+keep passing on the day the fixture grew a fourth resource.
+
+**P2 finally has a function, and the reason it did not is the interesting part.** P2
+(policies-are-live) was the only entry in `binding.md` §Preconditions with no `p*_` helper and no
+lesson behind it. That was not an oversight: every admission claim this repository had ever made was
+a claim that something was **DENIED**, and a denial is self-witnessing — an absent policy, an
+unactivated binding and a deleted policy all fail to produce one. This suite's core arm asserts an
+object **IS ADMITTED**, which reads exactly the same green against all three of those. That is the
+shape of [[LSN-006]] aimed at admission instead of at the dataplane. `p2_assert_policy_live` makes
+liveness an experiment — a server-side dry-run of a manifest the policy must reject, polled to the
+timeout — rather than a `kubectl get` of stored YAML, and it probes **validation 2** so that
+establishing the precondition does not quietly pre-establish either of the arms that follow.
+
+**The first run was red, for a reason nothing in the tree could have found.** L2-1 (P6) reported the
+deployed `kube-agents-agent-readonly` carrying **2** validations against the tree's **3** — the actor
+carve-out landed in P9-T7d-3 and the scratch cluster's policy was four days stale. L2-3 then failed
+as a direct consequence: validation 3 was not there to deny anything. That pairing is the best
+evidence the suite is non-vacuous that this unit could have produced, because it was not
+constructed — the arm that measures the artifact and the arm that depends on it went red together,
+in the right causal order. After `kubectl apply -f examples/gitops-repo/policy/vap-agent-readonly.yaml`
+the same run is 7/7 green. **The P6 arm defers with the remediation named rather than re-applying the
+policy itself**, deliberately: a suite that silently repairs its own environment is a suite that can
+never tell anyone the environment had drifted.
+
+**The library half.** `actor_overlay_can`, `actor_overlay_apply_write` and `actor_overlay_revoke_write`
+in `dev/lib/actor-overlay.sh`. The write half asserts considerably more than the read half, and the
+asymmetry is the ruling's: two of the three things bounding this grant _are these functions_, so
+they ask the authorizer rather than trusting `kubectl apply`'s exit code. `apply_write` checks four
+positives and four negatives (no `secrets`, no other namespace, no RBAC group, no cluster scope) and
+**revokes rather than returning** on any mismatch, because handing a wider-than-advertised authority
+to the suite that called you is worse than failing. `revoke_write` proves the authority is _gone_ by
+asking again — the read half does not, and does not need to: a leaked read on a scratch cluster is a
+nuisance, a leaked write is what V-CTN-037 exists to prevent. `actor_overlay_can`'s `*/*)` guard is
+[[LSN-044]] property 1b and is load-bearing rather than decorative here: this helper takes its
+resource as a variable, which is precisely the refactor that makes the static half of that rule
+unenforceable, and half its questions are negative — `auth can-i update deployments/scale` asks
+about a Deployment _named_ `scale` and answers `no` for a reason that has nothing to do with the
+policy under test.
+
+**The suite claims no check ID, and that is not an omission.** There is no row in 09 §6 for "the
+ruling this phase made is still true", and minting one would put a line in
+`verification/results.csv` for a property no spec states. Same shape as `verify-phase9.sh`, same
+argument. It is listed in `dev/L2-CHAIN.txt` all the same — what it protects is a decision, and a
+decision nobody re-executes is a decision that was right on the day it was written.
+
+**Carried out, not fixed:** the scratch cluster's `kube-agents-agent-readonly` was four days stale
+and **nothing in the tree detected it** — this suite found it only because it happened to need that
+exact policy. A general "the deployed policies are the tree's policies" line is a candidate for the
+next improvement pass. Separately, `kubeagents-router` is in `CrashLoopBackOff` on the scratch
+cluster with 466 restarts over 39 hours, unrelated to this unit and unexamined.
+
+**The denominator moves by one.** T9b-5a is closed; 5b and 5c remain.
+
+### P9-T9b-5b-i — outcome, 2026-07-30
+
+**Landed:** `dev/verify/broker-execute-l2.sh` (new, `--negative-control` 13/13),
+`dev/verify/fixtures/broker_execute_probe.py` (new), the driver parameterization in
+`dev/lib/broker-driver.sh`, one `dev/L2-CHAIN.txt` line, `L2_CHAIN_FLOOR` 17→18 and
+`L2_SCOPE_FLOOR` 26→27 in the same commit.
+
+**Acceptance bullet (a) has now been executed.** "An envelope flows end-to-end in shadow mode and
+produces a well-formed `ActionRecord` with a valid undo plan" was the phase's largest unmeasured
+claim: four suites proved the undo machinery and every one of them started from an `ActionRecord` a
+test had written. This is the first line in the chain whose evidence is an object the **broker**
+produced.
+
+#### The claim set was cut in half at IMPLEMENT, and that is the finding
+
+The SELECT-time row claimed V-BRK-006, V-BRK-018, V-BRK-019, V-REV-002 and V-REV-003. Four of the
+five are not observable from a single successful shadow submission, and writing the suite is what
+surfaced it. Each is recorded here with where it went, because a check ID silently dropped between
+planning and implementation is indistinguishable from one that was never planned:
+
+| ID            | Why a shadow submit cannot witness it                                                                                                                                                                              | Where it went                                        |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------- |
+| **V-BRK-018** | "Snapshot-persist failure ⇒ refuse; neither target applied" is fault injection over a multi-target envelope. Nothing in this suite fails, deliberately.                                                            | **T9b-5b-ii**                                        |
+| **V-BRK-019** | The field-manager string is unreadable from a shadow: a server-side dry-run persists no `managedFields`, so there is nothing on the object to read the manager off. Needs a real apply, which Phase 9 does not do. | **Carried, unscheduled** — named in the suite header |
+| **V-REV-002** | `undo <id>` restores prior state. Requires executing an undo.                                                                                                                                                      | Later phase                                          |
+| **V-REV-003** | "No generatable undo plan ⇒ reclassified gated" is the **negative** of what this suite asserts, and needs an operation whose inverse does not exist. This envelope's inverse does.                                 | **T9b-5b-ii**                                        |
+
+What replaced them is **V-REV-001**, which nobody had scheduled here and which fits precisely: the
+record carries a validated undo plan the broker generated. Its row says "100%" and this is n=1, so
+the `results.csv` note says n=1 and names P9-T8b-4b-ii-2b-ii's corpus soak as what makes it a
+population claim. A suite that reported "100%" off one record would be the exact defect
+`broker-auth-l2.sh`'s assertion counter exists to prevent, one level up.
+
+**V-BRK-006 is claimed for its L2 clause only.** 09 §6 lists the row at L2 **and** L4 for a reason:
+"the record exists before the mutation" is observable from a running cluster, and "a broker killed
+mid-action leaves no unjournaled write" is not. The L2 half is asserted across **two clocks and two
+writers** — `metadata.creationTimestamp`, which the API server assigns, against
+`status.timestamps.executionStarted`, which the broker stamps when it issues the first mutating
+call. Equal stamps pass: RFC3339 here is second-granular and a fast pipeline routinely produces
+identical values, so treating equality as a violation would fail the arm for being quick.
+
+#### Two things the suite refuses to read from a second copy
+
+**The legal phase set comes off the served CRD**, not from `actionrecord_phases.go` and not from a
+list in the file. Either of those would be the suite agreeing with a copy of the same enum and would
+stay green on a cluster serving a different one. The `--negative-control` arm does hold the tree's
+list, and that is correct there: it is testing the assertion block, not a cluster, and
+`invented-phase` needs a set to be invented against.
+
+**The target object's name comes off the probe's own `note` line.** The suite has to go looking for
+an object after the run to answer "did the shadow mutate anything", and the probe is where that
+object's identity is decided. A suite that hardcoded the name would check the right object today and
+the wrong one the day the probe's constant changed — and checking the wrong object for absence
+always passes.
+
+#### The `¬` arm, and the bug it would have had
+
+Thirteen cases: eleven documents each broken in exactly one way, plus a correct one that must go
+**green** (an assertion block that failed everything would "catch" all eleven for the wrong reason),
+plus two that are not documents at all — the world in which the shadow created the object, and the
+world in which the suite could not tell. Every row carries a **needle**, and counts as caught only
+when a `FAIL:` line contains it (LSN-035): without that, breaking `jrec` would score 13/13 while
+proving the suite is broken.
+
+The first draft read the verdict off `$fail`. `assert_record` runs inside a command substitution,
+which is a subshell, so every `fail=1` it set died with it — the arm would have reported all eleven
+mutants as escapes. `broker-auth-l2.sh` counts `^PASS:`/`^FAIL:` lines for exactly this reason and
+the note is now in this file's header too.
+
+#### P1 fired on the first live run, and that is the second finding
+
+The first invocation against `gke-scratch-kube-agents-dev` stopped at P1: the deployed controller
+was `dev-7c4e163` against a tree at `8ffb43e`. This is the ordering rule Phase 9 wrote down for
+itself — every commit invalidates P1 for every L2 suite still to come — arriving on schedule, and
+the reason all remaining L0/L1 work goes in front of the remaining L2 work. Resolved with
+`dev/cluster/reload-images.sh operator gke-scratch-kube-agents-dev`, which deploys by digest.
+
+It then fired a **second** time, on a different image, and that is worth recording separately
+because the first resolution looked complete. The broker is not the controller: it is `kage-broker`,
+built and deployed by its own `reload-images.sh broker` target, which sets `KUBEAGENTS_BROKER_IMAGE`
+**on the controller** rather than on a Deployment, because the operator renders one broker per Agent
+CR and `brokerImage()` reads its own environment. P1 for any broker suite therefore requires **both**
+targets to have been run, and a suite that checked only the controller would report a current build
+while testing a stale broker. Both arms are in the suite for that reason.
+
+#### The defect the suite was written to find, which it found on its first run past P1
+
+**No deployed broker could write any ActionRecord's status. Ever, in any namespace.**
+
+`kube-agents-agent-scope-journal` matches `UPDATE` on `actionrecords/status` and decides whether the
+writer is the owning broker with
+
+```cel
+request.userInfo.username == 'system:serviceaccount:' + object.metadata.namespace + ':' + object.spec.actorServiceAccount
+```
+
+The left side is the ServiceAccount the kubelet projected a token for. The right side is whatever the
+broker process stamped into the record, which came from `brokerServiceAccount()` in
+`k8s-operator/cmd/broker/main.go`, which read `KAGE_BROKER_SERVICE_ACCOUNT` — **a variable nothing in
+the repository set** — and fell back to the literal `"kage-broker"`. That string is the name of the
+broker _image_. It is not a ServiceAccount anywhere in this tree; `grep` finds the literal at exactly
+one site, and every other occurrence of the token is an image reference. Meanwhile the pod runs as
+`actorServiceAccountName(agent)` — `<tier>-<leaf>-actor`, set eleven lines above the container spec.
+
+So the equality compared `…:kage-broker` against `…:platform-your-gcp-project-id-actor` and could not
+hold for any agent, on any cluster, at any time.
+
+What makes this the right defect for Accept (a) to have caught is **where** it surfaces. It is not a
+startup failure. The broker starts, serves TLS, authenticates the caller, validates the envelope,
+classifies it, and _creates_ the record — `Store.Create` succeeds, because the policy does not match
+CREATE. The refusal lands on the very next line, `s.client.Status().Update`, which is where
+`journal/store.go` writes the initial phase that the CREATE dropped along with the rest of the status
+subresource. Every record would sit at an empty `status.phase` with a status _label_ claiming
+otherwise — the exact inversion that store.go's own comment says was fixed once already — and every
+refusal would go unjournaled, contrary to 06 §4.1.
+
+Nothing could have seen it below L2. The envtest suites use a client whose identity is the test's,
+the golden manifest tests asserted the pod's `serviceAccountName` and had no reason to ask what the
+process would later _say_ that name was, and the two halves of the equality live in different
+repositories of thought: one in `internal/controller/broker_manifests.go`, one in `cmd/broker`. It
+required an authenticated agent submitting a real envelope at a deployed broker with the live
+admission policies loaded, which is the definition of this suite and the reason Phase 9 exists.
+
+**The fix is the downward API, not a second derivation.** `buildBrokerDeployment` now sets
+
+```yaml
+env:
+  - name: KAGE_BROKER_SERVICE_ACCOUNT
+    valueFrom:
+      fieldRef:
+        fieldPath: spec.serviceAccountName
+```
+
+and `brokerServiceAccount()` has no fallback at all. Writing `actorServiceAccountName(agent)` into
+the env would have been the smaller diff and would work today; it would also put the two halves of an
+equality the API server evaluates into two places that agree only as long as nobody edits one. Read
+off the pod, they are the same value by construction. Removing the fallback matters independently:
+`pipelineConfig` already refuses an empty actor service account before the listener opens, and the
+default defeated that guard by converting _unconfigured_ into _confidently wrong_ — the strictly
+worse state, because unconfigured fails at startup where someone is watching.
+
+`TestBrokerRecordsTheIdentityItHolds` is the L1 guard. It asserts the fieldRef, not the presence of
+the variable, and a three-mutant check confirms it: dropping the env block, pointing the fieldRef at
+`metadata.name`, and — the one that matters — replacing the fieldRef with a **correct literal** are
+all caught. The third is the regression wearing a disguise, and a test that only asked "is the value
+right?" would wave it through.
+
+#### The other finding, which was a gap in this suite's own fixture
+
+The run before that one stopped one step earlier, at step 3, with
+`403 target-forbidden … cannot get resource "namespaces"`. `classify/resolve.go` reads namespace
+**labels** for every operation that names a namespace, because a namespace label is a classification
+input — an apply into a namespace labelled production is not the same action as the same apply into a
+scratch one. That read happens before any risk class exists, on every envelope.
+
+`actor-tenant-grant.yaml` grants "the kinds the broker's step-3 live reads actually touch" and states
+in its own comment that a kind the pipeline never reads is a kind it must not grant. The namespace
+object _is_ a kind the pipeline reads, and it was missing — the fixture was incomplete against its
+own stated rule. It now grants `get` on `namespaces`, and `get` alone: `GetNamespaceLabels` is a
+single-object read, and `list`/`watch` on a cluster-scoped kind are not requests a namespaced Role
+can authorize, so granting them would read as authority while conferring none. The RoleBinding lives
+in the tenant namespace, so what this actually confers is `get` on that one namespace's own object.
+
+**Filed, not fixed:** the shipped actor grant
+(`k8s-operator/scripts/broker-operations-grant.yaml.template`, 06 §2.2.1) has no `namespaces` rule
+either, and a production broker needs this read for every namespaced operation it classifies. Those
+twenty triples are single-sourced and V-BRK-013 asserts exact equality against them, so adding one is
+a ruling with its own unit — the same shape as P9-T9b-5a — and not something to slip into a suite.
+
+#### The third finding was recorded as a halt, and the halt was wrong
+
+With the namespace read granted, the next run reached the same step and stopped one call later:
+
+```
+403 target-forbidden — step 3: … resolving lower-tier owner: listing Agents to find a lower-tier
+owner: agents.kubeagents.x-k8s.io is forbidden: … cannot list resource "agents" … at the cluster scope
+```
+
+That is not another missing line in a fixture. Reading outward from it, **06 §2.2.1's actor grant is
+not sufficient for the gates 06 §3 and 06 §4.2 require the actor to run**. Four reads, in the order
+the executor makes them:
+
+| Read                                       | Site               | On refusal                                                                                                                                                                 | Covered by the twenty triples?                                                        |
+| ------------------------------------------ | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| namespace labels                           | `resolve.go:88`    | hard error → refuse                                                                                                                                                        | **no** (fixture now grants it; shipped grant does not)                                |
+| `list agents`, **cluster-scoped**          | `livestate.go:335` | hard error → refuse, deliberately: "returning [no owner] when the truth is 'I could not look' would drop the gate exactly when the API server is unhealthy"                | **no** — granted namespaced, and a RoleBinding cannot authorize a cluster-scoped list |
+| every discovered namespaced kind, in scope | `livestate.go:240` | **tolerated** per kind — the count survives holes — but `listed == 0` is a hard error                                                                                      | no, and mostly should not be                                                          |
+| `list secrets`, **in the caller's scope**  | `livestate.go:295` | hard error → refuse; "an empty digest set would report 'no secret material in this payload' for every payload, which is the exfiltration gate answering yes to everything" | **no**                                                                                |
+
+I read that table as a spec contradiction and recorded PROTOCOL §8.5. **That was wrong, and the
+error is worth more than the finding.** Every row of the rightmost column asks "covered by the twenty
+triples?", and the twenty triples are **06 §2.2.1** — the _broker-operations_ grant. They are not the
+actor's authority. **06 §2.2**, one level up and a different object entirely, is the actor **scope**
+template, and its header says what it is: "These are the literal rule bodies the render overlay emits
+and `vap-agent-scope` validates against. A rule not present here is not grantable to an actor
+identity." Read it and every row of the table is answered:
+
+| Read                                       | 06 §2.2 platform ACTOR ClusterRole                                                      |
+| ------------------------------------------ | --------------------------------------------------------------------------------------- |
+| namespace labels                           | `[""] / [namespaces, serviceaccounts, configmaps, secrets] / [get, list, watch, …]`     |
+| `list agents`, cluster-scoped              | `[kubeagents.x-k8s.io] / [agents] / [get, list, watch, create, update, patch, delete]`  |
+| every discovered namespaced kind, in scope | partially; and `CountWorkloadObjects` tolerates a per-kind `Forbidden` by construction  |
+| `list secrets`, in the caller's scope      | `secrets`, cluster-wide, in the same rule as `namespaces` — deliberately, for this tier |
+
+So the "wall" is not a wall. `SecretDigests` already narrows to the namespace whenever the scope has
+one (`if s.Namespace != "" { InNamespace }`); the cluster-wide read arises only for a project-scoped
+platform caller, which is exactly the tier 06 §2.2 hands cluster-wide `secrets` to. There is nothing
+to rule on, no property to weaken, and resolutions 1–3 were three answers to a question the spec had
+already answered. **The halt is withdrawn.**
+
+What is actually true is narrower, and is not a contradiction: **06 §2.2's actor scope template has
+no renderer in this tree.** `k8s-operator/scripts/` holds ten templates and none of them is it; no
+manifest carries the `kube-agents/scope` label or a `cnrm.cloud.google.com` rule; and its validator
+`vap-agent-scope` matches no `name:` anywhere, because it is P10-T1. Unimplemented spec is ordinary
+scheduled work, and confusing it for a contradiction cost this unit a halt.
+
+#### The third finding, stated correctly, and it is the same shape as the first
+
+Set the grant question aside and one thing in the table survives on its own terms:
+
+> **The broker's ownership gate issues a cluster-scoped `list agents` on every namespaced operation,
+> and nothing the install path applies authorizes it.**
+
+§2.2.1 does grant `agents`, but in the **namespaced** half, and its own comment says what for: "step
+5: its own pause state." That is the caller reading its own Agent CR. It is not the ownership lookup.
+`LowerTierOwner` lists cluster-wide because it must — it answers "which agent's _scope_ covers
+namespace X", which cannot be found by listing in X — and `resolveOwner` has no short-circuit at all:
+
+```go
+func resolveOwner(ctx context.Context, live LiveState, caller Caller, op *ResolvedOp) (string, error) {
+	if live == nil {
+		return "", nil
+	}
+	return live.LowerTierOwner(ctx, caller, op.Kind, op.Namespace, op.Name)
+}
+```
+
+`live != nil` is the only guard, so on a freshly provisioned cluster every namespaced envelope fails
+closed at the ownership gate. This is the `brokerServiceAccount()` defect a second time and the
+resemblance is not a coincidence: a read the broker makes on every call, authorized by no grant that
+is actually applied, invisible to every level below L2, and found by the first suite to drive a real
+envelope through the pipeline. The thing that would authorize it is 06 §2.2's tier template — the one
+with no renderer. So the fix is not a spec edit and not a grant widening; it is the missing renderer,
+and it is now scheduled as **P9-T9b-5b-0** below.
+
+#### What this unit landed, and what it did not
+
+Landed and independently verified: the identity defect and its L1 guard, the fixture's missing
+namespace read, and the suite, probe, chain line and floors that produced all three findings. The
+suite's own verdict on the run is `rc 3 DEFERRED` with the blocker printed — it declined to score
+V-BRK-006 or V-REV-001, which is the behaviour it was built to have.
+
+Not landed: V-BRK-006 L2 and V-REV-001 remain unproven. They are not deferrable — both are
+BLOCKING-ALWAYS-family and green at no level, and `check_deferrals_name_blockers` refuses exactly
+that row. They are blocked on P9-T9b-5b-0, which is implementation work this harness can do, not on
+a human.
+
+---
+
+### P9-T9b-5b-0 — the actor grant does not have the shape 06 §2.2 gives it
+
+Scheduled out of the withdrawn halt above; it blocks 5b-i's two unproven claims, 5b-ii and 5c. Its
+first draft said "render 06 §2.2's actor scope template, which has no renderer." Reading §2.2 to the
+end made the finding both smaller and worse, and changed what has to be built.
+
+**06 §2.2 has a fourth fenced block, and it is a placement rule.** After the three tier templates:
+
+```yaml
+# Broker operations — appended verbatim to every actor Role/ClusterRole.
+```
+
+and §2.2.1's own prose agrees — "the three actor templates above cover what an agent **acts on**.
+They do not cover what the broker needs to **run its own pipeline** … Every actor identity
+**additionally** receives exactly this rule set, byte-identical across tiers." So a conformant actor
+identity holds **one** object per tier — a namespaced `Role` for developer-team, a `ClusterRole` for
+cluster-admin and platform — whose rules are the tier template's **plus** the broker-operations rules
+appended.
+
+**The install path builds something else.** `broker-operations-grant.yaml.template` renders a
+tier-neutral pair and splits the rules between them on what its own header calls "THE API'S OWN
+SEAM":
+
+| Object                       | Resources                                                                |
+| ---------------------------- | ------------------------------------------------------------------------ |
+| `ClusterRole` (tier-neutral) | `tokenreviews`, `fleetfreezes`, `changepolicies`                         |
+| `Role` (per namespace)       | `actionrecords`, `actionrecords/status`, **`agents`**, `approvalrosters` |
+
+That split keeps the rule set byte-identical, which is what §2.2.1's sentence asks for in isolation,
+and it silently changes the **scope** of every rule in the namespaced half. §2.2 says these rules are
+appended to the tier's own object; for platform and cluster-admin that object is a **ClusterRole**,
+so `agents: [get, list, watch]` is a cluster-scoped list. Attached instead to a namespaced Role, the
+identical rule authorizes a namespaced list and nothing else.
+
+**That is the whole of the step-3 failure.** `LowerTierOwner` needs a cluster-scoped `list agents`;
+06 §2.2 grants it to the top two tiers; the install path renders it namespaced; no identity on any
+cluster has ever held it. It is not a missing template and not a spec gap — the authority is
+specified, and an object-shape decision made in the render overlay demotes it. The same demotion
+applies to `actionrecords` and `approvalrosters`, which is worth checking in the same unit rather
+than discovering one at a time.
+
+**Why this cannot be one unit, and the ordering that follows.** `dev/tests/actor-grant-single-sourced.py`
+(V-BRK-013) asserts that every object labelled `kube-agents/role: actor` has rules **exactly** equal
+to §2.2.1's twenty triples, and its template says a superset fails as readily as a subset. Under
+§2.2 a conformant actor object is a strict superset by construction, so the check as written
+**encodes the deviation**: fix the install path and the check goes red; land a conformant template
+wearing the actor label and the check goes red before the install path is touched at all. That is a
+previously-green BLOCKING-ALWAYS suite going red, i.e. Halt 2, reached by doing the right thing.
+
+The check is not being _weakened_ — the reshaped assertion is "equals the tier template ∪ the twenty
+triples", which asserts strictly more and still fails both directions — so PROTOCOL §10.2 is not
+engaged. But it is a check change motivated by an implementation defect, which Guardrail 9 puts in a
+different unit from the fix. Three ordered sub-units, and the order is forced:
+
+- **5b-0-i — reshape V-BRK-013 to read 06 §2.2 as well as §2.2.1.** Discover actor objects by label,
+  determine the tier from `kube-agents/tier`, and require the rule set to equal the tier's §2.2
+  template plus the §2.2.1 block, in both directions. The existing shared pair is recognized during
+  the transition by the marker its own header already claims (tier-neutral, no `kube-agents/tier`)
+  and asserted against §2.2.1 alone, so the check stays green on today's tree while describing
+  tomorrow's. Needs the multi-line flow-sequence handling §2.2's blocks use and §2.2.1's do not —
+  Prettier reflows long `resources: [...]` lists — so `_flow_items` gains a bracket-joining
+  normalizer. No install change. L0.
+- **5b-0-ii — render the conformant per-tier actor object.** Three templates
+  (`actor-grant-{developer-team,cluster-admin,platform}.yaml.template`, following the existing
+  per-tier template family), a `render_actor_grant <tier> <namespace> <leaf>`, the binding, and the
+  wiring into `apply_agent_identity` — which already renders grant-then-identity in that order for
+  the reason this needs too. Retire the shared pair rather than delete it. L0 for the equality, L2
+  for the two-sided `auth can-i` that proves the scope actually changed.
+- **5b-0-iii — re-run `broker-execute-l2.sh` past step 3** and score V-BRK-006 L2 and V-REV-001.
+
+**New check ID.** None. This is V-BRK-013 doing what it was always for; a second check reading the
+same spec section would be the two-copies-that-agree failure its own template warns about. Next free
+V-BRK id is **V-BRK-033** if 5b-0-ii's L2 arm turns out to need one of its own.
+
+**Not in this unit family.** `vap-agent-scope` (P10-T1) is §2.2's validator and may lag the grant —
+precisely the state §2.2.1 has shipped in since P9-T7d-5.
+
+### P9-T9b-5b-0 — outcome so far: two product defects fixed, and 5b-0-ii confirmed as the blocker
+
+The plan above was written before any of it had been executed against a live broker. Three
+`broker-execute-l2.sh` runs later it is neither superseded nor wrong — it is **vindicated and was
+attempted too narrowly**. This section records what actually landed, the two product defects the
+runs found, and why V-BRK-006 (L2) and V-REV-001 are still `deferred`.
+
+#### What was tried instead of 5b-0-i/ii, and why it was not enough
+
+`8182078` took the small road: it moved `agents [get,list,watch]` from the namespaced half of
+`broker-operations-grant.yaml.template` to the tier-neutral `ClusterRole`, which is the single rule
+the step-3 diagnosis above named. That is a real fix and it holds — `LowerTierOwner` now gets its
+cluster-scoped `list agents` — but it treated a **class** of demotion as one instance of it. The
+plan's own sentence "the same demotion applies to `actionrecords` and `approvalrosters`, which is
+worth checking in the same unit rather than discovering one at a time" was the warning, and the
+thing discovered one at a time turned out not to be in §2.2.1 at all.
+
+#### Defect 4 — `ScopeOfTarget` built a malformed target scope for the platform tier
+
+Fixed at `0e0ebf0`. Found by the second run, which got past the `agents` list and died one line
+later with `503 snapshot-failed … target scope {ProjectID:your-gcp-project-id ClusterName:
+Namespace:kubeagents-execute-tenant} is malformed`.
+
+`ScopeOfTarget` built the target's scope by stamping the target's namespace onto the caller's
+**authority** scope. 06 §1.2 gives the platform tier `projectId` and nothing else, so for a platform
+caller that produced `{p, "", ns}` — an empty level above a non-empty one, which is precisely the
+hole `scope.IsWellFormed` exists to reject and `scope.Contains` would read as a wildcard.
+`resolveOwner` guards the live lookup with nothing but `live != nil`, so **the broker answered 503 at
+step 3 for every namespaced operation a platform agent had ever submitted, on every cluster, since
+the ownership lookup started reading live state.**
+
+The missing datum is not authority — it is which cluster the target sits in, and a broker serves
+exactly one. `Caller` gains `ServingCluster`, read from `spec.harness.clusterName` on the broker's
+own Agent CR, and `ScopeOfTarget` fills the cluster from it when the caller's scope names none. Filled
+**unconditionally**, for the same reason the namespace assignment is: the conditional form is the
+gat-151 shape one line up, and here it would leave a platform agent's cluster-scoped writes ungated
+against a cluster-admin owner.
+
+Invisible below L2 by construction: the one platform-tier unit test that reached `Find` passed `""`
+for the namespace, the single target shape that does not open the hole.
+`TestTargetScopeIsWellFormedForEveryTier` now covers the cross product of three tiers × two target
+shapes and the fail-closed direction; mutation verdict `caught`.
+
+The fix does not move the blast-radius denominator (`CountWorkloadObjects` reads `s.Namespace` and
+nothing else). Its only other behavioural delta is that a platform agent's cluster-scoped writes now
+gate as `cross-tier-direct-operation` when a cluster-admin agent owns the cluster, which is what
+06 §4.2 says and is strictly more gating, never less.
+
+#### Defect 5 — the material-egress scan needs an authority only 06 §2.2 confers
+
+The third run got past ownership and stopped at
+
+```
+403 target-forbidden — step 3: resolving 1 operations against live state: resolving secret digests:
+listing Secrets in scope your-gcp-project-id// for the material-egress scan: secrets is forbidden:
+User "system:serviceaccount:kubeagents-system:platform-your-gcp-project-id-actor" cannot list
+resource "secrets" in API group "" at the cluster scope
+```
+
+**The product is conformant here and the identity is not.** 06 §4.2's `secret-material-egress`
+builds its digest set from "every `Secret` **readable in the caller's scope**", and 06:1659 fixes
+the granularity — "scoped to the caller's own namespace / cluster rather than the fleet". For a
+platform caller that is the serving cluster, so a cluster-wide `list secrets` is the specified read.
+`livestate.SecretDigests` fails **closed** on a denied List and is right to: treating Forbidden as an
+empty digest set would report "no secret material" for every payload, and the actor's grant is not a
+sound proxy for the reader SA's, so an unreadable Secret is not an unexfiltratable one.
+
+06 §2.2's platform template grants exactly this — `- apiGroups: [""] resources: [namespaces,
+serviceaccounts, configmaps, secrets] verbs: [get, list, watch, …]`, on a **ClusterRole**. It is not
+in §2.2.1 and never was, so no narrowing of the shared pair reaches it. **Only 5b-0-ii lands it.**
+
+**And the fixture path is closed, deliberately.** The obvious shortcut — widen the test-only overlay
+— cannot be taken and should not be:
+
+- V-CTN-037 (`check_test_only_grants_are_confined`, L0, BLOCKING-ALWAYS) fails any
+  `kube-agents/test-only-grant` document that is cluster-scoped. A `ClusterRole` granting cluster-wide
+  `list secrets` is exactly that. The check refuses the shortcut before review has to.
+- `actor-tenant-write-grant.yaml`'s header already ruled on the narrower version: "`secrets` is
+  absent and is the one omission worth stating … a test-only grant over Secrets on a shared scratch
+  cluster is the one thing here that would be worth stealing."
+
+So the blocker is not environmental and not a missing fixture. It is the install path owing the
+platform actor an authority the spec gives it, which is 5b-0-ii, gated behind 5b-0-i by Guardrail 9.
+
+#### The tier the suite drives, recorded as a question and not resolved here
+
+`broker-execute-l2.sh` drives `examples/gitops-repo/fleet/platform-agent.yaml`, i.e. a **platform**
+agent writing a ConfigMap into a tenant namespace — which is the operation 03 §3.2 says the platform
+agent may not perform directly and 06 §4.2's `cross-tier-direct-operation` exists to gate. Driving
+the suite as a developer-team caller would be more faithful **and** would put the digest-set list
+inside one namespace, where a namespaced test-only Role can grant it within V-CTN-037's bounds.
+
+It is not done here because V-6 (`validateParentCeiling`) requires a developer-team Agent CR to name
+a live cluster-admin parent, which must in turn name a platform parent: the suite would seed a
+three-agent chain, three actor identities and three broker deployments. That is a fixture reshape of
+its own size, and it would also stop exercising defect 4's fix at L2 (a developer-team caller's scope
+already names its cluster, so the `ServingCluster` fill never fires). Recorded as a carried finding
+for 5b-0-ii to rule on once the grant exists, not as a way around the grant.
+
+#### Verdicts
+
+| ID            | Level | Verdict    | Blocker                                                                    |
+| ------------- | ----- | ---------- | -------------------------------------------------------------------------- |
+| **V-BRK-006** | L2    | `deferred` | P9-T9b-5b-0-ii — the platform actor holds no §2.2 grant, so step 3 refuses |
+| **V-REV-001** | L2    | `deferred` | same                                                                       |
+| **V-BRK-013** | L0    | `pass`     | unchanged and green; no check was touched in this unit                     |
+
+The suite reports this as `DEFERRED: the envelope was not accepted, so no journal entry exists to
+judge`, which is the correct shape — neither row is about admission, and a check that could not run
+its property is never a pass.
+
+### P9-T9b-5b-0-i — V-BRK-013 now reads 06 §2.2 as well as §2.2.1
+
+The check had one definition site and one bound: every Role/ClusterRole labelled
+`kube-agents/role: actor` holds exactly 06 §2.2.1's twenty broker-operations triples. That is true of
+today's tree and it is the sentence that has to stop being true before 5b-0-ii can render anything —
+so it is replaced here, in its own unit, per Guardrail 9.
+
+It now reads **two** definition sites and joins them by tier. 06 §2.2 gives three per-tier ACTOR
+templates — what an agent acts on, different for each tier — and §2.2.1 gives the grant every actor
+identity _additionally_ receives, byte-identical across tiers. What an object is owed therefore
+depends on whether it stamps itself with a `kube-agents/tier`:
+
+- **tier-neutral** (no `kube-agents/tier`) — the shared broker-operations pair, owed §2.2.1 alone.
+  That is all eleven actor objects in the tree today.
+- **tier-stamped** — owed its tier's §2.2 template **∪** §2.2.1's grant.
+
+Property 3 (nothing outside the bound) and property 4 (the bound is fully realised) are both
+evaluated against that per-tier set. Property 4 stays a **union over the tier's objects** rather than
+a per-object equality, because the grant is deliberately split across a ClusterRole and a Role —
+cluster-scoped reads above, persisted writes below — and it is only demanded of a tier that has at
+least one object. A tier with none has not been rendered yet, and a BLOCKING-ALWAYS check that goes
+red until an unrelated future unit lands is not a deferral 09 §9.6 permits; it is a red gate.
+
+Reading §2.2 at all required one parser change. Its `resources:` lists are long enough that Prettier
+reflows them across lines, and §2.2.1's are not, which is why this never came up. `parse_rules` gains
+`_join_flow_sequences`, a bracket-depth pass that collapses a reflowed flow sequence back onto one
+logical line **before** the key/value reader sees it. Joining is done there, on physical lines, and
+not by making the reader tolerant of newlines: a `resources:` with nothing after it is
+indistinguishable from the start of a _block_ sequence until you have counted brackets, and quietly
+reading a block sequence as empty is exactly the silently-smaller-grant failure `GrantSyntaxError`
+exists to prevent. Depth only rises at a `[`, so a bare `resources:` still raises.
+
+#### Two things the unit found that the plan did not have
+
+**1. `k8s-operator/scripts/*.yaml.template` was outside the check's population.** `read_sources`
+admitted `.yaml` and `.yaml.tmpl`. The provisioning path renders `broker-operations-grant.yaml.template`,
+so the one copy of the grant that actually lands on a live cluster was the one copy nothing compared
+to the spec — and it is also where 5b-0-ii's per-tier templates will live, which would have made the
+whole tier arm describe a tree it could not see ([[LSN-036]], [[LSN-050]]). Fixed by extension, not
+by path. The corpus goes from 6 actor objects to 11; both new ones are green.
+
+**2. The spec permits the per-tier object and the shipped admission policy refuses it.** This is the
+real find, and it is a constraint on 5b-0-ii that the plan did not carry.
+
+`vap-agent-readonly` validation 3 bounds every actor object to a literal CEL allow-list under
+`failurePolicy: Fail`, and property 2 has always asserted that allow-list equals §2.2.1's grant. Its
+`isActor` variable selects on the actor label **alone**, with no tier condition — so it governs
+tier-stamped objects too. A conformant platform actor ClusterRole carries 122 triples from 06 §2.2,
+of which **116 are outside that allow-list**, `list secrets` among them. The API server would refuse
+the apply. The spec says one thing, the installed policy says the other, and the two disagreeing
+quietly is how a render lands that no cluster will ever accept.
+
+06 §2.2 names `vap-agent-scope` as the validator for the tier templates and it does not exist
+(P10-T1). Note that landing it does not by itself help: admission is conjunctive, so a second policy
+admitting the tier rules leaves `vap-agent-readonly` still rejecting them. **The bound in
+`vap-agent-readonly` itself has to move, in the same unit as the render.**
+
+That is now **property 6** — no actor object grants a triple the installed allow-list rejects,
+measured against the **intersection** across copies, because a rule admitted by one cluster's policy
+and refused by another's is refused. It is green today (no tier-stamped object exists) and goes red
+the moment 5b-0-ii renders one without moving the bound.
+
+Property 6 reduces "admission would reject it" to "it is outside the allow-list" **only** while
+`isActor` is the bare label test. Narrowing `isActor` is the most natural way to make property 6's
+finding go away, it reads as a scoping fix, and it silently turns the reduction false. So the premise
+is asserted rather than assumed: **property 7** compares the `isActor` expression, in every copy,
+against the one form the reduction holds for.
+
+#### What ran
+
+| Artifact                                           | Result                                                                                                                 |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `actor-grant-single-sourced.py`                    | PASS — 20 grant triples; §2.2 adds cluster-admin=157, developer-team=152, platform=122; 3 VAP copies; 11 actor objects |
+| `actor-grant-single-sourced.py --negative-control` | PASS — **14/14** (was 8/8), each caught by the property it targets                                                     |
+| `dev/tests/invariants-gate.py`                     | 22/22                                                                                                                  |
+| full `dev/L0-CHAIN.txt`                            | clean                                                                                                                  |
+
+The six new mutations exist because the tier arm has no subject in the real tree, and an arm no input
+reaches is unexercised prose ([[LSN-035]]). The control **synthesises** the object 5b-0-ii will
+render — built _from_ the spec, not from a literal copied out of it, because a literal would be a
+fourth definition site and that is the one thing this check exists to forbid — and then perturbs it:
+conformant-but-inadmissible (property 6), one rule its template excludes (3), one rule its template
+requires, dropped (4), a typo'd tier (the mis-stamp that the old check would have measured against
+the wrong template and passed), a narrowed `isActor` (7), and a spec flow sequence swapped for a
+block sequence (the joiner's own risk).
+
+No mutant spec under `verification/mutants/`: V-BRK-013 predates `dev/mutate.py` and carries its
+sweep in-tree as `--negative-control`, which is the same discipline — each mutation named, and caught
+by the property it targets, not merely by the check going red.
+
+#### Verdicts
+
+| ID            | Level | Verdict | Note                                                                   |
+| ------------- | ----- | ------- | ---------------------------------------------------------------------- |
+| **V-BRK-013** | L0    | `pass`  | reshaped; strictly more asserted, 14/14 control, green on today's tree |
+
+Unchanged and still blocked: **V-BRK-006** (L2) and **V-REV-001**, on 5b-0-ii. 5b-0-ii now owes three
+things rather than two — the per-tier actor object, the binding, **and** the `vap-agent-readonly`
+allow-list that admits it.
+
+### P9-T9b-5b-0-ii-a — the phase profile, and the two shapes of the bound
+
+5b-0-ii was planned as one unit: render the per-tier actor object, bind it, and (after 5b-0-i) widen
+the allow-list that admits it. Planning it turned it again, and made it both smaller and different in
+kind.
+
+#### 06 §2.2's templates cannot be rendered whole inside Phase 9
+
+The platform ACTOR ClusterRole at 06:714–760 grants `create`/`update`/`patch`/`delete` on
+`namespaces, serviceaccounts, configmaps, secrets` **cluster-wide**. Phase 9's acceptance in 07 §2 is
+that the whole safety machinery runs end to end **with no write authority anywhere** — actor SAs bound
+to "empty" roles, everything dry-run. Rendering the template whole would hand every platform actor
+cluster-wide `delete secrets` in the phase whose entire point is that nothing can write. That is not a
+sizing problem; it breaks the phase's own acceptance criterion.
+
+#### The spec already sequences the write half elsewhere
+
+03 §4.2 (03:245–254) is decisive: `vap-agent-scope` is "**the same policy object as the read-only
+generation's `vap-agent-readonly`, inverted**: reader SAs keep the read-verb allow-list; actor SAs get
+a scope-and-template allow-list instead of a blanket write denial", and "'exceeds its tier template'
+is decidable in CEL **only because the template is compiled into the policy as a literal allow-list,
+generated from the same source as the rendered manifests**." That generator is **P10-T0**, deliberately
+scheduled ahead of **P10-T1**'s flip. Hand-transcribing three per-tier literal allow-lists into YAML
+in Phase 9 is exactly what B-002 refused, and would create a fourth definition site of the thing
+V-BRK-013 exists to single-source.
+
+So: **Phase 9 renders the READ half.** All four of `broker-execute-l2.sh` step 3's live reads
+(`list secrets`, `get namespaces`, `list agents`, the per-kind counts) are reads, so the read profile
+is sufficient to unblock V-BRK-006 (L2) and V-REV-001. The write half arrives with `vap-agent-scope`.
+
+#### What admission then needs, and what it does not
+
+Validation 3's inner test becomes `v in ['get','list','watch'] || (g+'/'+res+':'+v) in [ …20… ]`. No
+new literal list, no `has(...)` carve-out (5a's ruling forbids those as "a hole in the one runtime
+backstop, shaped exactly like a label that turns the policy off"), and `isActor` untouched. It
+preserves 01:200's stated property exactly — the set of **write** verbs admissible to any agent
+identity stays the four already enumerated — and it makes the actor arm say what validation 1 already
+says about every other agent RBAC object. **03 §4.3's obligation table (03:277–287) assigns
+`vap-agent-scope` only _write_ obligations for actors**; no row obliges admission to bound actor
+_reads_ per tier, which is what licenses the disjunct.
+
+#### Guardrail 9 forces the split, again
+
+The check must learn the new shapes before the product carries them. **5b-0-ii-a** (this unit, check
+only) → **5b-0-ii-b** (three read-only templates, `render_actor_grant`, the binding, the wiring into
+`apply_agent_identity`, retire the shared pair, and the disjunct in all three VAP copies) →
+**5b-0-iii** (L2).
+
+#### What changed in V-BRK-013
+
+**A ceiling and a profile, which are not the same set.** Property 3's bound becomes `ceiling(tier)` —
+the whole of 06 §2.2 ∪ §2.2.1, write verbs and all, which does **not** move with the phase. Property
+4's bound becomes `profile(tier)` — §2.2.1's grant plus the read verbs of §2.2's template while
+`DARK_PROFILE` holds. Only the completeness direction moves. The asymmetry is guarded: a strict-subset
+assertion plus a floor of 10 triples fails loudly if the read filter ever selects nothing away (dark
+mode is over, say so) or eats the template (the filter is broken).
+
+**Property 2 gained an assertion it never had.** The allow-list is only a bound in the company of the
+CEL that consumes it, so validation 3's verb test is now pinned to exactly two shapes: `bare` (the
+list alone) or `read-widened` (the list plus the three read verbs). A third shape is a failure. A
+check that reads the list and shrugs at the expression would score a `v != 'delete' ||` prefix —
+everything but one verb, admitted — as an unchanged twenty-triple policy.
+
+**Property 6 became the mechanism rather than the intention.** Its bound is whichever shape _every_
+copy carries, conjunctively. Under `read-widened`, a write triple from a tier's own template is
+admitted by neither disjunct — so what holds Phase 9 dark is admission, and this check asserts
+admission's shape rather than trusting the render to stay honest.
+
+`DARK_PROFILE = True` is the one constant that flips, in the same unit that widens the allow-list from
+`read-widened` to P10-T1's per-tier template allow-list. Flipping either alone turns the check red,
+which is the intended coupling.
+
+#### One hole the probe found, and closed
+
+Verifying "green on the tree 5b-0-ii-b will produce" is not optional for a check reshaped ahead of its
+implementation — a check that is green today and red on the correct future tree makes the next unit
+look like it broke something. Probing it that way found a false negative: **the check would have
+passed a `developer-team` ClusterRole**, which `vap-agent-readonly`'s wrong-scope validation denies
+outright. 06 §2.2 gives all three tiers a template and says nothing about the **kind** that carries
+it, so "render each tier's template" reads as a ClusterRole three times, is perfectly conformant to
+§2.2, is admissible under a widened validation 3 — and is refused anyway. Property 6 now covers
+validation 2 as well, with the namespace-scoped tier **parsed out of the policy**, not named in the
+check: "developer-team is namespace-scoped" already has definition sites in 03 §4 and in the policy,
+and a third one inside the check that exists to forbid third copies would be its own joke.
+
+#### What ran
+
+| Artifact                                           | Result                                                                                                          |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `actor-grant-single-sourced.py`                    | PASS — per tier, ceiling/profile: cluster-admin 171/83, developer-team 172/89, platform 136/68; 3 copies `bare` |
+| `actor-grant-single-sourced.py --negative-control` | PASS — **20/20** (was 14/14), each caught by the property it targets                                            |
+| the future-tree probe                              | 0 findings on the widened policy + three read-only profiles, developer-team as a `Role`                         |
+| `dev/tests/invariants-gate.py`                     | 22/22                                                                                                           |
+| `negative-controls-name-their-rule.py`             | PASS — 11 controls                                                                                              |
+| full `dev/L0-CHAIN.txt`                            | clean                                                                                                           |
+
+The six new mutations are the six wrong ways to land 5b-0-ii-b: the render without the widening (the
+ordering constraint 5b-0-i discovered, restated as a mutation); the widening with a **write** verb in
+the disjunct; a profile missing one read triple; the whole template rendered under a widened policy —
+the row without which `DARK_PROFILE` would be a comment, since property 4 alone permits a superset;
+the namespace-scoped tier as a ClusterRole; and a copy losing its wrong-scope validation.
+
+#### Verdicts
+
+| ID            | Level | Verdict | Note                                                                                     |
+| ------------- | ----- | ------- | ---------------------------------------------------------------------------------------- |
+| **V-BRK-013** | L0    | `pass`  | strictly more asserted; 20/20 control; green on today's tree **and** on 5b-0-ii-b's tree |
+
+Still blocked on 5b-0-ii-b: **V-BRK-006** (L2) and **V-REV-001**.
+
+---
+
+### P9-T9b-5b-0-ii-a-fix — the phase arm reads both copies (halt cleared)
+
+**Out of sequence, and it has to be.** This unit is not part of the 5b-0-ii-\* ladder; it exists
+because PR #83's first CI run turned **V-BRK-023** (L1, **BLOCKING-ALWAYS**) red and a
+BLOCKING-ALWAYS failure halts everything until a human clears it. The clearance came as
+_"run the harness until completion, start with the failed PR #83"_ (2026-07-30). The halt is closed;
+the ladder resumes at `5b-0-ii-b`, unchanged.
+
+#### What was wrong, in the order it has to be read
+
+Nothing about V-BRK-023's 2026-07-29 pass was untrue when it was written. `ActionRecord` carries
+`+kubebuilder:subresource:status`, so `client.Create` drops the status block, so a freshly created
+record's `status.phase` was empty **on the server** no matter what the caller set. The confirmer's
+phase arm therefore read the `kube-agents/status` **label**, and said so at length, on the explicit
+ground that reading `status.phase` "would have looked more correct and would have been vacuous".
+
+`304c1d5` then made that premise false, correctly. 06 §4.3 makes `status.phase` **authoritative** and
+the label a **derived index**; leaving status empty inverted the two, and every parked record read
+back an empty phase behind a label claiming otherwise. `journal.Store.Create` now follows itself with
+a `Status().Update`. `TestCreateDropsStatusAndKeepsThePhaseLabel` went red at that commit saying
+exactly this, in a failure message that named the remedy — which is the whole reason it asserted a
+premise rather than trusting one, and the reason the diagnosis cost one reading of the log instead of
+a bisect.
+
+**What the correction exposed is worse than a stale assertion, and is the actual finding.**
+`journal.Store.SetPhase` writes status **first** and the label **second**, and documents the second
+as _"best-effort ordering, never best-effort truth … the reconciler repairs the label if this second
+write is lost"_. So there is a window — unbounded, if that write is lost — in which `status.phase` is
+`Rejected` and the label still reads `Executing`. An arm reading the label alone reads the
+**non-authoritative** copy and **admits** the action. A fail-open window inside a fail-closed arm,
+in the last thing standing between a parked record and a live mutation.
+
+#### The fix, and why (b) rather than (a) or (c)
+
+The halt posed three options and named (b) as _"the only one that is strictly fail-closed in the
+divergence window"_. `ConfirmDurable` now reads both copies and refuses in two steps:
+
+1. **Divergence is a refusal in its own right.** When the authoritative copy and its index disagree
+   there is no single answer to "what phase is this record in", and the write-ahead rule does not
+   recognise _"probably Executing"_ any more than it recognises _"probably journaled"_. This is
+   strictly more than option (a) would give: it fails closed on the `SetPhase` window in **both**
+   directions, including the one where the label is ahead of status.
+2. **Past that, the agreed phase must be `Executing` or unset.** Both-empty still confirms —
+   `journal.Labels` omits the label when the phase is unset and `Create` returns before the status
+   write, so "no phase at all" is a shape a caller can legitimately produce, and it is the
+   two-empties case rather than a half-written record.
+
+Choosing either copy alone trades one guarantee for the other. Requiring both costs one assertion.
+
+#### Guardrail 9 and §10.2, argued rather than waived
+
+- **§10.2** (narrowing a BLOCKING-ALWAYS check is itself a halt) does not engage: the arm refuses a
+  strict superset of what it refused before.
+- **Guardrail 9** (a check may not change in the same unit as the implementation whose failure
+  motivated it) holds on three independent grounds. The replaced test exercises `journal.Store.Create`
+  and **not** the confirmer, so changing the arm does nothing to make it green — the
+  edit-the-check-to-green-the-implementation shape is structurally absent, not merely resisted. The
+  implementation whose failure motivated the test change is `304c1d5`, a **prior committed unit**. And
+  the assertion count goes **up**: 17 test functions / 30 cases → 19 / 38.
+
+#### What landed in the tests
+
+`TestCreateDropsStatusAndKeepsThePhaseLabel` is **replaced** by
+`TestCreateWritesBothThePhaseAndItsLabel`, which measures the new ground truth against a real API
+server and asserts three things: status carries the phase, the label carries it, and the two agree.
+Added alongside it:
+
+- `TestARecordWhoseStatusMovedWithoutItsLabelDoesNotConfirm` — reproduces the `SetPhase` window by
+  issuing `Status().Update` **directly**, deliberately not through `SetPhase`, precisely so the label
+  is left behind; asserts the half-written state really is on the server before confirming.
+- `TestEveryPhaseSurvivesLabelEncodingUnchanged` — the divergence arm compares byte-for-byte, so a
+  future phase name that `journal.labelValue` rewrites (a slash, a space, 64 bytes) would refuse
+  **every action of that phase**. Discovered by asking what the new arm's inputs are, not by a
+  failure.
+- Six divergence subtests in `TestEveryRefusalIsNotDurable`, plus an `atPhase()` fixture helper that
+  sets **both** copies, so the divergence arm and the phase arm can never cover for each other by
+  accident.
+
+#### Verdicts
+
+| ID            | Level | Verdict | Note                                                                                                                |
+| ------------- | ----- | ------- | ------------------------------------------------------------------------------------------------------------------- |
+| **V-BRK-023** | L1    | `pass`  | halt cleared; 19 functions / 38 cases, 0 skipped; 100.0% of statements; 19/19 mutants caught; `results.csv` row 147 |
+
+Non-vacuity is `verification/mutants/V-BRK-023.json`, committed here for the first time — the
+2026-07-29 sweep for this ID ran through the superseded `dev/mutate.sh` and left nothing behind to
+re-run. Its first key is a warning rather than a mechanism, and that gap is [[LSN-054]]: six of the
+nineteen mutants are caught only by envtest tests and score **ESCAPED** if `KUBEBUILDER_ASSETS` is
+unset, and `go test -list` — the guard [[lsn-048]] added so a missing catcher cannot read as a
+survivor — compiles rather than runs, so it lists those six either way and stays silent.
+
+#### Lessons opened
+
+- **[[LSN-054]]** — an envtest suite `t.Skip`s itself when the assets are unset, so the package prints
+  `ok` over a red test. Fifteen `*_envtest_test.go` files here behave identically. The sharp part is
+  that **[[LSN-052]]'s own preferred mechanization, `go test ./...`, is green on this failure**: a
+  mechanization that would not have caught the escape that motivated it is [[lsn-019]] arriving inside
+  the fix for LSN-052. The corrected candidate names `make -C k8s-operator test`.
+- **[[LSN-055]]** — twenty-five CHECKPOINT commits, one push, one CI run, and the red belonged to a
+  commit twenty back. Also establishes that LSN-052's candidate 2 (a push trigger on non-`main`
+  branches) is necessary but **insufficient**: a trigger nothing triggers is still one run.

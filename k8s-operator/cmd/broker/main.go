@@ -50,16 +50,34 @@ import (
 	"strconv"
 	"time"
 
-	// Import all Kubernetes client auth plugins (e.g. GCP, OIDC) so in-cluster and exec auth both work.
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	// NO `_ "k8s.io/client-go/plugin/pkg/client/auth"` here. The kubebuilder scaffold puts that blank
+	// import in every command it generates, and it is a PLUGIN LOADER: it exists to register
+	// out-of-process credential providers -- OIDC, and historically the cloud ones -- so that a
+	// kubeconfig may name a binary for the client to fork. The broker authenticates one way, with the
+	// projected token the kubelet mounts, and 08 §2.1 puts it on the smallest possible supply chain
+	// precisely because it is the one pod in the mesh whose ServiceAccount can write. Registering
+	// providers it will never use widens the runtime for nothing. Removed in P9-T9b-3 and kept out by
+	// V-RUN-010 (`dev/tests/broker-supply-chain-minimal.py`), which fails on any blank import here.
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
+
+	// The narrow subpackages, NOT the `ctrl "sigs.k8s.io/controller-runtime"` convenience alias. The
+	// alias is a facade over `pkg/manager`, `pkg/builder` and `pkg/controller` -- an entire
+	// controller runtime, in a process that runs no controller -- and `pkg/manager` imports
+	// `net/http/pprof`, whose package init registers /debug/pprof on http.DefaultServeMux. Nothing in
+	// this process serves DefaultServeMux, so the handlers were unreachable; they were also linked
+	// into the one image 08 §2.6 hardens hardest, one `http.ListenAndServe(addr, nil)` from being a
+	// second door next to the write credential. The doc comment above has claimed "no pprof" since
+	// this file was written; until P9-T9b-3 the binary disagreed with it. Four call sites, no
+	// behaviour change, and V-RUN-010 keeps the alias out.
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker"
@@ -69,7 +87,7 @@ import (
 
 var (
 	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
+	setupLog = ctrllog.Log.WithName("setup")
 )
 
 func init() {
@@ -144,11 +162,11 @@ func main() {
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	ctrllog.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	if waitMode {
 		w.certFile, w.keyFile, w.clientCAFile = o.certFile, o.keyFile, o.clientCAFile
-		if err := runWaitForBroker(ctrl.SetupSignalHandler(), w); err != nil {
+		if err := runWaitForBroker(signals.SetupSignalHandler(), w); err != nil {
 			// A configuration fault, not an unready broker — see runWaitForBroker. Exiting
 			// non-zero here is correct precisely because it is NOT the timeout path.
 			setupLog.Error(err, "wait-for-broker could not run")
@@ -157,7 +175,7 @@ func main() {
 		return
 	}
 
-	if err := run(ctrl.SetupSignalHandler(), o); err != nil {
+	if err := run(signals.SetupSignalHandler(), o); err != nil {
 		setupLog.Error(err, "broker exited with error")
 		os.Exit(1)
 	}
@@ -169,7 +187,7 @@ func run(ctx context.Context, o options) error {
 		return err
 	}
 
-	cfg, err := ctrl.GetConfig()
+	cfg, err := ctrlconfig.GetConfig()
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)
 	}
@@ -185,7 +203,7 @@ func run(ctx context.Context, o options) error {
 		return fmt.Errorf("build API client: %w", err)
 	}
 
-	security := broker.LogSecuritySink{Log: ctrl.Log.WithName("security")}
+	security := broker.LogSecuritySink{Log: ctrllog.Log.WithName("security")}
 
 	// ONE store, shared by the pipeline's step 11 and by the rejection journal below. A second one
 	// would be a second answer to "which namespace do records live in".
@@ -240,7 +258,7 @@ func run(ctx context.Context, o options) error {
 			ActorServiceAccount: brokerServiceAccount(),
 		},
 		Security:  security,
-		Log:       ctrl.Log.WithName("broker"),
+		Log:       ctrllog.Log.WithName("broker"),
 		Namespace: o.namespace,
 	})
 	if err != nil {
@@ -365,11 +383,24 @@ func (o *options) tlsConfig() (*tls.Config, error) {
 
 // brokerServiceAccount reports the broker's own write identity for the journal's `actor` field.
 // Recorded so a record says who COULD have written, distinct from who asked.
+// brokerServiceAccount is the identity this broker actually holds, projected into the pod by the
+// downward API from `spec.serviceAccountName` (see buildBrokerDeployment).
+//
+// There is no fallback, and the missing one is the point. It used to return "kage-broker" -- the
+// IMAGE's name, which is not a ServiceAccount anywhere in this repo -- and that default is why a
+// deployed broker could never write a record's status: it stamped `spec.actorServiceAccount:
+// kage-broker` into every ActionRecord, the journal policy computed `isOwningBroker` as
+// `system:serviceaccount:<ns>:kage-broker`, and the authenticated user was
+// `system:serviceaccount:<ns>:<tier>-<leaf>-actor`. The equality could not hold for any broker, in
+// any namespace, ever, and nothing said so until an envelope was submitted at a real one.
+//
+// `pipelineConfig` already refuses an empty actor service account before the listener opens. The
+// default defeated that guard by turning "unconfigured" into "configured wrong", which is the
+// strictly worse of the two states: unconfigured fails at startup where someone is watching, and
+// configured-wrong fails on the status write, after the action has been classified and the record
+// created, in a code path nothing exercised without a cluster.
 func brokerServiceAccount() string {
-	if v := os.Getenv("KAGE_BROKER_SERVICE_ACCOUNT"); v != "" {
-		return v
-	}
-	return "kage-broker"
+	return os.Getenv("KAGE_BROKER_SERVICE_ACCOUNT")
 }
 
 func envOr(key, fallback string) string {

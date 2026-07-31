@@ -93,6 +93,18 @@ def params(fn: ast.FunctionDef) -> set[str]:
     return {a.arg for a in fn.args.args + fn.args.kwonlyargs} - {"self"}
 
 
+def required_params(fn: ast.FunctionDef) -> set[str]:
+    """Parameters with no default -- the ones the model must supply or the call does not happen.
+
+    Positional defaults bind to the tail of `args`; keyword-only defaults are positionally aligned
+    with `kwonlyargs` and are `None` where absent.
+    """
+    positional = fn.args.posonlyargs + fn.args.args
+    required = {a.arg for a in positional[: len(positional) - len(fn.args.defaults)]}
+    required |= {a.arg for a, d in zip(fn.args.kwonlyargs, fn.args.kw_defaults) if d is None}
+    return required - {"self"}
+
+
 def tools_the_skill_calls(text: str) -> set[str]:
     """Every `name(` the skill writes in code voice -- backticked or in a fenced block."""
     called = set(re.findall(r"`([a-z_][a-z0-9_]*)\(", text))
@@ -175,10 +187,51 @@ class TestItDescribesToolsThatExist(unittest.TestCase):
             f"submit_action takes {sorted(params(self.tools['submit_action']))}.",
         )
 
-    def test_the_skill_names_intent_and_operations_because_they_are_required(self):
-        for required in ("intent", "operations"):
-            self.assertIn(required, params(self.tools["submit_action"]))
-            self.assertIn(f"`{required}`", self.text, f"the skill never mentions {required}, which is required")
+    def test_the_skill_names_every_parameter_the_tool_requires(self):
+        """Derived from the signature, not listed here.
+
+        It was `("intent", "operations")` written out until T8b-4d added a third required parameter,
+        `trigger_source`, at which point the hardcoded pair kept passing while the skill was free to
+        say nothing about it. A required parameter the instructions never mention is the worst of
+        the three failure shapes this file covers: not a tool that is missing and not a parameter
+        that does not exist, but a call the model cannot form at all, discovered at the moment it
+        first tries to change something.
+
+        **Being mentioned is not being documented**, and the difference is not pedantic: the first
+        version of this asserted only that the backticked name appeared somewhere in the body, and
+        both mutants for it escaped, because the same commit that deleted a parameter's definition
+        left a passing reference to it two paragraphs down. What is required is the definitional
+        bullet the file already uses for each of them -- `- **`name`** — ...` -- which is a shape a
+        cross-reference does not have.
+        """
+        required = required_params(self.tools["submit_action"]) | required_params(self.tools["plan_action"])
+        self.assertGreaterEqual(len(required), 3, "the tools declare fewer required parameters than 06 §9 gives them")
+        for name in sorted(required):
+            with self.subTest(parameter=name):
+                self.assertRegex(
+                    self.text,
+                    re.compile(rf"^- \*\*`{re.escape(name)}`\*\* —", re.M),
+                    f"the skill never defines {name}, which the tool requires. A mention elsewhere is not a "
+                    "definition; the model has nothing but this text to learn the parameter from.",
+                )
+
+    def test_the_skill_names_every_value_of_the_closed_enum_it_asks_the_agent_to_pick_from(self):
+        """`trigger_source` is required, closed, and unguessable -- the model has only this text.
+
+        Read out of `action_envelope.VALID_TRIGGER_SOURCES`, which is itself held equal to the Go
+        side by V-BRK-028, so this is a three-way join and not a list restated in prose. A source
+        the skill omits is one the agent will never choose, and the missing one is likelier to be an
+        autonomous origin than `chat` -- which biases the 01 §7 autonomy counts in exactly the
+        direction that makes the platform look more human-driven than it is.
+        """
+        source = (REPO / "agents" / "platform" / "scripts" / "action_envelope.py").read_text()
+        m = re.search(r"VALID_TRIGGER_SOURCES\s*=\s*frozenset\(\{(.*?)\}\)", source, re.S)
+        self.assertTrue(m, "action_envelope.py no longer declares VALID_TRIGGER_SOURCES by that name")
+        values = re.findall(r'"([^"]+)"', m.group(1))
+        self.assertEqual(len(values), 7, f"06 §4.1 closes trigger.source over seven values; found {values}")
+        for value in values:
+            with self.subTest(source=value):
+                self.assertIn(f"`{value}`", self.text, f"the skill omits the trigger source {value!r}")
 
     def test_require_approval_exists_and_the_skill_says_it_only_tightens(self):
         self.assertIn("require_approval", params(self.tools["submit_action"]))

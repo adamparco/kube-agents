@@ -314,18 +314,172 @@
       "edits": [
         {
           "file": "agents/platform/scripts/platform_mcp_server.py",
-          "find": "    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)",
-          "replace": "    if \"delete\" in intent.lower():\n        require_approval = True  # mutant\n    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)"
+          "find": "    return broker_client.submit_action(\n        intent,\n",
+          "replace": "    if \"delete\" in intent.lower():\n        require_approval = True  # mutant\n    return broker_client.submit_action(\n        intent,\n"
         },
         {
           "file": "agents/cluster-admin/scripts/platform_mcp_server.py",
-          "find": "    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)",
-          "replace": "    if \"delete\" in intent.lower():\n        require_approval = True  # mutant\n    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)"
+          "find": "    return broker_client.submit_action(\n        intent,\n",
+          "replace": "    if \"delete\" in intent.lower():\n        require_approval = True  # mutant\n    return broker_client.submit_action(\n        intent,\n"
         },
         {
           "file": "agents/developer-team/scripts/platform_mcp_server.py",
-          "find": "    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)",
-          "replace": "    if \"delete\" in intent.lower():\n        require_approval = True  # mutant\n    return broker_client.submit_action(intent, operations, rationale=rationale, require_approval=require_approval)"
+          "find": "    return broker_client.submit_action(\n        intent,\n",
+          "replace": "    if \"delete\" in intent.lower():\n        require_approval = True  # mutant\n    return broker_client.submit_action(\n        intent,\n"
+        }
+      ]
+    },
+    {
+      "id": "M16-the-origin-gets-a-default-again",
+      "why": "THE defect of T8b-4c, in the only shape it can still take after T8b-4d. The value here is `chat`, which is CORRECT and a member -- the point is that a default is the wrong shape whatever it says. `trigger.source` is what splits 06 SS4.1's two autonomy buckets, so a default makes 01 SS7's \"how much did the agents decide\" a measurement of the default for every caller that did not think about the question. Nothing else can see this: the envelope is legal, the enum mirror agrees, the keys decode, and the transport is right.",
+      "catcher": "test_the_origin_has_no_default_anywhere_on_the_way_in",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "    trigger_source: str,\n    trigger_ref: str = \"\",\n    trigger_detail: str = \"\",\n    requester: dict[str, Any] | None = None,\n    trace: dict[str, Any] | None = None,\n    rationale: str = \"\",\n    require_approval: bool = False,\n",
+          "replace": "    trigger_source: str = \"chat\",\n    trigger_ref: str = \"\",\n    trigger_detail: str = \"\",\n    requester: dict[str, Any] | None = None,\n    trace: dict[str, Any] | None = None,\n    rationale: str = \"\",\n    require_approval: bool = False,\n"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "    trigger_source: str,\n    trigger_ref: str = \"\",\n    trigger_detail: str = \"\",\n    requester: dict[str, Any] | None = None,\n    trace: dict[str, Any] | None = None,\n    rationale: str = \"\",\n    require_approval: bool = False,\n",
+          "replace": "    trigger_source: str = \"chat\",\n    trigger_ref: str = \"\",\n    trigger_detail: str = \"\",\n    requester: dict[str, Any] | None = None,\n    trace: dict[str, Any] | None = None,\n    rationale: str = \"\",\n    require_approval: bool = False,\n"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "    trigger_source: str,\n    trigger_ref: str = \"\",\n    trigger_detail: str = \"\",\n    requester: dict[str, Any] | None = None,\n    trace: dict[str, Any] | None = None,\n    rationale: str = \"\",\n    require_approval: bool = False,\n",
+          "replace": "    trigger_source: str = \"chat\",\n    trigger_ref: str = \"\",\n    trigger_detail: str = \"\",\n    requester: dict[str, Any] | None = None,\n    trace: dict[str, Any] | None = None,\n    rationale: str = \"\",\n    require_approval: bool = False,\n"
+        }
+      ]
+    },
+    {
+      "id": "M17-a-requester-kind-this-module-writes-leaves-the-enum",
+      "why": "The argument that the enum scan is not a special case for `trigger`. `session_requester` supplies `requester.kind` itself, from a literal, exactly the way the trigger source used to be supplied -- and `operator` is not one of 06 SS4.1's requester kinds, so every autonomous action would be a 400.",
+      "catcher": "test_every_enum_value_this_module_writes_itself_is_inside_the_closed_enum",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "    return {\"kind\": \"agent\", \"id\": os.environ.get(\"AGENT_NAME\")",
+          "replace": "    return {\"kind\": \"operator\", \"id\": os.environ.get(\"AGENT_NAME\")"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "    return {\"kind\": \"agent\", \"id\": os.environ.get(\"AGENT_NAME\")",
+          "replace": "    return {\"kind\": \"operator\", \"id\": os.environ.get(\"AGENT_NAME\")"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "    return {\"kind\": \"agent\", \"id\": os.environ.get(\"AGENT_NAME\")",
+          "replace": "    return {\"kind\": \"operator\", \"id\": os.environ.get(\"AGENT_NAME\")"
+        }
+      ]
+    },
+    {
+      "id": "M18-the-enum-scan-stops-finding-anything",
+      "why": "The vacuity control on the scan, and it has to be behaviour-preserving or the catcher would be whichever unrelated test broke first. The scan reads string literals out of dict literals; hoist the two kinds into a variable and it walks the same dicts, finds zero constants, examines nothing and reports green forever. Every other test stays green, because the module does exactly what it did before. The catcher is the `checked` floor.",
+      "catcher": "test_every_enum_value_this_module_writes_itself_is_inside_the_closed_enum",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "    user = (os.environ.get(\"SESSION_USER_ID\") or \"\").strip()\n    if user:\n        return {\"kind\": \"human\", \"id\": user}\n    return {\"kind\": \"agent\", \"id\": os.environ.get(\"AGENT_NAME\") or os.environ.get(ENV_IDENTITY) or \"agent\"}\n",
+          "replace": "    user = (os.environ.get(\"SESSION_USER_ID\") or \"\").strip()\n    kind = \"human\" if user else \"agent\"\n    if user:\n        return {\"kind\": kind, \"id\": user}\n    return {\"kind\": kind, \"id\": os.environ.get(\"AGENT_NAME\") or os.environ.get(ENV_IDENTITY) or \"agent\"}\n"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "    user = (os.environ.get(\"SESSION_USER_ID\") or \"\").strip()\n    if user:\n        return {\"kind\": \"human\", \"id\": user}\n    return {\"kind\": \"agent\", \"id\": os.environ.get(\"AGENT_NAME\") or os.environ.get(ENV_IDENTITY) or \"agent\"}\n",
+          "replace": "    user = (os.environ.get(\"SESSION_USER_ID\") or \"\").strip()\n    kind = \"human\" if user else \"agent\"\n    if user:\n        return {\"kind\": kind, \"id\": user}\n    return {\"kind\": kind, \"id\": os.environ.get(\"AGENT_NAME\") or os.environ.get(ENV_IDENTITY) or \"agent\"}\n"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "    user = (os.environ.get(\"SESSION_USER_ID\") or \"\").strip()\n    if user:\n        return {\"kind\": \"human\", \"id\": user}\n    return {\"kind\": \"agent\", \"id\": os.environ.get(\"AGENT_NAME\") or os.environ.get(ENV_IDENTITY) or \"agent\"}\n",
+          "replace": "    user = (os.environ.get(\"SESSION_USER_ID\") or \"\").strip()\n    kind = \"human\" if user else \"agent\"\n    if user:\n        return {\"kind\": kind, \"id\": user}\n    return {\"kind\": kind, \"id\": os.environ.get(\"AGENT_NAME\") or os.environ.get(ENV_IDENTITY) or \"agent\"}\n"
+        }
+      ]
+    },
+    {
+      "id": "M19-the-tool-declares-the-origin-and-drops-it",
+      "why": "The gap a one-statement body leaves open. The MCP tool still delegates, still has one statement, and the schema the model reads still advertises `trigger_source` -- it just never arrives. The model would keep supplying an origin and the client would keep not receiving one. (In production this is a TypeError on the first call; in this environment the MCP module is parsed and never imported, so only the AST arm sees it.)",
+      "catcher": "test_every_parameter_a_tool_takes_reaches_the_client_under_its_own_name",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/platform_mcp_server.py",
+          "find": "        trigger_source=trigger_source,\n        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        rationale=rationale,\n        require_approval=require_approval,\n",
+          "replace": "        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        rationale=rationale,\n        require_approval=require_approval,\n"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/platform_mcp_server.py",
+          "find": "        trigger_source=trigger_source,\n        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        rationale=rationale,\n        require_approval=require_approval,\n",
+          "replace": "        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        rationale=rationale,\n        require_approval=require_approval,\n"
+        },
+        {
+          "file": "agents/developer-team/scripts/platform_mcp_server.py",
+          "find": "        trigger_source=trigger_source,\n        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        rationale=rationale,\n        require_approval=require_approval,\n",
+          "replace": "        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        rationale=rationale,\n        require_approval=require_approval,\n"
+        }
+      ]
+    },
+    {
+      "id": "M20-two-parameters-cross-on-the-way-through",
+      "why": "The same defect one line over, and the reason the forwarding arm compares names rather than counting. Every parameter still reaches the client; two of them arrive as each other. The set-equality half of the arm passes on this, so the `kw.arg == kw.value.id` half has to earn its own verdict.",
+      "catcher": "test_every_parameter_a_tool_takes_reaches_the_client_under_its_own_name",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/platform_mcp_server.py",
+          "find": "        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        rationale=rationale,\n        require_approval=require_approval,\n",
+          "replace": "        trigger_ref=trigger_detail,\n        trigger_detail=trigger_ref,\n        rationale=rationale,\n        require_approval=require_approval,\n"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/platform_mcp_server.py",
+          "find": "        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        rationale=rationale,\n        require_approval=require_approval,\n",
+          "replace": "        trigger_ref=trigger_detail,\n        trigger_detail=trigger_ref,\n        rationale=rationale,\n        require_approval=require_approval,\n"
+        },
+        {
+          "file": "agents/developer-team/scripts/platform_mcp_server.py",
+          "find": "        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        rationale=rationale,\n        require_approval=require_approval,\n",
+          "replace": "        trigger_ref=trigger_detail,\n        trigger_detail=trigger_ref,\n        rationale=rationale,\n        require_approval=require_approval,\n"
+        }
+      ]
+    },
+    {
+      "id": "M21-a-plan-is-filed-under-an-origin-nobody-gave-it",
+      "why": "`plan_action` forwards a constant instead of its own parameter. The envelope is legal, the enum is satisfied, no signature changes and no default exists -- so M16's arm and both static arms pass. The plan and the write it previews are then filed under different origins, which is unreadable afterwards and is counted wrong in 01 SS7. Only driving the request path and reading the trigger back off the wire sees it.",
+      "catcher": "test_the_origin_the_caller_gave_is_the_origin_on_the_wire",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "        trigger_source=trigger_source,\n        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        requester=requester,\n",
+          "replace": "        trigger_source=\"chat\",\n        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        requester=requester,\n"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "        trigger_source=trigger_source,\n        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        requester=requester,\n",
+          "replace": "        trigger_source=\"chat\",\n        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        requester=requester,\n"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "        trigger_source=trigger_source,\n        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        requester=requester,\n",
+          "replace": "        trigger_source=\"chat\",\n        trigger_ref=trigger_ref,\n        trigger_detail=trigger_detail,\n        requester=requester,\n"
+        }
+      ]
+    },
+    {
+      "id": "M22-an-absent-ref-is-sent-as-a-blank-one",
+      "why": "`ref` and `detail` are `omitempty` on `broker.Trigger`, so the builder drops them when empty. Send them always and every envelope carries two blank strings: not a 400, and not visible in any static arm, but `trigger.ref == \"\"` is a value asserting there was nothing to look at, which is a different claim from having said nothing.",
+      "catcher": "test_an_unsupplied_ref_or_detail_is_left_off_the_wire_rather_than_sent_blank",
+      "edits": [
+        {
+          "file": "agents/platform/scripts/broker_client.py",
+          "find": "    trigger: dict[str, Any] = {\"source\": trigger_source}\n    if trigger_ref:\n        trigger[\"ref\"] = trigger_ref\n    if trigger_detail:\n        trigger[\"detail\"] = trigger_detail\n",
+          "replace": "    trigger: dict[str, Any] = {\"source\": trigger_source}\n    trigger[\"ref\"] = trigger_ref\n    if trigger_detail:\n        trigger[\"detail\"] = trigger_detail\n"
+        },
+        {
+          "file": "agents/cluster-admin/scripts/broker_client.py",
+          "find": "    trigger: dict[str, Any] = {\"source\": trigger_source}\n    if trigger_ref:\n        trigger[\"ref\"] = trigger_ref\n    if trigger_detail:\n        trigger[\"detail\"] = trigger_detail\n",
+          "replace": "    trigger: dict[str, Any] = {\"source\": trigger_source}\n    trigger[\"ref\"] = trigger_ref\n    if trigger_detail:\n        trigger[\"detail\"] = trigger_detail\n"
+        },
+        {
+          "file": "agents/developer-team/scripts/broker_client.py",
+          "find": "    trigger: dict[str, Any] = {\"source\": trigger_source}\n    if trigger_ref:\n        trigger[\"ref\"] = trigger_ref\n    if trigger_detail:\n        trigger[\"detail\"] = trigger_detail\n",
+          "replace": "    trigger: dict[str, Any] = {\"source\": trigger_source}\n    trigger[\"ref\"] = trigger_ref\n    if trigger_detail:\n        trigger[\"detail\"] = trigger_detail\n"
         }
       ]
     },

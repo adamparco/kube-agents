@@ -627,6 +627,88 @@ func TestClusterScopedTargetsAreNotInEveryCallersScope(t *testing.T) {
 	}
 }
 
+// TestTargetScopeIsWellFormedForEveryTier is the property the test above was one argument away from
+// asserting, and the gap cost a live defect.
+//
+// The gat-151 test pins ONE tier against ONE target shape: a developer-team caller with a
+// cluster-scoped target. That combination is the one that cannot open a hole, because the caller
+// narrows every level and the target only ever clears the last one. The combination that does is
+// the mirror of it -- a caller that narrows FEWER levels than the target needs -- and 06 §1.2
+// creates exactly one such caller: the platform tier, whose scope is `projectId` alone. Give it a
+// namespaced target and `ScopeOfTarget` used to return {p, "", ns}, which `scope.IsWellFormed`
+// rejects, so `OwnerLookup.Find` refused every namespaced operation a platform agent ever submitted
+// and the broker answered 503 `snapshot-failed` at step 3. It was invisible to this package's tests
+// for the whole of Phase 8 and most of Phase 9, and to every L0 and L1 suite, because the single
+// platform-tier caller under test (secretegress_test.go) asks for the cluster-scoped target too.
+//
+// So the property is stated over the CROSS PRODUCT rather than over a case: for every tier, and for
+// both target shapes, the derived scope must be well-formed. A tier added later gets the assertion
+// for free, and a tier whose scope stops naming a level -- which is a legitimate spec change -- gets
+// caught here rather than in a cluster.
+func TestTargetScopeIsWellFormedForEveryTier(t *testing.T) {
+	// ServingCluster is set on all three because it is a property of the BROKER, not of the tier:
+	// every broker runs in exactly one cluster and reads its name from the same field. A platform
+	// caller is the only one for which it is load-bearing; the others must be unaffected by it, and
+	// the cluster-name assertions below are what say so.
+	const serving = "c1"
+	tiers := []struct {
+		name  string
+		scope scope.Scope
+	}{
+		{"platform", scope.Scope{ProjectID: "proj"}},
+		{"cluster-admin", scope.Scope{ProjectID: "proj", ClusterName: serving}},
+		{"developer-team", scope.Scope{ProjectID: "proj", ClusterName: serving, Namespace: "team-a"}},
+	}
+	for _, tc := range tiers {
+		for _, ns := range []string{"", "team-a"} {
+			shape := "cluster-scoped target"
+			if ns != "" {
+				shape = "namespaced target"
+			}
+			t.Run(tc.name+"/"+shape, func(t *testing.T) {
+				caller := Caller{Name: tc.name, Tier: tc.name, Scope: tc.scope, ServingCluster: serving}
+				target := ScopeOfTarget(caller, ns)
+				if !target.IsWellFormed() {
+					t.Fatalf("ScopeOfTarget(%s, %q) = %+v, which is malformed; an empty level above a "+
+						"non-empty one reads as a wildcard, and OwnerLookup.Find refuses it, so every "+
+						"operation of this shape is refused at step 3", tc.name, ns, target)
+				}
+				if target.Namespace != ns {
+					t.Fatalf("target namespace = %q, want %q", target.Namespace, ns)
+				}
+				if target.ClusterName != serving {
+					t.Fatalf("target cluster = %q, want %q -- the target sits in the cluster the broker "+
+						"serves, whatever the caller's authority spans", target.ClusterName, serving)
+				}
+			})
+		}
+	}
+
+	// The consequence, stated as behaviour rather than as a predicate: with the hole open, a
+	// developer-team agent that plainly owns the namespace could not be found, because Contains
+	// failed at ClauseCluster before it ever compared namespaces. This is the assertion that fails
+	// if someone "simplifies" ScopeOfTarget back to using the caller's scope alone.
+	dev := agentCR("dev-team-a", "proj", "c1", "team-a")
+	platform := Caller{Name: "platform-agent", Tier: "platform",
+		Scope: scope.Scope{ProjectID: "proj"}, ServingCluster: "c1"}
+	owner, err := OwnerLookup{Agents: []agentv1alpha1.Agent{dev}}.Find(platform, ScopeOfTarget(platform, "team-a"))
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if owner != "dev-team-a" {
+		t.Fatalf("lower-tier owner = %q, want %q; a platform agent writing into a namespace a "+
+			"developer-team agent owns is `cross-tier-direct-operation` (06 §4.2) and must gate", owner, "dev-team-a")
+	}
+
+	// And the fail-closed direction: no serving cluster means the broker cannot say which cluster
+	// the target is in, so it refuses rather than guessing.
+	blind := Caller{Name: "platform-agent", Tier: "platform", Scope: scope.Scope{ProjectID: "proj"}}
+	if _, err := (OwnerLookup{Agents: []agentv1alpha1.Agent{dev}}).Find(blind, ScopeOfTarget(blind, "team-a")); err == nil {
+		t.Fatal("a caller with no serving cluster produced a usable target scope; the ownership " +
+			"lookup must refuse, because guessing the cluster would decide ownership by namespace name alone")
+	}
+}
+
 // TestEverySecurityControlCanReachAGate is the invariant that the `security-loosen` kind list used
 // to violate. The direction analysis models eight controls; if any of them can conclude `loosen` and
 // still not fire a floor rule, that control has a gate on paper and none in the cluster.

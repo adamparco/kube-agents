@@ -65,27 +65,45 @@ var (
 	scheme  = runtime.NewScheme()
 )
 
+// TestMain brings up envtest WHEN IT CAN, and runs the package either way.
+//
+// It used to `os.Exit(0)` on a missing KUBEBUILDER_ASSETS, and that is not a shortcut -- it is a
+// package-wide skip wearing the word `ok`. Everything in rollback_test.go is hermetic and belongs to
+// L0; none of it ran under `go test ./...`, which is what the L0 chain and PR CI execute. The
+// refusal that keeps a redacted Secret from being written back as sixty-four characters of hex was
+// among the tests not running, and the package reported `ok` in 1.3 seconds while asserting nothing.
+//
+// The correct shape is already used by escalate, history and writeahead: the environment is
+// OPTIONAL, and the tests that need it skip individually via requireEnv. Copied here rather than
+// invented. (probe still has the old shape -- filed, not fixed here.)
 func TestMain(m *testing.M) {
-	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
-		fmt.Fprintln(os.Stderr,
-			"KUBEBUILDER_ASSETS unset; run via `make test` to exercise the replayer against a real API server")
-		os.Exit(0)
-	}
-	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		panic(err)
-	}
-	testEnv = &envtest.Environment{Scheme: scheme}
-	cfg, err := testEnv.Start()
-	if err != nil {
-		panic(fmt.Sprintf("start envtest: %v", err))
-	}
-	k8s, err = client.New(cfg, client.Options{Scheme: scheme})
-	if err != nil {
-		panic(fmt.Sprintf("new client: %v", err))
+	if os.Getenv("KUBEBUILDER_ASSETS") != "" {
+		if err := clientgoscheme.AddToScheme(scheme); err != nil {
+			panic(err)
+		}
+		testEnv = &envtest.Environment{Scheme: scheme}
+		cfg, err := testEnv.Start()
+		if err != nil {
+			panic(fmt.Sprintf("start envtest: %v", err))
+		}
+		k8s, err = client.New(cfg, client.Options{Scheme: scheme})
+		if err != nil {
+			panic(fmt.Sprintf("new client: %v", err))
+		}
 	}
 	code := m.Run()
-	_ = testEnv.Stop()
+	if testEnv != nil {
+		_ = testEnv.Stop()
+	}
 	os.Exit(code)
+}
+
+// requireEnv skips the one test that called it, rather than the package that contains it.
+func requireEnv(t *testing.T) {
+	t.Helper()
+	if k8s == nil {
+		t.Skip("KUBEBUILDER_ASSETS unset; run via `make test` to exercise the replayer against a real API server")
+	}
 }
 
 // liveReplayer is the production wiring: the real client applier and the real client reader.
@@ -155,6 +173,7 @@ func sanitizedBody(t *testing.T, obj client.Object) *runtime.RawExtension {
 // agent. Both paths are run against the same server, a fresh object each time, so the difference is
 // observed rather than argued.
 func TestARecreateRefusesAStrangerAtTheSameNameWhereAnApplyWouldAdoptIt(t *testing.T) {
+	requireEnv(t)
 	ctx := context.Background()
 	ns := newNS(t, ctx)
 
@@ -216,6 +235,7 @@ func TestARecreateRefusesAStrangerAtTheSameNameWhereAnApplyWouldAdoptIt(t *testi
 // If either leg ever starts refusing on its own, this test fails, and the right response is to
 // re-examine the recreate step's safety argument -- not to relax the assertion.
 func TestARecreateIntoATakenNameThroughApplyIsNeitherARefusalNorARestore(t *testing.T) {
+	requireEnv(t)
 	ctx := context.Background()
 	ns := newNS(t, ctx)
 	a := &execute.ClientApplier{Client: k8s}
@@ -289,6 +309,7 @@ func TestARecreateIntoATakenNameThroughApplyIsNeitherARefusalNorARestore(t *test
 // The negative control for the pair above: when the name is genuinely free, the recreate works. A
 // replayer that refused every create would pass the first leg and be useless.
 func TestARecreateOntoAFreeNameRestoresTheObject(t *testing.T) {
+	requireEnv(t)
 	ctx := context.Background()
 	ns := newNS(t, ctx)
 
@@ -323,6 +344,7 @@ func TestARecreateOntoAFreeNameRestoresTheObject(t *testing.T) {
 // with a real new uid -- the exact situation the pin exists for, and the one a name-only delete
 // would destroy.
 func TestADeleteWithAPinnedUidWillNotRemoveAReplacement(t *testing.T) {
+	requireEnv(t)
 	ctx := context.Background()
 	ns := newNS(t, ctx)
 
@@ -383,6 +405,7 @@ func TestADeleteWithAPinnedUidWillNotRemoveAReplacement(t *testing.T) {
 // -- even though a healthy object of the right kind and name is sitting right there. Only the uid
 // tells them apart, and only a real deletion produces the new uid.
 func TestARestoreRefusesAReplacementAndSucceedsOnTheOriginal(t *testing.T) {
+	requireEnv(t)
 	ctx := context.Background()
 	ns := newNS(t, ctx)
 
@@ -474,6 +497,7 @@ func TestARestoreRefusesAReplacementAndSucceedsOnTheOriginal(t *testing.T) {
 // second assertion is the one that distinguishes this from applying the snapshot: a field another
 // manager changed after the action survives the rollback.
 func TestAScaleRestoresTheCountWithoutRevertingAnyoneElsesChanges(t *testing.T) {
+	requireEnv(t)
 	ctx := context.Background()
 	ns := newNS(t, ctx)
 

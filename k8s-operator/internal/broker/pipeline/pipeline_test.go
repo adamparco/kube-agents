@@ -111,6 +111,23 @@ func (f fakeRefs) InboundReferences(context.Context, agentv1alpha1.TargetRef) ([
 	return nil, nil
 }
 
+// fakeDryRunner is undo.DryRunner: 06 §4.3.1's plan-time "would this step apply".
+//
+// Permissive by default, because a validated plan is the ordinary case and the alternative would
+// make every unrelated test in this file assert its way past a gate. `err` makes the whole plan
+// downgrade; `identities` records the field-manager key the pipeline asked for, which is the one
+// thing about this seam a caller can get wrong invisibly.
+type fakeDryRunner struct {
+	err        error
+	steps      []agentv1alpha1.UndoStep
+	identities []string
+}
+
+func (f *fakeDryRunner) DryRun(_ context.Context, step agentv1alpha1.UndoStep) error {
+	f.steps = append(f.steps, step)
+	return f.err
+}
+
 // fakeReader is execute.Reader. absent makes Get return a NotFound, which is the normal answer for
 // a create and is NOT an error to CaptureAll.
 type fakeReader struct {
@@ -195,6 +212,9 @@ type fakeProber struct {
 	// unset one: a Deployment whose pods have never restarted reports 0, and the predicate compares
 	// it against a baseline rather than against zero.
 	restarts int64
+
+	// restartErr fails the baseline read itself, as distinct from `absent`.
+	restartErr error
 }
 
 func (f *fakeProber) Get(_ context.Context, ref agentv1alpha1.TargetRef) (*unstructured.Unstructured, error) {
@@ -205,6 +225,11 @@ func (f *fakeProber) Get(_ context.Context, ref agentv1alpha1.TargetRef) (*unstr
 }
 
 func (f *fakeProber) RestartCount(_ context.Context, ref agentv1alpha1.TargetRef) (int64, error) {
+	// Injected before the absent check so a test can ask what a FAILED baseline read does, which is
+	// a different question from what an absent workload does. V-BRK-031 needs both.
+	if f.restartErr != nil {
+		return 0, f.restartErr
+	}
 	// NotFound for an absent object, like probe.Source, which reads the workload to find its pod
 	// selector before it can count anything. verify.CaptureRestartBaselines depends on the
 	// difference: NotFound is "nothing was running, baseline zero", any other error is a refusal.
@@ -325,17 +350,21 @@ type rig struct {
 	live    *fakeLive
 	refs    fakeRefs
 	planner Planner
-	reader  *fakeReader
-	applier *fakeApplier
-	wal     fakeWriteAhead
-	prober  *fakeProber
-	rollup  *fakeRollback
-	pager   *fakePager
-	pauser  *fakePauser
-	records *fakeRecords
-	brake   *fakeBrake
-	budget  *solventLedger
-	classes *fakeClassifierSource
+	// dryRunner is the plan-time DryRunner. Permissive by default -- every step would apply -- so
+	// that a test which does not care about undo validation gets a validated plan and the step 6
+	// guard stays out of its way. A test that DOES care sets errs.
+	dryRunner *fakeDryRunner
+	reader    *fakeReader
+	applier   *fakeApplier
+	wal       fakeWriteAhead
+	prober    *fakeProber
+	rollup    *fakeRollback
+	pager     *fakePager
+	pauser    *fakePauser
+	records   *fakeRecords
+	brake     *fakeBrake
+	budget    *solventLedger
+	classes   *fakeClassifierSource
 
 	// verifyClock is the settle window's clock, and it ADVANCES -- see newRig. The pipeline's own
 	// clock stays pinned at testClock so action timestamps remain golden.
@@ -489,6 +518,25 @@ func createEnvelope() *broker.Envelope {
 	}
 }
 
+// deploymentEnvelope is createEnvelope over an apps/v1 Deployment, for the one property that a
+// ConfigMap cannot exercise: verify.NeedsRestartBaseline is keyed by kind, and only the workload
+// kinds get a pre-action restart read at step 3. A test that wants to fault that read has to submit
+// a target whose row actually needs it, or the prober is never called at all.
+func deploymentEnvelope() *broker.Envelope {
+	env := createEnvelope()
+	env.Intent = "create the application deployment"
+	env.Operations[0].Target = &broker.Target{
+		Group: "apps", Version: "v1", Kind: "Deployment", Namespace: testTenantNS, Name: "app",
+	}
+	env.Operations[0].DesiredState = map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata":   map[string]any{"name": "app", "namespace": testTenantNS},
+		"spec":       map[string]any{"replicas": int64(1)},
+	}
+	return env
+}
+
 // newRig assembles a pipeline whose every dependency permits, then applies the tweaks. A test
 // perturbs exactly one thing; everything it does not name is the allowing default.
 func newRig(t *testing.T, tweaks ...func(*rig)) *rig {
@@ -510,8 +558,9 @@ func newRig(t *testing.T, tweaks ...func(*rig)) *rig {
 			Freezes: &broker.FreezeView{ObservedAt: testClock},
 			Journal: broker.BrakeOK,
 		}},
-		budget:  &solventLedger{},
-		classes: &fakeClassifierSource{c: mustClassifier(t, nil)},
+		budget:    &solventLedger{},
+		classes:   &fakeClassifierSource{c: mustClassifier(t, nil)},
+		dryRunner: &fakeDryRunner{},
 	}
 	for _, tw := range tweaks {
 		tw(r)
@@ -525,8 +574,12 @@ func newRig(t *testing.T, tweaks ...func(*rig)) *rig {
 		Live:                r.live,
 		Refs:                r.refs,
 		Planner:             r.planner,
-		Reader:              r.reader,
-		Executor:            &execute.Executor{Applier: r.applier, Journal: r.wal},
+		DryRunner: func(id string) undo.DryRunner {
+			r.dryRunner.identities = append(r.dryRunner.identities, id)
+			return r.dryRunner
+		},
+		Reader:   r.reader,
+		Executor: &execute.Executor{Applier: r.applier, Journal: r.wal},
 		Verifier: &verify.Driver{
 			Prober:   r.prober,
 			Rollback: r.rollup,
@@ -727,7 +780,9 @@ func faultCases() []faultCase {
 			step: broker.StepClassify,
 			what: "the undo planner errors, so invertibility is unknown",
 			tweak: func(r *rig) {
-				r.planner = PlannerFunc(func(context.Context, undo.Request, undo.ReferenceIndex) (*undo.Result, error) { return nil, boom })
+				r.planner = PlannerFunc(func(context.Context, undo.Request, undo.ReferenceIndex, undo.DryRunner) (*undo.Result, error) {
+					return nil, boom
+				})
 			},
 		},
 		{
@@ -741,7 +796,7 @@ func faultCases() []faultCase {
 			step: broker.StepUndoPlan,
 			what: "the planner returned no plan object at all",
 			tweak: func(r *rig) {
-				r.planner = PlannerFunc(func(context.Context, undo.Request, undo.ReferenceIndex) (*undo.Result, error) {
+				r.planner = PlannerFunc(func(context.Context, undo.Request, undo.ReferenceIndex, undo.DryRunner) (*undo.Result, error) {
 					return &undo.Result{Refusals: []string{"the planner produced nothing"}}, nil
 				})
 			},
@@ -1172,23 +1227,30 @@ func TestTheAccountantIsAskedAboutThisAction(t *testing.T) {
 // was a field on the observed BrakeView, an unwired one was the zero BrakeBudget, and the zero
 // BrakeBudget permits -- so a broker with no accountant was constructible, started clean, and
 // enforced nothing ([[LSN-031]]).
-func TestNewRejectsAPipelineThatCannotCountItsOwnSpend(t *testing.T) {
-	full := func() Config {
-		return Config{
-			AgentName:  testAgent,
-			Namespace:  testNamespace,
-			Classifier: &fakeClassifierSource{c: mustClassifier(t, nil)},
-			Live:       &fakeLive{},
-			Refs:       fakeRefs{},
-			Reader:     &fakeReader{},
-			Executor:   &execute.Executor{Applier: &fakeApplier{}, Journal: fakeWriteAhead{}},
-			Verifier:   &verify.Driver{},
-			Records:    &fakeRecords{},
-			Brake:      &fakeBrake{},
-			Accountant: &solventLedger{},
-			Contested:  broker.NewContestedIndex(),
-		}
+// referenceConfig is the smallest Config New accepts. Every required-field test perturbs exactly
+// one thing about it, and each first asserts that the unperturbed version is accepted -- otherwise
+// a second missing field makes every one of those tests pass for the wrong reason.
+func referenceConfig(t *testing.T) Config {
+	t.Helper()
+	return Config{
+		AgentName:  testAgent,
+		Namespace:  testNamespace,
+		Classifier: &fakeClassifierSource{c: mustClassifier(t, nil)},
+		Live:       &fakeLive{},
+		Refs:       fakeRefs{},
+		Reader:     &fakeReader{},
+		Executor:   &execute.Executor{Applier: &fakeApplier{}, Journal: fakeWriteAhead{}},
+		Verifier:   &verify.Driver{},
+		Records:    &fakeRecords{},
+		Brake:      &fakeBrake{},
+		Accountant: &solventLedger{},
+		Contested:  broker.NewContestedIndex(),
+		DryRunner:  func(string) undo.DryRunner { return &fakeDryRunner{} },
 	}
+}
+
+func TestNewRejectsAPipelineThatCannotCountItsOwnSpend(t *testing.T) {
+	full := func() Config { return referenceConfig(t) }
 
 	if _, err := New(full()); err != nil {
 		t.Fatalf("the reference Config was rejected, so the case below proves nothing: %v", err)
@@ -1202,6 +1264,234 @@ func TestNewRejectsAPipelineThatCannotCountItsOwnSpend(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Accountant") {
 		t.Fatalf("the error must name what is missing: %v", err)
+	}
+}
+
+// --- V-REV-003: the undo plan is dry-run before the action, or the action gates ------------------
+//
+// The L1 row for V-REV-003 already existed and it proved the wrong half. It showed that
+// undo.Validate DOWNGRADES when handed a nil dry-runner -- a property of the function -- and
+// nothing anywhere asserted that a dry-runner is ever wired. It never was: pipeline.Config.Planner
+// defaulted to the generate-only `undo.Generate`, cmd/broker/wiring.go left it unset on purpose,
+// and undo.GenerateAndValidate ("the call the broker actually makes at step 6") had no non-test
+// caller. Every ActionRecord the broker wrote carried `undoPlan.validated: false`;
+// undo.ValidateReplayable refuses on exactly that field; the undo path was dead end to end and the
+// suite was green. 09 §11.9, "component built, never wired".
+//
+// So these tests assert the wiring and the consequence, not the function.
+
+func TestNewRejectsABrokerThatCannotDryRunItsUndoPlans(t *testing.T) {
+	if _, err := New(referenceConfig(t)); err != nil {
+		t.Fatalf("the reference Config was rejected, so the case below proves nothing: %v", err)
+	}
+
+	cfg := referenceConfig(t)
+	cfg.DryRunner = nil
+	_, err := New(cfg)
+	if err == nil {
+		t.Fatal("New accepted a Config with no DryRunner; such a broker starts clean, serves every request, and journals `validated: false` on every record it writes -- and nothing finds out until a human tries to undo one")
+	}
+	if !strings.Contains(err.Error(), "DryRunner") {
+		t.Fatalf("the error must name what is missing: %v", err)
+	}
+}
+
+// TestTheJournaledPlanWasDryRunAgainstTheAPIServer is the property V-REV-001 measures at L2, at the
+// level where it can be measured without a cluster: an accepted action's record carries a plan that
+// something actually checked.
+func TestTheJournaledPlanWasDryRunAgainstTheAPIServer(t *testing.T) {
+	r := newRig(t)
+	tr, res, err := r.submit(createEnvelope())
+	if err != nil {
+		t.Fatalf("submit: %v\ntrace: %s", err, tr)
+	}
+	if res.Decision != "accepted" {
+		t.Fatalf("decision = %q, want accepted\ntrace: %s", res.Decision, tr)
+	}
+	if len(r.records.stored) != 1 {
+		t.Fatalf("nothing was stored")
+	}
+	plan := r.records.stored[0].Spec.Undo
+	if plan == nil {
+		t.Fatal("the record carries no undo plan at all")
+	}
+	if !plan.Validated {
+		t.Errorf("the journaled plan has validated=false, so undo.ValidateReplayable would refuse it and this action can never be rolled back; plan = %+v", plan)
+	}
+
+	// And it was checked step by step, not stamped. A `validated: true` set by anything other than a
+	// completed pass over the steps is the failure mode this whole unit exists to remove.
+	if len(r.dryRunner.steps) != len(plan.Steps) || len(plan.Steps) == 0 {
+		t.Fatalf("the dry-runner saw %d step(s) and the plan has %d; every step must have been checked", len(r.dryRunner.steps), len(plan.Steps))
+	}
+	for i, got := range r.dryRunner.steps {
+		if got.Op != plan.Steps[i].Op || got.Target.Name != plan.Steps[i].Target.Name {
+			t.Errorf("step %d dry-run was %s %s, but the plan's step %d is %s %s",
+				i, got.Op, got.Target.Name, i, plan.Steps[i].Op, plan.Steps[i].Target.Name)
+		}
+	}
+}
+
+// TestADryRunIssuedUnderAnotherNameWouldBeAWrongAnswer pins the identity the pipeline asks for.
+//
+// Server-side apply reports a conflict for every field owned by a different field manager, and the
+// fields an undo restores are frequently the ones this agent set in an earlier action. A dry run
+// issued under any other name manufactures conflicts the real replay never hits -- so this seam is
+// wrong in the OVER-gating direction, silently, and the only way to see it is to look at the key.
+func TestADryRunIssuedUnderAnotherNameWouldBeAWrongAnswer(t *testing.T) {
+	r := newRig(t)
+	if _, _, err := r.submit(createEnvelope()); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	want := testIdentity().AgentIdentity()
+	if len(r.dryRunner.identities) == 0 {
+		t.Fatal("the pipeline never asked for a dry-runner, so no step was validated")
+	}
+	for _, got := range r.dryRunner.identities {
+		if got != want {
+			t.Errorf("the dry-runner was built for identity %q, want %q -- the replay's field manager", got, want)
+		}
+	}
+}
+
+// TestAStepThatWouldNotApplyGatesInsteadOfExecuting is 06 §4.3.1's second sentence: "if generation
+// or validation fails, the action is raised to gated". A create is `routine` on every other input,
+// so the gate here can only have come from the failed validation.
+func TestAStepThatWouldNotApplyGatesInsteadOfExecuting(t *testing.T) {
+	r := newRig(t, func(r *rig) {
+		r.dryRunner = &fakeDryRunner{err: errors.New("configmaps is forbidden: User cannot delete resource")}
+	})
+	tr, res, err := r.submit(createEnvelope())
+	if err != nil {
+		t.Fatalf("submit: %v\ntrace: %s", err, tr)
+	}
+	if res.Decision != "gated" {
+		t.Fatalf("decision = %q, want gated: a plan whose steps will not apply is not a plan\ntrace: %s", res.Decision, tr)
+	}
+	if r.applier.mutations != 0 {
+		t.Errorf("applier saw %d mutations; a gated action mutates nothing", r.applier.mutations)
+	}
+	if len(r.records.stored) != 1 {
+		t.Fatalf("the parked record was not written")
+	}
+	ar := r.records.stored[0]
+	if ar.Spec.Undo == nil || ar.Spec.Undo.Strategy != agentv1alpha1.UndoNone {
+		t.Errorf("undo strategy = %+v, want none: a plan that failed validation must not keep its steps, or a caller who checks only for their presence will replay them", ar.Spec.Undo)
+	}
+	if ar.Spec.Undo != nil && ar.Spec.Undo.Validated {
+		t.Error("the downgraded plan still claims validated=true")
+	}
+	// The reason reaches a human, and it is the API server's own words rather than "validation
+	// failed". The operator deciding whether to approve this needs to know it was an RBAC denial.
+	var caveats string
+	if ar.Spec.Undo != nil {
+		caveats = strings.Join(ar.Spec.Undo.Caveats, "; ")
+	}
+	if !strings.Contains(caveats, "is forbidden") {
+		t.Errorf("the plan's caveats do not carry the reason the step would not apply: %q", caveats)
+	}
+}
+
+// TestADryRunWhoseUndoPlanWouldNotApplyIsNotAServerFault pins the asymmetry that wiring the
+// validator exposed, and records where the rest of it lives.
+//
+// There are THREE sites that ask "is there a usable undo plan", not two: classify's 06 §4.2 step 6
+// floor, the pipeline's own step 6 re-check, and the brake's 06 §4.4 row 5. Only the first
+// suppresses for a dry run. Before this unit the difference could not show, because no plan was
+// ever validated and so no plan was ever downgraded; wiring the dry-runner makes a dry run whose
+// steps would 403 -- the ordinary case under a read-only shadow overlay -- the first envelope to
+// reach the disagreement.
+//
+// Two of the three now read the SAME predicate, classify.UndoPlanGateApplies, rather than two
+// spellings of one rule. Be precise about what that buys, because the tempting claim is bigger than
+// the truth: it is a structural fix, not a behavioural one. Mutating step 6 back to its own
+// spelling does NOT fail this test, and the reason is the third site -- the brake has already
+// raised the class to gated by the time step 6 looks, so step 6's second conjunct is false either
+// way. The predicate is asserted directly, in TestTheUndoPlanGateHasOneDefinitionSite; the value
+// here is that the two cannot drift apart later, not that today's behaviour depends on it.
+//
+// The third site is not reconciled, and that is deliberate. The brake raises this dry run to gated,
+// so it parks for approval instead of previewing -- over-gating rather than under-gating, safe, and
+// a rule in the 06 §4.4 table, which is V-BRK surface. Changing a brake row is a unit of its own,
+// not something to fold into the unit whose wiring surfaced it. Filed, asserted as-is below so that
+// reconciling it later is a visible change to this test, and named in the ledger.
+func TestADryRunWhoseUndoPlanWouldNotApplyIsNotAServerFault(t *testing.T) {
+	r := newRig(t, func(r *rig) {
+		r.dryRunner = &fakeDryRunner{err: errors.New("configmaps is forbidden: User cannot delete resource")}
+	})
+	env := createEnvelope()
+	env.DryRun = true
+
+	tr, res, err := r.submit(env)
+	if err != nil {
+		t.Fatalf("submit: %v -- a dry run whose undo plan could not be validated is not a server fault\ntrace: %s", err, tr)
+	}
+	// The one thing a dry run may never do, whatever it is classified.
+	if r.applier.mutations != 0 {
+		t.Errorf("applier saw %d mutations on a dry run", r.applier.mutations)
+	}
+	if got := eventFor(tr, broker.StepUndoPlan); got.Status != broker.StepCompleted {
+		t.Errorf("step 6 = %s, want completed: the dry-run suppression has to hold at both sites that spell the rule\ntrace: %s", got, tr)
+	}
+	// The brake's row 5, asserted so that reconciling it later is a visible change to this test
+	// rather than a silent one.
+	if res.Decision != "gated" {
+		t.Fatalf("decision = %q; today the brake raises this to gated at step 5\ntrace: %s", res.Decision, tr)
+	}
+	if !strings.Contains(tr.String(), string(broker.BrakeRuleUndoPlanUnusable)) {
+		t.Errorf("the gate did not come from the brake's undo-plan row, so this test is measuring something else\ntrace: %s", tr)
+	}
+}
+
+// TestStep6RefusesAPlanNothingValidated is the drift guard, and it is the reason step 6 asks
+// Validated() rather than Undoable().
+//
+// The planner is a seam. A future one -- or a mis-wired present one -- can return a plan that looks
+// entirely usable and that no dry-runner ever saw; `Undoable()` is true for it, the classifier is
+// satisfied, and the action executes carrying a rollback that ValidateReplayable will refuse. The
+// pipeline has to be able to tell those apart without trusting whoever supplied the planner.
+func TestStep6RefusesAPlanNothingValidated(t *testing.T) {
+	r := newRig(t, func(r *rig) {
+		r.planner = PlannerFunc(func(context.Context, undo.Request, undo.ReferenceIndex, undo.DryRunner) (*undo.Result, error) {
+			return &undo.Result{Plan: &agentv1alpha1.UndoPlan{
+				Strategy: agentv1alpha1.UndoDelete,
+				Steps: []agentv1alpha1.UndoStep{{
+					Op:     "delete",
+					Target: agentv1alpha1.TargetRef{Version: "v1", Kind: "ConfigMap", Namespace: testTenantNS, Name: "app-config"},
+				}},
+				// Never dry-run. This is the whole mutant.
+				Validated: false,
+			}}, nil
+		})
+	})
+	tr, _, err := r.submit(createEnvelope())
+	if err == nil {
+		t.Fatalf("the pipeline executed a plan nothing had validated\ntrace: %s", tr)
+	}
+	if r.applier.mutations != 0 {
+		t.Errorf("applier saw %d mutations", r.applier.mutations)
+	}
+	if got := tr.Reached(); got != broker.StepUndoPlan {
+		t.Errorf("failed at %s, want %s -- the fault belongs to step 6\ntrace: %s", got, broker.StepUndoPlan, tr)
+	}
+}
+
+// TestTheUndoPlanGateHasOneDefinitionSite. The suppression above is only safe if step 6 and the
+// classifier cannot disagree about when it applies, and they cannot disagree only if there is one
+// predicate. This is that predicate's own truth table, including the row that makes it worth
+// having: a dry run with no plan is excused, and the same envelope for real is not.
+func TestTheUndoPlanGateHasOneDefinitionSite(t *testing.T) {
+	for _, tc := range []struct {
+		dryRun, present, want bool
+	}{
+		{dryRun: false, present: false, want: true},
+		{dryRun: false, present: true, want: false},
+		{dryRun: true, present: false, want: false},
+		{dryRun: true, present: true, want: false},
+	} {
+		if got := classify.UndoPlanGateApplies(tc.dryRun, tc.present); got != tc.want {
+			t.Errorf("UndoPlanGateApplies(dryRun=%t, present=%t) = %t, want %t", tc.dryRun, tc.present, got, tc.want)
+		}
 	}
 }
 
@@ -1294,4 +1584,133 @@ func TestTheseAssertionsCanFail(t *testing.T) {
 		t.Error("a healthy ClassifierSource produced a policy-unavailable refusal; the fail-closed " +
 			"assertion would pass on a broker that never classifies anything")
 	}
+}
+
+// --- V-BRK-031: a permission boundary is an answer, not a crash ---------------------------------
+
+// TestALiveReadFailureIsTypedByWhetherItCanEverSucceed is V-BRK-031's positive half.
+//
+// Step 3 makes three live reads with the ACTOR identity, and before this check none of their
+// failures was a typed *Refusal. `server.go`'s `refuse` type-asserts for one, did not find one, and
+// answered 500 `internal-error` -- so a caller could not tell its own authority ceiling from a
+// broken broker, and, because `Journal` and `SecurityEvent` ride ON the Refusal, the envelope's
+// disposition was recorded nowhere at all.
+//
+// The property is not "these failures are typed". It is that they are typed by WHETHER RETRYING
+// COULD EVER HELP: an RBAC denial is permanent and carries no Retry-After, an API-server fault is
+// transient and does. Both halves are asserted for every one of the three reads, because a fix
+// applied to the snapshot alone would leave two sites answering 500 and would look identical from
+// the arm that motivated it.
+func TestALiveReadFailureIsTypedByWhetherItCanEverSucceed(t *testing.T) {
+	forbidden := apierrors.NewForbidden(
+		schema.GroupResource{Resource: "configmaps"}, "app-config",
+		errors.New(`User "system:serviceaccount:kubeagents-system:platform-dev-actor" cannot get resource "configmaps"`))
+	unauthorized := apierrors.NewUnauthorized("the actor's token was rejected")
+
+	sites := []struct {
+		read   string
+		env    *broker.Envelope
+		break_ func(*rig, error)
+	}{
+		{"the pre-state snapshot", createEnvelope(), func(r *rig, e error) { r.reader.err = e }},
+		// A Deployment, not the ConfigMap the other two rows use: verify.NeedsRestartBaseline is
+		// keyed by kind, and a ConfigMap's row does not compare restart counts across the action, so
+		// the prober is never called and this row would pass green having exercised nothing.
+		{"the restart baseline", deploymentEnvelope(), func(r *rig, e error) { r.prober.restartErr = e }},
+		{"the live-state resolve", createEnvelope(), func(r *rig, e error) { r.live.getErr = e }},
+	}
+	classes := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantReason string
+		wantRetry  bool
+	}{
+		{"an RBAC denial", forbidden, http.StatusForbidden, broker.ReasonTargetForbidden, false},
+		{"a rejected credential", unauthorized, http.StatusForbidden, broker.ReasonTargetForbidden, false},
+		{"an API-server fault", errInjected, http.StatusServiceUnavailable, broker.ReasonSnapshotFailed, true},
+	}
+
+	for _, site := range sites {
+		for _, class := range classes {
+			t.Run(site.read+"/"+class.name, func(t *testing.T) {
+				r := newRig(t, func(r *rig) { site.break_(r, class.err) })
+				_, _, err := r.submit(site.env)
+
+				ref, ok := err.(*broker.Refusal)
+				if !ok {
+					t.Fatalf("%s failed with %v (%T), which is not a *broker.Refusal -- server.go "+
+						"type-asserts for one and answers 500 internal-error without it", site.read, err, err)
+				}
+				if ref.Status != class.wantStatus || ref.Reason != class.wantReason {
+					t.Errorf("%s / %s: HTTP %d %q, want %d %q",
+						site.read, class.name, ref.Status, ref.Reason, class.wantStatus, class.wantReason)
+				}
+				if gotRetry := ref.RetryAfterSeconds > 0; gotRetry != class.wantRetry {
+					t.Errorf("%s / %s: retryAfterSeconds=%d, want retryable=%v. Telling a fleet to "+
+						"wait and retry a permission boundary is a loop that never terminates",
+						site.read, class.name, ref.RetryAfterSeconds, class.wantRetry)
+				}
+				if !ref.Journal {
+					t.Errorf("%s / %s: Journal=false. The journal is the complete record of every "+
+						"envelope's disposition; an agent enumerating what it may touch must leave a trace",
+						site.read, class.name)
+				}
+				if ref.SecurityEvent {
+					t.Errorf("%s / %s: SecurityEvent=true. In shadow mode the actor holds no tenant "+
+						"authority at all, so this fires on every action -- an alarm that gets muted. "+
+						"03 §6's events are for identity violations; forbidden-caller is that case",
+						site.read, class.name)
+				}
+				if !strings.Contains(ref.Detail, "step 3") {
+					t.Errorf("%s / %s: detail %q does not name the step; a refusal that says only "+
+						"'the read failed' sends a human to the wrong object", site.read, class.name, ref.Detail)
+				}
+			})
+		}
+	}
+}
+
+// TestLiveReadRefusalDiscriminatesRatherThanDefaulting is V-BRK-031's mandatory negative control.
+//
+// The test above passes on an implementation that answers 403 `target-forbidden` for every error it
+// ever sees -- two thirds of its rows would fail, but a reader skimming a green run would not know
+// that, and the shape of "type everything as the case that motivated the fix" is exactly how this
+// gets written. So the discrimination itself is asserted directly, on the one function that makes
+// it: the two classes must differ in reason, in status, and in retryability, and a nil error must
+// stay nil rather than becoming a refusal of the pipeline's own healthy reads.
+func TestLiveReadRefusalDiscriminatesRatherThanDefaulting(t *testing.T) {
+	if got := liveReadRefusal(nil, "step 3: a read that worked"); got != nil {
+		t.Fatalf("a nil error produced %v; every successful read in step 3 would refuse", got)
+	}
+
+	perm, ok := liveReadRefusal(
+		apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, "c", errors.New("denied")),
+		"step 3: x").(*broker.Refusal)
+	if !ok {
+		t.Fatal("a Forbidden did not produce a *broker.Refusal")
+	}
+	trans, ok := liveReadRefusal(errInjected, "step 3: x").(*broker.Refusal)
+	if !ok {
+		t.Fatal("an API-server fault did not produce a *broker.Refusal")
+	}
+
+	if perm.Reason == trans.Reason {
+		t.Errorf("both classes answer %q; the helper is defaulting, not discriminating", perm.Reason)
+	}
+	if perm.Status == trans.Status {
+		t.Errorf("both classes answer HTTP %d; a caller cannot branch on the status alone", perm.Status)
+	}
+	if perm.RetryAfterSeconds != 0 {
+		t.Errorf("the permanent class carries retryAfterSeconds=%d; Refusal's own rule is that an "+
+			"authorization refusal is never retryable", perm.RetryAfterSeconds)
+	}
+	if trans.RetryAfterSeconds <= 0 {
+		t.Error("the transient class carries no retryAfterSeconds, so a recoverable outage reads as final")
+	}
+
+	// A NotFound never reaches here -- CaptureAll turns it into an empty pre-state, which is the
+	// correct reading for a `create` whose target does not exist yet, and every other test in this
+	// file runs on exactly that path (newRig's reader is `absent: true`). Asserted there, by
+	// construction, rather than restated here as a case this helper is not the owner of.
 }

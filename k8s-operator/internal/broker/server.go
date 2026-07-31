@@ -32,19 +32,33 @@ import (
 
 // The HTTP surface (08 §2.3, 03 §4.1).
 //
-// Three routes. One of them mutates. That ratio is the point of V-BRK-021: the broker's
-// non-skippability argument is not "the pipeline checks everything", it is "there is nowhere else
-// to go". A second mutating route -- a debug apply, an admin endpoint, a `?force=true` short
-// circuit -- would not need to be exploited to break the model; it would only need to exist,
+// The broker's non-skippability argument is not "the pipeline checks everything", it is "there is
+// nowhere else to go". A second mutating route -- a debug apply, an admin endpoint, a `?force=true`
+// short circuit -- would not need to be exploited to break the model; it would only need to exist,
 // because then "every mutation is journaled" would depend on which door was used.
+//
+// V-BRK-021 used to state that as a number: one mutating route. That was a faithful proxy while
+// exactly one existed and wrong the moment a second legitimate door opened into the same corridor
+// -- 05 §1.3 designs `replay` and `approve` as exactly that, and 03 §4.1, which the check cites,
+// contains no route count at all. What 03 §4.1 actually requires is that steps 1, 3, 4, 5, 6 and 11
+// are "not skippable by any caller". So the property is stated here the way the source states it:
+// the mutating surface is DERIVED from what was registered rather than declared beside it (see
+// `handle` and `nonMutatingPaths` below), it is bounded by the routes 05 §1.3 names, and every
+// member of it reaches the pipeline. A number nobody can smuggle past is a stronger guarantee than
+// a number, and it does not have to be relitigated when the design adds the second door on purpose.
 const (
-	// ActionsPath is the one mutating route.
+	// ActionsPath is the submission route: the only mutating route that exists today, and the only
+	// one that takes caller-supplied operations in any design 05 §1.3 sanctions.
 	ActionsPath = "/v1alpha1/actions"
 	// NoncePath issues the single-use nonces of 06 §4.1. Non-mutating with respect to the cluster.
 	NoncePath = "/v1alpha1/nonce"
 	// HealthzPath is the liveness and readiness probe. Unauthenticated by necessity -- the kubelet
 	// has no projected token -- and therefore returns nothing but a constant.
 	HealthzPath = "/healthz"
+	// CatchAllPath is the explicit 404. Registered rather than left to the mux's default so that a
+	// debug handler added by a future edit collides with something instead of quietly joining the
+	// surface -- and so that it is a registration this file can account for like any other.
+	CatchAllPath = "/"
 
 	// Port is the envelope port of 08 §2.3. Not configurable: the agent's Service, its
 	// NetworkPolicy and the injected KUBEAGENTS_BROKER_ENDPOINT all name it, and a configurable
@@ -131,10 +145,36 @@ type Config struct {
 	Namespace string
 }
 
+// nonMutatingPaths is the DECLARED allowlist: registered paths that cannot change cluster state.
+//
+// It is the only declaration in the route machinery, and it is deliberately the small one. The
+// mutating set is what is left over after subtracting it from what was actually registered, so the
+// failure mode runs the safe way: a handler someone adds and forgets to think about lands in the
+// mutating set, where the 05 §1.3 subset assertion refuses it. The reverse arrangement -- declaring
+// the mutating routes and treating the rest as harmless -- makes forgetting invisible, which is the
+// exact drift a hand-written `[]string{ActionsPath}` allowed.
+var nonMutatingPaths = map[string]bool{
+	HealthzPath:  true,
+	NoncePath:    true,
+	CatchAllPath: true,
+}
+
 // Server is the broker's HTTP handler.
 type Server struct {
 	cfg Config
 	mux *http.ServeMux
+	// registered is every path handed to the mux, in registration order, recorded by handle. It is
+	// the ground truth Routes and MutatingRoutes are computed from; nothing restates it.
+	registered []string
+}
+
+// handle is the single registration point. Every route goes through it, which is what lets the
+// route reporters below be derived rather than declared -- and V-BRK-021's source scan asserts that
+// this is the only function in the package that touches the mux, so a registration cannot happen
+// without being recorded here.
+func (s *Server) handle(path string, h http.HandlerFunc) {
+	s.registered = append(s.registered, path)
+	s.mux.HandleFunc(path, h)
 }
 
 // NewServer wires the routes. It returns an error rather than panicking on a missing dependency,
@@ -155,26 +195,51 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Registered by exact path. Go 1.22's pattern matcher would let `/v1alpha1/actions/` match a
 	// subtree, and a subtree under the mutating route is a family of routes nobody enumerated.
-	s.mux.HandleFunc(HealthzPath, s.handleHealthz)
-	s.mux.HandleFunc(NoncePath, s.handleNonce)
-	s.mux.HandleFunc(ActionsPath, s.handleActions)
-	// Everything else. Explicit, so that a debug handler added by a future edit collides here
-	// instead of quietly joining the surface.
-	s.mux.HandleFunc("/", s.handleNotFound)
+	s.handle(HealthzPath, s.handleHealthz)
+	s.handle(NoncePath, s.handleNonce)
+	s.handle(ActionsPath, s.handleActions)
+	// Everything else, explicit rather than defaulted.
+	s.handle(CatchAllPath, s.handleNotFound)
 	return s, nil
 }
 
-// Routes reports every path the server serves, sorted. Exported so V-BRK-021 can assert the route
-// set from a unit test rather than by probing a running process -- a probe can only prove the
-// routes it thought to try.
-func (s *Server) Routes() []string {
-	out := []string{HealthzPath, NoncePath, ActionsPath}
+// Registered reports every path handed to the mux, sorted, catch-all included. It is the population
+// the two reporters below partition; a test that wants to know what this server actually serves
+// asks this rather than a literal, because a literal is a second copy that can be wrong.
+func (s *Server) Registered() []string {
+	out := append([]string(nil), s.registered...)
 	sort.Strings(out)
 	return out
 }
 
-// MutatingRoutes reports the routes that can change cluster state. Exactly one, and asserted.
-func (s *Server) MutatingRoutes() []string { return []string{ActionsPath} }
+// Routes reports every addressable path the server serves, sorted -- the registered set less the
+// catch-all, which is not a route so much as the absence of one. Exported so V-BRK-021 can assert
+// the route set from a unit test rather than by probing a running process; a probe can only prove
+// the routes it thought to try.
+func (s *Server) Routes() []string {
+	out := make([]string, 0, len(s.registered))
+	for _, p := range s.registered {
+		if p != CatchAllPath {
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// MutatingRoutes reports the routes that can change cluster state: the registered set less
+// nonMutatingPaths. Derived, never declared -- see the comment on nonMutatingPaths for why the
+// subtraction runs in that direction.
+func (s *Server) MutatingRoutes() []string {
+	out := make([]string, 0, len(s.registered))
+	for _, p := range s.registered {
+		if !nonMutatingPaths[p] {
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
 
 // ServeHTTP applies the checks that are true of every route before dispatching.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

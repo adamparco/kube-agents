@@ -53,7 +53,14 @@ type OwnerLookup struct {
 // naming the intermediate one in the approval request would send the question to the wrong human.
 func (l OwnerLookup) Find(caller Caller, target scope.Scope) (string, error) {
 	if !target.IsWellFormed() {
-		return "", fmt.Errorf("target scope %+v is malformed", target)
+		// Named rather than merely reported, because the shape of this failure does not point at its
+		// cause. The target scope is BUILT, not submitted, so a malformed one is never the caller's
+		// envelope being wrong -- it is ScopeOfTarget having been handed a caller with no cluster to
+		// put in it, which means the broker's own Agent CR has no `spec.harness.clusterName`.
+		return "", fmt.Errorf("target scope %+v is malformed: an empty level above a non-empty one "+
+			"would act as a wildcard. The target scope is derived, not submitted, so this is the "+
+			"broker's own identity and not the envelope: a caller whose scope names no cluster (the "+
+			"platform tier, correctly) served by a broker whose Agent CR sets no spec.harness.clusterName", target)
 	}
 	best := ""
 	bestDepth := -1
@@ -85,11 +92,13 @@ func (l OwnerLookup) Find(caller Caller, target scope.Scope) (string, error) {
 	return best, nil
 }
 
-// ScopeOfTarget builds the scope a target object occupies, given the caller's project and cluster.
+// ScopeOfTarget builds the scope a target object occupies, given the caller and the target's
+// namespace.
 //
-// A target's project and cluster are not on the object -- they are the cluster the broker is
-// serving, which is the caller's. Only the namespace comes from the target, and it is assigned
-// UNCONDITIONALLY, including when it is empty.
+// A target's project and cluster are not on the object -- they are the project and cluster the
+// broker is serving. The project is the caller's, because a broker only ever serves one. The
+// CLUSTER is the caller's only for the two tiers whose scope names one; see below. Only the
+// namespace comes from the target, and it is assigned UNCONDITIONALLY, including when it is empty.
 //
 // The conditional version of that assignment -- `if namespace != "" { s.Namespace = namespace }` --
 // is the bug corpus case gat-151 exists to catch, and it is a scope escape. A cluster-scoped target
@@ -101,12 +110,48 @@ func (l OwnerLookup) Find(caller Caller, target scope.Scope) (string, error) {
 // namespace-scoped caller does not contain, and the operation is forbidden at step 1 as it should
 // be.
 //
-// A cluster-scoped target for a caller who legitimately reaches that far (cluster-admin and up) is
-// that caller's own scope, which by condition 3 above can never be strictly contained by the
-// caller: cluster-scoped objects are never owned by a lower tier, which is correct, because a
-// developer-team agent's authority stops at its namespace.
+// A cluster-scoped target for a CLUSTER-ADMIN caller is that caller's own scope, which by condition
+// 3 above can never be strictly contained by the caller: within one cluster, cluster-scoped objects
+// are never owned by a lower tier, which is correct, because a developer-team agent's authority
+// stops at its namespace.
+//
+// # Why the cluster is filled in from the caller's SERVING cluster
+//
+// 06 §1.2 gives the platform tier a scope of `projectId` alone -- its authority is the project, and
+// naming a cluster in it would be wrong. So for a platform caller `caller.Scope` is {p, "", ""}, and
+// `s.Namespace = namespace` on its own produced {p, "", ns}: an empty level above a non-empty one,
+// which is exactly the hole `scope.IsWellFormed` exists to reject and `scope.Contains` would read as
+// a wildcard. Every namespaced operation from a platform agent therefore died at step 3 with
+// `target scope ... is malformed`, on every cluster, for as long as the ownership lookup has run
+// against live state -- `resolveOwner` guards it with nothing but `live != nil`. Nothing below L2
+// could see it: the one platform-tier unit test that reached Find passed `""` for the namespace,
+// which is the single target shape that does not open the hole.
+//
+// The missing datum is real and is not the caller's authority: it is which cluster the target sits
+// in. That is `harness.clusterName` on the broker's own Agent CR, and it is knowable for every tier
+// because a broker serves one cluster. Filling it here is what makes {p, cluster-a, ns} comparable
+// to a developer-team agent's {p, cluster-a, ns}, which is the whole point of condition 2 -- granted
+// the hole, `Contains` failed at ClauseCluster and the cross-tier gate could not have fired for a
+// platform caller even if the malformed-scope guard had let it try.
+//
+// UNCONDITIONALLY, again, and for the same reason the namespace assignment is unconditional. The
+// conditional form -- fill the cluster only when the target is namespaced -- is the gat-151 shape
+// one line up: a narrowing that looks like a no-op for the case in front of you and silently leaves
+// a stale field in place for the case that is not. Here it would leave a platform agent's
+// cluster-scoped writes at {p, "", ""}, which no cluster-admin scope contains, so reaching past a
+// cluster-admin agent to rewrite a ClusterRole in its cluster would stay ungated. Filling it always
+// gates that, which is what `cross-tier-direct-operation` says and one strictly safer than today.
+//
+// It does not move the blast-radius denominator: `CountWorkloadObjects` reads `s.Namespace` and
+// nothing else, so a scope that gains a cluster name counts the same objects.
+//
+// An empty ServingCluster leaves the hole and fails closed at Find, which is the only safe
+// direction: a broker that cannot say which cluster it serves cannot decide who owns the target.
 func ScopeOfTarget(caller Caller, namespace string) scope.Scope {
 	s := caller.Scope
+	if s.ClusterName == "" {
+		s.ClusterName = caller.ServingCluster
+	}
 	s.Namespace = namespace
 	return s
 }

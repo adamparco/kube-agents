@@ -1,0 +1,154 @@
+{
+  "_comment": "V-CTR-006 -- ActionRecord lifecycle: every legal transition succeeds, every illegal one is rejected (06 §4.3, L1). Before P9-T9b-1 the lifecycle existed only as ASCII art in a doc comment: `journal.Store.SetPhase` accepted `Verified -> Pending`, `Rejected -> Executing` and `\"\" -> Undone`, and `Store.Create` never wrote `status.phase` at all (status is a subresource, so the Create call dropped it and only the derived label landed). These mutants attack the three layers the check now rests on: the table itself and its accessors (M1, M2, M3, M4, M8), the creation whitelist (M5, M9), the enforcement points in the journal (M6, M7, M10), plus two vacuity controls (M11, M12) -- because a truth-table test that only enumerates legal edges passes just as happily against a predicate that returns true for everything, which is what this package's coverage looked like a week ago. Run with `python3 dev/mutate.py verification/mutants/V-CTR-006.json`.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./api/v1alpha1/", "./internal/journal/"]
+  },
+  "mutants": [
+    {
+      "id": "M1-the-enforcement-predicate-says-yes-to-everything",
+      "why": "The state this package was in until the transitions file existed, restored as a single line. Every caller keeps calling; every transition is legal. A lifecycle test written as a list of edges that work cannot tell this apart from a correct table -- only the closed-square form can, which is why the truth table iterates all 121 cells and counts the refusals.",
+      "catcher": "TestTheLifecycleIsAClosedTruthTableAndNotAListOfRememberedEdges",
+      "edits": [
+        {
+          "file": "k8s-operator/api/v1alpha1/actionrecord_phases.go",
+          "find": "func (p ActionPhase) CanTransitionTo(next ActionPhase) bool {\n\tif !KnownActionPhase(next) {\n\t\treturn false\n\t}",
+          "replace": "func (p ActionPhase) CanTransitionTo(next ActionPhase) bool {\n\tif true {\n\t\treturn true\n\t}\n\tif !KnownActionPhase(next) {\n\t\treturn false\n\t}"
+        }
+      ]
+    },
+    {
+      "id": "M2-the-edge-the-diagram-draws-and-no-principal-can-write",
+      "why": "06 §4.3's diagram draws `Failed --> RolledBack`; the same section's Terminal column marks Failed terminal, and no principal in its status-RBAC table can write that edge. The ruling that dropped it is the one judgement call in the whole table, so it needs a mutant: restoring the edge is exactly what a future reader who trusts the picture over the principal list would do.",
+      "catcher": "TestTheLifecycleIsAClosedTruthTableAndNotAListOfRememberedEdges",
+      "edits": [
+        {
+          "file": "k8s-operator/api/v1alpha1/actionrecord_phases.go",
+          "find": "\tPhaseFailed:     {},",
+          "replace": "\tPhaseFailed:     {PhaseRolledBack},"
+        }
+      ]
+    },
+    {
+      "id": "M3-an-unknown-phase-reads-as-a-finished-action",
+      "why": "IsTerminal answers from a map lookup whose second return value is the whole guard. Dropping it makes every phase the table has never heard of terminal -- so a typo in a controller, or a phase added to the CRD enum and forgotten here, reads as a completed action to anything that asks whether there is more to do.",
+      "catcher": "TestTheSixTerminalPhasesAreTheSixThePhaseTableMarks",
+      "edits": [
+        {
+          "file": "k8s-operator/api/v1alpha1/actionrecord_phases.go",
+          "find": "\tnext, ok := actionPhaseTransitions[p]\n\treturn ok && len(next) == 0",
+          "replace": "\tnext := actionPhaseTransitions[p]\n\treturn len(next) == 0"
+        }
+      ]
+    },
+    {
+      "id": "M4-the-lifecycle-becomes-writable-through-an-accessor",
+      "why": "Successors hands out package state. Returning the live slice lets one caller's append rewrite the lifecycle for every other caller in the process, and the mutation looks like a local variable at the call site. This is the class of defect no amount of transition-table testing finds unless a test actually writes to the returned value.",
+      "catcher": "TestTheTableCannotBeRewrittenThroughAnAccessor",
+      "edits": [
+        {
+          "file": "k8s-operator/api/v1alpha1/actionrecord_phases.go",
+          "find": "\tnext := actionPhaseTransitions[p]\n\tout := make([]ActionPhase, len(next))\n\tcopy(out, next)",
+          "replace": "\tout := actionPhaseTransitions[p]"
+        }
+      ]
+    },
+    {
+      "id": "M5-a-record-may-be-born-anywhere",
+      "why": "The empty from-phase treated as `anything goes` -- the reading that let a record's first observed phase be `Undone`. A journal entry created `Verified` is manufactured history: an action claimed executed and verified with no `Executing` it could have come from, and the journal is the evidence 03 §6 rests on.",
+      "catcher": "TestNoRecordMayBeBornInAPhaseThatAssertsAPastItDoesNotHave",
+      "edits": [
+        {
+          "file": "k8s-operator/api/v1alpha1/actionrecord_phases.go",
+          "find": "\tif p == \"\" {\n\t\treturn actionPhaseInitial[next]\n\t}",
+          "replace": "\tif p == \"\" {\n\t\treturn true\n\t}"
+        }
+      ]
+    },
+    {
+      "id": "M6-the-journal-stops-consulting-the-lifecycle-on-a-phase-change",
+      "why": "The table can be perfect and still enforce nothing. SetPhase is the one function every phase change in the system goes through; dropping its call leaves `api/v1alpha1`'s entire suite green while `Verified -> Pending` writes cleanly. 09 §11.9 in miniature -- a component built and not wired.",
+      "catcher": "TestSetPhaseRefusesATransitionTheLifecycleDoesNotHave",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tif err := agentv1alpha1.ValidateActionPhaseTransition(live.Status.Phase, phase); err != nil {\n\t\treturn fmt.Errorf(\"journal: refusing phase change on %s/%s: %w\", ar.Namespace, ar.Name, err)\n\t}",
+          "replace": "\tif false {\n\t\treturn fmt.Errorf(\"journal: refusing phase change on %s/%s\", ar.Namespace, ar.Name)\n\t}"
+        }
+      ]
+    },
+    {
+      "id": "M7-the-transition-is-judged-against-the-callers-stale-copy",
+      "why": "SetPhase re-reads before writing because status conflicts between the broker and a controller are routine. Validating the caller's in-memory phase rather than the live one asks whether the step was legal in a world that has since moved: two writers each take a legal step and land on a pair that is not. Identical behaviour single-threaded, which is why only a test that deliberately holds a stale copy sees it.",
+      "catcher": "TestTheTransitionIsJudgedAgainstTheLiveRecordAndNotTheCallersCopy",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tif err := agentv1alpha1.ValidateActionPhaseTransition(live.Status.Phase, phase); err != nil {",
+          "replace": "\tif err := agentv1alpha1.ValidateActionPhaseTransition(ar.Status.Phase, phase); err != nil {"
+        }
+      ]
+    },
+    {
+      "id": "M8-the-refusal-stops-saying-what-would-have-worked",
+      "why": "A controller that logs `illegal transition` and nothing else forces a human to re-derive the lifecycle from a doc comment mid-incident. Collapsing the four diagnoses into one generic string is the cheapest possible edit and costs exactly the thing the error exists for; it also hides `terminal` and `not a member`, which are different bugs with the same symptom.",
+      "catcher": "TestARefusalNamesBothEndsAndWhatWouldHaveWorked",
+      "edits": [
+        {
+          "file": "k8s-operator/api/v1alpha1/actionrecord_phases.go",
+          "find": "\tif !KnownActionPhase(to) {\n\t\treturn fmt.Errorf(\"phase %q is not a member of the 06 §4.3 lifecycle\", to)\n\t}",
+          "replace": "\tif true {\n\t\treturn fmt.Errorf(\"illegal transition\")\n\t}"
+        }
+      ]
+    },
+    {
+      "id": "M9-the-journal-lets-a-forged-record-be-created",
+      "why": "The Create-side twin of M5, at the enforcement point rather than in the predicate. Create is the 03 §6 fail-closed moment: a caller that gets nil back proceeds to execute. A record created `Verified` is a journal entry asserting an outcome for an action that has not started, and it is written by the same call that is supposed to make the action auditable.",
+      "catcher": "TestARecordMayNotBeCreatedInAPhaseThatClaimsAPastItNeverHad",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tif err := agentv1alpha1.ValidateActionPhaseTransition(\"\", ar.Status.Phase); err != nil {",
+          "replace": "\tif err := error(nil); err != nil {"
+        }
+      ]
+    },
+    {
+      "id": "M10-the-authoritative-field-goes-back-to-being-empty",
+      "why": "THE second defect, restored exactly. `status` is a subresource, so client.Create sends the status block and the API server drops it: the derived label lands and `status.phase` does not. 06 §4.3 makes the field authoritative and the label an index, so this inverts the two -- and every parked record reads back an empty phase, leaving the ChatOps gateway's one permitted transition with no from-phase to leave.",
+      "catcher": "TestTheRecordIsBornInAPhaseTheApiServerCanSee",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tif want == \"\" {\n\t\treturn nil\n\t}\n\tar.Status.Phase = want",
+          "replace": "\tif want != \"\" {\n\t\treturn nil\n\t}\n\tar.Status.Phase = want"
+        }
+      ]
+    },
+    {
+      "id": "M11-vacuity-control-the-truth-table-must-be-able-to-fail",
+      "why": "Vacuity control, not a defect. Removing one edge the diagram really does draw must turn the square red. If it does not, the 121-cell loop is asserting nothing and every `caught` above is an accident of some other test.",
+      "catcher": "TestTheLifecycleIsAClosedTruthTableAndNotAListOfRememberedEdges",
+      "edits": [
+        {
+          "file": "k8s-operator/api/v1alpha1/actionrecord_phases.go",
+          "find": "\tPhaseVerified: {PhaseUndone},",
+          "replace": "\tPhaseVerified: {},"
+        }
+      ]
+    },
+    {
+      "id": "M12-vacuity-control-the-crd-enum-cross-join-must-be-able-to-fail",
+      "why": "Vacuity control for the other direction. The enum test reads actionrecord_types.go as data; if the regex ever stops matching, or the set comparison is one-sided, dropping a phase from the table would sail through. A phase in the CRD enum and not in the table is a value the API server accepts and no code has an opinion about.",
+      "catcher": "TestEveryPhaseInTheCrdEnumIsInTheLifecycle",
+      "edits": [
+        {
+          "file": "k8s-operator/api/v1alpha1/actionrecord_phases.go",
+          "find": "\tPhaseExpired:    {},\n\tPhaseDryRun:     {},",
+          "replace": "\tPhaseExpired: {},"
+        }
+      ]
+    }
+  ]
+}

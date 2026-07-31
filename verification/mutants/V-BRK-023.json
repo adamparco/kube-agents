@@ -1,0 +1,238 @@
+{
+  "_comment": "Mutation sweep for V-BRK-023 -- write-ahead confirmation is a READ, not a flag, and its phase arm reads BOTH copies of the phase. Run: KUBEBUILDER_ASSETS=\"$(cd k8s-operator && bin/... )\" python3 dev/mutate.py verification/mutants/V-BRK-023.json. THE ENVIRONMENT IS LOAD-BEARING: `writeahead_envtest_test.go` calls requireEnv(t), which SKIPS every envtest catcher when KUBEBUILDER_ASSETS is unset, and a skipped catcher is not a failure -- so a sweep run without it scores M2/M6/M7/M9/M10/M11 as ESCAPED against a suite that catches them cleanly. `go test -list`, which the runner uses to refuse a catcher that does not exist (LSN-048), compiles rather than runs and so lists those six either way: the guard that would otherwise notice is itself blind to this. That is the same blindness that let the 2026-07-30 halt through and it is why this comment is the first thing in the file. Run it as `make -C k8s-operator setup-envtest` prints the path, or via the L1 line in dev/L0-CHAIN.txt's companion. The original 2026-07-29 sweep for this ID was routed through dev/mutate.sh with no committed spec; this file is that gap closed as well as the new arm covered.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./internal/broker/writeahead/..."]
+  },
+  "mutants": [
+    {
+      "id": "M1-the-divergence-arm-compares-a-value-against-itself",
+      "why": "The arm is present, reads both names, and asks nothing -- the LSN-034 shape the package doc cites by name two paragraphs above this code, arriving as a one-character typo rather than as a decision. Note what this row is NOT: the first draft of this spec made M1 'the arm is deleted', which scored BROKEN because Go rejects the unused labelPhase, and whose behaviour is in any case identical to M3. Deletion is therefore M3's job; this row exists because a self-comparison survives review in a way a deletion does not.",
+      "catcher": "TestEveryRefusalIsNotDurable",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif statusPhase != labelPhase {\n",
+          "replace": "\tif labelPhase != labelPhase {\n"
+        }
+      ]
+    },
+    {
+      "id": "M2-the-arm-reads-the-label-alone-again",
+      "why": "The exact pre-fix source, restored. Distinct from M1 because deleting the divergence check leaves the second arm reading the AUTHORITATIVE copy, which is already most of the fix; this mutant reverts both halves at once and is the literal `git revert` a future session might reach for.",
+      "catcher": "TestARecordWhoseStatusMovedWithoutItsLabelDoesNotConfirm",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tstatusPhase, labelPhase := string(ar.Status.Phase), ar.Labels[journal.StatusLabel]\n\tif statusPhase != labelPhase {\n\t\treturn fmt.Errorf(\n\t\t\t\"%w: the record for %s carries status.phase %q and the %s label %q -- the authoritative phase and its index disagree, so there is no phase this record is in and executing against it would be a guess\",\n\t\t\tErrNotDurable, actionID, statusPhase, journal.StatusLabel, labelPhase)\n\t}\n\tif statusPhase != \"\" && statusPhase != string(agentv1alpha1.PhaseExecuting) {",
+          "replace": "\tstatusPhase := ar.Labels[journal.StatusLabel]\n\tif statusPhase != \"\" && statusPhase != string(agentv1alpha1.PhaseExecuting) {"
+        }
+      ]
+    },
+    {
+      "id": "M3-the-arm-reads-status-alone",
+      "why": "The other single-copy answer, and the one that looks most defensible: 06 SS4.3 calls status.phase authoritative, so why read the index at all? Because the label is what survives a Create whose status write is lost, and a record carrying a PendingApproval label with an empty status would then execute. Reading one copy is a trade; reading both is not.",
+      "catcher": "TestEveryRefusalIsNotDurable",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif statusPhase != labelPhase {\n\t\treturn fmt.Errorf(\n\t\t\t\"%w: the record for %s carries status.phase %q and the %s label %q -- the authoritative phase and its index disagree, so there is no phase this record is in and executing against it would be a guess\",\n\t\t\tErrNotDurable, actionID, statusPhase, journal.StatusLabel, labelPhase)\n\t}\n",
+          "replace": "\t_ = labelPhase\n"
+        }
+      ]
+    },
+    {
+      "id": "M4-divergence-is-only-refused-when-status-is-populated",
+      "why": "The plausible carve-out. 'An empty status.phase just means the write has not landed yet, so do not treat it as divergence' -- which re-admits exactly the record whose status write was lost, with a label still naming a phase the broker never reached.",
+      "catcher": "TestEveryRefusalIsNotDurable",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif statusPhase != labelPhase {\n",
+          "replace": "\tif statusPhase != \"\" && statusPhase != labelPhase {\n"
+        }
+      ]
+    },
+    {
+      "id": "M5-divergence-is-only-refused-when-the-label-is-populated",
+      "why": "The mirror carve-out, and the one a reader is likelier to accept, because journal.Labels genuinely omits the label when the phase is unset. It admits a record whose status names a phase and whose index names none -- the shape a lost metadata write leaves behind.",
+      "catcher": "TestEveryRefusalIsNotDurable",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif statusPhase != labelPhase {\n",
+          "replace": "\tif labelPhase != \"\" && statusPhase != labelPhase {\n"
+        }
+      ]
+    },
+    {
+      "id": "M6-Create-stops-writing-status",
+      "why": "304c1d5 reverted, in the package the confirmer does not own. If journal.Store.Create goes back to leaving status.phase empty, every record it produces diverges from its own label and the confirmer refuses every action -- total, and invisible to any test that builds its fixture by hand. This is the mutant that keeps the envtest half of this check non-vacuous.",
+      "catcher": "TestCreateWritesBothThePhaseAndItsLabel",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tar.Status.Phase = want\n\tif err := s.client.Status().Update(ctx, ar); err != nil {",
+          "replace": "\tar.Status.Phase = want\n\tif err := error(nil); err != nil {"
+        }
+      ]
+    },
+    {
+      "id": "M7-Labels-stops-carrying-the-phase-into-metadata",
+      "why": "The other half of the same joint property, mutated in the other direction: status lands and the index does not. The confirmer then refuses every record, and the ChatOps and router queries that select on the label find nothing. Neither failure is visible from writeahead.go, which is why the catcher is the envtest measurement rather than a hermetic fixture.",
+      "catcher": "TestCreateWritesBothThePhaseAndItsLabel",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tif ar.Status.Phase != \"\" {\n\t\tl[StatusLabel] = labelValue(string(ar.Status.Phase))\n\t}\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M8-the-label-encoding-rewrites-phase-names",
+      "why": "The divergence arm compares the label byte-for-byte against string(status.phase), so anything journal.labelValue does to a phase name splits the two copies for every record ever written. Today no phase contains a character it touches; a phase added later with a slash, a space, or 64 bytes would, and the failure would be every action refused rather than one test red.",
+      "catcher": "TestEveryPhaseSurvivesLabelEncodingUnchanged",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\tout := b.String()\n\tif len(out) > 63 {",
+          "replace": "\tout := strings.ToLower(b.String())\n\tif len(out) > 63 {"
+        }
+      ]
+    },
+    {
+      "id": "M9-the-agreed-phase-is-no-longer-checked",
+      "why": "The original arm, deleted, leaving only divergence. A record parked in PendingApproval with a matching label agrees with itself perfectly and must still be refused -- 06 SS4.2 step 7 parks a gated action there and nothing has approved it.",
+      "catcher": "TestAParkedRecordDoesNotConfirmEvenThoughCreateSucceeded",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif statusPhase != \"\" && statusPhase != string(agentv1alpha1.PhaseExecuting) {\n\t\treturn fmt.Errorf(\n\t\t\t\"%w: the durable record for %s is in phase %q, not %q -- executing against it would apply changes the record does not describe\",\n\t\t\tErrNotDurable, actionID, statusPhase, agentv1alpha1.PhaseExecuting)\n\t}\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M10-any-named-phase-is-accepted-as-long-as-the-copies-agree",
+      "why": "The subtler version of M9: the arm still exists and still reads both copies, and the only thing it stops checking is WHICH phase. Verified, Rejected and PendingApproval all confirm. A reviewer skimming the diff sees an arm that reads status.phase and looks more correct than what it replaced.",
+      "catcher": "TestAParkedRecordDoesNotConfirmEvenThoughCreateSucceeded",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif statusPhase != \"\" && statusPhase != string(agentv1alpha1.PhaseExecuting) {\n",
+          "replace": "\tif false && statusPhase != \"\" && statusPhase != string(agentv1alpha1.PhaseExecuting) {\n"
+        }
+      ]
+    },
+    {
+      "id": "M11-Create-stops-folding-AlreadyExists",
+      "why": "The trap the phase arm exists for, removed from underneath it. If a retried Create errors instead of folding, the parked-record sequence never reaches the confirmer and TestAParkedRecordDoesNotConfirmEvenThoughCreateSucceeded stops being a test of the arm -- it becomes a test of Create. Named separately so a change to the journal cannot quietly hollow out this check.",
+      "catcher": "TestAParkedRecordDoesNotConfirmEvenThoughCreateSucceeded",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/store.go",
+          "find": "\t\tif apierrors.IsAlreadyExists(err) {",
+          "replace": "\t\tif false && apierrors.IsAlreadyExists(err) {"
+        }
+      ]
+    },
+    {
+      "id": "M12-the-server-assigned-identity-check-is-dropped",
+      "why": "The central claim of V-BRK-023: durability is proven by uid and resourceVersion, which an in-process buffer cannot mint. Without it the confirmer accepts a record that was echoed back rather than stored, which is precisely the flag-not-a-read failure the interface doc refuses.",
+      "catcher": "TestEveryRefusalIsNotDurable",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif ar.UID == \"\" || ar.ResourceVersion == \"\" {\n",
+          "replace": "\tif false && (ar.UID == \"\" || ar.ResourceVersion == \"\") {\n"
+        }
+      ]
+    },
+    {
+      "id": "M13-only-the-uid-half-is-required",
+      "why": "Half a check reads as a whole one in review. A store that assigns a uid from a local generator but no resourceVersion satisfies it, and resourceVersion is the half that is specifically about etcd admission.",
+      "catcher": "TestEveryRefusalIsNotDurable",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif ar.UID == \"\" || ar.ResourceVersion == \"\" {\n",
+          "replace": "\tif ar.UID == \"\" {\n"
+        }
+      ]
+    },
+    {
+      "id": "M14-a-record-on-its-way-out-still-confirms",
+      "why": "A non-nil deletionTimestamp means the mutation would outlive its own journal entry -- an unjournaled write arriving by a slower route. The record is readable and carries full server identity, so every other arm passes it.",
+      "catcher": "TestEveryRefusalIsNotDurable",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif ar.DeletionTimestamp != nil {\n",
+          "replace": "\tif false && ar.DeletionTimestamp != nil {\n"
+        }
+      ]
+    },
+    {
+      "id": "M15-the-derived-name-is-trusted-without-checking-the-content",
+      "why": "journal.RecordName derives the object name from the action id, so a Get is a lookup by derived key. Drop this and the broker executes action A against action B's journal entry whenever that join is wrong -- a join nobody else verifies.",
+      "catcher": "TestEveryRefusalIsNotDurable",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif ar.Spec.ActionID != actionID {\n",
+          "replace": "\tif false && ar.Spec.ActionID != actionID {\n"
+        }
+      ]
+    },
+    {
+      "id": "M16-a-nil-nil-reader-answer-falls-through",
+      "why": "Without the arm this is a nil dereference in the next statement, which panics the broker mid-request instead of refusing the action. A crash in a fail-closed path is not automatically fail-closed: it is an unhandled state, and the arms below it are the ones that decide.",
+      "catcher": "TestEveryRefusalIsNotDurable",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif ar == nil {\n",
+          "replace": "\tif false && ar == nil {\n"
+        }
+      ]
+    },
+    {
+      "id": "M17-a-missing-record-and-a-sick-API-server-become-one-message",
+      "why": "Both refuse, so no action executes either way -- and that is exactly why this could rot unnoticed. They are different incidents: one is a caller that executed before journalling, the other is an API server to page about. Collapsing them makes the operator-facing half of the check untrue while the security half stays green.",
+      "catcher": "TestTheTwoReadFailuresStaySeparate",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\t\tif apierrors.IsNotFound(err) {",
+          "replace": "\t\tif false && apierrors.IsNotFound(err) {"
+        }
+      ]
+    },
+    {
+      "id": "M18-a-confirmer-with-no-reader-reads-anyway",
+      "why": "The negative control V-BRK-023 declares: a misconfigured confirmer refuses WITHOUT reading. Removing the guard turns a configuration error into a nil-map read that returns whatever the zero value implies, and the refusal stops being a property of the code and becomes a property of the wiring.",
+      "catcher": "TestAMisconfiguredConfirmerRefuses",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif c == nil || c.Records == nil {\n",
+          "replace": "\tif false && (c == nil || c.Records == nil) {\n"
+        }
+      ]
+    },
+    {
+      "id": "M19-an-unconfigured-namespace-is-read-as-all-namespaces",
+      "why": "The confirmer reads its own agent's namespace and never an envelope's. An empty namespace against a real client is a cluster-scoped read, so one agent's journal entry could vouch for another agent's mutation -- the property TestARecordInAnotherNamespaceDoesNotConfirm is about, reached through configuration instead of through a forged envelope.",
+      "catcher": "TestAMisconfiguredConfirmerRefuses",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/writeahead/writeahead.go",
+          "find": "\tif c.Namespace == \"\" {\n",
+          "replace": "\tif false && c.Namespace == \"\" {\n"
+        }
+      ]
+    }
+  ]
+}

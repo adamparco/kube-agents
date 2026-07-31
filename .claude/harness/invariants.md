@@ -156,3 +156,32 @@ Two scripts cannot use this guard and are not exceptions to it. `dev/cluster/dow
 context at all, so they compare `$CLUSTER` to the one name they are for with `=`, not a glob. Same
 rule, different identifier: `platform-agent-host` lives in the same project and is one variable
 away from `clusters delete` and from `resize --num-nodes 0`.
+
+## Test-only authority stays in `dev/`
+
+A suite sometimes has to grant a real identity real authority to observe anything at all — the
+phase-9 actor holds the 06 §2.2.1 broker grant and nothing over a tenant workload, so every envelope
+died at step 3 with a 403 and steps 4 through 9 of the pipeline had never run against a live API
+server. Granting it is legitimate. The risk is entirely about where the grant ends up: applied by an
+install path it is an ordinary over-grant on every cluster, and it arrives wearing a filename saying
+it is only for tests, so nobody reviews it a second time.
+
+[gated: `check_test_only_grants_are_confined`, V-CTN-037] Every such grant carries
+`kube-agents/test-only-grant: "true"`, and the marker — not a path, not a filename ([[LSN-036]]) —
+is what the gate discovers by. Five properties follow: the marker appears only under `dev/` or in
+prose; no RBAC document under `dev/` is unmarked, so an unmarked fixture cannot dodge the first;
+nothing outside `dev/` names a file holding one; none is cluster-scoped, because a ClusterRole is
+not confinable to a test namespace and no teardown undoes the window it existed in; and none reaches
+`escalate`/`bind`/`impersonate`/`*` or any resource in `rbac.authorization.k8s.io`. An empty marked
+population is `VACUOUS`, not green.
+
+It is a **file**-shaped rule and that is why the fixtures are files. RBAC written as a heredoc inside
+a `dev/**.sh` is out of scope, because a heredoc's disposition is not statically derivable —
+`dev/tests/negative-attenuation.sh` applies a ClusterRole granting `impersonate` on purpose, as an
+adversarial input proving the VAP rejects it, and marking that would be a lie. Two scripts already
+grant that way; closing the heredoc half needs a way to tell an applied grant from an adversarial
+input, and that is an improvement pass.
+
+The marker is deliberately **not** `kube-agents/role: actor`: V-BRK-013 discovers by that label and
+asserts equality with 06 §2.2.1's twenty triples, so a fixture wearing it turns a green
+BLOCKING-ALWAYS check red and the one-line green is an exception in the check.

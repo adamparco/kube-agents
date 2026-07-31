@@ -51,13 +51,51 @@
 # P1 in full, and the header names that successor.
 
 # --- the standing regression suite ----------------------------------------------------------
-# verify-phase7.sh is the whole prior build in one command: it runs verify-phase{2,3,4,5,6}.sh,
-# chaos C1-C4, 03 §11 negative attenuation, the goldens and `go test ./...`. It is listed FIRST
-# because a phase's new L2 evidence is worth nothing if it was gathered on a cluster where the
-# previous phases had already broken.
+# The standing line is the LAST CLOSED PHASE'S GATE, and nothing else. Phase 8 closed on 2026-07-27
+# and this line still said verify-phase7.sh until 2026-07-30, which cost two things that are worth
+# naming because neither is visible from the chain file.
+#
+# The first is coverage: verify-phase7.sh reaches phases 2-6, so for three phases the standing
+# regression did not include the six Phase-8 suites at all. They were still run — they are listed
+# individually below — but they were run as Phase 8's own evidence rather than as the floor every
+# later phase has to clear, which is a different claim about the same commands.
+#
+# The second is subtler and is the reason this comment is this long. invariants-gate.py derives the
+# set of scripts it lints for declared preconditions from the TRANSITIVE CLOSURE OF THIS FILE
+# (_l2_scripts_in_scope). A phase gate that is in no chain line and that nothing else calls is
+# therefore outside that closure: verify-phase8.sh, the single script that renders Phase 8's verdict,
+# was never once asked which artifact it was judging. The lint was not broken and the script happens
+# to declare its preconditions properly; the point is that nothing checked, for three phases, and the
+# only way to find that out was to ask why the standing line was a phase behind.
+#
+# So: verify-phase8.sh is the whole prior build in one command. It runs verify-phase7.sh (=> phases
+# 2-6, chaos C1-C4, 03 §11 negative attenuation, the goldens and `go test ./...`) and all six Phase-8
+# suites. It is listed FIRST because a phase's new L2 evidence is worth nothing if it was gathered on
+# a cluster where the previous phases had already broken.
+bash dev/verify/verify-phase8.sh gke-scratch-kube-agents-dev
+
+# verify-phase7.sh stays a line of its own even though the line above reaches it, and the reason is
+# not sentiment. invariants-gate.py's check_closed_lessons_are_executable resolves chain lines
+# LITERALLY — it does not follow delegation, unlike _l2_scripts_in_scope four hundred lines away in
+# the same file — and dropping this line turned LSN-013 and LSN-028 red within one run, both of them
+# closed years of build-time ago against verify-phase7.sh as their mechanizing artifact.
+#
+# The first instinct was that the check is coarse and should follow delegation. It should not, and
+# the argument is the same one written under the Phase 8 heading below: verify-phase8.sh runs
+# verify-phase7.sh only when P1 resolves, so a delegated call is a CONDITIONAL one. "Named by a chain
+# line" means "runs every time the chain runs", and that is a stronger and more useful property than
+# "is reachable". A lesson mechanized by an artifact that runs only when a precondition happens to
+# hold is a lesson that can silently stop being mechanized on a cluster with a stale image.
 bash dev/verify/verify-phase7.sh gke-scratch-kube-agents-dev
 
 # --- Phase 8 L2 checks ------------------------------------------------------------------------
+# These five and webhook-negatives-l2.sh below are now ALSO reached through the standing line, and
+# they stay listed anyway. verify-phase8.sh runs each of them CONDITIONALLY — egress-enforcement only
+# on a dataplane P4 recognises, webhook-negatives only once it covers all ten of 06 §1.2's rules —
+# and a conditional caller is not a substitute for a line that always runs. Collapsing them into the
+# standing line would silently convert "this suite ran" into "this suite ran unless the gate decided
+# otherwise", which is exactly the distinction the gate's deferral arms exist to keep visible.
+#
 # Two kinds of claim, one cluster that can host both: the first three need a dataplane that actually
 # enforces NetworkPolicy (P4's allow-list of known-enforcing dataplanes — this target runs anetd,
 # GKE's Dataplane V2), the last two need the operator and its webhook. The target below satisfies
@@ -154,3 +192,90 @@ bash dev/verify/brake-fanout-l2.sh gke-scratch-kube-agents-dev
 # selector of `role: actor` alone can be caught round-robining one agent's envelopes into another
 # agent's broker.
 bash dev/verify/broker-per-agent-l2.sh gke-scratch-kube-agents-dev
+
+# V-BRK-007/008/009/010/017: what the deployed broker does with a credential. The third line that
+# needs P1 in full on the BROKER pod, and the first that needs the broker to actually SERVE — every
+# preceding broker line asserts around the door, because until dev/lib/broker-driver.sh nothing here
+# could assemble the three things the broker demands at once (a mesh-CA certificate, a projected
+# token with audience kubeagents-broker, and a SPIFFE URI in the first naming the ServiceAccount in
+# the second). broker-per-agent-l2.sh states that as an explicit non-claim.
+#
+# All five rows are BLOCKING-ALWAYS and all five carry the mandatory negative control. Nine of the
+# ten credentials this presents are ones the broker must refuse; the tenth runs FIRST and its
+# failure aborts the run, because refusals from a broker that refuses everything are not evidence.
+#
+# It runs after broker-per-agent-l2.sh, and both are last for the same reason: they seed and delete
+# Agent CRs in kubeagents-system. This one additionally mints a 15-minute token for the cluster-admin
+# agent's reader ServiceAccount so the broker can be asked to refuse it, which is a thing to do on a
+# scratch cluster and nowhere else. Its own anchored guard is what keeps that true.
+bash dev/verify/broker-auth-l2.sh gke-scratch-kube-agents-dev
+
+# NO CHECK ID, deliberately: this line protects a DECISION, the P9-T9b-5a ruling that the test-only
+# tenant write overlay steps outside `vap-agent-readonly`'s population rather than the policy being
+# taught a carve-out for it. There is no row in 09 §6 for "the ruling this phase made is still true",
+# and inventing one would put a line in verification/results.csv for a property no spec states.
+#
+# What it executes is the three premises the ruling rests on, which until this unit existed only as a
+# paragraph in a fixture header reading CEL and predicting an API server: that the shipped write
+# rules wearing `kube-agents/tier` are denied by validation 1, that the same rules wearing
+# `kube-agents/role: actor` are denied by validation 3, and that wearing neither they are admitted.
+# The three variants are DERIVED from `actor-tenant-write-grant.yaml` rather than re-typed, so all
+# three arms are about the rule set that actually gets granted.
+#
+# It is the first line in the repository to assert P2. Every prior admission claim in this tree was a
+# claim that something was DENIED, and a denial is self-witnessing — it cannot be produced by an
+# absent policy. This suite's core arm asserts an object IS ADMITTED, which reads exactly the same
+# green against a policy nobody installed, a binding that never activated, or a policy someone
+# deleted. `p2_assert_policy_live` makes liveness an experiment (a server dry-run of something the
+# policy must reject, polled) instead of a `kubectl get`, and it probes validation 2 so that
+# establishing the precondition does not pre-establish either of the arms.
+#
+# It runs in the terminal group with broker-per-agent-l2.sh and broker-auth-l2.sh, for the same
+# reason: it deletes and re-applies an Agent CR in kubeagents-system. When broker-execute-l2.sh
+# (P9-T9b-5b) lands it goes AFTER this line and not before — that suite cannot reach step 8 without
+# the write authority proved here, because execute/client.go issues real API calls with
+# client.DryRunAll and a server-side dry-run is authorized before it is dry-run.
+bash dev/verify/actor-overlay-admission-l2.sh gke-scratch-kube-agents-dev
+
+# V-BRK-006 (its L2 clause) and V-REV-001 (n=1) — Phase 9 acceptance bullet (a), and the first line in
+# this chain whose evidence is an object the BROKER wrote. Everything else that reads an ActionRecord
+# reads one a test put there; this submits one well-formed envelope through the shipped client and
+# then judges what the journal actually holds.
+#
+# It goes AFTER actor-overlay-admission-l2.sh, as that line's own comment requires. The dependency is
+# real and not stylistic: the executor's step-8 apply is issued with client.DryRunAll, the API server
+# authorizes a dry-run before it dry-runs it, and the write grant that makes it possible is the one the
+# ruling above put outside the policy's population. Run this first and it fails 403 from inside the
+# executor, which reads like a broker defect.
+#
+# It also runs in the terminal group, for the same reason its two neighbours do: it deletes and
+# re-applies the platform-agent CR in kubeagents-system. It leaves the tenant namespace and the
+# ActionRecord standing on purpose ([[LSN-045]]) — kube-agents-journal-retention denies DELETE of a
+# record until export confirms, so a suite that tore its namespace down would hang forever on its own
+# evidence.
+#
+# WHAT IT DOES NOT CLAIM, so the next reader does not go looking: V-BRK-018 and V-REV-003 are fault
+# injection and belong to P9-T9b-5b-ii; V-REV-002 needs an undo executed; V-BRK-019's field-manager
+# string is unreadable from a shadow because a server-side dry-run persists no managedFields. The
+# suite's own header carries the full accounting.
+bash dev/verify/broker-execute-l2.sh gke-scratch-kube-agents-dev
+
+# --- Phase 9's gate ------------------------------------------------------------------------------
+# verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the
+# two suites P9-T9b-5 still owes, the L0 chain run as a file, and the whole prior ratchet through the
+# standing line.
+#
+# IT IS RED TODAY, ON PURPOSE, and that is the reason it is listed rather than held back until it
+# passes. Sections B, E, F and G detect broker-execute-l2.sh, actor-grant-sweep-l2.sh, V-BRK-021's L2
+# claimant and planning defect 2's guard 1 BY ARTIFACT and fail while each is absent. A gate that is
+# only added once it is green is a gate that has never once told anyone something they did not
+# already know; the whole value of the artifact arms is that they are visible in an L2 run now,
+# months before anybody would otherwise notice that Accept (a) has never been executed against a
+# cluster. verify-phase8.sh spent three phases outside this file for want of that argument, which is
+# written out in full above the standing line.
+#
+# It is listed LAST and it duplicates work — it re-runs the standing line and every Phase-9 line
+# above it. That is accepted for as long as Phase 9 is open. At Phase 9's milestone it BECOMES the
+# standing line, at which point the seven Phase-9 lines above collapse into it the way the Phase-8
+# five should have, and L2_CHAIN_FLOOR in invariants-gate.py moves in that same commit.
+bash dev/verify/verify-phase9.sh gke-scratch-kube-agents-dev

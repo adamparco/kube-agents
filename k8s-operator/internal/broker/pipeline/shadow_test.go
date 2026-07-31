@@ -228,7 +228,7 @@ func TestTheShadowClassifiesAsTheRealThingWould(t *testing.T) {
 	// A refusal is a plan whose strategy is `none`, never a nil Plan (undo.Result). A nil one is a
 	// step-6 fault, which is a different test in the fault table.
 	noPlan := func(r *rig) {
-		r.planner = PlannerFunc(func(context.Context, undo.Request, undo.ReferenceIndex) (*undo.Result, error) {
+		r.planner = PlannerFunc(func(context.Context, undo.Request, undo.ReferenceIndex, undo.DryRunner) (*undo.Result, error) {
 			return &undo.Result{
 				Plan:     &agentv1alpha1.UndoPlan{Strategy: agentv1alpha1.UndoNone},
 				Refusals: []string{"nothing about this action can be inverted"},

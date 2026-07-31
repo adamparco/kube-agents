@@ -1,0 +1,158 @@
+{
+  "_comment": "V-REV-003 -- an action whose undo plan cannot be generated or validated is raised to gated and never auto-executes. The L1 row for this check already existed before P9-T8b-4b-ii-2b-i and it proved the wrong half: that undo.Validate downgrades when handed a nil dry-runner, a property of the FUNCTION, while nothing asserted a dry-runner was ever wired. Nothing was. undo.GenerateAndValidate had no non-test caller, every ActionRecord shipped `undoPlan.validated: false`, and undo.ValidateReplayable refuses on exactly that field -- so undo was non-functional end to end with a green suite (09 §11.9, component built, never wired). These mutants therefore attack the WIRING: the required-field arm (M1), the default planner (M2), the composition root (M3), the strength of the step 6 predicate (M4, M5), the identity the dry run carries (M6, M7), and the validator's own legs (M8, M9, M10) -- plus two vacuity controls (M11, M12), because a suite that measures an unwired component reports the same green as one that measures a wired one, which is the exact failure this check just had. Run with `python3 dev/mutate.py verification/mutants/V-REV-003.json`.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": [
+      "./internal/broker/pipeline/",
+      "./internal/broker/rollback/",
+      "./cmd/broker/"
+    ]
+  },
+  "mutants": [
+    {
+      "id": "M1-a-broker-may-start-with-nothing-to-validate-with",
+      "why": "THE defect, restored exactly: DryRunner becomes optional, so a deployment that forgets to wire one comes up clean, serves every request, and journals `validated: false` on every record. Nothing finds out until a human tries to undo an outage. An optional seam is how the original hole was spelled -- the field simply did not exist -- so the required-field arm is the only thing that makes its absence loud.",
+      "catcher": "TestNewRejectsABrokerThatCannotDryRunItsUndoPlans",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\tcase cfg.DryRunner == nil:",
+          "replace": "\tcase cfg.DryRunner == nil && cfg.Records == nil && cfg.Brake == nil:"
+        }
+      ]
+    },
+    {
+      "id": "M2-the-default-planner-goes-back-to-generate-only",
+      "why": "The original defect at its own definition site. The seam exists, the wiring exists, and the default quietly does not validate -- which is what shipped for five phases. Every record it writes is well-formed and carries a plan; the only difference is one boolean nobody was reading.",
+      "catcher": "TestTheJournaledPlanWasDryRunAgainstTheAPIServer",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\tcfg.Planner = PlannerFunc(undo.GenerateAndValidate)",
+          "replace": "\t\tcfg.Planner = PlannerFunc(func(ctx context.Context, req undo.Request, idx undo.ReferenceIndex, _ undo.DryRunner) (*undo.Result, error) {\n\t\t\treturn undo.Generate(ctx, req, idx)\n\t\t})"
+        }
+      ]
+    },
+    {
+      "id": "M3-the-composition-root-stops-supplying-a-dry-runner",
+      "why": "One level above M1: the constructor still demands a DryRunner, and the real broker hands it one that answers nothing. This is the shape a wiring defect takes once the required-field arm exists -- the field is populated and the value is inert -- and it is invisible to every test that builds its own Config.",
+      "catcher": "TestBuildPipelineWiresADryRunnerThatReachesTheClusterClient",
+      "edits": [
+        {
+          "file": "k8s-operator/cmd/broker/wiring.go",
+          "find": "\t\t\treturn &rollback.PlanDryRunner{Replayer: replayer, AgentIdentity: agentIdentity}",
+          "replace": "\t\t\t_ = agentIdentity\n\t\t\treturn &rollback.PlanDryRunner{Replayer: nil, AgentIdentity: \"\"}"
+        }
+      ]
+    },
+    {
+      "id": "M4-step-6-goes-back-to-asking-the-weaker-question",
+      "why": "The pipeline re-checks the class against the plan at 03 §4.1 step 6. Asking Undoable() rather than Validated() accepts a plan that exists and that nothing checked -- identical behaviour under the real planner, and the whole hole again the moment a planner is injected or swapped.",
+      "catcher": "TestStep6RefusesAPlanNothingValidated",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\tif classify.UndoPlanGateApplies(s.env.DryRun, s.plan.Validated()) && s.class.Class < classify.ClassGated {",
+          "replace": "\t\tif classify.UndoPlanGateApplies(s.env.DryRun, s.plan.Undoable()) && s.class.Class < classify.ClassGated {"
+        }
+      ]
+    },
+    {
+      "id": "M5-Validated-collapses-into-Undoable",
+      "why": "M4 from below: the predicate keeps its name and loses its meaning, so every caller that carefully asked the stronger question gets the weaker answer. A rename-proof version of the same defect -- grep for `Validated()` still finds the call sites, and they all now lie.",
+      "catcher": "TestStep6RefusesAPlanNothingValidated",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/undo/plan.go",
+          "find": "func (r *Result) Validated() bool {\n\treturn r != nil && r.Plan != nil && r.Plan.Validated\n}",
+          "replace": "func (r *Result) Validated() bool {\n\treturn r.Undoable()\n}"
+        }
+      ]
+    },
+    {
+      "id": "M6-the-pipeline-dry-runs-under-a-name-that-is-not-the-actors",
+      "why": "Server-side apply reports a conflict for every field owned by a different manager, and an undo commonly restores fields this agent set earlier. A dry run issued under the wrong name manufactures conflicts the real replay never hits: it downgrades working plans and gates the fleet for a reason that is an artifact of the check. Nothing about the outcome looks like a bug -- the broker simply becomes cautious.",
+      "catcher": "TestADryRunIssuedUnderAnotherNameWouldBeAWrongAnswer",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "p.cfg.DryRunner(agentIdentity(s.id))",
+          "replace": "p.cfg.DryRunner(string(s.id.Tier))"
+        }
+      ]
+    },
+    {
+      "id": "M7-the-validator-ignores-the-identity-it-was-built-for",
+      "why": "M6 at the other end of the same seam: the pipeline passes the right key and PlanDryRunner writes under a fixed one. Same wrong answer, different file, and the pipeline-side assertion cannot see it.",
+      "catcher": "TestTheDryRunCarriesTheFieldManagerTheReplayWould",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/rollback/dryrun.go",
+          "find": "\tfm, err := execute.FieldManager(d.AgentIdentity)",
+          "replace": "\tfm, err := execute.FieldManager(\"platform\")"
+        }
+      ]
+    },
+    {
+      "id": "M8-validating-a-plan-writes-to-the-cluster",
+      "why": "The one thing this component may never do. It runs BEFORE the action, on an envelope that may yet be refused at step 7 or gated at step 5, so a leg that forgets the flag applies an undo of an action that has not happened. Behaviour is identical against every fake that ignores the bit, which is why the fake records it.",
+      "catcher": "TestTheValidatorNeverMutatesAnything",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/rollback/dryrun.go",
+          "find": "\tif _, err := d.Replayer.Writer.Apply(ctx, obj, fm, true); err != nil {",
+          "replace": "\tif _, err := d.Replayer.Writer.Apply(ctx, obj, fm, false); err != nil {"
+        }
+      ]
+    },
+    {
+      "id": "M9-every-answer-from-the-API-server-is-read-as-yes",
+      "why": "The generalisation of the two errors that legitimately are not failures. A 403 on the create leg means the actor cannot recreate what it is about to delete, and reading it as `would apply` produces a validated plan that is guaranteed to fail during the incident it exists for. This is the failure mode the NotFound and AlreadyExists exemptions are one careless edit away from.",
+      "catcher": "TestARefusalFromTheAPIServerIsAFailedValidation",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/rollback/dryrun.go",
+          "find": "\t_, err = d.Replayer.Writer.Create(ctx, obj, fm, true)\n\tswitch {\n\tcase err == nil, apierrors.IsAlreadyExists(err):\n\t\treturn nil",
+          "replace": "\t_, err = d.Replayer.Writer.Create(ctx, obj, fm, true)\n\tswitch {\n\tcase err == nil, err != nil:\n\t\treturn nil"
+        }
+      ]
+    },
+    {
+      "id": "M10-a-replayable-op-loses-its-dry-run-leg",
+      "why": "The dispatch and Replayer.replayStep are two switches over one op set. Drop a case and the default arm refuses the step, undo.Validate downgrades the plan, and every action using that op gates -- a fleet-wide regression that surfaces as `the broker got cautious` rather than as a missing switch case. dryrun.go's dispatch doc names the catcher by name, so the name has to keep meaning something.",
+      "catcher": "TestThePlanValidatorCoversEveryReplayableOp",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/rollback/dryrun.go",
+          "find": "\tcase \"scale\":\n\t\treturn d.dryRunScale(ctx, step, fm)",
+          "replace": "\tcase \"scale-disabled\":\n\t\treturn d.dryRunScale(ctx, step, fm)"
+        }
+      ]
+    },
+    {
+      "id": "M11-vacuity-the-happy-path-is-actually-exercised",
+      "why": "Control, not a defect. Every assertion above is conditioned on a submission reaching step 6 with a plan; if the rig's envelope stopped earlier, the whole file would be green over an empty population -- which is indistinguishable from the wiring hole it replaced. Refusing at step 6 unconditionally must break the suite loudly.",
+      "catcher": "TestTheJournaledPlanWasDryRunAgainstTheAPIServer",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/pipeline/pipeline.go",
+          "find": "\t\t\treturn \"\", fmt.Errorf(\"step 6: no undo plan object reached this step; step 4 did not run or did not record one\")",
+          "replace": "\t\t\t_ = s\n\t\t}\n\t\tif true {\n\t\t\treturn \"\", fmt.Errorf(\"step 6: no undo plan object reached this step; step 4 did not run or did not record one\")"
+        }
+      ]
+    },
+    {
+      "id": "M12-vacuity-the-dry-runner-legs-are-actually-reached",
+      "why": "Control for the rollback half. If DryRun returned nil before dispatching, every leg-level assertion would pass on a call that did nothing -- the same shape as M3, one layer in. This mutant must be caught by the test that counts the calls, not merely by one that checks the error.",
+      "catcher": "TestThePlanValidatorCoversEveryReplayableOp",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/rollback/dryrun.go",
+          "find": "\tswitch step.Op {\n\tcase \"delete\":\n\t\treturn d.dryRunDelete(ctx, step)",
+          "replace": "\tif true {\n\t\treturn nil\n\t}\n\tswitch step.Op {\n\tcase \"delete\":\n\t\treturn d.dryRunDelete(ctx, step)"
+        }
+      ]
+    }
+  ]
+}

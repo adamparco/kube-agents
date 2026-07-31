@@ -274,7 +274,9 @@ def submit_action(
     intent: str,
     operations: list[dict[str, Any]],
     *,
-    trigger: dict[str, Any] | None = None,
+    trigger_source: str,
+    trigger_ref: str = "",
+    trigger_detail: str = "",
     requester: dict[str, Any] | None = None,
     trace: dict[str, Any] | None = None,
     rationale: str = "",
@@ -290,15 +292,40 @@ def submit_action(
     so the absence of those parameters is the API telling the caller the truth about what it can
     influence. `requireApproval` is the one direction a caller may push: it can ask for *more*
     gating than the classifier decided, never less.
+
+    **`trigger_source` is required and has no default**, which is the whole of P9-T8b-4d. 06 §9 says
+    this tool *takes* `trigger`; until T8b-4c it silently supplied `{"source": "agent"}`, a value
+    that is not a member of anything, so `envelope.go`'s `validTriggerSources` made *every* MCP
+    submission a `400 invalid-envelope` -- not a degraded field, the whole write path, for every
+    agent, on the default call. T8b-4c fixed the value to `chat` and mirrored the enum agent-side
+    (`action_envelope.VALID_TRIGGER_SOURCES` now refuses a bad one locally, with the seven named,
+    before a nonce is spent). But a correct default is still the wrong shape here, because the field
+    it fills in is the one 01 §7 counts: `trigger.source` is what splits 06 §4.1's two autonomy
+    buckets (`humanRequested ∈ {chat, undo}`,
+    `selfInitiated ∈ {watch, alert, cron, delegation, escalation}`). A default cannot be right for
+    both, and the direction it is wrong in is the expensive one -- an autonomous caller that forgets
+    to say so gets its work filed under "a human asked for this", and the resulting quarter's answer
+    to "how much of this did the agents decide on their own?" is quietly too low, with nothing
+    anywhere reading as an error. Required means the caller states the origin or the call does not
+    compile; the enum is named in the MCP tool's docstring, which is where the model reads it.
+
+    `ref` and `detail` are the corroboration: the alert name, the watch's object, the delegating
+    action's id. Both are `omitempty` on `broker.Trigger`, so an empty one is left off the wire
+    rather than sent blank.
     """
     c = client or BrokerClient()
+    trigger: dict[str, Any] = {"source": trigger_source}
+    if trigger_ref:
+        trigger["ref"] = trigger_ref
+    if trigger_detail:
+        trigger["detail"] = trigger_detail
     try:
         envelope = action_envelope.build_envelope(
             agent_identity=c.cfg.identity,
             intent=intent,
             operations=operations,
             requester=requester or session_requester(),
-            trigger=trigger or {"source": "agent"},
+            trigger=trigger,
             trace=trace or session_trace(),
             nonce=c.fetch_nonce(),
             rationale=rationale,
@@ -319,7 +346,9 @@ def plan_action(
     intent: str,
     operations: list[dict[str, Any]],
     *,
-    trigger: dict[str, Any] | None = None,
+    trigger_source: str,
+    trigger_ref: str = "",
+    trigger_detail: str = "",
     requester: dict[str, Any] | None = None,
     trace: dict[str, Any] | None = None,
     rationale: str = "",
@@ -337,7 +366,9 @@ def plan_action(
     return submit_action(
         intent,
         operations,
-        trigger=trigger,
+        trigger_source=trigger_source,
+        trigger_ref=trigger_ref,
+        trigger_detail=trigger_detail,
         requester=requester,
         trace=trace,
         rationale=rationale,
@@ -357,6 +388,16 @@ def session_trace() -> dict[str, Any]:
     absent rather than refusing, because a missing trace degrades an incident timeline and a
     refused action degrades the product -- and unlike the identity, nothing downstream is made
     *wrong* by a trace that only covers the broker leg.
+
+    `SPAN_ID` goes on the wire as `spanId`, which is the name `broker.Trace` carries and the name
+    06 §4.1's schema prints. It was `parentSpanId` until P9-T8b-4c, and that spelling was not a
+    cosmetic difference: `DecodeEnvelope` runs with `DisallowUnknownFields`, so an agent in a
+    traced session had EVERY action refused `400 unknown-field`, naming a trace key rather than
+    anything the agent did. Nothing sets `SPAN_ID` today, which is the only reason it was latent
+    -- the bug would have arrived on the day tracing was wired and read as the broker refusing
+    everything. `spanId` is documented as "the originating span" on `ActionRecord.trace`, which is
+    what the runtime's `SPAN_ID` is; V-BRK-032 holds every key this function can emit to
+    `broker.Trace`'s json tags so the next one is a build failure rather than an outage.
     """
     trace_id = (os.environ.get("TRACE_ID") or "").strip().lower()
     if not action_envelope._HEX32.match(trace_id):
@@ -364,7 +405,7 @@ def session_trace() -> dict[str, Any]:
     out: dict[str, Any] = {"traceId": trace_id}
     span = (os.environ.get("SPAN_ID") or "").strip()
     if span:
-        out["parentSpanId"] = span
+        out["spanId"] = span
     return out
 
 

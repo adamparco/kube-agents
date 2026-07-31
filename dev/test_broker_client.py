@@ -250,6 +250,58 @@ class TestTheGoSideIsTheDefinition(unittest.TestCase):
             "RESPONSE_FIELDS and render_response disagree, so the join above checks the wrong set",
         )
 
+    # Every closed-enum envelope field this module can name in a literal, mapped to the mirror that
+    # closes it. `kind` is unambiguous inside this scan because the only `kind` this module writes is
+    # the requester's -- a target's Kubernetes kind arrives inside `operations`, which is a caller
+    # argument and never a literal here. The scan asserts that (grep for the four keys turns up
+    # nothing else), so a future literal that collides is a failure and not a silent widening.
+    ENUM_BY_FIELD = {
+        "source": "VALID_TRIGGER_SOURCES",
+        "kind": "VALID_REQUESTER_KINDS",
+        "platform": "VALID_PLATFORMS",
+        "op": "VALID_OPS",
+    }
+
+    def test_every_enum_value_this_module_writes_itself_is_inside_the_closed_enum(self):
+        """A value the module supplies is a value nobody reviews, and one had been wrong from the start.
+
+        `submit_action` passed `trigger or {"source": "agent"}` and `agent` is not one of 06 §4.1's
+        seven sources. Because `envelope.go` validates the enum, that made **every** MCP submission
+        a `400 invalid-envelope` -- not a degraded field, the entire write path, for every agent, on
+        the default call. Nothing caught it: the enum mirror agrees with Go (V-BRK-028), the wire
+        keys are all decodable (V-BRK-032), the transport is correct (the rest of this file), and a
+        supplied value is none of those things. It is a *value*, and until this test the only
+        assertion about a value was made against values the tests themselves supplied.
+
+        Scoped to every dict literal in the module rather than to `build_envelope`'s keyword
+        defaults, which is where the defect happened to live. T8b-4d removed that default -- the
+        trigger is a parameter now -- and a scan pinned to the old shape would have gone from
+        catching one thing to catching nothing while still reporting green. What is actually being
+        asserted is "no closed-enum value originates in this file unless it is a member", and
+        `session_requester`'s two `kind`s are inside it for the same reason the trigger was.
+        """
+        tree = ast.parse((tier_dir("platform") / MODULE).read_text())
+        envelope_mod = self.mod.action_envelope  # the same copy the shipped client validates against
+        checked = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            for key, val in zip(node.keys, node.values):
+                if not (isinstance(key, ast.Constant) and isinstance(val, ast.Constant) and isinstance(val.value, str)):
+                    continue
+                enum_name = self.ENUM_BY_FIELD.get(key.value)
+                if enum_name is None:
+                    continue
+                checked += 1
+                with self.subTest(field=key.value, value=val.value):
+                    self.assertIn(
+                        val.value,
+                        getattr(envelope_mod, enum_name),
+                        f"{MODULE} writes {key.value}={val.value!r}, which is not in {enum_name}. "
+                        "The broker validates this enum, so every envelope carrying it is a 400.",
+                    )
+        self.assertTrue(checked, "no enum-typed literal was found at all, so this scan proves nothing")
+
 
 # --- 2. mTLS has no off switch ------------------------------------------------------------------------
 
@@ -334,7 +386,7 @@ class TestTheRequest(unittest.TestCase):
         client = mod.BrokerClient(config(mod), opener=rec)
         ops = [{"op": "apply", "target": {"version": "v1", "kind": "ConfigMap", "namespace": "team-x", "name": "cm"}, "desiredState": {"data": {"a": "b"}}}]
         fn = mod.plan_action if dry_run else mod.submit_action
-        out = fn("raise the memory limit", ops, client=client)
+        out = fn("raise the memory limit", ops, trigger_source="chat", client=client)
         return mod, rec, out
 
     def test_it_fetches_a_nonce_then_posts_to_the_actions_route(self):
@@ -402,11 +454,61 @@ class TestTheRequest(unittest.TestCase):
         )
         client = mod.BrokerClient(config(mod), opener=rec)
         ops = [{"op": "delete", "target": {"version": "v1", "kind": "Pod", "namespace": "team-x", "name": "p"}}]
-        mod.submit_action("first", ops, client=client)
-        mod.submit_action("second", ops, client=client)
+        mod.submit_action("first", ops, trigger_source="chat", client=client)
+        mod.submit_action("second", ops, trigger_source="chat", client=client)
         self.assertEqual(rec.paths(), [mod.NONCE_PATH, mod.ACTIONS_PATH, mod.NONCE_PATH, mod.ACTIONS_PATH])
         nonces = [json.loads(b)["nonce"] for b in rec.bodies if b]
         self.assertEqual(len(set(nonces)), 2, "the same nonce was submitted twice")
+
+    def test_the_origin_the_caller_gave_is_the_origin_on_the_wire(self):
+        """The first assertion anywhere that `trigger` survives the trip. It had never been driven.
+
+        Both defects T8b-4d can introduce are here: a `plan_action` that forgets to forward its own
+        `trigger_source`, and either function substituting a constant for it. `alert` is used rather
+        than `chat` precisely because `chat` is what a hardcode would most plausibly say.
+        """
+        for tier in TIERS:
+            for dry_run in (False, True):
+                with self.subTest(tier=tier, dry_run=dry_run):
+                    mod = load(tier)
+                    token_reader(mod)
+                    rec = Recorder().nonce_then({"_status": 202, "actionId": "A1", "decision": "accepted"})
+                    client = mod.BrokerClient(config(mod), opener=rec)
+                    ops = [{"op": "delete", "target": {"version": "v1", "kind": "Pod", "namespace": "team-x", "name": "p"}}]
+                    fn = mod.plan_action if dry_run else mod.submit_action
+                    fn("drain it", ops, trigger_source="alert", trigger_ref="KubePodCrashLooping", client=client)
+                    self.assertEqual(rec.envelope["trigger"], {"source": "alert", "ref": "KubePodCrashLooping"})
+
+    def test_an_unsupplied_ref_or_detail_is_left_off_the_wire_rather_than_sent_blank(self):
+        """Both are `omitempty` on `broker.Trigger`. A blank string is a value, and it is not one."""
+        _, rec, _ = self.run_submit("platform")
+        self.assertEqual(rec.envelope["trigger"], {"source": "chat"})
+
+    def test_the_origin_has_no_default_anywhere_on_the_way_in(self):
+        """A required parameter is the whole of T8b-4d, and a default is how it stops being one.
+
+        Not a check on the default's *value*: `chat` was the correct value and was still wrong here.
+        `trigger.source` is what splits 06 §4.1's two autonomy buckets, so whatever a default says,
+        it says it for every caller that did not think about the question -- and the 01 §7 count of
+        "how much of this did the agents decide" is then measuring the default. The failure is
+        silent by construction, because a defaulted enum member is a legal envelope.
+        """
+        for tier in TIERS:
+            for module, names in ((MODULE, ("submit_action", "plan_action")), (MCP_MODULE, ("submit_action", "plan_action"))):
+                tree = ast.parse((tier_dir(tier) / module).read_text())
+                fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names}
+                for name in names:
+                    with self.subTest(tier=tier, module=module, function=name):
+                        fn = fns[name]
+                        positional = fn.args.posonlyargs + fn.args.args
+                        required = {a.arg for a in positional[: len(positional) - len(fn.args.defaults)]}
+                        required |= {a.arg for a, d in zip(fn.args.kwonlyargs, fn.args.kw_defaults) if d is None}
+                        self.assertIn(
+                            "trigger_source",
+                            required,
+                            f"{module}:{name} gives trigger_source a default; the autonomy split then reports the "
+                            "default for every caller that did not think about it",
+                        )
 
     def test_the_envelope_names_no_tier_scope_or_risk_class(self):
         """03 §4.1 step 1 derives those from the identity; naming one could only be an override."""
@@ -447,7 +549,9 @@ class TestFailClosed(unittest.TestCase):
         token_reader(mod)
         rec = Recorder().nonce_then()
         client = mod.BrokerClient(config(mod), opener=rec)
-        out = mod.submit_action("bad", [{"op": "conjure", "target": {"version": "v1", "kind": "Pod", "name": "p"}}], client=client)
+        out = mod.submit_action(
+            "bad", [{"op": "conjure", "target": {"version": "v1", "kind": "Pod", "name": "p"}}], trigger_source="chat", client=client
+        )
         self.assertTrue(out.startswith("REFUSED (not sent)"), out)
         self.assertEqual(rec.paths(), [mod.NONCE_PATH], "a rejected envelope was POSTed anyway")
 
@@ -510,6 +614,46 @@ class TestTheToolsAreWiredAndThin(unittest.TestCase):
                     self.assertEqual(len(body), 1, f"{name} has {len(body)} statements; it must only delegate")
                     self.assertIsInstance(body[0], ast.Return)
                     self.assertEqual(ast.unparse(body[0].value.func), f"broker_client.{name}")
+
+    def test_every_parameter_a_tool_takes_reaches_the_client_under_its_own_name(self):
+        """A one-statement body proves the tool does not reimplement. It does not prove it forwards.
+
+        T8b-4d gave both tools `trigger_source`, `trigger_ref` and `trigger_detail`. A tool that
+        declares a parameter and then drops it still delegates, still has one statement, and still
+        passes every other assertion in this class -- and the MCP schema the model reads would go on
+        advertising it. The model would keep supplying an origin, the client would keep not
+        receiving one, and the field 01 §7 counts would be wrong in a way no test looked at.
+
+        The crossing case (`trigger_ref=trigger_detail`) is the same defect one line over, so the
+        keyword's name and the name of what is passed under it are compared, not just the set.
+        """
+        for tier in TIERS:
+            client_fns = {
+                n.name: n
+                for n in ast.parse((tier_dir(tier) / MODULE).read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name in ("submit_action", "plan_action")
+            }
+            for name, fn in self.tools(tier).items():
+                with self.subTest(tier=tier, tool=name):
+                    declared = [a.arg for a in fn.args.args + fn.args.kwonlyargs]
+                    call = fn.body[-1].value
+                    forwarded = [a.id for a in call.args if isinstance(a, ast.Name)]
+                    for kw in call.keywords:
+                        self.assertIsInstance(kw.value, ast.Name, f"{name} passes {kw.arg}= something that is not a parameter")
+                        self.assertEqual(kw.arg, kw.value.id, f"{name} passes {kw.value.id} under the name {kw.arg}")
+                        forwarded.append(kw.arg)
+                    self.assertEqual(
+                        sorted(declared),
+                        sorted(forwarded),
+                        f"{name} declares {sorted(declared)} and forwards {sorted(forwarded)}; the difference is a "
+                        "parameter the MCP schema advertises and the client never sees",
+                    )
+                    accepts = {a.arg for a in client_fns[name].args.args + client_fns[name].args.kwonlyargs}
+                    self.assertFalse(
+                        set(forwarded) - accepts,
+                        f"broker_client.{name} does not accept {sorted(set(forwarded) - accepts)}; the tool would "
+                        "raise TypeError on its first call",
+                    )
 
     def test_the_mcp_module_imports_the_client(self):
         for tier in TIERS:
