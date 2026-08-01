@@ -13,12 +13,14 @@ commands that do touch the network are driven through a single recorded seam
 import contextlib
 import io
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CalledProcessError, CompletedProcess
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -45,6 +47,7 @@ def make_finding(
     excerpt="No resources found in payments namespace.",
     impact="All pod-to-pod traffic in payments is unrestricted.",
     remediation=None,
+    recommendation=None,
 ):
     return {
         "id": fid,
@@ -55,6 +58,19 @@ def make_finding(
         "object": obj,
         "evidence": {"command": command, "excerpt": excerpt},
         "impact": impact,
+        "recommendation": recommendation
+        or {
+            "action": "Apply a default-deny NetworkPolicy to the payments namespace.",
+            "rationale": (
+                "Namespace-scoped default-deny is the smallest change that closes "
+                "east-west exposure; a mesh AuthorizationPolicy would only cover "
+                "injected pods."
+            ),
+            "risk": (
+                "Unlabelled cross-namespace traffic into payments breaks on apply. "
+                "Check current flows first."
+            ),
+        },
         "remediation": remediation
         or {
             "kind": "manifest",
@@ -97,16 +113,30 @@ THREE_SEVERITIES = [
 
 
 class Recorder:
-    """Stands in for audit_pr.run_cmd, recording every command and replying by rule."""
+    """Stands in for audit_pr.run_cmd, recording every command and replying by rule.
 
-    def __init__(self, replies=None):
+    `failures` maps a command fragment to the return code that command should
+    produce: with `check=True` it raises CalledProcessError exactly as
+    subprocess would, and with `check=False` it returns the non-zero result.
+    Without it every failure path in the harness is untestable, because a
+    recorder that always succeeds can only ever exercise the happy path.
+    """
+
+    def __init__(self, replies=None, failures=None):
         self.calls: list[list[str]] = []
         self.replies = replies or {}
+        self.failures = failures or {}
 
     def __call__(self, cmd, *, check=True, capture=True):
         self.calls.append(list(cmd))
+        joined = " ".join(cmd)
+        for key, code in self.failures.items():
+            if key in joined:
+                if check:
+                    raise CalledProcessError(code, cmd, "", "simulated failure")
+                return CompletedProcess(cmd, code, "", "simulated failure")
         for key, payload in self.replies.items():
-            if key in " ".join(cmd):
+            if key in joined:
                 return CompletedProcess(cmd, 0, payload, "")
         return CompletedProcess(cmd, 0, "", "")
 
@@ -164,7 +194,9 @@ class BaseTestCase(unittest.TestCase):
         )
 
     def git_add_calls(self, recorder):
-        return [c for c in recorder.calls if c[:2] == ["git", "add"]]
+        # "add" is not at a fixed index: the harness passes git-level flags
+        # (--literal-pathspecs) ahead of the subcommand.
+        return [c for c in recorder.calls if c[0] == "git" and "add" in c[:3]]
 
 
 class HarnessTestCase(BaseTestCase):
@@ -610,13 +642,79 @@ class TestStaging(unittest.TestCase):
 
     def test_git_add_command_is_explicit(self):
         cmd = audit_pr.build_git_add_command(["a.yaml", "b.yaml"])
-        self.assertEqual(cmd, ["git", "add", "--", "a.yaml", "b.yaml"])
+        self.assertEqual(
+            cmd,
+            ["git", "--literal-pathspecs", "add", "--", "a.yaml", "b.yaml"],
+        )
+
+    def test_literal_pathspecs_precedes_the_subcommand(self):
+        # `git add --literal-pathspecs` is an error: the flag is git-level, so
+        # it has to sit before `add` or the whole guard fails at runtime.
+        cmd = audit_pr.build_git_add_command(["a.yaml"])
+        self.assertLess(cmd.index("--literal-pathspecs"), cmd.index("add"))
 
     def test_wildcard_pathspecs_refused(self):
         for pathspec in (".", "-A", "--all", "-a", "*", ":/"):
             with self.subTest(pathspec=pathspec):
                 with self.assertRaisesRegex(ValueError, "wildcard pathspec"):
                     audit_pr.build_git_add_command([pathspec])
+
+    def test_glob_metacharacters_refused_in_a_declared_path(self):
+        # --literal-pathspecs makes these harmless to git, but a path with a
+        # glob in it is a sign the agent meant to stage a set, not a file.
+        for path in (
+            "clusters/*.yaml",
+            "clusters/prod-?/netpol.yaml",
+            "clusters/[ab]/netpol.yaml",
+            "clusters/x].yaml",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(audit_pr.ValidationError):
+                    audit_pr.validate_findings(
+                        make_doc(
+                            findings=[
+                                make_finding(
+                                    remediation={
+                                        "kind": "manifest",
+                                        "path": path,
+                                        "note": "n",
+                                    }
+                                )
+                            ]
+                        ),
+                        AUDIT,
+                    )
+
+    def test_literal_pathspec_flag_defeats_a_glob_against_real_git(self):
+        # Defence in depth, measured rather than assumed. The validator above
+        # already refuses a glob, so this exercises the *second* layer: it
+        # takes the flag prefix the harness actually emits and points it at a
+        # repo holding a file literally named '*.yaml' alongside two files the
+        # glob would match. Without the flag git stages all three.
+        git = shutil.which("git")
+        if git is None:  # pragma: no cover - git is present locally and in CI
+            self.skipTest("git not on PATH")
+
+        prefix = audit_pr.build_git_add_command(["one.yaml"])[1:3]
+        self.assertEqual(prefix, ["--literal-pathspecs", "add"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def run(*args, **kw):
+                return subprocess.run(
+                    [git, *args], cwd=root, check=True, capture_output=True, text=True, **kw
+                )
+
+            run("init", "-q", "-b", "main")
+            run("config", "user.email", "audit@example.invalid")
+            run("config", "user.name", "audit")
+            for name in ("*.yaml", "one.yaml", "two.yaml"):
+                (root / name).write_text("x\n", encoding="utf-8")
+
+            run(*prefix, "--", "*.yaml")
+            staged = run("diff", "--cached", "--name-only").stdout.split()
+            self.assertEqual(staged, ["*.yaml"])
 
     def test_empty_staging_set_refuses_to_build_an_add(self):
         with self.assertRaisesRegex(ValueError, "no explicit paths"):
@@ -666,6 +764,7 @@ class TestFinishWithFindings(HarnessTestCase):
             adds[0],
             [
                 "git",
+                "--literal-pathspecs",
                 "add",
                 "--",
                 "clusters/prod-us-east/payments-netpol.yaml",
@@ -674,11 +773,10 @@ class TestFinishWithFindings(HarnessTestCase):
         )
 
         # The wildcard stagers must never appear anywhere in the command stream.
-        for call in self.harness.calls:
-            if call[:2] == ["git", "add"]:
-                self.assertNotIn(".", call)
-                self.assertNotIn("-A", call)
-                self.assertNotIn("--all", call)
+        for call in self.git_add_calls(self.harness):
+            self.assertNotIn(".", call)
+            self.assertNotIn("-A", call)
+            self.assertNotIn("--all", call)
 
         commit = self.harness.matching("git", "commit")[0]
         self.assertIn("--allow-empty", commit)
@@ -974,6 +1072,642 @@ class TestDryRun(BaseTestCase):
             self.run_finish(make_doc(findings=[]), argv_extra=("--dry-run",)), 0
         )
         self.assertIn("is now clean", self.out)
+
+
+# --------------------------------------------------------------------------- #
+# Size budget — the difference between a stream that publishes and one that 422s
+# --------------------------------------------------------------------------- #
+
+
+def bulk_findings(count, severity="minor", prefix="f"):
+    """`count` findings with distinct ids and SOP-shaped prose."""
+    return [
+        make_finding(
+            fid=f"{prefix}-{i:04d}",
+            severity=severity,
+            title=f"Finding {i}: workload deviates from the baseline",
+            namespace=f"ns-{i:04d}",
+            obj=f"Deployment/app-{i:04d}",
+            command=(
+                f"kubectl --context prod-us-east -n ns-{i:04d} get deployment "
+                f"app-{i:04d} -o jsonpath='{{.spec.template.spec.containers[*].resources}}'"
+            ),
+            excerpt="\n".join(f"line {n} of captured output" for n in range(12)),
+            remediation={
+                "kind": "manifest",
+                "path": f"clusters/prod-us-east/ns-{i:04d}-app-{i:04d}.yaml",
+                "note": "Apply the corrected manifest.",
+            },
+        )
+        for i in range(count)
+    ]
+
+
+class TestRenderBudget(BaseTestCase):
+    def render(self, doc):
+        return audit_pr.render_body(doc, staged_paths=[], generated_at=NOW)
+
+    def test_body_stays_under_the_github_limit_at_250_findings(self):
+        body = self.render(make_doc(findings=bulk_findings(250)))
+        self.assertLess(len(body), audit_pr.MAX_BODY_CHARS)
+
+    def test_ten_findings_render_untruncated(self):
+        findings = bulk_findings(10)
+        body = self.render(make_doc(findings=findings))
+        self.assertNotIn("further findings omitted", body)
+        for finding in findings:
+            self.assertIn(finding["id"], body)
+
+    def test_truncation_notice_names_the_omitted_count(self):
+        body = self.render(make_doc(findings=bulk_findings(250)))
+        self.assertRegex(body, r"\d+ further finding\(s\) are omitted")
+
+    def test_title_carries_the_true_total_even_when_truncated(self):
+        findings = bulk_findings(250)
+        body = self.render(make_doc(findings=findings))
+        title = audit_pr.pr_title(AUDIT, findings)
+        self.assertIn("250 findings", title)
+        # The rendered body must not silently disagree with the title.
+        self.assertIn("250", body)
+
+    def test_delta_block_lists_exactly_the_rendered_ids(self):
+        findings = bulk_findings(250)
+        body = self.render(make_doc(findings=findings))
+        recorded = audit_pr.parse_delta_block(body)
+        ordered = [f["id"] for f in audit_pr.sort_findings(findings)]
+
+        self.assertTrue(recorded)
+        self.assertLess(len(recorded), len(findings), "fixture must overflow")
+        # The recorded set is a prefix of the severity-first order, so
+        # truncation only ever eats the least-severe end.
+        self.assertEqual(recorded, ordered[: len(recorded)])
+        # Every recorded id is genuinely in the body, and the first id that is
+        # not recorded is genuinely absent — otherwise the next run reads a
+        # truncated finding as resolved and announces a fix that never happened.
+        for fid in recorded:
+            self.assertIn(fid, body)
+        self.assertNotIn(ordered[len(recorded)], body)
+
+    def test_criticals_survive_a_flood_of_minor_findings(self):
+        findings = bulk_findings(5, severity="critical", prefix="crit") + bulk_findings(
+            300, severity="minor"
+        )
+        body = self.render(make_doc(findings=findings))
+        for i in range(5):
+            self.assertIn(f"crit-{i:04d}", body)
+        self.assertLess(len(body), audit_pr.MAX_BODY_CHARS)
+
+    def test_scope_only_body_cannot_overflow(self):
+        # Zero findings, an enormous fleet: this overflowed at 148,627 chars
+        # before the scope tables were capped.
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {"name": f"c-{i:04d}", "location": "us-east1", "project": "acme"}
+                for i in range(1200)
+            ],
+            skipped=[
+                {"cluster": f"s-{i:04d}", "reason": "control plane unreachable"}
+                for i in range(1200)
+            ],
+        )
+        body = self.render(doc)
+        self.assertLess(len(body), audit_pr.MAX_BODY_CHARS)
+        self.assertIn("more", body)
+
+    def test_clean_comment_stays_under_the_limit_at_900_skipped(self):
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {"name": f"c-{i:04d}", "location": "us-east1", "project": "acme"}
+                for i in range(900)
+            ],
+            skipped=[
+                {"cluster": f"s-{i:04d}", "reason": "unreachable"} for i in range(900)
+            ],
+        )
+        comment = audit_pr.render_clean_comment(AUDIT, doc, NOW)
+        self.assertLess(len(comment), audit_pr.MAX_BODY_CHARS)
+
+    def test_delta_comment_stays_under_the_limit(self):
+        # Newly reachable: capping the body means N is no longer pinned under
+        # ~67 by the body failing first, so this path stops being dead code.
+        findings = bulk_findings(250)
+        comment = audit_pr.render_delta_comment(
+            AUDIT,
+            [f["id"] for f in findings],
+            [f"gone-{i:04d}" for i in range(250)],
+            findings,
+            {f["id"]: f["title"] for f in findings},
+            NOW,
+        )
+        self.assertLess(len(comment), audit_pr.MAX_BODY_CHARS)
+
+    def test_long_command_is_trimmed(self):
+        finding = make_finding(command="kubectl get pods " + "x" * 5000)
+        rendered = "\n".join(audit_pr.render_finding(finding))
+        self.assertLess(len(rendered), 4000)
+        self.assertIn("truncated", rendered.lower())
+
+    def test_selection_is_a_prefix_of_the_sorted_order(self):
+        findings = bulk_findings(3, severity="minor") + bulk_findings(
+            2, severity="critical", prefix="c"
+        )
+        rendered, omitted = audit_pr.select_rendered_findings(findings, 1)
+        self.assertEqual(len(rendered), 1)
+        self.assertEqual(rendered[0]["severity"], "critical")
+        self.assertEqual(len(omitted), 4)
+
+    def test_at_least_one_finding_always_renders(self):
+        rendered, _ = audit_pr.select_rendered_findings(bulk_findings(5), 0)
+        self.assertEqual(len(rendered), 1)
+
+
+# --------------------------------------------------------------------------- #
+# Schema — recommendation, limitations, and the finding-id charset
+# --------------------------------------------------------------------------- #
+
+
+class TestRecommendation(BaseTestCase):
+    def assert_rejected(self, recommendation, pattern="recommendation"):
+        doc = make_doc(findings=[make_finding(recommendation=recommendation)])
+        with self.assertRaisesRegex(audit_pr.ValidationError, pattern):
+            audit_pr.validate_findings(doc, AUDIT)
+
+    def test_missing_recommendation_is_rejected(self):
+        doc = make_doc(findings=[make_finding()])
+        del doc["findings"][0]["recommendation"]
+        with self.assertRaisesRegex(audit_pr.ValidationError, "recommendation"):
+            audit_pr.validate_findings(doc, AUDIT)
+
+    def test_each_sub_field_is_required(self):
+        full = {"action": "a", "rationale": "r", "risk": "k"}
+        for field in ("action", "rationale", "risk"):
+            with self.subTest(missing=field):
+                partial = {k: v for k, v in full.items() if k != field}
+                self.assert_rejected(partial, field)
+
+    def test_empty_sub_field_is_rejected(self):
+        for field in ("action", "rationale", "risk"):
+            with self.subTest(empty=field):
+                rec = {"action": "a", "rationale": "r", "risk": "k"}
+                rec[field] = "   "
+                self.assert_rejected(rec, field)
+
+    def test_wrong_type_is_rejected(self):
+        self.assert_rejected("just a string")
+        self.assert_rejected(["action", "rationale", "risk"])
+        self.assert_rejected({"action": 5, "rationale": "r", "risk": "k"}, "action")
+
+    def test_recommendation_renders_all_three_fields(self):
+        rendered = "\n".join(
+            audit_pr.render_finding(
+                make_finding(
+                    recommendation={
+                        "action": "Do the thing.",
+                        "rationale": "Because the alternative is worse.",
+                        "risk": "Traffic may drop; check flows first.",
+                    }
+                )
+            )
+        )
+        self.assertIn("Do the thing.", rendered)
+        self.assertIn("Because the alternative is worse.", rendered)
+        self.assertIn("Traffic may drop; check flows first.", rendered)
+
+
+class TestScopeLimitations(BaseTestCase):
+    def test_limitations_are_accepted(self):
+        doc = make_doc(
+            clusters=[
+                {
+                    "name": "prod-us-east",
+                    "location": "us-east1",
+                    "project": "acme-prod",
+                    "limitations": "Autopilot: checks 2.1-2.3 did not run.",
+                }
+            ]
+        )
+        self.assertTrue(audit_pr.validate_findings(doc, AUDIT))
+
+    def test_empty_limitations_entry_is_rejected(self):
+        doc = make_doc(
+            clusters=[
+                {
+                    "name": "prod-us-east",
+                    "location": "us-east1",
+                    "project": "acme-prod",
+                    "limitations": "   ",
+                }
+            ]
+        )
+        with self.assertRaisesRegex(audit_pr.ValidationError, "limitations"):
+            audit_pr.validate_findings(doc, AUDIT)
+
+    def test_a_cluster_cannot_be_both_audited_and_skipped(self):
+        # The Autopilot false-all-clear: the collision this field exists to end.
+        doc = make_doc(
+            clusters=[
+                {"name": "prod-us-east", "location": "us-east1", "project": "acme"}
+            ],
+            skipped=[{"cluster": "prod-us-east", "reason": "Autopilot"}],
+        )
+        with self.assertRaises(audit_pr.ValidationError):
+            audit_pr.validate_findings(doc, AUDIT)
+
+    def test_duplicate_skipped_entries_are_rejected(self):
+        doc = make_doc(
+            findings=[],
+            skipped=[
+                {"cluster": "dr-west", "reason": "unreachable"},
+                {"cluster": "dr-west", "reason": "unreachable again"},
+            ],
+        )
+        with self.assertRaises(audit_pr.ValidationError):
+            audit_pr.validate_findings(doc, AUDIT)
+
+    def test_a_finding_cannot_name_a_skipped_cluster(self):
+        doc = make_doc(
+            findings=[make_finding(cluster="dr-west")],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        with self.assertRaises(audit_pr.ValidationError):
+            audit_pr.validate_findings(doc, AUDIT)
+
+
+class TestFindingIdCharset(BaseTestCase):
+    def test_usable_ids_are_accepted(self):
+        for fid in ("a", "netpol-missing-payments", "v1.2.3-drift", "a" * 100):
+            with self.subTest(fid=fid):
+                self.assertEqual(audit_pr.validate_finding_id(fid, "where"), fid)
+
+    def test_ids_git_would_refuse_are_rejected(self):
+        # Each of these produces a branch `git check-ref-format` rejects once
+        # the id becomes part of platform-agent/fix-<audit>-<id>.
+        for fid in (
+            "has:colon",
+            "has space",
+            "has..dots",
+            "has*star",
+            "ends.lock",
+            "UPPERCASE",
+            "-leading-dash",
+            "trailing-dash-",
+            "a" * 101,
+            "",
+            "has~tilde",
+            "has^caret",
+            "has?question",
+            "has[bracket",
+            "has\\backslash",
+            "has\tab",
+        ):
+            with self.subTest(fid=fid):
+                with self.assertRaises(audit_pr.ValidationError):
+                    audit_pr.validate_finding_id(fid, "where")
+
+    def test_accepted_ids_survive_git_check_ref_format(self):
+        # The rule is only worth anything if git agrees with it.
+        git = shutil.which("git")
+        if git is None:  # pragma: no cover - git is present locally and in CI
+            self.skipTest("git not on PATH")
+        for fid in ("a", "netpol-missing-payments", "v1.2.3-drift", "a" * 100):
+            with self.subTest(fid=fid):
+                branch = audit_pr.group_branch_for(AUDIT, [make_finding(fid=fid)])
+                proc = subprocess.run(
+                    [git, "check-ref-format", f"refs/heads/{branch}"],
+                    capture_output=True,
+                )
+                self.assertEqual(proc.returncode, 0, branch)
+
+
+# --------------------------------------------------------------------------- #
+# Remediation grouping (§5)
+# --------------------------------------------------------------------------- #
+
+
+def manifest_finding(fid, path, severity="critical"):
+    return make_finding(
+        fid=fid,
+        severity=severity,
+        remediation={"kind": "manifest", "path": path, "note": "n"},
+    )
+
+
+class TestRemediationGroups(BaseTestCase):
+    def ids(self, groups):
+        return [[f["id"] for f in group] for group in groups]
+
+    def test_disjoint_paths_are_separate_groups(self):
+        groups = audit_pr.remediation_groups(
+            [manifest_finding("a", "x.yaml"), manifest_finding("b", "y.yaml")]
+        )
+        self.assertEqual(self.ids(groups), [["a"], ["b"]])
+
+    def test_a_shared_path_merges_two_findings(self):
+        # compliance_audit_sop.md points every finding in a namespace at one
+        # shared default-sa-automount.yaml, so this is the common case.
+        groups = audit_pr.remediation_groups(
+            [
+                manifest_finding("a", "shared.yaml"),
+                manifest_finding("b", "shared.yaml"),
+                manifest_finding("c", "other.yaml"),
+            ]
+        )
+        self.assertEqual(self.ids(groups), [["a", "b"], ["c"]])
+
+    def test_grouping_is_transitive(self):
+        # Today's schema is one path per finding, which makes groups plain
+        # equivalence classes and never exercises the union step. The union-find
+        # is written to be transitive anyway, so drive it through the path
+        # accessor: a—b share x, b—c share y, so all three are one PR.
+        paths = {"a": {"x.yaml"}, "b": {"x.yaml", "y.yaml"}, "c": {"y.yaml"}}
+        findings = [manifest_finding(fid, f"{fid}.yaml") for fid in ("a", "b", "c")]
+        with patch.object(
+            audit_pr, "_finding_paths", lambda f: paths[f["id"]]
+        ):
+            groups = audit_pr.remediation_groups(findings)
+        self.assertEqual(self.ids(groups), [["a", "b", "c"]])
+
+    def test_grouping_is_independent_of_input_order(self):
+        findings = [
+            manifest_finding("c", "other.yaml"),
+            manifest_finding("b", "shared.yaml"),
+            manifest_finding("a", "shared.yaml"),
+        ]
+        self.assertEqual(
+            self.ids(audit_pr.remediation_groups(findings)),
+            [["a", "b"], ["c"]],
+        )
+
+    def test_non_manifest_findings_do_not_form_groups(self):
+        groups = audit_pr.remediation_groups(
+            [
+                make_finding(fid="a", remediation={"kind": "gcloud", "note": "g"}),
+                make_finding(fid="b", remediation={"kind": "manual", "note": "m"}),
+            ]
+        )
+        self.assertEqual(groups, [])
+
+    def test_branch_is_named_for_the_lowest_sorted_id(self):
+        group = [manifest_finding("zeta", "s.yaml"), manifest_finding("alpha", "s.yaml")]
+        self.assertEqual(
+            audit_pr.group_branch_for(AUDIT, group),
+            f"platform-agent/fix-{AUDIT}-alpha",
+        )
+
+    def test_group_paths_are_deduplicated_and_sorted(self):
+        group = [manifest_finding("a", "s.yaml"), manifest_finding("b", "s.yaml")]
+        self.assertEqual(audit_pr.group_paths(group), ["s.yaml"])
+
+
+# --------------------------------------------------------------------------- #
+# §4 finding states and promotion (§3.1, Q4)
+# --------------------------------------------------------------------------- #
+
+
+class TestFindingState(BaseTestCase):
+    def test_all_six_states(self):
+        cases = [
+            (True, None, audit_pr.STATE_OPEN),
+            (True, {"state": "OPEN"}, audit_pr.STATE_PR_OPEN),
+            (True, {"state": "MERGED"}, audit_pr.STATE_PR_MERGED_PERSISTS),
+            (True, {"state": "CLOSED"}, audit_pr.STATE_REFUSED),
+            (False, None, audit_pr.STATE_RESOLVED),
+            (False, {"state": "MERGED"}, audit_pr.STATE_RESOLVED_MERGED),
+        ]
+        for reproduces, pr, expected in cases:
+            with self.subTest(reproduces=reproduces, pr=pr):
+                self.assertEqual(audit_pr.derive_finding_state(reproduces, pr), expected)
+
+    def test_merged_at_counts_as_merged_even_without_a_state(self):
+        self.assertEqual(
+            audit_pr.derive_finding_state(True, {"mergedAt": "2026-08-01T00:00:00Z"}),
+            audit_pr.STATE_PR_MERGED_PERSISTS,
+        )
+
+    def test_every_state_has_a_label(self):
+        for state in (
+            audit_pr.STATE_OPEN,
+            audit_pr.STATE_PR_OPEN,
+            audit_pr.STATE_PR_MERGED_PERSISTS,
+            audit_pr.STATE_RESOLVED_MERGED,
+            audit_pr.STATE_RESOLVED,
+            audit_pr.STATE_REFUSED,
+        ):
+            self.assertIn(state, audit_pr.STATE_LABELS)
+
+
+class TestPromotion(BaseTestCase):
+    def test_only_critical_manifest_findings_auto_promote(self):
+        findings = [
+            manifest_finding("crit", "a.yaml", severity="critical"),
+            manifest_finding("maj", "b.yaml", severity="major"),
+            make_finding(
+                fid="crit-gcloud",
+                severity="critical",
+                remediation={"kind": "gcloud", "note": "g"},
+            ),
+        ]
+        promote, withheld = audit_pr.promotion_candidates(findings, {})
+        self.assertEqual(promote, ["crit"])
+        self.assertEqual(withheld, [])
+
+    def test_a_finding_with_an_existing_pr_is_not_promoted_again(self):
+        findings = [manifest_finding("crit", "a.yaml")]
+        promote, withheld = audit_pr.promotion_candidates(
+            findings, {"crit": {"state": "CLOSED"}}
+        )
+        self.assertEqual(promote, [])
+        self.assertEqual(withheld, [])
+
+    def test_auto_promotion_is_capped_and_names_the_withheld(self):
+        findings = [
+            manifest_finding(f"c-{i:02d}", f"{i}.yaml", severity="critical")
+            for i in range(9)
+        ]
+        promote, withheld = audit_pr.promotion_candidates(findings, {})
+        self.assertEqual(len(promote), audit_pr.AUTO_PROMOTION_CAP)
+        self.assertEqual(len(withheld), 4)
+        self.assertEqual(set(promote) & set(withheld), set())
+
+    def test_an_explicit_request_bypasses_the_cap(self):
+        findings = [
+            manifest_finding(f"c-{i:02d}", f"{i}.yaml", severity="critical")
+            for i in range(9)
+        ] + [manifest_finding("asked", "asked.yaml", severity="minor")]
+        promote, withheld = audit_pr.promotion_candidates(
+            findings, {}, requested=["asked", "c-08"]
+        )
+        self.assertIn("asked", promote)
+        self.assertIn("c-08", promote)
+        # The two requested are uncapped; the auto path still yields cap-many.
+        self.assertEqual(len(promote), 2 + audit_pr.AUTO_PROMOTION_CAP)
+        self.assertNotIn("c-08", withheld)
+
+    def test_a_requested_non_manifest_finding_is_not_promoted(self):
+        findings = [
+            make_finding(fid="g", remediation={"kind": "gcloud", "note": "g"}),
+        ]
+        promote, _ = audit_pr.promotion_candidates(findings, {}, requested=["g"])
+        self.assertEqual(promote, [])
+
+
+# --------------------------------------------------------------------------- #
+# /remediate parsing (§3.1) and idempotency markers
+# --------------------------------------------------------------------------- #
+
+
+def comment(body, association="MEMBER", login="dev", node_id="IC_1"):
+    return {
+        "id": node_id,
+        "body": body,
+        "author": {"login": login},
+        "authorAssociation": association,
+    }
+
+
+class TestRemediateCommands(BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.findings = [
+            manifest_finding("netpol-missing", "a.yaml"),
+            make_finding(fid="cluster-old", remediation={"kind": "gcloud", "note": "g"}),
+        ]
+
+    def parse(self, comments):
+        return audit_pr.parse_remediate_commands(comments, self.findings)
+
+    def test_an_authorized_request_is_accepted(self):
+        targets, refusals = self.parse([comment("/remediate netpol-missing")])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_commenter_without_write_access_is_refused_once(self):
+        targets, refusals = self.parse(
+            [comment("/remediate netpol-missing", association="NONE", login="drive-by")]
+        )
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("write access", refusals[0]["reasons"][0])
+        self.assertEqual(refusals[0]["comment_id"], "IC_1")
+
+    def test_a_non_manifest_target_is_refused(self):
+        targets, refusals = self.parse([comment("/remediate cluster-old")])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("gcloud", refusals[0]["reasons"][0])
+
+    def test_an_unknown_target_is_refused(self):
+        _, refusals = self.parse([comment("/remediate no-such-finding")])
+        self.assertIn("not a finding", refusals[0]["reasons"][0])
+
+    def test_a_fenced_command_never_fires(self):
+        body = "Here is how you would ask:\n\n```\n/remediate netpol-missing\n```\n"
+        targets, refusals = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_remediate_all_expands_to_promotable_targets_only(self):
+        targets, refusals = self.parse([comment("/remediate all")])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_must_start_the_line(self):
+        targets, _ = self.parse([comment("maybe we should /remediate netpol-missing")])
+        self.assertEqual(targets, [])
+
+    def test_one_refusal_per_comment_not_per_bad_target(self):
+        body = "/remediate cluster-old\n/remediate no-such-finding\n"
+        _, refusals = self.parse([comment(body)])
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(len(refusals[0]["reasons"]), 2)
+
+    def test_targets_are_deduplicated_and_sorted(self):
+        targets, _ = self.parse(
+            [
+                comment("/remediate netpol-missing", node_id="IC_1"),
+                comment("/remediate netpol-missing", node_id="IC_2"),
+            ]
+        )
+        self.assertEqual(targets, ["netpol-missing"])
+
+
+class TestMarkers(BaseTestCase):
+    def test_persists_marker_round_trips(self):
+        body = f"Some text\n\n{audit_pr.persists_marker('abc')}\n"
+        self.assertTrue(audit_pr.has_marker(body, audit_pr.PERSISTS_MARKER_RE, "abc"))
+        self.assertFalse(audit_pr.has_marker(body, audit_pr.PERSISTS_MARKER_RE, "xyz"))
+
+    def test_refused_marker_round_trips(self):
+        body = f"Reply\n{audit_pr.refused_marker('IC_9')}\n"
+        self.assertTrue(audit_pr.has_marker(body, audit_pr.REFUSED_MARKER_RE, "IC_9"))
+        self.assertFalse(audit_pr.has_marker(body, audit_pr.REFUSED_MARKER_RE, "IC_8"))
+
+    def test_absent_body_has_no_marker(self):
+        self.assertFalse(audit_pr.has_marker(None, audit_pr.PERSISTS_MARKER_RE, "abc"))
+        self.assertFalse(audit_pr.has_marker("", audit_pr.PERSISTS_MARKER_RE, "abc"))
+
+
+class TestDeltaBlockAnchoring(BaseTestCase):
+    def test_a_marker_quoted_inside_an_excerpt_cannot_hijack_the_real_block(self):
+        # An opener injected mid-line must not start a match that spans into
+        # the real block below it.
+        body = (
+            "Evidence:\n"
+            '    text <!-- audit-findings: ["injected"] and more\n'
+            "\n"
+            + audit_pr.delta_block(["real-one", "real-two"])
+            + "\n"
+        )
+        self.assertEqual(audit_pr.parse_delta_block(body), ["real-one", "real-two"])
+
+
+# --------------------------------------------------------------------------- #
+# Failure paths — reachable only now that Recorder can fail
+# --------------------------------------------------------------------------- #
+
+
+class TestFailurePaths(HarnessTestCase):
+    def test_a_failed_push_aborts_before_the_pr_is_opened(self):
+        self.harness.replies = {"pr list": "[]"}
+        self.harness.failures = {"git push": 1}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        rc = self.run_finish(make_doc())
+
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(self.harness.matching("pr", "create"))
+
+    def test_a_failed_commit_aborts_before_the_push(self):
+        self.harness.replies = {"pr list": "[]"}
+        self.harness.failures = {"git commit": 1}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        rc = self.run_finish(make_doc())
+
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(self.harness.matching("git", "push"))
+
+    def test_a_failed_stage_aborts_before_the_commit(self):
+        self.harness.replies = {"pr list": "[]"}
+        self.harness.failures = {"add --": 1}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        rc = self.run_finish(make_doc())
+
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(self.harness.matching("git", "commit"))
+
+    def test_recorder_raises_on_check_true_and_returns_on_check_false(self):
+        # The fault-injection seam itself, so a silently-broken Recorder cannot
+        # make every failure test above vacuously pass.
+        recorder = Recorder(failures={"gh pr list": 1})
+        with self.assertRaises(CalledProcessError):
+            recorder(["gh", "pr", "list"])
+        result = recorder(["gh", "pr", "list"], check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(recorder(["git", "status"]).returncode, 0)
 
 
 if __name__ == "__main__":

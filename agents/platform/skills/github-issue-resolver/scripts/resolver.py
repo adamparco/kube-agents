@@ -179,8 +179,10 @@ def handle_poll(args):
     # Sweep stale issues first
     sweep_stale_issues(repo)
 
-    # Query next unaddressed issue
-    search_query = "is:issue is:open -label:status:in-progress -label:status:escalation-needed -label:agent:ignore -label:status:resolved"
+    # Query next unaddressed issue.
+    # `agent:audit` is excluded because those issues are fleet-audit ledgers:
+    # that skill owns them and rewrites them in place on every run.
+    search_query = "is:issue is:open -label:status:in-progress -label:status:escalation-needed -label:agent:ignore -label:status:resolved -label:agent:audit"
     res = run_gh(
         [
             "issue",

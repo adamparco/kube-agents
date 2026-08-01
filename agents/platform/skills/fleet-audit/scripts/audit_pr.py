@@ -55,7 +55,22 @@ AUDITS: dict[str, str] = {
 }
 
 SEVERITIES = ("critical", "major", "minor")
+SEVERITY_RANK = {severity: i for i, severity in enumerate(SEVERITIES)}
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
+
+# Every finding must carry all three. The hint is quoted back in the rejection,
+# because "recommendation.rationale is required" does not tell the model what
+# distinguishes a rationale from a restated action.
+RECOMMENDATION_FIELDS: tuple[tuple[str, str], ...] = (
+    ("action", "what to do, imperative, one or two sentences"),
+    (
+        "rationale",
+        "why this fix and not the obvious alternative; name the alternative you "
+        "considered and why you rejected it",
+    ),
+    ("risk", "what breaks on apply, and the read-only check to run first"),
+)
+
 PROTECTED_BRANCHES = {"main", "master", "production"}
 BASE_BRANCH = "main"
 SCRATCH_DIR = "/opt/data/scratch"
@@ -64,21 +79,80 @@ SCRATCH_DIR = "/opt/data/scratch"
 # remediation files only, never the whole working tree.
 FORBIDDEN_ADD_PATHSPECS = {".", "-A", "--all", "-a", "*", ":/", "./", ":"}
 
+# Glob metacharacters git expands in a pathspec. `git --literal-pathspecs` is
+# the real guard (see build_git_add_command); rejecting these at validation time
+# means the refusal names the offending finding instead of silently staging the
+# wrong files.
+GLOB_METACHARACTERS = "*?[]"
+
+# A finding id becomes a component of the remediation branch
+# `platform-agent/fix-<audit-id>-<finding-id>`, so it must survive
+# `git check-ref-format`: no ':', no whitespace, no '..' run, no '.lock' suffix.
+FINDING_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?$")
+
 # The hidden block that makes the run-over-run delta computable without keeping
-# any state outside the PR itself.
-DELTA_RE = re.compile(r"<!--\s*audit-findings:\s*(\[.*?\])\s*-->", re.S)
+# any state outside the report itself. Anchored to line boundaries so an opener
+# pasted inside a fenced evidence excerpt cannot start a match that swallows the
+# real block further down the body.
+DELTA_RE = re.compile(
+    r"^[ \t]*<!--\s*audit-findings:\s*(\[.*?\])\s*-->[ \t]*$", re.M | re.S
+)
 # Per-finding marker on each heading, so a *resolved* finding can still be named
 # by title when it no longer exists in the current findings.json.
 FINDING_MARKER_RE = re.compile(
     r"^####\s+(.*?)\s*<!--\s*finding:\s*(\S+?)\s*-->\s*$", re.M
 )
 
+# Idempotency markers. Design §3.1 deliberately never mutates a `/remediate`
+# comment — a repo writer must be able to re-issue one after closing a PR — so
+# "act exactly once" is carried instead by hidden markers in the bodies this
+# harness already owns, the same technique the delta block uses.
+PERSISTS_MARKER_RE = re.compile(
+    r"^[ \t]*<!--\s*audit-persists:\s*(\S+?)\s*-->[ \t]*$", re.M
+)
+REFUSED_MARKER_RE = re.compile(
+    r"^[ \t]*<!--\s*audit-refused:\s*(\S+?)\s*-->[ \t]*$", re.M
+)
+
+# `/remediate <finding-id>` / `/remediate all`, at the start of a line.
+REMEDIATE_RE = re.compile(r"^[ \t]*/remediate[ \t]+(\S+)[ \t]*$", re.M)
+# Fenced code blocks are stripped before command matching, so a `/remediate`
+# quoted inside an evidence excerpt never fires.
+FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*$", re.M | re.S)
+
 MAX_EXCERPT_LINES = 40
 MAX_EXCERPT_CHARS = 2000
+# The SOPs mandate pasting the evidence command verbatim, which makes it the
+# dominant per-finding term; trim_excerpt guards the wrong field on its own.
+MAX_COMMAND_CHARS = 2000
+
+# GitHub rejects an issue or pull-request body over 65,536 characters with a
+# 422. Issue bodies carry the identical limit, so this budget is the difference
+# between a stream that publishes and one that 422s every morning forever.
+MAX_BODY_CHARS = 65_536
+BODY_BUDGET = 60_000
+MAX_SCOPE_ROWS = 60
+MAX_DELTA_ROWS = 50
+
+# Auto-promotion ceiling per `finish` run (design §3.1). An explicit
+# `/remediate` bypasses it: a human asked for that one by name.
+AUTO_PROMOTION_CAP = 5
+
+# `authorAssociation` values that imply write access, and therefore the standing
+# to issue `/remediate`.
+WRITE_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 
 class ValidationError(ValueError):
     """A findings.json (or audit id) that the harness refuses to publish."""
+
+
+class BodyTooLargeError(ValidationError):
+    """A rendered body that still exceeds GitHub's limit after budgeting.
+
+    Subclasses ValidationError so it exits 2 — the code every SOP's step 5
+    already branches on — rather than surfacing as an opaque fatal.
+    """
 
 
 def log(msg: str) -> None:
@@ -150,7 +224,42 @@ def _require_repo_relative(path: str, where: str) -> str:
         raise ValidationError(
             f"{where}: must not escape the repository root ('..' segment), got {path!r}"
         )
+    found = [char for char in GLOB_METACHARACTERS if char in path]
+    if found:
+        raise ValidationError(
+            f"{where}: must name one literal file, not a glob "
+            f"(contains {', '.join(repr(c) for c in found)}), got {path!r}"
+        )
+    if path.startswith(":"):
+        raise ValidationError(
+            f"{where}: must not begin with ':' — git reads a leading colon as a "
+            f"pathspec magic prefix, not a filename; got {path!r}"
+        )
     return path
+
+
+def validate_finding_id(fid: str, where: str) -> str:
+    """A finding id is a git ref component, not just a delta key.
+
+    Design §2 names the remediation branch
+    `platform-agent/fix-<audit-id>-<finding-id>`, so an unconstrained id yields
+    a branch `git check-ref-format` rejects — not merely a churning delta.
+    """
+    if not FINDING_ID_RE.match(fid):
+        raise ValidationError(
+            f"{where}: {fid!r} is not a usable id. Use 1-100 characters matching "
+            "[a-z0-9._-], starting and ending alphanumeric — the id becomes part "
+            "of a git branch name, so ':', whitespace and uppercase are refused"
+        )
+    if ".." in fid:
+        raise ValidationError(
+            f"{where}: {fid!r} contains '..', which git refuses in a ref name"
+        )
+    if fid.endswith(".lock"):
+        raise ValidationError(
+            f"{where}: {fid!r} ends in '.lock', which git refuses in a ref name"
+        )
+    return fid
 
 
 def validate_findings(data: object, audit_id: str) -> dict:
@@ -181,6 +290,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
             "scope.clusters: must be a non-empty list — an audit that enumerated "
             "no clusters is a failure, not a clean run"
         )
+    audited_names: set[str] = set()
     for i, cluster in enumerate(clusters):
         if not isinstance(cluster, dict):
             raise ValidationError(f"scope.clusters[{i}]: expected an object")
@@ -188,12 +298,24 @@ def validate_findings(data: object, audit_id: str) -> dict:
             _require_str(
                 cluster.get(field), f"scope.clusters[{i}].{field}", allow_empty=False
             )
+        audited_names.add(str(cluster["name"]))
+        # Optional, but non-empty when present: "I read this cluster fine, but
+        # some checks did not run or do not apply" is a different claim from
+        # "I could not read this cluster", and conflating the two produces
+        # false all-clears.
+        if "limitations" in cluster:
+            _require_str(
+                cluster.get("limitations"),
+                f"scope.clusters[{i}].limitations",
+                allow_empty=False,
+            )
 
     skipped = scope.get("skipped", [])
     if not isinstance(skipped, list):
         raise ValidationError(
             "scope.skipped: must be a list (use [] when nothing was skipped)"
         )
+    skipped_names: set[str] = set()
     for i, entry in enumerate(skipped):
         if not isinstance(entry, dict):
             raise ValidationError(f"scope.skipped[{i}]: expected an object")
@@ -203,6 +325,19 @@ def validate_findings(data: object, audit_id: str) -> dict:
         _require_str(
             entry.get("reason"), f"scope.skipped[{i}].reason", allow_empty=False
         )
+        name = str(entry["cluster"])
+        if name in audited_names:
+            raise ValidationError(
+                f"scope.skipped[{i}].cluster: {name!r} is also in scope.clusters. "
+                "A cluster belongs to exactly one list — if you read it but some "
+                "checks did not run, drop it from scope.skipped and describe the "
+                "gap in that cluster's scope.clusters[].limitations instead"
+            )
+        if name in skipped_names:
+            raise ValidationError(
+                f"scope.skipped[{i}].cluster: duplicate entry for {name!r}"
+            )
+        skipped_names.add(name)
 
     findings = data.get("findings")
     if not isinstance(findings, list):
@@ -218,6 +353,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
         fid = finding.get("id")
         _require_str(fid, f"findings[{i}].id", allow_empty=False)
         assert isinstance(fid, str)
+        validate_finding_id(fid, f"findings[{i}].id")
         if fid in seen_ids:
             raise ValidationError(
                 f"findings[{i}].id: duplicate id {fid!r} (first seen at "
@@ -236,6 +372,13 @@ def validate_findings(data: object, audit_id: str) -> dict:
         _require_str(
             finding.get("cluster"), f"findings[{i}].cluster", allow_empty=False
         )
+        if str(finding["cluster"]) in skipped_names:
+            raise ValidationError(
+                f"findings[{i}].cluster: {finding['cluster']!r} is listed in "
+                "scope.skipped, so this run claims it could not read it — a finding "
+                "against it is a contradiction. Move the cluster to scope.clusters "
+                "(with a limitations note) or drop the finding"
+            )
         # namespace may legitimately be empty for cluster-scoped objects.
         _require_str(finding.get("namespace", ""), f"findings[{i}].namespace")
         _require_str(finding.get("object"), f"findings[{i}].object", allow_empty=False)
@@ -256,6 +399,23 @@ def validate_findings(data: object, audit_id: str) -> dict:
         _require_str(
             evidence.get("excerpt", ""), f"findings[{i}].evidence.excerpt"
         )
+
+        # Required on EVERY finding, not only the promotable ones. Deferring the
+        # reasoning to promotion time means writing it when the evidence is no
+        # longer in front of you.
+        recommendation = finding.get("recommendation")
+        if not isinstance(recommendation, dict):
+            raise ValidationError(
+                f"findings[{i}].recommendation: required object with 'action', "
+                "'rationale' and 'risk'"
+            )
+        for field, hint in RECOMMENDATION_FIELDS:
+            value = recommendation.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValidationError(
+                    f"findings[{i}].recommendation.{field}: required, must be a "
+                    f"non-empty string — {hint}"
+                )
 
         remediation = finding.get("remediation")
         if not isinstance(remediation, dict):
@@ -331,7 +491,11 @@ def build_git_add_command(paths: list[str]) -> list[str]:
                 "the named remediation files (never `git add .` / `git add -A`)"
             )
         _require_repo_relative(path, "git add pathspec")
-    return ["git", "add", "--", *paths]
+    # --literal-pathspecs is git-level, not add-level (`git add
+    # --literal-pathspecs` is an error), and it is the only thing that actually
+    # holds: `git add -- '*.yaml'` still expands and stages files the audit
+    # never declared. The `--` separator alone does not disable globbing.
+    return ["git", "--literal-pathspecs", "add", "--", *paths]
 
 
 def findings_phrase(count: int) -> str:
@@ -394,6 +558,278 @@ def compute_delta(
 
 
 # --------------------------------------------------------------------------- #
+# Pure helpers — remediation grouping
+# --------------------------------------------------------------------------- #
+
+
+def _finding_paths(finding: dict) -> set[str]:
+    """The repo paths a finding's remediation would touch (empty unless manifest)."""
+    remediation = finding.get("remediation") or {}
+    if remediation.get("kind") != "manifest":
+        return set()
+    path = str(remediation.get("path", "") or "")
+    return {path} if path else set()
+
+
+def remediation_groups(findings: list[dict]) -> list[list[dict]]:
+    """Group manifest findings whose remediation paths intersect, transitively.
+
+    Two findings that write the same file cannot own separate pull requests —
+    the second would conflict with the first. This is not hypothetical: the
+    compliance SOP tells the agent to point every finding in a namespace at one
+    shared `default-sa-automount.yaml`.
+
+    Union-find over paths rather than a plain group-by, so the grouping stays
+    correct if a finding ever declares more than one path.
+    """
+    manifest = [f for f in findings if _finding_paths(f)]
+    parent: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(a: str, b: str) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[max(root_a, root_b)] = min(root_a, root_b)
+
+    for finding in manifest:
+        for path in _finding_paths(finding):
+            parent.setdefault(path, path)
+    for finding in manifest:
+        paths = sorted(_finding_paths(finding))
+        for path in paths[1:]:
+            union(paths[0], path)
+
+    buckets: dict[str, list[dict]] = {}
+    for finding in manifest:
+        root = find(sorted(_finding_paths(finding))[0])
+        buckets.setdefault(root, []).append(finding)
+
+    groups = [
+        sorted(group, key=lambda f: str(f.get("id", ""))) for group in buckets.values()
+    ]
+    groups.sort(key=lambda group: str(group[0].get("id", "")))
+    return groups
+
+
+def group_branch_for(audit_id: str, group: list[dict]) -> str:
+    """Name a remediation branch after the lowest-sorted finding in its group.
+
+    The branch name is the only durable link between a finding and its pull
+    request — one `gh pr list --json headRefName` reconstructs the whole mapping
+    with no state kept anywhere else.
+    """
+    ids = sorted(str(f.get("id", "")) for f in group if f.get("id"))
+    if not ids:
+        raise ValueError("cannot name a remediation branch for an empty group")
+    return f"platform-agent/fix-{audit_id}-{ids[0]}"
+
+
+def group_paths(group: list[dict]) -> list[str]:
+    """Every path the group stages, sorted and de-duplicated."""
+    paths: set[str] = set()
+    for finding in group:
+        paths |= _finding_paths(finding)
+    return sorted(paths)
+
+
+# --------------------------------------------------------------------------- #
+# Pure helpers — /remediate commands
+# --------------------------------------------------------------------------- #
+
+
+def strip_fenced_blocks(text: str) -> str:
+    """Drop fenced code blocks so a `/remediate` quoted in evidence never fires."""
+    return FENCE_RE.sub("", text or "")
+
+
+def parse_remediate_commands(
+    comments: list[dict], findings: list[dict]
+) -> tuple[list[str], list[dict]]:
+    """Read `/remediate` requests off the ledger issue.
+
+    Returns (authorized finding ids, refusals). A refusal is one entry per
+    comment, not per bad target, because the reply is posted once per comment
+    and marked with that comment's node id.
+    """
+    by_id = {str(f.get("id", "")): f for f in findings}
+    promotable = {
+        fid
+        for fid, finding in by_id.items()
+        if (finding.get("remediation") or {}).get("kind") == "manifest"
+    }
+
+    targets: set[str] = set()
+    refusals: list[dict] = []
+
+    for comment in comments or []:
+        body = strip_fenced_blocks(str(comment.get("body", "")))
+        matches = REMEDIATE_RE.findall(body)
+        if not matches:
+            continue
+
+        node_id = str(comment.get("id", "") or "")
+        author = str((comment.get("author") or {}).get("login", "") or "") or "someone"
+        association = str(comment.get("authorAssociation", "") or "").upper()
+        reasons: list[str] = []
+
+        if association not in WRITE_ASSOCIATIONS:
+            refusals.append(
+                {
+                    "comment_id": node_id,
+                    "author": author,
+                    "reasons": [
+                        f"@{author} does not have write access to this repository "
+                        f"(`authorAssociation: {association or 'NONE'}`). A remediation "
+                        "pull request may only be requested by someone who could merge it."
+                    ],
+                }
+            )
+            continue
+
+        for raw in matches:
+            target = raw.strip().strip("`")
+            if target == "all":
+                targets |= promotable
+                continue
+            if target not in by_id:
+                reasons.append(
+                    f"`{target}` is not a finding in the current report — it may have "
+                    "been resolved, or the id may be a typo."
+                )
+                continue
+            if target not in promotable:
+                kind = (by_id[target].get("remediation") or {}).get("kind")
+                reasons.append(
+                    f"`{target}` has a `{kind}` remediation, not a `manifest` one. "
+                    "Only a finding whose fix is a file in this repository can become "
+                    "a pull request; run the command in the report instead."
+                )
+                continue
+            targets.add(target)
+
+        if reasons:
+            refusals.append(
+                {"comment_id": node_id, "author": author, "reasons": reasons}
+            )
+
+    return sorted(targets), refusals
+
+
+# --------------------------------------------------------------------------- #
+# Pure helpers — finding state and promotion
+# --------------------------------------------------------------------------- #
+
+STATE_OPEN = "open"
+STATE_PR_OPEN = "pr-open"
+STATE_PR_MERGED_PERSISTS = "pr-merged-persists"
+STATE_RESOLVED_MERGED = "resolved-merged"
+STATE_RESOLVED = "resolved"
+STATE_REFUSED = "refused"
+
+STATE_LABELS = {
+    STATE_OPEN: "open",
+    STATE_PR_OPEN: "fix proposed",
+    STATE_PR_MERGED_PERSISTS: "⚠ fix merged, still reproduces",
+    STATE_RESOLVED_MERGED: "resolved (fix merged)",
+    STATE_RESOLVED: "resolved",
+    STATE_REFUSED: "fix refused",
+}
+
+
+def derive_finding_state(reproduces: bool, pr: dict | None) -> str:
+    """The §4 state of one finding, from whether it reproduces and its PR.
+
+    `pr` is the remediation pull request found on the finding's branch, or None.
+    A merged PR whose finding still reproduces is the case the old rolling-PR
+    model could not express at all.
+    """
+    state = str((pr or {}).get("state", "") or "").upper()
+    merged = state == "MERGED" or bool((pr or {}).get("mergedAt"))
+
+    if reproduces:
+        if pr is None:
+            return STATE_OPEN
+        if merged:
+            return STATE_PR_MERGED_PERSISTS
+        if state == "OPEN":
+            return STATE_PR_OPEN
+        return STATE_REFUSED
+    return STATE_RESOLVED_MERGED if merged else STATE_RESOLVED
+
+
+def promotion_candidates(
+    findings: list[dict],
+    pr_by_finding: dict[str, dict | None],
+    requested: list[str] | None = None,
+    cap: int = AUTO_PROMOTION_CAP,
+) -> tuple[list[str], list[str]]:
+    """Split findings into (promote now, withheld for an explicit request).
+
+    Auto-promotion is deliberately narrow — `critical`, `manifest`, and no pull
+    request on its branch in any state — and capped, so one bad night cannot
+    bury the repository in generated pull requests. An explicit `/remediate`
+    bypasses the cap: a human asked for that one by name.
+
+    The cap counts findings, and a group of findings sharing a path collapses to
+    one pull request, so the number of PRs opened is at most `cap`.
+    """
+    by_id = {str(f.get("id", "")): f for f in findings}
+    requested_set = {fid for fid in (requested or []) if fid in by_id}
+
+    promote = [
+        fid
+        for fid in sorted(requested_set)
+        if (by_id[fid].get("remediation") or {}).get("kind") == "manifest"
+    ]
+
+    auto: list[str] = []
+    for finding in sort_findings(findings):
+        fid = str(finding.get("id", ""))
+        if fid in requested_set:
+            continue
+        if finding.get("severity") != "critical":
+            continue
+        if (finding.get("remediation") or {}).get("kind") != "manifest":
+            continue
+        if pr_by_finding.get(fid) is not None:
+            continue
+        auto.append(fid)
+
+    promote.extend(auto[:cap])
+    return promote, auto[cap:]
+
+
+# --------------------------------------------------------------------------- #
+# Pure helpers — idempotency markers
+# --------------------------------------------------------------------------- #
+
+
+def persists_marker(finding_id: str) -> str:
+    return f"<!-- audit-persists:{finding_id} -->"
+
+
+def refused_marker(comment_id: str) -> str:
+    return f"<!-- audit-refused:{comment_id} -->"
+
+
+def has_marker(text: str | None, pattern: re.Pattern[str], value: str) -> bool:
+    """True when `text` already carries this marker.
+
+    Design §3.1 keeps `/remediate` comments unmutated on purpose, so a repo
+    writer can re-issue one after closing a pull request. "Act exactly once"
+    therefore lives in the bodies the harness owns, not in the command.
+    """
+    if not text:
+        return False
+    return value in {match for match in pattern.findall(text)}
+
+
+# --------------------------------------------------------------------------- #
 # Pure helpers — rendering
 # --------------------------------------------------------------------------- #
 
@@ -407,6 +843,18 @@ def _fence(text: str) -> str:
     """A backtick fence long enough to wrap text that itself contains fences."""
     longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
     return "`" * max(3, longest + 1)
+
+
+def _clip_comment(text: str) -> str:
+    """Last-resort clip for a comment body.
+
+    Comments are already row-capped; unlike the description a clipped comment
+    loses nothing durable, so this truncates rather than raising.
+    """
+    if len(text) <= MAX_BODY_CHARS:
+        return text
+    keep = MAX_BODY_CHARS - 120
+    return text[:keep].rstrip() + "\n\n_… (comment truncated by audit_pr.py)_"
 
 
 def trim_excerpt(excerpt: str) -> str:
@@ -428,8 +876,29 @@ def trim_excerpt(excerpt: str) -> str:
     return text
 
 
+def trim_command(command: str) -> str:
+    """Clip the evidence command.
+
+    The SOPs require pasting the command verbatim, so on a fleet with long
+    `--context`/`-o jsonpath` invocations it — not the excerpt — is the term
+    that grows without bound. A truncated command is still a usable pointer;
+    an unpublishable body is not.
+    """
+    text = (command or "").strip()
+    if len(text) <= MAX_COMMAND_CHARS:
+        return text
+    return (
+        text[:MAX_COMMAND_CHARS].rstrip()
+        + "\n# … (command truncated by audit_pr.py)"
+    )
+
+
 def _finding_sort_key(finding: dict) -> tuple:
-    """Stable ordering, so an unchanged fleet renders a byte-identical body."""
+    """Stable ordering, so an unchanged fleet renders a byte-identical findings section.
+
+    Not a byte-identical *body*: the header and footer each carry a generated
+    timestamp, so two runs over an unchanged fleet always differ by those lines.
+    """
     return (
         str(finding.get("cluster", "")),
         str(finding.get("namespace", "")),
@@ -452,7 +921,7 @@ def render_finding(finding: dict) -> list[str]:
     lines.append("")
 
     evidence = finding.get("evidence") or {}
-    command = str(evidence.get("command", "")).strip()
+    command = trim_command(str(evidence.get("command", "")))
     lines.append("Evidence — reproduce with:")
     lines.append("")
     fence = _fence(command)
@@ -463,6 +932,12 @@ def render_finding(finding: dict) -> list[str]:
         lines.append("")
         fence = _fence(excerpt)
         lines += [f"{fence}text", excerpt, fence]
+
+    recommendation = finding.get("recommendation") or {}
+    lines.append("")
+    lines.append(f"- **Recommendation:** {recommendation.get('action', '')}")
+    lines.append(f"- **Why this fix:** {recommendation.get('rationale', '')}")
+    lines.append(f"- **Risk on apply:** {recommendation.get('risk', '')}")
 
     remediation = finding.get("remediation") or {}
     kind = remediation.get("kind")
@@ -475,45 +950,104 @@ def render_finding(finding: dict) -> list[str]:
     elif kind == "gcloud":
         lines.append("- **Remediation (gcloud):**")
         lines.append("")
-        fence = _fence(note)
-        lines += [f"{fence}bash", note or "# (no command supplied)", fence]
+        command_note = trim_command(note)
+        fence = _fence(command_note)
+        lines += [f"{fence}bash", command_note or "# (no command supplied)", fence]
     else:
         lines.append(f"- **Remediation (manual):** {note or '_none supplied_'}")
     return lines
 
 
-def render_body(
-    data: dict,
-    *,
-    staged_paths: list[str],
-    generated_at: datetime,
-    audit_id: str | None = None,
-) -> str:
-    """Render the complete PR body. The model never hand-writes this."""
-    audit_id = audit_id or str(data.get("audit", ""))
-    findings = list(data.get("findings") or [])
-    scope = data.get("scope") or {}
-    clusters = list(scope.get("clusters") or [])
-    skipped = list(scope.get("skipped") or [])
-    stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
+def sort_findings(findings: list[dict]) -> list[dict]:
+    """Severity-first, then the stable within-severity key.
 
-    out: list[str] = []
-    out.append(
+    A pure function of the finding set, never of its input order — two runs over
+    an unchanged fleet must produce the same findings section whatever order the
+    model happened to emit.
+    """
+    return sorted(
+        findings,
+        key=lambda f: (
+            SEVERITY_RANK.get(str(f.get("severity", "")), len(SEVERITIES)),
+            _finding_sort_key(f),
+        ),
+    )
+
+
+def select_rendered_findings(
+    findings: list[dict], budget: int
+) -> tuple[list[dict], list[dict]]:
+    """Split the sorted findings into (rendered, omitted) against a char budget.
+
+    Selection walks the severity-first order and stops at the first finding that
+    does not fit, so the rendered set is always a prefix: truncation only ever
+    eats the least-severe end, and criticals are structurally safe. At least one
+    finding always renders — a body with a single oversized finding is still
+    more useful than a body with none.
+
+    Each finding is charged for its own rendered text *and* for the slot its id
+    occupies in the hidden delta block, because that block is itself unbounded:
+    1,250 ids render over 80,000 characters of marker alone.
+    """
+    ordered = sort_findings(findings)
+    used = 0
+    fitted = 0
+    for finding in ordered:
+        cost = len("\n".join(render_finding(finding))) + 2
+        cost += len(str(finding.get("id", ""))) + 3  # "id",
+        if fitted and used + cost > budget:
+            break
+        used += cost
+        fitted += 1
+    return ordered[:fitted], ordered[fitted:]
+
+
+def _render_header(audit_id: str) -> list[str]:
+    return [
         f"This pull request is maintained in place by the `{audit_id}` watchdog and is "
         "rewritten in full on every run — hand edits to this description will be lost, "
         "and the audit will never open a second PR for this stream."
-    )
+    ]
 
-    # --- Scope ---
-    out += ["", "## Scope", ""]
-    out.append(f"Audited {len(clusters)} cluster(s) on {stamp}.")
-    out += ["", "| Cluster | Location | Project |", "| ------- | -------- | ------- |"]
-    for cluster in clusters:
-        out.append(
+
+def _render_scope(
+    clusters: list[dict], skipped: list[dict], generated_at: datetime
+) -> list[str]:
+    """The scope tables, row-capped.
+
+    A body with *zero* findings overflows without this cap: 1,200 audited plus
+    1,200 skipped clusters render over 148,000 characters of table.
+    """
+    stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
+    show_limitations = any(str(c.get("limitations", "")).strip() for c in clusters)
+
+    out = ["", "## Scope", "", f"Audited {len(clusters)} cluster(s) on {stamp}."]
+    if show_limitations:
+        out += [
+            "",
+            "| Cluster | Location | Project | Limitations |",
+            "| ------- | -------- | ------- | ----------- |",
+        ]
+    else:
+        out += [
+            "",
+            "| Cluster | Location | Project |",
+            "| ------- | -------- | ------- |",
+        ]
+    for cluster in clusters[:MAX_SCOPE_ROWS]:
+        row = (
             f"| `{_cell(cluster.get('name', ''))}` "
             f"| {_cell(cluster.get('location', ''))} "
-            f"| `{_cell(cluster.get('project', ''))}` |"
+            f"| `{_cell(cluster.get('project', ''))}` "
         )
+        if show_limitations:
+            row += f"| {_cell(cluster.get('limitations', '')) or '—'} "
+        out.append(row + "|")
+    if len(clusters) > MAX_SCOPE_ROWS:
+        remaining = len(clusters) - MAX_SCOPE_ROWS
+        columns = 4 if show_limitations else 3
+        out.append(f"| _…and {remaining} more_ " + "|  " * (columns - 1) + "|")
+
     if skipped:
         out += [
             "",
@@ -525,45 +1059,57 @@ def render_body(
             "| Cluster | Reason |",
             "| ------- | ------ |",
         ]
-        for entry in skipped:
+        for entry in skipped[:MAX_SCOPE_ROWS]:
             out.append(
                 f"| `{_cell(entry.get('cluster', ''))}` | {_cell(entry.get('reason', ''))} |"
             )
+        if len(skipped) > MAX_SCOPE_ROWS:
+            out.append(f"| _…and {len(skipped) - MAX_SCOPE_ROWS} more_ |  |")
+    return out
 
-    # --- Findings ---
-    out += ["", "## Findings", ""]
+
+def _render_findings(
+    findings: list[dict], budget: int
+) -> tuple[list[str], list[dict]]:
+    """The findings section, plus the findings that did not fit the budget."""
+    out = ["", "## Findings", ""]
     if not findings:
         out.append("No findings. Every audited cluster is compliant with this audit.")
-    else:
-        counts = severity_counts(findings)
-        out.append(
-            f"{findings_phrase(len(findings))}: {counts['critical']} critical, "
-            f"{counts['major']} major, {counts['minor']} minor."
-        )
-        for severity in SEVERITIES:
-            group = sorted(
-                (f for f in findings if f.get("severity") == severity),
-                key=_finding_sort_key,
-            )
-            if not group:
-                continue
-            out += ["", f"### {severity.capitalize()} ({len(group)})"]
-            for finding in group:
-                out.append("")
-                out += render_finding(finding)
+        return out, []
 
-    # --- Remediation files ---
-    out += ["", "## Remediation files in this PR", ""]
-    if staged_paths:
-        out += [f"- `{path}`" for path in staged_paths]
-    else:
-        out.append(
-            "No files changed — every remediation in this audit is a `gcloud` or "
-            "`manual` action, so this pull request carries the report only."
-        )
+    counts = severity_counts(findings)
+    out.append(
+        f"{findings_phrase(len(findings))}: {counts['critical']} critical, "
+        f"{counts['major']} major, {counts['minor']} minor."
+    )
 
-    # --- Footer + hidden delta block ---
-    out += [
+    rendered, omitted = select_rendered_findings(findings, budget)
+    for severity in SEVERITIES:
+        group = [f for f in rendered if f.get("severity") == severity]
+        if not group:
+            continue
+        total = counts[severity]
+        suffix = f"{len(group)} of {total}" if len(group) < total else str(total)
+        out += ["", f"### {severity.capitalize()} ({suffix})"]
+        for finding in group:
+            out.append("")
+            out += render_finding(finding)
+
+    if omitted:
+        out += [
+            "",
+            f"_{len(omitted)} further finding(s) are omitted from this description to "
+            "stay inside GitHub's body limit. The counts in the title and in the "
+            "summary above are the true totals; the omitted findings are the "
+            "least severe._",
+        ]
+    return out, omitted
+
+
+def _render_footer(
+    audit_id: str, generated_at: datetime, rendered_ids: list[str]
+) -> list[str]:
+    return [
         "",
         "---",
         "",
@@ -571,10 +1117,69 @@ def render_body(
         f"{generated_at.isoformat()}. Findings come from read-only inspection of the "
         "live fleet; every one carries the exact command it was derived from.",
         "",
-        delta_block(finding_ids(findings)),
+        delta_block(rendered_ids),
         "",
     ]
-    return "\n".join(out)
+
+
+def render_body(
+    data: dict,
+    *,
+    staged_paths: list[str],
+    generated_at: datetime,
+    audit_id: str | None = None,
+) -> str:
+    """Render the complete PR body. The model never hand-writes this.
+
+    Everything but the findings renders and is measured first; whatever is left
+    of BODY_BUDGET is the findings budget. The hidden delta block carries the
+    ids the body actually **rendered**, not the full finding set — otherwise the
+    next run would read a truncated finding as resolved and announce a fix that
+    never happened.
+    """
+    audit_id = audit_id or str(data.get("audit", ""))
+    findings = list(data.get("findings") or [])
+    scope = data.get("scope") or {}
+    clusters = list(scope.get("clusters") or [])
+    skipped = list(scope.get("skipped") or [])
+
+    fixed: list[str] = _render_header(audit_id)
+    fixed += _render_scope(clusters, skipped, generated_at)
+
+    remediation_section = ["", "## Remediation files in this PR", ""]
+    if staged_paths:
+        remediation_section += [f"- `{path}`" for path in staged_paths]
+    else:
+        remediation_section.append(
+            "No files changed — every remediation in this audit is a `gcloud` or "
+            "`manual` action, so this pull request carries the report only."
+        )
+
+    # Measure the footer with an empty delta block: each finding is separately
+    # charged for its own id slot inside select_rendered_findings.
+    overhead = len("\n".join(fixed + remediation_section))
+    overhead += len("\n".join(_render_footer(audit_id, generated_at, [])))
+    overhead += len("\n".join(["", "## Findings", "", ""])) + 400  # section chrome
+
+    findings_lines, omitted = _render_findings(findings, max(BODY_BUDGET - overhead, 0))
+    rendered_ids = [
+        fid for fid in finding_ids(findings) if fid not in {str(f.get("id", "")) for f in omitted}
+    ]
+
+    body = "\n".join(
+        fixed
+        + findings_lines
+        + remediation_section
+        + _render_footer(audit_id, generated_at, rendered_ids)
+    )
+    if len(body) > MAX_BODY_CHARS:
+        raise BodyTooLargeError(
+            f"rendered body is {len(body)} characters, over GitHub's "
+            f"{MAX_BODY_CHARS} limit even after budgeting to {BODY_BUDGET}; "
+            "this is a harness bug, not a findings error — report it rather than "
+            "trimming the audit"
+        )
+    return body
 
 
 def render_delta_comment(
@@ -596,25 +1201,31 @@ def render_delta_comment(
     if new_ids:
         out.append(f"**{len(new_ids)} new**")
         out.append("")
-        for fid in new_ids:
+        for fid in new_ids[:MAX_DELTA_ROWS]:
             finding = by_id.get(fid, {})
             severity = str(finding.get("severity", "unknown"))
             title = str(finding.get("title", fid))
             out.append(f"- **{severity}** — {title} (`{fid}`)")
+        if len(new_ids) > MAX_DELTA_ROWS:
+            out.append(f"- _…and {len(new_ids) - MAX_DELTA_ROWS} more_")
         out.append("")
 
     if resolved_ids:
         out.append(f"**{len(resolved_ids)} resolved**")
         out.append("")
-        for fid in resolved_ids:
+        for fid in resolved_ids[:MAX_DELTA_ROWS]:
             title = previous_titles.get(fid) or fid
             out.append(f"- {title} (`{fid}`)")
+        if len(resolved_ids) > MAX_DELTA_ROWS:
+            out.append(f"- _…and {len(resolved_ids) - MAX_DELTA_ROWS} more_")
         out.append("")
 
     out.append(
         "The pull request description has been rewritten to the current state of the fleet."
     )
-    return "\n".join(out)
+    # Capping the body made this path reachable: previously the body failed
+    # first at ~67 findings, so a delta this large could never be produced.
+    return _clip_comment("\n".join(out))
 
 
 def render_clean_comment(
@@ -625,7 +1236,10 @@ def render_clean_comment(
     clusters = list(scope.get("clusters") or [])
     skipped = list(scope.get("skipped") or [])
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
-    names = ", ".join(f"`{c.get('name', '')}`" for c in clusters)
+    shown = clusters[:MAX_SCOPE_ROWS]
+    names = ", ".join(f"`{c.get('name', '')}`" for c in shown)
+    if len(clusters) > len(shown):
+        names += f", and {len(clusters) - len(shown)} more"
 
     out = [
         f"### `{audit_id}` is now clean — closing",
@@ -645,9 +1259,11 @@ def render_clean_comment(
         ]
         out += [
             f"- `{_cell(entry.get('cluster', ''))}` — {_cell(entry.get('reason', ''))}"
-            for entry in skipped
+            for entry in skipped[:MAX_SCOPE_ROWS]
         ]
-    return "\n".join(out)
+        if len(skipped) > MAX_SCOPE_ROWS:
+            out.append(f"- _…and {len(skipped) - MAX_SCOPE_ROWS} more_")
+    return _clip_comment("\n".join(out))
 
 
 # --------------------------------------------------------------------------- #
