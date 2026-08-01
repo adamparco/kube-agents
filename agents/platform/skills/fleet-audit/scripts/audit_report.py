@@ -1,6 +1,6 @@
 #!/opt/hermes/.venv/bin/python3
 """
-audit_pr.py — Deterministic reporting harness for the fleet-audit skill.
+audit_report.py — Deterministic reporting harness for the fleet-audit skill.
 
 Every autonomous audit watchdog (compliance, security patch, obtainability,
 cost, consistency drift) funnels its findings through this script. Each audit
@@ -15,13 +15,13 @@ produced here, deterministically.
 
 Two-command lifecycle, plus one on-demand command:
 
-    audit_pr.py start     --audit <audit-id>
-    audit_pr.py finish    --audit <audit-id> --findings-file <path> [--dry-run]
-    audit_pr.py remediate --audit <audit-id> --findings-file <path>
+    audit_report.py start     --audit <audit-id>
+    audit_report.py finish    --audit <audit-id> --findings-file <path> [--dry-run]
+    audit_report.py remediate --audit <audit-id> --findings-file <path>
                           --finding <id> [--finding <id>...] [--dry-run]
 
 The pure functions (validate/render/delta) carry no I/O and are unit tested in
-test_audit_pr.py; the thin shell below them owns all subprocess execution.
+test_audit_report.py; the thin shell below them owns all subprocess execution.
 """
 
 from __future__ import annotations
@@ -878,7 +878,7 @@ def _clip_comment(text: str) -> str:
     if len(text) <= MAX_BODY_CHARS:
         return text
     keep = MAX_BODY_CHARS - 120
-    return text[:keep].rstrip() + "\n\n_… (comment truncated by audit_pr.py)_"
+    return text[:keep].rstrip() + "\n\n_… (comment truncated by audit_report.py)_"
 
 
 def trim_excerpt(excerpt: str) -> str:
@@ -896,7 +896,7 @@ def trim_excerpt(excerpt: str) -> str:
         text = text[:MAX_EXCERPT_CHARS].rstrip()
         clipped = True
     if clipped:
-        text += "\n… (excerpt truncated by audit_pr.py — re-run the command above for the full output)"
+        text += "\n… (excerpt truncated by audit_report.py — re-run the command above for the full output)"
     return text
 
 
@@ -913,7 +913,7 @@ def trim_command(command: str) -> str:
         return text
     return (
         text[:MAX_COMMAND_CHARS].rstrip()
-        + "\n# … (command truncated by audit_pr.py)"
+        + "\n# … (command truncated by audit_report.py)"
     )
 
 
@@ -1616,7 +1616,7 @@ def repo_root() -> Path:
     root = (res.stdout or "").strip()
     if res.returncode != 0 or not root:
         raise RuntimeError(
-            "Not inside a git working tree; run `audit_pr.py start` first"
+            "Not inside a git working tree; run `audit_report.py start` first"
         )
     return Path(root)
 

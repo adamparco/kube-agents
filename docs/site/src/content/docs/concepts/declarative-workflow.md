@@ -32,25 +32,49 @@ Safety red lines enforced by the skill: direct/manual cluster mutations are forb
 
 Source: [`agents/platform/skills/fleet-audit/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/fleet-audit).
 
-`submit-suggestion` fits a one-off change: the agent decides what to propose, writes the body, and opens a PR. A recurring [fleet audit](/kube-agents/concepts/autonomous-watchdogs/) does not fit that shape — a daily audit using `submit-suggestion` would open a near-identical PR every morning. `fleet-audit` is the second write path, and it inverts the division of labour: **the model produces evidence, the script produces the pull request.**
+`submit-suggestion` fits a one-off change: the agent decides what to propose, writes the body, and opens a PR. A recurring [fleet audit](/kube-agents/concepts/autonomous-watchdogs/) does not fit that shape. A daily audit using `submit-suggestion` would open a near-identical PR every morning; and an audit report is not a diff at all, so a PR is the wrong container for it — a reviewer would have to accept or reject every finding at once, a force-push would orphan their line comments each run, and closing the PR on a clean fleet would read as _rejected_ rather than _done_. `fleet-audit` is the second write path, and it inverts the division of labour: **the model produces evidence, the script produces the published artefacts.**
 
-The agent's only output is a validated `findings.json` — one entry per deviation, each carrying the literal read-only command that proves it. `audit_pr.py` does the rest:
+The agent's only output is a validated `findings.json` — one entry per deviation, each carrying the literal read-only command that proves it and a `recommendation` (action, rationale, risk). `audit_report.py` does the rest:
 
 ```bash
-./skills/fleet-audit/scripts/audit_pr.py start --audit <audit-id>
+./skills/fleet-audit/scripts/audit_report.py start --audit <audit-id>
 # … the agent inspects the fleet read-only and writes findings.json …
-./skills/fleet-audit/scripts/audit_pr.py finish --audit <audit-id> --findings-file <path>
+./skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> --findings-file <path>
 ```
 
-`start` mints credentials, ensures the `audit:<id>` labels, resets `platform-agent/audit-<audit-id>` onto `main`, and reports whether the stream already has an open PR. `finish` validates the document, stages **only** the paths named in `remediation.path`, commits, force-pushes, renders the PR body, and then either opens the stream's PR or rewrites the existing one in place — commenting with just the delta since the last run. A run with no findings closes the PR instead.
+What it publishes has two tiers: a durable report that is always there, and — only where there is something to merge — narrow pull requests that carry an actual diff.
 
-Three properties follow from the script owning the body rather than the model:
+### Tier 1 — the ledger issue
 
-- **One PR per audit stream.** The `--audit` id is checked against a fixed allowlist, and the branch name is derived from it rather than passed in, so a typo cannot open a sixth stream.
-- **A computable delta.** The body carries a hidden `<!-- audit-findings: [...] -->` block; the next run diffs finding ids against it. This is why the SOPs require finding ids to be stable and free of timestamps.
-- **No invented output.** The model never writes the title, body, commit message, or any timestamp — so two runs against an unchanged fleet produce an unchanged PR.
+Each audit stream owns exactly one **GitHub issue**, rewritten in place on every run and labelled `agent:audit`, `audit:<audit-id>`, and `severity:<highest severity present>`. Its title is generated (`[audit] <human name> — <n> findings (<c> critical)`), and its body carries the scope table, a findings table with a state column, and per-finding detail: evidence, impact, recommendation, remediation, and a link to that finding's remediation PR where one exists.
 
-It shares `submit-suggestion`'s guardrails: same Minty token path, the same refusal of `git add .` / `git add -A`, and the same hard block on force-pushing `main`, `master`, or `production`.
+A run that finds nothing **closes the issue as completed**, and closes any remediation PRs still open for the stream. That is the point of the shape: a closed issue reads as _done_.
+
+### Tier 2 — remediation pull requests
+
+A finding whose remediation is a manifest can be promoted into its own pull request on `platform-agent/fix-<audit-id>-<finding-id>`, based on `main`, carrying only that finding's manifest and linked back to the ledger with `Part of #<issue>`. It takes the ledger's labels plus `audit:remediation`. Findings whose `remediation.path` values overlap share a single PR, since separate branches touching the same file would conflict on merge.
+
+Promotion is hybrid:
+
+- **Automatic** when the finding is `critical`, its remediation is a `manifest`, and no PR yet exists on its branch — capped at five auto-promotions per run, with any withheld findings named in the ledger as awaiting an explicit request.
+- **On request** otherwise. Someone with write access on the repo comments `/remediate <finding-id>` — or `/remediate all` — on the ledger issue, and the next run opens the PRs and replies with the links. Only `manifest` findings are promotable: naming a `gcloud` or `manual` finding gets one reply explaining that its fix is a command to run, not a file to merge. A command from an author without write access gets one reply and nothing else.
+
+Each finding's state is recomputed every run, never stored, and the ledger renders exactly one of `open`, `pr-open`, `pr-merged-persists`, `resolved (fix merged)`, `resolved (no PR)`, or `refused`. Two of those states act on the PR side, and the second is one the old PR-as-report model had no way to express:
+
+- A remediation PR whose finding no longer reproduces is **closed automatically**, with a comment naming the command that no longer reproduces. The branch is deliberately **not** deleted, so any human fixup pushed to it survives and the PR can be reopened.
+- A finding that still reproduces after its PR merged is rendered with a **"fix merged, still reproduces"** warning and the merged PR gets one comment. It is never reopened.
+
+### What the script owns
+
+Three properties follow from the script owning the artefacts rather than the model:
+
+- **One ledger per audit stream.** The `--audit` id is checked against a fixed allowlist, and the branch and label names are derived from it rather than passed in, so a typo cannot open a sixth stream. The agent never calls `gh issue create` itself.
+- **A computable delta.** The issue body carries a hidden `<!-- audit-findings: [...] -->` block; the next run diffs finding ids against it. This is why the SOPs require finding ids to be stable and free of timestamps.
+- **No invented output.** The model never writes the title, body, commit message, or any timestamp — so two runs against an unchanged fleet produce an unchanged ledger.
+
+The `agent:audit` label is also what keeps the two issue-writing watchdogs apart: the `github-issue-resolver` job's poll query excludes it, so it never tries to "resolve" an audit ledger.
+
+`fleet-audit` shares `submit-suggestion`'s guardrails: same Minty token path, the same refusal of `git add .` / `git add -A`, and the same hard block on force-pushing `main`, `master`, or `production`.
 
 ## Minty (GitHub Token Minter)
 
@@ -60,7 +84,7 @@ Minty is a small in-cluster service that brokers GitHub App installation tokens 
 
 ### How it works
 
-1. A GitHub App is created (once, by you) with the needed permissions (`contents:write`, `pull_requests:write`) and installed on the target repo.
+1. A GitHub App is created (once, by you) with the needed permissions (`contents:write`, `pull_requests:write`, `issues:write` — `fleet-audit` publishes its ledger as an issue) and installed on the target repo.
 2. The App's private key is imported into a **GCP KMS asymmetric signing key** (keyring `github-token-minter-keyring`, key `github-token-minter-key`, created by `provision_10_deploy_github_minter.sh`) — the raw key material never lives outside KMS.
 3. When `submit-suggestion` needs a token, the credential broker calls Minty (default endpoint `http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token`) using the agent's Workload Identity.
 4. Minty asks KMS to sign a JWT with the imported private key.
@@ -96,7 +120,7 @@ Explicitly called out as forbidden in `SOUL.md`:
 
 - Running raw `kubectl apply` against a live cluster for infrastructure changes.
 - Configuring `git` credential helpers manually.
-- Running ad-hoc `git clone` against the GitOps repo for change submission, or driving `git`/`gh` directly to open a PR. `SOUL.md §3.2` names exactly two packaged skills that may own the write path: `submit-suggestion` for a one-off change, `fleet-audit` for a scheduled audit run.
+- Running ad-hoc `git clone` against the GitOps repo for change submission, or driving `git`/`gh` directly to open a PR or file an issue. `SOUL.md §3.2` names exactly two packaged skills that may own the write path: `submit-suggestion` for a one-off change, `fleet-audit` for a scheduled audit run.
 - Outputting raw tool schemas, JSON payloads, or exit codes in user-facing messages.
 
 ## Where to go next

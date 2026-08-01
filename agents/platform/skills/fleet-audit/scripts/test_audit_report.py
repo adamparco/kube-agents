@@ -1,13 +1,13 @@
-"""Unit tests for audit_pr — the fleet-audit PR harness.
+"""Unit tests for audit_report — the fleet-audit PR harness.
 
 Run:
   python3 -m unittest discover -s agents/platform/skills/fleet-audit/scripts \
-      -p 'test_audit_pr.py' -v
+      -p 'test_audit_report.py' -v
 
 Stdlib only, matching the other agent-script tests. No gh, gcloud, or GitHub
 credentials are required: the validate/render/delta layer is pure, and the two
 commands that do touch the network are driven through a single recorded seam
-(audit_pr.run_cmd) plus stubs for credential minting.
+(audit_report.run_cmd) plus stubs for credential minting.
 """
 
 import contextlib
@@ -25,7 +25,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import audit_pr  # noqa: E402
+import audit_report  # noqa: E402
 
 AUDIT = "compliance-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
@@ -113,7 +113,7 @@ THREE_SEVERITIES = [
 
 
 class Recorder:
-    """Stands in for audit_pr.run_cmd, recording every command and replying by rule.
+    """Stands in for audit_report.run_cmd, recording every command and replying by rule.
 
     `failures` maps a command fragment to the return code that command should
     produce: with `check=True` it raises CalledProcessError exactly as
@@ -172,8 +172,8 @@ class BaseTestCase(unittest.TestCase):
         return json.dumps([{"number": number, "url": url}])
 
     def patch_attr(self, name, value):
-        """monkeypatch.setattr(audit_pr, name, value), undone at teardown."""
-        patcher = patch.object(audit_pr, name, value)
+        """monkeypatch.setattr(audit_report, name, value), undone at teardown."""
+        patcher = patch.object(audit_report, name, value)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -181,7 +181,7 @@ class BaseTestCase(unittest.TestCase):
         """Invoke the CLI, capturing stdout/stderr into self.out / self.err."""
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = audit_pr.main(argv)
+            code = audit_report.main(argv)
         self.out = out.getvalue()
         self.err = err.getvalue()
         return code
@@ -213,7 +213,7 @@ class BaseTestCase(unittest.TestCase):
 
 
 class HarnessTestCase(BaseTestCase):
-    """Wires audit_pr's I/O seam to a recorder and pins the repo root to the temp tree."""
+    """Wires audit_report's I/O seam to a recorder and pins the repo root to the temp tree."""
 
     def setUp(self):
         super().setUp()
@@ -232,7 +232,7 @@ class HarnessTestCase(BaseTestCase):
 class TestRenderBody(unittest.TestCase):
     def test_renders_scope_findings_and_footer(self):
         doc = make_doc()
-        body = audit_pr.render_issue_body(doc, generated_at=NOW)
+        body = audit_report.render_issue_body(doc, generated_at=NOW)
         self.assertIn("This issue is the ledger for the `compliance-audit` audit", body)
         self.assertIn("## Scope", body)
         self.assertIn("| `prod-us-east` | us-east1 | `acme-prod` |", body)
@@ -249,21 +249,21 @@ class TestRenderBody(unittest.TestCase):
         )
 
     def test_body_explains_how_to_ask_for_a_remediation_pr(self):
-        body = audit_pr.render_issue_body(make_doc(), generated_at=NOW)
+        body = audit_report.render_issue_body(make_doc(), generated_at=NOW)
         self.assertIn("`/remediate <finding-id>`", body)
         self.assertIn("write access", body)
 
     def test_body_names_no_staged_files(self):
         # The ledger is an issue: it has no diff, so it must never claim one.
-        body = audit_pr.render_issue_body(make_doc(), generated_at=NOW)
+        body = audit_report.render_issue_body(make_doc(), generated_at=NOW)
         self.assertNotIn("Remediation files in this PR", body)
 
     def test_evidence_command_is_fenced(self):
-        body = audit_pr.render_issue_body(make_doc(), generated_at=NOW)
+        body = audit_report.render_issue_body(make_doc(), generated_at=NOW)
         self.assertIn("```bash\nkubectl get networkpolicy -n payments\n```", body)
 
     def test_severity_groups_ordered_critical_major_minor(self):
-        body = audit_pr.render_issue_body(
+        body = audit_report.render_issue_body(
             make_doc(findings=THREE_SEVERITIES), generated_at=NOW
         )
         order = [
@@ -275,7 +275,7 @@ class TestRenderBody(unittest.TestCase):
         self.assertIn("4 findings: 2 critical, 1 major, 1 minor.", body)
 
     def test_empty_severity_group_is_omitted(self):
-        body = audit_pr.render_issue_body(
+        body = audit_report.render_issue_body(
             make_doc(findings=[make_finding(severity="minor")]),
             generated_at=NOW,
         )
@@ -287,13 +287,13 @@ class TestRenderBody(unittest.TestCase):
         doc = make_doc(
             skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}]
         )
-        body = audit_pr.render_issue_body(doc, generated_at=NOW)
+        body = audit_report.render_issue_body(doc, generated_at=NOW)
         self.assertIn("### Skipped", body)
         self.assertIn("**Coverage is partial.**", body)
         self.assertIn("| `dr-west` | control plane unreachable |", body)
 
     def test_no_skipped_section_when_none_skipped(self):
-        body = audit_pr.render_issue_body(make_doc(), generated_at=NOW)
+        body = audit_report.render_issue_body(make_doc(), generated_at=NOW)
         self.assertNotIn("### Skipped", body)
         self.assertNotIn("Coverage is partial", body)
 
@@ -304,15 +304,15 @@ class TestRenderBody(unittest.TestCase):
                 "note": "gcloud container clusters update prod-us-east --enable-shielded-nodes",
             }
         )
-        body = audit_pr.render_issue_body(
+        body = audit_report.render_issue_body(
             make_doc(findings=[finding]), generated_at=NOW
         )
         self.assertIn("- **Remediation (gcloud):**", body)
         self.assertIn("gcloud container clusters update prod-us-east", body)
-        self.assertEqual(audit_pr.manifest_paths([finding]), [])
+        self.assertEqual(audit_report.manifest_paths([finding]), [])
 
     def test_manifest_remediation_links_the_path(self):
-        body = audit_pr.render_issue_body(make_doc(), generated_at=NOW)
+        body = audit_report.render_issue_body(make_doc(), generated_at=NOW)
         self.assertIn(
             "[`clusters/prod-us-east/payments-netpol.yaml`]"
             "(clusters/prod-us-east/payments-netpol.yaml)",
@@ -320,17 +320,17 @@ class TestRenderBody(unittest.TestCase):
         )
 
     def test_cluster_scoped_finding_renders_without_namespace(self):
-        body = audit_pr.render_issue_body(
+        body = audit_report.render_issue_body(
             make_doc(findings=[make_finding(namespace="", obj="ClusterRole/admin")]),
             generated_at=NOW,
         )
         self.assertIn("_cluster-scoped_", body)
 
     def test_body_is_deterministic_regardless_of_input_order(self):
-        first = audit_pr.render_issue_body(
+        first = audit_report.render_issue_body(
             make_doc(findings=THREE_SEVERITIES), generated_at=NOW
         )
-        second = audit_pr.render_issue_body(
+        second = audit_report.render_issue_body(
             make_doc(findings=list(reversed(THREE_SEVERITIES))),
             generated_at=NOW,
         )
@@ -338,25 +338,25 @@ class TestRenderBody(unittest.TestCase):
 
     def test_title_and_commit_subject(self):
         self.assertEqual(
-            audit_pr.issue_title(AUDIT, THREE_SEVERITIES),
+            audit_report.issue_title(AUDIT, THREE_SEVERITIES),
             "[audit] Security & RBAC Posture Audit — 4 findings (2 critical)",
         )
         self.assertEqual(
-            audit_pr.commit_subject(AUDIT, THREE_SEVERITIES),
+            audit_report.commit_subject(AUDIT, THREE_SEVERITIES),
             "chore(audit): compliance-audit — 4 findings (2 critical, 1 major, 1 minor)",
         )
 
     def test_single_finding_is_not_pluralised(self):
         one = [make_finding(fid="only-one")]
         self.assertEqual(
-            audit_pr.issue_title(AUDIT, one),
+            audit_report.issue_title(AUDIT, one),
             "[audit] Security & RBAC Posture Audit — 1 finding (1 critical)",
         )
         self.assertEqual(
-            audit_pr.commit_subject(AUDIT, one),
+            audit_report.commit_subject(AUDIT, one),
             "chore(audit): compliance-audit — 1 finding (1 critical, 0 major, 0 minor)",
         )
-        body = audit_pr.render_issue_body(
+        body = audit_report.render_issue_body(
             make_doc(findings=one), generated_at=NOW
         )
         self.assertIn("1 finding: 1 critical, 0 major, 0 minor.", body)
@@ -364,19 +364,19 @@ class TestRenderBody(unittest.TestCase):
 
     def test_zero_findings_title_is_pluralised(self):
         self.assertEqual(
-            audit_pr.issue_title(AUDIT, []),
+            audit_report.issue_title(AUDIT, []),
             "[audit] Security & RBAC Posture Audit — 0 findings (0 critical)",
         )
 
     def test_excerpt_is_trimmed(self):
         long_excerpt = "\n".join(f"line {i}" for i in range(200))
-        trimmed = audit_pr.trim_excerpt(long_excerpt)
-        self.assertLessEqual(trimmed.count("\n"), audit_pr.MAX_EXCERPT_LINES)
+        trimmed = audit_report.trim_excerpt(long_excerpt)
+        self.assertLessEqual(trimmed.count("\n"), audit_report.MAX_EXCERPT_LINES)
         self.assertIn("excerpt truncated", trimmed)
 
     def test_excerpt_containing_a_fence_does_not_break_out(self):
         finding = make_finding(excerpt="```\nnested fence\n```")
-        body = audit_pr.render_issue_body(
+        body = audit_report.render_issue_body(
             make_doc(findings=[finding]), generated_at=NOW
         )
         self.assertIn("````text", body)
@@ -390,32 +390,32 @@ class TestRenderBody(unittest.TestCase):
 class TestDeltaBlock(unittest.TestCase):
     def test_block_is_sorted_and_exact(self):
         self.assertEqual(
-            audit_pr.delta_block(["b", "a"]), '<!-- audit-findings: ["a","b"] -->'
+            audit_report.delta_block(["b", "a"]), '<!-- audit-findings: ["a","b"] -->'
         )
 
     def test_round_trip(self):
         ids = ["zeta", "alpha", "mid"]
-        body = audit_pr.render_issue_body(
+        body = audit_report.render_issue_body(
             make_doc(findings=[make_finding(fid=i) for i in ids]),
             generated_at=NOW,
         )
-        self.assertEqual(audit_pr.parse_delta_block(body), sorted(ids))
+        self.assertEqual(audit_report.parse_delta_block(body), sorted(ids))
 
     def test_missing_or_broken_block_parses_as_empty(self):
-        self.assertEqual(audit_pr.parse_delta_block(""), [])
-        self.assertEqual(audit_pr.parse_delta_block(None), [])
-        self.assertEqual(audit_pr.parse_delta_block("no marker here"), [])
+        self.assertEqual(audit_report.parse_delta_block(""), [])
+        self.assertEqual(audit_report.parse_delta_block(None), [])
+        self.assertEqual(audit_report.parse_delta_block("no marker here"), [])
         self.assertEqual(
-            audit_pr.parse_delta_block("<!-- audit-findings: [oops] -->"), []
+            audit_report.parse_delta_block("<!-- audit-findings: [oops] -->"), []
         )
 
     def test_compute_delta(self):
-        new, resolved = audit_pr.compute_delta(["a", "b"], ["b", "c"])
+        new, resolved = audit_report.compute_delta(["a", "b"], ["b", "c"])
         self.assertEqual(new, ["c"])
         self.assertEqual(resolved, ["a"])
 
     def test_delta_across_two_rendered_runs(self):
-        run_one = audit_pr.render_issue_body(
+        run_one = audit_report.render_issue_body(
             make_doc(
                 findings=[
                     make_finding(fid="a", title="Alpha finding"),
@@ -430,18 +430,18 @@ class TestDeltaBlock(unittest.TestCase):
                 make_finding(fid="c", title="Charlie finding"),
             ]
         )
-        run_two = audit_pr.render_issue_body(run_two_doc, generated_at=NOW)
+        run_two = audit_report.render_issue_body(run_two_doc, generated_at=NOW)
 
-        previous_ids = audit_pr.parse_delta_block(run_one)
-        current_ids = audit_pr.parse_delta_block(run_two)
-        new, resolved = audit_pr.compute_delta(previous_ids, current_ids)
+        previous_ids = audit_report.parse_delta_block(run_one)
+        current_ids = audit_report.parse_delta_block(run_two)
+        new, resolved = audit_report.compute_delta(previous_ids, current_ids)
         self.assertEqual(new, ["c"])
         self.assertEqual(resolved, ["a"])
 
-        titles = audit_pr.parse_finding_titles(run_one)
+        titles = audit_report.parse_finding_titles(run_one)
         self.assertEqual(titles["a"], "Alpha finding")
 
-        comment = audit_pr.render_delta_comment(
+        comment = audit_report.render_delta_comment(
             AUDIT, new, resolved, run_two_doc["findings"], titles, NOW
         )
         self.assertIn("**1 new**", comment)
@@ -451,7 +451,7 @@ class TestDeltaBlock(unittest.TestCase):
         self.assertIn("Alpha finding", comment)
 
     def test_no_comment_when_nothing_changed(self):
-        self.assertIsNone(audit_pr.render_delta_comment(AUDIT, [], [], [], {}, NOW))
+        self.assertIsNone(audit_report.render_delta_comment(AUDIT, [], [], [], {}, NOW))
 
 
 # --------------------------------------------------------------------------- #
@@ -461,38 +461,38 @@ class TestDeltaBlock(unittest.TestCase):
 
 class TestValidation(unittest.TestCase):
     def test_valid_document_passes(self):
-        self.assertEqual(audit_pr.validate_findings(make_doc(), AUDIT)["audit"], AUDIT)
+        self.assertEqual(audit_report.validate_findings(make_doc(), AUDIT)["audit"], AUDIT)
 
     def test_zero_findings_is_valid(self):
-        audit_pr.validate_findings(make_doc(findings=[]), AUDIT)
+        audit_report.validate_findings(make_doc(findings=[]), AUDIT)
 
     def test_unknown_audit_id_rejected(self):
-        with self.assertRaisesRegex(audit_pr.ValidationError, "unknown audit id"):
-            audit_pr.validate_audit_id("not-an-audit")
+        with self.assertRaisesRegex(audit_report.ValidationError, "unknown audit id"):
+            audit_report.validate_audit_id("not-an-audit")
 
     def test_audit_id_mismatch_rejected(self):
-        with self.assertRaises(audit_pr.ValidationError) as exc:
-            audit_pr.validate_findings(make_doc(audit="obtainability-audit"), AUDIT)
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(make_doc(audit="obtainability-audit"), AUDIT)
         self.assertIn("audit:", str(exc.exception))
         self.assertIn("obtainability-audit", str(exc.exception))
 
     def test_empty_scope_clusters_rejected(self):
-        with self.assertRaises(audit_pr.ValidationError) as exc:
-            audit_pr.validate_findings(make_doc(clusters=[]), AUDIT)
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(make_doc(clusters=[]), AUDIT)
         self.assertIn("scope.clusters", str(exc.exception))
         self.assertIn("not a clean run", str(exc.exception))
 
     def test_missing_evidence_command_rejected(self):
         doc = make_doc(findings=[make_finding(), make_finding(fid="second")])
         del doc["findings"][1]["evidence"]["command"]
-        with self.assertRaises(audit_pr.ValidationError) as exc:
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
         self.assertIn("findings[1].evidence.command", str(exc.exception))
 
     def test_empty_evidence_command_rejected(self):
         doc = make_doc(findings=[make_finding(command="   ")])
-        with self.assertRaises(audit_pr.ValidationError) as exc:
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
         self.assertIn("findings[0].evidence.command", str(exc.exception))
         self.assertIn("dropped, not softened", str(exc.exception))
 
@@ -504,8 +504,8 @@ class TestValidation(unittest.TestCase):
                 make_finding(fid="dupe"),
             ]
         )
-        with self.assertRaises(audit_pr.ValidationError) as exc:
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
         self.assertIn("findings[2].id", str(exc.exception))
         self.assertIn("findings[0]", str(exc.exception))
 
@@ -513,8 +513,8 @@ class TestValidation(unittest.TestCase):
         doc = make_doc(
             findings=[make_finding(remediation={"kind": "manifest", "note": "fix it"})]
         )
-        with self.assertRaises(audit_pr.ValidationError) as exc:
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
         self.assertIn("findings[0].remediation.path", str(exc.exception))
 
     def test_gcloud_with_path_rejected(self):
@@ -525,26 +525,26 @@ class TestValidation(unittest.TestCase):
                 )
             ]
         )
-        with self.assertRaises(audit_pr.ValidationError) as exc:
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
         self.assertIn("findings[0].remediation.path", str(exc.exception))
 
     def test_bad_severity_rejected(self):
         doc = make_doc(findings=[make_finding(severity="catastrophic")])
-        with self.assertRaises(audit_pr.ValidationError) as exc:
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
         self.assertIn("findings[0].severity", str(exc.exception))
 
     def test_bad_remediation_kind_rejected(self):
         doc = make_doc(
             findings=[make_finding(remediation={"kind": "ansible", "note": "n"})]
         )
-        with self.assertRaises(audit_pr.ValidationError) as exc:
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
         self.assertIn("findings[0].remediation.kind", str(exc.exception))
 
     def test_empty_namespace_allowed(self):
-        audit_pr.validate_findings(
+        audit_report.validate_findings(
             make_doc(findings=[make_finding(namespace="")]), AUDIT
         )
 
@@ -558,20 +558,20 @@ class TestValidation(unittest.TestCase):
                         )
                     ]
                 )
-                with self.assertRaises(audit_pr.ValidationError) as exc:
-                    audit_pr.validate_findings(doc, AUDIT)
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
                 self.assertIn("findings[0].remediation.path", str(exc.exception))
 
     def test_findings_must_be_a_list(self):
         doc = make_doc()
         doc["findings"] = {"nope": True}
-        with self.assertRaisesRegex(audit_pr.ValidationError, "findings:"):
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaisesRegex(audit_report.ValidationError, "findings:"):
+            audit_report.validate_findings(doc, AUDIT)
 
     def test_skipped_entry_needs_a_reason(self):
         doc = make_doc(skipped=[{"cluster": "dr-west"}])
-        with self.assertRaises(audit_pr.ValidationError) as exc:
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
         self.assertIn("scope.skipped[0].reason", str(exc.exception))
 
 
@@ -590,13 +590,13 @@ class TestAuditCatalogue(unittest.TestCase):
             self.skipTest(f"{jobs_file} not present")
         jobs = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
         names = {job["id"]: job["name"] for job in jobs}
-        for audit_id, human in audit_pr.AUDITS.items():
+        for audit_id, human in audit_report.AUDITS.items():
             if audit_id in names:
                 with self.subTest(audit=audit_id):
                     self.assertEqual(
                         human,
                         names[audit_id],
-                        f"audit_pr.AUDITS[{audit_id!r}] is {human!r} but "
+                        f"audit_report.AUDITS[{audit_id!r}] is {human!r} but "
                         f"cron/jobs.json calls it {names[audit_id]!r}",
                     )
 
@@ -611,16 +611,16 @@ class TestProtectedBranches(unittest.TestCase):
         for branch in ("main", "master", "production", "MAIN", " main "):
             with self.subTest(branch=branch):
                 with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
-                    audit_pr.assert_pushable(branch)
+                    audit_report.assert_pushable(branch)
 
     def test_remediation_branch_is_pushable(self):
         # The audit report branch is gone; the only branch the harness ever
         # pushes is a remediation branch, so that is what the guard must clear.
-        for audit_id in audit_pr.AUDITS:
+        for audit_id in audit_report.AUDITS:
             with self.subTest(audit=audit_id):
-                branch = audit_pr.group_branch_for(audit_id, [make_finding(fid="a")])
+                branch = audit_report.group_branch_for(audit_id, [make_finding(fid="a")])
                 self.assertEqual(branch, f"platform-agent/fix-{audit_id}-a")
-                self.assertEqual(audit_pr.assert_pushable(branch), branch)
+                self.assertEqual(audit_report.assert_pushable(branch), branch)
 
 
 # --------------------------------------------------------------------------- #
@@ -645,7 +645,7 @@ class TestStaging(unittest.TestCase):
             make_finding(fid="e", remediation={"kind": "manual", "note": "call SRE"}),
         ]
         self.assertEqual(
-            audit_pr.manifest_paths(findings),
+            audit_report.manifest_paths(findings),
             [
                 "clusters/prod-us-east/payments-netpol.yaml",
                 "clusters/stage-eu/psp.yaml",
@@ -653,7 +653,7 @@ class TestStaging(unittest.TestCase):
         )
 
     def test_git_add_command_is_explicit(self):
-        cmd = audit_pr.build_git_add_command(["a.yaml", "b.yaml"])
+        cmd = audit_report.build_git_add_command(["a.yaml", "b.yaml"])
         self.assertEqual(
             cmd,
             ["git", "--literal-pathspecs", "add", "--", "a.yaml", "b.yaml"],
@@ -662,14 +662,14 @@ class TestStaging(unittest.TestCase):
     def test_literal_pathspecs_precedes_the_subcommand(self):
         # `git add --literal-pathspecs` is an error: the flag is git-level, so
         # it has to sit before `add` or the whole guard fails at runtime.
-        cmd = audit_pr.build_git_add_command(["a.yaml"])
+        cmd = audit_report.build_git_add_command(["a.yaml"])
         self.assertLess(cmd.index("--literal-pathspecs"), cmd.index("add"))
 
     def test_wildcard_pathspecs_refused(self):
         for pathspec in (".", "-A", "--all", "-a", "*", ":/"):
             with self.subTest(pathspec=pathspec):
                 with self.assertRaisesRegex(ValueError, "wildcard pathspec"):
-                    audit_pr.build_git_add_command([pathspec])
+                    audit_report.build_git_add_command([pathspec])
 
     def test_glob_metacharacters_refused_in_a_declared_path(self):
         # --literal-pathspecs makes these harmless to git, but a path with a
@@ -681,8 +681,8 @@ class TestStaging(unittest.TestCase):
             "clusters/x].yaml",
         ):
             with self.subTest(path=path):
-                with self.assertRaises(audit_pr.ValidationError):
-                    audit_pr.validate_findings(
+                with self.assertRaises(audit_report.ValidationError):
+                    audit_report.validate_findings(
                         make_doc(
                             findings=[
                                 make_finding(
@@ -707,7 +707,7 @@ class TestStaging(unittest.TestCase):
         if git is None:  # pragma: no cover - git is present locally and in CI
             self.skipTest("git not on PATH")
 
-        prefix = audit_pr.build_git_add_command(["one.yaml"])[1:3]
+        prefix = audit_report.build_git_add_command(["one.yaml"])[1:3]
         self.assertEqual(prefix, ["--literal-pathspecs", "add"])
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -730,7 +730,7 @@ class TestStaging(unittest.TestCase):
 
     def test_empty_staging_set_refuses_to_build_an_add(self):
         with self.assertRaisesRegex(ValueError, "no explicit paths"):
-            audit_pr.build_git_add_command([])
+            audit_report.build_git_add_command([])
 
 
 # --------------------------------------------------------------------------- #
@@ -822,7 +822,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(label[0][:4], ["gh", "issue", "edit", "7"])
 
     def test_updates_in_place_and_posts_delta(self):
-        previous_body = audit_pr.render_issue_body(
+        previous_body = audit_report.render_issue_body(
             make_doc(
                 findings=[
                     make_finding(fid="a", title="Alpha finding"),
@@ -867,7 +867,7 @@ class TestFinishWithFindings(HarnessTestCase):
 
     def test_no_comment_when_findings_unchanged(self):
         doc = make_doc()
-        previous_body = audit_pr.render_issue_body(doc, generated_at=NOW)
+        previous_body = audit_report.render_issue_body(doc, generated_at=NOW)
         self.harness.replies = {
             "issue list": self.issue_list(),
             "--json body": json.dumps({"body": previous_body}),
@@ -926,7 +926,7 @@ class TestFinishWithFindings(HarnessTestCase):
 
 class TestFinishClean(HarnessTestCase):
     def test_clean_run_closes_the_open_ledger_as_completed(self):
-        previous_body = audit_pr.render_issue_body(
+        previous_body = audit_report.render_issue_body(
             make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]),
             generated_at=NOW,
         )
@@ -990,7 +990,7 @@ class TestFinishClean(HarnessTestCase):
         )
 
     def test_clean_comment_names_date_and_scope(self):
-        comment = audit_pr.render_clean_comment(AUDIT, make_doc(findings=[]), NOW)
+        comment = audit_report.render_clean_comment(AUDIT, make_doc(findings=[]), NOW)
         self.assertIn("2026-08-01 09:30 UTC", comment)
         self.assertIn("0 findings", comment)
         self.assertIn("`prod-us-east`", comment)
@@ -1006,7 +1006,7 @@ class TestStart(HarnessTestCase):
     def setUp(self):
         super().setUp()
         # handle_start pre-creates /opt/data/scratch; keep the tests off the real FS.
-        patcher = patch.object(audit_pr.os, "makedirs", lambda *a, **k: None)
+        patcher = patch.object(audit_report.os, "makedirs", lambda *a, **k: None)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.patch_attr(
@@ -1170,11 +1170,11 @@ def bulk_findings(count, severity="minor", prefix="f"):
 
 class TestRenderBudget(BaseTestCase):
     def render(self, doc):
-        return audit_pr.render_issue_body(doc, generated_at=NOW)
+        return audit_report.render_issue_body(doc, generated_at=NOW)
 
     def test_body_stays_under_the_github_limit_at_250_findings(self):
         body = self.render(make_doc(findings=bulk_findings(250)))
-        self.assertLess(len(body), audit_pr.MAX_BODY_CHARS)
+        self.assertLess(len(body), audit_report.MAX_BODY_CHARS)
 
     def test_ten_findings_render_untruncated(self):
         findings = bulk_findings(10)
@@ -1190,7 +1190,7 @@ class TestRenderBudget(BaseTestCase):
     def test_title_carries_the_true_total_even_when_truncated(self):
         findings = bulk_findings(250)
         body = self.render(make_doc(findings=findings))
-        title = audit_pr.issue_title(AUDIT, findings)
+        title = audit_report.issue_title(AUDIT, findings)
         self.assertIn("250 findings", title)
         # The rendered body must not silently disagree with the title.
         self.assertIn("250", body)
@@ -1198,8 +1198,8 @@ class TestRenderBudget(BaseTestCase):
     def test_delta_block_lists_exactly_the_rendered_ids(self):
         findings = bulk_findings(250)
         body = self.render(make_doc(findings=findings))
-        recorded = audit_pr.parse_delta_block(body)
-        ordered = [f["id"] for f in audit_pr.sort_findings(findings)]
+        recorded = audit_report.parse_delta_block(body)
+        ordered = [f["id"] for f in audit_report.sort_findings(findings)]
 
         self.assertTrue(recorded)
         self.assertLess(len(recorded), len(findings), "fixture must overflow")
@@ -1220,7 +1220,7 @@ class TestRenderBudget(BaseTestCase):
         body = self.render(make_doc(findings=findings))
         for i in range(5):
             self.assertIn(f"crit-{i:04d}", body)
-        self.assertLess(len(body), audit_pr.MAX_BODY_CHARS)
+        self.assertLess(len(body), audit_report.MAX_BODY_CHARS)
 
     def test_scope_only_body_cannot_overflow(self):
         # Zero findings, an enormous fleet: this overflowed at 148,627 chars
@@ -1237,7 +1237,7 @@ class TestRenderBudget(BaseTestCase):
             ],
         )
         body = self.render(doc)
-        self.assertLess(len(body), audit_pr.MAX_BODY_CHARS)
+        self.assertLess(len(body), audit_report.MAX_BODY_CHARS)
         self.assertIn("more", body)
 
     def test_clean_comment_stays_under_the_limit_at_900_skipped(self):
@@ -1251,14 +1251,14 @@ class TestRenderBudget(BaseTestCase):
                 {"cluster": f"s-{i:04d}", "reason": "unreachable"} for i in range(900)
             ],
         )
-        comment = audit_pr.render_clean_comment(AUDIT, doc, NOW)
-        self.assertLess(len(comment), audit_pr.MAX_BODY_CHARS)
+        comment = audit_report.render_clean_comment(AUDIT, doc, NOW)
+        self.assertLess(len(comment), audit_report.MAX_BODY_CHARS)
 
     def test_delta_comment_stays_under_the_limit(self):
         # Newly reachable: capping the body means N is no longer pinned under
         # ~67 by the body failing first, so this path stops being dead code.
         findings = bulk_findings(250)
-        comment = audit_pr.render_delta_comment(
+        comment = audit_report.render_delta_comment(
             AUDIT,
             [f["id"] for f in findings],
             [f"gone-{i:04d}" for i in range(250)],
@@ -1266,11 +1266,11 @@ class TestRenderBudget(BaseTestCase):
             {f["id"]: f["title"] for f in findings},
             NOW,
         )
-        self.assertLess(len(comment), audit_pr.MAX_BODY_CHARS)
+        self.assertLess(len(comment), audit_report.MAX_BODY_CHARS)
 
     def test_long_command_is_trimmed(self):
         finding = make_finding(command="kubectl get pods " + "x" * 5000)
-        rendered = "\n".join(audit_pr.render_finding(finding))
+        rendered = "\n".join(audit_report.render_finding(finding))
         self.assertLess(len(rendered), 4000)
         self.assertIn("truncated", rendered.lower())
 
@@ -1278,13 +1278,13 @@ class TestRenderBudget(BaseTestCase):
         findings = bulk_findings(3, severity="minor") + bulk_findings(
             2, severity="critical", prefix="c"
         )
-        rendered, omitted = audit_pr.select_rendered_findings(findings, 1)
+        rendered, omitted = audit_report.select_rendered_findings(findings, 1)
         self.assertEqual(len(rendered), 1)
         self.assertEqual(rendered[0]["severity"], "critical")
         self.assertEqual(len(omitted), 4)
 
     def test_at_least_one_finding_always_renders(self):
-        rendered, _ = audit_pr.select_rendered_findings(bulk_findings(5), 0)
+        rendered, _ = audit_report.select_rendered_findings(bulk_findings(5), 0)
         self.assertEqual(len(rendered), 1)
 
 
@@ -1296,14 +1296,14 @@ class TestRenderBudget(BaseTestCase):
 class TestRecommendation(BaseTestCase):
     def assert_rejected(self, recommendation, pattern="recommendation"):
         doc = make_doc(findings=[make_finding(recommendation=recommendation)])
-        with self.assertRaisesRegex(audit_pr.ValidationError, pattern):
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaisesRegex(audit_report.ValidationError, pattern):
+            audit_report.validate_findings(doc, AUDIT)
 
     def test_missing_recommendation_is_rejected(self):
         doc = make_doc(findings=[make_finding()])
         del doc["findings"][0]["recommendation"]
-        with self.assertRaisesRegex(audit_pr.ValidationError, "recommendation"):
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaisesRegex(audit_report.ValidationError, "recommendation"):
+            audit_report.validate_findings(doc, AUDIT)
 
     def test_each_sub_field_is_required(self):
         full = {"action": "a", "rationale": "r", "risk": "k"}
@@ -1326,7 +1326,7 @@ class TestRecommendation(BaseTestCase):
 
     def test_recommendation_renders_all_three_fields(self):
         rendered = "\n".join(
-            audit_pr.render_finding(
+            audit_report.render_finding(
                 make_finding(
                     recommendation={
                         "action": "Do the thing.",
@@ -1353,7 +1353,7 @@ class TestScopeLimitations(BaseTestCase):
                 }
             ]
         )
-        self.assertTrue(audit_pr.validate_findings(doc, AUDIT))
+        self.assertTrue(audit_report.validate_findings(doc, AUDIT))
 
     def test_empty_limitations_entry_is_rejected(self):
         doc = make_doc(
@@ -1366,8 +1366,8 @@ class TestScopeLimitations(BaseTestCase):
                 }
             ]
         )
-        with self.assertRaisesRegex(audit_pr.ValidationError, "limitations"):
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaisesRegex(audit_report.ValidationError, "limitations"):
+            audit_report.validate_findings(doc, AUDIT)
 
     def test_a_cluster_cannot_be_both_audited_and_skipped(self):
         # The Autopilot false-all-clear: the collision this field exists to end.
@@ -1377,8 +1377,8 @@ class TestScopeLimitations(BaseTestCase):
             ],
             skipped=[{"cluster": "prod-us-east", "reason": "Autopilot"}],
         )
-        with self.assertRaises(audit_pr.ValidationError):
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.validate_findings(doc, AUDIT)
 
     def test_duplicate_skipped_entries_are_rejected(self):
         doc = make_doc(
@@ -1388,23 +1388,23 @@ class TestScopeLimitations(BaseTestCase):
                 {"cluster": "dr-west", "reason": "unreachable again"},
             ],
         )
-        with self.assertRaises(audit_pr.ValidationError):
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.validate_findings(doc, AUDIT)
 
     def test_a_finding_cannot_name_a_skipped_cluster(self):
         doc = make_doc(
             findings=[make_finding(cluster="dr-west")],
             skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
         )
-        with self.assertRaises(audit_pr.ValidationError):
-            audit_pr.validate_findings(doc, AUDIT)
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.validate_findings(doc, AUDIT)
 
 
 class TestFindingIdCharset(BaseTestCase):
     def test_usable_ids_are_accepted(self):
         for fid in ("a", "netpol-missing-payments", "v1.2.3-drift", "a" * 100):
             with self.subTest(fid=fid):
-                self.assertEqual(audit_pr.validate_finding_id(fid, "where"), fid)
+                self.assertEqual(audit_report.validate_finding_id(fid, "where"), fid)
 
     def test_ids_git_would_refuse_are_rejected(self):
         # Each of these produces a branch `git check-ref-format` rejects once
@@ -1428,8 +1428,8 @@ class TestFindingIdCharset(BaseTestCase):
             "has\tab",
         ):
             with self.subTest(fid=fid):
-                with self.assertRaises(audit_pr.ValidationError):
-                    audit_pr.validate_finding_id(fid, "where")
+                with self.assertRaises(audit_report.ValidationError):
+                    audit_report.validate_finding_id(fid, "where")
 
     def test_accepted_ids_survive_git_check_ref_format(self):
         # The rule is only worth anything if git agrees with it.
@@ -1438,7 +1438,7 @@ class TestFindingIdCharset(BaseTestCase):
             self.skipTest("git not on PATH")
         for fid in ("a", "netpol-missing-payments", "v1.2.3-drift", "a" * 100):
             with self.subTest(fid=fid):
-                branch = audit_pr.group_branch_for(AUDIT, [make_finding(fid=fid)])
+                branch = audit_report.group_branch_for(AUDIT, [make_finding(fid=fid)])
                 proc = subprocess.run(
                     [git, "check-ref-format", f"refs/heads/{branch}"],
                     capture_output=True,
@@ -1464,7 +1464,7 @@ class TestRemediationGroups(BaseTestCase):
         return [[f["id"] for f in group] for group in groups]
 
     def test_disjoint_paths_are_separate_groups(self):
-        groups = audit_pr.remediation_groups(
+        groups = audit_report.remediation_groups(
             [manifest_finding("a", "x.yaml"), manifest_finding("b", "y.yaml")]
         )
         self.assertEqual(self.ids(groups), [["a"], ["b"]])
@@ -1472,7 +1472,7 @@ class TestRemediationGroups(BaseTestCase):
     def test_a_shared_path_merges_two_findings(self):
         # compliance_audit_sop.md points every finding in a namespace at one
         # shared default-sa-automount.yaml, so this is the common case.
-        groups = audit_pr.remediation_groups(
+        groups = audit_report.remediation_groups(
             [
                 manifest_finding("a", "shared.yaml"),
                 manifest_finding("b", "shared.yaml"),
@@ -1489,9 +1489,9 @@ class TestRemediationGroups(BaseTestCase):
         paths = {"a": {"x.yaml"}, "b": {"x.yaml", "y.yaml"}, "c": {"y.yaml"}}
         findings = [manifest_finding(fid, f"{fid}.yaml") for fid in ("a", "b", "c")]
         with patch.object(
-            audit_pr, "_finding_paths", lambda f: paths[f["id"]]
+            audit_report, "_finding_paths", lambda f: paths[f["id"]]
         ):
-            groups = audit_pr.remediation_groups(findings)
+            groups = audit_report.remediation_groups(findings)
         self.assertEqual(self.ids(groups), [["a", "b", "c"]])
 
     def test_grouping_is_independent_of_input_order(self):
@@ -1501,12 +1501,12 @@ class TestRemediationGroups(BaseTestCase):
             manifest_finding("a", "shared.yaml"),
         ]
         self.assertEqual(
-            self.ids(audit_pr.remediation_groups(findings)),
+            self.ids(audit_report.remediation_groups(findings)),
             [["a", "b"], ["c"]],
         )
 
     def test_non_manifest_findings_do_not_form_groups(self):
-        groups = audit_pr.remediation_groups(
+        groups = audit_report.remediation_groups(
             [
                 make_finding(fid="a", remediation={"kind": "gcloud", "note": "g"}),
                 make_finding(fid="b", remediation={"kind": "manual", "note": "m"}),
@@ -1517,13 +1517,13 @@ class TestRemediationGroups(BaseTestCase):
     def test_branch_is_named_for_the_lowest_sorted_id(self):
         group = [manifest_finding("zeta", "s.yaml"), manifest_finding("alpha", "s.yaml")]
         self.assertEqual(
-            audit_pr.group_branch_for(AUDIT, group),
+            audit_report.group_branch_for(AUDIT, group),
             f"platform-agent/fix-{AUDIT}-alpha",
         )
 
     def test_group_paths_are_deduplicated_and_sorted(self):
         group = [manifest_finding("a", "s.yaml"), manifest_finding("b", "s.yaml")]
-        self.assertEqual(audit_pr.group_paths(group), ["s.yaml"])
+        self.assertEqual(audit_report.group_paths(group), ["s.yaml"])
 
 
 # --------------------------------------------------------------------------- #
@@ -1534,33 +1534,33 @@ class TestRemediationGroups(BaseTestCase):
 class TestFindingState(BaseTestCase):
     def test_all_six_states(self):
         cases = [
-            (True, None, audit_pr.STATE_OPEN),
-            (True, {"state": "OPEN"}, audit_pr.STATE_PR_OPEN),
-            (True, {"state": "MERGED"}, audit_pr.STATE_PR_MERGED_PERSISTS),
-            (True, {"state": "CLOSED"}, audit_pr.STATE_REFUSED),
-            (False, None, audit_pr.STATE_RESOLVED),
-            (False, {"state": "MERGED"}, audit_pr.STATE_RESOLVED_MERGED),
+            (True, None, audit_report.STATE_OPEN),
+            (True, {"state": "OPEN"}, audit_report.STATE_PR_OPEN),
+            (True, {"state": "MERGED"}, audit_report.STATE_PR_MERGED_PERSISTS),
+            (True, {"state": "CLOSED"}, audit_report.STATE_REFUSED),
+            (False, None, audit_report.STATE_RESOLVED),
+            (False, {"state": "MERGED"}, audit_report.STATE_RESOLVED_MERGED),
         ]
         for reproduces, pr, expected in cases:
             with self.subTest(reproduces=reproduces, pr=pr):
-                self.assertEqual(audit_pr.derive_finding_state(reproduces, pr), expected)
+                self.assertEqual(audit_report.derive_finding_state(reproduces, pr), expected)
 
     def test_merged_at_counts_as_merged_even_without_a_state(self):
         self.assertEqual(
-            audit_pr.derive_finding_state(True, {"mergedAt": "2026-08-01T00:00:00Z"}),
-            audit_pr.STATE_PR_MERGED_PERSISTS,
+            audit_report.derive_finding_state(True, {"mergedAt": "2026-08-01T00:00:00Z"}),
+            audit_report.STATE_PR_MERGED_PERSISTS,
         )
 
     def test_every_state_has_a_label(self):
         for state in (
-            audit_pr.STATE_OPEN,
-            audit_pr.STATE_PR_OPEN,
-            audit_pr.STATE_PR_MERGED_PERSISTS,
-            audit_pr.STATE_RESOLVED_MERGED,
-            audit_pr.STATE_RESOLVED,
-            audit_pr.STATE_REFUSED,
+            audit_report.STATE_OPEN,
+            audit_report.STATE_PR_OPEN,
+            audit_report.STATE_PR_MERGED_PERSISTS,
+            audit_report.STATE_RESOLVED_MERGED,
+            audit_report.STATE_RESOLVED,
+            audit_report.STATE_REFUSED,
         ):
-            self.assertIn(state, audit_pr.STATE_LABELS)
+            self.assertIn(state, audit_report.STATE_LABELS)
 
 
 class TestPromotion(BaseTestCase):
@@ -1574,13 +1574,13 @@ class TestPromotion(BaseTestCase):
                 remediation={"kind": "gcloud", "note": "g"},
             ),
         ]
-        promote, withheld = audit_pr.promotion_candidates(findings, {})
+        promote, withheld = audit_report.promotion_candidates(findings, {})
         self.assertEqual(promote, ["crit"])
         self.assertEqual(withheld, [])
 
     def test_a_finding_with_an_existing_pr_is_not_promoted_again(self):
         findings = [manifest_finding("crit", "a.yaml")]
-        promote, withheld = audit_pr.promotion_candidates(
+        promote, withheld = audit_report.promotion_candidates(
             findings, {"crit": {"state": "CLOSED"}}
         )
         self.assertEqual(promote, [])
@@ -1591,8 +1591,8 @@ class TestPromotion(BaseTestCase):
             manifest_finding(f"c-{i:02d}", f"{i}.yaml", severity="critical")
             for i in range(9)
         ]
-        promote, withheld = audit_pr.promotion_candidates(findings, {})
-        self.assertEqual(len(promote), audit_pr.AUTO_PROMOTION_CAP)
+        promote, withheld = audit_report.promotion_candidates(findings, {})
+        self.assertEqual(len(promote), audit_report.AUTO_PROMOTION_CAP)
         self.assertEqual(len(withheld), 4)
         self.assertEqual(set(promote) & set(withheld), set())
 
@@ -1601,20 +1601,20 @@ class TestPromotion(BaseTestCase):
             manifest_finding(f"c-{i:02d}", f"{i}.yaml", severity="critical")
             for i in range(9)
         ] + [manifest_finding("asked", "asked.yaml", severity="minor")]
-        promote, withheld = audit_pr.promotion_candidates(
+        promote, withheld = audit_report.promotion_candidates(
             findings, {}, requested=["asked", "c-08"]
         )
         self.assertIn("asked", promote)
         self.assertIn("c-08", promote)
         # The two requested are uncapped; the auto path still yields cap-many.
-        self.assertEqual(len(promote), 2 + audit_pr.AUTO_PROMOTION_CAP)
+        self.assertEqual(len(promote), 2 + audit_report.AUTO_PROMOTION_CAP)
         self.assertNotIn("c-08", withheld)
 
     def test_a_requested_non_manifest_finding_is_not_promoted(self):
         findings = [
             make_finding(fid="g", remediation={"kind": "gcloud", "note": "g"}),
         ]
-        promote, _ = audit_pr.promotion_candidates(findings, {}, requested=["g"])
+        promote, _ = audit_report.promotion_candidates(findings, {}, requested=["g"])
         self.assertEqual(promote, [])
 
 
@@ -1641,7 +1641,7 @@ class TestRemediateCommands(BaseTestCase):
         ]
 
     def parse(self, comments):
-        return audit_pr.parse_remediate_commands(comments, self.findings)
+        return audit_report.parse_remediate_commands(comments, self.findings)
 
     def test_an_authorized_request_is_accepted(self):
         targets, refusals = self.parse([comment("/remediate netpol-missing")])
@@ -1700,18 +1700,18 @@ class TestRemediateCommands(BaseTestCase):
 
 class TestMarkers(BaseTestCase):
     def test_persists_marker_round_trips(self):
-        body = f"Some text\n\n{audit_pr.persists_marker('abc')}\n"
-        self.assertTrue(audit_pr.has_marker(body, audit_pr.PERSISTS_MARKER_RE, "abc"))
-        self.assertFalse(audit_pr.has_marker(body, audit_pr.PERSISTS_MARKER_RE, "xyz"))
+        body = f"Some text\n\n{audit_report.persists_marker('abc')}\n"
+        self.assertTrue(audit_report.has_marker(body, audit_report.PERSISTS_MARKER_RE, "abc"))
+        self.assertFalse(audit_report.has_marker(body, audit_report.PERSISTS_MARKER_RE, "xyz"))
 
     def test_refused_marker_round_trips(self):
-        body = f"Reply\n{audit_pr.refused_marker('IC_9')}\n"
-        self.assertTrue(audit_pr.has_marker(body, audit_pr.REFUSED_MARKER_RE, "IC_9"))
-        self.assertFalse(audit_pr.has_marker(body, audit_pr.REFUSED_MARKER_RE, "IC_8"))
+        body = f"Reply\n{audit_report.refused_marker('IC_9')}\n"
+        self.assertTrue(audit_report.has_marker(body, audit_report.REFUSED_MARKER_RE, "IC_9"))
+        self.assertFalse(audit_report.has_marker(body, audit_report.REFUSED_MARKER_RE, "IC_8"))
 
     def test_absent_body_has_no_marker(self):
-        self.assertFalse(audit_pr.has_marker(None, audit_pr.PERSISTS_MARKER_RE, "abc"))
-        self.assertFalse(audit_pr.has_marker("", audit_pr.PERSISTS_MARKER_RE, "abc"))
+        self.assertFalse(audit_report.has_marker(None, audit_report.PERSISTS_MARKER_RE, "abc"))
+        self.assertFalse(audit_report.has_marker("", audit_report.PERSISTS_MARKER_RE, "abc"))
 
 
 class TestDeltaBlockAnchoring(BaseTestCase):
@@ -1722,10 +1722,10 @@ class TestDeltaBlockAnchoring(BaseTestCase):
             "Evidence:\n"
             '    text <!-- audit-findings: ["injected"] and more\n'
             "\n"
-            + audit_pr.delta_block(["real-one", "real-two"])
+            + audit_report.delta_block(["real-one", "real-two"])
             + "\n"
         )
-        self.assertEqual(audit_pr.parse_delta_block(body), ["real-one", "real-two"])
+        self.assertEqual(audit_report.parse_delta_block(body), ["real-one", "real-two"])
 
 
 # --------------------------------------------------------------------------- #
@@ -1748,23 +1748,23 @@ class TestSelectPrByHead(BaseTestCase):
     def test_highest_number_wins(self):
         # A branch reused after its first PR merged must report the live one.
         prs = [pr(3, "b"), pr(11, "b"), pr(7, "b")]
-        self.assertEqual(audit_pr._select_pr_by_head(prs, "b")["number"], 11)
+        self.assertEqual(audit_report._select_pr_by_head(prs, "b")["number"], 11)
 
     def test_no_match_is_none(self):
-        self.assertIsNone(audit_pr._select_pr_by_head([pr(1, "other")], "b"))
-        self.assertIsNone(audit_pr._select_pr_by_head([], "b"))
-        self.assertIsNone(audit_pr._select_pr_by_head(None, "b"))
+        self.assertIsNone(audit_report._select_pr_by_head([pr(1, "other")], "b"))
+        self.assertIsNone(audit_report._select_pr_by_head([], "b"))
+        self.assertIsNone(audit_report._select_pr_by_head(None, "b"))
 
     def test_a_fork_qualified_head_still_matches(self):
         # gh reports `owner:branch` for a cross-repository PR. Accepting the
         # suffix keeps the lookup working if remediation ever moves to a fork,
         # instead of silently reporting every finding as having no PR.
         prs = [pr(4, "adamparco:platform-agent/fix-x")]
-        found = audit_pr._select_pr_by_head(prs, "platform-agent/fix-x")
+        found = audit_report._select_pr_by_head(prs, "platform-agent/fix-x")
         self.assertEqual(found["number"], 4)
 
     def test_a_bare_substring_does_not_match(self):
-        self.assertIsNone(audit_pr._select_pr_by_head([pr(4, "xfix-x")], "fix-x"))
+        self.assertIsNone(audit_report._select_pr_by_head([pr(4, "xfix-x")], "fix-x"))
 
 
 class TestReconcileRemediationPrs(BaseTestCase):
@@ -1785,8 +1785,8 @@ class TestReconcileRemediationPrs(BaseTestCase):
         ]
 
     def test_one_pr_fans_out_to_every_member_of_its_group(self):
-        branch = audit_pr.group_branch_for(AUDIT, self.findings[:2])
-        by_finding, urls = audit_pr.reconcile_remediation_prs(
+        branch = audit_report.group_branch_for(AUDIT, self.findings[:2])
+        by_finding, urls = audit_report.reconcile_remediation_prs(
             AUDIT, self.findings, [pr(9, branch)]
         )
         self.assertEqual(by_finding["a"]["number"], 9)
@@ -1796,7 +1796,7 @@ class TestReconcileRemediationPrs(BaseTestCase):
         self.assertNotIn("c", urls)
 
     def test_no_prs_leaves_every_finding_unlinked(self):
-        by_finding, urls = audit_pr.reconcile_remediation_prs(AUDIT, self.findings, [])
+        by_finding, urls = audit_report.reconcile_remediation_prs(AUDIT, self.findings, [])
         self.assertEqual(set(by_finding), {"a", "b", "c"})
         self.assertTrue(all(v is None for v in by_finding.values()))
         self.assertEqual(urls, {})
@@ -1814,7 +1814,7 @@ class TestOpenRemediationPr(HarnessTestCase):
         # own log lines instead of letting them print over the test output.
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            result = audit_pr.open_remediation_pr(
+            result = audit_report.open_remediation_pr(
                 "acme/fleet",
                 AUDIT,
                 self.group,
@@ -1890,7 +1890,7 @@ class TestOpenRemediationPr(HarnessTestCase):
 class TestRemediationPrBody(BaseTestCase):
     def test_part_of_not_closes(self):
         # "Closes #N" would retire the ledger the moment one fix merged.
-        body = audit_pr.render_remediation_pr_body(
+        body = audit_report.render_remediation_pr_body(
             AUDIT, [make_finding(fid="a")], issue_number=42, generated_at=NOW
         )
         self.assertIn("Part of #42", body)
@@ -1898,33 +1898,33 @@ class TestRemediationPrBody(BaseTestCase):
 
     def test_body_records_the_findings_it_covers(self):
         group = [make_finding(fid="a"), make_finding(fid="b")]
-        body = audit_pr.render_remediation_pr_body(
+        body = audit_report.render_remediation_pr_body(
             AUDIT, group, issue_number=42, generated_at=NOW
         )
-        self.assertEqual(audit_pr.parse_delta_block(body), ["a", "b"])
+        self.assertEqual(audit_report.parse_delta_block(body), ["a", "b"])
         self.assertIn("## Files", body)
         self.assertIn("clusters/prod-us-east/payments-netpol.yaml", body)
 
     def test_title_names_the_head_finding_and_counts_the_rest(self):
         one = [make_finding(fid="a", title="No NetworkPolicy")]
         self.assertEqual(
-            audit_pr.remediation_pr_title(AUDIT, one),
+            audit_report.remediation_pr_title(AUDIT, one),
             "fix(compliance-audit): No NetworkPolicy",
         )
         two = one + [make_finding(fid="b", severity="minor", title="Other")]
         self.assertTrue(
-            audit_pr.remediation_pr_title(AUDIT, two).endswith("(+1 more)")
+            audit_report.remediation_pr_title(AUDIT, two).endswith("(+1 more)")
         )
 
 
 class TestStaleClose(HarnessTestCase):
     def close(self, prs, current_ids):
-        return audit_pr.close_stale_remediation_prs(
+        return audit_report.close_stale_remediation_prs(
             "acme/fleet", AUDIT, prs, current_ids, {"a": "Old title"}, {}, NOW
         )
 
     def test_closes_and_comments_but_never_deletes_the_branch(self):
-        stale = pr(8, "platform-agent/fix-x", body=audit_pr.delta_block(["a"]))
+        stale = pr(8, "platform-agent/fix-x", body=audit_report.delta_block(["a"]))
         closed = self.close([stale], set())
 
         self.assertEqual(closed, ["https://github.com/acme/fleet/pull/8"])
@@ -1939,13 +1939,13 @@ class TestStaleClose(HarnessTestCase):
         )
 
     def test_a_pr_with_one_live_finding_stays_open(self):
-        live = pr(8, "platform-agent/fix-x", body=audit_pr.delta_block(["a", "b"]))
+        live = pr(8, "platform-agent/fix-x", body=audit_report.delta_block(["a", "b"]))
         self.assertEqual(self.close([live], {"b"}), [])
         self.assertEqual(self.harness.gh_calls("pr", "close"), [])
 
     def test_an_already_closed_pr_is_left_alone(self):
         done = pr(
-            8, "platform-agent/fix-x", state="MERGED", body=audit_pr.delta_block(["a"])
+            8, "platform-agent/fix-x", state="MERGED", body=audit_report.delta_block(["a"])
         )
         self.assertEqual(self.close([done], set()), [])
         self.assertEqual(self.harness.gh_calls("pr", "close"), [])
@@ -1969,7 +1969,7 @@ class TestMergedButPersists(HarnessTestCase):
         )
 
     def run_it(self, prs_by_finding):
-        audit_pr.comment_on_merged_but_persisting(
+        audit_report.comment_on_merged_but_persisting(
             "acme/fleet", AUDIT, [self.finding], prs_by_finding, NOW
         )
 
@@ -1981,13 +1981,13 @@ class TestMergedButPersists(HarnessTestCase):
         self.assertEqual(self.harness.gh_calls("pr", "reopen"), [])
 
     def test_silent_when_the_marker_is_already_in_the_pr_body(self):
-        self.merged["body"] = f"merged\n{audit_pr.persists_marker('a')}\n"
+        self.merged["body"] = f"merged\n{audit_report.persists_marker('a')}\n"
         self.harness.replies = {"--json comments": json.dumps({"comments": []})}
         self.run_it({"a": self.merged})
         self.assertEqual(self.harness.gh_calls("pr", "comment"), [])
 
     def test_silent_when_the_marker_is_already_in_a_pr_comment(self):
-        prior = {"body": f"said it\n{audit_pr.persists_marker('a')}\n"}
+        prior = {"body": f"said it\n{audit_report.persists_marker('a')}\n"}
         self.harness.replies = {"--json comments": json.dumps({"comments": [prior]})}
         self.run_it({"a": self.merged})
         self.assertEqual(self.harness.gh_calls("pr", "comment"), [])
@@ -2006,17 +2006,17 @@ class TestReplyToRefusals(HarnessTestCase):
         }
 
     def test_one_reply_carrying_the_requesting_comment_id(self):
-        audit_pr.reply_to_refusals("acme/fleet", 42, [self.refusal()], [], NOW)
+        audit_report.reply_to_refusals("acme/fleet", 42, [self.refusal()], [], NOW)
         self.assertEqual(len(self.harness.gh_calls("issue", "comment")), 1)
 
     def test_silent_when_that_comment_was_already_answered(self):
-        answered = [{"body": f"earlier\n{audit_pr.refused_marker('IC_1')}\n"}]
-        audit_pr.reply_to_refusals("acme/fleet", 42, [self.refusal()], answered, NOW)
+        answered = [{"body": f"earlier\n{audit_report.refused_marker('IC_1')}\n"}]
+        audit_report.reply_to_refusals("acme/fleet", 42, [self.refusal()], answered, NOW)
         self.assertEqual(self.harness.gh_calls("issue", "comment"), [])
 
     def test_a_different_comment_still_gets_its_own_reply(self):
-        answered = [{"body": f"earlier\n{audit_pr.refused_marker('IC_1')}\n"}]
-        audit_pr.reply_to_refusals(
+        answered = [{"body": f"earlier\n{audit_report.refused_marker('IC_1')}\n"}]
+        audit_report.reply_to_refusals(
             "acme/fleet", 42, [self.refusal("IC_2")], answered, NOW
         )
         self.assertEqual(len(self.harness.gh_calls("issue", "comment")), 1)
@@ -2073,9 +2073,9 @@ class TestAutoPromotionInFinish(HarnessTestCase):
 
         self.assertEqual(self.run_finish(make_doc(findings=findings)), 0)
         self.assertEqual(
-            len(self.harness.gh_calls("pr", "create")), audit_pr.AUTO_PROMOTION_CAP
+            len(self.harness.gh_calls("pr", "create")), audit_report.AUTO_PROMOTION_CAP
         )
-        body = audit_pr.render_issue_body(
+        body = audit_report.render_issue_body(
             make_doc(findings=findings),
             generated_at=NOW,
             audit_id=AUDIT,
@@ -2218,7 +2218,7 @@ class TestFailurePaths(HarnessTestCase):
     def test_a_failed_delta_comment_is_survivable(self):
         # Losing the delta comment costs one notification; aborting would
         # leave the ledger correct but the run marked failed to the cron.
-        previous_body = audit_pr.render_issue_body(
+        previous_body = audit_report.render_issue_body(
             make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
         )
         self.harness.replies = {

@@ -5,7 +5,7 @@ sidebar:
   order: 6
 ---
 
-`agents/platform/cron/jobs.json` defines the scheduled jobs. Each one fires a pre-authored prompt at the Platform Agent on a cron schedule. The prompts typically point at a [governance SOP](/kube-agents/concepts/governance-sops/); the agent reads the SOP, executes the procedure, and either files a PR (via `submit-suggestion`) or posts a proactive Chat alert.
+`agents/platform/cron/jobs.json` defines the scheduled jobs. Each one fires a pre-authored prompt at the Platform Agent on a cron schedule. The prompts typically point at a [governance SOP](/kube-agents/concepts/governance-sops/); the agent reads the SOP, executes the procedure, and either publishes to your GitOps repo — a proposed PR via `submit-suggestion`, or an audit ledger issue via `fleet-audit` — or posts a proactive Chat alert.
 
 Watchdog runs execute autonomously: the agent config sets `approvals.cron_mode: approve` (see `deploy/shared/defaults/config.yaml`), so commands that would otherwise require human approval run without prompting when triggered by a scheduled job.
 
@@ -17,7 +17,7 @@ The roster, with exact cron expressions, enabled state, and prompts, is generate
 
 ### The five fleet audits
 
-Each audit reads its SOP, executes read-only checks against the fleet, writes a validated findings file, and hands it to the [`fleet-audit`](/kube-agents/skills/) skill's `audit_pr.py` helper. The helper owns every git and `gh` operation and renders the pull-request body itself — the model never writes one.
+Each audit reads its SOP, executes read-only checks against the fleet, writes a validated findings file, and hands it to the [`fleet-audit`](/kube-agents/skills/) skill's `audit_report.py` helper. The helper owns every git and `gh` operation and renders every body itself — the model never writes one.
 
 | Job                           | SOP                                  | Audits                                                                    |
 | ----------------------------- | ------------------------------------ | ------------------------------------------------------------------------- |
@@ -29,8 +29,8 @@ Each audit reads its SOP, executes read-only checks against the fleet, writes a 
 
 Two properties matter more than the check lists:
 
-- **One rolling PR per audit.** The helper finds the audit's existing open PR by its `audit:<id>` label and rewrites it in place, commenting only on what changed since the last run. A daily audit therefore produces one PR that stays current, not thirty near-identical ones a month.
-- **Silence is a real outcome.** A run with no findings closes the audit's PR and returns `[SILENT]`, so a quiet fleet generates no Chat traffic.
+- **One ledger issue per audit, plus fixes on demand.** The helper finds the audit's existing open issue by its `audit:<id>` label and rewrites it in place, commenting only on what changed since the last run. A daily audit therefore produces one issue that stays current, not thirty near-identical PRs a month. A finding whose fix is a manifest is promoted into its own narrow pull request — automatically when it is critical, otherwise when a repo writer asks for it on the ledger. See [Declarative workflow](/kube-agents/concepts/declarative-workflow/#the-fleet-audit-skill).
+- **Silence is a real outcome.** A run with no findings closes the audit's ledger issue as completed and returns `[SILENT]`, so a quiet fleet generates no Chat traffic.
 
 ### The disabled jobs
 
@@ -78,7 +78,7 @@ Edit `cron/jobs.json`, flip `enabled` to `false`, and redeploy the workspace (`p
 
 1. Write a governance SOP in `agents/platform/governance/<your-sop>.md`.
 2. Add a job entry to `cron/jobs.json` pointing at it as `governance/<your-sop>.md`.
-3. If the job files findings, add its id to the allowlist in `agents/platform/skills/fleet-audit/scripts/audit_pr.py` and preload `"skills": ["fleet-audit"]`.
+3. If the job files findings, add its id to the allowlist in `agents/platform/skills/fleet-audit/scripts/audit_report.py` and preload `"skills": ["fleet-audit"]`.
 4. Run `make docs-generate` — the reference table is generated, and a cron expression missing from `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`.
 5. Redeploy.
 
@@ -88,4 +88,4 @@ Keep the schedule realistic — LLM inference on every tick has cost. Hourly or 
 
 - [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) — full annotated `jobs.json`.
 - [Governance SOPs](/kube-agents/concepts/governance-sops/) — the playbooks these watchdogs execute.
-- [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — how findings become PRs.
+- [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — how findings become a ledger issue and remediation PRs.

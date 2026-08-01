@@ -11,7 +11,7 @@ The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kub
 
 ## The five audit SOPs
 
-Five SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the pull request. Each check in each SOP states its exact command, its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, and a remediation kind — so a finding is either reproducible or it is dropped.
+Five SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states its exact command, its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped.
 
 ### `compliance_audit_sop.md`
 
@@ -60,7 +60,7 @@ The cron watchdog invokes the SOP by prompting the agent to read `governance/<so
 - A **skill** is a reusable capability (how to onboard an app, how to submit a PR, how to open and close an audit run).
 - An **SOP** composes skills into a fleet-wide procedure with a policy for when to act.
 
-The division of labour in the five audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders the pull-request body itself. The SOPs forbid hand-writing a PR body or invoking git directly, which is what keeps the five PRs uniform and their run-to-run deltas computable.
+The division of labour in the five audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the five ledgers uniform and their run-to-run deltas computable.
 
 The five audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`). The disabled governance jobs still ship with `"skills": []`.
 

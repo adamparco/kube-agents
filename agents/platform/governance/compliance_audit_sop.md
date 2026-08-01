@@ -1,6 +1,6 @@
 # SOP: Security & RBAC Posture Audit (Daily Governance)
 
-**Purpose:** A read-only, fleet-wide security sweep of every managed GKE cluster. Detects privilege-escalation surfaces, over-broad RBAC, missing network isolation, and cluster-level identity misconfiguration, then emits reproducible findings and remediation artifacts as one Pull Request. Cron id `compliance-audit`, schedule `20 6 * * *` (daily 06:20 UTC).
+**Purpose:** A read-only, fleet-wide security sweep of every managed GKE cluster. Detects privilege-escalation surfaces, over-broad RBAC, missing network isolation, and cluster-level identity misconfiguration, then emits reproducible findings into one GitHub issue — the stream's ledger — with narrow remediation Pull Requests hung off it. Cron id `compliance-audit`, schedule `20 6 * * *` (daily 06:20 UTC).
 
 **Data sources:** `kubectl` read verbs, `gcloud container clusters|node-pools list|describe`, and the `gke` MCP server. Nothing else. There are **no external inputs** — no blueprint, no CMDB, no BigQuery, no Prometheus, no Policy Controller / Gatekeeper, no Security Command Center, no kanban delegation to Cluster Agents. Every finding comes from a command this SOP runs itself, in this run.
 
@@ -11,11 +11,14 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_pr.py start --audit compliance-audit
-# -> {"branch":..., "existing_pr": <int|null>, "repo":"org/repo", "findings_path":"/opt/data/scratch/findings_compliance-audit.json"}
+./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit
+# -> {"issue": <int|null>, "repo":"org/repo", "findings_path":"/opt/data/scratch/findings_compliance-audit.json",
+#     "pending_remediation_requests":["<finding-id>", ...]}
 ```
 
-`findings_path` is the only file you write findings to. `start` leaves you in the GitOps repo working tree on `branch`; every path in §3 is relative to it. Do not run `git`, `gh`, or `submit-suggestion` anywhere in this SOP — `audit_pr.py` owns the write path and renders the PR body. **Never hand-write a PR body.**
+`findings_path` is the only file you write findings to. `issue` is the stream's open ledger issue, or `null` when the stream has none. `pending_remediation_requests` is the set of finding ids a repo writer asked for with a `/remediate` comment on the ledger — write a `kind: manifest` file for every one of them during §2 and §3, whether or not this SOP would have promoted it on its own.
+
+`start` leaves you in the GitOps repo working tree; every path in §3 is relative to it. There is no report branch, and `start` creates none. Do not run `git`, `gh`, or `submit-suggestion` anywhere in this SOP — `audit_report.py` owns the write path and renders the ledger issue and every remediation PR. **Never hand-write an issue body or a PR body.**
 
 ### 1. Enumerate the target fleet
 
@@ -35,11 +38,17 @@ kubectl auth can-i list pods --all-namespaces
 
 Every cluster you actually query goes in `scope.clusters` as `{name, location, project}`. `scope.clusters` must be non-empty — if enumeration returns nothing or every cluster fails, do **not** emit an empty-scope file; stop and report the enumeration failure.
 
-Record what you could not audit in `scope.skipped` as `{cluster, reason}`:
+**The one-question scope rule.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; if some checks did not run there, name them in that cluster's `limitations`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding.
+
+`scope.skipped` is only for clusters you could **not** read, as `{cluster, reason}`:
 
 - `status != RUNNING` → `"cluster status <STATUS>, not queried"`.
 - `get-credentials` / `auth can-i` fails → `"no read access: <trimmed stderr>"`. Never infer a finding from a cluster you could not reach.
-- **Autopilot** (`autopilot.enabled == true`): checks 2.1–2.3 are rejected by admission and 2.9 has no user-managed node pools, so all four are inapplicable. Skip them and record one aggregate entry: `{"cluster":"<name>","reason":"autopilot: 2.1-2.3 admission-enforced, 2.9 no user node pools"}`. Checks 2.4–2.8, 2.10, 2.11 still run there. A privileged-container finding on Autopilot is a false positive by construction.
+
+`scope.clusters[].limitations` is an optional string on a cluster you **did** read, naming the checks that did not run there and why. When present it must be non-empty and must name the checks by number. Partial coverage is never a reason to move the cluster to `scope.skipped` — that would suppress every real finding from the checks that _did_ run.
+
+- **Autopilot** (`autopilot.enabled == true`): checks 2.1–2.3 are rejected by admission and 2.9 has no user-managed node pools, so all four are inapplicable. The cluster still belongs in `scope.clusters`, carrying `"limitations": "Autopilot cluster: checks 2.1-2.3 are admission-enforced and 2.9 has no user-managed node pools; those four did not run."` Checks 2.4–2.8, 2.10 and 2.11 run there exactly as on a Standard cluster and **their findings are real** — an Autopilot cluster is audited, not skipped. A privileged-container finding on Autopilot is a false positive by construction; a missing-NetworkPolicy finding on Autopilot is not.
+- Any other gap on a reachable cluster — a check whose command errored, an API group that is absent — is recorded the same way, in that cluster's `limitations`, naming the check and the reason.
 
 ### 2. Checks
 
@@ -58,7 +67,7 @@ PRE='.items[]
 
 **Universal suppressions — every check in this section:** namespaces matching `$SYS`; objects carrying `addonmanager.kubernetes.io/mode` or `components.gke.io/component-name` (the GKE-managed add-ons — `fluentbit-gke`, `gke-metrics-agent`, `pdcsi-node`, `netd`, `anetd`, `ip-masq-agent`, `konnectivity-agent`, `gke-metadata-server`, `nvidia-gpu-device-plugin`; flagging these is the fastest way to get this audit switched off); pods with a non-empty `ownerReferences` — audit the **owning controller**, never the pod, because pod name suffixes are random. `kubeagents-system` is deliberately **not** suppressed: the harness audits itself.
 
-**Finding identity.** Derive `id` deterministically — never from a timestamp, counter, pod suffix, or ReplicaSet hash:
+**Finding identity.** `<check-slug>` is the backticked token in each `####` heading below. Derive `id` deterministically from it — never from a timestamp, counter, pod suffix, or ReplicaSet hash:
 
 ```
 id = "<check-slug>.<cluster>.<namespace-or-_>.<kind>-<name>"    lowercased, [^a-z0-9.-] -> "-"
@@ -66,9 +75,13 @@ id = "<check-slug>.<cluster>.<namespace-or-_>.<kind>-<name>"    lowercased, [^a-
 
 e.g. `privileged-container.prod-usc1.payments.deployment-api`. One finding per (check, workload): three privileged containers in one Deployment is **one** finding listing all three in `evidence.excerpt`.
 
+The result must match `^[a-z0-9][a-z0-9._-]{0,98}[a-z0-9]$`, contain no `..` segment, and not end in `.lock`. The id becomes a git branch component (`platform-agent/fix-compliance-audit-<finding-id>`), so a colon, a space, a `*`, a `..` or a `.lock` suffix is rejected outright. Cap at 100 characters by trimming the object name from the right, then strip any leading or trailing `.` or `-`; never drop the leading slug, and never substitute a hash.
+
 **Evidence.** `evidence.command` is mandatory and must be the literal command run, with `$WL`/`$SYS`/`$PRE` expanded so a human can paste it unchanged. **A finding you cannot reproduce is dropped, not softened** — there is no "possible" severity.
 
-#### 2.1 Privileged containers
+**Credential hygiene.** Never paste a Secret's `data:` block, a ServiceAccount token, a kubeconfig, or a private key into `evidence.excerpt`. Re-run the command with a field selector or an `-o jsonpath` that omits the value and quote that output instead — the object reference proves the finding, the credential never does. The harness redacts high-confidence credential shapes as a backstop, not as the primary control.
+
+#### 2.1 Privileged containers (`privileged-container`)
 
 ```bash
 $WL | jq -r --arg sys "$SYS" "$PRE"'
@@ -79,12 +92,12 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 ```
 
 - **Flag when:** a container or initContainer sets `securityContext.privileged: true`, or adds capability `SYS_ADMIN`.
-- **Do NOT flag:** universal suppressions; CSI node drivers and CNI agents shipped as GKE add-ons; Autopilot clusters; `allowPrivilegeEscalation: true` on its own — that is the Kubernetes default and would fire on nearly every workload.
+- **Do NOT flag:** universal suppressions; CSI node drivers and CNI agents shipped as GKE add-ons; Autopilot clusters — the check does not run there and §1 records that in the cluster's `limitations`; `allowPrivilegeEscalation: true` on its own — that is the Kubernetes default and would fire on nearly every workload.
 - **Severity:** `critical` — a privileged container is one escape away from owning the node and every workload on it.
 - **Impact:** "Container has full host device and kernel access; compromising this workload compromises the node."
 - **Remediation:** `kind: manual`. Dropping privilege can break a workload that needs one specific capability, so the owner confirms. Note the minimal replacement: remove `privileged`, add only the required `capabilities.add` entries.
 
-#### 2.2 Host namespace sharing
+#### 2.2 Host namespace sharing (`host-namespace`)
 
 ```bash
 $WL | jq -r --arg sys "$SYS" "$PRE"'
@@ -93,12 +106,12 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 ```
 
 - **Flag when:** the pod spec sets `hostNetwork`, `hostPID`, or `hostIPC` to `true`.
-- **Do NOT flag:** universal suppressions; Autopilot clusters; ingress/gateway data-plane DaemonSets that legitimately bind host ports — verify `hostNetwork` is the only flag set **and** a `hostPort` is declared, then record `minor` rather than suppressing silently.
+- **Do NOT flag:** universal suppressions; Autopilot clusters (§1 `limitations`); ingress/gateway data-plane DaemonSets that legitimately bind host ports — verify `hostNetwork` is the only flag set **and** a `hostPort` is declared, then record `minor` rather than suppressing silently.
 - **Severity:** `critical` when `hostPID` or `hostIPC` is set (direct visibility into other tenants' processes and memory); `major` when only `hostNetwork` is set — it bypasses NetworkPolicy enforcement and exposes node loopback, but does not cross the process boundary.
 - **Impact:** "Workload shares the node's process/IPC/network namespace, bypassing pod isolation and NetworkPolicy enforcement."
 - **Remediation:** `kind: manual`. Name the field to remove; for `hostNetwork`, note that a `NodePort` Service or a Gateway listener is the supported replacement for `hostPort`.
 
-#### 2.3 hostPath volume mounts
+#### 2.3 hostPath volume mounts (`hostpath-mount`)
 
 ```bash
 $WL | jq -r --arg sys "$SYS" "$PRE"'
@@ -109,12 +122,12 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 ```
 
 - **Flag when:** the pod spec declares a `hostPath` volume that a container actually mounts.
-- **Do NOT flag:** universal suppressions; Autopilot clusters; a declared-but-unmounted `hostPath`; the log-shipper pattern (`/var/log`, `/var/lib/docker/containers`) when **every** mount of it is `readOnly: true` — record those `minor`.
+- **Do NOT flag:** universal suppressions; Autopilot clusters (§1 `limitations`); a declared-but-unmounted `hostPath`; the log-shipper pattern (`/var/log`, `/var/lib/docker/containers`) when **every** mount of it is `readOnly: true` — record those `minor`.
 - **Severity:** `critical` when the path is `/`, `/etc`, `/proc`, `/var/run/docker.sock`, `/run/containerd/containerd.sock`, or under `/var/lib/kubelet`, **or** when any mount of it is writable — those are node takeover or credential theft. `major` otherwise: still a persistence and cross-tenant leak path.
 - **Impact:** "Workload mounts a node filesystem path, giving it access to state belonging to the node and to other tenants' pods."
 - **Remediation:** `kind: manual`. Name the replacement — a PersistentVolumeClaim, a ConfigMap/Secret projection, or the CSI driver appropriate to the data.
 
-#### 2.4 `cluster-admin` bound to non-system subjects
+#### 2.4 `cluster-admin` bound to non-system subjects (`cluster-admin-binding`)
 
 ```bash
 kubectl get clusterrolebindings -o json | jq -r '.items[]
@@ -131,7 +144,7 @@ kubectl get clusterrolebindings -o json | jq -r '.items[]
 - **Impact:** "Subject holds unrestricted read/write on every resource in the cluster, including Secrets in every namespace."
 - **Remediation:** `kind: manual`. Give the binding name, the subject, and the verification step a human runs first: `kubectl auth can-i --list --as=system:serviceaccount:<ns>:<sa>`, then delete the binding and substitute a scoped Role.
 
-#### 2.5 Wildcard verbs/resources in bound Roles and ClusterRoles
+#### 2.5 Wildcard verbs/resources in bound Roles and ClusterRoles (`wildcard-rbac`)
 
 ```bash
 kubectl get clusterroles,roles -A -o json | jq -r '.items[]
@@ -151,7 +164,7 @@ Intersect the two and report only wildcard roles the second command shows bound 
 - **Impact:** "Subject can perform any verb on any resource in this scope, including reading Secrets and creating privileged pods — an unbounded escalation path."
 - **Remediation:** `kind: manual`. Include the `kubectl auth can-i --list --as=...` output as the starting point for an enumerated replacement rule set.
 
-#### 2.6 Namespaces with no enforcing NetworkPolicy
+#### 2.6 Namespaces with no enforcing NetworkPolicy (`netpol-missing`)
 
 ```bash
 comm -23 \
@@ -168,7 +181,7 @@ kubectl get netpol -A -o json | jq -r '.items[]
 - **Impact:** "Every pod in this namespace accepts traffic from every pod in the cluster; a compromise anywhere reaches these workloads unimpeded."
 - **Remediation:** `kind: manifest`, path `remediations/compliance-audit/<cluster>/<namespace>-default-deny.yaml`. Generate a `NetworkPolicy` `default-deny-ingress` (`podSelector: {}`, `policyTypes: [Ingress]`, no `ingress` rules) plus an `allow-dns-egress` policy permitting UDP/TCP 53 to `kube-system`. `remediation.note` must say it is deliberately ingress-only and the team adds per-service allow rules before merge.
 
-#### 2.7 Default ServiceAccount token automounting
+#### 2.7 Default ServiceAccount token automounting (`default-sa-automount`)
 
 ```bash
 kubectl get sa -A --field-selector metadata.name=default -o json \
@@ -184,7 +197,7 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 - **Impact:** "Workload mounts an API-server credential it does not use, handing an attacker an authenticated foothold for free."
 - **Remediation:** `kind: manifest`, path `remediations/compliance-audit/<cluster>/<namespace>-default-sa-automount.yaml` — the namespace's `default` ServiceAccount with `automountServiceAccountToken: false`. One file fixes every workload in that namespace, so emit it once per namespace and point all of that namespace's findings at the same path.
 
-#### 2.8 Workload Identity not enabled on the cluster
+#### 2.8 Workload Identity not enabled on the cluster (`workload-identity-off`)
 
 ```bash
 gcloud container clusters describe "$C" --location="$L" --project="$PROJECT" \
@@ -192,12 +205,12 @@ gcloud container clusters describe "$C" --location="$L" --project="$PROJECT" \
 ```
 
 - **Flag when:** `workloadIdentityConfig.workloadPool` is absent or empty.
-- **Do NOT flag:** Autopilot clusters — Workload Identity is always on and the field always populated; clusters in `scope.skipped`.
+- **Do NOT flag:** Autopilot clusters — the check runs there, but Workload Identity is always on and the field always populated, so it simply never fires; clusters in `scope.skipped`, which you could not read and about which you therefore have no evidence either way. A `limitations` note is **not** a suppression: on a cluster in `scope.clusters`, run every check its `limitations` string does not name.
 - **Severity:** `critical` — without it every pod authenticates to Google Cloud as the node service account, so all workloads on a node share one identity and pod-level IAM is impossible.
 - **Impact:** "All pods on this cluster share the node service account's Google Cloud permissions; there is no per-workload IAM boundary."
 - **Remediation:** `kind: gcloud` — `gcloud container clusters update <C> --location=<L> --project=<PROJECT> --workload-pool=<PROJECT>.svc.id.goog`. Note that node pools must then move to `GKE_METADATA` (2.9) and that this recreates nodes.
 
-#### 2.9 Node pool exposes the legacy GCE metadata endpoint
+#### 2.9 Node pool exposes the legacy GCE metadata endpoint (`legacy-metadata`)
 
 ```bash
 gcloud container node-pools list --cluster="$C" --location="$L" --project="$PROJECT" \
@@ -205,12 +218,12 @@ gcloud container node-pools list --cluster="$C" --location="$L" --project="$PROJ
 ```
 
 - **Flag when:** a node pool's `config.workloadMetadataConfig.mode` is empty or `GCE_METADATA` — metadata concealment is off and any pod can read `169.254.169.254`.
-- **Do NOT flag:** Autopilot clusters (no user-managed node pools, skipped in §1); pools already reporting `GKE_METADATA`. Detection is configuration-only **by design** — probing the endpoint live would need `kubectl run`/`exec`, both write verbs forbidden by the Red Lines, and the node pool mode is authoritative for this control anyway.
+- **Do NOT flag:** Autopilot clusters — there are no user-managed node pools, and §1 records that in the cluster's `limitations`; pools already reporting `GKE_METADATA`. Detection is configuration-only **by design** — probing the endpoint live would need `kubectl run`/`exec`, both write verbs forbidden by the Red Lines, and the node pool mode is authoritative for this control anyway.
 - **Severity:** `critical` — one unauthenticated HTTP request from any pod to a node-wide credential.
 - **Impact:** "Any pod on this node pool can read the node service account's access token from the legacy metadata endpoint and escalate to that identity's full Google Cloud permissions."
 - **Remediation:** `kind: gcloud` — `gcloud container node-pools update <POOL> --cluster=<C> --location=<L> --project=<PROJECT> --workload-metadata=GKE_METADATA`. Note that this drains and recreates the pool's nodes.
 
-#### 2.10 Public control plane with no authorized networks
+#### 2.10 Public control plane with no authorized networks (`public-control-plane`)
 
 ```bash
 gcloud container clusters describe "$C" --location="$L" --project="$PROJECT" \
@@ -223,7 +236,7 @@ gcloud container clusters describe "$C" --location="$L" --project="$PROJECT" \
 - **Impact:** "The cluster's API server accepts connections from any address on the internet; credential compromise or an API-server CVE is directly exploitable from outside the network."
 - **Remediation:** `kind: gcloud` — `gcloud container clusters update <C> --location=<L> --project=<PROJECT> --enable-master-authorized-networks --master-authorized-networks=<CIDR[,CIDR...]>`. The CIDR list must come from a human; say so in `remediation.note` and do not invent one.
 
-#### 2.11 Pod Security `restricted` profile gaps
+#### 2.11 Pod Security `restricted` profile gaps (`podsecurity-gaps`)
 
 ```bash
 $WL | jq -r --arg sys "$SYS" "$PRE"'
@@ -243,40 +256,71 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 
 ### 3. Generate remediation artifacts
 
-- Write every `kind: manifest` file into the repo working tree **before** calling `finish`. The helper checks that each `remediation.path` exists; a missing file hard-fails the run.
-- `remediation.path` is repo-root relative, always under `remediations/compliance-audit/<cluster>/`, and must match the file you wrote exactly.
+- Write every `kind: manifest` file into the repo working tree **before** calling `finish`. The helper checks that each `remediation.path` exists; a missing file hard-fails the run. This includes every finding named in `pending_remediation_requests` from §0 — a `/remediate` request with no manifest on disk cannot be promoted.
+- `remediation.path` is repo-root relative, always under `remediations/compliance-audit/<cluster>/`, and must match the file you wrote exactly. No `..`, no glob metacharacter (`*`, `?`, `[`, `]`), no leading `:` — the helper rejects all of them.
 - One file per remediation. Two findings share a path only where 2.7 says so (the per-namespace `default` ServiceAccount patch).
+- **Findings that share a path share a Pull Request.** The promotion unit is the group of findings whose `remediation.path` values intersect, unioned transitively. 2.7 is the one case in this SOP that produces a group: every finding in a namespace points at that namespace's single `default-sa-automount.yaml`, so all of them are one group, on one branch, in one PR. Every other check here is one finding, one path, one PR.
 - Manifests are proposals. Never `kubectl apply` them and never embed a live `resourceVersion`.
-- For `kind: gcloud` and `kind: manual`, write no file and **omit `remediation.path` entirely** — the helper rejects a path on a non-manifest remediation. Put the full command or ordered human steps in `remediation.note`, with real cluster, location, project, and object names substituted — no angle-bracket placeholders except the human-supplied CIDR in 2.10.
-- A `kind: gcloud` `note` is rendered into the PR **inside a bash fence**, so it must be shell-pasteable: commands on their own lines, and caveats (2.8 and 2.9 both recreate nodes; 2.10 needs a human-supplied CIDR) as `#` comment lines above the command they guard. Prose in a `gcloud` note renders as broken shell. A `kind: manual` note is rendered as prose and should read as prose.
+- For `kind: gcloud` and `kind: manual`, write no file and **omit `remediation.path` entirely** — the helper rejects a path on a non-manifest remediation. Put the full command or ordered human steps in `remediation.note`, with real cluster, location, project, and object names substituted — no angle-bracket placeholders except the human-supplied CIDR in 2.10. Neither kind is ever promotable to a PR; a `/remediate` request naming one is refused.
+- A `kind: gcloud` `note` is rendered into the ledger issue **inside a bash fence**, so it must be shell-pasteable: commands on their own lines, and caveats (2.8 and 2.9 both recreate nodes; 2.10 needs a human-supplied CIDR) as `#` comment lines above the command they guard. Prose in a `gcloud` note renders as broken shell. A `kind: manual` note is rendered as prose and should read as prose.
 
 ### 4. Emit findings.json
 
-Write the whole document to `findings_path` in one shot, with `audit: "compliance-audit"`, `scope.clusters` listing every cluster queried, and `scope.skipped` carrying the rest plus the Autopilot entry from §1. Self-check before writing:
+Write the whole document to `findings_path` in one shot, with `audit: "compliance-audit"`, `scope.clusters` listing every cluster you queried — each carrying the `limitations` string §1 recorded for it, where there is one — and `scope.skipped` listing only the clusters you could not read. Self-check before writing:
 
 - Every finding has a non-empty `evidence.command` that is the literal command run. Drop anything else.
-- `id`s are unique in the file and re-derived by the §2 rule — never copied from a previous run.
+- `id`s are unique in the file, re-derived by the §2 rule from the check's slug, and match the §2 charset — never copied from a previous run.
 - `namespace` is `""` for cluster-scoped findings (2.4, 2.5 ClusterRoles, 2.8, 2.9, 2.10); `object` is `<Kind>/<name>` (`Deployment/api`, `ClusterRoleBinding/dev-admin`, `NodePool/pool-1`, `Cluster/prod-usc1`).
-- `remediation.path` is present iff `kind == "manifest"`, that file exists on disk, and no finding references a cluster/check pair recorded in `scope.skipped`.
+- Every finding carries a complete `recommendation` — see below.
+- `remediation.path` is present iff `kind == "manifest"` and that file exists on disk.
+- No cluster appears in both scope lists, and no finding names a cluster in `scope.skipped`. The validator rejects the document on either. A `limitations` note suppresses nothing: findings from the checks that _did_ run on that cluster belong in the file.
+
+Emit the complete set of findings. The harness bounds the rendering, not you: it caps the issue body at 60,000 characters, trims each excerpt to 40 lines / 2,000 chars and each command to 2,000 chars, and caps the scope tables at 60 rows. When findings do not fit, the body says so and the title's counts remain the true totals — so trim `evidence.excerpt` to the lines that prove the finding rather than pasting a dump, and never drop a real finding to keep the ledger short.
+
+**`recommendation` — required on every finding.** Three non-empty strings, no exceptions, on `gcloud` and `manual` findings that will never become a PR just as much as on promotable ones. You write it now because the evidence is in front of you now; deferring it to the moment a human asks for the fix is how the reasoning gets lost.
+
+- `action` — what to do. Imperative, one or two sentences.
+- `rationale` — why **this** fix and not the obvious alternative. Name the alternative you considered and say why you rejected it.
+- `risk` — what breaks when it is applied, and the read-only check to run first.
+
+Worked example, for a 2.6 finding on the `payments` namespace:
+
+```json
+"recommendation": {
+  "action": "Apply a default-deny NetworkPolicy to the payments namespace.",
+  "rationale": "Namespace-scoped default-deny is the smallest change that closes east-west exposure without touching mesh config; a mesh AuthorizationPolicy would also work but takes effect only for injected pods.",
+  "risk": "Any unlabelled cross-namespace traffic into payments breaks on apply. Enumerate what currently reaches it first with `kubectl get svc,endpoints -n payments`, and land the per-service allow rules in the same change."
+}
+```
+
+Three `rationale`/`risk` pairs in this SOP are check-specific and must not be written generically: 2.8 and 2.9 both recreate nodes, so say so in `risk`; 2.10's `risk` must state that an incomplete CIDR list locks every operator out of the API server, which is why the list comes from a human.
 
 ### 5. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_pr.py finish --audit compliance-audit \
+./skills/fleet-audit/scripts/audit_report.py finish --audit compliance-audit \
   --findings-file /opt/data/scratch/findings_compliance-audit.json
-# -> {"status":"CLEAN"|"OPENED"|"UPDATED","pr_url":...,"new":n,"resolved":m}
+# -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
+#     "prs_opened":[...],"prs_closed":[...]}
 ```
 
-- `status == "CLEAN"` → your final response is exactly `[SILENT]`. No preamble, no "no issues found". A clean fleet is a silent fleet.
-- `status == "OPENED"` or `"UPDATED"` → one line, then stop: `Security & RBAC posture audit: <new> new, <resolved> resolved across <count(scope.clusters)> clusters — <pr_url>`
-- If `finish` reports a schema error, fix the findings file and re-run `finish`. Do not work around the validator and do not open a PR by hand.
+`finish` owns publication end to end. Tier 1 is one ledger issue for this stream, rewritten in place every run and labelled `agent:audit`, `audit:compliance-audit`, `severity:<highest>`; a clean run closes it as completed. Tier 2 is a narrow remediation PR per remediation group, branched `platform-agent/fix-compliance-audit-<lowest-sorted-finding-id>` off `main`, linked with `Part of #<issue>` and additionally labelled `audit:remediation`. A PR opens automatically only for a finding that is `critical` **and** `manifest` **and** has no PR on its branch in any state, capped at five per run, with any withheld findings named in the ledger. Everything else waits for a repo writer to comment `/remediate <finding-id>` or `/remediate all`, which arrives as `pending_remediation_requests` on the next run's `start`.
+
+**No finding this SOP produces meets the auto-promotion bar.** Every `manifest` check here is `major` or `minor` (2.6, 2.7, 2.11) and every `critical` check is `gcloud` or `manual`, so every remediation PR from this stream is human-requested. That is deliberate: the fixes worth shipping unattended are the ones a reviewer can merge without a conversation, and none of these are. Never inflate a severity to force a PR open.
+
+- `status == "CLEAN"` → the ledger issue closes as completed and your final response is exactly `[SILENT]`. No preamble, no "no issues found". A clean fleet is a silent fleet.
+- `status == "UPDATED"` with `new: 0` **and** `resolved: 0` → also exactly `[SILENT]`. Nothing moved; the ledger already says everything you would.
+- `status == "OPENED"`, or `"UPDATED"` with a non-zero `new` or `resolved` → one line, then stop: `Security & RBAC posture audit: <new> new, <resolved> resolved across <count(scope.clusters)> clusters — <issue_url>`
+- Exit 2 means the validator rejected the document and nothing was published: fix the findings file and re-run `finish`. Exit 1 is fatal. Exit 0 published. Do not work around the validator, and never open the issue or a PR by hand.
+- A finding that still reproduces after its remediation PR merged renders in the ledger with a `⚠ fix merged, still reproduces` warning and the merged PR gets one comment. The audit never reopens it, and neither do you — re-verify the finding and let the next run carry it.
 
 ## Red Lines
 
 - **Read-only.** No `kubectl apply|patch|create|delete|edit|scale|exec|run|port-forward|cp`, no `gcloud container clusters|node-pools update`, no write of any kind against any cluster. `gcloud container clusters get-credentials` is the sole exception and touches only a local kubeconfig.
-- **No hand-written PR body, branch, commit, or `gh` call.** `audit_pr.py` owns the entire git/GitHub path; do not invoke `submit-suggestion` from this SOP.
+- **No hand-written issue body, PR body, branch, commit, or `gh` call.** `audit_report.py` owns the entire git/GitHub path. Never call `gh issue create` — one stream has one ledger and `finish` owns it — never open a remediation PR yourself, and do not invoke `submit-suggestion` from this SOP.
 - **No unreproducible findings.** No `evidence.command`, no finding. Never soften something you could not verify into a lower severity or a "possible issue" — delete it.
-- **No unstable ids.** Never derive an `id` from a pod suffix, ReplicaSet hash, timestamp, or loop counter; unstable ids make every run look like a fleet of new problems and destroy the delta.
-- **No inference from an unaudited cluster.** An unreachable cluster, or a check that is admission-enforced or structurally inapplicable on Autopilot, goes in `scope.skipped` with a reason — never into `findings`.
+- **No finding without a `recommendation`.** All three sub-fields, non-empty, on every finding, written while the evidence is still in front of you.
+- **No unstable ids.** Never derive an `id` from a pod suffix, ReplicaSet hash, timestamp, or loop counter; unstable ids make every run look like a fleet of new problems and destroy the delta. An id that violates the §2 charset is rejected outright — it has to be a legal git branch component.
+- **No inference from an unaudited cluster.** A cluster you could not read goes in `scope.skipped` and never appears in a finding. A cluster you read where some checks did not run — Autopilot's 2.1–2.3 and 2.9, a command that errored — stays in `scope.clusters` with a `limitations` string. Never demote a partially-checked cluster to `scope.skipped`: that silently discards every real finding from the checks that did run on a cluster you were told to audit.
 - **No forbidden sources.** No BigQuery, Prometheus, Policy Controller / Gatekeeper, Security Command Center, external blueprint, or CMDB — and no kanban delegation to Cluster Agents. This audit runs entirely in the Platform Agent.
-- **Never print raw credentials.** ServiceAccount tokens, kubeconfig contents, and Secret values never appear in `evidence.excerpt` — record the object reference instead.
+- **Never print raw credentials.** ServiceAccount tokens, kubeconfig contents, Secret `data:` blocks, and private keys never appear in `evidence.excerpt` — record the object reference, or re-run with a field selector or `-o jsonpath` that omits the value. The harness's redaction is a backstop, not permission.

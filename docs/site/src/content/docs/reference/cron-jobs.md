@@ -54,17 +54,17 @@ Each entry follows this shape:
 }
 ```
 
-| Field                | Type            | Purpose                                                                                                                                                 |
-| -------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`                 | string          | Stable identifier used in observability and enable/disable ops. It survives renames — `obtainability-audit` is now the Workload Reliability Audit.      |
-| `name`               | string          | Human-readable name for logs and Chat replies. For the five audits it is also the PR title, via the `AUDITS` map in `fleet-audit`'s `audit_pr.py`.      |
-| `schedule.kind`      | string          | Only `"cron"` is used today.                                                                                                                            |
-| `schedule.expr`      | string          | Standard 5-field cron expression, evaluated in the pod's time zone (UTC unless overridden).                                                             |
-| `schedule.display`   | string          | Display form (usually equal to `expr`).                                                                                                                 |
-| `prompt`             | string          | The literal message sent to the agent when the schedule fires. Governance jobs name their SOP **relative to the profile home** — `governance/<sop>.md`. |
-| `skills`             | array of string | Optional: skills to preload. The five audits preload `fleet-audit`; the disabled governance jobs leave it empty (the SOP loads what it needs).          |
-| `enabled`            | bool            | Set `false` to disable without deleting the entry.                                                                                                      |
-| `deliver` (optional) | string          | Chat delivery mode. `"all"` is set on all six enabled jobs, which is safe because each returns exactly `[SILENT]` when it has nothing to report.        |
+| Field                | Type            | Purpose                                                                                                                                                          |
+| -------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                 | string          | Stable identifier used in observability and enable/disable ops. It survives renames — `obtainability-audit` is now the Workload Reliability Audit.               |
+| `name`               | string          | Human-readable name for logs and Chat replies. For the five audits it is also the ledger issue title, via the `AUDITS` map in `fleet-audit`'s `audit_report.py`. |
+| `schedule.kind`      | string          | Only `"cron"` is used today.                                                                                                                                     |
+| `schedule.expr`      | string          | Standard 5-field cron expression, evaluated in the pod's time zone (UTC unless overridden).                                                                      |
+| `schedule.display`   | string          | Display form (usually equal to `expr`).                                                                                                                          |
+| `prompt`             | string          | The literal message sent to the agent when the schedule fires. Governance jobs name their SOP **relative to the profile home** — `governance/<sop>.md`.          |
+| `skills`             | array of string | Optional: skills to preload. The five audits preload `fleet-audit`; the disabled governance jobs leave it empty (the SOP loads what it needs).                   |
+| `enabled`            | bool            | Set `false` to disable without deleting the entry.                                                                                                               |
+| `deliver` (optional) | string          | Chat delivery mode. `"all"` is set on all six enabled jobs, which is safe because each returns exactly `[SILENT]` when it has nothing to report.                 |
 
 ## Editing
 
