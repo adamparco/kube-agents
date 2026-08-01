@@ -134,7 +134,210 @@ and that the drain is committed rather than left in the working tree.
 
 **Last drained:** 2026-07-31
 
-_(empty)_
+### Build a `KnowledgeEntry` CRD as the agents' indirect-communication substrate, watched rather than polled
+
+- **Kind:** task
+- **Where:** a new namespaced CRD in `k8s-operator/api/v1alpha1/`;
+  [06](../design/06-api-and-data-contracts.md) §5 (the OKF contract it replaces as the _live_ store)
+  and §3 (the `knowledge/` line in the repo layout);
+  [05](../design/05-system-architecture.md) §1.2 (the journal-store decision this copies verbatim),
+  the C9 / C13 rows in §1, and the §7 locked decision "OKF location — `knowledge/` root in the
+  mirror repo"; [03](../design/03-security-model.md) §2–§3.3; the three reader templates in
+  `k8s-operator/scripts/{developer-team,cluster-admin,platform}-agent.yaml{,.template}`;
+  [09](../design/09-verification-and-validation.md) §6
+- **Why it matters:** OKF-in-git is the wrong substrate for the one job it is now being asked to do,
+  and the reason is isolation rather than latency. **A sparse checkout is not an access control.** A
+  GitHub App token cannot scope below the repo, so the `contents:read` token every tier's
+  `read-knowledge` skill uses reads the _whole_ `knowledge/` tree — a developer-team agent can read
+  platform's blueprints and every sibling namespace's observations. Nothing in
+  [03](../design/03-security-model.md) §3 covers this, because knowledge was never modelled as a
+  scoped resource. The tiering the rest of the system enforces by RBAC, admission and cloud IAM
+  simply does not exist for the knowledge layer.
+
+  **The substrate should be a namespaced `KnowledgeEntry` CR in `kubeagents.x-k8s.io/v1alpha1`,
+  created in the author's own namespace.** This is not a new argument — it is
+  [05](../design/05-system-architecture.md) §1.2's argument, which already chose exactly this for
+  the journal and already recorded the rejections: an external database (availability coupling,
+  second credential, second network path through default-deny), object storage alone (**not
+  watchable, no per-scope RBAC**), and — in as many words — _the mirror repository_. Every line of
+  that rationale transfers to knowledge. etcd is already required and already up;
+  `kubectl get knowledgeentries -A` is a debugging surface with no new client; and a watch is free
+  here and awkward everywhere else.
+
+  **The hierarchy the CRD needs is one `apiGroups` entry per tier, not new machinery** — measured,
+  not assumed. `developer-team-agent.yaml.template:27-30` is already a **namespaced `Role`** with
+  `get, list, watch` on `resources: ["*"]`, and `cluster-admin-agent.yaml.template:25-28` is already
+  a **`ClusterRole`** with the same three verbs. Their shapes are precisely "own namespace only" and
+  "every namespace in my cluster". What blocks the CRD is that both enumerate
+  `apiGroups: ["", "apps", "batch", "networking.k8s.io", ...]` and **neither lists
+  `kubeagents.x-k8s.io`** — so adding the group to each template _is_ the grant, and the visibility
+  ladder falls out of RBAC rather than out of agent goodwill.
+
+  **Watches are the point of the item, and the parent must not poll.** Each agent runs an informer
+  over `knowledgeentries` across its own scope and reacts on the event; `watch` is already in both
+  reader grants above, so no new verb is required. Three things the task owes beyond "add an
+  informer", because a watch that wakes an LLM is not the same object as a watch that updates a
+  cache:
+
+  1. **A landing place for the event.** [05](../design/05-system-architecture.md) §1's C11 already
+     gives each agent a durable self-generated work queue on its PVC with atomic writes. A watch
+     event should enqueue there, so a pod restart mid-reaction resumes instead of dropping the
+     entry — and so "the parent responded" survives a restart as evidence.
+  2. **Loop damping, which the mesh has and a watch does not.** [06](../design/06-api-and-data-contracts.md)
+     §7 rule 7 gives mesh calls `chain.visited` plus `MaxMeshDepth = 3`. An agent that writes a
+     `KnowledgeEntry` in reaction to seeing one has no such bound, and A-reacts-to-B-reacts-to-A is
+     a two-agent infinite loop that spends real inference money. Carry `chainId` onto the CR and
+     apply the same depth rule, or state why the shape cannot loop.
+  3. **The event consumes the _watcher's_ initiative budget**, matching §7 rule 8 — otherwise a
+     chatty child spends its parent's autonomy just by writing notes, which is the exact property
+     rule 8 exists to protect.
+
+  **Writes stay brokered; this must not become a second write path.** The agent pod's reader
+  identity has no write verb on anything, ever, and "any write by a reader identity is an alarm"
+  ([03](../design/03-security-model.md) §3.1, SLI 2). So a `KnowledgeEntry` is created by the
+  **broker** on the agent's behalf, classified (`routine` is the obvious floor) and journaled like
+  any other action, in the agent's **own** namespace only — a write into a sibling's namespace is
+  already forbidden by §3.3 rule 5 and must stay that way. This is also what keeps the substrate off
+  the control path: an entry is untrusted **data for the callee's model, never instructions to its
+  broker**, exactly as §7's `context` field is.
+
+  **Cross-cluster is settled, not open — the design already answers it twice, and neither answer is
+  a watch.** The concern that a hub Platform Agent which cannot watch a spoke's CRs is cut off from
+  its Cluster Admin Agents is answered by observing that **escalation never used a watch and does
+  not start now**. [05](../design/05-system-architecture.md) §1.4 already routes "a spoke's Cluster
+  Admin Agent escalating to the hub's Platform Agent" to the hub's VPC-internal mesh endpoint,
+  published in the bootstrap bundle; both mesh kinds are already **"async request/acknowledge rather
+  than a held synchronous call"**; and §1.4's closing paragraph already gives the peer-is-down case a
+  durable answer — retry with backoff, held in the escalating agent's **C11 queue** with a TTL, and
+  surfaced to the human roster over C15 on expiry rather than dropped. So the child→parent path is
+  intact in every topology, and the CRD adds a durable local record beneath it rather than replacing
+  the transport. Three directions, three mechanisms, all of them already in the design:
+
+  | Direction                      | Mechanism                                                                                                                    | Already exists as                                                                       |
+  | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+  | Within one cluster             | informer on `knowledgeentries`                                                                                               | the `watch` verb both reader grants hold                                                |
+  | Child → parent, across cluster | mesh `escalate` carrying a **reference** to the entry; the parent's own broker materialises a **local mirror CR** in the hub | C-AM, 05 §1.4                                                                           |
+  | Parent → child, across cluster | **controller-to-controller** over the hub channel, each spoke controller writing the local copy                              | `FleetFreeze` fan-out, 05 §1.5 — < 30 s, and the same Pub/Sub path `C17` already drains |
+
+  **The third row is the one worth copying deliberately, because it is the same problem already
+  solved.** `FleetFreeze` is a **per-cluster object precisely because no cross-cluster Kubernetes
+  credentials exist**, and it is fanned out controller-to-controller from the hub's channel with a
+  deliberate asymmetry: losing the **local** object read is fail-closed, losing the **hub channel**
+  is not — it alarms and holds last known state, "because a hub network blip must not stop every
+  remediation in the fleet". Knowledge wants exactly that asymmetry and can afford it more easily,
+  since a stale blueprint is not a brake. Copy the mechanism and the asymmetry; do not invent a
+  second one.
+
+  **What this buys is that the Platform Agent runs exactly one informer, over its own cluster.**
+  Cross-cluster entries arrive as locally-materialised copies, so there is no cross-cluster watch, no
+  hub→spoke credential, and no second code path in the agent's reasoning loop. **A hub-side
+  aggregator holding spoke read credentials is refused** on the same grounds
+  [05](../design/05-system-architecture.md) §1 already refuses a fleet-wide writer: it would need
+  cross-cluster credentials, and one component that can read every cluster's knowledge is the
+  fleet-wide reader analogue of the thing the topology exists to prevent.
+
+  **And the delivery contract already exists, which collapses most of the remaining work.** `C17` is
+  described as delivering `alert`, `github`, `escalation`, `k8s-event` and `delegation` to the in-pod
+  session-inject seam "under one kind-discriminated delivery contract". **`knowledge` should be a
+  sixth kind on that seam**, not a new ingress. Then a local watch event, a cross-cluster mesh push
+  and a hub-channel fan-out are three transports under one contract, and the agent's loop cannot tell
+  — or need to tell — which cluster an entry came from.
+
+  **One honest cost, named rather than discovered.** A mesh push that is lost leaves an entry in the
+  spoke with no mirror in the hub. The C11 retry queue covers the common case; a low-frequency
+  reconcile sweep is the backstop, and that sweep **is** polling. That is acceptable only because it
+  is a backstop rather than the delivery path — but the task must state its interval and say plainly
+  that it is not how the parent learns things, or the no-polling property erodes into a poll with a
+  fast path.
+
+  **Three things still need a ruling and should not be quietly decided at IMPLEMENT.** (a) **Which of
+  the six canonical types move.** `observation` and `runbook` clearly want the live store;
+  `cluster-blueprint` may be happier in git where a human reviews the diff. (b) **Retention** — the
+  journal has two clocks and a TTL, but durable knowledge whose whole value is outliving the
+  conversation probably has neither, and etcd sizing then matters (reuse §1.2's ≥1 MiB → export-sink
+  rule rather than inventing one). (c) **What git is still for**: the recommendation is the archival
+  and human-diff tier, the role `journal/<YYYY>/<MM>/<DD>.ndjson` already plays — not a second source
+  of truth.
+
+  **The design specs move in the same unit, because this is a substrate change and a half-migrated
+  substrate is worse than either end.** `docs/design/` is the source of truth, so the code cannot
+  land ahead of it. **Eight design docs mention OKF today** — 01, 02, 04, 05, 06, 07, 09 and
+  `README.md` — and the ones carrying load are: **06 §5** rewritten from a markdown-frontmatter
+  contract into the CR schema (including what happens to the shared `okf_frontmatter` parser and
+  `dev/okf-validate.py`, which is on `dev/L0-CHAIN.txt:38` and is the one-definition-site the
+  `read-knowledge` skill deliberately shares with CI); **06 §3**'s layout comment; **05** C9, C13 and
+  the §7 locked decision, which currently names git as the location; **07 §2** for the task's own
+  phase placement, plus its deferred-items row asserting "the journal and OKF cover recall
+  adequately"; and **02 §2.3**, so the mesh (a request, addressed to one peer) and the knowledge
+  layer (a fact, addressed to nobody) are not read as two ways to do one thing. **03 and 08 mention
+  OKF nowhere**, which is itself the finding: 03 §2 has no trust-boundary row for an indirect
+  agent↔agent channel and 03 §3 has no per-scope knowledge rule, and 08 has no runtime story for an
+  informer inside the agent pod. Both gain content rather than having it edited.
+
+  Four more edits follow from the cross-cluster ruling above and are easy to miss because none of
+  them mention OKF today: the **C17 row in 05 §1** gains `knowledge` in its kind list; **05 §1.4**
+  gains the entry-reference push and should keep its "async request/acknowledge" sentence adjacent,
+  since that sentence is what makes the ruling true; **05 §1.5**'s `FleetFreeze` fan-out is now cited
+  by a second mechanism, so it wants a forward reference rather than being silently copied; and
+  **06 §7** gains the push's shape — a `MeshRequest` whose `context` carries an entry reference and
+  no instruction, which is the existing rule and worth restating where someone will look for it.
+
+  **09 is additive only.** A new **V-ISO** row for the property that does not exist today — a
+  developer-team agent cannot read a sibling namespace's entries, asserted as a negative — a row for
+  watch-not-poll, since "the parent responds quickly" is otherwise untestable prose, and a row for
+  the cross-cluster materialisation, asserting both halves: that an entry written in a spoke reaches
+  the hub's local store, and that **no hub credential reaches the spoke's API server** while it does. **V-CTR-010**
+  (OKF entries validate), **V-CHR-006** (no OKF entry for work inside own authority), **V-ADV-009**
+  (OKF files as an injection channel — the CR body inherits this verbatim, and a watch-driven
+  reaction makes it _more_ acute, since no human is in the loop at read time) and the **C9 row in
+  §5** all reference OKF and need re-reading against the new substrate. Check IDs are never reused or
+  renumbered, so this is new IDs plus edited assertions on existing ones, never a renumber.
+
+  **This item does not fit in one phase, and saying so is part of the item.** Phase 9's defining
+  constraint is that no write authority exists anywhere in the system — the argument already recorded
+  in this file under B-001 · B-002 for why the tier renderer could not be pulled into Phase 9. A
+  `KnowledgeEntry` **write** is a write, and the cross-cluster half rides a mesh that P12-T1 does not
+  build until Phase 12. So the scope splits four ways, and only the first slice is `now`:
+
+  | Slice                                                                                                                                          | Earliest phase | Why                                                                                                                  |
+  | ---------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------- |
+  | CRD type, the `apiGroups` entries in all three reader templates, the informer, `knowledge` as a C17 kind, and **every** design-spec edit above | 9              | Types, read grants and delivery — no write authority anywhere in it. The branch is already `phase-9-actor-read-half` |
+  | The broker create-op for an entry                                                                                                              | 10, per tier   | Phase 9's broker is dark; a write arrives with first authority, tier by tier                                         |
+  | Child → parent cross-cluster push, and the parent's local materialisation                                                                      | 12             | It rides the mesh (P12-T1), which does not exist yet                                                                 |
+  | Parent → child fan-out                                                                                                                         | ~10–11         | **Not** mesh-blocked — it is the `FleetFreeze` controller-to-controller path over the channel C17 already drains     |
+
+  Splitting it this way is the recommendation, not a constraint. What must not happen is the split
+  being decided silently at IMPLEMENT, or a `now` sitting on an item whose later three-quarters
+  cannot start.
+
+  **Two problems in the Phase 9 slice have no precedent in this repo, and the slice should answer
+  them before code depends on the answers.** First, **reaction-loop control**: the mesh bounds
+  recursion with `chain.visited` and `MaxMeshDepth = 3`, and a watch has nothing at all — there is no
+  existing pattern here to copy, so obligation 2 above is design work, not plumbing. Second, **the
+  journal cost of a knowledge write**: if the broker creates the entry, every note an agent writes
+  becomes an `ActionRecord` with a classification, an undo plan, a snapshot and two retention clocks.
+  The tempting lighter path — let the entry be written outside the broker — dissolves the property
+  that there is no other write path, which is the property SLI 2 is built on. Pick the cost, in the
+  spec, with the reasoning visible.
+
+  Roughly 60 files in the tree mention OKF, 25 of them under `agents/` (three copies each of
+  `read-knowledge`, `detect-drift` and `escalate`, plus the SOULs and the heartbeat and drift SOPs).
+  Those follow the specs and are not the hard part; naming them here so the unit's scope is not a
+  surprise at PLAN. The read-path migration probably **shrinks** the tree rather than growing it:
+  each of the three 255-line `read_knowledge.py` copies exists mostly to make git safe to read from —
+  a read-only subcommand allowlist, a write-intent tripwire, a sparse checkout plus an assertion that
+  it did not leak `clusters/` — and RBAC replaces all of it with a scoped `list`/`watch`.
+
+- **Priority:** now, **for the Phase 9 slice only** — the human operator asked for this to be the
+  next thing completed, and the first row of the table above is the part that can actually complete
+  under Phase 9's no-write-authority constraint. It displaces the planned Phase 9 ordering; per this
+  file's own rule the harness should say what it displaced. The other three rows are **successors,
+  not deferrals**: schedule them bound to Phases 10, 11 and 12 as named above, so the drain records
+  where they land rather than leaving them to be rediscovered.
+- **Added:** 2026-08-01
+- **Source:** requested by the human operator in-session, after a discussion of why OKF-in-git is a
+  poor fit for indirect agent communication. Transcribed into the inbox at their instruction — the
+  reasoning above is the harness's, the decision to do it is theirs.
 
 ---
 
