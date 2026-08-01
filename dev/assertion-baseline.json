@@ -693,6 +693,11 @@
       "TestCorpusCoversEveryFloorRule",
       "TestCorpusIsDeterministic"
     ],
+    "k8s-operator/internal/broker/classify/digest_containment_test.go": [
+      "TestClassifyPackageLogsNothing",
+      "TestDigestSetEntriesAreExactlyTheSpecifiedForms",
+      "TestDigestSetSurfaceCannotYieldADigest"
+    ],
     "k8s-operator/internal/broker/classify/direction_test.go": [
       "TestBooleanPolarity",
       "TestCombineDirection",
@@ -1539,6 +1544,11 @@
       "TestRetentionForRefusesAnUnknownClass",
       "TestTerminalCoversEveryEndState",
       "TestUndoWindowOpen"
+    ],
+    "k8s-operator/internal/journal/snapshot_redaction_test.go": [
+      "TestJournalRedactionIsRecognisedByTheReplayer",
+      "TestJournalSecretDigestIsPerKeyOverTheStoredValue",
+      "TestJournaledSecretBodyCarriesNoMaterialAnywhere"
     ],
     "k8s-operator/internal/journal/snapshot_test.go": [
       "TestLoadSnapshotVerifiesTheDigestBothWays",

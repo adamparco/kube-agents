@@ -264,6 +264,10 @@
   runs: "bash dev/verify/classify-live-state-l2.sh gke-scratch-kube-agents-dev"
   asserts_in: "dev/verify/classify-live-state-l2.sh"
 
+"V-GAT-024":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/broker/classify/digest_containment_test.go"
+
 "V-ISO-001":
   runs: "bash dev/verify/chaos-suite.sh gke-scratch-kube-agents-dev"
   asserts_in: "dev/verify/chaos-suite.sh"
@@ -327,6 +331,13 @@
 "V-MET-014":
   runs: "python3 dev/tests/negative-controls-name-their-rule.py"
   asserts_in: "dev/tests/negative-controls-name-their-rule.py"
+
+# V-OBS-008 lives in an external test package (`journal_test`) so it can import `undo`, which
+# imports `journal`. That is the whole point of the check: the marker one package writes and the
+# other refuses on is a contract no single package's suite can see.
+"V-OBS-008":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/journal/snapshot_redaction_test.go"
 
 "V-PRO-021":
   runs: "make -C k8s-operator test"

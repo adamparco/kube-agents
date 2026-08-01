@@ -81,48 +81,54 @@
 # section states the numbers precisely so that they are falsifiable, and a check that never reads
 # 5m/10m/90s/30s/15s/20m/2m cannot fail when a constant drifts from the table.
 #
-# Published gaps -- six requirements deliberately left unmapped, because no catalog row
-# asserts them. Three in 06:
+# Published gaps -- three requirements deliberately left unmapped, because no catalog row
+# asserts them. One in 06:
 #   R-06.2.3-6   "developer-team actor: none in v1". Nothing asserts the ABSENCE of a
 #                developer-team actor GSA; every containment check asserts what a principal
 #                cannot do, not that a principal does not exist.
-#   R-06.4.2-44  the live-Secret digest comparison method,
-#                `sha256(secretNamespace || 0x1f || value)`.
-#   R-06.4.2-45  digests are never journaled or logged; `reasons[]` names the source Secret and
-#                key, never the value.
-# The last two are one hole: no check in the catalog reaches the COMPARISON METHOD behind
-# `secret-material-egress`. The rule row itself, R-06.4.2-30, is NOT part of that hole and was
-# wrongly filed inside it until 2026-07-31: it is a row of the same code-floor rule table as
-# `secret-write` and `blast-radius-cap`, `RuleSecretMaterialEgress` is a member of
-# `classify.AllFloorRuleIDs`, and the corpus carries nine cases for it -- so V-MET-005 and
-# V-GAT-001 reach it by exactly the argument that maps every one of its siblings, and singling it
-# out was a curation error, not a stricter reading. Closing 44/45 is still a catalog change.
-# And three elsewhere:
+# R-06.4.2-30 is NOT one of them, and was wrongly filed as one until 2026-07-31: it is a row of the
+# same code-floor rule table as `secret-write` and `blast-radius-cap`, `RuleSecretMaterialEgress` is
+# a member of `classify.AllFloorRuleIDs`, and the corpus carries nine cases for it -- so V-MET-005
+# and V-GAT-001 reach it by exactly the argument that maps every one of its siblings, and singling
+# it out was a curation error, not a stricter reading.
+# And two elsewhere:
 #   R-03.4.3-8   no write to an `Agent` CR whose identity is an ANCESTOR of the writer's.
 #                V-CTN-007 covers the writer's OWN CR and V-CTN-025 the brake field on a child's;
 #                nothing walks `parentRef` upward on a write.
 #   R-03.4.3-9   actor writes stay inside the LIVE tier template. Both template checks
 #                (V-CTN-012, V-CTR-004) are the inlined-literal form, which is the point of 03
 #                section 4.2 -- the live-object form is a deferred capability with no check.
-#   R-05.1.2-2   snapshots are stripped of `managedFields` and of `Secret` `data`, with a
-#                per-key digest instead of material. Same hole as R-06.4.2-44/45, one layer down.
 #
-# Two of the eight closed on 2026-07-31, and both closed as CATALOG rows over machinery that had
-# been in the tree for units -- unmapped only because no check ID claimed it. That is the shape of
-# most of what is left, and it is worth naming: an obligation with no `checks:` entry is not
-# evidence that the property is unbuilt, and reading it that way is how a build re-implements what
-# it already has.
+# Five of the eight closed on 2026-07-31, and every one of them closed as a CATALOG row over
+# machinery that had been in the tree for units -- unmapped only because no check ID claimed it.
+# That is the shape of most of what is left, and it is worth naming: an obligation with no `checks:`
+# entry is not evidence that the property is unbuilt, and reading it that way is how a build
+# re-implements what it already has.
 #   R-07.5-4  -> V-CTN-038. "Authority never precedes machinery" is invariant 7 of
 #               `dev/tests/invariants-gate.py`, on `dev/L0-CHAIN.txt` since P8. What it lacked was
-#               a control: no agent identity has ever held a write verb, so the enforcing branch
-#               had never once executed and every green came from the input being absent. The row
-#               and the control landed together, because a catalog ID over an unexercised branch is
-#               V-MET-014's failure wearing someone else's name.
+#               a control. Eleven agent-RBAC documents in this tree DO carry a non-read verb, so
+#               the green comes entirely from the other conjunct -- `missing_machinery()` has
+#               returned `[]` since P8 closed the undo path -- and the enforcing branch has never
+#               once executed against the real corpus. The row and the control landed together,
+#               because a catalog ID over an unexercised branch is V-MET-014's failure wearing
+#               someone else's name.
 #   R-06.4.2-17 -> V-CTR-021. Asserted at three layers already (`ValidateDottedPath`,
 #               `ValidateChangeRule`, and the webhook's per-index loop) plus the matcher's own
 #               refusal, and the seven-mutant sweep is what shows no single layer is load-bearing
 #               alone. The gap entry above read "no check asserts ChangePolicy dialect admission at
 #               all", which was true of the CATALOG and false of the tree.
+#   R-06.4.2-44 and R-06.4.2-45 -> V-GAT-024. The comparison method and the containment claim,
+#               closed together because they are one property read from two ends. The formula half
+#               recomputes `sha256(ns || 0x1f || v)` and `sha256(v)` over all three forms
+#               independently of `digestForms`; the containment half is a closed allowlist over
+#               `*DigestSet`'s exported surface, which is what turns "never journaled and never
+#               logged" from a statement about today's call sites into one about the type system.
+#   R-05.1.2-2 -> V-OBS-008. The journal side of the same property, and the one place the tree was
+#               genuinely thin: `journal.Sanitize` WRITES the `sha256:` marker and
+#               `undo.RedactedSecretKeys` REFUSES on it, across a package boundary neither side's
+#               suite crossed. Each doc comment stated the contract from its own end and neither was
+#               a test. A drift there does not fail -- it writes the hex of each value's own digest
+#               into the live Secret and reports a completed undo.
 #
 # 853 requirements.
 
@@ -1343,7 +1349,8 @@
     - V-ISO-006
 "R-05.1.2-2":
   text: "Snapshots are stripped of `managedFields` and of `Secret` `data` (a Secret's pre-state is recorded as a per-key digest, never as material — undoing a Secret change restores from the digest-matched value only if the broker still holds it in the sink under the sink's own encryption)."
-  checks: []
+  checks:
+    - V-OBS-008
 "R-05.1.2-3":
   text: "This is a _reversibility_ horizon, and it is always **shorter** than the record's TTL."
   checks:
@@ -2597,10 +2604,12 @@
     - V-CTN-002
 "R-06.4.2-44":
   text: "**Comparison method — a match against live Secret values, never a heuristic.** At classification the broker builds a set of digests of every value in every `Secret` **readable in the caller's scope**: for each key, `sha256(secretNamespace || 0x1f || value)` and `sha256(value)`, plus the base64 and URL-encoded forms of the value."
-  checks: []
+  checks:
+    - V-GAT-024
 "R-06.4.2-45":
   text: "Digests are computed in-broker, held in memory, never journaled and never logged; `classification.reasons[]` names the **source Secret and key** and never the value."
-  checks: []
+  checks:
+    - V-GAT-024
 "R-06.4.2-46":
   text: '**`cross-tier-direct-operation` — making a stated prohibition into a rule.** [03](03-security-model.md) §3.2 says the Platform Agent "may not operate tenant workloads directly — delegate to the tier that owns them".'
   checks:

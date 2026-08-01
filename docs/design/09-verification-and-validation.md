@@ -386,21 +386,22 @@ CH1–CH9 as defined in [05](05-system-architecture.md) §8. `V-ISO-00n` ≡ `CH
 
 ### 6.5 V-GAT — Classification, gating, approval
 
-| ID        | Assertion                                                                                          | Source  | Lvl    | Phase |
-| --------- | -------------------------------------------------------------------------------------------------- | ------- | ------ | ----- |
-| V-GAT-001 | Classifier golden corpus passes in full (§7.1)                                                     | 03 §5.2 | L1     | 9     |
-| V-GAT-002 | The wired-in classifier is the same one the corpus tests — an L2 spot-check per class              | 03 §5   | L2     | 9     |
-| V-GAT-003 | A representative gated action per tier parks as `PendingApproval` and does not execute ¬           | 04 §9   | L2     | 10    |
-| V-GAT-004 | Forbidden actions are rejected with **no approval path offered anywhere** ¬                        | 03 §5.1 | L2     | 10    |
-| V-GAT-005 | Approval cannot be laundered: self, sibling, parent-for-child, and non-roster approvals refused ¬  | 04 §2.3 | L1, L2 | 10    |
-| V-GAT-006 | Approval is not a bypass — a stale snapshot re-gates rather than executing ¬                       | 04 §3.1 | L2     | 10    |
-| V-GAT-007 | An unapproved action expires at its TTL and never executes afterwards ¬                            | 04 §3.1 | L2     | 10    |
-| V-GAT-008 | Parked work does not block: the agent demonstrably continues other work                            | 04 §3.1 | L2     | 10    |
-| V-GAT-009 | `ChangePolicy` can tighten and **provably cannot loosen**, including the floor and forbidden set ¬ | 03 §5.3 | L1, L2 | 9     |
-| V-GAT-010 | Asymmetry: tightening a control classifies routine/elevated; loosening the same control gates ¬    | 03 §5.2 | L1     | 9     |
-| V-GAT-011 | Blast-radius cap: over per-action cap ⇒ gated; over hard cap ⇒ abort ¬                             | 04 §4.2 | L1, L2 | 10    |
-| V-GAT-012 | An object marked `kube-agents/change-policy: gated` is always gated ¬                              | 03 §5.2 | L2     | 10    |
-| V-GAT-013 | Approval is recorded by an authenticated human on the record — a model claim is not accepted ¬     | 04 §2.3 | L2     | 10    |
+| ID        | Assertion                                                                                                                                                                                                                                                                                                                                          | Source  | Lvl    | Phase |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- | ------ | ----- |
+| V-GAT-001 | Classifier golden corpus passes in full (§7.1)                                                                                                                                                                                                                                                                                                     | 03 §5.2 | L1     | 9     |
+| V-GAT-002 | The wired-in classifier is the same one the corpus tests — an L2 spot-check per class                                                                                                                                                                                                                                                              | 03 §5   | L2     | 9     |
+| V-GAT-003 | A representative gated action per tier parks as `PendingApproval` and does not execute ¬                                                                                                                                                                                                                                                           | 04 §9   | L2     | 10    |
+| V-GAT-004 | Forbidden actions are rejected with **no approval path offered anywhere** ¬                                                                                                                                                                                                                                                                        | 03 §5.1 | L2     | 10    |
+| V-GAT-005 | Approval cannot be laundered: self, sibling, parent-for-child, and non-roster approvals refused ¬                                                                                                                                                                                                                                                  | 04 §2.3 | L1, L2 | 10    |
+| V-GAT-006 | Approval is not a bypass — a stale snapshot re-gates rather than executing ¬                                                                                                                                                                                                                                                                       | 04 §3.1 | L2     | 10    |
+| V-GAT-007 | An unapproved action expires at its TTL and never executes afterwards ¬                                                                                                                                                                                                                                                                            | 04 §3.1 | L2     | 10    |
+| V-GAT-008 | Parked work does not block: the agent demonstrably continues other work                                                                                                                                                                                                                                                                            | 04 §3.1 | L2     | 10    |
+| V-GAT-009 | `ChangePolicy` can tighten and **provably cannot loosen**, including the floor and forbidden set ¬                                                                                                                                                                                                                                                 | 03 §5.3 | L1, L2 | 9     |
+| V-GAT-010 | Asymmetry: tightening a control classifies routine/elevated; loosening the same control gates ¬                                                                                                                                                                                                                                                    | 03 §5.2 | L1     | 9     |
+| V-GAT-011 | Blast-radius cap: over per-action cap ⇒ gated; over hard cap ⇒ abort ¬                                                                                                                                                                                                                                                                             | 04 §4.2 | L1, L2 | 10    |
+| V-GAT-012 | An object marked `kube-agents/change-policy: gated` is always gated ¬                                                                                                                                                                                                                                                                              | 03 §5.2 | L2     | 10    |
+| V-GAT-013 | Approval is recorded by an authenticated human on the record — a model claim is not accepted ¬                                                                                                                                                                                                                                                     | 04 §2.3 | L2     | 10    |
+| V-GAT-024 | The secret-egress digest set is exactly the specified formula — `sha256(ns‖0x1f‖v)` and `sha256(v)` over the raw, base64 and URL-encoded forms — and a digest **cannot leave the classifier**: the map is unexported, `*DigestSet`'s exported surface is `{Lookup, Len}`, `SecretHit` carries only provenance, and the package imports no logger ¬ | 06 §4.2 | L1     | 9     |
 
 ### 6.6 V-PRO — Proactivity and its bounds
 
@@ -517,14 +518,15 @@ name a permissive accountant" to the empty set.
 
 ### 6.10 V-OBS — SLIs, audit, attribution
 
-| ID        | Assertion                                                                                      | Source | Lvl    | Phase |
-| --------- | ---------------------------------------------------------------------------------------------- | ------ | ------ | ----- |
-| V-OBS-001 | SLI 1 cross-scope escapes: alert exists, reads zero, and **fires when deliberately tripped** ¬ | 01 §7  | L3     | 14    |
-| V-OBS-002 | SLI 2 unjournaled mutations: exists, zero, fires ¬                                             | 01 §7  | L3     | 14    |
-| V-OBS-003 | SLI 3 self-escalations: exists, zero, fires ¬                                                  | 01 §7  | L3     | 14    |
-| V-OBS-004 | SLI 4 undo health: coverage and undo success rate reported                                     | 01 §7  | L3     | 14    |
-| V-OBS-005 | Attribution chain intact: chat → envelope → `ActionRecord` → audit log, one trace ID           | 06 §8  | L2, L3 | 10    |
-| V-OBS-006 | Proactivity metrics exist: MTTR, share auto-resolved, actions/day, flap and revert counters    | 01 §7  | L3, L4 | 14    |
+| ID        | Assertion                                                                                                                                                                                                                | Source  | Lvl    | Phase |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- | ------ | ----- |
+| V-OBS-001 | SLI 1 cross-scope escapes: alert exists, reads zero, and **fires when deliberately tripped** ¬                                                                                                                           | 01 §7   | L3     | 14    |
+| V-OBS-002 | SLI 2 unjournaled mutations: exists, zero, fires ¬                                                                                                                                                                       | 01 §7   | L3     | 14    |
+| V-OBS-003 | SLI 3 self-escalations: exists, zero, fires ¬                                                                                                                                                                            | 01 §7   | L3     | 14    |
+| V-OBS-004 | SLI 4 undo health: coverage and undo success rate reported                                                                                                                                                               | 01 §7   | L3     | 14    |
+| V-OBS-005 | Attribution chain intact: chat → envelope → `ActionRecord` → audit log, one trace ID                                                                                                                                     | 06 §8   | L2, L3 | 10    |
+| V-OBS-006 | Proactivity metrics exist: MTTR, share auto-resolved, actions/day, flap and revert counters                                                                                                                              | 01 §7   | L3, L4 | 14    |
+| V-OBS-008 | A journaled snapshot carries no `managedFields` and no Secret material anywhere in its bytes — a Secret's pre-state is a per-key digest — and the rollback replayer recognises that redaction and refuses to replay it ¬ | 05 §1.2 | L1     | 9     |
 
 ### 6.11 V-ADV — Adversarial (BLOCKING-ALWAYS)
 

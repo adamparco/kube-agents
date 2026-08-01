@@ -1,0 +1,145 @@
+{
+  "_comment": "V-GAT-024 -- a secret digest is computed in-broker and cannot leave package `classify` (06 §4.2). M1-M4 and M10 break the FORMULA (both digests, all three forms, the 0x1f separator, the form labels); M5-M7 widen the SURFACE, which is the only way a digest gets out of the package; M8-M9 put a writer inside it. The surface mutants are the point: every one of them leaves behaviour identical and every existing behavioural test green.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./internal/broker/classify/"]
+  },
+  "mutants": [
+    {
+      "id": "M1-namespace-separator-dropped",
+      "why": "without 0x1f the salted digest is sha256(ns||value), so namespace `team` + secret `a...` and namespace `teama` + secret `...` collide and a hit names the wrong owner",
+      "catcher": "TestDigestSetEntriesAreExactlyTheSpecifiedForms",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "out[hashHex(append(append([]byte(ns), 0x1f), b...))] = name",
+          "replace": "out[hashHex(append([]byte(ns), b...))] = name"
+        }
+      ]
+    },
+    {
+      "id": "M2-unsalted-digest-dropped",
+      "why": "the unsalted digest is the one that catches the cross-namespace copy -- read from namespace A, written into namespace B, which is the exfiltration shape rather than the coincidence shape",
+      "catcher": "TestDigestSetEntriesAreExactlyTheSpecifiedForms",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "\t\tout[hashHex(b)] = name\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M3-url-form-dropped",
+      "why": "a secret that went into a connection string or a webhook URL is URL-encoded, and the gate stops seeing it",
+      "catcher": "TestDigestSetEntriesAreExactlyTheSpecifiedForms",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "\t\t\"url\":    []byte(url.QueryEscape(string(value))),\n",
+          "replace": ""
+        },
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "\t\"net/url\"\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M4-base64-form-dropped",
+      "why": "`data:` is base64, so the encoded form is what someone actually copies out of a Secret and into a ConfigMap",
+      "catcher": "TestDigestSetEntriesAreExactlyTheSpecifiedForms",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "\t\t\"base64\": []byte(base64.StdEncoding.EncodeToString(value)),\n",
+          "replace": ""
+        },
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "\t\"encoding/base64\"\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M5-exported-getter-hands-out-the-map",
+      "why": "one exported accessor and every digest is reachable from any package that holds a DigestSet -- the journal writer, the notifier, anything with a logger. Behaviour is unchanged and no behavioural test can see it",
+      "catcher": "TestDigestSetSurfaceCannotYieldADigest",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "// Len reports how many digests are in the set, for metrics and tests. Never logs the contents.",
+          "replace": "// Digests exposes the raw digest map for callers that want to persist it.\nfunc (ds *DigestSet) Digests() map[string]SecretHit { return ds.byDigest }\n\n// Len reports how many digests are in the set, for metrics and tests. Never logs the contents."
+        }
+      ]
+    },
+    {
+      "id": "M6-exported-field-on-the-set",
+      "why": "same escape by a different door: an exported field needs no method at all, and `%+v` on the struct prints every digest",
+      "catcher": "TestDigestSetSurfaceCannotYieldADigest",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "type DigestSet struct {\n",
+          "replace": "type DigestSet struct {\n\t// Hits is the digest map, exported for metrics.\n\tHits map[string]SecretHit\n"
+        }
+      ]
+    },
+    {
+      "id": "M7-secret-hit-gains-a-field-that-can-hold-material",
+      "why": "SecretHit reaches the journal, the chat notification and the audit log; a field that can hold the value is the leak the whole rule exists to prevent, and it leaks on the day someone populates it",
+      "catcher": "TestDigestSetSurfaceCannotYieldADigest",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/input.go",
+          "find": "type SecretHit struct {\n\tNamespace string",
+          "replace": "type SecretHit struct {\n\tValue     string\n\tNamespace string"
+        }
+      ]
+    },
+    {
+      "id": "M8-a-logger-arrives-in-the-package",
+      "why": "06 §4.2 says digests are never logged; a logger in the package that holds them turns that from a property of the code into a promise about call sites",
+      "catcher": "TestClassifyPackageLogsNothing",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "\t\"fmt\"\n\t\"net/url\"\n",
+          "replace": "\t\"fmt\"\n\t\"log\"\n\t\"net/url\"\n"
+        },
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "func hashHex(b []byte) string {",
+          "replace": "func init() { log.SetPrefix(\"classify: \") }\n\nfunc hashHex(b []byte) string {"
+        }
+      ]
+    },
+    {
+      "id": "M9-a-print-arrives-in-the-package",
+      "why": "no import needed for this one -- `fmt` is already here, and stdout in a pod IS the log",
+      "catcher": "TestClassifyPackageLogsNothing",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "func hashHex(b []byte) string {\n\tsum := sha256.Sum256(b)",
+          "replace": "func hashHex(b []byte) string {\n\tfmt.Print(\"\")\n\tsum := sha256.Sum256(b)"
+        }
+      ]
+    },
+    {
+      "id": "M10-form-label-drifts",
+      "why": "the reason string tells a human HOW the material matched -- raw, base64 or url -- and that is what distinguishes a leak from a legitimate reference",
+      "catcher": "TestDigestSetEntriesAreExactlyTheSpecifiedForms",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/secretegress.go",
+          "find": "\t\t\"raw\":    value,",
+          "replace": "\t\t\"plain\":  value,"
+        }
+      ]
+    }
+  ]
+}
