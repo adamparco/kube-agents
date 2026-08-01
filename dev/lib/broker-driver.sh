@@ -88,6 +88,13 @@ BROKER_DRIVER_PROBE_NAME="broker_probe.py"
 # not — `broker_probe.py` targets its own namespace and ignores this.
 BROKER_DRIVER_TENANT_NS="${BROKER_DRIVER_TENANT_NS:-}"
 
+# The name the probe should give the object it aims at. Empty means "use the probe's own constant",
+# which is what every single-submission caller wants. A caller that runs the same probe repeatedly
+# against one cluster MUST vary it per submission: 06 §9's idempotency key is a hash over identity +
+# operations + dryRun, so an unvaried target makes every submission after the first the SAME action,
+# answered `200 decision=deduplicated` carrying the FIRST submission's actionId ([[LSN-067]]).
+BROKER_DRIVER_TARGET_NAME="${BROKER_DRIVER_TARGET_NAME:-}"
+
 # WHAT ELSE THE PROBE IS TOLD (P9-T9b-5b-ii-a)
 #   Newline-separated `NAME=VALUE`, appended to the pod's env and empty by default. It exists
 #   because `broker_refuse_probe.py` runs the SAME probe twice against two different cluster states
@@ -330,6 +337,12 @@ spec:
           value: "$ns"
         - name: PROBE_TENANT_NAMESPACE
           value: "$BROKER_DRIVER_TENANT_NS"
+        # Empty for every caller that submits once, which leaves the probe's historical constant in
+        # place. A caller that submits the SAME probe more than once per cluster must vary this, or
+        # 06 §9's idempotency key is identical and the broker answers the second submission with the
+        # first one's record ([[LSN-067]]).
+        - name: PROBE_TARGET_NAME
+          value: "$BROKER_DRIVER_TARGET_NAME"
         - name: PROBE_FOREIGN_TLS_DIR
           value: "$BROKER_DRIVER_FOREIGN_TLS_DIR"
         - name: PROBE_UNTRUSTED_TLS_DIR

@@ -1746,7 +1746,17 @@ CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
 # scale. The line above it already scores V-REV-001 and is green; this one is the same check with a
 # denominator of 35 instead of 1, which is the difference between "the undo planner worked once" and
 # "the undo planner covers the corpus". Same commit as the line, same rule.
-L2_CHAIN_FLOOR = 22
+# Raised 22 -> 29 on 2026-07-31 (P9-T11g-4a and P9-T11h), in one move, and the count is OBSERVED
+# rather than incremented — read back out of _l2_chain_scripts() after the lines landed, because six
+# suites arrived across two units and an arithmetic floor would have been wrong in whichever
+# direction the last author guessed. The six: vap-corpus-l2.sh (V-CTN-012), manager-role-l2.sh
+# (V-CTN-017 at L2), classifier-identity-l2.sh (V-GAT-002), startup-ordering-l2.sh (V-RUN-005),
+# workload-pair-l2.sh (V-RUN-001/002/004/009) and brake-l2.sh (V-CTR-007, V-RUN-007/008). Same rule
+# as every line above: the floor moves in the commit that adds the chain line, never after it.
+# Raised 29 -> 30 on 2026-07-31 (P9-T11h): reader-scope-l2.sh, V-CTN-001 and the L2 half of
+# V-CTN-004. V-CTN-001 is BLOCKING-ALWAYS and was the last row of the phase-9 required set still not
+# green; a floor that did not move with it would let the line be deleted without anything going red.
+L2_CHAIN_FLOOR = 30
 # How many scripts the TRANSITIVE scope held when it was widened (2026-07-25, P8-T8). A separate
 # ratchet from the one above because the two guard different things: L2_CHAIN_FLOOR notices a line
 # leaving L2-CHAIN.txt, this one notices a claim-making script leaving the closure — including one
@@ -1770,7 +1780,14 @@ L2_CHAIN_FLOOR = 22
 # it by artifact and failing while it was absent. A fifth time together.
 # Raised 30 -> 31 on 2026-07-31 (P9-T8b-4b-ii-2b-ii-b): undo-coverage-l2.sh, named on an L2 chain
 # line. A sixth time together.
-L2_SCOPE_FLOOR = 31
+# Raised 31 -> 37 on 2026-07-31 (P9-T11g-4a and P9-T11h): the same six suites, all named on chain
+# lines, so the two floors move together a seventh time — and this is the run that shows why they are
+# still two numbers. The chain gained six lines and the closure gained six scripts, but the closure
+# count is read from _l2_scripts_in_scope() and not derived from the other, so the day a suite joins
+# by being SOURCED rather than named, only this one moves.
+# Raised 37 -> 38 on 2026-07-31 (P9-T11h): reader-scope-l2.sh, named on an L2 chain line. Both floors
+# move together an eighth time.
+L2_SCOPE_FLOOR = 38
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:

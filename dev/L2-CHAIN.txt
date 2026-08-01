@@ -203,6 +203,24 @@ bash dev/verify/brake-fanout-l2.sh gke-scratch-kube-agents-dev
 # agent's broker.
 bash dev/verify/broker-per-agent-l2.sh gke-scratch-kube-agents-dev
 
+# --- V-RUN-001/002/004/009 at L2 — the workload pair, its identities and its labels ---------
+# Cardinality and ownership of the gateway/broker pair; the reader SA and the broker's actor SA
+# resolve, differ, and match what the CR and status.broker.actorServiceAccount publish; five
+# label keys across eight targets, with cluster-wide selectability established BY OWNERSHIP
+# rather than by the selector under test; and deletion leaving the identities behind.
+#
+# FIVE labels, not the four 09 §6.8 names. That row's own Source column points at 05 §8, and
+# 05 §8's heading is "Labels — five, not three". 08 §2.5 tables all five and agentlabels.For()
+# renders five. Dropping kube-agents/agent would also leave the same 09 row's "and selectable"
+# clause unbacked, since it is the only key that selects a single pair. Five is a strict superset
+# of the four-label reading, so the suite cannot pass where that reading would fail.
+#
+# P1 is asserted on the controller only: _p1_build_inputs maps k8s-operator | kage-router |
+# kage-broker, and the two shipped ghcr.io CRs have no mapping, so asserting it on both halves of
+# each pair returns 3 forever. The suite applies both shipped CRs directly rather than through
+# seed_parent_agent, which injects scaleToZero and would leave V-RUN-004's pod arms unmeasurable.
+bash dev/verify/workload-pair-l2.sh gke-scratch-kube-agents-dev
+
 # V-BRK-007/008/009/010/017: what the deployed broker does with a credential. The third line that
 # needs P1 in full on the BROKER pod, and the first that needs the broker to actually SERVE — every
 # preceding broker line asserts around the door, because until dev/lib/broker-driver.sh nothing here
@@ -269,6 +287,26 @@ bash dev/verify/actor-overlay-admission-l2.sh gke-scratch-kube-agents-dev
 # unreadable from a shadow because a server-side dry-run persists no managedFields. V-BRK-018 is the
 # next line's. The suite's own header carries the full accounting.
 bash dev/verify/broker-execute-l2.sh gke-scratch-kube-agents-dev
+
+# --- V-GAT-002 at L2 — the classifier's four rungs, on a live broker ----------------------
+# Four patch operations with IDENTICAL merge-patch bodies against four ConfigMaps in one tenant
+# namespace, differing only in the lever staged on the target: none, a production environment
+# label, a gated risk-class annotation, a forbidden one. Identical bodies is the point — if the
+# operations differed, a class difference would not be attributable to the lever.
+#
+# One rung is displaced and the suite says so rather than hiding it. Every Phase 9 action is
+# spec.dryRun, history.go::derive() skips dry-run records ("an action that was never executed is
+# not experience"), so novelty applies +1 to every classification and `routine` is not observable
+# on this build at all. The routine rung therefore asserts the strongest statement dark mode
+# admits: elevated with `novel-action` as its ONLY escalation. Corpus-class agreement for that
+# rung is deferred to the phase that grants write authority.
+#
+# Attribution, not just class, is asserted: rungs 1 and 2 land on the same live class and only
+# the reason distinguishes them, and rejection.go writes Class: RiskForbidden on EVERY journaled
+# refusal whatever it refused for — so a class-only arm would score an RBAC denial as "the
+# classifier said forbidden". Needles are `~`-terminated so broker/forbidden cannot match
+# broker/target-forbidden.
+bash dev/verify/classifier-identity-l2.sh gke-scratch-kube-agents-dev
 
 # V-BRK-018 and V-ISO-006 at L2, and the journal half of Phase 9 acceptance bullet (d) — the same
 # submission path as the line above, run at the two ways it can refuse and then at the way it comes
@@ -348,6 +386,21 @@ bash dev/verify/broker-refuse-l2.sh gke-scratch-kube-agents-dev
 # reasons appear on the record and the suite asserts the classifier's by name.
 bash dev/verify/broker-gate-l2.sh gke-scratch-kube-agents-dev
 
+# --- V-RUN-005 at L2 — the agent starts without its broker, and converges when it arrives ---
+# 08 §7(a) says to delay the broker's image pull. That is the wrong experiment on this build:
+# buildWaitForBrokerContainer runs brokerImage(), so `wait-for-broker` IS the broker binary
+# inside the agent pod, and an unpullable image puts the pod in Init:ImagePullBackOff — the init
+# container never runs, never times out, and observe-and-report is never reached.
+#
+# The lever that works is manifest_helpers.go:210-223: scaleToZero sets replicas=0 on the AGENT
+# Deployment only, while brokerReplicas is a constant. One CR in one namespace gives all three
+# arms — broker Available with the gateway at zero; re-apply without scaleToZero and the init
+# container exits 0 having polled the rendered KUBEAGENTS_BROKER_ENDPOINT + /healthz; then delete
+# this run's actor SA so ServiceAccount admission refuses the broker pod, and the init container
+# times out, still exits 0, and logs observe-and-report with AgentReady ∧ ¬BrokerReady ⇒ ¬Ready.
+# Three image digests are read from live imageIDs and a tag-only answer is a FAIL, not a note.
+bash dev/verify/startup-ordering-l2.sh gke-scratch-kube-agents-dev
+
 # V-BRK-013 at L2, and Phase 9's acceptance (e) — "no agent identity in the fleet holds a write
 # verb, verified by a full auth can-i sweep". The L0 half of V-BRK-013 has been green for a while
 # and is a real result; it is also, entirely, a statement about files. This is the same property
@@ -391,6 +444,17 @@ bash dev/verify/broker-gate-l2.sh gke-scratch-kube-agents-dev
 # install that is a test granting exactly what this phase exists to withhold. The revoke is asserted
 # in its own arm and repeated unconditionally from the EXIT trap.
 bash dev/verify/actor-grant-sweep-l2.sh gke-scratch-kube-agents-dev
+
+# --- V-CTN-017 at L2 — the controller mints no RBAC, asked of the INSTALL ----------------
+# The L0 arm (dev/tests/controller-mints-no-rbac.py, on dev/L0-CHAIN.txt) parses the rendered
+# ClusterRoles AND the +kubebuilder:rbac markers and asserts they agree triple-for-triple. That
+# is a property of the TREE. This is the same property asked of the CLUSTER, and the two can
+# disagree in the direction that matters: a grant can be added to config/rbac/role.yaml and
+# never applied, or applied out of band and present in neither artifact. The suite imports the
+# L0 file with importlib rather than restating its constants, so "what 08 §7 forbids" has one
+# definition site across both levels. It ends with a 253-question authorizer sweep asked as all
+# three control-plane ServiceAccounts, with positive controls derived from the tree's own grants.
+bash dev/verify/manager-role-l2.sh gke-scratch-kube-agents-dev
 
 # V-REV-001 at L2 at POPULATION scale — "100% of executed non-gated ActionRecords carry a validated
 # undo plan". broker-execute-l2.sh already scores V-REV-001 and its row is a real result; it is also
@@ -446,6 +510,32 @@ bash dev/verify/undo-coverage-l2.sh gke-scratch-kube-agents-dev
 # zero and back and deletes both halves of the pair — reversible, single-object, and restored by an
 # EXIT trap, but not something to run against anything but a scratch cluster.
 bash dev/verify/chaos-suite.sh gke-scratch-kube-agents-dev
+
+# --- V-CTR-007, V-RUN-007, V-RUN-008 at L2 — the brake, and what it must survive -----------
+# 25 assertions in three arms. The brake has to work with inference down, which means it has to
+# work through kubectl against the API server and nothing else, and that is the property the arms
+# are built around rather than a caveat appended to them.
+bash dev/verify/brake-l2.sh gke-scratch-kube-agents-dev
+
+# --- V-CTN-001, V-CTN-004 at L2 — the reader reads only inside its tier scope ---------------------
+# 1389 `auth can-i` questions as all three reader ServiceAccounts, derived rather than listed — the
+# roster from the reader label, the tiers from the tree cross-checked against the served CRD
+# (LSN-036), the yes-side from the rules actually bound to each tier filtered through
+# `kubectl api-resources -o name`, the verb allow-list imported from the L0 arm by importlib so the
+# two levels cannot drift. Two-sided per tier: the positive control is the vacuity guard (LSN-035)
+# and goes red on an under-bound reader before any negative can go silently true.
+#
+# The 'no for any other cluster' clause of 03 §11 is NOT asserted here, and the run says so in a
+# GREEN banner rather than only in a red one: RBAC carries no cluster axis, so the only reachable
+# proxy would answer from the group axis arm L2-E already owns and would answer identically for this
+# cluster's own name. The L3 arm owns that clause and it is recorded as a deferral.
+#
+# IT MUST RUN SERIALLY, WHICH ON THIS CHAIN IS FREE. Its roster is derived cluster-wide from
+# `kube-agents/role=reader`, and every suite that seeds an agent identity mints an SA carrying that
+# label — correctly, because seed_agent_identity renders it with the SHIPPED renderer rather than a
+# copy (LSN-024). Run concurrently with one of them it sees a fourth reader that the GitOps overlay
+# does not bind and reports 102 true-but-irrelevant failures ([[LSN-066]]).
+bash dev/verify/reader-scope-l2.sh gke-scratch-kube-agents-dev
 
 # --- Phase 9's gate ------------------------------------------------------------------------------
 # verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the

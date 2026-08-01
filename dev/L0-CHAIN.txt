@@ -378,6 +378,42 @@ python3 dev/verify/fixtures/soak_corpus.py --self-test
 # the live line proves those, and only against a cluster.
 bash dev/verify/undo-coverage-l2.sh --negative-control
 
+# The cluster-free negative controls of the L2 suites landed for the phase-9 gate. Each runs its
+# own arms against synthesised transcripts, one injected defect per arm, and each row names the
+# arm it targets — so the control fails the day an arm stops asserting, not the day someone
+# notices. They belong on L0 and not only on L2 because a control that only runs where a cluster
+# is is a control that runs at most once a day; these run on every PR.
+bash dev/verify/manager-role-l2.sh --negative-control
+bash dev/verify/startup-ordering-l2.sh --negative-control
+bash dev/verify/classifier-identity-l2.sh --negative-control
+# reader-scope's control is the one that matters most on this list: V-CTN-001 is BLOCKING-ALWAYS, so
+# its live arm may never be deferred, and a control that only ran where a cluster is would leave the
+# repo unable to tell a green run from an arm that stopped asking. 8 mutations, each caught by its
+# owning arm and no other.
+bash dev/verify/reader-scope-l2.sh --negative-control
+# workload-pair's four rows (V-RUN-001/002/004/009) are the only ones on this list whose live arms
+# ALL measured green on a real cluster first time, which is exactly why they needed a control: a
+# suite of green rows reads identical to a suite of vacuous ones. 33 rows — 23 synthesised defects
+# and 10 correct inputs — replayed against the suite's own `judge_*` functions rather than a second
+# copy of them ([[LSN-024]]), each defect matched to the arm that targets it by needle, so a defect
+# caught by the wrong clause scores MISS rather than ok ([[LSN-035]]). Its load-bearing row is
+# V-RUN-002's: a pair running as ONE ServiceAccount must trip exactly the arm that compares the two
+# identities and leave the three that merely read a name green.
+bash dev/verify/workload-pair-l2.sh --negative-control
+# brake-l2 is the only suite on this list that ALREADY carries seven `¬` arms — A-0, A-5, A-6, B-2,
+# B-4, C-3 and the pre-strip `auth can-i` — and it still needed this one. Those seven are live
+# contrasts: they prove the CLUSTER can move the reading, and not one of them can run where there is
+# no cluster. This mode proves the other half, that the suite's JUDGING can go red: 39 rows, 26
+# synthesised defects and 13 correct inputs, replayed against the file's own `judge_*` functions
+# rather than a second copy of them ([[LSN-024]]), each defect matched to its owning arm by needle so
+# a defect caught by the wrong clause scores MISS ([[LSN-035]]) and an input equal to the clean
+# baseline scores BROKEN ([[LSN-063]]). Two rows are why it is on L0 and not only on L2: a retry
+# answered `200 decision=deduplicated` must be REJECTED where an arm wants a fresh acceptance — that
+# is [[LSN-067]], measured here, and it is a 200 that reads like a success — and a fail-closed row-1
+# refusal from a broker that RESTARTED must trip only B-6, since its 403 is byte-identical to the one
+# a broker that degraded in place returns.
+bash dev/verify/brake-l2.sh --negative-control
+
 # --- The phase ratchet, derived rather than remembered (planning defect 4) ------------------------
 # The CHECK ITSELF is not on this chain, and that is deliberate. `phase-ratchet-is-asserted.py
 # --phase 9` is RED today by construction: 38 of Phase 9's 75 required check IDs have no green row

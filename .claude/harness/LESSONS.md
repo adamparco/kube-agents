@@ -93,8 +93,13 @@ will start selecting.
 | **LSN-062** | records, verification, orient | A harness record states that a file "does not exist", and the file is right there. `P9-T11g-2a`'s split note said `verification/traceability.yaml` did not exist. It had existed since `P8-T10` — 71 KB, 177 entries, V-MET-011's artifact, green on every run. The question actually asked was *"does 09 §8's `R-<doc>.<section>-<n>` requirement mapping exist?"* — a correct **no** — and the answer was written down against the **filename §8 happens to use for it** rather than against the question. The unit's conclusion survived; its published reason did not, and it shipped in a commit message, a phase-file row and a ledger cell before the next ORIENT caught it | **open** | Proposed for the next improvement pass: an L0 lint that reads `docs/build/*.md`, `.claude/harness/*.md` and `verification/*.yaml` headers for a repo path asserted absent ("does not exist", "is absent", "is not in the tree", "nothing at") and fails when the path is present — the claim is cheap to make, load-bearing for scheduling, and trivially checkable |
 | **LSN-063** | checks, verification, mutation-testing | A negative-control row prints `MISS`, and the mutation it names never applied | **open** | Guarded in `requirements-are-enumerated.py` and, after it recurred one unit later, `coverage-ratchet-holds.py` (a mutated tuple equal to the base prints `BROKEN` and fails); a third recurrence in `load-bearing-coverage-is-full.py` widened it — a literal LINE NUMBER expires the same way a literal count does, and the mutation still applied, so only [[LSN-035]]'s per-row needle caught it; proposed for the next improvement pass: both halves for the other 18 `negative_control()` loops, hoisted into one helper and policed by `negative-controls-name-their-rule.py` |
 | **LSN-064** | checks, verification, L2, shell | Every assertion ran on the right-hand side of a pipe, so `fail=1` landed in a subshell and the suite could not go red | **open** | Fixed in `webhook-negatives-l2.sh` by moving the failure flag into a `mktemp` FAILFILE at the single `bad` choke point, proved with an in-tree mutant (rc 1); a repo-wide scan with `||` excluded found no second instance; proposed for the next improvement pass: that scan as an L0 lint under `dev/tests/`, standing in for the broader property that a suite whose exit code no single-assertion mutation can make non-zero is not a check |
+| **LSN-065** | checks, verification, L2, shell, self-concealing | `IFS=$'\t' read … <<<"$(fn)"` — an assignment prefix is already in effect while the here-string operand is expanded, so the function ran with `IFS=<tab>`, unquoted `$K` stopped splitting on spaces, and every `kubectl` became one command name that does not exist. The `2>/dev/null` on each status read ate the `command not found`, so a live cluster was reported as a pod with no phase and a CR with no conditions — the exact shape the suite exists to report | **open** | Fixed at all four sites in `startup-ordering-l2.sh` by substituting into a plain variable first; a repo-wide scan found no third instance (`chaos-suite.sh:513` already had the safe shape); proposed for the next improvement pass: an L0 lint refusing an assignment prefix on any command whose redirection operand is computed |
+| **LSN-066** | verification, L2, concurrency, false-red, derived-rosters | `reader-scope-l2.sh` (V-CTN-001, BLOCKING-ALWAYS) went red with 102 failures against a ServiceAccount owned by a **different L2 suite running at the same time**. Neither artifact is wrong: the roster is derived from the reader label ([[LSN-036]]) and the fixture carries that label because it is rendered by the shipped renderer ([[LSN-024]]). Both obvious repairs are refused — one re-introduces LSN-024, the other weakens a BLOCKING-ALWAYS check | **open** | The chain is already serial and the constraint is now stated in the `reader-scope-l2.sh` block of `dev/L2-CHAIN.txt` with the reasons the repairs are refused; proposed for the next improvement pass: an advisory lock taken by every L2 chain script, standing in for the property that a check deriving its subject set from cluster state measures every other tenant of that cluster too |
+| **LSN-067** | checks, verification, L2, broker, idempotency, false-red, self-concealing | `brake-l2.sh` submitted a **fixed** envelope eleven times and got one `actionId` — 1 `accepted`, 10 `deduplicated`. 06 §4.1's idempotency key is a sha256 over identity + operations + dryRun, so a probe with a constant target IS the same action every time, and every arm after the first was answered by the first submission's record: two arms red where the stale answer disagreed, nine vacuously green where it agreed | **open** | Fixed by parameterising the probe's target name (`PROBE_TARGET_NAME` → `BROKER_DRIVER_TARGET_NAME` → `brake-l2-shadow-target-$SUBMIT_N`), default preserved so single-submission callers are byte-identical; proposed for the next improvement pass: `broker_driver_run` itself asserts `distinct(actionId) == submissions` |
+| **LSN-068** | fixtures, verification, L2, networkpolicy, dns, install-path, prose-is-not-mechanization | The operator's `<agent>-to-broker` policy is **Egress-only**, so it makes the reader pod default-deny for every other egress including DNS; rule 1 of the tier allowlist owns DNS and `provision_13` applies it, which a scratch cluster never runs. `startup-ordering-l2.sh` read `context deadline exceeded` on the init container's first probe while the broker Deployment said 1/1/1 — and the opposite arm, which expects that timeout, was passing for free. `broker-driver.sh`'s header had stated the whole fact in an earlier phase | **open** | Fixture now seeds the tier allowlist through `common.sh:render_egress_policy` (rule 9 included — the broker carries `kube-agents/tier` too). Proposed: a shared `dev/lib/shipped-render.sh`; a declared precondition 'this namespace models an installed agent'; and a product-side check that every Agent's namespace admits DNS |
+| **LSN-069** | networkpolicy, install-path, provisioning, dataplane-v2, broker, silent-failure, product-defect | Rule 9 pinned the `kubernetes` **ClusterIP** and the **kubeconfig endpoint**; GKE Dataplane V2 DNATs before scoring egress, so the packet carries the **`endpoints/kubernetes`** address (10.150.0.9 scratch / 10.150.0.2 live) which `resolve_apiserver_cidrs` never read. The broker blocks in `startSources()` BEFORE its listener opens, so the symptom is an EMPTY log and `connection refused` on both probes | **open** | `resolve_apiserver_cidrs` now reads `endpointslices` (then `endpoints`) first and emits all three /32s, deduplicated. Proved by adding one /32 to the live namespace: broker `1/1` in one probe period. Separate finding: the LIVE `platform-egress` has no rule 9 at all and three agent gateways run under it |
 
-**Open: 3 of 64**.
+**Open: 8 of 69**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -3723,3 +3728,340 @@ tractable half of that.
 same lesson at the level of the process exit code rather than the assertion) · [[LSN-049]] (an
 applier that died and its `0` was read as the suite passing) · [[LSN-019]] (prose on the artifact is
 not a mechanization).
+
+---
+
+## LSN-065 — `IFS=$'\t' read … <<<"$(fn)"` ran the function with IFS already set, and every cluster read came back empty
+
+**Tags:** checks, verification, L2, shell, self-concealing
+**Opened:** 2026-07-31 (P9-T11h) · **Status:** open
+
+`startup-ordering-l2.sh` reported, on a live cluster, that the agent pod had no `.status.phase`,
+that its container published no `restartCount`, and that the Agent CR carried none of the three 08
+§7(c) conditions. Both directions — broker-first and agent-first — failed with the same four
+problems, and the run took six minutes longer than it should have because each read polled its full
+timeout before giving up. At the same moment, from another shell, all three values read back
+instantly and correctly: `Running`, `0`, `AgentReady=True BrokerReady=False Ready=False`.
+
+The suite was not observing the cluster at all. Four call sites had this shape:
+
+```bash
+IFS=$'\t' read -r phase restarts <<<"$(pod_transcript "$agent_pod")"
+```
+
+A variable assignment written as a **command prefix is already in effect while the redirection
+operand is expanded**, so `pod_transcript` runs with `IFS=<tab>`. Every helper in the file reaches
+the cluster through unquoted `$K`, which holds `kubectl --context gke-scratch-kube-agents-dev`.
+Unquoted expansion splits on `IFS` — and with `IFS` no longer containing a space, that is **one
+word**: a command named `kubectl --context gke-scratch-kube-agents-dev`. No such command exists,
+the `2>/dev/null` every status read carries eats the `command not found`, and the function returns
+empty strings.
+
+Reduced to four lines:
+
+```bash
+K="echo hello"; f() { $K world; }
+out="$(f)"; IFS=$'\t' read -r a <<<"$out"   # a=[hello world]
+IFS=$'\t' read -r b <<<"$(f)"               # bash: echo hello: command not found · b=[]
+```
+
+**Why it is worse than a wrong answer.** The failure produces exactly the output shape the suite
+exists to report. An empty phase renders as `the agent pod is in phase '<unreadable>', not Running`;
+absent conditions render as `AgentReady=<unset>` under a paragraph quoting 08 §2.4 on fleets blinded
+by a broker outage. A blind instrument and a broken product are the same four lines of red. Two
+sibling helpers in the same file — `wait_agent_image_id`, `wait_init_terminated` — are
+character-for-character the same read against the same pod and both PASSED, because they are called
+without the prefix; that near-identity is what made the fault read as a property of the cluster.
+
+**Fixed** by substituting into a plain variable first and reading from the variable, at all four
+sites. `chaos-suite.sh:513` already had the safe shape (`IFS=: read … <<<"$_pair"`), and a
+repo-wide scan found no third instance.
+
+A second, unrelated defect surfaced in the same run and is fixed with it: `broker_ready_now` applied
+its `:-0` default to the **subject** of the sanitising `case`, so an empty read arrived at the case
+as the string `0`, matched neither arm, left the variable empty, and the `-gt` below died with
+`integer expression expected`. The sanitiser sanitised a copy.
+
+**Proposed mechanization** (improvement pass): an L0 lint under `dev/tests/`, on `dev/L0-CHAIN.txt`,
+failing any `<<<` here-string whose operand contains a command substitution **when the same simple
+command carries a variable-assignment prefix**. It is a two-line regex over `dev/**/*.sh` and it
+generalises one step further, which is the version worth writing: **an assignment prefix on a
+command whose redirection operand is computed is a scope bug whether or not the variable is `IFS`.**
+
+**Related:** [[LSN-064]] (the sibling — there the suite could not go red; here it could not see, and
+both were found only because a human read the transcript) · [[LSN-035]] (a check that goes quiet
+reads identically to a passing one) · [[LSN-060]] (the negative control skipped the statement under
+test, so green measured nothing).
+
+---
+
+## LSN-066 — A derived roster is a shared-cluster global, and two L2 suites at once made a BLOCKING-ALWAYS check red
+
+**Tags:** verification, L2, concurrency, false-red, derived-rosters
+**Opened:** 2026-07-31 (P9-T11h) · **Status:** open
+
+`reader-scope-l2.sh` (V-CTN-001, **BLOCKING-ALWAYS**) came back rc 1 with `readers=4` and 102
+failures, every one of them against `system:serviceaccount:startup-ordering-l2:platform-agent` — a
+ServiceAccount belonging to a **different L2 suite that happened to be running at the same time**.
+Re-run after that namespace went away: rc 0, 1389 questions, 8/8 arms, identical per-arm scales.
+
+Neither suite is wrong, and this is the part worth keeping. `reader-scope-l2.sh` derives its roster
+cluster-wide from `kube-agents/role=reader` rather than from a curated list, which is [[LSN-036]]
+applied correctly — a listed roster is a roster someone must remember to extend.
+`startup-ordering-l2.sh` mints its fixture identity through `seed_agent_identity`, which calls
+`render_agent_identity` out of the **shipped** `k8s-operator/scripts/common.sh`, so the fixture
+carries the same labels the real install carries — which is [[LSN-024]] applied correctly, because a
+hand-written stand-in is a fixture that can pass while the shipped identity is broken. The label
+that makes the fixture honest is the same label that makes it visible to the derived roster.
+
+So the tempting fixes are both wrong. Making the fixture drop the reader label re-introduces
+[[LSN-024]]. Narrowing the roster to namespaces the GitOps overlay covers **weakens a
+BLOCKING-ALWAYS check** — a reader identity nobody bound, standing in a namespace nobody expected, is
+precisely what V-CTN-001 exists to find, and it should stay findable. The defect is in neither
+artifact: it is that **two L2 suites were run concurrently**, which `dev/L2-CHAIN.txt` never does and
+which nothing forbade.
+
+**Fixed for the chain** by the chain already being serial, and recorded where a future reader will
+meet it: the `reader-scope-l2.sh` block in `dev/L2-CHAIN.txt` states the constraint and why the
+obvious repairs are refused.
+
+**Proposed mechanization** (improvement pass): an advisory lock, taken by every script on
+`dev/L2-CHAIN.txt` against a single well-known file, so a second concurrent L2 suite blocks rather
+than producing a red that points at the wrong artifact. Cheap, and it fails safe — the lock is
+per-machine, and the cluster guard is unaffected. The general property behind it: **a check that
+derives its subject set from cluster state is measuring every other tenant of that cluster too.**
+
+**Related:** [[LSN-036]] (derive the roster, never curate it — the rule that makes this possible) ·
+[[LSN-024]] (fixtures render through the shipped renderer — the rule that makes it visible) ·
+[[LSN-048]] (a BROKEN row leaves the mutant unmeasured — a red that names the wrong thing costs the
+same session either way).
+
+---
+
+## LSN-067 — Eleven submissions, one action: the idempotency key is a hash of the operations, so a suite that re-submits the same probe measures the first answer ten more times
+
+**Tags:** checks, verification, L2, broker, idempotency, false-red, self-concealing
+**Opened:** 2026-07-31 (P9-T11h) · **Status:** open
+
+`brake-l2.sh` (V-CTR-007, V-RUN-007, V-RUN-008) came back with two FAILs, both on a **positive** arm
+— B-7 and the V-RUN-008 release arm, each of which submits an envelope after clearing a fault and
+asserts the broker now accepts it. Both reported `outcome='http' status='200' decision='deduplicated'`
+where the arm wanted `202 accepted`. Read as a product finding, that is "the brake does not release":
+the freeze is lifted, the grant is restored, and the broker still will not take work.
+
+The product was correct. Counted across the whole transcript: **11 submissions, one `actionId`
+(`01KYXM37W6Z6NN4P9SRKASRP1X`), 1 `accepted` and 10 `deduplicated`.**
+
+`action_envelope.compute_idempotency_key(agent_identity, operations, dry_run)` is a sha256 over
+exactly those three things, and `CompareIdempotencyKey` on the broker side recomputes it rather than
+trusting what it was sent. The probe submits a fixed operation — `apply` a ConfigMap named by the
+module constant `TARGET_NAME` — as one fixed identity, always `dryRun: true`. So every submission in
+the run is, by the spec's own definition, **the same action**, and 06 §4.1's dedup path answers the
+second and subsequent ones `200 decision=deduplicated` carrying the **first** submission's record.
+This is not the anti-replay guard: that keys on `(identity, traceId, idempotencyKey)` and each
+submission carries a fresh trace, which is precisely the distinction `antireplay.go:224-227` draws —
+same triple is a replay, same key in a new trace is a retry, and a retry gets the original record.
+
+**Why it survives a careful reading of the arm.** Every arm checked the status code and the decision
+word against what it expected _for that arm_, and a dedup is a 200, not an error. The arm asserting
+"still refused during the freeze" was answered by a record minted **before** the freeze existed, and
+passed. The arms asserting "accepted again now the fault is cleared" were answered by the same
+pre-freeze record, and failed — so the suite went red on the two arms where the stale answer
+happened to disagree, and **green on the arms where the stale answer happened to agree**. Nine
+passing arms in that run measured one submission. A suite reporting a mix of red and green is the
+last shape anyone re-reads for "did the instrument observe anything at all".
+
+**Fixed** by making the target name a parameter rather than a constant:
+`broker_execute_probe.py`'s `TARGET_NAME` now reads `PROBE_TARGET_NAME` from the environment,
+`dev/lib/broker-driver.sh` plumbs it through as `BROKER_DRIVER_TARGET_NAME`, and `brake-l2.sh`'s
+`submit()` sets `brake-l2-shadow-target-$SUBMIT_N`. The default is the historical constant, so
+`broker-execute-l2.sh` — which submits once and is green — is byte-identical. Varying the target
+varies the operations, which varies the key, which is the only honest way to ask the question twice:
+the alternative, varying the identity or the dryRun flag, would change what is under test.
+
+**Proposed mechanization** (improvement pass): the general property is that **a suite submitting a
+fixed envelope more than once is measuring one action N times**, and it is checkable without
+understanding any arm — count `distinct(actionId)` across a transcript and compare it to the number
+of submissions. Two places it could live: an assertion inside `broker_driver_run` itself, which
+would catch every current and future caller, or a `dev/tests/` lint refusing a `submit`-style helper
+in `dev/verify/**` that is called more than once without something per-call in the operations. The
+first is cheaper and cannot be forgotten by a new suite; prefer it.
+
+**Related:** [[LSN-064]] (the suite could not go red) · [[LSN-065]] (the suite could not see) —
+with this one, three instrument defects in a single unit, each producing output shaped exactly like
+a genuine product defect. [[LSN-035]] (in this repo a vacuous pass is a failure: nine of the arms
+here were vacuous and reported green) · [[LSN-048]] (a row that did not evaluate its subject is not
+a finding).
+
+---
+
+## LSN-068 — The operator's pair policy is the first artifact that makes an agent pod default-deny on egress, so in any namespace where `provision_13` has not run it silently takes DNS away — and the fact was already written down, in prose, in a sibling file
+
+**Tags:** fixtures, verification, L2, networkpolicy, dns, install-path, prose-is-not-mechanization
+**Opened:** 2026-08-01 (P9-T11g-4b) · **Status:** open
+
+`startup-ordering-l2.sh` (V-RUN-005) went red on arm (a) — _the agent starts first, the broker is
+not there yet_ — with a transcript that read like a product defect and was not one:
+
+```
+broker-first: the init container logged 'observe', not the 'broker is ready' line
+init_exit=0 init_log=observe phase=Running restarts=0 AgentReady=True BrokerReady=True Ready=True
+```
+
+Everything is healthy and the caller still never saw the broker. A read-only watcher caught the
+decisive frame: the init container's **first** probe, and the broker Deployment at the same instant.
+
+```
+| DEBUG setup broker not ready yet {"url": "https://ordering-agent-broker.startup-ordering-l2.svc...:8443/healthz",
+                                    "attempt": 1, "err": "... context deadline exceeded"}
+-- broker deploy at this moment --
+| ordering-agent-broker    1     1        1
+```
+
+**The name never resolved.** `buildAgentToBrokerPolicy` (`pair_netpol.go`) renders an **Egress-only**
+policy selecting the reader half with exactly one rule — TCP 8443 to the actor pod. In Kubernetes,
+a pod selected by _any_ egress policy becomes default-deny for _every other_ egress, DNS included.
+The operator is right to render only the hop it owns, and its header says so: _"Two policies
+selecting the same pod ADD their allowances… `<agent>-to-broker` admits the agent's egress hop to
+that port, which the tier allowlist does not cover."_ Rule 1 of that tier allowlist is
+`netpol-agent-egress.yaml.template`'s DNS rule, whose own comment is _"Without this, every
+name-based egress fails before it starts"_ — and it is applied by
+`provision_13_apply_network_policies.sh`, which `dev/cluster/up.sh` does not run. On the scratch
+cluster the only NetworkPolicy that existed at all was `team-x/default-deny-all`. The live install
+carries all three tier policies, so this is not a live regression; it is what an agent gets in a
+namespace the install path never touched.
+
+**IT ALSO MADE THE OTHER ARM VACUOUS**, which is the part that matters more than the red one. Arm
+(a) _expects_ wait-for-broker to time out and the pair to converge to observe-and-report. On a
+namespace with no DNS it gets that timeout for free, and would go on passing if `wait-for-broker`
+were deleted outright. One red arm and one arm passing for the wrong reason, from a single missing
+rule ([[LSN-035]]).
+
+**Not a check to weaken, and not an operator bug.** The smallest diff to green was to stop asserting
+the broker-first ordering; the correct diff was to make the fixture a namespace an install path
+actually produces. `seed_tier_egress_policy` now applies the tier allowlist through
+**`common.sh:render_egress_policy`** — the same function `provision_13` calls, never a copy
+([[LSN-024]]) — sourced in a subshell because `common.sh` installs its own `trap cleanup EXIT` at
+load and would otherwise replace the suite's namespace teardown with a `tput cnorm`. Rule 9 is
+rendered too: the tier selector is `kube-agents/tier`, which the **broker** pod carries, so applying
+the allowlist without the API-server rule would have taken TokenReview, the FleetFreeze read and the
+ActionRecord write away from the broker and traded one silent network failure for another.
+
+**THE PART THAT IS ACTUALLY THE LESSON.** This was already known. `dev/lib/broker-driver.sh`'s
+header, committed in an earlier phase, states it exactly:
+
+> `<agent>-to-broker` makes every reader-labelled pod default-deny on egress with exactly one hole —
+> TCP 8443 to the actor half — and there is no DNS rule in it anywhere. A real agent pod gets DNS
+> from the per-tier install-time egress policy, which `provision_13` applies and a scratch cluster
+> does not carry.
+
+A suite written after that paragraph paid the full cost anyway, because a paragraph in one file is
+not reachable from another file ([[LSN-019]]: prose on the artifact is not a mechanization). Two
+suites have now solved the same problem two different ways — `broker-driver.sh` with `hostAliases`
+short-circuiting DNS and declaring the non-claim, this one by seeding the real policy — and a third
+(`tenant-isolation-l2.sh`) already had its own `render()` wrapper around `common.sh`. Three call
+sites, no shared helper.
+
+**Proposed mechanization** (improvement pass), in preference order:
+
+1. **`dev/lib/shipped-render.sh`** — one helper that sources `common.sh` in a subshell with the trap
+   cleared and calls a named renderer, replacing the wrapper in `tenant-isolation-l2.sh`, the new
+   one here, and whatever the next suite would have written. Note while extracting it that
+   `tenant-isolation-l2.sh`'s `render()` does **not** clear the EXIT trap, so `tput cnorm` can land
+   on the same stdout the manifest is captured from — latent, not currently biting.
+2. **A precondition, not a paragraph.** `P11: the namespace models an installed agent` — assert that
+   a namespace about to hold an Agent CR carries a policy admitting DNS, or seed one, and fail with
+   the sentence above rather than with a timeout 120 seconds later. Every L2 suite that stands up an
+   Agent in a fresh namespace has this precondition today and none of them declares it.
+3. **A product-side check** (own ID, V-ISO or V-CTN family): every namespace holding an Agent CR also
+   holds a policy admitting DNS for the pods the pair policy selects. This is the only one of the
+   three that would catch a real install — a second developer-team tenant namespace created after
+   `provision_13` last ran gets the pair policy from the controller and the tier policy from nobody.
+
+**Related:** [[LSN-024]] (render through the shipped renderer) · [[LSN-019]] (prose is not a
+mechanization) · [[LSN-035]] (a vacuous pass is a failure here) · [[LSN-006]] (an ADMIT arm reads
+identically against an absent policy — this is its egress-side twin: a DENY that reads identically
+against an absent policy).
+
+---
+
+## LSN-069 — Rule 9 pinned two addresses no packet ever carries: the kube-apiserver's egress address is `endpoints/kubernetes`, not the ClusterIP a pod dials and not the endpoint the kubeconfig names
+
+**Tags:** networkpolicy, install-path, provisioning, dataplane-v2, broker, silent-failure, product-defect
+**Opened:** 2026-08-01 (P9-T11g-4b) · **Status:** open
+
+Seeding the shipped tier egress allowlist into an L2 fixture ([[LSN-068]]) took the broker down
+instead of fixing it, in a way with no error message anywhere:
+
+```
+ordering-agent-broker   0/1  Running  3 restarts
+Readiness probe failed: dial tcp 10.68.0.61:8443: connect: connection refused
+Liveness probe failed:  dial tcp 10.68.0.61:8443: connect: connection refused
+kubectl logs <broker>   ->  (empty)
+kubectl logs <broker> -p ->  (empty)
+```
+
+**No logs at all, and the port refused.** `cmd/broker/main.go`'s `run()` calls
+`startSources(ctx, sources)` — the brake read — **before** `httpServer.ListenAndServeTLS`, with the
+comment _"A broker that is accepting submissions while its brake has never been read is a broker
+whose first few actions were decided by a source that had nothing in it."_ That ordering is correct
+and it is why the symptom carries no information: the process is alive, blocked on the API server,
+has not reached its own `setupLog.Info("starting kage-broker", …)` line, and the kubelet is killing
+it on the liveness probe. A reader sees a crash-looping broker with an empty log.
+
+**The tier policy selects the broker too.** Its selector is `kube-agents/tier`, which the broker pod
+carries — `render_apiserver_block`'s header says so explicitly and is the reason rule 9 exists at
+all. So applying the allowlist without a correct rule 9 closes TokenReview (step 1), the FleetFreeze
+read (step 5) and the ActionRecord write (step 11).
+
+**Rule 9 was rendered. It named the wrong addresses.** `resolve_apiserver_cidrs` produced two /32s
+from two sources — the `kubernetes` Service ClusterIP and the host out of the kubeconfig's `server:`
+URL — on the stated argument that _"whether NetworkPolicy evaluates egress before or after that
+translation is dataplane-specific, so a policy naming only one of the two fails on the other."_ The
+argument is sound and the enumeration was short by one:
+
+| source | scratch | live |
+| --- | --- | --- |
+| `svc/kubernetes` ClusterIP (dialled) | 34.118.224.1 | 34.118.224.1 |
+| kubeconfig `server:` (public endpoint) | 35.221.35.254 | 34.145.154.119 |
+| **`endpoints/kubernetes` (what the packet carries)** | **10.150.0.9** | **10.150.0.2** |
+
+GKE Dataplane V2 DNATs the ClusterIP in eBPF **before** egress policy is scored, so the address the
+policy sees is the control plane's node-network address — a third form, on neither list, and not
+derivable from either.
+
+**Measured, not reasoned.** With the rendered policy in place and the broker crash-looping, one
+extra NetworkPolicy admitting `10.150.0.9/32:443` was applied to the same namespace and nothing
+else changed. The broker went `1/1 Running` inside one probe period. Policies union, so that single
+/32 is the entire difference.
+
+**Fixed** in `common.sh:resolve_apiserver_cidrs`: source 2 now reads `endpointslices` for the
+`kubernetes` Service first (`endpoints` as fallback — v1 Endpoints is deprecated from 1.33 and warns
+on stderr on every read), and emits endpoint-first, then the ClusterIP, then the kubeconfig host,
+deduplicated. All three are kept: the original argument for the two that did not match still stands,
+this script cannot know where a given dataplane scores egress, and three /32s on 443 is a narrow
+price for not needing to be right about it. Removing the two would be a second guess.
+
+**A SECOND, SEPARATE FINDING ON THE LIVE INSTALL, which this is the wrong unit to act on.**
+`platform-agent-host`'s `platform-egress` has **four** egress rules — DNS, the control namespace on
+:80/:8080, the Google restricted VIP, GitHub — and **no rule 9 and no WI metadata block at all**. It
+is a pre-rule-9 render that has never been re-applied, and three tier-labelled agent gateways are
+running under it right now. Nothing visibly breaks because inference is in-cluster on :80 (rule 2),
+so what is actually closed is the half `render_apiserver_block` calls out: _"The READER needs it too,
+for every kubectl-shaped skill it runs; that half has been latent since Phase 5."_ Re-running
+`provision_13` against the live cluster is an outer-loop action, recorded as a `finding` row rather
+than taken here.
+
+**Why no check caught it, and what would have.** V-CMP's reference-render suite checks that rule 9
+renders **when an address is supplied** and that `resolve_apiserver_cidrs` **fails closed when none
+is** — both true throughout, because both are properties of the renderer and neither is a property
+of the answer. The gap is between "a rule was rendered" and "the rule matches the traffic", and only
+a cluster can close it. Proposed mechanization (improvement pass): an L2 arm that, for each address
+in a rendered rule 9, asserts it appears in `endpoints/kubernetes` — cheap, needs no traffic, and
+would have gone red on both clusters. A traffic-level arm (a tier-labelled pod that reaches the API
+server through the policy) is stronger and belongs with [[LSN-068]]'s item 3.
+
+**Related:** [[LSN-068]] (the fixture that had to seed this policy at all) · [[LSN-019]] (the header
+reasoned carefully about exactly this failure and still enumerated wrong — a correct argument over
+an incomplete set) · [[LSN-006]] (an ADMIT arm reads identically against an absent policy; here a
+rendered rule read identically to a matching one).

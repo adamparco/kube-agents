@@ -180,6 +180,10 @@
   runs: "python3 dev/tests/crd-has-no-authority-fields.py"
   asserts_in: "dev/tests/crd-has-no-authority-fields.py"
 
+"V-CTN-001":
+  runs: "bash dev/verify/reader-scope-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/reader-scope-l2.sh"
+
 "V-CTN-004":
   runs: "python3 dev/tests/reader-holds-only-read-verbs.py"
   asserts_in: "dev/tests/reader-holds-only-read-verbs.py"
@@ -268,9 +272,17 @@
   runs: "make -C k8s-operator test"
   asserts_in: "k8s-operator/internal/webhook/changepolicy_webhook_test.go"
 
+"V-CTR-007":
+  runs: "bash dev/verify/brake-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/brake-l2.sh"
+
 "V-GAT-001":
   runs: "make -C k8s-operator test"
   asserts_in: "k8s-operator/internal/broker/classify/corpus_test.go"
+
+"V-GAT-002":
+  runs: "bash dev/verify/classifier-identity-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/classifier-identity-l2.sh"
 
 "V-GAT-009":
   runs: "make -C k8s-operator test"
@@ -423,9 +435,37 @@
   runs: "python3 dev/tests/settle-windows-match-the-spec.py"
   asserts_in: "dev/tests/settle-windows-match-the-spec.py"
 
+"V-RUN-001":
+  runs: "bash dev/verify/workload-pair-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/workload-pair-l2.sh"
+
+"V-RUN-002":
+  runs: "bash dev/verify/workload-pair-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/workload-pair-l2.sh"
+
 "V-RUN-003":
   runs: "make -C k8s-operator test"
   asserts_in: "k8s-operator/cmd/broker/waitforbroker_test.go"
+
+"V-RUN-004":
+  runs: "bash dev/verify/workload-pair-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/workload-pair-l2.sh"
+
+"V-RUN-005":
+  runs: "bash dev/verify/startup-ordering-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/startup-ordering-l2.sh"
+
+"V-RUN-007":
+  runs: "bash dev/verify/brake-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/brake-l2.sh"
+
+"V-RUN-008":
+  runs: "bash dev/verify/brake-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/brake-l2.sh"
+
+"V-RUN-009":
+  runs: "bash dev/verify/workload-pair-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/workload-pair-l2.sh"
 
 "V-RUN-010":
   runs: "python3 dev/tests/broker-supply-chain-minimal.py"

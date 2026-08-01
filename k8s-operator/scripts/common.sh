@@ -683,11 +683,42 @@ render_apiserver_block() {
 #      from the kubeconfig, and for any cluster reached through a bastion or a
 #      forwarded endpoint where the address the kubeconfig names is not the address
 #      the pods reach.
-#   2. The live cluster: the `kubernetes` Service ClusterIP, plus the host out of the
-#      current context's `server:` URL. Both become /32s. This is the ordinary GKE
-#      case and it needs no configuration at all — which matters, because a knob that
-#      must be filled in for the broker to work is a knob that will not be filled in.
+#   2. The live cluster: the `kubernetes` Service's ENDPOINT addresses, its ClusterIP,
+#      and the host out of the current context's `server:` URL. All become /32s. This
+#      is the ordinary GKE case and it needs no configuration at all — which matters,
+#      because a knob that must be filled in for the broker to work is a knob that will
+#      not be filled in.
 #   3. Nothing. Return 1.
+#
+# THE ENDPOINT ADDRESS IS THE ONE THAT ACTUALLY MATCHES, AND IT WAS MISSING UNTIL
+# 2026-08-01. This function shipped reading the ClusterIP and the kubeconfig host, on
+# the argument above that one of the two must be what the dataplane sees. On GKE
+# neither is. A pod dials the ClusterIP (34.118.224.1), the dataplane DNATs it in eBPF
+# BEFORE egress policy is evaluated, and the packet the policy scores carries the
+# control-plane's node-network address — `endpoints/kubernetes` in `default`, which is
+# a third address this function never read: 10.150.0.9 on the scratch cluster,
+# 10.150.0.2 on the live one, and neither cluster's kubeconfig names it (they name
+# 35.221.35.254 and 34.145.154.119, the public endpoints). The rendered rule 9 was
+# therefore two /32s that no packet ever carries.
+#
+# It presents exactly as the header of render_apiserver_block warns and worse. The
+# broker's startSources() reads the brake BEFORE the listener opens, so the pod never
+# binds :8443 at all: `kubectl logs` is EMPTY, the readiness and liveness probes both
+# report `connection refused`, and the kubelet restarts it on a loop. Nothing anywhere
+# says "network". Measured on 2026-08-01 by adding a single /32 for the endpoint
+# address to the same namespace — the broker went 1/1 within one probe period
+# ([[LSN-069]]).
+#
+# ALL THREE FORMS ARE STILL EMITTED, endpoint first. The ClusterIP and the kubeconfig
+# host stay because the original argument for them stands — where the dataplane
+# evaluates egress relative to DNAT is not something this script can know — and three
+# /32s on 443 is a narrow price for not having to be right about it. Adding the one
+# that matches is the fix; removing the two that did not would be a second guess.
+#
+# EndpointSlice is read first and `endpoints` is the fallback: v1 Endpoints is
+# deprecated from 1.33 and prints a warning to stderr on every read, which is noise in
+# an install log and, on a cluster that has dropped the compatibility shim, no answer
+# at all.
 #
 # A hostname in the `server:` URL is DELIBERATELY NOT RESOLVED here. NetworkPolicy
 # takes addresses, resolving one at install time pins whatever the DNS answer was that
@@ -695,7 +726,7 @@ render_apiserver_block() {
 # rotation is worse than one that was never written. Set KUBE_APISERVER_CIDR instead.
 resolve_apiserver_cidrs() {
   local override="${KUBE_APISERVER_CIDR:-}"
-  local out="" clusterip server host
+  local out="" clusterip server host endpoints ep
 
   if [ -n "$(printf '%s' "${override}" | tr -d '[:space:]')" ]; then
     printf '%s\n' "${override}"
@@ -715,24 +746,37 @@ resolve_apiserver_cidrs() {
     esac
   }
 
-  clusterip="$(kubectl get service kubernetes -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")"
-  if _ipv4 "${clusterip}"; then
-    out="${clusterip}/32"
+  # _append <candidate> — a /32 for a dotted quad, deduplicated. Order is preserved, so
+  # rule 9 reads endpoint-first and a human comparing it against `endpoints/kubernetes`
+  # sees the match on the first line.
+  _append() {
+    case ",${out}," in
+      *",$1/32,"*) return 0 ;;
+    esac
+    _ipv4 "$1" || return 0
+    if [ -n "${out}" ]; then out="${out},$1/32"; else out="$1/32"; fi
+  }
+
+  endpoints="$(kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes \
+    -o jsonpath='{.items[*].endpoints[*].addresses[*]}' 2>/dev/null || echo "")"
+  if [ -z "$(printf '%s' "${endpoints}" | tr -d '[:space:]')" ]; then
+    endpoints="$(kubectl get endpoints kubernetes -n default \
+      -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || echo "")"
   fi
+  for ep in ${endpoints}; do
+    _append "${ep}"
+  done
+
+  clusterip="$(kubectl get service kubernetes -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")"
+  _append "${clusterip}"
 
   server="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")"
   host="${server#*://}"
   host="${host%%:*}"
   host="${host%%/*}"
-  if _ipv4 "${host}"; then
-    if [ -n "${out}" ]; then
-      out="${out},${host}/32"
-    else
-      out="${host}/32"
-    fi
-  fi
+  _append "${host}"
 
-  unset -f _ipv4
+  unset -f _ipv4 _append
 
   [ -z "${out}" ] && return 1
   printf '%s\n' "${out}"

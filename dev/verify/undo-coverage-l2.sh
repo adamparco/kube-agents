@@ -58,8 +58,13 @@
 #     transcript as `expectClass` and is never compared to the record. The soak partitions on the
 #     class the BROKER chose, and that is deliberate: a soak that filtered on the expected class
 #     would score V-REV-001 over a population the classifier never agreed to, and would go green on
-#     a broker that gated all thirty-seven. Class fidelity is V-CLS's row, scored at L1 against the
-#     same corpus by `dev/verify/classifier-corpus.sh`.
+#     a broker that gated all thirty-seven. Class fidelity is **V-GAT-002**'s row, scored at L2 by
+#     `dev/verify/classifier-identity-l2.sh`. (This comment used to point at `V-CLS` and
+#     `dev/verify/classifier-corpus.sh`. Neither ever existed — not the suite prefix, not the file.
+#     A dangling pointer in a "what this does not claim" block is worse than no pointer at all: it
+#     reads as *someone else proved this* and survives review precisely because nobody follows it.
+#     It also escaped the check that exists for it — `check-ids-have-implementations.py` matches
+#     `V-[A-Z]{3}-\d{3}`, and a bare suite prefix with no number never matches.)
 #   V-REV-002 (`undo <id>` restores prior state). Requires executing an undo. Phase 9 has no write
 #     authority anywhere (07 §2) and this suite executes nothing.
 #   V-REV-003 (no generatable undo plan ⇒ reclassified gated). The NEGATIVE of A-3, and it needs a
