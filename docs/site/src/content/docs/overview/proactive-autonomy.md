@@ -18,22 +18,19 @@ Every step is real code shipping in the repo. The SOPs live in [`agents/platform
 
 ## What runs on its own
 
-The shipping schedule at time of writing:
+Five fleet audits run enabled, each on its own schedule and each maintaining a single pull request:
 
-| Job                             | Schedule             | What it does                                                                                 |
-| ------------------------------- | -------------------- | -------------------------------------------------------------------------------------------- |
-| `blueprint-sync`                | Daily 09:00          | Audit clusters against master blueprints; reconcile drift declaratively.                     |
-| `policy-propagation`            | Hourly               | Push updated security, network, and resource policies across clusters and namespaces.        |
-| `global-capacity-orchestrator`  | Hourly               | Fleet-wide utilization audit; propose rebalancing when regions are hot or cold.              |
-| `fleet-wide-cost-analysis`      | Daily 10:00          | Aggregate cost usage; surface saving opportunities and right-sizing candidates.              |
-| `security-patch-orchestrator`   | Daily 11:00          | CVE scan; coordinate staggered emergency GKE upgrades.                                       |
-| `obtainability-audit`           | Daily 12:00          | Find rigid capacity allocations; emit YAML patches to move workloads onto flexible capacity. |
-| `compliance-audit`              | Weekly Sun 09:00     | Fleet-wide security/architectural policy compliance sweep.                                   |
-| `standardization-validator`     | Weekly Sun 10:00     | Deep-diff of live cluster configs vs. corporate architectural patterns.                      |
-| `lifecycle-deprecation-manager` | Monthly (1st, 09:00) | Track deprecated Kubernetes API versions ahead of the next GKE upgrade window.               |
-| `github-issue-resolver`         | Every 30 min         | Poll the target repo; triage and (within tight guardrails) resolve open issues.              |
+- **Security & RBAC posture** (daily) — privileged and host-namespace containers, over-privileged RBAC bindings, namespaces with no `NetworkPolicy`, Workload Identity and metadata-concealment gaps.
+- **Workload reliability** (daily) — missing resource requests, drain-blocking or absent PodDisruptionBudgets, unscalable Deployments, zone-pinned scheduling, missing probes.
+- **Upgrade & patch readiness** (weekly) — control-plane and node versions against the cluster's release channel, version skew, `autoUpgrade`/`autoRepair` off, missing maintenance windows.
+- **Fleet waste** (weekly) — over-provisioned requests, orphaned PersistentVolumes and disks, idle reserved IPs, near-empty node pools. Reported in resource units, not dollars: there is no billing export to price against.
+- **Fleet consistency drift** (weekly) — clusters that diverge from the rest of the fleet on release channel, Workload Identity, Shielded Nodes, logging config and similar facets. The baseline is derived from the fleet itself, so it needs no blueprint to compare against.
 
-Schedules are literal `cron` expressions from `jobs.json`. See [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) for the full table with cron expressions and prompts.
+Alongside them, `github-issue-resolver` polls the target repo every 30 minutes and triages open issues within tight guardrails.
+
+Each audit calls the [`fleet-audit`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/fleet-audit) skill, whose helper owns every git and `gh` operation and renders the PR body from a validated findings file. A finding with no reproducible command is dropped, not softened; a clean run closes the PR and says nothing at all.
+
+Five further jobs ship **disabled** — see [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/#the-disabled-jobs) for why. [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) has the full table, generated from `jobs.json`, with exact cron expressions and prompts.
 
 ## Why this matters
 
@@ -47,7 +44,7 @@ The design goal: fleet issues stop rotting silently while the on-call queue is q
 
 ## Safety rails
 
-- **Declarative-only for infra changes.** `SOUL.md §1` forbids direct `kubectl apply` for GKE infrastructure. Everything routes through the GitOps PR flow (`submit-suggestion`).
+- **Declarative-only for infra changes.** `SOUL.md §1` forbids direct `kubectl apply` for GKE infrastructure. Everything routes through the GitOps PR flow — `submit-suggestion` for a one-off change, `fleet-audit` for a scheduled audit run, and nothing else (`SOUL.md §3.2`).
 - **Destructive operations always ask.** Cluster deletion, tenant offboarding, broad IAM revocation — the persona explicitly gates these on human confirmation, no matter how many "just do it" phrases are in the user's message.
 - **Bounded retries.** The recovery ladder in `SOUL.md §4` bounds each blocker at 5 attempts / 10 minutes before escalating.
 

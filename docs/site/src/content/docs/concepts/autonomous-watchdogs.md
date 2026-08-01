@@ -13,20 +13,35 @@ Full JSON is annotated on [Reference → Cron jobs](/kube-agents/reference/cron-
 
 ## The shipping jobs
 
-| Job                             | Cron           | Cadence           | Invokes                                |
-| ------------------------------- | -------------- | ----------------- | -------------------------------------- |
-| `blueprint-sync`                | `0 9 * * *`    | Daily 09:00       | `blueprint_sync_sop.md`                |
-| `policy-propagation`            | `0 * * * *`    | Hourly            | `policy_propagation_sop.md`            |
-| `global-capacity-orchestrator`  | `0 * * * *`    | Hourly            | `global_capacity_orchestrator_sop.md`  |
-| `fleet-wide-cost-analysis`      | `0 10 * * *`   | Daily 10:00       | `fleet_wide_cost_analysis_sop.md`      |
-| `security-patch-orchestrator`   | `0 11 * * *`   | Daily 11:00       | `security_patch_orchestrator_sop.md`   |
-| `obtainability-audit`           | `0 12 * * *`   | Daily 12:00       | `obtainability_audit_sop.md`           |
-| `compliance-audit`              | `0 9 * * 0`    | Weekly Sun 09:00  | `compliance_audit_sop.md`              |
-| `standardization-validator`     | `0 10 * * 0`   | Weekly Sun 10:00  | `standardization_validator_sop.md`     |
-| `lifecycle-deprecation-manager` | `0 9 1 * *`    | Monthly 1st 09:00 | `lifecycle_deprecation_manager_sop.md` |
-| `github-issue-resolver`         | `*/30 * * * *` | Every 30 minutes  | `github-issue-resolver` skill          |
+The roster, with exact cron expressions, enabled state, and prompts, is generated from `jobs.json` on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Six jobs ship enabled: the five fleet audits below and `github-issue-resolver`.
 
-All are `enabled: true` in the shipping config.
+### The five fleet audits
+
+Each audit reads its SOP, executes read-only checks against the fleet, writes a validated findings file, and hands it to the [`fleet-audit`](/kube-agents/skills/) skill's `audit_pr.py` helper. The helper owns every git and `gh` operation and renders the pull-request body itself — the model never writes one.
+
+| Job                           | SOP                                  | Audits                                                                    |
+| ----------------------------- | ------------------------------------ | ------------------------------------------------------------------------- |
+| `compliance-audit`            | `compliance_audit_sop.md`            | Security and RBAC posture across the fleet                                |
+| `obtainability-audit`         | `obtainability_audit_sop.md`         | Workload reliability: requests, PDBs, HPAs, probes, scheduling rigidity   |
+| `security-patch-orchestrator` | `security_patch_orchestrator_sop.md` | Version currency and upgrade-policy hygiene against the cluster's channel |
+| `fleet-wide-cost-analysis`    | `fleet_wide_cost_analysis_sop.md`    | Observable waste, in resource units — no billing export required          |
+| `fleet-consistency-drift`     | `fleet_consistency_drift_sop.md`     | Clusters diverging from a baseline derived from the fleet itself          |
+
+Two properties matter more than the check lists:
+
+- **One rolling PR per audit.** The helper finds the audit's existing open PR by its `audit:<id>` label and rewrites it in place, commenting only on what changed since the last run. A daily audit therefore produces one PR that stays current, not thirty near-identical ones a month.
+- **Silence is a real outcome.** A run with no findings closes the audit's PR and returns `[SILENT]`, so a quiet fleet generates no Chat traffic.
+
+### The disabled jobs
+
+`blueprint-sync`, `policy-propagation`, `global-capacity-orchestrator`, `standardization-validator`, and `lifecycle-deprecation-manager` ship with `enabled: false`. Their SOPs are retained, but as written they cannot produce a finding on a stock install:
+
+- `blueprint-sync` and `standardization-validator` compare clusters against a "master blueprint" / "corporate architectural patterns" document that no install provides. `fleet-consistency-drift` covers the same intent by deriving its baseline from the live fleet instead.
+- `policy-propagation` reads policy templates from a `/opt/defaults/templates/` directory that is not shipped.
+- `global-capacity-orchestrator` ran hourly with no defined output artifact.
+- `lifecycle-deprecation-manager` overlaps `security-patch-orchestrator`.
+
+Re-enable any of them by flipping `enabled` back to `true` and redeploying — but rewrite the SOP first, or the run will find nothing.
 
 ## Job shape
 
@@ -34,25 +49,26 @@ Each job in `jobs.json` follows this schema:
 
 ```json
 {
-  "id": "blueprint-sync",
-  "name": "Blueprint Sync",
+  "id": "compliance-audit",
+  "name": "Security & RBAC Posture Audit",
   "schedule": {
     "kind": "cron",
-    "expr": "0 9 * * *",
-    "display": "0 9 * * *"
+    "expr": "20 6 * * *",
+    "display": "20 6 * * *"
   },
-  "prompt": "Execute GKE blueprint alignment audit. Read '/opt/defaults/governance/blueprint_sync_sop.md' and perform the daily GKE cluster compliance checks against the master blueprints.",
-  "skills": [],
-  "enabled": true
+  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home and execute it exactly, using the fleet-audit skill to open and close the audit run. Reply with exactly [SILENT] when the fleet is clean.",
+  "skills": ["fleet-audit"],
+  "enabled": true,
+  "deliver": "all"
 }
 ```
 
-- **`id`** — stable identifier, referenced in observability and disable/enable ops.
+- **`id`** — stable identifier, referenced in observability and disable/enable ops. It outlives renames: `obtainability-audit` is now the Workload Reliability Audit, but the id stays put.
 - **`schedule.expr`** — standard 5-field cron in the pod's local time zone (UTC unless the pod's TZ is overridden).
-- **`prompt`** — verbatim message sent to the agent when the schedule fires. Typically instructs the agent to load a specific SOP file from `/opt/defaults/governance/`.
-- **`skills`** — optional array of skill names to preload. Most jobs leave this empty because the SOP directs skill loading itself; `github-issue-resolver` is the exception and loads its namesake skill directly.
+- **`prompt`** — verbatim message sent to the agent when the schedule fires. Governance jobs point at an SOP **relative to the profile home** (`governance/<sop>.md`), which is where `profile_scaffold.py` overlays the baked `/opt/platform-template/governance/` directory. An absolute `/opt/defaults/governance/...` path does not resolve — nothing is mounted there.
+- **`skills`** — optional array of skill names to preload. The five audits preload `fleet-audit`; `github-issue-resolver` preloads its namesake skill.
 - **`enabled`** — set to `false` to disable a job without deleting its entry.
-- **`deliver`** (optional) — controls chat delivery. Set on `github-issue-resolver` to `"all"` meaning every run reports back.
+- **`deliver`** (optional) — controls chat delivery. `"all"` means every run reports back. It is set on all six enabled jobs, which is safe because each returns `[SILENT]` when it has nothing to say.
 
 ## Disabling a watchdog
 
@@ -61,10 +77,12 @@ Edit `cron/jobs.json`, flip `enabled` to `false`, and redeploy the workspace (`p
 ## Adding a watchdog
 
 1. Write a governance SOP in `agents/platform/governance/<your-sop>.md`.
-2. Add a job entry to `cron/jobs.json` pointing at the SOP.
-3. Redeploy.
+2. Add a job entry to `cron/jobs.json` pointing at it as `governance/<your-sop>.md`.
+3. If the job files findings, add its id to the allowlist in `agents/platform/skills/fleet-audit/scripts/audit_pr.py` and preload `"skills": ["fleet-audit"]`.
+4. Run `make docs-generate` — the reference table is generated, and a cron expression missing from `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`.
+5. Redeploy.
 
-Keep the schedule realistic — LLM inference on every tick has cost. Hourly or daily is the sweet spot for most SOPs; sub-15-minute cadences should have a clear justification.
+Keep the schedule realistic — LLM inference on every tick has cost. Hourly or daily is the sweet spot for most SOPs; sub-15-minute cadences should have a clear justification. Stagger start minutes so two audits never contend for the same session.
 
 ## Where to go next
 

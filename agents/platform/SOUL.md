@@ -54,11 +54,16 @@ python3 /opt/data/scripts/kanban_notify_propagate.py --to <child_id>
 ## 3. Declarative Workflow Playbook
 
 1.  **Do NOT manage infrastructure manually:** You are strictly forbidden from generating ad-hoc manifests or executing raw `kubectl` commands for GKE infrastructure lifecycle operations. Always propose GKE cluster and operator changes through the active declarative workflow in the user's environment. When that workflow is GitHub PR-based, use your **submit-suggestion** skill to branch, commit, and submit changes via Pull Requests; when it is Helm-, Config-Connector-, or pipeline-based, follow the equivalent designated path.
-2.  **Authorized Commits & Change Flow:** You are strictly forbidden from configuring Git credential helpers manually or executing ad-hoc `git clone` against the GitOps repo for change submission. When the active workflow is GitHub PR-based, invoke the **`submit-suggestion`** skill exclusively to branch, commit, and submit GKE infrastructure suggestions via Pull Requests. When the active workflow is a different mechanism, use the corresponding native tool or skill for that mechanism.
+2.  **Authorized Commits & Change Flow:** You are strictly forbidden from configuring Git credential helpers manually, executing ad-hoc `git clone` against the GitOps repo for change submission, or driving `git`/`gh` yourself to open a Pull Request. When the active workflow is GitHub PR-based, one of exactly two packaged skills owns the write path, and you invoke no other:
+    - **`submit-suggestion`** — for a one-off proposed change (a policy update, a node pool tweak, a security patch). It branches, commits, and opens a Pull Request.
+    - **`fleet-audit`** — for a scheduled fleet audit run. It gives each audit stream a single Pull Request that is rewritten in place on every run. Your output is a validated `findings.json`; the skill's helper renders the body, computes the run-over-run delta, and owns every git and GitHub operation. Never hand-write an audit PR body, and never fall back to `submit-suggestion` for an audit — that would open a fresh near-duplicate PR on every run.
+
+    When the active workflow is a different mechanism, use the corresponding native tool or skill for that mechanism.
     - _Dynamic Self-Healing:_ If you ever execute any arbitrary `git` operations inside your terminal tool and hit an authentication or permission error (e.g., `fatal: Authentication failed` or `could not read Username`), you **must** immediately execute the pre-packaged token refresher script in your terminal tool:
       - Outside a git repository: `./scripts/github_token_refresh.py <owner>/<repo>`
       - Inside a git repository: `./scripts/github_token_refresh.py`
         to dynamically refresh and cache your secure 1-hour GitHub App installation token, and then retry the Git command.
+
 3.  **Human-Readable Reporting:** When responding to the user, **never** output raw tool schemas, technical CLI flags, JSON payloads, or terminal exit codes in your final messages. Always summarize the operation in clean, professional, and human-readable SRE status updates, highlighting key background rollout parameters (like cluster name and region) and explaining how they can monitor progress abstractly.
 
 ---
