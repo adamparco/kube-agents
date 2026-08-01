@@ -537,6 +537,31 @@ bash dev/verify/brake-l2.sh gke-scratch-kube-agents-dev
 # does not bind and reports 102 true-but-irrelevant failures ([[LSN-066]]).
 bash dev/verify/reader-scope-l2.sh gke-scratch-kube-agents-dev
 
+# --- The tier egress allowlist, rendered and admitted ([[LSN-068]] item 3, [[LSN-069]]) ---------
+# Two arms, one file, because they are two halves of one question: does the egress policy a tier
+# runs under let the traffic the design requires through. Arm 1 asks it of the CLUSTER -- every
+# namespace holding an Agent admits DNS to its own tier -- and the roster is derived three ways and
+# unioned (Agent CRs, `kube-agents/tier`-labelled workloads, and the SERVED CRD's own schema
+# default for an empty `spec.tier`), so no tier name and no namespace is written down here
+# ([[LSN-036]]). Arm 2 asks it of the RENDER -- rule 9's addresses are scored against
+# `endpoints/kubernetes` through the shipped `render_egress_policy` and never a copy ([[LSN-024]]).
+#
+# Arm 2's predicate is AT LEAST ONE rendered rule-9 address is an endpoint address, deliberately
+# not every one: `resolve_apiserver_cidrs` emits three /32s on purpose because it cannot know where
+# a given dataplane scores egress relative to DNAT, so an every-address predicate goes red on a
+# CORRECT render. [[LSN-069]] is that NONE of them was.
+#
+# TWO THINGS A GREEN RUN OF THIS LINE DOES NOT COVER, and the file says both in its own banner.
+# Arm 1 has never executed its positive path -- the scratch cluster carries zero Agent CRs, so the
+# roster is empty and the arm returns rc 3 DEFERRED rather than a pass; every claim about it today
+# rests on its 8 control rows. And arm 2's subject is the render, not the installed object:
+# `shipped_render_rule9_cidrs` scopes to the `# 9)` YAML comment marker, which `kubectl get -o yaml`
+# does not return. That gap is not cosmetic -- read-only against the live install on 2026-08-01,
+# the three standing `<tier>-egress` policies carry four egress rules each and NO apiserver address
+# of any kind, while arm 2 reports all three tiers green. The installed-object arm is scheduled;
+# until it lands, this line proves the renderer and not the cluster.
+bash dev/verify/tier-egress-render-l2.sh gke-scratch-kube-agents-dev
+
 # --- Phase 9's gate ------------------------------------------------------------------------------
 # verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the
 # two suites P9-T9b-5 still owes, the L0 chain run as a file, and the whole prior ratchet through the

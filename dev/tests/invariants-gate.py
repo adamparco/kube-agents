@@ -1849,7 +1849,9 @@ CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
 # Raised 29 -> 30 on 2026-07-31 (P9-T11h): reader-scope-l2.sh, V-CTN-001 and the L2 half of
 # V-CTN-004. V-CTN-001 is BLOCKING-ALWAYS and was the last row of the phase-9 required set still not
 # green; a floor that did not move with it would let the line be deleted without anything going red.
-L2_CHAIN_FLOOR = 30
+# Raised 30 -> 31 on 2026-08-01 (improvement pass 07): tier-egress-render-l2.sh, the [[LSN-068]]
+# item 3 and [[LSN-069]] mechanization. Both floors move together a ninth time.
+L2_CHAIN_FLOOR = 31
 # How many scripts the TRANSITIVE scope held when it was widened (2026-07-25, P8-T8). A separate
 # ratchet from the one above because the two guard different things: L2_CHAIN_FLOOR notices a line
 # leaving L2-CHAIN.txt, this one notices a claim-making script leaving the closure — including one
@@ -1880,7 +1882,9 @@ L2_CHAIN_FLOOR = 30
 # by being SOURCED rather than named, only this one moves.
 # Raised 37 -> 38 on 2026-07-31 (P9-T11h): reader-scope-l2.sh, named on an L2 chain line. Both floors
 # move together an eighth time.
-L2_SCOPE_FLOOR = 38
+# Raised 38 -> 39 on 2026-08-01 (improvement pass 07): tier-egress-render-l2.sh, named on an L2
+# chain line. A ninth time together.
+L2_SCOPE_FLOOR = 39
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:

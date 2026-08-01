@@ -951,9 +951,19 @@ class NegativeControlsExerciseTheStatementUnderTest(unittest.TestCase):
     def write(self, name: str, body: str) -> None:
         (self._dir / name).write_text(body, encoding="utf-8")
 
+    # The dispatch arm is load-bearing, not decoration. Until 2026-08-01 this fixture only
+    # MENTIONED `--negative-control`, in a comment, and the check admitted it because the check
+    # asked `"--negative-control" in text` -- the exact substring bug B-011 was filed about. Now
+    # that the corpus gate is `handles()` (AST for Python, a quote-aware lex for shell), a suite
+    # that merely names the flag is correctly not a suite that has a ¬ form, and a fixture standing
+    # in for "a suite that HAS one" has to actually have one.
     WELL_FORMED = (
         '#!/usr/bin/env bash\n'
         '# --negative-control replays the assertion block.\n'
+        'if [ "${1:-}" = "--negative-control" ]; then\n'
+        '  replay_assertion_block\n'
+        '  exit 0\n'
+        'fi\n'
         '# NEGATIVE CONTROL DOES NOT EXERCISE:\n'
         '#   - the HTTP POST to the broker\n'
         '#   - the API-server lookup of the record\n'

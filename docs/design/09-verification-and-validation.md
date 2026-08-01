@@ -910,6 +910,25 @@ audit-log query. **A `pass` with no evidence reference is treated as `skipped`.*
 - A retired check keeps its ID, gains `status: RETIRED`, and names its replacement ID.
 - **A BLOCKING-ALWAYS check may not be deferred.** If it cannot run, the build is not verifiable —
   which is itself the finding.
+- **What "the check" means when a check has more than one level.** The bullet above is about the
+  **check**, not about each of its levels independently. A BLOCKING-ALWAYS check that is green at
+  one of its declared levels and unrunnable at another may record the **unrunnable level** as
+  `deferred`, with a blocker, an owner and a promotion condition; the check itself is verified and
+  the build is not blind. A check that is green at **no** level may not be deferred at all — its
+  verdict is `finding` or `fail`, and it blocks. This paragraph relaxes nothing: it states the
+  reading `check_deferrals_name_blockers` in `dev/tests/invariants-gate.py` has enforced all along
+  (it clears a BLOCKING-ALWAYS deferral only on the green-somewhere clause), and it closes the case
+  the prose left open by naming the verdict for green-nowhere. **The executable rule is
+  authoritative**; if it and this paragraph ever disagree, the paragraph is the bug.
+- **Which verdict, when the level was never attempted.** `deferred` is for a level blocked by
+  something **outside** the current unit's reach — an unbuilt fixture cluster, an unprovisioned
+  target, a spec tightening that has not landed. An arm nobody has written yet is **not** a
+  blocker: "the check does not exist" describes unstarted work, and filing it as `deferred` is
+  §11.8's deferred-read-as-done wearing the right label. That case is a `finding`, naming what
+  would claim the level. This was written on 2026-08-01 after two rows one day apart took opposite
+  readings of the same situation — one filing an unclaimed level as a `finding` and arguing a
+  deferral would be the wrong verdict, the other filing an unwritten arm as `deferred` with the
+  closing phase as its own owner.
 
 ### 9.7 Flake policy
 
