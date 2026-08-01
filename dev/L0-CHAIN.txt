@@ -518,3 +518,80 @@ python3 dev/tests/settle-windows-match-the-spec.py
 # from the table, a row inserted with no entry behind it, the ceiling constant moved off 30m, a row
 # pushed above the ceiling, the RBAC constant edited, and the default constant edited.
 python3 dev/tests/settle-windows-match-the-spec.py --negative-control
+
+# --- V-CTN-039: the developer-team tier has no cloud actor identity (P9-T11g-3) -------------------
+# 06 §2.3's Cloud IAM table gives the developer-team actor "**none in v1**", and this is the one
+# containment row that asserts a principal DOES NOT EXIST. Every other V-CTN check asserts what some
+# principal cannot do, which is a different shape: you can only sweep the verbs of an identity you
+# can name. The failure mode is silent by construction — a WI annotation on the actor SA, or one
+# `*GSA*` variable in provisioning, and the tier acquires a cloud write surface that no `auth can-i`
+# sweep in this repo would ever see, because `auth can-i` answers about Kubernetes.
+#
+# Two arms on the annotation, because only one of them looks like the annotation. The literal
+# `iam.gke.io/gcp-service-account` key is the obvious edit; the realistic one is moving
+# `${AGENT_READER_ANNOTATIONS}` eleven lines down in common.sh, past the comment that says not to,
+# where the key never appears in the diff at all. The placeholder set is discovered by walking
+# common.sh's assignment chain to a fixpoint rather than being listed, so a renamed variable does
+# not silently empty the arm.
+#
+# The last property is the one that stops the check being satisfiable by deletion: the tier's
+# KUBERNETES actor grant must still exist and still carry `kube-agents/role: actor`. Without it,
+# "no cloud actor" and "no actor at all" are the same green, and deleting the developer-team actor
+# outright is the cheapest possible way to pass.
+python3 dev/tests/devteam-has-no-cloud-actor.py
+# Fifteen mutations across all five properties, each naming the finding ITS property produces
+# ([[LSN-035]]). One is deliberately `ignored`: the developer-team READER taking 06 §2.3's spelling
+# (`kubeagents-devteam-<ns>-gsa`) against provisioning's `kubeagents-developer-team-gsa` is a real
+# defect and it is V-CTN-030's, at phase 11 — this row asserts the check stays SILENT on it, because
+# a check that fires on its neighbour's defect cannot be read as evidence for its own.
+python3 dev/tests/devteam-has-no-cloud-actor.py --negative-control
+
+# --- V-CTN-004: the reader SA holds only read verbs, universally (P9-T11g-3) ----------------------
+# The allow-list IS the property. `READ_VERBS = ("get", "list", "watch")` is the only verb list the
+# file contains, and `impersonate`, `escalate`, `bind` and `create` appear nowhere in it — which is
+# the direct mechanization of 09 §11.4 and of the phase-0 ruling that a deny-list check admitted
+# `impersonate` because nobody had thought to deny it. A deny-list is a list of the attacks you
+# already imagined; the verb Kubernetes adds next is caught here by construction or not at all.
+#
+# "Universally" is bought by property 5, not by the verb sweep: a reader SUBJECT must be bound only
+# to a role this check classified as a reader. Sweeping nine reader roles proves nothing if the
+# reader ServiceAccount is also a subject of the broker-operations ClusterRoleBinding — one word in
+# a `subjects:` list, and the reader holds `create` on the journal without any reader role changing.
+#
+# One asymmetry, argued at length in the docstring so it can be overturned deliberately: wildcard
+# VERBS and wildcard apiGroups are unconditional findings, but wildcard `resources: ["*"]` is a
+# finding only inside a rule whose apiGroups are not a closed enumeration. All nine reader roles
+# carry it, 06 §2.2's platform read template requires it, and V-CTN-004's own VAP regression fixture
+# pins `vaptest-reader-labelled-readonly` as EXPECT: ADMITTED. Flagging it would have made the check
+# contradict the spec's own conformance fixture.
+python3 dev/tests/reader-holds-only-read-verbs.py
+# Sixteen mutations, each caught by the property it was written for ([[LSN-035]]). Four are about
+# the corpus rather than the verbs, because every assertion above is an absence and an absence over
+# an empty corpus is free: a reader role file deleted, a reader role losing its label so the corpus
+# quietly shrinks below its floor, a corpus file that stops parsing, and a new install path carrying
+# agent RBAC that is named in neither list.
+python3 dev/tests/reader-holds-only-read-verbs.py --negative-control
+
+# --- V-CTN-017: the controller mints no RBAC (P9-T11g-3) ------------------------------------------
+# 08 §7 says to assert this "by parsing the generated RBAC, not by inspection", and the check parses
+# BOTH artifacts and then asserts they agree — 28 `+kubebuilder:rbac` markers against `manager-role`,
+# triple for triple, 110 on each side today. Neither alone is the property. Markers-only misses a
+# hand-edit to the file `kustomize build` actually installs. Rendered-only misses a marker added
+# without `make manifests`, where the grant lands later, in a commit that looks like formatting.
+#
+# Read verbs on RBAC objects are NOT permitted, and that is 08 §623's call rather than a choice made
+# here: the "beyond `get;list;watch`" clause attaches to ServiceAccounts alone. Nothing under
+# `k8s-operator/` imports the RBAC API, so a read verb could only be a dead grant — and zero is the
+# only bound a parser can hold without deciding for itself which verbs are reads, which is exactly
+# what 09 §11.4 records going wrong.
+#
+# `serviceaccounts/token` is separately forbidden from ServiceAccounts themselves, because
+# TokenRequest returns the credential rather than the identity. A controller that may read a
+# ServiceAccount and mint its token has the actor's authority without holding a single RBAC verb.
+python3 dev/tests/controller-mints-no-rbac.py
+# Twenty-one mutations ([[LSN-035]]). Three land deliberately OUTSIDE `config/rbac/role.yaml` — the
+# hand-written brake role, the router's role, and a Go marker — so a discovery that quietly narrowed
+# to the generated file fails instead of passing over a smaller corpus. Two more attack the scanner
+# rather than the roles: the generated ClusterRole emptied, so every scan below it has nothing to
+# scan, and the self-test probe swapped for a harmless role, which blinds property 1.
+python3 dev/tests/controller-mints-no-rbac.py --negative-control
