@@ -274,6 +274,17 @@ The live install has never been checked for the same gap; that is a read-only lo
 B-007's improvement-pass work because that already points the same `auth can-i` / `get` shape at a
 cluster.
 
+**Half (1) landed 2026-08-01**, at the Phase 9 `harness-milestone` as scheduled: `LEDGER.md`
+`## Deferrals` now carries a row for the router's live Pub/Sub path, citing the two places the
+knowledge actually lived (`dev/cluster/up.sh:274-296`, `dev/cluster/reload-images.sh:216-235` and
+`:379-393`) and naming the external blocker as a Pub/Sub subscription plus a Workload-Identity-bound
+GSA. Its promotion condition is deliberately a **run** and not a reading — `up.sh`'s `else` arm
+already prints "THE ROUTER CAME UP, WHICH THIS TREE DOES NOT EXPECT" and calls it a ledger edit, so
+the trigger fires by itself rather than waiting for someone to re-read the deferrals table. **The
+item stays in `## Scheduled`** because half (2) has not happened: nobody has looked at
+`platform-agent-host` for the same gap. Moving it to `## Done` now would be this file's rule 2
+failing in the other direction — a row that reads landed while half its reasoning is still owed.
+
 ---
 
 ## Refused
