@@ -151,7 +151,12 @@ cleanup() {
   echo "  real install creates those once per namespace and outlives every CR in it, and deleting"
   echo "  them here would silently change what the NEXT suite in the chain is running against."
 }
-trap cleanup EXIT
+# P12 ([[LSN-066]]): this trap is installed AFTER p10_assert_control_plane_healthy, whose
+# p12_assert_exclusive_l2 took the one-suite-per-cluster lock and put `_l2_lock_exit_handler` on
+# EXIT. Replacing that trap here would leak the lock to the next acquirer's stale break, so the
+# release is chained in. It cannot change this script's exit status: bash runs the EXIT trap with
+# the pending status and only an explicit `exit` inside the trap overrides it.
+trap 'cleanup; l2_lock_release' EXIT
 
 # ------------------------------------------------------------------------------------------------
 # Fixtures: the two shipped CRs, then the identity each one's broker runs as

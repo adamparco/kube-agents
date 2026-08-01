@@ -972,7 +972,12 @@ cleanup() {
   echo "  are LEFT STANDING — that is not tidiness, it is the property V-RUN-009 just measured, and"
   echo "  deleting them here would also change what the next suite in the chain runs against."
 }
-trap cleanup EXIT
+# P12 ([[LSN-066]]): this trap is installed AFTER p10_assert_control_plane_healthy, whose
+# p12_assert_exclusive_l2 took the one-suite-per-cluster lock and put `_l2_lock_exit_handler` on
+# EXIT. Replacing that trap here would leak the lock to the next acquirer's stale break, so the
+# release is chained in. It cannot change this script's exit status: bash runs the EXIT trap with
+# the pending status and only an explicit `exit` inside the trap overrides it.
+trap 'cleanup; l2_lock_release' EXIT
 
 # ------------------------------------------------------------------------------------------------
 # Small readers. Each one pins ONE object and reads from it; none of them re-list a moving set.

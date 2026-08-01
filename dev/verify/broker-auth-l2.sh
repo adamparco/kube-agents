@@ -1033,7 +1033,12 @@ cleanup() {
   echo "  minted for L2-5 is not revocable and is not revoked; it expires in 15 minutes, grants"
   echo "  nothing this broker will honour, and exists only on a scratch cluster."
 }
-trap cleanup EXIT
+# P12 ([[LSN-066]]): this trap is installed AFTER p10_assert_control_plane_healthy, whose
+# p12_assert_exclusive_l2 took the one-suite-per-cluster lock and put `_l2_lock_exit_handler` on
+# EXIT. Replacing that trap here would leak the lock to the next acquirer's stale break, so the
+# release is chained in. It cannot change this script's exit status: bash runs the EXIT trap with
+# the pending status and only an explicit `exit` inside the trap overrides it.
+trap 'cleanup; l2_lock_release' EXIT
 
 # ------------------------------------------------------------------------------------------------
 # Fixtures: the two shipped CRs and the identities their brokers run as
@@ -1153,6 +1158,13 @@ broker_driver_untrusted_keypair "$K" "$NS" "$UNTRUSTED_SECRET" || {
 
 driver_out="$(broker_driver_run "$K" "$NS" "$AGENT" "$FOREIGN_AGENT" "$DRIVER_POD" "$DRIVER_CM" "$UNTRUSTED_SECRET")"
 driver_rc=$?
+if [ "$driver_rc" -eq 4 ]; then
+  echo "FAIL: two submissions collided onto one actionId ([[LSN-067]]). The experiment RAN and the"
+  echo "  instrument read it, so this is a measurement and not an inability to measure: every arm"
+  echo "  after the first was answered by the first submission's record, and the verdicts taken"
+  echo "  through it are void. A FAIL, never a DEFERRED (09 §11.8)."
+  exit 1
+fi
 if [ "$driver_rc" -ne 0 ]; then
   echo "DEFERRED: the driver pod could not be run to completion, so no credential was ever presented."
   echo "  This is an inability to run the experiment, not a property that failed (P10's distinction)."
@@ -1272,6 +1284,21 @@ if [ "$assertions" -ne "$EXPECTED_ASSERTIONS" ]; then
   echo
   bad "only $assertions of $EXPECTED_ASSERTIONS assertions ran. The verdict below would be about arms that never executed."
 fi
+
+# ------------------------------------------------------------------------------------------------
+# [[LSN-067]] once for the whole run, not once per arm. The driver's action ledger is cumulative
+# across this entire process, so this is the only place the whole population can be counted at once.
+# broker_driver_run already asserts after every submission, but every call site in this file maps a
+# non-zero driver rc to DEFERRED — an inability to run the experiment — and THIS verdict is not
+# that: it says the submissions did run and did not mint one action each, so an arm above was
+# answered by a record some other submission minted. Scored so it reaches the exit code.
+#
+# AFTER the assertion-count guard, so a red here can never make that guard report "only N of M" with
+# N greater than M. BEFORE the ledger is deleted, which cleanup does from the EXIT trap — i.e. after
+# this line. Zero submissions returns 0 and prints NOT-EVALUATED: this is the instrument check, not
+# a claim that anything was submitted.
+broker_driver_assert_distinct_actions ||
+  bad "LSN-067: the submissions this run made did not mint one distinct actionId each, so at least one arm above was scored against another submission's record. The instrument failed; the verdicts measured through it are void."
 
 echo
 echo "===================================================================="

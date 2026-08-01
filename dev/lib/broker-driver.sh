@@ -618,8 +618,16 @@ YAML
   fi
 
   # distinct(actionId) == submissions, over every run this suite process has made. [[LSN-067]].
+  #
+  # RC 4, NOT 1, AND THE DIFFERENCE IS THE WHOLE POINT. Every `return 1` above says the experiment
+  # could not be run — the pod would not schedule, the logs would not read — and all seven callers
+  # correctly map that to `DEFERRED … exit 3`. This one is the opposite: the experiment ran, the
+  # instrument read it, and the reading is that two submissions collided onto one actionId. Sharing
+  # rc 1 would file a MEASUREMENT as an inability to measure, which is a deferral with no external
+  # blocker (09 §11.8) on a BLOCKING-ALWAYS suite — the exact mis-attribution P10's rc-2/rc-1 split
+  # exists to prevent, one level down. Callers give rc 4 its own arm and FAIL on it.
   broker_driver_record_actions "$transcript" || return 1
-  broker_driver_assert_distinct_actions || return 1
+  broker_driver_assert_distinct_actions || return 4
 }
 
 # broker_driver_delete <kubectl-cmd> <namespace> <pod> <configmap> <untrusted-secret>

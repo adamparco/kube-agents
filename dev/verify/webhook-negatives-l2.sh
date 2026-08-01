@@ -178,7 +178,12 @@ cleanup() {
   $K delete namespace "$TEAM_NS" --ignore-not-found --wait=false >/dev/null 2>&1
   rm -f "$FAILFILE"
 }
-trap cleanup EXIT INT TERM
+# P12 ([[LSN-066]]): this trap is installed AFTER p10_assert_control_plane_healthy, whose
+# p12_assert_exclusive_l2 took the one-suite-per-cluster lock and put `_l2_lock_exit_handler` on
+# EXIT. Replacing that trap here would leak the lock to the next acquirer's stale break, so the
+# release is chained in. It cannot change this script's exit status: bash runs the EXIT trap with
+# the pending status and only an explicit `exit` inside the trap overrides it.
+trap 'cleanup; l2_lock_release' EXIT INT TERM
 
 # P3: delete any leftover from an earlier run rather than reusing it — a grandfathered parent may
 # predate the rules under test.

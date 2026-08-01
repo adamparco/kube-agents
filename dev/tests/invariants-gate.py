@@ -2379,6 +2379,130 @@ def check_l2_scripts_assert_cluster_health() -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------
+#
+# P12 / LSN-066. The one-suite-per-cluster lock is wired, and nothing quietly un-wires it.
+#
+# The obvious lint here -- "every L2 script calls l2_lock_guard" -- would be RED against a correct
+# tree. The lock is taken from ONE definition site: p10_assert_control_plane_healthy calls
+# p12_assert_exclusive_l2, which calls l2_lock_guard, and the 30-odd suites reach it transitively
+# because check_l2_scripts_assert_cluster_health above already forces every cluster-reading script
+# in the L2 closure to call P10. Writing a second, per-script roster would duplicate that one and
+# then disagree with it. So this asserts the three LINKS of the chain instead, plus the one thing a
+# single definition site cannot defend on its own:
+#
+# THE TRAP. `l2_lock_guard` installs its release as an EXIT trap and chains whatever trap was
+# already set. A suite that installs its own EXIT trap AFTER taking the lock therefore REPLACES the
+# release, and the lock survives the process. That is not a correctness hole -- the next acquirer
+# breaks it as stale -- but "BROKE A STALE LOCK" printed on every line of the chain is a warning
+# that means nothing (the V-MET-014 / LSN-035 shape), and a reused pid turns it into a half-hour
+# hang and a false red on a BLOCKING-ALWAYS suite. Seventeen suites had exactly this ordering.
+#
+# ORDER IS THE WHOLE PREDICATE, so a trap BEFORE the first P10 / l2_lock_guard line is not a
+# finding: that is the trap the lock chains, not the one that stomps it. Nine suites in the corpus
+# are in that shape today and must stay green. TOP-LEVEL only (column 0): an indented `trap - EXIT`
+# inside a function or subshell is scoped to it and never touches the script's own handler.
+P12_CALL = re.compile(r"(?<![\w-])p12_assert_exclusive_l2\s+\S")
+LOCK_GUARD_CALL = re.compile(r"(?<![\w-])l2_lock_guard\s+\S")
+LOCK_TAKEN = re.compile(r"(?<![\w-])(?:p10_assert_control_plane_healthy|l2_lock_guard)\s+\S")
+TOP_LEVEL_EXIT_TRAP = re.compile(r"^trap\s+.*(?<![\w-])EXIT(?![\w-])")
+# Seventeen suites install an EXIT trap after taking the lock. A floor, not a ratchet: the count is
+# not a property worth defending, but a rule that matches nothing has stopped being evidence.
+POST_LOCK_TRAP_FLOOR = 17
+# Module-level so the unit tests can repoint them at a synthetic library. The property is about the
+# SHAPE of the wiring, not about today's `dev/lib/`, and an arm that edited the real file to prove
+# a link is load-bearing would be mutating the thing every other check in this file reads.
+L2_LOCK_LIB = REPO / "dev" / "lib" / "l2-lock.sh"
+PRECONDITIONS_LIB = REPO / "dev" / "lib" / "preconditions.sh"
+
+
+def check_l2_lock_is_wired() -> list[str]:
+    """P12 / LSN-066. The lock's three links hold, and no post-lock EXIT trap drops the release."""
+    failures: list[str] = []
+    lib, pre = L2_LOCK_LIB, PRECONDITIONS_LIB
+    if not lib.exists() or not pre.exists():
+        return [
+            f"VACUOUS: {lib.relative_to(REPO)} or {pre.relative_to(REPO)} is missing, so the P12 "
+            f"lock this check is about does not exist to be wired. If either moved, move this "
+            f"check with it -- in the same commit."
+        ]
+
+    lib_code = _code_lines(lib.read_text())
+    for fn in ("l2_lock_guard", "l2_lock_release"):
+        if f"{fn}()" not in lib_code and f"{fn} ()" not in lib_code:
+            failures.append(
+                f"dev/lib/l2-lock.sh no longer defines {fn}. Every link below points at it, and "
+                f"a suite that sources the library and calls a function it does not define takes "
+                f"no lock while reporting that it did (LSN-066)."
+            )
+
+    pre_code = _code_lines(pre.read_text())
+    # Link 1: P10 calls P12. This is what makes the lock universal without a second roster.
+    p10_body = pre_code.split("p10_assert_control_plane_healthy()", 1)
+    if len(p10_body) < 2:
+        failures.append(
+            "dev/lib/preconditions.sh no longer defines p10_assert_control_plane_healthy, which "
+            "is the single site the P12 lock is taken from. Without it every L2 suite reads a "
+            "shared cluster unserialized (LSN-066)."
+        )
+    elif not P12_CALL.search(p10_body[1]):
+        failures.append(
+            "p10_assert_control_plane_healthy no longer calls p12_assert_exclusive_l2. That call "
+            "is the ONLY thing that makes the one-suite-per-cluster lock universal: the suites "
+            "reach it transitively through P10, which check_l2_scripts_assert_cluster_health "
+            "already requires of every cluster-reading script. Remove it and 30 suites silently "
+            "stop locking, with no per-script diff to notice (LSN-066)."
+        )
+    # Link 2: P12 actually takes the lock, rather than merely being called.
+    p12_body = pre_code.split("p12_assert_exclusive_l2()", 1)
+    if len(p12_body) < 2:
+        failures.append(
+            "dev/lib/preconditions.sh no longer defines p12_assert_exclusive_l2, which P10 calls "
+            "and binding.md §Preconditions P12 names."
+        )
+    elif not LOCK_GUARD_CALL.search(p12_body[1].split("\np10_assert", 1)[0]):
+        failures.append(
+            "p12_assert_exclusive_l2 no longer calls l2_lock_guard, so it is a precondition that "
+            "asserts nothing -- the exact shape of an artifact nothing runs (LSN-019)."
+        )
+
+    # Link 3: nobody stomps the release.
+    trapped = 0
+    for p in sorted(_l2_scripts_in_scope()):
+        if not p.exists():
+            continue
+        lines = _code_lines(p.read_text()).splitlines()
+        taken = next((i for i, ln in enumerate(lines) if LOCK_TAKEN.search(ln)), None)
+        if taken is None:
+            continue
+        post = [
+            (i, ln)
+            for i, ln in enumerate(lines)
+            if i > taken and TOP_LEVEL_EXIT_TRAP.match(ln)
+        ]
+        if post:
+            trapped += 1
+        for _, ln in post:
+            if "l2_lock_release" not in ln:
+                failures.append(
+                    f"{p.relative_to(REPO)} installs a top-level EXIT trap AFTER taking the P12 "
+                    f"lock and does not chain l2_lock_release: `{ln.strip()}`. bash REPLACES the "
+                    f"handler, so this discards the release the lock installed and the lock "
+                    f"survives the process -- every later suite then prints 'BROKE A STALE LOCK', "
+                    f"and a reused pid turns that into a full-timeout hang and a false red. Write "
+                    f"it as `trap 'yourcleanup; l2_lock_release' EXIT` (LSN-066)."
+                )
+    if trapped < POST_LOCK_TRAP_FLOOR:
+        return [
+            f"VACUOUS: only {trapped} L2 script(s) install an EXIT trap after taking the P12 lock; "
+            f"there were {POST_LOCK_TRAP_FLOOR} when this was written. Either the closure shrank "
+            f"or the trap/lock predicates stopped matching, and in both cases the trap arm above "
+            f"is now green about nothing. Move this floor in the same commit that removes the "
+            f"script."
+        ]
+    return failures
+
+
+# ---------------------------------------------------------------------------------------------
 
 CAPACITY_LIB = REPO / "dev" / "lib" / "substrate-capacity.sh"
 # `# @covers: <command>` on the line above `assert_<name>_capacity() {`. Parsed, not hardcoded --
@@ -4222,6 +4346,10 @@ CHECKS = [
     (
         "LSN-026 / P10 — L2 scripts assert the cluster can run the experiment",
         check_l2_scripts_assert_cluster_health,
+    ),
+    (
+        "LSN-066 / P12 — the one-suite-per-cluster lock is wired and not stomped",
+        check_l2_lock_is_wired,
     ),
     (
         "LSN-027 — cluster-creating scripts measure their substrate first",

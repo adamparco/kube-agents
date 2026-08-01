@@ -144,7 +144,12 @@ cleanup() {
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
   unseed_parent_agents "$K" "${SEEDED[@]:-}"
 }
-trap cleanup EXIT
+# P12 ([[LSN-066]]): this trap is installed AFTER p10_assert_control_plane_healthy, whose
+# p12_assert_exclusive_l2 took the one-suite-per-cluster lock and put `_l2_lock_exit_handler` on
+# EXIT. Replacing that trap here would leak the lock to the next acquirer's stale break, so the
+# release is chained in. It cannot change this script's exit status: bash runs the EXIT trap with
+# the pending status and only an explicit `exit` inside the trap overrides it.
+trap 'cleanup; l2_lock_release' EXIT
 
 # --- setup: the two ancestors the dev-team CR hangs beneath (06 §1.2 V-6) ----------------------
 # NOT a check. Applied platform-first, because the cluster-admin manifest is a child too and would be

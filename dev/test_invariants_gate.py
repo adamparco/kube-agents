@@ -1643,5 +1643,132 @@ class BacklogStructureIsUniform(unittest.TestCase):
         self.assertTrue(any("How this file is structured" in p for p in problems), problems)
 
 
+class L2LockIsWired(unittest.TestCase):
+    """[[LSN-066]] / P12: the lock is taken from one site, and no later trap throws the release away.
+
+    Each arm here is a shape the tree was actually in. The trap arm in particular: seventeen suites
+    installed their own `trap cleanup EXIT` after taking the lock, which REPLACES the release
+    `l2_lock_guard` had chained, so the lock outlived every one of them. Nothing was red — the next
+    acquirer broke the lock as stale and printed a warning — which is why it needs a check rather
+    than a reader.
+
+    The link arms repoint `L2_LOCK_LIB` / `PRECONDITIONS_LIB` at synthetic files, and the trap arm
+    repoints `_l2_scripts_in_scope`, because the property is about the shape of the wiring and an
+    arm that edited the real library to prove a link is load-bearing would be mutating what every
+    other check in the gate reads.
+    """
+
+    LIB = "l2_lock_guard() { :; }\nl2_lock_release() { :; }\nl2_lock_path() { echo /tmp/x; }\n"
+    PRE = (
+        "p12_assert_exclusive_l2() {\n"
+        '  l2_lock_guard "$ctx"\n'
+        "}\n"
+        "p10_assert_control_plane_healthy() {\n"
+        '  p12_assert_exclusive_l2 "$K" || return 2\n'
+        "}\n"
+    )
+    # Takes the lock (transitively, via P10) and then installs its own EXIT trap. The chained
+    # release is what keeps this green.
+    SUITE = (
+        "#!/usr/bin/env bash\n"
+        'p10_assert_control_plane_healthy "$K" "$CTX" || exit 2\n'
+        "trap 'cleanup; l2_lock_release' EXIT\n"
+    )
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(dir=gate.REPO / "dev")
+        self.addCleanup(self._tmp.cleanup)
+        self._dir = pathlib.Path(self._tmp.name)
+        for attr in ("L2_LOCK_LIB", "PRECONDITIONS_LIB", "POST_LOCK_TRAP_FLOOR",
+                     "_l2_scripts_in_scope"):
+            saved = getattr(gate, attr)
+            self.addCleanup(lambda a=attr, v=saved: setattr(gate, a, v))
+        gate.L2_LOCK_LIB = self._dir / "l2-lock.sh"
+        gate.PRECONDITIONS_LIB = self._dir / "preconditions.sh"
+        gate.L2_LOCK_LIB.write_text(self.LIB, encoding="utf-8")
+        gate.PRECONDITIONS_LIB.write_text(self.PRE, encoding="utf-8")
+        gate.POST_LOCK_TRAP_FLOOR = 1
+        self._real = {
+            "L2_LOCK_LIB": gate.REPO / "dev" / "lib" / "l2-lock.sh",
+            "PRECONDITIONS_LIB": gate.REPO / "dev" / "lib" / "preconditions.sh",
+            "POST_LOCK_TRAP_FLOOR": 17,
+            "_l2_scripts_in_scope": gate._l2_scripts_in_scope,
+        }
+        self.scripts: list[pathlib.Path] = []
+        gate._l2_scripts_in_scope = lambda: list(self.scripts)
+
+    def suite(self, name: str, body: str) -> None:
+        p = self._dir / name
+        p.write_text(body, encoding="utf-8")
+        self.scripts.append(p)
+
+    def test_green_on_the_tree_as_it_stands(self):
+        """The arm that matters most: the real wiring, real library, real suites, no findings."""
+        for attr, value in self._real.items():
+            setattr(gate, attr, value)
+        self.assertEqual([], gate.check_l2_lock_is_wired())
+
+    def test_green_on_a_well_wired_synthetic_tree(self):
+        self.suite("good-l2.sh", self.SUITE)
+        self.assertEqual([], gate.check_l2_lock_is_wired())
+
+    def test_an_unchained_post_lock_trap_fails(self):
+        # THE defect, verbatim: `trap cleanup EXIT` after the lock. bash replaces the handler.
+        self.suite("bad-l2.sh", self.SUITE.replace("'cleanup; l2_lock_release'", "cleanup"))
+        problems = gate.check_l2_lock_is_wired()
+        self.assertTrue(any("does not chain l2_lock_release" in p for p in problems), problems)
+
+    def test_a_trap_installed_BEFORE_the_lock_is_not_flagged(self):
+        # Nine suites in the corpus are in this shape and must stay green: `l2_lock_guard` chains
+        # whatever trap it finds, so a trap set earlier is the one it chains, not one that stomps
+        # it. A check that flagged these would have its first finding be a false positive.
+        self.suite(
+            "early-l2.sh",
+            "#!/usr/bin/env bash\ntrap cleanup EXIT\n"
+            'p10_assert_control_plane_healthy "$K" "$CTX" || exit 2\n',
+        )
+        self.suite("good-l2.sh", self.SUITE)
+        self.assertEqual([], gate.check_l2_lock_is_wired())
+
+    def test_an_indented_trap_is_not_flagged(self):
+        # `startup-ordering-l2.sh` clears EXIT inside a subshell. That handler is the subshell's.
+        self.suite("nested-l2.sh", self.SUITE + "run() {\n  trap - EXIT\n}\n")
+        self.assertEqual([], gate.check_l2_lock_is_wired())
+
+    def test_p10_not_calling_p12_fails(self):
+        # The single definition site removed: 30 suites silently stop locking, no per-script diff.
+        gate.PRECONDITIONS_LIB.write_text(
+            self.PRE.replace('  p12_assert_exclusive_l2 "$K" || return 2\n', "  :\n"),
+            encoding="utf-8",
+        )
+        self.suite("good-l2.sh", self.SUITE)
+        problems = gate.check_l2_lock_is_wired()
+        self.assertTrue(any("no longer calls p12_assert_exclusive_l2" in p for p in problems),
+                        problems)
+
+    def test_p12_not_taking_the_lock_fails(self):
+        gate.PRECONDITIONS_LIB.write_text(
+            self.PRE.replace('  l2_lock_guard "$ctx"\n', "  :\n"), encoding="utf-8"
+        )
+        self.suite("good-l2.sh", self.SUITE)
+        problems = gate.check_l2_lock_is_wired()
+        self.assertTrue(any("no longer calls l2_lock_guard" in p for p in problems), problems)
+
+    def test_a_library_missing_its_release_fails(self):
+        gate.L2_LOCK_LIB.write_text(self.LIB.replace("l2_lock_release() { :; }\n", ""),
+                                    encoding="utf-8")
+        self.suite("good-l2.sh", self.SUITE)
+        problems = gate.check_l2_lock_is_wired()
+        self.assertTrue(any("no longer defines l2_lock_release" in p for p in problems), problems)
+
+    def test_a_tree_with_no_post_lock_trap_is_reported_as_vacuous(self):
+        # The way this check would silently empty out: the scope shrinks, or the trap predicate
+        # stops matching. Either way the trap arm is then green about nothing.
+        gate.POST_LOCK_TRAP_FLOOR = 17
+        self.suite("good-l2.sh", self.SUITE)
+        problems = gate.check_l2_lock_is_wired()
+        self.assertTrue(any("VACUOUS" in p for p in problems), problems)
+
+
 if __name__ == "__main__":
     unittest.main()
