@@ -106,6 +106,16 @@ bash dev/verify/closed-allowlist-l2.sh gke-scratch-kube-agents-dev
 bash dev/verify/gitops-tree-applies-l2.sh gke-scratch-kube-agents-dev
 bash dev/verify/multi-agent-namespace-l2.sh gke-scratch-kube-agents-dev
 
+# V-CTN-012 (attenuation) — and the reason this line sits directly under gitops-tree-applies-l2.sh
+# is that it is the other half of that line. The gitops sweep applies every YAML under
+# examples/gitops-repo/ as a whole file, so the seven-document negative corpus gets ONE verdict and
+# one of the seven satisfies it; the five-document positive corpus gets asked V-CMP-003's question
+# (can the tree land) rather than its own (has the carve-out narrowed). This suite splits both files
+# on their own separators and submits each document alone, so no document's verdict can stand in for
+# another's. It is gated on P2 and exits 3 — DEFERRED, not pass — if the policy is not live, because
+# five of its arms expect an ADMIT and an ADMIT reads identically against an absent policy (LSN-006).
+bash dev/verify/vap-corpus-l2.sh gke-scratch-kube-agents-dev
+
 # V-CTR-002 in full: one REJECTED fixture for each of 06 §1.2's V-1…V-10, every rejection asserted to
 # name its own field path. closed-allowlist-l2.sh above is the deep-dive on one of those rules (V-7);
 # this is the roll call, so a rule that stops being enforced shows up as a missing line rather than
@@ -292,6 +302,14 @@ bash dev/verify/broker-execute-l2.sh gke-scratch-kube-agents-dev
 # that stops the record being written, so `server.go` logs "there is no record to put it on" and
 # gives up. Asserting it needs CH6's other fault (drop the CRD's storage version), which breaks the
 # store for every subject. Rows 1, 2, 5, 6 and 9 belong elsewhere and the suite's header says where.
+#
+# It also carries V-BRK-005 ("with the journal store unavailable the broker refuses to execute",
+# 03 §6). That is scenario B's sentence word for word, and binding it here rather than writing a
+# fourth suite is deliberate: a second line inducing the same fault against the same pod would cost
+# another ~50 seconds of a blinded audit trail and, on the day the property broke, would go red
+# alongside this one without saying which of the two faults mattered. The suite's header carries the
+# argument in full, including the one thing 03 §6's framing needs that the execution framing does
+# not — that the refusal comes from the brake probe at step 5, not from the Create failing at 7.
 bash dev/verify/broker-refuse-l2.sh gke-scratch-kube-agents-dev
 
 # V-REV-003 at L2 — the third outcome the pipeline has, and the only one the two lines above cannot

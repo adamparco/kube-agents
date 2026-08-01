@@ -106,11 +106,31 @@ rules:
   - nonResourceURLs: ["/healthz", "/metrics"] # -> DENIED
     verbs: ["get"]
 ---
-# DOC 6 — an empty apiGroups list. EXPECT: DENIED by validation #3.
-# The same vacuity, reached a different way: `apiGroups: []` with a real resource and verb. Without
-# the `size(...) > 0` guards this rule passes every `.all()` in validation 3 while granting nothing
-# today — and grants whatever a later mutation puts in the list, from an object that admission has
-# already blessed once.
+# DOC 6 — an empty apiGroups list. EXPECT: DENIED by structural schema validation.
+#
+# This document declared `DENIED by validation #3` until 2026-07-31, when it was submitted ALONE for
+# the first time and never reached the policy:
+#
+#   The Role "vaptest-actor-empty-groups" is invalid: rules[0].apiGroups: Required value:
+#   resource rules must supply at least one api group
+#
+# The reasoning it was written under is sound and unchanged — without the `size(...) > 0` guards, an
+# empty list passes every `.all()` in validation 3 while granting nothing today, and grants whatever
+# a later mutation puts in the list from an object admission has already blessed. What is false is
+# that a resource rule can BE that shape. RBAC's structural schema requires at least one entry in
+# each of `apiGroups`, `resources` and `verbs` (all three probed against the API server on the same
+# day), so the `.all()`-over-empty escape is unreachable on a resource rule regardless of the policy.
+#
+# It is kept, not deleted, and it is kept as a NEGATIVE. Three layers refuse this object — schema,
+# then policy, then RBAC — and the outermost one is doing the work; a document pinned to that fact
+# fails loudly if the schema ever relaxes, which is the only way the escape reopens. What it must
+# not do is keep claiming validation #3: the blob-form sweep read "the file was refused" and scored
+# this as a policy test for as long as it existed, which is the whole reason the per-document runner
+# (`dev/verify/vap-corpus-l2.sh`, V-CTN-012) was built.
+#
+# The vacuity class itself is still tested, and by a document that does reach admission: DOC 5's
+# `nonResourceURLs` rule, which the schema exempts from all three requirements and validation #3
+# refuses on its own.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

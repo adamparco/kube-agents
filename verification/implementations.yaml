@@ -44,6 +44,10 @@
   runs: "make -C k8s-operator test"
   asserts_in: "k8s-operator/internal/broker/envelope_test.go"
 
+"V-BRK-005":
+  runs: "bash dev/verify/broker-refuse-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/broker-refuse-l2.sh"
+
 "V-BRK-006":
   runs: "make -C k8s-operator test"
   asserts_in: "k8s-operator/internal/broker/execute/execute_envtest_test.go"
@@ -160,6 +164,10 @@
   runs: "bash dev/verify/multi-agent-namespace-l2.sh gke-scratch-kube-agents-dev"
   asserts_in: "dev/verify/multi-agent-namespace-l2.sh"
 
+"V-CMP-006":
+  runs: "python3 -m unittest discover dev"
+  asserts_in: "dev/test_mcp_env_declared.py"
+
 "V-CMP-007":
   runs: "python3 dev/tests/identity-has-install-path.py"
   asserts_in: "dev/tests/identity-has-install-path.py"
@@ -175,6 +183,18 @@
 "V-CTN-004":
   runs: "python3 dev/tests/reader-holds-only-read-verbs.py"
   asserts_in: "dev/tests/reader-holds-only-read-verbs.py"
+
+"V-CTN-012":
+  runs: "bash dev/verify/vap-corpus-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/vap-corpus-l2.sh"
+
+"V-CTN-015":
+  runs: "bash dev/verify/webhook-negatives-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/webhook-negatives-l2.sh"
+
+"V-CTN-016":
+  runs: "bash dev/verify/webhook-negatives-l2.sh gke-scratch-kube-agents-dev"
+  asserts_in: "dev/verify/webhook-negatives-l2.sh"
 
 "V-CTN-017":
   runs: "python3 dev/tests/controller-mints-no-rbac.py"

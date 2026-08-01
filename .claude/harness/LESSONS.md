@@ -92,8 +92,9 @@ will start selecting.
 | **LSN-061** | go, kubernetes, api-semantics, subresource, silent-loss | `status` is a **subresource**: a Create keeps spec and metadata and **discards the whole status block**. `journal.Store.Create` had known that since Phase 5 — it re-writes `status.phase` afterwards — and put back exactly **one field** of the block it knew had been dropped. Everything else the broker composes at 06 §4.2 step 6 went with it, including the lifecycle clock the write-ahead rule exists to make observable; and the Create's reply body **overwrote the caller's copy**, so the pipeline reached step 8 holding a nil `status.timestamps` and **panicked on a live cluster** at the one moment a failure is unrecoverable. Symmetrically, `SetPhase` re-read the record and wrote the LIVE copy, discarding every field the caller had composed | **closed** | `mergeOwnedStatus` — the six fields 06 §4.3 assigns the owning broker SA, nil-guarded per field, snapshotted **before** the Create — used by both `Create` and `SetPhase` (`k8s-operator/internal/journal/store.go`). `state.clock()` makes the pipeline's stamping nil-safe. The journal package's fake client has modelled the subresource drop since it was written (`dropStatusLikeTheApiServer`); the pipeline's fake now models it too under `dropStatusOnCreate`. `verification/mutants/V-BRK-006.json` 15/15, M13/M14/M15 targeting exactly this. Run by `make -C k8s-operator test` (the L1 half) and by `dev/verify/broker-execute-l2.sh` (L2-CHAIN line 261), whose L2-2 arm is the property itself: `creationTimestamp` from the API server against `status.timestamps.executionStarted` from the broker |
 | **LSN-062** | records, verification, orient | A harness record states that a file "does not exist", and the file is right there. `P9-T11g-2a`'s split note said `verification/traceability.yaml` did not exist. It had existed since `P8-T10` — 71 KB, 177 entries, V-MET-011's artifact, green on every run. The question actually asked was *"does 09 §8's `R-<doc>.<section>-<n>` requirement mapping exist?"* — a correct **no** — and the answer was written down against the **filename §8 happens to use for it** rather than against the question. The unit's conclusion survived; its published reason did not, and it shipped in a commit message, a phase-file row and a ledger cell before the next ORIENT caught it | **open** | Proposed for the next improvement pass: an L0 lint that reads `docs/build/*.md`, `.claude/harness/*.md` and `verification/*.yaml` headers for a repo path asserted absent ("does not exist", "is absent", "is not in the tree", "nothing at") and fails when the path is present — the claim is cheap to make, load-bearing for scheduling, and trivially checkable |
 | **LSN-063** | checks, verification, mutation-testing | A negative-control row prints `MISS`, and the mutation it names never applied | **open** | Guarded in `requirements-are-enumerated.py` and, after it recurred one unit later, `coverage-ratchet-holds.py` (a mutated tuple equal to the base prints `BROKEN` and fails); a third recurrence in `load-bearing-coverage-is-full.py` widened it — a literal LINE NUMBER expires the same way a literal count does, and the mutation still applied, so only [[LSN-035]]'s per-row needle caught it; proposed for the next improvement pass: both halves for the other 18 `negative_control()` loops, hoisted into one helper and policed by `negative-controls-name-their-rule.py` |
+| **LSN-064** | checks, verification, L2, shell | Every assertion ran on the right-hand side of a pipe, so `fail=1` landed in a subshell and the suite could not go red | **open** | Fixed in `webhook-negatives-l2.sh` by moving the failure flag into a `mktemp` FAILFILE at the single `bad` choke point, proved with an in-tree mutant (rc 1); a repo-wide scan with `||` excluded found no second instance; proposed for the next improvement pass: that scan as an L0 lint under `dev/tests/`, standing in for the broader property that a suite whose exit code no single-assertion mutation can make non-zero is not a check |
 
-**Open: 2 of 63**.
+**Open: 3 of 64**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -3663,3 +3664,62 @@ chances to implement it wrong.
 **Related:** [[LSN-048]] (a `-run` pattern that matched nothing scored three unevaluated mutants as
 survivors) · [[LSN-049]] (an applier that died and its `0` was read as the suite passing) ·
 [[LSN-035]] (a check that goes quiet reads identically to a passing one).
+
+## LSN-064 — Every assertion was on the right-hand side of a pipe, so the suite could not go red
+
+**Tags:** checks, verification, L2, shell
+**Opened:** 2026-07-31 (P9-T11g-4)
+**Status:** open — fixed in the one suite that had it; the lint is an improvement pass
+
+**What happened.** `P9-T11g-4` bound two BLOCKING-ALWAYS rows, V-CTN-015 and V-CTN-016, to arms that
+had been running in `dev/verify/webhook-negatives-l2.sh` since P8-T9. Binding them meant breaking
+the suite on purpose to see it fail, and it would not. The suite printed four `FAIL:` lines and
+exited **0**, under a banner reading `V-CTR-002: PASS`.
+
+Nearly every assertion in that file is invoked as `child_yaml … | reject …`. In bash **every**
+component of a pipeline runs in a subshell, so the `fail=1` inside `reject` and `admit` was assigned
+in a child process and discarded when it exited. The suite had 31 assertions and no way to report
+any of them.
+
+```
+$ bash -c 'fail=0; bad(){ fail=1; }; echo x | bad; echo "fail=$fail"'
+fail=0
+```
+
+**Why it survived.** `V-CTR-002` was recorded green at L2 on the strength of that exit code, and
+`dev/L2-CHAIN.txt` gates on it. Nothing was wrong with the arms — all 31 really do pass today, which
+is why no run ever looked odd. A suite that cannot fail is indistinguishable from a suite that is
+passing, from the outside, forever. It was found only because a new row was being bound and the
+binding required a negative control; had the two IDs been recorded against the existing arms without
+one, three check IDs would now rest on an exit code that is a constant.
+
+**The fix, and why it is a file.** `bad` appends to a `mktemp` `FAILFILE`; the exit code is derived
+from it once at the end and never assigned by an assertion. A file survives the subshell, and `bad`
+is the single choke point every `reject`, `admit` and inline failure already goes through — so call
+sites that do not exist yet are covered without each one having to remember. Restructuring the 31
+call sites away from pipes was the alternative and is worse: it is 31 chances to get it wrong, and
+the 32nd assertion someone adds next year reintroduces the bug.
+
+**Negative control** (run in-tree — `REPO_ROOT` derives from `${BASH_SOURCE[0]}`, so a `/tmp` copy
+cannot source `dev/lib/preconditions.sh` and exits 2 before reaching any arm): one piped assertion
+mutated to expect a field path the API server cannot produce → **rc 1**, banner
+`V-CTR-002 · V-CTN-015 · V-CTN-016: FAIL — 1 failed assertion(s)`. The same mutation before the fix
+gave rc 0 and a PASS banner.
+
+**Scope.** A scan of every `dev/**/*.sh` for the shape — a helper that assigns a failure counter,
+invoked on the right-hand side of a real single pipe, `||` excluded — found **no other instance**.
+`dev/verify/multi-agent-namespace-l2.sh` matched a first, cruder pass and is a false positive:
+`cmd | $K apply … || bad "…"` runs `bad` as the RHS of `||`, which is the current shell, not the
+pipeline.
+
+**Proposed mechanization** (improvement pass): that scan, as an L0 lint under `dev/tests/`, on
+`dev/L0-CHAIN.txt`. It is ~40 lines of Python and it is cheap, but the reason to have it is not the
+one instance it found — it is that the failure mode is silent by construction and the next one will
+also be found only by accident. Pair it with the weaker, broader property behind it: **a suite whose
+exit code cannot be made non-zero by any single-assertion mutation is not a check.** The lint is the
+tractable half of that.
+
+**Related:** [[LSN-035]] (a check that goes quiet reads identically to a passing one — this is the
+same lesson at the level of the process exit code rather than the assertion) · [[LSN-049]] (an
+applier that died and its `0` was read as the suite passing) · [[LSN-019]] (prose on the artifact is
+not a mechanization).

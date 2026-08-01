@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# V-BRK-018 and V-ISO-006 at L2, and the journal half of Phase 9 acceptance bullet (d) — what a
+# V-BRK-005, V-BRK-018 and V-ISO-006 at L2, and the journal half of Phase 9 acceptance bullet (d) — what a
 # DEPLOYED broker does when it accepts an envelope and then discovers, several steps in, that it
 # cannot proceed (09 §6.2, 09 §6.4, 06 §4.4 rows 3 and 4, 05 §8 CH6, 03 §6, 05 §1.2).
 #
@@ -13,7 +13,7 @@
 #       well-formed body, caller in scope, both operations individually valid. The refusal comes
 #       from step 3 and from nowhere earlier.
 #
-#   B · journal-gone — 06 §4.4 row 3, and the journal half of Accept (d): "the brake refuses and the
+#   B · journal-gone — V-BRK-005, 06 §4.4 row 3, and the journal half of Accept (d): "the brake refuses and the
 #       agent pauses when the journal is unreachable." One ordinary envelope, submitted while the
 #       actor's `actionrecords` grant has been revoked out from under the running broker. The brake
 #       probes the ActionRecord store at step 5 and refuses 503 — four steps before the write-ahead
@@ -38,6 +38,29 @@
 #   row was carried by a suite that named V-BRK-018 and nothing else, so 09's CH6 row had no results
 #   line while the property behind it had been green for units. Binding it here is the whole of
 #   P9-T11b-2; arm C is what the binding turned out to cost.
+#
+# WHY ARM B ALSO CARRIES V-BRK-005, AND WHY THAT IS A BINDING AND NOT A SECOND CLAIM
+#   09 §6 line 345 is `V-BRK-005 | With the journal store unavailable the broker refuses to execute
+#   ¬ | 03 §6 | L2 | 9`. That sentence is arm B's sentence. Arm B makes the journal store
+#   unavailable — it revokes the running broker's `create` on `actionrecords`, which is the second
+#   of the two faults 05 §8 CH6 names — and asserts the broker refuses 503 at the step-5 brake
+#   probe, four steps before the write-ahead Create would have been attempted, with zero mutations
+#   and zero records in the window. There is nothing in V-BRK-005's row that arm B does not already
+#   submit to a live broker.
+#
+#   So this is the same shape as V-ISO-006 above, one row later: a property green for units,
+#   carried by a suite that named a different ID, with 09's row sitting unclaimed. The fix is to
+#   name it, not to write a fourth arm — a second suite inducing the same fault against the same
+#   pod would double the runtime and halve the signal, because when the property broke two lines
+#   would go red and neither would say which fault was the one that mattered.
+#
+#   WHAT IS DIFFERENT IS THE FRAMING, and it is why the binding is safe. V-BRK-018 and V-ISO-006
+#   read arm B as an EXECUTION property — nothing runs unjournaled. 03 §6 is "The human brake:
+#   pause, freeze, undo", and reads it as a BRAKE property: an unreachable journal is one of the
+#   conditions the brake must trip on, alongside the human-pulled ones. Arm B asserts both halves
+#   already — the refusal, and that the refusal came from the brake probe at step 5 rather than
+#   from the Create failing at step 7. That second assertion is the one V-BRK-005 needs, and it is
+#   exactly the one a suite that only checked "nothing was written" would not have.
 #
 # WHY THE RESTORE IS AN ARM AND NOT CLEANUP
 #   "Restoring the journal restores service without a broker restart" is the clause that separates a
@@ -1399,7 +1422,8 @@ fi
 echo
 echo "===================================================================="
 if [ "$fail" -eq 0 ]; then
-  echo " PROVEN: V-BRK-018 · V-ISO-006 (05 §8 CH6) at L2 · the journal half of Phase 9 acceptance (d)"
+  echo " PROVEN: V-BRK-005 · V-BRK-018 · V-ISO-006 (03 §6, 05 §8 CH6) at L2 · the journal half of"
+  echo " Phase 9 acceptance (d)"
   echo " A two-target envelope with one unreadable target was refused at step 3 and left no"
   echo " write-ahead record, no captured pre-state and neither object behind; a broker whose journal"
   echo " had been revoked out from under it refused 503 rather than executing unjournaled, and wrote"
