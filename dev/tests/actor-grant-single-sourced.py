@@ -614,6 +614,33 @@ def _is_vap_copy(rel: str) -> bool:
     return any(p.match(g) for g in VAP_GLOBS)
 
 
+# The install-path copy of the policy: the one a provisioning skill renders onto a new cluster,
+# as opposed to the two exemplar copies under examples/gitops-repo. Located by PROPERTY rather
+# than by literal path, because the literal is exactly what the P13-T5 persona rename broke --
+# `propose-cluster-admin` became `provision-cluster-admin`, the anchor assertion in `narrow` raised
+# KeyError, and `--negative-control` could not run at all. An unevaluable control is a failure, not
+# a pass, so the locator is the check's own VAP glob narrowed to the templated copy under a skill's
+# asset tree; a rename that keeps the file where it belongs no longer breaks it, and a rename that
+# MOVES it out of the skill tree still fails loudly here.
+SKILL_ASSET_TREE = re.compile(r"^agents/[^/]+/skills/[^/]+/assets/")
+
+
+def _skill_vap_tmpl(sources: dict[str, str]) -> str:
+    """The sole vap-agent-readonly template under a skill's assets, keyed as `sources` keys it."""
+    found = sorted(
+        rel
+        for rel in sources
+        if _is_vap_copy(rel) and rel.endswith(".tmpl") and SKILL_ASSET_TREE.match(rel)
+    )
+    assert len(found) == 1, (
+        f"expected exactly one vap-agent-readonly template under a skill's assets, found "
+        f"{found!r}. The mutations below narrow every installed copy of the policy at once; with "
+        f"this one missing they would narrow only the exemplars, and property 6's bound -- the "
+        f"intersection over copies -- would move for the wrong reason."
+    )
+    return found[0]
+
+
 def check(sources: dict[str, str]) -> list[str]:
     failures: list[str] = []
 
@@ -908,10 +935,7 @@ def negative_control() -> int:
     canon_vap = "examples/gitops-repo/policy/vap-agent-readonly.yaml"
     canon_rbac = "examples/gitops-repo/policy/rbac-overlay/broker-operations.yaml"
     boot_vap = "examples/gitops-repo/clusters/cluster-a/bootstrap/20-policy/vap-agent-readonly.yaml"
-    tmpl_vap = (
-        "agents/platform/skills/propose-cluster-admin/assets/bootstrap/20-policy/"
-        "vap-agent-readonly.yaml.tmpl"
-    )
+    tmpl_vap = _skill_vap_tmpl(sources)
     overlay = "examples/gitops-repo/policy/rbac-overlay/platform.yaml"
     # The install-path render of 06 §2.2's platform template, landed by P9-T9b-5b-0-ii-b. Property
     # 4 measures the UNION of a tier's objects, so the two missing-rule rows below have to perturb

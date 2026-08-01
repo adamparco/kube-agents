@@ -137,16 +137,39 @@ class TestTheSkillExists(unittest.TestCase):
                 self.assertEqual(fm.get("name"), SKILL)
                 self.assertTrue(fm.get("description"), "a skill with no description is a skill nothing loads")
 
-    def test_submit_suggestion_still_ships(self):
-        """Its retirement is P10-T3, per tier, as each tier's shadow mode is turned off.
+    def test_submit_suggestion_is_gone_from_every_tier(self):
+        """The inverse of the arm that stood here, and the inversion was a deliberate ruling.
 
-        Phase 9 has no write authority anywhere by design, so retiring the GitOps path here would
-        leave every tier with a dead proposal path and a no-op imperative one. 07 §5: replaced,
-        never deleted, and swapped in the same phase that removes it.
+        This arm used to assert that `submit-suggestion` STILL SHIPS, with a good argument: its
+        retirement was scheduled at P10-T3, per tier, as each tier's shadow mode was turned off, and
+        07 §5 says a path is replaced rather than deleted and swapped in the same phase that removes
+        it. Deleting the GitOps path in Phase 9 -- a phase whose defining constraint is that no write
+        authority exists anywhere -- looked like it would leave every tier with a dead proposal path
+        and a no-op imperative one.
+
+        P13-T5 was pulled forward from Phase 13 into Phase 9 by human ruling on the milestone halt,
+        and the conversion deleted the skill. That is not a violation of the argument above; it is
+        the argument reaching its real conclusion. `submit-suggestion`'s write path was a GitHub
+        token living in an agent pod, and it was the one write credential the phase's own property
+        did not cover, because it wrote to git rather than to a cluster. Removing it does not leave
+        Phase 9 with less change capability than the design intends -- the design intends none --
+        and it removes the last surface on which an agent could effect a change without an Action
+        Envelope. 02 §2.1 does not allocate the skill to any tier, which is why V-CMP-020 requires
+        its absence.
+
+        Kept as an arm rather than deleted so the retirement is asserted rather than assumed: a
+        directory quietly restored by `scripts/sync-upstream-skills.py` or by a bad merge would
+        otherwise reappear silently. V-CMP-020 also covers this from the allocation side; this is
+        the cheap local statement of it, and the two failing together is more legible than either
+        alone.
         """
         for tier in TIERS:
             with self.subTest(tier=tier):
-                self.assertTrue((REPO / "agents" / tier / "skills" / "submit-suggestion" / "SKILL.md").is_file())
+                self.assertFalse(
+                    (REPO / "agents" / tier / "skills" / "submit-suggestion").exists(),
+                    f"{tier} still ships submit-suggestion. It was retired by P13-T5 and its replacement is "
+                    "apply-change, which submits an Action Envelope instead of opening a pull request.",
+                )
 
 
 class TestItDescribesToolsThatExist(unittest.TestCase):
@@ -312,20 +335,81 @@ class TestNoMutatingShellOutAndNoProposalPath(unittest.TestCase):
                     m = re.search(pattern, text)
                     self.assertIsNone(m, f"{tier}'s apply-change issues {what}: {m.group(0) if m else ''!r}")
 
-    def test_the_rule_is_scanning_something(self):
-        """Non-vacuity: the same rule over `submit-suggestion` must fire, or the scan reads nothing.
+    # A synthetic positive control, in the format the scan reads. Every FORBIDDEN pattern appears
+    # exactly once, split across the two places `instruction_text` keeps -- a fenced block and bare
+    # prose -- because a control that only exercises one half cannot tell a broken fence regex from
+    # a broken prose regex.
+    #
+    # A FINDING, RECORDED HERE AND NOT FIXED HERE. The gcloud line below reads `gcloud projects
+    # create`, and it is deliberately the WEAKEST mutating gcloud command that could stand in this
+    # slot. The first draft of this control used `gcloud container clusters update prod`, which is
+    # the canonical GKE mutation, and the scan did not fire: `gcloud\s+\w+\s+(create|delete|update|
+    # patch|set)\b` matches only the two-token `gcloud <noun> <verb>` shape, and essentially every
+    # mutating gcloud command an agent would actually reach for is three tokens -- `gcloud container
+    # clusters create|delete|update`, `gcloud compute instances create|delete`, `gcloud iam
+    # service-accounts create`, `gcloud container node-pools create|delete`. The forbidden-gcloud
+    # arm is therefore much narrower than it reads, and has been since it was written.
+    #
+    # Strengthening the pattern is a change to an assertion, and this repo does not change an
+    # assertion in the same unit as the work that surfaced it (PROTOCOL §10.1 / Guardrail 9) -- the
+    # unit that widens the regex has to run against a tree where the widened form matters, or the
+    # widening is untested. Routed to `harness-improve`. The control uses a form the pattern claims
+    # to catch so that this arm measures the scan as written rather than as intended; a control
+    # tuned to a bug is how a bug gets a green test of its own.
+    POSITIVE_CONTROL = """\
+Run `kubectl get pods` first, then apply it:
 
-        `submit-suggestion` is the skill this one replaces and it is still in the tree for one more
-        phase, which makes it a free positive control -- a real file, in the same format, that the
-        rule must reject. Without this, an `instruction_text` that returned "" would pass the arm
-        above on every tier forever.
+```bash
+kubectl apply -f manifest.yaml
+gcloud projects create kage-scratch
+```
+
+Then git push the branch and open the PR with gh pr create --fill.
+"""
+
+    # The same text with every command moved into an inline span -- a skill MENTIONING the commands
+    # it forbids, which is what this skill's own body does and what the scan must not flag.
+    NEGATIVE_CONTROL = """\
+This path never runs `kubectl apply -f manifest.yaml`, never
+`gcloud container clusters update prod`, never `git push`, and never `gh pr create`.
+There is no propose verb here.
+"""
+
+    def test_the_rule_is_scanning_something(self):
+        """Non-vacuity, and the discrimination the scan actually turns on.
+
+        THIS USED TO READ `agents/platform/skills/submit-suggestion/SKILL.md`, on the reasoning that
+        the skill this one replaces was "still in the tree for one more phase, which makes it a free
+        positive control". P13-T5 was pulled forward from Phase 13 into Phase 9 and deleted it, and
+        the arm went from proving non-vacuity to raising `FileNotFoundError`. The lesson is narrow
+        and worth keeping: a positive control anchored on a file that is scheduled for deletion is
+        not free, it is borrowed, and the loan comes due in the one commit where the scan most needs
+        to still work. The control is now synthetic and cannot be deleted out from under the scan.
+
+        It is also strictly stronger than what it replaces, which only asserted that SOME pattern
+        fired against SOME file. Two directions are asserted here, and the second is the one that
+        matters: `instruction_text` exists to tell a command the skill ISSUES from one it MENTIONS,
+        and a regex that flags both would redden this skill's own body -- whose job includes naming
+        the commands that never appear in this path. An `instruction_text` returning "" passes the
+        first direction and fails nothing; one returning the raw markdown passes the first and fails
+        the second.
         """
-        text = self.instruction_text((REPO / "agents/platform/skills/submit-suggestion/SKILL.md").read_text())
-        hits = [what for pattern, what in self.FORBIDDEN if re.search(pattern, text)]
-        self.assertTrue(
-            hits,
-            "the forbidden-command scan finds nothing in submit-suggestion, whose entire body is git and gh "
-            "commands. The scan is reading the wrong text and the arm above is vacuous.",
+        fired = [what for pattern, what in self.FORBIDDEN if re.search(pattern, self.instruction_text(self.POSITIVE_CONTROL))]
+        self.assertEqual(
+            len(fired),
+            len(self.FORBIDDEN),
+            f"the forbidden-command scan missed {len(self.FORBIDDEN) - len(fired)} of its own patterns against a "
+            f"control that plants every one of them: fired only {fired}. The scan is reading the wrong text and "
+            "test_the_body_issues_no_mutating_command is vacuous.",
+        )
+
+        spared = [what for pattern, what in self.FORBIDDEN if re.search(pattern, self.instruction_text(self.NEGATIVE_CONTROL))]
+        self.assertEqual(
+            spared,
+            [],
+            f"the scan flagged {spared} in text that only MENTIONS those commands inside inline code spans. "
+            "instruction_text is not stripping spans, so any skill that documents what it refuses to run is red "
+            "-- including this one.",
         )
 
     def test_the_skill_names_no_brake_verb_as_something_the_agent_does(self):

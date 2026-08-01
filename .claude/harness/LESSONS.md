@@ -99,8 +99,9 @@ will start selecting.
 | **LSN-068** | fixtures, verification, L2, networkpolicy, dns, install-path, prose-is-not-mechanization | The operator's `<agent>-to-broker` policy is **Egress-only**, so it makes the reader pod default-deny for every other egress including DNS; rule 1 of the tier allowlist owns DNS and `provision_13` applies it, which a scratch cluster never runs. `startup-ordering-l2.sh` read `context deadline exceeded` on the init container's first probe while the broker Deployment said 1/1/1 — and the opposite arm, which expects that timeout, was passing for free. `broker-driver.sh`'s header had stated the whole fact in an earlier phase | closed | All three landed: `dev/lib/shipped-render.sh` (one renderer, [[LSN-024]]) · precondition **P11**, `preconditions.sh` `p11_assert_namespace_admits_dns`, tier argument REQUIRED · and the product-side arm, `dev/verify/tier-egress-render-l2.sh` arm 1, on `dev/L2-CHAIN.txt`. P11 also parses its jsonpath by splitting on TAB **by hand**: `IFS=<tab> read` collapses runs of tabs, and the live install's `default-deny-all` really does emit three consecutive ones, which made the empty-podSelector branch unreachable |
 | **LSN-069** | networkpolicy, install-path, provisioning, dataplane-v2, broker, silent-failure, product-defect | Rule 9 pinned the `kubernetes` **ClusterIP** and the **kubeconfig endpoint**; GKE Dataplane V2 DNATs before scoring egress, so the packet carries the **`endpoints/kubernetes`** address (10.150.0.9 scratch / 10.150.0.2 live) which `resolve_apiserver_cidrs` never read. The broker blocks in `startSources()` BEFORE its listener opens, so the symptom is an EMPTY log and `connection refused` on both probes | closed | `common.sh` `resolve_apiserver_cidrs` reads `endpointslices` (then `endpoints`) first and emits all three /32s, deduplicated — proved by adding one /32 to the live namespace: broker `1/1` in one probe period. Held by `dev/verify/tier-egress-render-l2.sh` arm 2, on `dev/L2-CHAIN.txt`, which asserts the rendered rule 9 covers an address the API server actually answers on. Its subject is the RENDER; the installed object is a separate arm and the live `platform-egress` has no rule 9 at all, scheduled as **P10-T0c** |
 | **LSN-070** | rbac, retirement, install-path, gitops, agent-authored-assets, revocation | A retirement was applied to ONE renderer and read as a repo-wide fact. `12c509d` deleted the namespaced `Role kubeagents-broker-operations` and the `RoleBinding ${AGENT_READER_KSA}-broker-operations` from `k8s-operator/scripts/`, and the note that closed it said no template renders them. **Five other files still do** — the reference GitOps tree and, with production consequence, the assets an agent PROPOSES in `propose-cluster-admin` and `propose-developer-team`. A tier brought up through the GitOps path creates the retired object fresh, from a template, today. Two lifecycle gaps hold it there: `kubectl apply` never deletes what a template STOPPED rendering, and `delete_agent_identity` deletes the identically-named **ClusterRoleBinding** and not the namespaced RoleBinding | **open** | Measured on the scratch cluster 2026-08-01: the residue confers **no verb the shipped per-tier Role does not**, confirmed against `team-x`'s residue-free actor as a live control, so this is an **unrevocability** defect and not an escalation — and a future narrowing of the actor grant would be a silent no-op for two of three tiers. Mechanization in flight: `dev/tests/retired-objects-are-not-rendered.py`, deriving the property that the kinds rendered under a name by the install path must cover the kinds rendered under that name anywhere else |
+| **LSN-071** | verification, negative-control, regex, forbidden-set, cloud-cli, check-that-lies | The FORBIDDEN-command scan for a mutating `gcloud` matched only the two-token `gcloud <noun> <verb>` shape, and essentially every mutating gcloud command an agent would reach for is **three** tokens. It read green for its whole life because no fixture ever spelled a real one; the miss surfaced only when a control row was written with the canonical `gcloud container clusters update prod` and **did not fire**. A forbidden-set pattern is only as strong as the most realistic spelling anyone tried against it | **open** | Disclosed in-file at `dev/test_apply_change_skill.py:344-350`; the control row stands at a form the pattern does claim to catch, so nothing reads green that is not. Not fixed in-unit under Guardrail 9 — the unit that found it is a persona conversion, and editing the check there is the exact coupling the guardrail forbids. Owed at the next improvement pass: widen to `gcloud(\s+[a-z0-9-]+){1,3}\s+(create\|delete\|update\|patch\|set\|enable\|disable\|add\|remove\|import\|deploy)\b`, derive the verb set from the world rather than from the assertion, add one control row per token depth, then sweep every other forbidden-set pattern in the corpus for the same shape |
 
-**Open: 1 of 70**.
+**Open: 2 of 71**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -4152,12 +4153,15 @@ still rendered by five files:
 | reference GitOps overlay | `examples/gitops-repo/policy/rbac-overlay/broker-operations.yaml` |
 | reference GitOps identity | `examples/gitops-repo/clusters/cluster-a/agents/identity/broker-operations.yaml` |
 | reference GitOps tier | `examples/gitops-repo/clusters/cluster-a/namespaces/team-x/50-developer-team-identity.yaml` |
-| **an agent's proposal asset** | `agents/platform/skills/propose-cluster-admin/assets/identity/broker-operations.yaml.tmpl` |
-| **an agent's proposal asset** | `agents/cluster-admin/skills/propose-developer-team/assets/50-developer-team-identity.yaml.tmpl` |
+| **an agent's proposal asset** | `agents/platform/skills/provision-cluster-admin/assets/identity/broker-operations.yaml.tmpl` |
+| **an agent's proposal asset** | `agents/cluster-admin/skills/provision-developer-team/assets/50-developer-team-identity.yaml.tmpl` |
 
 The last two are the ones that matter. "No template renders that object" is true of the install path
 and **false of the path an agent takes when it provisions a tier**. A cluster brought up through
-`propose-cluster-admin` / `propose-developer-team` creates the residue *fresh, from a template*.
+`provision-cluster-admin` / `provision-developer-team` creates the residue *fresh, from a template*.
+(Both skills were named `propose-*` when this was written; P13-T5 renamed the directories on
+2026-08-01 and the paths above are repointed, because this lesson is **open** and its mechanization
+has to be aimed at files that exist.)
 
 **Which makes the live install a window, not a clean bill.** `platform-agent-host` is a pre-broker
 generation — `api-resources --api-group=kubeagents.x-k8s.io` returns `Agent` and nothing else, there
@@ -4195,3 +4199,65 @@ names in the check.
 [[LSN-062]] (a harness record asserting a repo-wide absence that was only true of one directory —
 the same error about scope, one layer up) · [[LSN-019]] (prose on the artifact is not a
 mechanization: the retirement's own note said no template renders them).
+---
+
+## LSN-071 — The forbidden-`gcloud` pattern matched a shape no real gcloud command has
+
+**Tags:** verification, negative-control, regex, forbidden-set, cloud-cli, check-that-lies
+**Opened:** 2026-08-01 (P13-T5, the persona conversion) · **Status:** open
+
+`dev/test_apply_change_skill.py` scans every `apply-change` SKILL.md for commands the skill must
+never issue. One row of that forbidden set is
+
+```
+(r"gcloud\s+\w+\s+(create|delete|update|patch|set)\b", "a mutating gcloud shell-out")
+```
+
+and it has been green since it was written, on three tier copies, through every run of the L0 chain.
+
+**How the miss surfaced.** Not from a failure — from writing the check's *negative control*. The
+first draft of the control line used `gcloud container clusters update prod`, which is the canonical
+GKE mutation and the single most likely thing an agent would actually reach for. The control
+reported the mutant **uncaught**. The pattern wants `gcloud <one word> <verb>`; `gcloud container
+clusters update` is `gcloud <two words> <verb>`, and so is nearly the whole surface worth forbidding:
+
+| the pattern catches | the pattern misses |
+| --- | --- |
+| `gcloud projects create` | `gcloud container clusters create \| delete \| update` |
+| `gcloud services enable`¹ | `gcloud compute instances create \| delete` |
+| | `gcloud iam service-accounts create` |
+| | `gcloud container node-pools create \| delete` |
+
+¹ and only because `enable` is not in the verb list, so this one is missed too.
+
+**Why it stayed green, which is the part worth keeping.** A forbidden-set check has no positive
+subject. It passes when it finds nothing, and finding nothing is also what it does when it is
+looking for a string no one writes. Every fixture in the suite had been written *by someone reading
+the pattern*, so every fixture matched it: the corpus was derived from the assertion instead of from
+the world. That is the same failure as [[LSN-057]] (a corpus discovered by mention) and
+[[LSN-060]] (a control that skipped the statement under test) arriving through a third door — and it
+is the door a **negative control is supposed to be** the guard for, which is why the control is what
+caught it.
+
+**Why it was not fixed where it was found.** Guardrail 9: the unit that found it was a persona
+conversion, and widening a check inside the unit whose implementation motivated the widening is the
+coupling the guardrail exists to break. What the unit did instead: the control row now stands at
+`gcloud projects create kage-scratch`, a form the pattern genuinely claims to catch and deliberately
+the *weakest* mutating gcloud command that could stand in that slot, and the whole finding is
+written into the file at `dev/test_apply_change_skill.py:344-350` so the next reader meets it before
+the pattern.
+
+**The mechanization owed.** Widen the pattern to `gcloud(\s+[a-z0-9-]+){1,3}\s+(create|delete|
+update|patch|set|enable|disable|add|remove|import|deploy)\b`, then re-derive rather than re-guess:
+the honest form of this check enumerates the mutating verb set from something outside the check, and
+the control gains a row per token-depth so a future narrowing to two tokens fails. **Then look for
+the same shape elsewhere** — every other forbidden-set row in the tree whose fixtures were written
+from the pattern rather than from a real command, starting with the `kubectl` rows beside it, which
+are two-token by nature and therefore probably fine, and `dev/tests/devteam-has-no-cloud-actor.py:189`,
+which pins `gcloud iam service-accounts` explicitly and is therefore evidence that somebody already
+knew the three-token shape existed.
+
+**Related:** [[LSN-035]] (a vacuous pass is a failure, not a pass) · [[LSN-057]] (corpus discovered
+by mention) · [[LSN-060]] (the control skipped the statement under test) · [[LSN-063]] (a needle at
+zero occurrences is BROKEN, not a survivor — the same "nothing matched" ambiguity, on the mutation
+side rather than the assertion side).

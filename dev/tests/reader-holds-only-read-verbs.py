@@ -127,9 +127,9 @@ TIER_LABEL = "kube-agents/tier"
 # namespace that does not exist yet. Held as an allow-list rather than a glob because property 7
 # makes an omission a finding: a file the sweep finds and this list does not name fails the run.
 CORPUS = (
-    "agents/cluster-admin/skills/propose-developer-team/assets/50-developer-team-identity.yaml.tmpl",
-    "agents/platform/skills/propose-cluster-admin/assets/identity/broker-operations.yaml.tmpl",
-    "agents/platform/skills/propose-cluster-admin/assets/identity/cluster-admin-identity.yaml.tmpl",
+    "agents/cluster-admin/skills/provision-developer-team/assets/50-developer-team-identity.yaml.tmpl",
+    "agents/platform/skills/provision-cluster-admin/assets/identity/broker-operations.yaml.tmpl",
+    "agents/platform/skills/provision-cluster-admin/assets/identity/cluster-admin-identity.yaml.tmpl",
     "examples/gitops-repo/clusters/cluster-a/agents/identity/broker-operations.yaml",
     "examples/gitops-repo/clusters/cluster-a/agents/identity/cluster-admin-identity.yaml",
     "examples/gitops-repo/clusters/cluster-a/namespaces/team-x/50-developer-team-identity.yaml",
@@ -194,8 +194,8 @@ ANCHORS = (
     "k8s-operator/scripts/developer-team-agent.yaml.template",
     "examples/gitops-repo/policy/rbac-overlay/platform.yaml",
     "examples/gitops-repo/clusters/cluster-a/agents/identity/cluster-admin-identity.yaml",
-    "agents/platform/skills/propose-cluster-admin/assets/identity/cluster-admin-identity.yaml.tmpl",
-    "agents/cluster-admin/skills/propose-developer-team/assets/50-developer-team-identity.yaml.tmpl",
+    "agents/platform/skills/provision-cluster-admin/assets/identity/cluster-admin-identity.yaml.tmpl",
+    "agents/cluster-admin/skills/provision-developer-team/assets/50-developer-team-identity.yaml.tmpl",
 )
 
 SWEEP_SUFFIXES = (".yaml", ".yml", ".tmpl", ".template")

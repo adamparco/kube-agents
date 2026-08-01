@@ -11,19 +11,25 @@ The full skill catalog is on the [Skill catalog](/kube-agents/skills/) page. Thi
 
 ## Where skills live
 
+Each tier carries its own set, allocated to the authority that skill needs — 12 on platform, 13 on cluster-admin, 12 on developer-team, 26 distinct skills in all:
+
 ```text
 agents/platform/skills/
+├── apply-change/
+│   └── SKILL.md
 ├── gke-cluster-creator/
 │   └── SKILL.md
-├── gke-multi-tenancy/
-│   └── SKILL.md
-├── submit-suggestion/
+├── provision-cluster-admin/
 │   ├── SKILL.md
-│   └── (supporting scripts)
-└── ... (17 more)
+│   ├── assets/          (bundle templates)
+│   └── scripts/         (the renderer)
+└── ... (9 more)
+
+agents/cluster-admin/skills/    (13)
+agents/developer-team/skills/   (12)
 ```
 
-Some skills are pure Markdown; others carry supporting files (helper scripts, YAML templates) in the same directory. The Hermes runtime discovers `SKILL.md` files automatically at startup.
+Some skills are pure Markdown; others carry supporting files (helper scripts, YAML templates) in the same directory. The Hermes runtime discovers `SKILL.md` files automatically at startup, and an agent only ever sees the directory for its own tier.
 
 ## Frontmatter contract
 
@@ -61,13 +67,13 @@ Most shipping skills follow this shape:
 - **Overview** — one paragraph explaining what the skill does and when the agent should use it.
 - **Workflows** — numbered procedures for common tasks.
 - **Examples** — YAML manifests, shell commands, or link templates the model can adapt.
-- **Safety red lines** — explicit "don't do X" rules (e.g. the `submit-suggestion` skill lists commit-scope guardrails).
+- **Safety red lines** — explicit "don't do X" rules (e.g. the `apply-change` skill lists what never appears in the write path: no `git` branch or PR, no `kubectl apply`, and no tool that approves or un-gates the agent's own action).
 
 The `gke-compute-classes` skill is a good example — it explicitly delineates when the agent should _not_ invoke it, guarding against over-eager use.
 
 ## Adding a new skill
 
-1. Create `agents/platform/skills/<your-skill>/SKILL.md`.
+1. Create `agents/<tier>/skills/<your-skill>/SKILL.md`, under the tier whose authority the skill needs.
 2. Add frontmatter with `name` and a specific `description` — this is what routes the agent to the skill.
 3. Write the procedure. Prefer concrete steps and example manifests over abstract descriptions.
 4. If the skill has safety-critical operations (destructive changes, wide-blast-radius commands), list explicit red lines the model must honor.

@@ -1,53 +1,63 @@
 #!/opt/hermes/.venv/bin/python3
-"""detect-drift — read-only GitOps-desired vs. live diff → corrective PR, never a direct fix (Phase 4 D3).
+"""detect-drift (platform tier) — find fleet drift read-only, then remediate it through the broker.
 
-The Platform Agent's drift-detection SOP runs this on a schedule. It compares the GitOps-**desired**
-manifest against the **live** object read with a read-only `get` (invariant 1) and, on divergence,
-produces a **corrective-PR artifact** via `submit-suggestion` — unprompted, and WITHOUT ever touching
-the live object (SC4, 01 §7; 04 §5.1). The correction flows only as a reviewed PR; the drifted live
-object is left exactly as found.
+The Platform Agent's drift sweep runs this on a schedule. It reads its **project**: the clusters in
+the fleet, the child agents that govern them, the namespaces whose tenancy baseline it owns, and the
+IaC mirror it reconciles against ([02](02-agent-personas.md) §2.5.2, platform row). Detection is a
+pure function over JSON the agent captured with a read-only `get` — this script opens no socket,
+holds no credential, and mutates nothing.
 
-Two load-bearing details from the design panel:
+WHAT CHANGED, AND WHY IT IS NOT A SMALLER CHANGE THAN IT LOOKS
+--------------------------------------------------------------
+This skill used to end in a **corrective pull request**: a git branch, an OKF observation entry, and
+a handoff to `submit-suggestion`. 02 §2.5.1 puts "opening a GitHub issue, an OKF entry, or a pull
+request for work inside its own authority" on the same footing as a failed action, so that whole
+path is gone. What replaces it is the **operations** half of an Action Envelope (06 §4.1): this
+script emits the concrete changes, and the agent hands them to `apply-change`'s `submit_action`,
+which is the only thing in the system that writes.
 
-  1. DESIRED-AUTHORITATIVE, SERVER-DEFAULT-TOLERANT DIFF. Drift is computed as "does every field the
-     GitOps manifest specifies still match live?". Fields that live adds but desired never specified
-     (server defaults like `terminationGracePeriodSeconds`, controller-added fields) are NOT drift, so
-     benign defaults don't open false-positive PRs.
+The agent is safe to act because scope, gating, the initiative budget and the undo plan are enforced
+in the broker — a separate process, under a different identity, that the agent cannot reach. So this
+script never decides a risk class and never says one out loud (03 §5): it emits operations, the
+broker classifies them, and a remediation that comes back `gated` is **reported as gated**, not
+skipped and not routed around.
+
+WHAT THE PLATFORM TIER CAN SEE, WHICH IS WHAT IT MAY CHECK
+-----------------------------------------------------------
+The reader identity on this pod is project-wide and read-only (03 §3.1, §3.2): the fleet's clusters,
+its cloud resources, and the `Agent` CRs beneath it. So the four subjects below are fleet subjects,
+and the one thing this tier must NOT do with a finding is fix it inside a cluster: namespace-scoped
+tenancy objects and cluster internals are outside its templated write surface, so it **delegates**
+them to the Cluster Admin Agent that owns them (02 §3, §2.3) rather than reaching in.
+
+  mirror-drift               the executed state of an object no longer matches the IaC mirror
+  fleet-version-skew         a cluster's control plane is a minor behind the newest in the fleet
+  tenancy-baseline-missing   a governed namespace is missing a baseline kind  -> DELEGATE
+  cluster-without-agent      a cluster in the project has no Cluster Admin Agent -> provision it
+
+Two load-bearing details of the diff survive the conversion unchanged, because they were never about
+the PR:
+
+  1. DESIRED-AUTHORITATIVE, SERVER-DEFAULT-TOLERANT. Drift is "does every field the mirror specifies
+     still match live?". Fields live adds that desired never specified (server defaults like
+     `terminationGracePeriodSeconds`, controller-added fields) are NOT drift, so benign defaults do
+     not produce a remediation that changes nothing.
   2. CANONICAL IGNORE-SET. `status`, `managedFields`, `resourceVersion`, `uid`, `creationTimestamp`,
-     `generation`, `selfLink`, and the noisy `last-applied-configuration` / `revision` annotations are
-     stripped from both sides before diffing.
+     `generation`, `selfLink`, and the noisy `last-applied-configuration` / `revision` annotations
+     are stripped from both sides before diffing.
 
-Exit codes: 0 = no drift; 2 = drift found (and, with --emit-corrective, the artifact was produced);
-1 = error. Never a nonzero-because-it-changed-something: this script only ever *reads* live.
+Exit codes: 0 = no drift; 2 = drift found (and, with --emit-operations, the operations were printed);
+1 = error. Never a nonzero-because-it-changed-something: this script only ever *reads*.
 """
 
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
-import os
-import subprocess
+import re
 import sys
-import tempfile
-from pathlib import Path
 
-# Reuse the colocated submit-suggestion helper (same resolution as raise-escalation) so the corrective
-# proposal goes out exactly the way every other change does. submit_suggestion imports
-# github_token_refresh at import time, so its scripts dir must be discoverable first.
-_HERE = Path(__file__).resolve()
-_CANDIDATES = [
-    "/opt/defaults/scripts",
-    str(_HERE.parents[3] / "scripts"),
-    str(_HERE.parents[2] / "submit-suggestion" / "scripts"),
-]
-for _p in _CANDIDATES:
-    if _p not in sys.path and os.path.isdir(_p):
-        sys.path.insert(0, _p)
-
-import submit_suggestion  # noqa: E402
-
-# Fields dropped from BOTH sides before diffing — cluster/server bookkeeping, never GitOps-authored.
+# Fields dropped from BOTH sides before diffing — cluster/server bookkeeping, never mirror-authored.
 IGNORE_KEYS = {
     "managedFields",
     "resourceVersion",
@@ -60,6 +70,10 @@ IGNORE_ANNOTATIONS = {
     "kubectl.kubernetes.io/last-applied-configuration",
     "deployment.kubernetes.io/revision",
 }
+
+# `1.31.4-gke.1183000`, `v1.30.9`, `1.29` — only the (major, minor) pair decides skew. Patch and the
+# `-gke.N` suffix move on their own release cadence and comparing them produces a finding a week.
+GKE_VERSION = re.compile(r"^v?(\d+)\.(\d+)")
 
 
 def load_manifest(path: str) -> dict:
@@ -76,7 +90,7 @@ def load_manifest(path: str) -> dict:
 
 def strip(obj):
     """Recursively drop the ignore-set (and `status`, and noisy annotations) so the diff sees only
-    GitOps-authored fields."""
+    mirror-authored fields."""
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
@@ -122,160 +136,270 @@ def find_drift(desired, live, path: str = "") -> list[dict]:
     return drifts
 
 
-def object_slug(desired: dict, override: str | None) -> str:
+def object_slug(desired: dict, override: str | None = None) -> str:
     if override:
         return override
     kind = str(desired.get("kind", "object")).lower()
     name = str((desired.get("metadata") or {}).get("name", "unknown")).lower()
-    slug = f"{kind}-{name}"
-    import re
-
-    return re.sub(r"[^a-z0-9]+", "-", slug).strip("-") or "object"
+    return re.sub(r"[^a-z0-9]+", "-", f"{kind}-{name}").strip("-") or "object"
 
 
-def render_observation(*, slug: str, desired: dict, drifts: list[dict], object_path: str | None, created: str) -> str:
-    kind = desired.get("kind", "object")
-    name = (desired.get("metadata") or {}).get("name", "unknown")
-    lines = [
-        "---",
-        "type: observation",
-        f"title: Drift detected — {kind}/{name}",
-        "status: open",
-        "observed-by: platform",
-        f"created: {created}",
-        "---",
-        "",
-        f"# Drift: {kind}/{name}",
-        "",
-        "The live object diverged from GitOps-desired state. Detected read-only — **the live object was",
-        "NOT modified** (invariant 1, SC4). Reconcile by merging the re-asserted desired manifest below;",
-        "the agent never patches live directly.",
-        "",
-        "## Drifted fields",
-        "",
+# --- findings -------------------------------------------------------------------------------------
+#
+# A finding carries its own remediation, and there are exactly four shapes it can take. Three of them
+# are NOT "emit an operation", and that is the point: 02 §2.5.1 makes ending a diagnosis with no
+# action a defect, and 02 §3 makes reaching into a cluster's internals a refusal. `delegate` and
+# `handoff` are how a fleet finding still ends in work; `blocked` names the one fact that is missing,
+# so the agent can go get it rather than guess.
+
+
+def finding(
+    check: str,
+    subject: str,
+    evidence: str,
+    *,
+    operations: list[dict] | None = None,
+    delegate: str | None = None,
+    handoff: str | None = None,
+    blocked: str | None = None,
+) -> dict:
+    out: dict = {"check": check, "subject": subject, "evidence": evidence}
+    if operations:
+        out["operations"] = operations
+    if delegate:
+        out["delegate"] = delegate
+    if handoff:
+        out["handoff"] = handoff
+    if blocked:
+        out["blocked"] = blocked
+    return out
+
+
+def target_of(obj: dict) -> dict:
+    """The 06 §4.1 target reference for a Kubernetes object, read out of the object itself."""
+    api = str(obj.get("apiVersion") or "v1")
+    group, _, version = api.rpartition("/")
+    meta = obj.get("metadata") or {}
+    target = {"group": group, "version": version or "v1", "kind": obj.get("kind") or "", "name": meta.get("name") or ""}
+    if meta.get("namespace"):
+        target["namespace"] = meta["namespace"]
+    return target
+
+
+def mirror_drift(desired: dict, live: dict) -> list[dict]:
+    """The IaC mirror says one thing and the cluster says another. Re-assert the mirror.
+
+    `apply` and not `patch`: the mirror is the whole authored object, a patch would leave a field
+    someone deleted by hand still deleted, and server-side apply is what the broker executes anyway
+    (03 §4.1 step 9).
+    """
+    drifts = find_drift(strip(desired), strip(live))
+    if not drifts:
+        return []
+    fields = ", ".join(d["path"] for d in drifts[:6]) + ("…" if len(drifts) > 6 else "")
+    found = finding(
+        "mirror-drift",
+        object_slug(desired),
+        f"{len(drifts)} field(s) diverged from the IaC mirror: {fields}",
+        operations=[{"op": "apply", "target": target_of(desired), "desiredState": desired}],
+    )
+    found["fields"] = drifts
+    return [found]
+
+
+def cluster_resource(cluster: dict, project_id: str) -> str | None:
+    """`projects/<p>/locations/<l>/clusters/<c>` — the cloudTarget resource path, if it is derivable."""
+    if cluster.get("resource"):
+        return str(cluster["resource"])
+    location, name = cluster.get("location"), cluster.get("name")
+    if project_id and location and name:
+        return f"projects/{project_id}/locations/{location}/clusters/{name}"
+    return None
+
+
+def parse_minor(version: str | None) -> tuple[int, int] | None:
+    m = GKE_VERSION.match(str(version or ""))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def version_skew(inventory: dict) -> list[dict]:
+    """A cluster whose control plane is behind the newest minor running in the same fleet."""
+    project_id = str(inventory.get("projectId") or "")
+    clusters = inventory.get("clusters") or []
+    minors = {c.get("name"): parse_minor(c.get("controlPlaneVersion")) for c in clusters}
+    known = [m for m in minors.values() if m]
+    if len(known) < 2:
+        return []  # one cluster, or none with a readable version: there is no fleet to skew against
+    newest = max(known)
+
+    findings: list[dict] = []
+    for cluster in clusters:
+        name = cluster.get("name")
+        mine = minors.get(name)
+        if not mine or mine >= newest:
+            continue
+        newest_str = f"{newest[0]}.{newest[1]}"
+        evidence = (
+            f"control plane is on {cluster.get('controlPlaneVersion')} ({mine[0]}.{mine[1]}) while the "
+            f"fleet's newest is {newest_str}"
+        )
+        resource = cluster_resource(cluster, project_id)
+        if not resource:
+            findings.append(
+                finding(
+                    "fleet-version-skew",
+                    f"cluster/{name}",
+                    evidence,
+                    blocked=f"the cloud resource path for cluster {name} (projects/<project>/locations/<loc>/clusters/{name})",
+                )
+            )
+            continue
+        findings.append(
+            finding(
+                "fleet-version-skew",
+                f"cluster/{name}",
+                evidence,
+                operations=[
+                    {
+                        "op": "apply",
+                        "cloudTarget": {
+                            "provider": "gcp",
+                            "service": "container.googleapis.com",
+                            "resource": resource,
+                            "method": "update",
+                        },
+                        "desiredState": {"desiredMasterVersion": newest_str},
+                    }
+                ],
+            )
+        )
+    return findings
+
+
+def missing_child_agents(inventory: dict) -> list[dict]:
+    """02 §6: a cluster with no Cluster Admin Agent is a defect the tier above remediates, not a
+    configuration someone forgot to fill in.
+
+    The remediation is `provision-cluster-admin`, which renders the child's whole bundle from the
+    tier template. This skill does not emit those operations itself — a second copy of the child
+    bundle is a second copy that drifts, and the tier template is the thing that makes an over-grant
+    inexpressible (03 §4.2).
+    """
+    governed = {
+        str(a.get("cluster") or (a.get("scope") or {}).get("clusterName") or "")
+        for a in inventory.get("agents") or []
+        if a.get("tier") == "cluster-admin"
+    }
+    return [
+        finding(
+            "cluster-without-agent",
+            f"cluster/{cluster.get('name')}",
+            f"cluster {cluster.get('name')} in {cluster.get('location') or 'the project'} has no Cluster Admin Agent",
+            handoff="provision-cluster-admin",
+        )
+        for cluster in inventory.get("clusters") or []
+        if cluster.get("name") not in governed
     ]
-    for d in drifts:
-        lines.append(f"- `{d['path']}` ({d['kind']}): desired `{d['desired']}` → live `{d['live']}`")
-    if object_path:
-        lines += ["", "## Correction", "", f"Re-asserts `{object_path}`; merging this PR reconciles the cluster via GitOps rollout."]
-    lines.append("")
+
+
+def tenancy_baseline_gaps(inventory: dict) -> list[dict]:
+    """A namespace the platform governs is missing a kind its tenancy baseline requires.
+
+    The platform tier **defines** the tenancy model and does not apply it (02 §2.1, §3): a
+    namespace-scoped ResourceQuota or NetworkPolicy is cluster-internal, outside this tier's
+    templated write surface, so submitting it would be refused rather than merely impolite. The
+    finding therefore ends in a one-hop delegation to that cluster's Cluster Admin Agent (02 §2.3),
+    which re-authorizes in its own scope and runs its own broker pipeline.
+    """
+    findings: list[dict] = []
+    for entry in inventory.get("governedNamespaces") or []:
+        required = list(entry.get("baseline") or [])
+        present = set(entry.get("present") or [])
+        missing = [kind for kind in required if kind not in present]
+        if not missing:
+            continue
+        cluster, namespace = entry.get("cluster"), entry.get("namespace")
+        findings.append(
+            finding(
+                "tenancy-baseline-missing",
+                f"{cluster}/{namespace}",
+                f"namespace {namespace} is running with no {', '.join(missing)} — the tenancy baseline requires "
+                f"{', '.join(required)}",
+                delegate=f"cluster-admin-{cluster}",
+            )
+        )
+    return findings
+
+
+def survey_fleet(inventory: dict) -> list[dict]:
+    return version_skew(inventory) + missing_child_agents(inventory) + tenancy_baseline_gaps(inventory)
+
+
+# --- reporting ------------------------------------------------------------------------------------
+
+
+def all_operations(findings: list[dict]) -> list[dict]:
+    return [op for f in findings for op in f.get("operations") or []]
+
+
+def render(findings: list[dict]) -> str:
+    """The `What I noticed` beat of the 02 §2.5.4 report, plus what each finding ends in.
+
+    The other three beats belong to the agent, because this script cannot know them: `What I did`
+    comes from the broker's reply, `How I verified` from the observation window after it, and the
+    undo handle from the `ActionRecord`. Nothing here states a risk class — the broker computes it.
+    """
+    lines = [f"What I noticed — {len(findings)} drift finding(s) in the fleet:"]
+    for f in findings:
+        lines.append(f"  [{f['check']}] {f['subject']}: {f['evidence']}")
+        if f.get("operations"):
+            lines.append(f"      -> remediate: {len(f['operations'])} operation(s) for apply-change/submit_action")
+        if f.get("delegate"):
+            lines.append(f"      -> delegate to {f['delegate']} — this is cluster-internal, not the platform's to apply")
+        if f.get("handoff"):
+            lines.append(f"      -> hand off to the {f['handoff']} skill")
+        if f.get("blocked"):
+            lines.append(f"      -> blocked on {f['blocked']}")
     return "\n".join(lines)
 
 
-def _git(work: str, *args: str) -> str:
-    return subprocess.run(["git", "-C", work, *args], check=True, capture_output=True, text=True).stdout
-
-
-def emit_corrective(
-    *,
-    work: str,
-    desired: dict,
-    drifts: list[dict],
-    slug: str,
-    object_path: str | None,
-    dry_run: bool,
-    artifact_dir: str | None,
-    created: str,
-) -> str:
-    """Write the drift observation (+ re-assert the desired manifest) on a platform proposal branch and
-    hand off to submit-suggestion. Returns the branch name. Live is never touched here."""
-    branch = f"platform-agent/drift-{slug}"
-    _git(work, "checkout", "-b", branch)
-    _git(work, "config", "user.email", "platform-agent@kube-agents.local")
-    _git(work, "config", "user.name", "kube-agents platform agent")
-
-    obs_rel = os.path.join("knowledge", "observation", f"drift-{slug}.md")
-    os.makedirs(os.path.join(work, "knowledge", "observation"), exist_ok=True)
-    with open(os.path.join(work, obs_rel), "w", encoding="utf-8") as fh:
-        fh.write(render_observation(slug=slug, desired=desired, drifts=drifts, object_path=object_path, created=created))
-    staged = [obs_rel]
-
-    # Optionally re-assert the desired manifest so a merge re-applies it (idempotent).
-    if object_path:
-        dst = os.path.join(work, object_path)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        if object_path.endswith((".yaml", ".yml")):
-            import yaml
-
-            with open(dst, "w", encoding="utf-8") as fh:
-                yaml.safe_dump(desired, fh, sort_keys=False)
-        else:
-            with open(dst, "w", encoding="utf-8") as fh:
-                json.dump(desired, fh, indent=2)
-        staged.append(object_path)
-
-    _git(work, "add", *staged)  # stage only the corrective files, never `git add .`
-    _git(work, "commit", "-m", f"fix(drift): correct {slug}")
-
-    saved = os.getcwd()
-    os.chdir(work)
-    try:
-        title = f"fix(drift): reconcile {slug}"
-        body = (
-            f"Automated corrective PR from the platform drift-detection SOP. The live object drifted "
-            f"from GitOps-desired state; this re-asserts desired and records the finding in "
-            f"`{obs_rel}`. Detection is read-only — the live object was not modified (SC4)."
-        )
-        if dry_run:
-            submit_suggestion.dry_run(branch, "platform", title, body, artifact_dir)
-        else:
-            submit_suggestion.refresh_git_credentials()
-            submit_suggestion.push_branch(branch, "platform")
-            print(submit_suggestion.create_pull_request(None, branch, title, body))
-    finally:
-        os.chdir(saved)
-    return branch
-
-
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Read-only GitOps-desired vs. live drift detection.")
-    p.add_argument("--desired", required=True, help="Path to the GitOps-desired manifest (JSON or YAML).")
-    p.add_argument("--live", required=True, help="Path to the live object JSON (e.g. `kubectl get -o json`).")
-    p.add_argument("--json", action="store_true", help="Emit the drift report as JSON.")
-    p.add_argument("--emit-corrective", action="store_true", help="On drift, produce a corrective PR/artifact.")
-    p.add_argument("--work-dir", help="GitOps working tree to write the corrective branch into.")
-    p.add_argument("--object-path", help="Repo-relative path of the desired manifest to re-assert.")
-    p.add_argument("--slug", help="Override the drift slug (default: <kind>-<name>).")
-    p.add_argument("--created", help="Created date for the observation (default: today).")
-    p.add_argument("--dry-run", action="store_true", help="With --emit-corrective, no push/PR (hermetic artifact).")
-    p.add_argument("--artifact-dir", help="With --dry-run, also write the artifact here.")
+    p = argparse.ArgumentParser(description="Read-only fleet drift detection for the Platform Agent.")
+    subject = p.add_mutually_exclusive_group(required=True)
+    subject.add_argument("--desired", help="Path to the IaC-mirror manifest for one object (JSON or YAML).")
+    subject.add_argument("--fleet", help="Path to the fleet inventory JSON (clusters, agents, governedNamespaces).")
+    p.add_argument("--live", help="With --desired: the live object JSON (e.g. `kubectl get -o json`).")
+    p.add_argument("--json", action="store_true", help="Emit the whole report as JSON.")
+    p.add_argument(
+        "--emit-operations",
+        action="store_true",
+        help="Print only the Action Envelope operations, ready for apply-change's submit_action.",
+    )
     return p.parse_args(argv)
 
 
 def run(argv: list[str]) -> int:
     args = parse_args(argv)
-    desired = strip(load_manifest(args.desired))
-    live = strip(load_manifest(args.live))
-    drifts = find_drift(desired, live)
 
-    if args.json:
-        print(json.dumps({"drift": bool(drifts), "fields": drifts}, indent=2))
-    elif not drifts:
-        print("no drift: live matches every GitOps-desired field.")
+    if args.desired:
+        if not args.live:
+            raise ValueError("--desired requires --live (the read-only `get` of the same object).")
+        findings = mirror_drift(load_manifest(args.desired), load_manifest(args.live))
     else:
-        print(f"DRIFT DETECTED — {len(drifts)} field(s) diverged from GitOps-desired:")
-        for d in drifts:
-            print(f"  - {d['path']} ({d['kind']}): desired={d['desired']!r} live={d['live']!r}")
+        findings = survey_fleet(load_manifest(args.fleet))
 
-    if not drifts:
-        return 0
+    operations = all_operations(findings)
 
-    if args.emit_corrective:
-        if not args.work_dir:
-            raise ValueError("--emit-corrective requires --work-dir (the GitOps working tree).")
-        slug = object_slug(desired, args.slug)
-        created = args.created or datetime.date.today().isoformat()
-        emit_corrective(
-            work=args.work_dir,
-            desired=load_manifest(args.desired),  # re-assert the ORIGINAL desired, not the stripped form
-            drifts=drifts,
-            slug=slug,
-            object_path=args.object_path,
-            dry_run=args.dry_run,
-            artifact_dir=args.artifact_dir,
-            created=created,
-        )
-    return 2
+    if args.emit_operations:
+        print(json.dumps(operations, indent=2))
+    elif args.json:
+        print(json.dumps({"drift": bool(findings), "findings": findings, "operations": operations}, indent=2))
+    elif not findings:
+        print("no drift: the fleet matches every state this tier asserts.")
+    else:
+        print(render(findings))
+
+    return 2 if findings else 0
 
 
 def main() -> int:

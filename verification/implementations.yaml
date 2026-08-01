@@ -180,6 +180,14 @@
   runs: "python3 dev/tests/crd-has-no-authority-fields.py"
   asserts_in: "dev/tests/crd-has-no-authority-fields.py"
 
+# Added 2026-08-01, on the day the deferral ended. The check was committed four phases early and
+# deliberately kept OUT of this file, under the header rule above -- "a check with no green row is
+# absent, and that is correct" -- because its blocker was the P13-T5 conversion and not the
+# assertion. P13-T5 landed, so the row lands with it.
+"V-CMP-020":
+  runs: "python3 dev/tests/tier-skills-match-the-allocation.py"
+  asserts_in: "dev/tests/tier-skills-match-the-allocation.py"
+
 "V-CTN-001":
   runs: "bash dev/verify/reader-scope-l2.sh gke-scratch-kube-agents-dev"
   asserts_in: "dev/verify/reader-scope-l2.sh"

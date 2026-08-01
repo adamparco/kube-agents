@@ -156,10 +156,13 @@ def validate_location(location: str, project_id: str) -> str:
     return ""
 
 
-# NOTE: kube-agents agents are READ-ONLY (03 §4, 06 §9). No kubectl apply/delete write path exists in
-# this MCP server — the removed apply_manifest/delete_cluster_manifest helpers must not be reintroduced.
-# All infrastructure mutation goes through the `submit-suggestion` skill (a reviewed GitOps PR that the
-# CI/CD actuation pipeline applies on merge), never a direct cluster write from the agent process.
+# NOTE: the agent process holds the READER identity only (03 §4, 06 §9). No kubectl apply/delete/patch
+# or mutating gcloud path exists in this MCP server — the removed apply_manifest/delete_cluster_manifest
+# helpers must not be reintroduced. The agent is not passive, though: infrastructure mutation goes out as
+# an Action Envelope via submit_action/plan_action below (the `apply-change` skill) to the Action Broker,
+# which holds the scoped actor identity this process cannot reach and is what resolves scope, classifies
+# risk, gates, snapshots, executes, verifies and journals an ActionRecord with an undo plan. Envelope to
+# the broker, never a direct cluster write from the agent process.
 
 
 @mcp.tool()

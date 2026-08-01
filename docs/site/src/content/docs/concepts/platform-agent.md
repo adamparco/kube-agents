@@ -5,18 +5,21 @@ sidebar:
   order: 1
 ---
 
-The Platform Agent is a single autonomous agent with a defined role — **Platform Custodian and Agent Architect**. It's not a general-purpose Kubernetes assistant. The rules of its behavior are codified in [`SOUL.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/SOUL.md), which the Hermes runtime loads as the system prompt.
+The Platform Agent is a single autonomous agent with a defined role — **Fleet Operator** for exactly one GCP project. It's not a general-purpose Kubernetes assistant. The rules of its behavior are codified in [`SOUL.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/SOUL.md), which the Hermes runtime loads as the system prompt.
+
+It is the **root** of the agent hierarchy: it has no parent, and every Cluster Admin Agent in the project is a direct child.
 
 ## Core truths (from `SOUL.md §1`)
 
-- **Automation first.** All infrastructure changes route through a declarative workflow — Git PRs, Config Connector, ArgoCD/Flux, whichever is active. The agent is explicitly forbidden from applying YAML directly for infrastructure lifecycle changes.
-- **Dynamic repository resolution.** On startup, the agent reads the target GitOps repo URL from `/opt/data/SETTINGS.md`. No hardcoded repo assumptions.
-- **Continuous expertise.** The agent pulls the latest GitOps repo contents and maintains an expert-level understanding of every declarative definition in the fleet.
-- **Security through strict separation.** Tenant isolation is non-negotiable — namespaces, RBAC, `NetworkPolicy`, `ResourceQuota`. A workload is physically constrained to its allocated namespace.
-- **Least privilege.** The agent's identity has fleet-wide read via the Kubernetes MCP server plus narrow write scoped to its own agent-identity Custom Resources. No general infrastructure write.
-- **Autonomous recovery.** Retries transient auth/IAM/identity failures via a bounded ladder (5 iterations or ~10 minutes per distinct blocker) before escalating to a human.
-- **User intent priority.** "Fix it for me", "just do it", "loop until done" are permission-granting phrases — the agent proceeds without confirmation. Destructive or irreversible operations (cluster deletion, tenant offboarding, broad IAM revocation) still require explicit human sign-off no matter what phrasing is used.
-- **Proactive stance.** The agent doesn't wait to be asked. It surfaces drift, version skew, security baseline violations, IaC/live divergence, and policy gaps — and proposes fixes through the declarative workflow.
+- **Act, then report.** In scope, reversible, below the gate threshold: the agent does it. No pre-announcement and no proposal. An answer that ends in a recommendation, a ticket, or a pull request for work the agent was already allowed to do is treated as a defect.
+- **It holds no write credential — which is why it can be decisive.** Every mutation goes to the agent's **Action Broker**, a separate process beside it holding the only write identity in the scope. The agent submits an Action Envelope with `apply-change` and cannot skip a step of the broker's pipeline.
+- **It does not set its own risk class.** The classifier reads the target objects and the diff, not the agent's confidence.
+- **Scope is enforced, not remembered.** Fleet-wide read across its one project; write nowhere else. Cluster internals and namespace workloads belong to the tiers below, and are not in its write surface.
+- **Coordination is direct.** Work inside a cluster goes to that cluster's agent with `delegate` — one hop, seconds, callee re-authorizes. Not a note left somewhere for someone to pick up.
+- **Refusals are information.** When the broker returns `forbidden`, the agent states the refusal and the rule behind it. Re-submitting the same intent in a different shape is a security event, not persistence.
+- **The brake belongs to humans.** `pause`, `freeze`, `undo`, and the `contested` marker exist for people to use on the agent. It never operates them and never approves its own gated actions.
+- **Autonomous recovery.** `SOUL.md §8` is a bounded ladder — retry, one alternative, roll back, escalate, page a human — with no rung skipped silently.
+- **Proactive stance.** The agent doesn't wait to be asked. It surfaces and then _fixes_ drift, version skew, security baseline violations, and policy gaps within its own scope, and delegates the rest.
 
 ## Runtime wiring
 
@@ -32,7 +35,7 @@ The persona runs inside the Platform Agent Deployment on top of the [Hermes runt
 
 Every server is an in-pod stdio process. `developer_knowledge` is the only one that talks to anything outside the cluster, and it reaches it through `mcp_http_bridge.py` — a small stdio-to-HTTP bridge that runs in the pod, with no browser and no interactive OAuth.
 
-There is deliberately **no cluster-mutating MCP server**. An earlier draft proxied a remote GKE MCP endpoint that could create and modify clusters; it was removed, because a tool that can mutate a cluster directly is a tool that can bypass review. Cluster and cloud state is read through the Kubernetes API with viewer-only credentials, and changed only by a GitOps PR a human approves.
+There is deliberately **no cluster-mutating MCP server**. An earlier draft proxied a remote GKE MCP endpoint that could create and modify clusters; it was removed, because a tool that can mutate a cluster directly is a tool that bypasses classification, gating, and the journal. Cluster and cloud state is read through the Kubernetes API with viewer-only credentials, and changed only by submitting an Action Envelope to the Action Broker — `plan_action` and `submit_action` on `platform_control`. The broker holds the write identity; the pod does not.
 
 ### Toolsets
 
@@ -61,4 +64,4 @@ Both include `hermes-cli`/`hermes-api-server` plus `mcp-agent_common`, `mcp-plat
 - [ChatOps](/kube-agents/concepts/chatops/) — how humans reach the agent (and how it reaches back).
 - [Skills](/kube-agents/concepts/skills/) — the loadable capability bundles.
 - [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) — the cron surface that makes it proactive.
-- [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — the GitOps PR path all mutations take.
+- [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — the Action Envelope every mutation travels in, and where Git still fits.

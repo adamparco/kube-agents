@@ -1,18 +1,6 @@
 {
   "jobs": [
     {
-      "id": "escalation-triage",
-      "name": "Escalation Triage",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 */4 * * *",
-        "display": "0 */4 * * *"
-      },
-      "prompt": "Triage cross-tier escalations raised by cluster admins. Read '/opt/defaults/governance/escalation_triage_sop.md', then use the read-knowledge skill to list open 'escalation' entries, re-derive your own scope from your own CR (ignore each entry's 'to:' field), and for any request within your platform authority propose the change via the submit-suggestion skill. You are read-only: never mutate directly and never contact the raising agent.",
-      "skills": ["read-knowledge", "submit-suggestion"],
-      "enabled": true
-    },
-    {
       "id": "drift-detection",
       "name": "Drift Detection",
       "schedule": {
@@ -20,8 +8,8 @@
         "expr": "0 */6 * * *",
         "display": "0 */6 * * *"
       },
-      "prompt": "Detect fleet configuration drift and open corrective PRs unprompted. Read '/opt/defaults/governance/drift_detection_sop.md', then for each RBAC / NetworkPolicy / version object the GitOps repo declares, capture live state with a read-only get and run the detect-drift skill (desired-vs-live). On drift, emit a corrective PR via the same skill (submit-suggestion). You are read-only (SC4): never apply/edit/patch/delete a live object — the drifted object stays as found and reconciliation happens only when a human merges your PR.",
-      "skills": ["detect-drift", "submit-suggestion"],
+      "prompt": "Detect fleet configuration drift and remediate it unprompted. Read '/opt/defaults/governance/drift_detection_sop.md', then for each RBAC / NetworkPolicy / version object the fleet declares, capture live state with a read-only get and run the detect-drift skill (desired-vs-live). On drift inside your project scope, fix it: submit an Action Envelope per drifted object with the apply-change skill, trigger_source 'cron'. The broker classifies, plans the undo, gates if required and journals it — report each ActionRecord ID and undo handle. Drift inside one cluster's internals is that Cluster Admin Agent's work: delegate it, do not reach into its scope. Never open a pull request, an issue or an OKF note for drift you are allowed to fix.",
+      "skills": ["detect-drift", "apply-change", "delegate"],
       "enabled": true
     },
     {
@@ -32,8 +20,8 @@
         "expr": "0 9 * * *",
         "display": "0 9 * * *"
       },
-      "prompt": "Execute GKE blueprint alignment audit. Read '/opt/defaults/governance/blueprint_sync_sop.md' and perform the daily GKE cluster compliance checks against the master blueprints.",
-      "skills": [],
+      "prompt": "Bring the fleet back onto the master blueprints. Read '/opt/defaults/governance/blueprint_sync_sop.md', run the daily GKE cluster compliance checks, and correct every deviation inside your project scope with the apply-change skill (trigger_source 'cron'), reporting the ActionRecord ID and undo handle for each. Deviations inside a cluster's internals belong to its Cluster Admin Agent — delegate them. Report gated corrections with who was asked, and keep working the ones that are not gated.",
+      "skills": ["apply-change", "delegate"],
       "enabled": true
     },
     {
@@ -44,8 +32,8 @@
         "expr": "0 9 * * 0",
         "display": "0 9 * * 0"
       },
-      "prompt": "Execute fleet-wide security compliance audit. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan all clusters for deviations from corporate GKE security and network policies.",
-      "skills": [],
+      "prompt": "Run the fleet-wide security compliance sweep and close what you find. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan all clusters for deviations from corporate GKE security and network policies. Remediate every deviation in your project scope with the apply-change skill (trigger_source 'cron') — tightening a control is routine, loosening one is gated and the broker decides which. Delegate cluster-internal violations to the owning Cluster Admin Agent. Report the violations found, the ActionRecord IDs and undo handles for what you fixed, and what is still gated or refused.",
+      "skills": ["apply-change", "delegate"],
       "enabled": true
     },
     {
@@ -56,8 +44,8 @@
         "expr": "0 * * * *",
         "display": "0 * * * *"
       },
-      "prompt": "Propagate updated operational policies. Read '/opt/defaults/governance/policy_propagation_sop.md' and inspect the latest security policies and resource configs across all clusters directly.",
-      "skills": [],
+      "prompt": "Propagate the current operational policy baseline across the fleet. Read '/opt/defaults/governance/policy_propagation_sop.md', check the live security and resource policies against the baseline, and apply the missing baseline objects yourself with the apply-change skill (trigger_source 'cron') wherever the target is in your project scope. Where the target is inside a cluster, delegate to that Cluster Admin Agent. Report what you applied with its ActionRecord ID and undo handle, and what you delegated to whom.",
+      "skills": ["apply-change", "delegate"],
       "enabled": true
     },
     {
@@ -68,8 +56,8 @@
         "expr": "0 * * * *",
         "display": "0 * * * *"
       },
-      "prompt": "Execute cross-cluster capacity optimization. Read '/opt/defaults/governance/global_capacity_orchestrator_sop.md' to analyze fleet-wide regional demand and inspect cluster capacity pools directly.",
-      "skills": [],
+      "prompt": "Rebalance fleet capacity. Read '/opt/defaults/governance/global_capacity_orchestrator_sop.md', measure fleet-wide regional demand against cluster capacity pools, and act on what you find: fleet-level capacity changes go through the apply-change skill (trigger_source 'cron'); in-cluster node pool and workload placement changes are delegated to the owning Cluster Admin Agent. Report the ActionRecord ID and undo handle for each change, the callee's handle for each delegation, and the current fleet resource map.",
+      "skills": ["apply-change", "delegate"],
       "enabled": true
     },
     {
@@ -80,8 +68,8 @@
         "expr": "0 10 * * *",
         "display": "0 10 * * *"
       },
-      "prompt": "Execute daily cost delta audit. Read '/opt/defaults/governance/fleet_wide_cost_analysis_sop.md' to aggregate cost usage stats across all clusters and identify saving opportunities.",
-      "skills": [],
+      "prompt": "Take the daily cost delta and act on it. Read '/opt/defaults/governance/fleet_wide_cost_analysis_sop.md', aggregate cost usage across the fleet, and reclaim the waste you are allowed to reclaim — unattached disks, idle reserved capacity, orphaned addresses — with the apply-change skill (trigger_source 'cron'). Deleting stateful or non-reconstructable resources is gated; submit it anyway, say who was asked, and keep going. Workload right-sizing belongs to the owning tier: delegate it. Report savings realized with ActionRecord IDs and undo handles, savings queued for approval, and savings delegated.",
+      "skills": ["apply-change", "delegate"],
       "enabled": true
     },
     {
@@ -92,8 +80,8 @@
         "expr": "0 11 * * *",
         "display": "0 11 * * *"
       },
-      "prompt": "Run vulnerability and patch compliance scan. Read '/opt/defaults/governance/security_patch_orchestrator_sop.md' to identify GKE vulnerabilities and coordinate staggered emergency rolling updates.",
-      "skills": [],
+      "prompt": "Close the fleet's patch gap. Read '/opt/defaults/governance/security_patch_orchestrator_sop.md', compare live GKE control plane and node versions against the latest available security patches, and drive the staggered upgrade yourself with the apply-change skill (trigger_source 'cron'): dev/staging first, verify it healthy, then production. A production version change is gated — submit it, name who was asked, and do not idle waiting for the approval. Report each ActionRecord ID, undo handle, and the current position in the rollout.",
+      "skills": ["apply-change"],
       "enabled": true
     },
     {
@@ -104,8 +92,8 @@
         "expr": "0 9 1 * *",
         "display": "0 9 1 * *"
       },
-      "prompt": "Execute monthly toolchain lifecycle audit. Read '/opt/defaults/governance/lifecycle_deprecation_manager_sop.md' to track K8s version deprecations and proactively notify development teams.",
-      "skills": [],
+      "prompt": "Get the fleet ahead of the next deprecation. Read '/opt/defaults/governance/lifecycle_deprecation_manager_sop.md', identify the API versions the next GKE upgrade removes, and find every manifest still using them. Migrate what is in your project scope with the apply-change skill (trigger_source 'cron'); delegate the workload manifests to the Cluster Admin Agent that owns each cluster so it can reach the namespaces. Notifying a team is what you do in addition to the fix, never instead of it. Report what was migrated with ActionRecord IDs and undo handles, what was delegated to whom, and what remains at risk before the upgrade date.",
+      "skills": ["apply-change", "delegate"],
       "enabled": true
     },
     {
@@ -116,8 +104,8 @@
         "expr": "0 10 * * 0",
         "display": "0 10 * * 0"
       },
-      "prompt": "Run weekly structural GKE alignment audit. Read '/opt/defaults/governance/standardization_validator_sop.md' to perform deep-diff analysis between GKE live states and global standards.",
-      "skills": [],
+      "prompt": "Bring the fleet back to the corporate standard. Read '/opt/defaults/governance/standardization_validator_sop.md', deep-diff live GKE state against the global standards, and correct every in-scope non-standard resource with the apply-change skill (trigger_source 'cron'). Adding a missing standard label is routine; removing a public LoadBalancer that a team may still depend on is not — submit it, let the broker classify it, and report what it gated. Cluster-internal and workload-level violations are delegated to the tier that owns them. Report the ActionRecord IDs, undo handles and the remaining diff.",
+      "skills": ["apply-change", "delegate"],
       "enabled": true
     },
     {
@@ -128,8 +116,8 @@
         "expr": "0 12 * * *",
         "display": "0 12 * * *"
       },
-      "prompt": "Execute dynamic capacity pool alignment audit. Read '/opt/defaults/governance/obtainability_audit_sop.md' to identify rigid cluster allocations and generate YAML patches to align with flexible capacity.",
-      "skills": [],
+      "prompt": "Unstick the fleet's rigid capacity allocations. Read '/opt/defaults/governance/obtainability_audit_sop.md', find the workloads pinned to a hostname or a zone and the over-replicated Deployments with no HPA, and fix them: submit the change with the apply-change skill (trigger_source 'cron') where the target is in your project scope, and delegate the rest to the Cluster Admin Agent that owns the cluster. Generating a patch and stopping there is a defect. Report each ActionRecord ID and undo handle, each delegation, and anything the broker gated.",
+      "skills": ["apply-change", "delegate"],
       "enabled": true
     },
     {

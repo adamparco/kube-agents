@@ -284,7 +284,7 @@ if command -v python3 >/dev/null 2>&1; then
   # only symptom was "no identity file" below. Hence the rc capture — a renderer that fails must say
   # WHY, not leave the next reader to guess from an absent file. Mechanized in
   # dev/tests/cli-contract.py, which now fails L0 if any caller passes a flag no parser has.
-  render_err="$(agents/cluster-admin/skills/propose-developer-team/scripts/render_developer_team.py \
+  render_err="$(agents/cluster-admin/skills/provision-developer-team/scripts/render_developer_team.py \
       --cluster cluster-a --namespace team-x --project-id demo-proj --location us-central1 \
       --team-lead-chat-id users/1 --hub-inference-cidr 10.8.0.16/32 --hub-minty-cidr 10.8.0.32/32 \
       --mcp-cidrs 10.8.0.64/32 --repo-root "$TMP" 2>&1 >/dev/null)"; render_rc=$?

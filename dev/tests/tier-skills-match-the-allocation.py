@@ -1,38 +1,42 @@
 #!/usr/bin/env python3
 """V-CMP-020: each tier's `skills/` tree is its 02 §2.1 row, and only its 02 §2.1 row.
 
-DELIBERATELY NOT ON `dev/L0-CHAIN.txt`, AND NOT IN `verification/implementations.yaml`.
-=======================================================================================
-This check is RED on the tree, with 37 findings, and every one of them is the persona
-conversion that 02 §2.1's own "Renames the conversion must perform" table describes and
-that `07` schedules at **P13-T5**: `submit-suggestion` -> `apply-change`,
-`raise-escalation` -> `escalate`, `propose-*` -> `provision-*`, the new `delegate`, and
-the four workload skills the Developer Team does not yet hold. 02 §2.1 says so in as many
-words -- *"The old skills exist today under `agents/*/skills/`; 07 sequences the swap."*
+PROMOTED 2026-08-01. THE DEFERRAL IS OVER; THIS CHECK IS ON THE CHAIN.
+======================================================================
+For four phases this file carried the opposite header. It was committed deliberately RED,
+with 37 findings, off `dev/L0-CHAIN.txt` and absent from `verification/implementations.yaml`
+-- because every one of those findings was the persona conversion that 02 §2.1's own
+"Renames the conversion must perform" table describes and that `07` schedules at
+**P13-T5**: `submit-suggestion` -> `apply-change`, `raise-escalation` -> `escalate`,
+`propose-*` -> `provision-*`, the new `delegate`, and the four workload skills the
+Developer Team did not yet hold. 02 §2.1 said so in as many words -- *"The old skills
+exist today under `agents/*/skills/`; 07 sequences the swap."* That is not a defect a
+check found; it is a conversion a check was waiting to verify, and the honest state until
+then was `deferred` with a named blocker rather than `pass` or a chain line reddening CI
+for four phases. V-CMP is BLOCKING-PHASE, not BLOCKING-ALWAYS, so 09 §9.6 permitted it.
 
-So this is not a defect this check found. It is a conversion this check will verify, and
-the honest state until then is `deferred` with a named blocker, not `pass` and not a
-chain line that turns CI red for four phases. V-CMP is BLOCKING-PHASE, not
-BLOCKING-ALWAYS, so 09 §9.6 permits the deferral.
+The blocker cleared: **P13-T5 was pulled forward from Phase 13 into Phase 9** by human
+ruling on the Phase 9 milestone halt (`docs/build/LEDGER.md`, Decisions, 2026-08-01). The
+conversion landed, and the promotion the old header specified was performed in the same
+commit, exactly as written:
 
-  Blocker:              07 P13-T5 (persona conversion)
-  Promotion condition:  `python3 dev/tests/tier-skills-match-the-allocation.py` exits 0.
-                        On that day, add it and its `--negative-control` to
-                        `dev/L0-CHAIN.txt` and add its `implementations.yaml` row.
+  - this check and its `--negative-control` are lines on `dev/L0-CHAIN.txt`;
+  - `verification/implementations.yaml` carries its row;
+  - the deferral row in the ledger is CLOSED, naming this file as the artifact that runs.
 
-The file is committed ahead of that day on purpose: it makes the promotion condition a
-command rather than a paragraph, and `implementations.yaml`'s own rule -- *"a check with
-no green row is absent, and that is correct"* -- is about the REGISTRY, which is why
-there is no row for it there.
+Committing the file ahead of that day is what made the promotion a command rather than a
+paragraph, and it is why the closure could be a green run instead of an argument.
 
-A CATALOGUING FINDING, recorded and not acted on here.
-------------------------------------------------------
+THE CATALOGUING FINDING STANDS, AND IS NOW THE ONLY THING LEFT OPEN HERE.
+-------------------------------------------------------------------------
 09 §6 dates this row at phase **8**. It dates `V-CMP-021` -- the structurally identical
 row over jobs and SOPs, blocked by the same conversion, cited to the same §5.3 -- at
-phase **13**. One of the two datings is wrong, and it is almost certainly this one.
-Correcting it is a spec edit that would remove this row from the phase-8/9 required set,
-which is exactly the change Guardrail 9 forbids inside the unit whose check it greens.
-It belongs to `harness-improve`.
+phase **13**. One of the two datings is wrong. When this header was first written the
+guess was "almost certainly this one"; the human ruling went the other way, and 09 §6.15's
+phase cell of `8` stands as correct. That makes `V-CMP-021`'s **13** the suspect dating,
+and it now has a second problem the first header could not have known: V-CMP-021 has no
+implementation at all. Correcting a phase cell is a spec edit and belongs to
+`harness-improve`, not here.
 
 02 §2.1 is the only place the roster's capabilities are allocated. It is a twelve-row table with one
 column per tier, and it is prose-adjacent in the worst way: a ✅ moved one column left is a valid

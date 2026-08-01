@@ -13,7 +13,7 @@ in the tree stayed green, and the install path really did stop rendering both ob
 A read-only survey of `gke-scratch-kube-agents-dev` on 2026-08-01 found them standing anyway. The
 retirement had been carried out on the install path and nowhere else: the reference GitOps tree and —
 the part that matters — the assets an agent *proposes* when it provisions a new tier still render
-both shapes. `propose-cluster-admin` and `propose-developer-team` create the retired objects **fresh,
+both shapes. `provision-cluster-admin` and `provision-developer-team` create the retired objects **fresh,
 from a template, on day one**, in production. "No template renders that object" was true of
 `k8s-operator/scripts/**` and false of the repository.
 
@@ -515,7 +515,16 @@ INSTALL_GRANT = "k8s-operator/scripts/broker-operations-grant.yaml.template"
 INSTALL_IDENTITY = "k8s-operator/scripts/agent-identity.yaml.template"
 GITOPS_GRANT = "examples/gitops-repo/policy/rbac-overlay/broker-operations.yaml"
 GITOPS_IDENTITY = "examples/gitops-repo/policy/rbac-overlay/cluster-admin.yaml"
-TIER_ASSET = "agents/cluster-admin/skills/propose-developer-team/assets/50-identity.yaml.tmpl"
+# The synthetic corpus keys are PATHS OF REAL RENDERERS, so a reader can check the fixture against
+# the thing it models. This one spelled `50-identity.yaml.tmpl` under `propose-developer-team`: a
+# directory the P13-T5 persona rename retired, and a basename that never existed under either name.
+# The key is only a dict key -- `clean_corpus` writes its content inline -- so the phantom opened no
+# file and matched nothing; it was a realism defect, not a vacuous scan. Repointed at the renderer
+# whose two templated `*-broker-operations` bindings the fixture below is a copy of.
+TIER_ASSET = (
+    "agents/cluster-admin/skills/provision-developer-team/assets/"
+    "50-developer-team-identity.yaml.tmpl"
+)
 
 
 def clean_corpus() -> dict[str, str]:

@@ -225,7 +225,7 @@ python3 dev/tests/identity-has-install-path.py --negative-control
 # leave every agent Certificate Pending forever. So this asserts the reference graph instead of the
 # output: no transforming kustomization can REACH config/mesh-ca (over the whole graph, not the one
 # edge that broke), the Go constant and the ClusterIssuer name agree, the CA stays in cert-manager,
-# and every remote pull — GitOps wave 10, the propose-cluster-admin template — names config/install.
+# and every remote pull — GitOps wave 10, the provision-cluster-admin template — names config/install.
 # Empty result sets are FAILs (LSN-035). `--negative-control` is the `¬`; one of its nine mutations
 # is the original bug verbatim.
 python3 dev/tests/install-render-is-faithful.py
@@ -459,8 +459,10 @@ bash dev/lib/shipped-render.sh --negative-control
 
 # --- The phase ratchet, derived rather than remembered (planning defect 4) ------------------------
 # The CHECK ITSELF is not on this chain, and that is deliberate. `phase-ratchet-is-asserted.py
-# --phase 9` is RED today by construction: 38 of Phase 9's 75 required check IDs have no green row
-# yet. The chain is a required PR check, so an arm that stays red until an entire phase closes would
+# --phase 9` is RED until the phase closes, by construction. The counts in this comment were stale
+# for most of the phase -- it read "38 of Phase 9's 75" long after both numbers had moved, which is
+# the ordinary fate of a tally written into prose; as of 2026-08-01 the phase requires 96 check IDs
+# and 95 are green. The chain is a required PR check, so an arm that stays red until a phase closes
 # redden every unrelated commit and destroy the per-commit attribution CHECKPOINT exists to produce
 # ([[LSN-055]]). It runs in `dev/verify/verify-phase9.sh` section J, and `invariants-gate.py`
 # (`check_phase_gate_runs_its_own_ratchet`, above) is what stops that section being removed.
@@ -473,11 +475,60 @@ bash dev/lib/shipped-render.sh --negative-control
 # wrong moment.
 python3 dev/tests/phase-ratchet-is-asserted.py --phase 9 --negative-control
 
+# --- V-CMP-020: each tier's skills/ tree is its 02 §2.1 row, and only its 02 §2.1 row -------------
+# PROMOTED 2026-08-01, out of a deferral that had a named blocker and outlived it. This check was
+# committed four phases ago deliberately RED and deliberately OFF this chain: its 37 findings were
+# not defects, they were the P13-T5 persona conversion that 02 §2.1's own rename table describes,
+# and a chain line that stays red until a scheduled conversion lands reddens every unrelated commit
+# ([[LSN-055]]). The blocker was `07 P13-T5`, the conversion was pulled forward into Phase 9 by
+# human ruling, and the promotion the check's own docstring specified was performed the same day.
+#
+# WHY BOTH ARMS, AND WHY THE CONTROL IS NOT THE CHEAP ONE HERE. Properties 2-4 are set comparisons,
+# and a set comparison against a table that did not parse is the greenest thing in this repo -- 02
+# §2.1 is a twelve-row Markdown table, so a moved `✅`, a respelled one, a dropped `|`, or a
+# retitled heading each turn the whole check vacuous while it keeps printing PASS. The control's 18
+# mutations run from BOTH ends: nine perturb the tree, nine perturb the table, and four of those
+# nine attack the parse rather than the content. It also cannot use the live tree as its base any
+# more, and says so in its own output -- the working tree is now 0 findings from 02 §2.1, which is
+# the whole point of the promotion and would make a live-tree control measure nothing.
+python3 dev/tests/tier-skills-match-the-allocation.py
+python3 dev/tests/tier-skills-match-the-allocation.py --negative-control
+
+# --- The mesh SKILL.md files encode 02 §2.3, or the contract is not in the product ----------------
+# The named successor to the four assertions in `dev/test_raise_escalation.py`, which died with the
+# P13-T5 conversion. Cross-tier coordination used to be a 215-line Python helper with a unit-test
+# module around it; it is now four prose SKILL.md files, and for one commit nothing in the repo could
+# reach the contract at all. That is the shape a capability loses its coverage in: not by anyone
+# deleting a check, but by the artifact the check was pointed at ceasing to be code.
+#
+# Asserts 02 §2.3 where it now lives -- exactly one hop to the counterpart 02 §6's lineage graph gives
+# that tier, the chain and loop guard at 06 §7's `MaxMeshDepth`, the callee re-authorizing (mTLS +
+# TokenReview, untrusted intent/rationale, its own envelope through its own broker pipeline) over
+# 02 §2.3's closed field list, authority never inherited, all six reply branches as a SET, the tier
+# grant in BOTH directions, and the OKF withdrawn as the escalation channel. 66 distinct findings,
+# 164 per-file evaluations per run.
+#
+# EVERY CONSTANT IS DERIVED AT RUN TIME ([[LSN-036]]) -- no tier roster, no branch list, no field
+# list, no port and no depth cap is typed into the check; they come out of 02 §1/§2.3/§6 and 06 §7,
+# and a parser that stops matching is a `VACUOUS:` FAILURE, not a quiet pass ([[LSN-035]],
+# [[LSN-038]]). The arm worth naming: 02 §2.3 bolds exactly three of the six reply obligations, and
+# the check READS that marking rather than repeating it, so `refused`/`timeout`/`paused` must carry
+# the spec's content words and keep them emphasised.
+#
+# The control mutates the REAL tree, copied, one property at a time ([[LSN-060]]), and it did real
+# work: it started at 42/54 and caught four of the author's own assertions that were looser than the
+# docstring claimed -- `envelope`+`own` was satisfied by every file's opening line, and
+# `attribution`+`ActionRecord` by the adjacent traceId/requester rows. Both directions of the
+# topology arm have their own row: a cloned `agents/platform/skills/escalate/` (a root acquiring an
+# upward verb) and a deleted `agents/developer-team/skills/escalate/` (a tier losing one it holds).
+python3 dev/tests/mesh-skills-encode-the-contract.py
+python3 dev/tests/mesh-skills-encode-the-contract.py --negative-control
+
 # --- An object retired from one renderer is retired from all of them ([[LSN-070]]) ----------------
 # `12c509d` retired the namespaced half of the 06 §2.2.1 broker-operations grant from the two INSTALL
 # templates, wrote the retirement into both headers, and stayed green. A read-only survey on
 # 2026-08-01 found both objects standing on gke-scratch, because the retirement had happened on the
-# install path and nowhere else: `propose-cluster-admin` and `propose-developer-team` still CREATE
+# install path and nowhere else: `provision-cluster-admin` and `provision-developer-team` still CREATE
 # them, fresh, every time an agent provisions a tier. "No template renders that object" was true of
 # `k8s-operator/scripts/` and false of the repository. The general shape is an object retired from
 # one of several renderers, where the other renderer is the one nobody was editing and frequently

@@ -27,9 +27,11 @@
 #             un-hardened agent-tier pod (error names readOnlyRootFilesystem — proves it's the VAP),
 #             ADMITS a hardened one, and leaves a non-agent pod (no tier label) UNTOUCHED (scope proof).
 #   P5-D (d)  Every proposed mutation is attributable.
-#             HERMETIC: test_submit_suggestion.py (Requested-by:/Trace-Id: trailers — flag>env>autonomous
-#             fallback, single-line, idempotent, reach the dry-run artifact) + go router audit test
-#             (a delivered turn ties Sender to TraceID and carries it to dispatch).
+#             HERMETIC: go router audit test (a delivered turn ties Sender to TraceID and carries it to
+#             dispatch). The PR-trailer half was test_submit_suggestion.py; the P13-T5 persona conversion
+#             deleted the submit-suggestion module (`apply-change` replaces it, and a brokered change is
+#             attributed by its ActionRecord rather than by a git trailer), so that invocation is gone
+#             rather than left pointed at a file that errors at import.
 #   REGRESS   LIVE: negative-attenuation.sh (03 §11 — write / impersonate / wrong-scope DENIED, the
 #             load-bearing read-only ceiling) + prior-phase gates verify-phase{2,3,4}.sh. HERMETIC:
 #             `go test ./...` across the operator (goldens, router, controller, watcher). 05 §8 chaos is
@@ -178,9 +180,10 @@ for vf in "$VAP_HARDEN" "$VAP_READONLY"; do
 done
 
 # --- P5-D (d): every proposed mutation is attributable ------------------------------------------
-echo; echo "== P5-D (d): mutation attribution — PR trailers + audit ties Sender→trace_id =="
-pytest_ok "submit-suggestion stamps Requested-by:/Trace-Id: trailers (flag>env>autonomous; single-line; idempotent; reach artifact)" \
-          "dev/test_submit_suggestion.py"
+echo; echo "== P5-D (d): mutation attribution — audit ties Sender→trace_id =="
+# RETIRED: dev/test_submit_suggestion.py tested the deleted submit-suggestion module; the
+# apply-change skill replaced it (dev/test_apply_change_skill.py), and attribution for a brokered
+# change is the router audit tie below plus the ActionRecord, not a git trailer on a PR.
 ( cd k8s-operator && go test ./internal/router/ -run 'TestGateway_AuditAttributionSurface' >/tmp/p5-audit.log 2>&1 ) \
   && pass "router audit: a delivered turn ties Sender to TraceID and carries it to dispatch (T-A)" \
   || { bad "router attribution audit test FAILED (Acc d / T-A)"; tail -20 /tmp/p5-audit.log; }

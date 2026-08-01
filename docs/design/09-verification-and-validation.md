@@ -229,7 +229,7 @@ catalog rows, which are the single definition site for both.
   `internal/controller/mesh_trust.go` names a `ClusterIssuer` that exists, the CA `Certificate`
   stays in `cert-manager` (the only namespace a ClusterIssuer resolves `ca.secretName` from), and
   that Secret is one a `Certificate` in-tree creates. Every path that pulls the overlay — the two
-  cluster-facing Makefile targets, GitOps bootstrap wave 10, and the `propose-cluster-admin`
+  cluster-facing Makefile targets, GitOps bootstrap wave 10, and the `provision-cluster-admin`
   template — must name `config/install` and not `config/default`, the transformed half that omits
   the CA. Reports **fail**, never partial, and an empty result set is a fail rather than a vacuous
   pass: a `namePrefix` applied to the CA does not error, does not fail to apply, and surfaces only

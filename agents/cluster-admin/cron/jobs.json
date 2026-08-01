@@ -1,18 +1,6 @@
 {
   "jobs": [
     {
-      "id": "escalation-triage",
-      "name": "Escalation Triage",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 */4 * * *",
-        "display": "0 */4 * * *"
-      },
-      "prompt": "Triage cross-tier escalations raised by developer teams in this cluster. Read '/opt/defaults/governance/escalation_triage_sop.md', then use the read-knowledge skill to list open 'escalation' entries, re-derive your own scope from your own CR (ignore each entry's 'to:' field), and for any request within your own cluster authority propose the change via the submit-suggestion skill. You are read-only: never mutate directly and never contact the raising agent; escalate genuinely fleet-wide requests upward with the raise-escalation skill.",
-      "skills": ["read-knowledge", "submit-suggestion", "raise-escalation"],
-      "enabled": true
-    },
-    {
       "id": "heartbeat",
       "name": "Heartbeat Sweep",
       "schedule": {
@@ -20,8 +8,8 @@
         "expr": "*/15 * * * *",
         "display": "*/15 * * * *"
       },
-      "prompt": "Run the backstop heartbeat sweep for your one cluster. Read '/opt/defaults/governance/heartbeat_sop.md'. This is the last-resort poll (04 §4) — event triggers and scheduled cron are the primary paths; only sweep for drift/degradation they did not already cover. Scoped to this cluster only, using read-only tooling: check node/capacity health, lingering crash-loop/pending workloads no watch reacted to, and cluster config-vs-blueprint drift. Update your heartbeat state. If healthy, respond NO_REPLY. Propose any in-cluster correction via the submit-suggestion skill (never mutate directly); escalate any genuinely fleet-wide finding upward with the raise-escalation skill (never contact another agent directly).",
-      "skills": ["read-knowledge", "submit-suggestion", "raise-escalation"],
+      "prompt": "Run the backstop heartbeat sweep for your one cluster. Read '/opt/defaults/governance/heartbeat_sop.md'. This is the last-resort poll (04 §4) — event triggers and scheduled cron are the primary paths; only sweep for drift/degradation they did not already cover. Scoped to this cluster only: check node/capacity health, lingering crash-loop/pending workloads no watch reacted to, and cluster config-vs-blueprint drift. Update your heartbeat state. If healthy, respond NO_REPLY. Fix anything you find inside your cluster authority now, this turn, with the apply-change skill (trigger_source 'cron') — deferring an in-scope fix to the next heartbeat is a defect — and report the ActionRecord ID and undo handle. A workload problem inside one namespace belongs to its Developer Team Agent: delegate it. A genuinely fleet-wide finding goes one hop up with the escalate skill; act on the structured reply and never route around a refusal or a pause.",
+      "skills": ["read-knowledge", "apply-change", "delegate", "escalate"],
       "enabled": true
     },
     {
@@ -32,8 +20,8 @@
         "expr": "0 9 * * *",
         "display": "0 9 * * *"
       },
-      "prompt": "Execute blueprint alignment audit for this cluster. Read '/opt/defaults/governance/blueprint_sync_sop.md' and perform the daily compliance checks on this cluster's configuration and its namespaces against the master blueprints.",
-      "skills": [],
+      "prompt": "Bring this cluster back onto the master blueprints. Read '/opt/defaults/governance/blueprint_sync_sop.md', run the daily compliance checks on this cluster's configuration and its namespaces, and correct every deviation inside your cluster authority with the apply-change skill (trigger_source 'cron'), reporting the ActionRecord ID and undo handle for each. A deviation in a namespace's own workloads is that Developer Team Agent's work — delegate it. A deviation in a cluster-level setting the Platform tier owns goes one hop up with the escalate skill.",
+      "skills": ["apply-change", "delegate", "escalate"],
       "enabled": true
     },
     {
@@ -44,8 +32,8 @@
         "expr": "0 9 * * 0",
         "display": "0 9 * * 0"
       },
-      "prompt": "Execute security compliance audit for this cluster. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan this cluster's namespaces for deviations from corporate GKE security and network policies.",
-      "skills": [],
+      "prompt": "Run the security compliance sweep for this cluster and close what you find. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan this cluster's namespaces for deviations from corporate GKE security and network policies. Remediate every deviation inside your cluster authority with the apply-change skill (trigger_source 'cron') — adding a missing NetworkPolicy or quota is routine, relaxing one is gated and the broker decides which. Workload-level hardening inside a namespace is delegated to its Developer Team Agent. Report the violations, the ActionRecord IDs and undo handles for what you fixed, and what is still gated or refused.",
+      "skills": ["apply-change", "delegate"],
       "enabled": true
     },
     {
@@ -56,8 +44,8 @@
         "expr": "0 * * * *",
         "display": "0 * * * *"
       },
-      "prompt": "Propagate updated operational policies within this cluster. Read '/opt/defaults/governance/policy_propagation_sop.md' and inspect the latest security policies and resource configs across this cluster's namespaces directly.",
-      "skills": [],
+      "prompt": "Propagate the current policy baseline across this cluster's namespaces. Read '/opt/defaults/governance/policy_propagation_sop.md', check the live security and resource policies against the baseline, and apply every missing baseline object yourself with the apply-change skill (trigger_source 'cron'). Namespace tenancy objects are yours; the workloads inside a namespace are not — delegate those to the Developer Team Agent. If the baseline you were given is itself wrong for this cluster, escalate rather than diverge from it silently. Report what you applied with its ActionRecord ID and undo handle.",
+      "skills": ["apply-change", "delegate", "escalate"],
       "enabled": true
     },
     {
@@ -68,8 +56,8 @@
         "expr": "0 10 * * 0",
         "display": "0 10 * * 0"
       },
-      "prompt": "Run weekly structural alignment audit for this cluster. Read '/opt/defaults/governance/standardization_validator_sop.md' to perform deep-diff analysis between this cluster's live namespace/workload states and the corporate standards.",
-      "skills": [],
+      "prompt": "Bring this cluster back to the corporate standard. Read '/opt/defaults/governance/standardization_validator_sop.md', deep-diff this cluster's live namespace and workload state against the standards, and correct every in-scope non-standard resource with the apply-change skill (trigger_source 'cron'). Adding a missing standard label is routine; withdrawing a public LoadBalancer a team may still depend on is not — submit it and report what the broker gated. Workload-level corrections inside a namespace are delegated to its Developer Team Agent. Report the ActionRecord IDs, undo handles and the remaining diff.",
+      "skills": ["apply-change", "delegate"],
       "enabled": true
     },
     {
@@ -80,8 +68,8 @@
         "expr": "0 12 * * *",
         "display": "0 12 * * *"
       },
-      "prompt": "Execute dynamic capacity pool alignment audit for this cluster. Read '/opt/defaults/governance/obtainability_audit_sop.md' to identify rigid workload allocations across this cluster's namespaces and generate YAML patches to align with flexible capacity.",
-      "skills": [],
+      "prompt": "Unstick this cluster's rigid capacity allocations. Read '/opt/defaults/governance/obtainability_audit_sop.md', find the workloads pinned to a hostname or a zone and the over-replicated Deployments with no HPA, and fix the ones that are yours — node pools, ComputeClasses and cluster-level scheduling constraints — with the apply-change skill (trigger_source 'cron'). Workload specs inside a namespace belong to its Developer Team Agent: delegate those. Generating a patch and stopping there is a defect. Report each ActionRecord ID and undo handle, each delegation, and anything the broker gated.",
+      "skills": ["apply-change", "delegate"],
       "enabled": true
     }
   ]

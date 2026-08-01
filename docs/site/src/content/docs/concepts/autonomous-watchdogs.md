@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-`agents/platform/cron/jobs.json` defines the scheduled jobs. Each one fires a pre-authored prompt at the Platform Agent on a cron schedule. The prompts typically point at a [governance SOP](/kube-agents/concepts/governance-sops/); the agent reads the SOP, executes the procedure, and either files a PR (via `submit-suggestion`) or posts a proactive Chat alert.
+`agents/platform/cron/jobs.json` defines the scheduled jobs. Each one fires a pre-authored prompt at the Platform Agent on a cron schedule. The prompts typically point at a [governance SOP](/kube-agents/concepts/governance-sops/); the agent reads the SOP, executes the procedure, and either submits the correction to its Action Broker (via `apply-change`) or posts a proactive Chat alert.
 
 Full JSON is annotated on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/).
 
@@ -76,4 +76,4 @@ Keep the schedule realistic — LLM inference on every tick has cost. Hourly or 
 
 - [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) — full annotated `jobs.json`.
 - [Governance SOPs](/kube-agents/concepts/governance-sops/) — the playbooks these watchdogs execute.
-- [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — how findings become PRs.
+- [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — how findings become executed changes.

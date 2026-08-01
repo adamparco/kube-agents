@@ -38,9 +38,9 @@ type Message struct {
 	ThreadID string
 	// TraceID is the per-turn correlation id (Phase 5 T-A, 06 §8; acceptance d). It roots the attribution
 	// chain: the gateway stamps it on every AuditRecord (tying Sender to the turn) and the dispatcher carries
-	// it to the target pod as the kage_trace_id attribute, so a GitOps PR the agent later opens can echo it
-	// as a Trace-Id trailer that resolves back to this exact turn. Never a routing or authz signal — purely a
-	// correlation key; empty when the inbound edge supplied no id.
+	// it to the target pod as the kage_trace_id attribute, so an Action Envelope the agent later submits can
+	// echo it onto the journaled ActionRecord's trace.traceId, which resolves back to this exact turn. Never
+	// a routing or authz signal — purely a correlation key; empty when the inbound edge supplied no id.
 	TraceID string
 	// Raw is the original event payload to re-publish unchanged; if empty the dispatcher publishes Text.
 	Raw []byte

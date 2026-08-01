@@ -518,7 +518,7 @@ Phase 3 adds the read-only **Developer Team Agent** (one per namespace), the loa
 placement clause** (a developer-team `Agent` must be created in the namespace it scopes —
 `metadata.namespace == spec.scope.namespace`), the per-namespace **isolation baseline**
 (default-deny NetworkPolicy + a per-tier egress allowlist, `ResourceQuota`, and in-namespace
-`ExternalName` aliases for the shared hub services), the **`propose-developer-team`** cascade on the
+`ExternalName` aliases for the shared hub services), the **`provision-developer-team`** cascade on the
 Cluster Admin Agent, and the router completion (NL confidence/clarify, candidate validity, thread
 affinity, audit attribution). It reuses the Phase 2 stack on the same cluster.
 
@@ -584,8 +584,23 @@ read-only `knowledge/`-only checkout, and a lower tier raises a cross-tier reque
 `knowledge/escalation/<slug>.md` PR that the **parent picks up on its next sweep** — never a direct
 agent-to-agent call (invariant 3); (3) **proactive SOPs** — the Platform Agent's **drift-detection SOP**
 opens a corrective PR unprompted (SC4, 01 §7), and per-tier **heartbeat SOPs** run scoped audits. A
-trigger changes only _when_ an agent wakes, never _what_ it may do — every resulting change still flows
-through a reviewed `submit-suggestion` PR.
+trigger changes only _when_ an agent wakes, never _what_ it may do — every resulting change still
+flows through the tier's own change path, which the trigger neither widens nor bypasses.
+
+> **Both halves of Phase 4's coordination model have since been superseded, and this section is kept
+> as the record of what Phase 4 accepted.** The P13-T5 persona conversion (02 §2.1) replaced the
+> reviewed-GitOps-PR change path with **`apply-change`** — an Action Envelope submitted to the tier's
+> own Action Broker — and replaced the indirect, OKF-mediated escalation with **`escalate`**, a direct
+> one-hop mesh call to `parentRef`, which is the opposite of invariant 3 as stated above. `read-knowledge`
+> survives unchanged; OKF remains the knowledge layer and stops being a coordination channel.
+> **Consequence for the gate below:** its (b) leg's skill-level half tested the deleted escalation
+> module, and its (e) leg's second half tested the deleted proposal module. Both invocations were
+> removed from the gate rather than left pointed at files that error at import; the properties they
+> carried now live in `dev/tests/mesh-skills-encode-the-contract.py` (the mesh contract, on the L0
+> chain) and `dev/test_apply_change_skill.py` (the envelope path). What the (b) leg still asserts
+> structurally — that a child's egress NetworkPolicy carries no parent-tier destination — is a
+> Phase 4 property that the mesh supersedes, so read a green (b) as a record of what Phase 4
+> accepted, not as a current claim about agent-to-agent reachability.
 
 > **The image half of this caveat is gone; the transport half is not.** The watcher sidecar, the
 > controller's per-tier watcher-arg rendering and the seam hardening all ship inside the
@@ -605,7 +620,8 @@ through a reviewed `submit-suggestion` PR.
    It proves 07 §2 Phase 4 Accept **(a)–(e)** hermetically — **(a)** per-tier scoped watcher +
    fail-closed `validate()` + controller `--owner`/`--scope-namespace` rendering + the hardened
    inject seam (bearer/owner auth, `kind` discriminator); **(b)** the escalation round-trip is
-   **indirect** (written via `submit-suggestion --dry-run`, read back via `read-knowledge`, with the
+   **indirect** (the escalation file written by the child's dry-run change path, read back via
+   `read-knowledge`, with the
    child egress NetworkPolicy carrying **no parent-tier destination** — cross-tier flow is GitOps +
    loopback only); **(c)** a runbook is retrieved through the sparse read-only OKF path (which can
    never push) with `okf-validate` green; **(d)** per-tier heartbeats run **scoped** audits
@@ -633,8 +649,15 @@ context on every agent pod** made continuously enforced — PSS `enforce: restri
 plus a focused `vap-agent-pod-hardening` VAP that requires `readOnlyRootFilesystem: true` on every
 `kube-agents/tier` pod (restricted-PSS does not cover it), composing with — never colliding with — the
 RBAC-governing `vap-agent-readonly`. (4) **End-to-end attribution** — the authenticated requester +
-per-turn trace id flow router → inject seam → session → PR, stamped as durable `Requested-by:` /
-`Trace-Id:` trailers on the mutation PR (which squash-merge lands in `main`'s history).
+per-turn trace id flow router → inject seam → session → the change path, and at Phase 5 that path
+ended in a mutation PR carrying durable `Requested-by:` / `Trace-Id:` trailers (which squash-merge
+lands in `main`'s history).
+
+> **The attribution terminus moved with the change path.** P13-T5 deleted the GitOps change path, so
+> nothing stamps git trailers any more; 06 §4.1 carries requester and trace on the **Action Envelope**
+> and journals them on the `ActionRecord` instead. What Phase 5 proved and what still holds is the
+> **carriage** — router → inject seam → session, with the router audit tying `Sender` to the `TraceID`
+> that reaches dispatch. The terminus itself has no live witness in this tree today.
 
 > **Both criteria that needed capable infrastructure now have it.** Egress **enforcement** (b) needs a
 > NetworkPolicy-enforcing CNI, and Dataplane V2 is one, so `dev/tests/egress-enforcement.sh` proves an
@@ -665,9 +688,11 @@ per-turn trace id flow router → inject seam → session → PR, stamped as dur
    `restricted` label, both VAPs are present, and — live —
    the pod-hardening VAP **rejects** an un-hardened `kube-agents/tier` pod (the error names
    `readOnlyRootFilesystem`), **admits** a hardened one, and leaves a non-agent pod **untouched** (scope
-   proof); **(d)** `submit-suggestion` stamps the `Requested-by:` / `Trace-Id:` trailers (flag > env >
-   autonomous fallback, single-line, idempotent, reaching the dry-run artifact) and the router audit ties
-   `Sender` to the `TraceID` carried through to dispatch. It then re-runs the load-bearing **regression**
+   proof); **(d)** the router audit ties `Sender` to the `TraceID` carried through to dispatch — the
+   half that asserted git trailers on a proposal PR (flag > env > autonomous fallback, single-line,
+   idempotent) tested a module P13-T5 deleted, and was removed from the gate rather than left pointed
+   at a missing file. A brokered change is attributed by its `ActionRecord`, not by a git trailer, so
+   the remaining router-audit tie is the whole of (d) now. It then re-runs the load-bearing **regression**
    live on the dev cluster (03 §11 `negative-attenuation.sh`) plus the full prior-phase gates
    (`verify-phase{2,3,4}.sh`) and `go test ./...`.
 2. **Deferred, not faked:** the **live headless detector** in `review-gate.yml` needs the

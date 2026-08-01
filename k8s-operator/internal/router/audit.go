@@ -46,8 +46,9 @@ type AuditRecord struct {
 	// input; carried purely so an operator can trace a whole conversation across turns.
 	ThreadID string
 	// TraceID is the per-turn correlation id (Phase 5 T-A, 06 §8): the same id the dispatcher stamps as the
-	// kage_trace_id attribute and the agent echoes as a PR Trace-Id trailer. Recording it here is what ties
-	// the requester (Sender) to the exact turn a later GitOps mutation traces back to (acceptance d).
+	// kage_trace_id attribute and the agent echoes onto the Action Envelope it submits. Recording it here is
+	// what ties the requester (Sender) to the exact turn a later broker-executed mutation traces back to,
+	// via that mutation's ActionRecord.trace.traceId (acceptance d).
 	TraceID string
 	// Allowed is the before-dispatch authorization decision.
 	Allowed bool

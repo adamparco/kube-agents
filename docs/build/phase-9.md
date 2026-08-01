@@ -8244,3 +8244,295 @@ is never mixed with feature work. Four items enter its queue from here:
 **Then `harness-milestone`** — the pre-merge gate (phase acceptance, phase ratchet, regression,
 invariants), the confirmation that no BLOCKING-ALWAYS check is deferred or quarantined, the PR with
 the verification table, and the merge that closes Phase 9.
+
+---
+
+## Milestone gate — the ratchet audit, and five things it found · 2026-08-01
+
+`harness-milestone` §2.1 asks for eight confirmations a green run can still hide. Seven came back
+clean and are tabulated in the PR. This section records what the eighth pass turned up, because four
+of the five items are **defects in the ratchet machinery itself** — a check that lies is the one
+class of finding that cannot be caught by running the checks harder, and [[LSN-001]]'s rule is fix,
+don't skip, not fix-here.
+
+**Clean, and by how much.** Assertion ratchet **1320 → 1401**, 81 added and 0 removed. Coverage
+**357** against a floor of **349**. V-MET-002 (420 obligations), V-MET-004, V-MET-006 and V-MET-014
+all green. Nothing was weakened anywhere in the phase diff: `L2_CHAIN_FLOOR` 18 → 31,
+`L2_SCOPE_FLOOR` 27 → 39, `EXPECTED_ASSERTIONS` 14 → 21, the 09 catalog 234 → 259 rows with **zero**
+phase or level changes, and 09 §10's ratchet table byte-identical. Zero `pass` rows carry an empty
+`evidence_ref`.
+
+### The five findings, and where each one goes
+
+**(1) `is_green()` cannot see a retraction — the one that matters.** `dev/tests/phase-ratchet-is-asserted.py`
+scores a check green on `any(result == "pass" and evidence…)`, and its `parse_results()` never reads
+the `level` column at all. So a `pass` that a later `**correction**` row retracts still scores
+green — and that is not hypothetical: **V-CMP-004 is live in exactly that state**. The correct
+semantics already exist one file over, in `invariants-gate.py`'s `_dagger_pass_failures`, which is
+what makes this a divergence between two readers of the same file rather than an open question about
+what the file means. **Routed to `harness-improve`, not fixed here** — Guardrail 9, and this is the
+sharpest possible instance of it: the check whose defect I would be repairing is the check that
+scores the phase I am trying to close.
+
+**(2) Nothing ever executes `--phase 8`.** `verify-phase8.sh` has no ratchet arm, and
+`check_phase_gate_runs_its_own_ratchet` carries `grandfathered = {"2".."8"}`. Run by hand, phase 8 is
+red on **three** checks — V-CMP-005, V-CMP-020, and **V-CMP-004, which the arm does not report**
+(finding 1 is why). A grandfather clause that was meant to stop old phases blocking new work has
+instead made a whole phase unmeasurable, and it hid a second finding while doing it.
+
+**(3) Phase 8 closed on an acceptance row that names a retracted check and a check with no row.**
+`docs/build/phase-8.md:342` binds V-CMP-004 (retracted) and V-CMP-005 (no row at all). This is the
+stale table that pulls V-CMP-005 into phase 8's required set in the first place — the finding above
+and this one are the same defect seen from two ends.
+
+**(4) The retirement inventory cannot tell a deletion from a duplication.** Commit `5b3dd27` removed
+eight tests from `dev/test_invariants_gate.py` and listed four as `retired`. The other four have
+duplicate names elsewhere in the file, so the `file::name` inventory key still resolves and the
+removal is invisible. The key needs to be position- or count-aware, or names need to be unique.
+
+**(5) 09 §9.6 paragraph 1, two residual defects.** Paragraph 2 is an unambiguous tightening and
+stands. Paragraph 1 documents pre-existing shipped code — the green-somewhere carve-out is on
+`origin/main` — but its sentence _"A check that is green at **no** level may not be deferred at all"_
+is written unscoped where the code scopes it to BLOCKING-ALWAYS, and **V-CMP-020 was a live
+counterexample in this very branch** until the P13-T5 conversion greened it. The not-yet-due
+carve-out is undocumented entirely. Prose that is stricter than its executable twin is the shape
+`check_deferrals_name_blockers` already warns about in `harness-improve` §3.3.
+
+**Disclosure, unrelated to the five:** `dev/L0-CHAIN.txt:461`'s comment reads "38 of Phase 9's 75"
+and the true figure is 1 of 96.
+
+### Where they go
+
+(1), (4) and (5) are check and spec defects and belong to the improvement pass this milestone runs
+before the PR — never to a feature unit, and (1) least of all. (2) and (3) are phase-8 debt that
+predates this branch; they are disclosed in the PR and scheduled, not silently carried. None of the
+five is a Phase 9 regression, and none of them is load-bearing on the Phase 9 acceptance table.
+
+## Unit `P13-T5` — the persona conversion, pulled forward four phases · 2026-08-01 · ✅
+
+The milestone halt above asked one question and got the expensive answer. 09 §6.15 requires
+V-CMP-020 — _"Each tier's `skills/` set matches its 02 §2.1 row exactly — nothing missing, nothing
+borrowed from another tier"_ — green by phase **8**; 07 §2 schedules the conversion that would make
+it true as **P13-T5**, five phases later. The harness recommended moving the one cell from `8` to
+`13` and was overruled, correctly: it is the beneficiary of that edit, and SELF-IMPROVEMENT §5 names
+a threshold change made while trying to get something to pass as the situation in which judgement is
+worst. So the work came forward instead. **Nothing in 09, in 07, in the check, or in any threshold
+was edited to produce the green.** The assertion that now exits 0 is byte-identical to the one that
+reported 37 findings, which is the only reason the pass means anything.
+
+**175 files, +5185 / −5863.** The tree ends at 26 skills over 12 rows — platform 12, cluster-admin
+13, developer-team 12.
+
+### What actually moved
+
+02 §2.1's own rename table drove all of it, and every one of the 37 findings was a row in that
+table rather than a defect the check had discovered:
+
+| Was                                       | Is                      | The change underneath the rename                                                                                                    |
+| ----------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `submit-suggestion`                       | `apply-change`          | An agent no longer opens a pull request. It submits an Action Envelope and the broker executes it, classified, journaled, undoable. |
+| `raise-escalation`                        | `escalate`              | An OKF entry the parent might later read becomes a synchronous one-hop call with six possible structured replies.                   |
+| —                                         | `delegate`              | New. The downward half of the mesh, which had no representation at all.                                                             |
+| `propose-cluster-admin`, `propose-*-team` | `provision-*`           | The verb was the whole problem: these skills render a tenancy, they do not ask for one.                                             |
+| seven workload skills under `platform/`   | under `developer-team/` | The Developer Team held none of the skills 02 §2.1 assigns it, while the Platform Agent carried the entire superset.                |
+
+The renames were the cheap part. The expensive part is that **`submit-suggestion` was a live Python
+import**: `detect-drift` imported it, both `propose-*` skills sat on it, two MCP servers stamped its
+git trailers, and the developer-team cron jobs invoked it by name. That coupling is also the answer
+to whether this could have waited for Phase 13 — it could not have been done cleanly there either,
+because the allocation and the conversion are the same edit seen from two sides.
+
+### The security decision that was not ours to make quietly
+
+`agents/platform/skills/provision-cluster-admin/assets/netpol-cluster-admin-egress.yaml.tmpl:77`
+punches a NetworkPolicy egress hole to GitHub, and the comment justifying it names
+`submit-suggestion` — the skill this unit deleted. **The hole is still open and this unit did not
+close it.** Closing an egress rule is a security-model change with a blast radius past the persona
+tree, and it belongs to P10/P11 where the network model is the subject. It is recorded here, in the
+PR, and in the backlog rather than silently narrowed or silently kept.
+
+The related fact is the one that resolved a genuine tension in the retirement. `test_submit_suggestion_still_ships`
+existed because P10-T3 argued the skill should stay; the argument's own conclusion now points the
+other way. Its write credential was a **GitHub token in an agent pod** — the one write path Phase 9's
+brokered-mutation property never covered, because it wrote to git rather than to a cluster. The arm
+was not deleted; it was inverted into `test_submit_suggestion_is_gone_from_every_tier`.
+
+### Coverage: what a conversion can silently take away
+
+The conversion deleted two whole unittest modules by deleting the code they imported. Both went red
+at import, which is the loud failure; the quiet one is that **a capability can lose its coverage
+without anyone touching a check** — not by deletion, but by the artifact the check was pointed at
+ceasing to be code. Cross-tier coordination went from a 215-line Python helper with a test module
+around it to four prose `SKILL.md` files, and for the length of one commit nothing in the repo could
+reach the contract at all.
+
+So `dev/tests/mesh-skills-encode-the-contract.py` is the named successor, and it is a check rather
+than a unittest module because its subject is prose. It asserts 02 §2.3 where the contract now
+lives: one hop to the counterpart **02 §6's lineage graph** gives that tier, the chain and loop guard
+at 06 §7's `MaxMeshDepth`, the callee re-authorizing (mTLS + `TokenReview`, untrusted `intent` and
+`rationale`, its own envelope through its own broker pipeline) over 02 §2.3's closed field list,
+authority never inherited, all six reply branches as a **set**, the tier grant in both directions,
+and the OKF withdrawn as the escalation channel. 66 distinct findings, 164 per-file evaluations per
+run, negative control **55/55**.
+
+Two details worth keeping. First, **every constant is derived at run time** ([[LSN-036]]) — the tier
+roster, the lineage edges, the branch list, the message fields, the mesh port and the depth cap all
+come out of 02 §1/§2.3/§6 and 06 §7, and a parser that stops matching is a `VACUOUS:` failure rather
+than a quiet pass ([[LSN-035]], [[LSN-038]]). Second, 02 §2.3 **bolds** exactly three of the six
+reply obligations, and the check reads that marking instead of repeating it: `refused`, `timeout` and
+`paused` must carry the spec's content words _and_ keep them emphasised.
+
+The control did real work rather than confirming a belief. It opened at 42/54 and caught four
+assertions that were looser than their own docstrings claimed — `envelope`+`own` was satisfied by
+every file's opening line about its own broker, and `attribution`+`ActionRecord` by the adjacent
+`traceId`/`requester` table rows. Both directions of the topology arm have their own row: a cloned
+`agents/platform/skills/escalate/` (a root acquiring an upward verb) and a deleted
+`agents/developer-team/skills/escalate/` (a tier losing one it holds).
+
+### Two gaps in the blueprint the check found, and the one it could not assert
+
+The leaf tier was the **only** one of the four mesh files with no cross-cluster prohibition. The
+other three close it in three different shapes; `developer-team/escalate` forbade a sibling Developer
+Team, its grandparent Platform, and another agent's broker, and said nothing about **a Cluster Admin
+Agent that is not its parent** — which is exactly the reach into another cluster the property is
+about. A fourth row now closes it, and a matching row closes the symmetric hole in
+`cluster-admin/escalate` ("a Platform Agent that is not your parent, or any agent in another project
+at all"), so the rule is one shape in four files and derivable rather than four phrasings and a
+phrase match.
+
+The OKF gloss disagreed with the spec in the majority's favour: three files said "SOPs, blueprints,
+**baselines**" and one said "**runbooks**". 02 §2.3 line 204 says runbooks, so the three were
+corrected, not the one.
+
+That correction then turned a negative-control row **BROKEN** — the row's needle quoted both lines
+of the bullet verbatim, including `baselines`. This is [[LSN-063]] behaving exactly as written: at
+zero occurrences the replace hands back the file unchanged and the suite re-runs against the tree it
+was already green on, so the row would have scored a survivor it never evaluated. The needle now
+stops at the end of the first line. **The row is not weaker for being shorter** — same bullet, same
+deletion, same P7 property — but it is no longer keyed to a sentence the spec owns and may correct
+again.
+
+**What the check deliberately does not claim.** Nothing in this tree implements the mesh: no
+`MeshRequest`, no `:8444` listener, no `internal/mesh/`. Every P2 and P3 property is asserted as
+_the blueprint states the contract_, never as _the runtime enforces it_. That a chain is actually
+rejected, that `TokenReview` actually runs, that the NetworkPolicy actually permits only these edges
+(03 §9) — all runtime properties, all outside this check, and its docstring says so. It stays L0 for
+that reason. When the transport lands, conformance rows verify the wire and this file keeps
+verifying that the agent was told the truth about it.
+
+### The retirement accounting
+
+Eighteen named tests were retired, every one against a replacement that exists and is green today
+(ratchet rule 1). Baseline **1401 → 1447**, and all 34 mechanized invariant checks pass.
+
+| Retired                                   | Replaced by                                                                                                     |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `dev/test_raise_escalation.py` (4)        | `dev/tests/mesh-skills-encode-the-contract.py`, arm by arm — P7, P5, P6 topology, P6 counterpart                |
+| `dev/test_submit_suggestion.py` (11)      | `dev/test_action_envelope.py` + `dev/test_envelope_wire_keys.py` + `dev/test_apply_change_skill.py`, arm by arm |
+| `dev/test_detect_drift.py` (3, of 3 → 64) | the rewritten suite in the same file                                                                            |
+
+Two of those mappings are stronger than what they replace, which is worth naming because a
+retirement table usually is not. The old attribution path **defaulted** a blank requester to
+`<tier>-agent (autonomous)`; the envelope **refuses** it (`test_an_empty_identity_is_refused_not_defaulted`).
+And the newline-injection guard was a strip on a git trailer; it is now a regex refusal at build
+time (`test_a_malformed_trace_id_is_refused`).
+
+One mapping is weaker on purpose. `test_helper_and_skill_identical_across_lower_tiers` asserted
+byte-identity, which was the right property for one shared Python helper and is the **wrong** one for
+four prose files: each must name its own counterpart, so identical copies are now the defect rather
+than the assertion.
+
+### Findings routed, not fixed here
+
+Guardrail 9 forbids changing a check in the same unit as the implementation whose failure motivated
+it, and four of these are check or spec defects.
+
+1. **The `gcloud` FORBIDDEN pattern misses every three-token mutating form.**
+   `gcloud\s+\w+\s+(create|delete|update|patch|set)\b` matches `gcloud projects create` and misses
+   `gcloud container clusters create|delete|update`, `gcloud compute instances create`,
+   `gcloud iam service-accounts create` and `gcloud container node-pools create` — essentially every
+   mutating command an agent would actually reach for. Found by writing a synthetic control that
+   failed `3 != 4`. **The regex was not strengthened.** The control was changed to a form the pattern
+   claims to catch, because a control tuned to a bug is how a bug gets a green test of its own.
+2. **V-CMP-021 has no implementation at all**, and now that 09 §6.15's `8` has been ruled correct
+   for V-CMP-020, **V-CMP-021's phase-13 dating is the suspect one** — the cataloguing finding at
+   `verification/results.csv:218` points the other way from where it was first written.
+3. **`dev/tests/cli-contract.py:93`** — the `MIN_CLIS` non-vacuity comment cites a basis the
+   restructure invalidated.
+4. **Three `detect_drift.py` defects.** Argparse usage errors exit **2**, colliding with "drift
+   found", while all three module docstrings and all three `SKILL.md` §2 promise `1 = error`; a cron
+   wrapper branching on 2 reads a usage error as a drifted fleet. And `untuned_alerts`
+   (developer-team) and `addon_versions` (cluster-admin) pass `target` through from the inventory
+   **verbatim**, with no scope validation — a poisoned inventory steers a target out of scope, and
+   the containment suite reads honest fixtures so it would not see it. The right test is a
+   poisoned-inventory case per tier; it would be red today, so it is scheduled rather than written.
+
+Two more are disclosed and deliberately untouched: the GitHub egress hole above, and
+`k8s-operator/api/v1alpha1/common_types.go:432,464`, where `IACSpec`'s doc comments still narrate
+"proposes via GitOps". That one is genuinely contested in the spec — 06 line 220 keeps
+`spec.iac.format` alive while lines 24 and 1121 redefine the repo as "a mirror, not a control path" —
+so the field is live and only its narrative is wrong. Editing a CRD field comment regenerates
+`config/crd/bases/…_agents.yaml`, which feeds the byte-locked `examples/gitops-repo/` exemplars, and
+two writers there breaks a green check.
+
+**Where each one went**, because "routed" is only true if it names a destination. `docs/build/BACKLOG.md`
+is not one of them: `binding.md` §State says the harness drains that file **at ORIENT and nowhere
+else**, so a harness-discovered finding written into it would be the harness filing tickets to
+itself in the one file reserved for a person.
+
+| Finding                                                      | Destination                                                                                                                                                                                       |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 — the `gcloud` pattern                                     | **[[LSN-071]]**, open, with the widening and the "look for the same shape elsewhere" sweep as the mechanization the next pass owes                                                                |
+| 2 — V-CMP-021 unimplemented, phase-13 dating now the suspect | The Phase 9 `harness-milestone` improvement pass, as an uncovered-requirement row — it is a scheduling question, not a repair                                                                     |
+| 3 — `cli-contract.py:93`'s invalidated `MIN_CLIS` basis      | The same pass, beside it: both are a check's stated basis outliving the thing it was derived from                                                                                                 |
+| 4 — the three `detect_drift.py` defects                      | **P10-T9**, new roadmap row. It is product code with an unasserted containment property, so the test comes first and it will be red                                                               |
+| 5 — the GitHub egress rule cut for a deleted skill           | **P10-T10**, new roadmap row, deliberately beside P10-T0c: that task re-applies the tier allowlists, and re-applying a rule whose stated basis is false is the moment the mistake becomes durable |
+| 6 — `examples/gitops-repo/` and the `IACSpec` narrative      | **P11-T7**, new roadmap row, riding P11-T4 — the cascade conversion is what decides what the published bundle is _for_, and rewriting the exemplar before then means guessing at it twice         |
+
+### The most dangerous thing in the sweep
+
+`scripts/sync-upstream-skills.py` carried a hardcoded `SKILL_MAPPINGS` that was all-`["platform"]`
+and `shutil.rmtree`s each destination before copying. Run once after this conversion, it would have
+re-created **nine** directories under `agents/platform/skills/` and re-reddened V-CMP-020 — proven,
+not inferred: the old script against a throwaway copy takes the check from PASS to 9 findings. It
+would also have reverted `gke-cluster-creator` and `gke-cluster-lifecycle` to upstream text, 423
+lines of kube-agents-specific rewriting, and **that half is invisible to V-CMP-020**, which reads
+directory names.
+
+Nothing triggers it — no workflow, no Makefile target, no cron, no chain line; `grep -r sync-upstream`
+over the repo returns zero hits outside a docstring that names it as a hazard. It is a human-run
+utility, which is the worst combination: destructive, unscheduled, and green.
+
+The table is gone. The script now imports 02 §2.1's parser and derives the allocation at run time
+([[LSN-036]]), with no fallback — a missing spec, a missing parser, an unparsed table or an empty
+tier each `SystemExit`s **before the first `rmtree`**. A run against a correct tree is now
+byte-identical to a no-op, and a run after deleting two skills recreates them in the correct tiers.
+
+### How this was built
+
+Six subagents on strictly disjoint write surfaces, each briefed with an explicit forbidden-file list,
+no git write commands, and no cluster access. Every shared definition site —
+`dev/L0-CHAIN.txt`, `verification/results.csv`, `verification/implementations.yaml`,
+`dev/assertion-baseline.json`, `docs/build/**` — was report-only for all six and written serially.
+That rule was not free: one agent's brief mentioned an "L0 sweep", and it had to be told mid-run to
+report replacement text rather than apply it. It complied. A second was redirected off minting
+`verification/mutants/V-CMP-025.json` — all 20 existing mutant specs are keyed to real 09 §6 IDs, and
+inventing one lands a check in a required set and in the phase ratchet, which is a spec edit wearing
+a filename.
+
+One agent died mid-response on an API error and was resumed from its transcript, told first to read
+its own diff off disk rather than trust its memory of what had landed.
+
+### Gate
+
+| Gate                                     | Result                                                                                      |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `phase-ratchet-is-asserted.py --phase 9` | **PASS — all 96 required checks green**, each with an `evidence_ref` (was 95/96)            |
+| `tier-skills-match-the-allocation.py`    | rc 0 — 26 skills over 12 rows; `--negative-control` **18/18**                               |
+| `mesh-skills-encode-the-contract.py`     | rc 0 — 4 files, 164 evaluations; `--negative-control` **55/55**                             |
+| `invariants-gate.py`                     | **34/34**                                                                                   |
+| `python3 -m unittest discover dev`       | green                                                                                       |
+| `make -C k8s-operator test`              | rc 0, 35 packages `ok`, `internal/controller` 85.8%, **zero skips** — envtest genuinely ran |
+| `make validate`                          | pass                                                                                        |
+
+HALT 1 is cleared by the work, not by a reading of it.

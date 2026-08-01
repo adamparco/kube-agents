@@ -24,7 +24,15 @@ Across this cluster's namespaces, execute these auditing checks directly using n
     - Query: `"kubectl get clusterrolebindings -o json"`
     - 🚨 **Policy Violation:** Verify that no non-system service accounts have been granted the `cluster-admin` role. Wildcard `*` bindings on resources are strictly forbidden for non-system workloads.
 
-### 3. Report & Warn
+### 3. Remediate the Violations
 
-- Generate a formatted compliance markdown report for this cluster.
-- If violations are found, present them clearly to the cluster administrators with exact namespaces, pod names, and remediation instructions (e.g., recommended NetworkPolicy YAMLs). Propose any fix through your **`submit-suggestion` skill** (in your `cluster-admin-agent/` branch namespace); never mutate the cluster directly.
+A compliance finding you are allowed to fix and did not fix is not a finding, it is a defect (02 §2.5.1). Close each one on this run:
+
+1.  **Submit the fix** with your **`apply-change` skill** (`trigger_source: cron`), one envelope per violation — the missing `NetworkPolicy` created, the over-privileged binding withdrawn.
+2.  **Let the broker classify it.** Adding a missing `NetworkPolicy` or quota is a tightening and routine. Withdrawing a `cluster-admin` binding is an identity change and is **gated**: it parks for a human on the approval roster and nothing changes until that person approves. That gate is deliberate — submit the change anyway, name who was asked, say plainly that nothing has changed yet, and keep working the rest. Never re-shape a gated fix into something that would classify lower.
+3.  **Stay inside your surface.** Workload-level hardening inside a namespace belongs to its Developer Team Agent: **delegate** in one hop and report what the callee answered. Anything above your cluster ceiling goes up with **`escalate`**.
+4.  You hold no write credential — never mutate the cluster directly, and never open a pull request or an issue in place of acting.
+
+### 4. Report
+
+Four beats (02 §2.5.4) for this cluster: the violations found with exact namespaces and object names; what you fixed with each `ActionRecord` ID; how you verified it; and the undo handle (`/kage undo <action-id>`). List separately what is parked for approval and with whom, what was refused and why, and what you delegated or escalated. Failures and unresolved violations first, unsoftened.

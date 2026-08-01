@@ -2,8 +2,9 @@
 """read-knowledge — a read-only OKF retrieval path that can never become a write path (Phase 4 D4, 06 §5).
 
 Retrieves Operational Knowledge Framework entries (runbooks, escalations, blueprints, …) from the
-GitOps repo's `knowledge/` tree. It is the READ half of the indirect-coordination model: agents never
-call each other; they leave and pick up knowledge here (invariant 3).
+GitOps repo's `knowledge/` tree. OKF is the KNOWLEDGE layer and only that — durable context one agent
+records and another reads later. It is not a coordination channel: cross-tier requests are direct,
+synchronous mesh calls (02 §2.3), not files left here to be polled for.
 
 Two invariant-preserving properties, enforced structurally (not just by convention):
 
@@ -19,8 +20,8 @@ The frontmatter parser is imported from the SHARED module (`okf_frontmatter`, sh
 /opt/defaults/scripts) — the very file `dev/okf-validate.py` uses — so an agent reads exactly the
 schema CI validates.
 
-Auth: a **contents:read**-scoped token (default env GITHUB_READ_TOKEN), NOT the submit-suggestion write
-token. For a local/file path repo (the hermetic Kind test) no token is needed.
+Auth: a **contents:read**-scoped token (default env GITHUB_READ_TOKEN). The pod holds no write
+credential at all (02 §2.2). For a local/file path repo (the hermetic Kind test) no token is needed.
 
 Usage:
     read_knowledge.py --repo <url|path> [--ref main] [--type runbook] [--link runbook/x.md] [--json]
@@ -69,7 +70,7 @@ def refuse_write_intent(argv: list[str]) -> None:
         if low in _WRITE_INTENT:
             raise WriteRefused(
                 f"read-knowledge is READ-ONLY and refuses write intent {a!r}; "
-                f"use the submit-suggestion skill to propose a change via a reviewed PR."
+                f"use the apply-change skill to submit the change to your broker."
             )
 
 

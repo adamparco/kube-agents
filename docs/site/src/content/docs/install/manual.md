@@ -68,7 +68,7 @@ The manual install covers only the agent workspace. To reach parity with a `./pr
 - **Cluster access**: a Kubernetes context the agent can call. The shipping config reads the cluster through the in-pod `platform_control` MCP server using the pod's own ServiceAccount, so on a non-GKE cluster you need a Kubernetes context and a viewer-scoped ServiceAccount — there is no remote cluster MCP endpoint to point anywhere.
 - **Chat ingress**: Google Chat Pub/Sub or Slack Socket Mode. See [ChatOps](/kube-agents/concepts/chatops/).
 - **Inference gateway**: any Completions-API-compatible endpoint (LiteLLM is the default recommendation). See [Inference gateway](/kube-agents/concepts/inference-gateway/).
-- **GitHub token minter**: for the `submit-suggestion` and `github-issue-resolver` skills. See [Deploy → Token minter](/kube-agents/deploy/token-minter/).
+- **GitHub token minter**: for the GitHub flows — a write-behind IaC mirror, the rendered provisioning bundles, and the `github-issue-resolver` watchdog. Not needed for the change path itself. See [Deploy → Token minter](/kube-agents/deploy/token-minter/).
 
 ## Verify
 

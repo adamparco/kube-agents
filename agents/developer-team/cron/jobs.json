@@ -8,8 +8,8 @@
         "expr": "*/15 * * * *",
         "display": "*/15 * * * *"
       },
-      "prompt": "Run the backstop heartbeat sweep for your one namespace. Read '/opt/defaults/governance/heartbeat_sop.md'. This is the last-resort poll (04 §4) — event triggers and scheduled cron are the primary paths; only sweep for drift/degradation they did not already cover. Scoped to your one namespace only, using read-only tooling: check lingering crash-loop/pending workloads no watch reacted to, workload security regressions (privileged/host access/root), and gross request-vs-usage drift. Update your heartbeat state. If healthy, respond NO_REPLY. Propose any in-namespace correction via the submit-suggestion skill (never mutate directly); escalate any cluster-scoped finding to your parent Cluster Admin Agent with the raise-escalation skill (never contact another agent directly).",
-      "skills": ["read-knowledge", "submit-suggestion", "raise-escalation"],
+      "prompt": "Run the backstop heartbeat sweep for your one namespace. Read '/opt/defaults/governance/heartbeat_sop.md'. This is the last-resort poll (04 §4) — event triggers and scheduled cron are the primary paths; only sweep for drift/degradation they did not already cover. Scoped to your one namespace only: check lingering crash-loop/pending workloads no watch reacted to, workload security regressions (privileged/host access/root), and gross request-vs-usage drift. Update your heartbeat state. If healthy, respond NO_REPLY. Fix anything you find inside your namespace now, this turn, with the apply-change skill (trigger_source 'cron') — deferring an in-scope fix to the next heartbeat is a defect — and report the ActionRecord ID and undo handle. Anything cluster-scoped goes one hop up to your parent Cluster Admin Agent with the escalate skill; act on the structured reply and never route around a refusal or a pause.",
+      "skills": ["read-knowledge", "apply-change", "escalate"],
       "enabled": true
     },
     {
@@ -20,8 +20,8 @@
         "expr": "0 9 * * 0",
         "display": "0 9 * * 0"
       },
-      "prompt": "Execute security compliance audit for this namespace. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan this namespace's workloads for deviations from corporate GKE security and network policies. You are read-only: file any remediation as a submit-suggestion PR, never mutate the namespace directly.",
-      "skills": [],
+      "prompt": "Run the security compliance sweep for this namespace and close what you find. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan this namespace's workloads for deviations from corporate GKE security and network policies. Harden every deviation yourself with the apply-change skill (trigger_source 'cron') — adding a NetworkPolicy, dropping a privileged securityContext and setting runAsNonRoot are tightenings, which are routine; the broker classifies and gates, you do not. Anything cluster-scoped goes up with the escalate skill. Report the violations, the ActionRecord IDs and undo handles for what you fixed, and what is still gated or refused.",
+      "skills": ["apply-change", "escalate"],
       "enabled": true
     },
     {
@@ -32,8 +32,8 @@
         "expr": "0 10 * * 0",
         "display": "0 10 * * 0"
       },
-      "prompt": "Run weekly structural alignment audit for this namespace. Read '/opt/defaults/governance/standardization_validator_sop.md' to perform deep-diff analysis between this namespace's live workload states and the corporate standards. You are read-only: propose corrections via submit-suggestion PRs.",
-      "skills": [],
+      "prompt": "Bring this namespace back to the corporate standard. Read '/opt/defaults/governance/standardization_validator_sop.md', deep-diff this namespace's live workload state against the standards, and correct every non-standard resource with the apply-change skill (trigger_source 'cron'). Adding a missing standard label or a probe is routine; withdrawing a Service another team may still be calling is not — submit it and report what the broker gated. Namespace-level or cluster-level standards you cannot reach go one hop up with the escalate skill. Report the ActionRecord IDs, undo handles and the remaining diff.",
+      "skills": ["apply-change", "escalate"],
       "enabled": true
     },
     {
@@ -44,8 +44,8 @@
         "expr": "0 12 * * *",
         "display": "0 12 * * *"
       },
-      "prompt": "Execute dynamic capacity pool alignment audit for this namespace. Read '/opt/defaults/governance/obtainability_audit_sop.md' to identify rigid workload allocations in this namespace and generate YAML patches (as submit-suggestion PRs) to align with flexible capacity. You are read-only; you never apply patches directly.",
-      "skills": [],
+      "prompt": "Unstick this namespace's rigid workload allocations. Read '/opt/defaults/governance/obtainability_audit_sop.md', find the workloads pinned to a hostname or a zone and the over-replicated Deployments with no HPA, and fix them with the apply-change skill (trigger_source 'cron'). Generating a patch and stopping there is a defect. Node pools, ComputeClasses and cluster-level scheduling constraints are above your ceiling — escalate those to your parent Cluster Admin Agent and act on the reply. Report each ActionRecord ID and undo handle, each escalation, and anything the broker gated.",
+      "skills": ["apply-change", "escalate"],
       "enabled": true
     }
   ]

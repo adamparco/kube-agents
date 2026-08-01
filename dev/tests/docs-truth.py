@@ -86,10 +86,27 @@ RETIRED = {
     "platformagents": "the CRD plural went with the rename; `kubectl get platformagents` errors",
     "platformagent-crd": "the docs page was renamed to agent-crd; the old slug 404s",
     "mcp-gke": "the toolset for the dropped cluster-mutating `gke` remote MCP (03 §4, 06 §9)",
-    "create_cluster": "retired with the `gke` MCP; provisioning is now author-KCC-and-open-a-PR",
+    "create_cluster": "retired with the `gke` MCP; cluster creation is now authored artifacts submitted as one Action Envelope",
     "mcp-remote": "replaced by mcp_http_bridge.py in P8-T4; it wanted a browser a pod does not have",
     "proxy.js": "the mcp-remote entrypoint, removed with it",
     "ALLOW_ALL_USERS": "the permissive escape hatch, deleted in P8-T1 (V-CTR-014)",
+    # The P13-T5 persona conversion. Two of these are pure renames and two are not, and
+    # that distinction is the whole reason they are here rather than in a sed script: for
+    # `submit-suggestion` and `raise-escalation`, swapping the string leaves a sentence
+    # that is still false. The reason strings say what to write instead.
+    "submit-suggestion": "replaced by `apply-change` in P13-T5, and NOT as a rename: the old skill opened a GitHub PR, `apply-change` submits an Action Envelope to the tier's Action Broker, which classifies, plans an undo, executes and journals it. Any sentence about proposing a change in git, opening a PR, or a suggestion branch is now false and needs rewriting, not a path swap",
+    "raise-escalation": "replaced by `escalate` in P13-T5. It is a mesh call one hop up to `parentRef` where the callee re-authorizes in its own scope, not a ticket-filing script",
+    "propose-cluster-admin": "renamed to `provision-cluster-admin` in P13-T5. Behaviour is unchanged — it still renders a GitOps bundle for a human to review — so this one really is a path swap",
+    "propose-developer-team": "renamed to `provision-developer-team` in P13-T5. Behaviour unchanged, same as its platform-tier sibling",
+    # The underscore forms, which are the module and fixture names rather than the skill
+    # names. They are listed separately because they were held back at first: while
+    # `dev/test_submit_suggestion.py` and `dev/test_raise_escalation.py` still existed,
+    # substring matching would have fired on a filename that was a true statement about the
+    # tree. P13-T5 deleted both fixtures along with both `*.py` helpers, so the names now
+    # denote nothing and the entries are safe. If a successor fixture ever needs to name one
+    # in prose, correct the prose — do not add a RETIRED_ALLOW entry for it.
+    "submit_suggestion": "the module behind the retired `submit-suggestion` skill; `submit_suggestion.py` was deleted from all three tiers in P13-T5. Successors: dev/test_action_envelope.py, dev/test_envelope_wire_keys.py, dev/test_apply_change_skill.py",
+    "raise_escalation": "the shared helper behind the retired `raise-escalation` skill, deleted from both lower tiers in P13-T5. Cross-tier coordination is now four prose SKILL.md files asserted by dev/tests/mesh-skills-encode-the-contract.py",
 }
 # (path, identifier) -> reason it is legitimately there. Every entry must match, or fail:
 # an exemption that stops matching is a permission nobody is watching any more.

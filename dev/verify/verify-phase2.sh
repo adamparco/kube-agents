@@ -226,7 +226,7 @@ if bash dev/tests/negative-attenuation.sh "$CTX"; then pass "VAP attenuation sui
 echo; echo "== V-K8: cascade render -> VAP dry-run =="
 if command -v python3 >/dev/null 2>&1; then
   TMP="$(mktemp -d)"
-  ( cd agents/platform && ./skills/propose-cluster-admin/scripts/render_cluster_admin.py \
+  ( cd agents/platform && ./skills/provision-cluster-admin/scripts/render_cluster_admin.py \
       --cluster cluster-vfy --project-id demo-proj --location us-central1 --admin-chat-id users/1 \
       --hub-inference-cidr 10.8.0.16/32 --hub-minty-cidr 10.8.0.32/32 \
       --github-cidrs 140.82.112.0/20 --mcp-cidrs 10.8.0.64/32 --repo-root "$TMP" >/dev/null 2>&1 )
