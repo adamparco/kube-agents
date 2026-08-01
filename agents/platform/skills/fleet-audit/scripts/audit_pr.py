@@ -1,13 +1,17 @@
 #!/opt/hermes/.venv/bin/python3
 """
-audit_pr.py — Deterministic PR harness for the fleet-audit skill.
+audit_pr.py — Deterministic reporting harness for the fleet-audit skill.
 
 Every autonomous audit watchdog (compliance, security patch, obtainability,
-cost, consistency drift) funnels its findings through this script so that each
-audit stream owns exactly ONE continuously-updated Pull Request. The LLM's role
-is strictly constrained to **inspecting the fleet read-only and emitting a
-findings.json**; every git/gh operation, the PR body, the commit subject, the
-timestamps, and the run-over-run delta are produced here, deterministically.
+cost, consistency drift) funnels its findings through this script. Each audit
+stream owns exactly ONE open GitHub **issue** — its ledger — rewritten in place
+on every run and closed as completed when the fleet comes back clean. Fixes
+travel separately, as narrow remediation pull requests carrying only the files
+that fix a specific group of findings, so a report is never a pull request with
+no diff. The LLM's role is strictly constrained to **inspecting the fleet
+read-only and emitting a findings.json**; every git/gh operation, every rendered
+body, the commit subjects, the timestamps, and the run-over-run delta are
+produced here, deterministically.
 
 Two-command lifecycle:
 
@@ -179,10 +183,6 @@ def validate_audit_id(audit_id: str) -> str:
 
 def audit_name(audit_id: str) -> str:
     return AUDITS[audit_id]
-
-
-def branch_for(audit_id: str) -> str:
-    return f"platform-agent/audit-{audit_id}"
 
 
 def findings_path_for(audit_id: str) -> str:
@@ -512,7 +512,7 @@ def commit_subject(audit_id: str, findings: list[dict]) -> str:
     )
 
 
-def pr_title(audit_id: str, findings: list[dict]) -> str:
+def issue_title(audit_id: str, findings: list[dict]) -> str:
     counts = severity_counts(findings)
     return (
         f"[audit] {audit_name(audit_id)} — {findings_phrase(len(findings))} "
@@ -720,6 +720,28 @@ def parse_remediate_commands(
     return sorted(targets), refusals
 
 
+def pending_remediate_targets(comments: list[dict]) -> list[str]:
+    """Ids named by an authorized `/remediate`, before any findings exist.
+
+    `start` runs before the fleet is inspected, so there is nothing to validate
+    a target against yet. This reports what was asked for, so the agent knows
+    which remediation files to write while it inspects; `finish` then applies
+    the full `parse_remediate_commands` gate against the real finding set.
+    `all` is not expanded here — it names no specific file to write.
+    """
+    targets: set[str] = set()
+    for comment in comments or []:
+        association = str(comment.get("authorAssociation", "") or "").upper()
+        if association not in WRITE_ASSOCIATIONS:
+            continue
+        body = strip_fenced_blocks(str(comment.get("body", "")))
+        for raw in REMEDIATE_RE.findall(body):
+            target = raw.strip().strip("`")
+            if target and target != "all":
+                targets.add(target)
+    return sorted(targets)
+
+
 # --------------------------------------------------------------------------- #
 # Pure helpers — finding state and promotion
 # --------------------------------------------------------------------------- #
@@ -908,7 +930,9 @@ def _finding_sort_key(finding: dict) -> tuple:
     )
 
 
-def render_finding(finding: dict) -> list[str]:
+def render_finding(
+    finding: dict, *, state: str | None = None, pr_url: str | None = None
+) -> list[str]:
     fid = str(finding.get("id", ""))
     title = str(finding.get("title", "")).strip()
     namespace = str(finding.get("namespace", "")).strip()
@@ -918,6 +942,16 @@ def render_finding(finding: dict) -> list[str]:
     lines = [f"#### {title} <!-- finding:{fid} -->", ""]
     lines.append(f"- **Where:** {where} — `{finding.get('object', '')}`")
     lines.append(f"- **Impact:** {finding.get('impact', '')}")
+    if state:
+        label = STATE_LABELS.get(state, state)
+        suffix = f" — {pr_url}" if pr_url else ""
+        lines.append(f"- **State:** {label}{suffix}")
+        if state == STATE_PR_MERGED_PERSISTS:
+            lines.append(
+                "  The proposed fix was merged and this finding still reproduces. "
+                "The remediation was incomplete, or something outside this "
+                "repository reverted it — the merged pull request is not reopened."
+            )
     lines.append("")
 
     evidence = finding.get("evidence") or {}
@@ -975,7 +1009,11 @@ def sort_findings(findings: list[dict]) -> list[dict]:
 
 
 def select_rendered_findings(
-    findings: list[dict], budget: int
+    findings: list[dict],
+    budget: int,
+    *,
+    states: dict[str, str] | None = None,
+    pr_urls: dict[str, str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Split the sorted findings into (rendered, omitted) against a char budget.
 
@@ -993,8 +1031,17 @@ def select_rendered_findings(
     used = 0
     fitted = 0
     for finding in ordered:
-        cost = len("\n".join(render_finding(finding))) + 2
-        cost += len(str(finding.get("id", ""))) + 3  # "id",
+        fid = str(finding.get("id", ""))
+        # Charged against the *rendered* text, state line included: the state
+        # and PR link are per-finding, so estimating without them would
+        # under-count by a few thousand characters across a full body.
+        rendered = render_finding(
+            finding,
+            state=(states or {}).get(fid),
+            pr_url=(pr_urls or {}).get(fid),
+        )
+        cost = len("\n".join(rendered)) + 2
+        cost += len(fid) + 3  # its slot in the hidden delta block
         if fitted and used + cost > budget:
             break
         used += cost
@@ -1004,9 +1051,17 @@ def select_rendered_findings(
 
 def _render_header(audit_id: str) -> list[str]:
     return [
-        f"This pull request is maintained in place by the `{audit_id}` watchdog and is "
-        "rewritten in full on every run — hand edits to this description will be lost, "
-        "and the audit will never open a second PR for this stream."
+        f"This issue is the ledger for the `{audit_id}` audit. It is rewritten in "
+        "full on every run — hand edits to this description will be lost, and the "
+        "audit will never open a second ledger for this stream. It closes when the "
+        "audit comes back clean.",
+        "",
+        "Fixes are proposed as separate remediation pull requests, one per group of "
+        "findings that share a file, linked from each finding below. To ask for one "
+        "that was not opened automatically, comment `/remediate <finding-id>` (or "
+        "`/remediate all`) — you need write access to this repository, and only a "
+        "finding whose remediation is a file in this repository can become a pull "
+        "request.",
     ]
 
 
@@ -1069,7 +1124,11 @@ def _render_scope(
 
 
 def _render_findings(
-    findings: list[dict], budget: int
+    findings: list[dict],
+    budget: int,
+    *,
+    states: dict[str, str] | None = None,
+    pr_urls: dict[str, str] | None = None,
 ) -> tuple[list[str], list[dict]]:
     """The findings section, plus the findings that did not fit the budget."""
     out = ["", "## Findings", ""]
@@ -1077,13 +1136,41 @@ def _render_findings(
         out.append("No findings. Every audited cluster is compliant with this audit.")
         return out, []
 
+    states = states or {}
+    pr_urls = pr_urls or {}
     counts = severity_counts(findings)
     out.append(
         f"{findings_phrase(len(findings))}: {counts['critical']} critical, "
         f"{counts['major']} major, {counts['minor']} minor."
     )
 
-    rendered, omitted = select_rendered_findings(findings, budget)
+    rendered, omitted = select_rendered_findings(
+        findings, budget, states=states, pr_urls=pr_urls
+    )
+
+    # A one-row-per-finding index, so the state of the whole stream is legible
+    # without scrolling through every evidence block.
+    if any(states.get(str(f.get("id", ""))) for f in rendered):
+        out += [
+            "",
+            "| Finding | Severity | Cluster | State |",
+            "| ------- | -------- | ------- | ----- |",
+        ]
+        for finding in rendered[:MAX_DELTA_ROWS]:
+            fid = str(finding.get("id", ""))
+            state = states.get(fid, STATE_OPEN)
+            label = STATE_LABELS.get(state, state)
+            url = pr_urls.get(fid)
+            out.append(
+                f"| `{_cell(fid)}` | {_cell(str(finding.get('severity', '')))} "
+                f"| `{_cell(str(finding.get('cluster', '')))}` "
+                f"| {label}{f' ({url})' if url else ''} |"
+            )
+        if len(rendered) > MAX_DELTA_ROWS:
+            out.append(
+                f"| _…and {len(rendered) - MAX_DELTA_ROWS} more below_ |  |  |  |"
+            )
+
     for severity in SEVERITIES:
         group = [f for f in rendered if f.get("severity") == severity]
         if not group:
@@ -1092,8 +1179,11 @@ def _render_findings(
         suffix = f"{len(group)} of {total}" if len(group) < total else str(total)
         out += ["", f"### {severity.capitalize()} ({suffix})"]
         for finding in group:
+            fid = str(finding.get("id", ""))
             out.append("")
-            out += render_finding(finding)
+            out += render_finding(
+                finding, state=states.get(fid), pr_url=pr_urls.get(fid)
+            )
 
     if omitted:
         out += [
@@ -1122,14 +1212,42 @@ def _render_footer(
     ]
 
 
-def render_body(
+def _render_withheld(withheld: list[str], findings: list[dict]) -> list[str]:
+    """Name the findings eligible for a pull request that the cap held back.
+
+    A cap that silently drops work reads as "nothing more to do". Naming them,
+    with the command to ask for one, is what keeps the cap honest.
+    """
+    if not withheld:
+        return []
+    by_id = {str(f.get("id", "")): f for f in findings}
+    out = [
+        "",
+        "## Awaiting `/remediate`",
+        "",
+        f"{len(withheld)} finding(s) qualify for an automatic remediation pull "
+        f"request but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
+        "one bad night cannot bury this repository in generated pull requests. "
+        "Comment `/remediate <finding-id>` to open any of them now — an explicit "
+        "request is not capped.",
+        "",
+    ]
+    for fid in withheld:
+        finding = by_id.get(fid) or {}
+        out.append(f"- `{fid}` — {finding.get('title', '')}")
+    return out
+
+
+def render_issue_body(
     data: dict,
     *,
-    staged_paths: list[str],
     generated_at: datetime,
     audit_id: str | None = None,
+    states: dict[str, str] | None = None,
+    pr_urls: dict[str, str] | None = None,
+    withheld: list[str] | None = None,
 ) -> str:
-    """Render the complete PR body. The model never hand-writes this.
+    """Render the complete ledger issue body. The model never hand-writes this.
 
     Everything but the findings renders and is measured first; whatever is left
     of BODY_BUDGET is the findings budget. The hidden delta block carries the
@@ -1142,34 +1260,36 @@ def render_body(
     scope = data.get("scope") or {}
     clusters = list(scope.get("clusters") or [])
     skipped = list(scope.get("skipped") or [])
+    states = states or {}
+    pr_urls = pr_urls or {}
 
     fixed: list[str] = _render_header(audit_id)
     fixed += _render_scope(clusters, skipped, generated_at)
-
-    remediation_section = ["", "## Remediation files in this PR", ""]
-    if staged_paths:
-        remediation_section += [f"- `{path}`" for path in staged_paths]
-    else:
-        remediation_section.append(
-            "No files changed — every remediation in this audit is a `gcloud` or "
-            "`manual` action, so this pull request carries the report only."
-        )
+    withheld_section = _render_withheld(list(withheld or []), findings)
 
     # Measure the footer with an empty delta block: each finding is separately
     # charged for its own id slot inside select_rendered_findings.
-    overhead = len("\n".join(fixed + remediation_section))
+    overhead = len("\n".join(fixed + withheld_section))
     overhead += len("\n".join(_render_footer(audit_id, generated_at, [])))
     overhead += len("\n".join(["", "## Findings", "", ""])) + 400  # section chrome
+    if states:
+        # The state index is one row per rendered finding, capped, and is not
+        # part of any single finding's charged cost.
+        overhead += MAX_DELTA_ROWS * 160 + 200
 
-    findings_lines, omitted = _render_findings(findings, max(BODY_BUDGET - overhead, 0))
-    rendered_ids = [
-        fid for fid in finding_ids(findings) if fid not in {str(f.get("id", "")) for f in omitted}
-    ]
+    findings_lines, omitted = _render_findings(
+        findings,
+        max(BODY_BUDGET - overhead, 0),
+        states=states,
+        pr_urls=pr_urls,
+    )
+    omitted_ids = {str(f.get("id", "")) for f in omitted}
+    rendered_ids = [fid for fid in finding_ids(findings) if fid not in omitted_ids]
 
     body = "\n".join(
         fixed
         + findings_lines
-        + remediation_section
+        + withheld_section
         + _render_footer(audit_id, generated_at, rendered_ids)
     )
     if len(body) > MAX_BODY_CHARS:
@@ -1221,7 +1341,7 @@ def render_delta_comment(
         out.append("")
 
     out.append(
-        "The pull request description has been rewritten to the current state of the fleet."
+        "The ledger description has been rewritten to the current state of the fleet."
     )
     # Capping the body made this path reachable: previously the body failed
     # first at ~67 findings, so a delta this large could never be produced.
@@ -1247,8 +1367,8 @@ def render_clean_comment(
         f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
         f"{len(clusters)} audited cluster(s): {names}.",
         "",
-        "Every finding previously reported here is gone, so this pull request is "
-        "being closed. The next run that finds anything will open a fresh one.",
+        "Every finding previously reported here is gone, so this ledger is being "
+        "closed as completed. The next run that finds anything opens a fresh one.",
     ]
     if skipped:
         out += [
@@ -1368,11 +1488,21 @@ def ensure_labels(repo: str, audit_id: str) -> None:
         )
 
 
-def find_existing_pr(repo: str, audit_id: str) -> tuple[int | None, str | None]:
-    """The audit's single open PR, if any. Lowest number wins (deterministic)."""
+class GitHubLookupError(RuntimeError):
+    """A GitHub lookup failed in a way that must not be read as 'nothing found'."""
+
+
+def find_existing_issue(repo: str, audit_id: str) -> tuple[int | None, str | None]:
+    """The audit's single open ledger issue, if any. Lowest number wins.
+
+    Raises rather than reporting "none" when the lookup itself fails. The old
+    code returned (None, None) on a non-zero exit, which made a `gh` outage
+    indistinguishable from an empty result: the run would open a duplicate
+    ledger, or on a clean run report CLEAN having closed nothing.
+    """
     res = gh(
         [
-            "pr",
+            "issue",
             "list",
             "-R",
             repo,
@@ -1388,40 +1518,72 @@ def find_existing_pr(repo: str, audit_id: str) -> tuple[int | None, str | None]:
         check=False,
     )
     if res.returncode != 0:
-        return None, None
-    try:
-        prs = json.loads(res.stdout or "[]")
-    except json.JSONDecodeError:
-        return None, None
-    if not isinstance(prs, list) or not prs:
-        return None, None
-    prs.sort(key=lambda p: int(p.get("number", 0)))
-    if len(prs) > 1:
-        log(
-            f"WARNING: {len(prs)} open PRs carry label audit:{audit_id}; updating "
-            f"#{prs[0].get('number')} and leaving the rest alone. Close the duplicates."
+        raise GitHubLookupError(
+            f"could not list issues for audit:{audit_id} in {repo} "
+            f"(gh exited {res.returncode}): {(res.stderr or '').strip()[:200]}"
         )
-    return int(prs[0]["number"]), prs[0].get("url")
+    try:
+        issues = json.loads(res.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise GitHubLookupError(
+            f"gh issue list returned output that is not JSON: {exc}"
+        ) from exc
+    if not isinstance(issues, list) or not issues:
+        return None, None
+    issues.sort(key=lambda p: int(p.get("number", 0)))
+    if len(issues) > 1:
+        log(
+            f"WARNING: {len(issues)} open issues carry label audit:{audit_id}; "
+            f"updating #{issues[0].get('number')} and leaving the rest alone. "
+            "Close the duplicates."
+        )
+    return int(issues[0]["number"]), issues[0].get("url")
 
 
-def fetch_pr_body(repo: str, number: int) -> str:
-    res = gh(["pr", "view", str(number), "-R", repo, "--json", "body"], check=False)
+def fetch_issue_body(repo: str, number: int) -> str | None:
+    """The ledger's current body, or None when it could not be read.
+
+    None and "" are different answers. An unreadable body means the delta is
+    unknowable; treating it as empty would announce every live finding as new.
+    """
+    res = gh(["issue", "view", str(number), "-R", repo, "--json", "body"], check=False)
     if res.returncode != 0:
-        return ""
+        log(
+            f"WARNING: could not read issue #{number} (gh exited {res.returncode}); "
+            "skipping the delta comment rather than reporting every finding as new."
+        )
+        return None
     try:
         return str(json.loads(res.stdout or "{}").get("body") or "")
     except json.JSONDecodeError:
-        return ""
+        log(f"WARNING: issue #{number} body came back as non-JSON; skipping the delta.")
+        return None
 
 
-def fetch_pr_url(repo: str, number: int) -> str | None:
-    res = gh(["pr", "view", str(number), "-R", repo, "--json", "url"], check=False)
+def fetch_issue_url(repo: str, number: int) -> str | None:
+    res = gh(["issue", "view", str(number), "-R", repo, "--json", "url"], check=False)
     if res.returncode != 0:
         return None
     try:
         return json.loads(res.stdout or "{}").get("url")
     except json.JSONDecodeError:
         return None
+
+
+def fetch_issue_comments(repo: str, number: int) -> list[dict]:
+    """Comments on the ledger, for `/remediate` parsing. Empty on failure."""
+    res = gh(
+        ["issue", "view", str(number), "-R", repo, "--json", "comments"], check=False
+    )
+    if res.returncode != 0:
+        log(f"WARNING: could not read comments on issue #{number}; treating as none.")
+        return []
+    try:
+        comments = json.loads(res.stdout or "{}").get("comments") or []
+    except json.JSONDecodeError:
+        log(f"WARNING: comments on issue #{number} came back as non-JSON.")
+        return []
+    return [c for c in comments if isinstance(c, dict)]
 
 
 def _write_temp(text: str, suffix: str = ".md") -> str:
@@ -1441,16 +1603,46 @@ def _unlink(path: str) -> None:
 
 
 def apply_severity_label(repo: str, number: int, findings: list[dict]) -> None:
-    """Tag the PR with its highest live severity so triage can sort by it."""
+    """Tag the ledger with its highest live severity so triage can sort by it."""
     counts = severity_counts(findings)
     highest = next((s for s in SEVERITIES if counts[s]), None)
     if highest is None:
         return
-    args = ["pr", "edit", str(number), "-R", repo, "--add-label", f"severity:{highest}"]
+    args = [
+        "issue",
+        "edit",
+        str(number),
+        "-R",
+        repo,
+        "--add-label",
+        f"severity:{highest}",
+    ]
     for severity in SEVERITIES:
         if severity != highest:
             args += ["--remove-label", f"severity:{severity}"]
     gh(args, check=False)
+
+
+def post_comment(repo: str, number: int, text: str, *, what: str) -> None:
+    """Comment on an issue, logging rather than aborting when GitHub refuses.
+
+    A 422 on a comment used to skip the close that followed it, because the
+    close sat outside the try/finally. A comment is a courtesy; the state
+    change is the point.
+    """
+    comment_file = _write_temp(text)
+    try:
+        res = gh(
+            ["issue", "comment", str(number), "-R", repo, "-F", comment_file],
+            check=False,
+        )
+        if res.returncode != 0:
+            log(
+                f"WARNING: could not post the {what} on #{number} "
+                f"(gh exited {res.returncode}); continuing."
+            )
+    finally:
+        _unlink(comment_file)
 
 
 def load_findings(path: str, audit_id: str) -> dict:
@@ -1486,40 +1678,42 @@ def assert_remediation_files_exist(findings: list[dict], root: Path) -> None:
 
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
-    branch = branch_for(audit_id)
 
     refresh_credentials()
     repo = resolve_repo()
     ensure_labels(repo, audit_id)
 
-    git(["checkout", BASE_BRANCH])
-    git(["pull", "--ff-only", "origin", BASE_BRANCH])
-    # -B: create the branch, or reset an existing one back onto main. The audit
-    # rewrites its report from scratch on every run, so history is disposable.
-    git(["checkout", "-B", branch])
+    # No branch is created or reset here. The report branch is gone: the ledger
+    # is an issue, and each remediation pull request branches off main on demand.
+    existing_issue, _ = find_existing_issue(repo, audit_id)
 
-    existing_pr, _ = find_existing_pr(repo, audit_id)
+    pending: list[str] = []
+    if existing_issue is not None:
+        pending = pending_remediate_targets(fetch_issue_comments(repo, existing_issue))
 
     try:
         os.makedirs(SCRATCH_DIR, exist_ok=True)
     except OSError:
         pass
 
+    # A crashed run must not leave a document behind for the next one to
+    # publish as if it were fresh.
+    findings_path = findings_path_for(audit_id)
+    Path(findings_path).unlink(missing_ok=True)
+
     print(
         json.dumps(
             {
-                "branch": branch,
-                "existing_pr": existing_pr,
+                "issue": existing_issue,
                 "repo": repo,
-                "findings_path": findings_path_for(audit_id),
+                "findings_path": findings_path,
+                "pending_remediation_requests": pending,
             }
         )
     )
 
 
-def _handle_finish_dry_run(
-    audit_id: str, data: dict, now: datetime
-) -> None:
+def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
     findings = list(data["findings"])
     paths = manifest_paths(findings)
 
@@ -1533,16 +1727,34 @@ def _handle_finish_dry_run(
             )
 
     if not findings:
-        log("STATUS: CLEAN — 0 findings; the open PR (if any) would be closed.")
+        log("STATUS: CLEAN — 0 findings; the open ledger (if any) would be closed.")
         print(render_clean_comment(audit_id, data, now))
         return
 
-    log(f"TITLE: {pr_title(audit_id, findings)}")
-    log(f"COMMIT: {commit_subject(audit_id, findings)}")
-    log(f"STAGES: {', '.join(paths) if paths else '(nothing — empty commit)'}")
+    states = {str(f.get("id", "")): STATE_OPEN for f in findings}
+    promote, withheld = promotion_candidates(findings, {})
+    groups = remediation_groups([f for f in findings if str(f.get("id", "")) in promote])
+
+    log(f"TITLE: {issue_title(audit_id, findings)}")
+    # "declared", not "on disk": the loop above warns about the ones missing.
+    log(f"MANIFESTS DECLARED: {', '.join(paths) if paths else '(none)'}")
+    log(
+        "WOULD OPEN: "
+        + (
+            ", ".join(group_branch_for(audit_id, g) for g in groups)
+            if groups
+            else "(no remediation pull requests)"
+        )
+    )
+    if withheld:
+        log(f"WITHHELD BY THE CAP: {', '.join(withheld)}")
     print(
-        render_body(
-            data, staged_paths=paths, generated_at=now, audit_id=audit_id
+        render_issue_body(
+            data,
+            generated_at=now,
+            audit_id=audit_id,
+            states=states,
+            withheld=withheld,
         )
     )
 
@@ -1561,84 +1773,80 @@ def handle_finish(args: argparse.Namespace) -> None:
     repo = resolve_repo()
     ensure_labels(repo, audit_id)
 
-    existing_pr, existing_url = find_existing_pr(repo, audit_id)
-    previous_body = fetch_pr_body(repo, existing_pr) if existing_pr else ""
-    previous_ids = parse_delta_block(previous_body)
-    previous_titles = parse_finding_titles(previous_body)
+    existing_issue, existing_url = find_existing_issue(repo, audit_id)
+    previous_body = fetch_issue_body(repo, existing_issue) if existing_issue else ""
+    # None means the body was unreadable, which is not the same as empty: the
+    # delta is unknowable, so report no delta rather than a fabricated one.
+    delta_known = previous_body is not None
+    previous_ids = parse_delta_block(previous_body or "")
+    previous_titles = parse_finding_titles(previous_body or "")
     current_ids = finding_ids(findings)
     new_ids, resolved_ids = compute_delta(previous_ids, current_ids)
 
-    # --- Clean run: retire the stream's PR, touch nothing else. ---
+    # --- Clean run: retire the stream's ledger, touch nothing else. ---
     if not findings:
-        if existing_pr:
-            comment_file = _write_temp(render_clean_comment(audit_id, data, now))
-            try:
-                gh(["pr", "comment", str(existing_pr), "-R", repo, "-F", comment_file])
-            finally:
-                _unlink(comment_file)
-            gh(["pr", "close", str(existing_pr), "-R", repo])
-            log(f"Audit {audit_id} is clean; closed PR #{existing_pr}.")
+        if existing_issue:
+            post_comment(
+                repo,
+                existing_issue,
+                render_clean_comment(audit_id, data, now),
+                what="all-clear comment",
+            )
+            # Completed, not "not planned": a closed ledger means the fleet is
+            # clean, never that the report was rejected.
+            gh(
+                [
+                    "issue",
+                    "close",
+                    str(existing_issue),
+                    "-R",
+                    repo,
+                    "--reason",
+                    "completed",
+                ]
+            )
+            log(f"Audit {audit_id} is clean; closed issue #{existing_issue}.")
         else:
-            log(f"Audit {audit_id} is clean and has no open PR; nothing to do.")
+            log(f"Audit {audit_id} is clean and has no open ledger; nothing to do.")
         print(
             json.dumps(
                 {
                     "status": "CLEAN",
-                    "pr_url": existing_url,
+                    "issue_url": existing_url,
                     "new": 0,
                     "resolved": len(previous_ids),
+                    "prs_opened": [],
+                    "prs_closed": [],
                 }
             )
         )
         return
 
-    # --- Findings: stage, commit, force-push, publish. ---
+    # --- Findings: publish the ledger. No branch, no commit, no force-push. ---
     root = repo_root()
     assert_remediation_files_exist(findings, root)
-    paths = manifest_paths(findings)
 
-    branch = branch_for(audit_id)
-    assert_pushable(branch)
-    if current_branch() != branch:
-        log(f"Not on {branch}; resetting the audit branch onto HEAD.")
-        git(["checkout", "-B", branch])
+    states = {str(f.get("id", "")): STATE_OPEN for f in findings}
+    _, withheld = promotion_candidates(findings, {})
 
-    if paths:
-        run_cmd(build_git_add_command(paths))
-    else:
-        log("No manifest remediations; committing an empty report commit.")
-
-    subject = commit_subject(audit_id, findings)
-    # --allow-empty unconditionally: an audit whose remediation files are all
-    # byte-identical to main still needs a commit for the branch/PR to exist.
-    git(
-        [
-            "commit",
-            "--allow-empty",
-            "-m",
-            subject,
-            "-m",
-            f"Generated by the Platform Agent {audit_id} watchdog at {now.isoformat()}.",
-        ]
-    )
-    git(["push", "-f", "origin", branch])
-
-    title = pr_title(audit_id, findings)
+    title = issue_title(audit_id, findings)
     body_file = _write_temp(
-        render_body(data, staged_paths=paths, generated_at=now, audit_id=audit_id)
+        render_issue_body(
+            data,
+            generated_at=now,
+            audit_id=audit_id,
+            states=states,
+            withheld=withheld,
+        )
     )
     try:
-        if existing_pr is None:
+        if existing_issue is None:
             res = gh(
                 [
-                    "pr",
+                    "issue",
                     "create",
                     "-R",
                     repo,
-                    "--base",
-                    BASE_BRANCH,
-                    "--head",
-                    branch,
                     "--title",
                     title,
                     "--body-file",
@@ -1651,17 +1859,17 @@ def handle_finish(args: argparse.Namespace) -> None:
             )
             status = "OPENED"
             lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
-            pr_url = lines[-1] if lines else None
-            number = existing_pr
-            if pr_url:
-                tail = pr_url.rstrip("/").rsplit("/", 1)[-1]
+            issue_url = lines[-1] if lines else None
+            number = None
+            if issue_url:
+                tail = issue_url.rstrip("/").rsplit("/", 1)[-1]
                 number = int(tail) if tail.isdigit() else None
         else:
             gh(
                 [
-                    "pr",
+                    "issue",
                     "edit",
-                    str(existing_pr),
+                    str(existing_issue),
                     "-R",
                     repo,
                     "--title",
@@ -1671,8 +1879,8 @@ def handle_finish(args: argparse.Namespace) -> None:
                 ]
             )
             status = "UPDATED"
-            number = existing_pr
-            pr_url = existing_url or fetch_pr_url(repo, existing_pr)
+            number = existing_issue
+            issue_url = existing_url or fetch_issue_url(repo, existing_issue)
     finally:
         _unlink(body_file)
 
@@ -1680,25 +1888,29 @@ def handle_finish(args: argparse.Namespace) -> None:
         apply_severity_label(repo, number, findings)
 
     if status == "UPDATED" and number is not None:
-        comment = render_delta_comment(
-            audit_id, new_ids, resolved_ids, findings, previous_titles, now
-        )
-        if comment:
-            comment_file = _write_temp(comment)
-            try:
-                gh(["pr", "comment", str(number), "-R", repo, "-F", comment_file])
-            finally:
-                _unlink(comment_file)
+        if not delta_known:
+            log(
+                "Previous ledger body was unreadable; skipping the delta comment "
+                "rather than announcing every live finding as new."
+            )
         else:
-            log("No new or resolved findings; body refreshed without a comment.")
+            comment = render_delta_comment(
+                audit_id, new_ids, resolved_ids, findings, previous_titles, now
+            )
+            if comment:
+                post_comment(repo, number, comment, what="delta comment")
+            else:
+                log("No new or resolved findings; body refreshed without a comment.")
 
     print(
         json.dumps(
             {
                 "status": status,
-                "pr_url": pr_url,
-                "new": len(new_ids),
-                "resolved": len(resolved_ids),
+                "issue_url": issue_url,
+                "new": len(new_ids) if delta_known else 0,
+                "resolved": len(resolved_ids) if delta_known else 0,
+                "prs_opened": [],
+                "prs_closed": [],
             }
         )
     )
@@ -1711,19 +1923,21 @@ def handle_finish(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Deterministic audit-PR harness for the fleet-audit skill."
+        description="Deterministic audit-reporting harness for the fleet-audit skill."
     )
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     start_parser = subparsers.add_parser(
-        "start", help="Refresh credentials, reset the audit branch, locate the open PR."
+        "start",
+        help="Refresh credentials, locate the ledger issue, report pending "
+        "/remediate requests.",
     )
     start_parser.add_argument(
         "--audit", required=True, help=f"Audit id: one of {', '.join(sorted(AUDITS))}."
     )
 
     finish_parser = subparsers.add_parser(
-        "finish", help="Validate findings and publish/refresh/close the audit PR."
+        "finish", help="Validate findings and publish/refresh/close the ledger issue."
     )
     finish_parser.add_argument("--audit", required=True, help="Audit id.")
     finish_parser.add_argument(
