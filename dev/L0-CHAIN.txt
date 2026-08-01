@@ -282,6 +282,24 @@ python3 dev/tests/cluster-check-hygiene.py --negative-control
 python3 dev/tests/negative-controls-name-their-rule.py
 python3 dev/tests/negative-controls-name-their-rule.py --negative-control
 
+# --- the probe emits the tag the suite reads (B-008) -----------------------------------------
+# Every L2 broker suite talks to its probe over one channel: line-tagged stdout. The probe writes
+# `emit("door-opened", ...)` and the suite reads `field door-opened 3`, and NOTHING holds the two
+# spellings together. Rename one end and the suite does not fail -- `field` simply matches no line,
+# hands back the empty string, and the arm that compares it to an expectation quietly stops
+# asserting. That is a green suite over a channel that carries nothing, which is the shape 09 §9.4
+# is about. The contract is deliberately ASYMMETRIC and the asymmetry is the whole design: a tag the
+# suite READS and the probe cannot emit is a FAILING direction, because the read is dead. A tag the
+# probe EMITS and no suite reads is ADVISORY, because a probe is allowed to journal diagnostics
+# nobody asserts on. Both ends are derived, never listed (LSN-036): a probe's emit helper is found
+# by its `print` of a tab-joined first argument, a suite's accessor by an `awk -v` binding compared
+# to the tag column for equality, and the pairing includes the DEFAULT binding a suite inherits from
+# `dev/lib/broker-driver.sh` without naming it. A suite with no accessor is announced as
+# non-participating rather than passing silently, and a participating pair whose probe emits nothing
+# is a FAIL, not a vacuous pass (LSN-035). `--negative-control` scores six rows with per-row needles.
+python3 dev/tests/probe-tags-match-their-suite.py
+python3 dev/tests/probe-tags-match-their-suite.py --negative-control
+
 # --- the L2 auth suite's own negative control (P9-T8b-4b-i) ---------------------------------
 # The `¬` arm of V-BRK-007/008/009/010/017. It is here, in the chain that needs no cluster, because
 # it deliberately addresses none: the only way to inject "a broker that accepts a credential it must

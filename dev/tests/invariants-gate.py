@@ -1520,6 +1520,78 @@ def _results_rows() -> list[dict[str, str]]:
         return list(csv.DictReader(fh))
 
 
+RESULTS_COLUMNS = ("date", "phase", "check_id", "level", "target", "result", "evidence_ref", "notes")
+
+
+def check_results_rows_have_eight_fields() -> list[str]:
+    """Every `results.csv` row parses to exactly the eight columns the header declares.
+
+    Nothing asserted this, and on 2026-08-01 two of 243 rows did not. One was written with **no
+    `notes` column at all** -- seven fields, so `csv.DictReader` handed every consumer
+    `notes=None`. The other was written with an **unquoted** notes field carrying fourteen embedded
+    commas, so it parsed to **twenty-two** fields and its reasoning was being read as columns 8
+    through 22, with the surplus swept into `DictReader`'s `None` key where no arm looks.
+
+    The reason this is worth an arm rather than a one-time repair is what it does NOT break.
+    `date`, `phase`, `check_id`, `level`, `target`, `result` and `evidence_ref` all survive both
+    shapes intact, because both defects land at or after the last delimiter a reader depends on --
+    so the assertion ratchet, the deferral arms, the phase ratchet and the coverage gates all read
+    a malformed row correctly and stay green. The only column that silently rots is the one that
+    carries the reasoning, which is the column a future ORIENT reads to find out why a verdict was
+    recorded. A defect that damages only the explanation is exactly the defect no verdict-shaped
+    check can see.
+
+    This arm is about **shape**, not content: it makes no claim about what any field says. The
+    fix for a wrong field is a `**correction**` row (see `_dagger_pass_failures`); the fix for a
+    row that does not parse is to re-emit that row with correct quoting, which changes no field's
+    visible text and is therefore not a rewrite of history.
+    """
+    if not RESULTS_CSV.exists():
+        return [f"{RESULTS_CSV.relative_to(REPO)} does not exist, so no verdict has a home."]
+    with RESULTS_CSV.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))
+    if not rows:
+        return [f"{RESULTS_CSV.relative_to(REPO)} is empty; an empty verdict ledger is not a pass."]
+
+    failures = []
+    header = tuple(c.strip() for c in rows[0])
+    if header != RESULTS_COLUMNS:
+        failures.append(
+            f"verification/results.csv header is {header!r}, expected {RESULTS_COLUMNS!r}. "
+            "Every arm that reads this file keys on those names."
+        )
+    # LSN-035: an empty corpus is a failure, not a vacuous pass. The file had 243 data rows when
+    # this floor was written; 50 leaves room for a retire-and-rebuild without letting a truncated
+    # read report green.
+    body = rows[1:]
+    if len(body) < 50:
+        failures.append(
+            f"verification/results.csv parsed to only {len(body)} data row(s). The ledger is "
+            "append-only and had 243 on 2026-08-01, so this is a truncated or unparseable read, "
+            "not a small ledger."
+        )
+    for i, row in enumerate(body, start=2):
+        if len(row) == len(RESULTS_COLUMNS):
+            continue
+        cid = row[2] if len(row) > 2 else "<unparseable>"
+        if len(row) < len(RESULTS_COLUMNS):
+            why = (
+                "a trailing column was omitted, so every consumer reads it as absent rather than "
+                "empty"
+            )
+        else:
+            why = (
+                "a field carrying commas was written unquoted, so its text is being read as "
+                f"columns {len(RESULTS_COLUMNS)}-{len(row)}"
+            )
+        failures.append(
+            f"verification/results.csv row {i} ({cid}) parses to {len(row)} field(s), not "
+            f"{len(RESULTS_COLUMNS)}: {why}. Re-emit the row with correct quoting -- that preserves "
+            "every field's visible text, so it repairs the encoding without rewriting the verdict."
+        )
+    return failures
+
+
 def _dagger_pass_failures(dagger: list[str]) -> list[str]:
     """The other half: a † check may not be recorded as **passing**.
 
@@ -3572,6 +3644,515 @@ def check_phase_gate_runs_its_own_ratchet() -> list[str]:
 # This is a retirement with a named replacement, not a deletion (invariants §8).
 
 
+# ---------------------------------------------------------------------------------------------
+# LSN-062 — a record that says a path is absent is checked against the tree
+# ---------------------------------------------------------------------------------------------
+#
+# `P9-T11g-2a`'s split note published -- in a phase-file row, a ledger cell, an outcome section and
+# a commit message -- that `verification/traceability.yaml` **does not exist**. It had existed since
+# `P8-T10` (`ead358e`): 71 KB, 177 entries, V-MET-011's artifact, green on the L0 chain every run.
+# The question the unit had actually answered was "does 09 §8's `R-<doc>.<section>-<n>` requirement
+# mapping exist?", a correct and well-evidenced **no**, and the answer was written down against the
+# FILENAME §8 happens to use for that mapping. Every sentence after it stayed consistent, because
+# only the label was wrong.
+#
+# Why this direction and not the other. A claim that a file EXISTS has a backstop: the next thing
+# that opens it fails. A claim that a file is ABSENT has none -- nothing fails when you decline to
+# run `ls` -- and it is load-bearing, because "X does not exist" is how work gets scheduled. So the
+# absent direction gets a check rather than a habit.
+#
+# The corpus is the three places the harness keeps records that later units read as fact:
+# `docs/build/*.md`, `.claude/harness/*.md`, and the header comment of `verification/*.yaml`. Both
+# markdown globs are DELIBERATELY NON-RECURSIVE. `docs/build/archive/` is a frozen record of closed
+# phases whose sentences are true of the tree they describe and were never meant to be re-read as
+# present tense; a live phase file is the opposite, and is exactly where the incident happened.
+
+ABSENCE_MD_GLOBS = ("docs/build/*.md", ".claude/harness/*.md")
+ABSENCE_YAML_GLOB = "verification/*.yaml"
+
+# The non-vacuity floor, and it is a floor on CANDIDATES EXAMINED, not on findings. The normal case
+# in this corpus is a TRUE absence claim -- "there is no `deploy/kubeagents-broker`", "`k8s-operator/
+# config/samples` holds no Agent" -- so a findings-based floor would demand the records stay wrong.
+# On 2026-08-01 the scanner attached a path to nine claims across BUILD-REVIEW.md, LEDGER.md,
+# HARNESS.md and phase-9.md. Four is a little under half of that: high enough that the two ways this
+# arm dies quietly (the sentence splitter stops splitting, the path attacher stops attaching -- both
+# send the count to zero or one) fail loudly, and low enough that correcting or striking every
+# finding this arm currently raises, plus a few more, does not turn a clean-up into a red gate.
+# [[LSN-035]]/[[LSN-036]]: a scanner that silently stopped matching prints the same green as one
+# that examined the corpus.
+ABSENCE_CLAIM_FLOOR = 4
+
+# What counts as "a repo path" when it appears in backticks. Either it has a separator, or it ends
+# in an extension this repo actually uses. Design point: THE ARM ONLY FIRES ON A CLAIM THAT NAMES A
+# PATH. "The requirement mapping does not exist" is a claim about a property, it is very likely to
+# be true, and there is nothing here to resolve -- guessing which artifact a prose noun refers to is
+# the exact substitution (a NAME asserted, a PROPERTY established) that LSN-062 is about. Such a
+# sentence is ignored in silence, on purpose.
+PATH_EXTENSIONS = (
+    ".md", ".py", ".sh", ".go", ".yaml", ".yml", ".json", ".txt", ".csv", ".toml", ".tpl",
+    ".template", ".mod", ".sum", ".tf", ".cfg", ".ini", ".env", ".lock",
+)
+
+# Present tense: the claim is about the tree as it stands, which is the tree this arm can see.
+_ADVERB = r"(?:\s+(?:\w+ly|yet|still|now|ever|then))"
+_ABSENT_NOW = (
+    r"(?:does|do)\s+not" + _ADVERB + r"{0,2}\s+(?:yet\s+)?exists?"
+    r"|(?:doesn't|don't)" + _ADVERB + r"{0,2}\s+exists?"
+    r"|(?:is|are)" + _ADVERB + r"{0,2}\s+absent"
+    r"|(?:is|are)\s+not" + _ADVERB + r"{0,2}\s+(?:in the tree|present in the tree|in the repo|on disk)"
+    r"|(?:has|have)\s+never\s+existed"
+    r"|no\s+longer\s+exists?"
+)
+# Past tense. Handled, not exempted -- see `_absence_claims`.
+_ABSENT_THEN = (
+    r"(?:did|would)\s+not" + _ADVERB + r"{0,2}\s+(?:yet\s+)?exists?"
+    r"|didn't" + _ADVERB + r"{0,2}\s+exists?"
+    r"|(?:was|were)" + _ADVERB + r"{0,2}\s+absent"
+    r"|(?:was|were)\s+not" + _ADVERB + r"{0,2}\s+(?:in the tree|present in the tree|in the repo|on disk)"
+    r"|had\s+never\s+existed"
+    r"|no\s+longer\s+existed"
+)
+# The path follows these instead of preceding them.
+_ABSENT_PREFIX_NOW = r"there\s+(?:is|are)\s+no(?!\w)|nothing\s+at|no\s+such\s+file(?:\s+at)?|no\s+such\s+path|no\s+file\s+at"
+_ABSENT_PREFIX_THEN = r"there\s+(?:was|were)\s+no(?!\w)"
+
+ABSENT_NOW_RE = re.compile(_ABSENT_NOW, re.I)
+ABSENT_THEN_RE = re.compile(_ABSENT_THEN, re.I)
+ABSENT_PREFIX_NOW_RE = re.compile(_ABSENT_PREFIX_NOW, re.I)
+ABSENT_PREFIX_THEN_RE = re.compile(_ABSENT_PREFIX_THEN, re.I)
+
+# A coordinated run of backticked tokens (`a.py`, `b.py` and `c.py`) touching the phrase, plus the
+# filler allowed between the two. THE WINDOW IS THE POINT. "`X` does not exist" and "`X` exists"
+# differ by two words, and a regex that scans a paragraph for a path and a negation independently
+# fires on both -- so the path must be the thing the phrase is predicated OF, not merely nearby.
+# `_BAD_FILLER` is what makes the join legal: no second backticked token (a nearer path would be the
+# real subject), no colon, no coordinating conjunction that switches subject, no `exists`/`present`
+# (the sentence is drawing a contrast and the phrase belongs to the other half), and no
+# `<article> <noun> that/which` -- a fresh head noun means the phrase is about the noun, not the
+# path. That last one is not hypothetical: LEDGER.md:88 reads "the three promises
+# `internal/broker/undo` makes to a replayer that did not exist", where the absent thing is the
+# replayer.
+_LEFT_PATHS = re.compile(r"((?:`[^`\n]+`)(?:\s*(?:,|and|or|nor|·)\s*`[^`\n]+`)*)([^`]{0,60})$")
+# The prefix form gets a much shorter window than the suffix form, because "there is no" is followed
+# by its subject immediately and anything longer is a different noun. HARNESS.md:98 -- "there is no
+# reading of that which is not \"read and ignored\"" -- has a backticked path thirty characters
+# later and is not a claim about it.
+_RIGHT_PATHS = re.compile(r"^([^`]{0,20}?)((?:`[^`\n]+`)(?:\s*(?:,|and|or|nor|·)\s*`[^`\n]+`)*)")
+_BAD_FILLER = re.compile(
+    r"`|:|\b(?:but|while|whereas|though|although|because|since|however|whose|if|unless|"
+    r"exists?|present)\b|"
+    r"\b(?:a|an|the|its|their|this|these|those|another|his|her|our|your)\s+[\w'’-]+\s+"
+    r"(?:that|which|who)\b",
+    re.I,
+)
+# A scoping preposition right after the phrase means the sentence never claimed the path is missing
+# from the REPOSITORY: "`verify-phase8.sh` is absent from the chain" is a true statement about
+# `dev/L2-CHAIN.txt`. The negative lookahead keeps the three scopes that ARE the tree.
+_RIGHT_SCOPE = re.compile(
+    r"^\W{0,3}(?:from|in|on|under|within|among|outside|beyond|between|across)\b"
+    r"(?!\s+(?:disk|the tree|the repo|the repository|the working tree|the worktree|the filesystem))",
+    re.I,
+)
+# A claim ATTRIBUTED to someone else, or quoted, is a report of a claim and not one. The corpus
+# needs this: LESSONS.md's own body for LSN-062 has to be able to say that a unit "published that
+# `verification/traceability.yaml` does not exist", and phase-9.md's correction block has to be able
+# to quote the retracted sentence. Stated limit: an attributed sentence is not checked at all, so
+# "the ledger says `x` does not exist" escapes even when it is the record's own live claim. Narrow
+# on purpose -- speech and record verbs only, not `reads`/`names`/`shows`.
+_ATTRIBUTED = re.compile(
+    r"\b(?:said|says|stated|states|claimed|claims|wrote|published|publishes|reported|asserted|"
+    r"insisted|believed|thought|assumed|told|quoted|quotes)\b",
+    re.I,
+)
+_QUOTED = re.compile(r"\"[^\"\n]*\"|“[^”\n]*”")
+# A struck-through claim is a CORRECTED claim, and a corrected record is what this arm wants the
+# tree to look like. Exempt per LSN-062's own proposal. Fenced blocks are command transcripts and
+# diffs -- quoted material, not the record's assertion -- and `ls: no such file` in captured output
+# is a fact about the moment it was captured.
+_STRIKETHROUGH = re.compile(r"~~.*?~~", re.S)
+_CODE_FENCE = re.compile(r"^```.*?^```", re.M | re.S)
+# An ISO date in the SAME sentence. See `_absence_claims` for what it buys and why the sentence is
+# the unit.
+_IN_SENTENCE_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+# Hard breaks that end a statement regardless of punctuation: a blank line, a list bullet, a
+# heading, a blockquote marker, and a table-cell pipe. Everything between two hard breaks is
+# re-flowed (single newlines become spaces) before sentence splitting, because this corpus hard-
+# wraps prose at ~100 columns -- splitting on `\n` would put the path and the phrase of a wrapped
+# sentence in different windows and lose the claim. `.replace("\n", " ")` is length-preserving, so
+# every offset still maps back to a real line number.
+_HARD_BREAK = re.compile(r"\n\s*\n|\n\s*(?:[-*+]|\d+\.)\s|\n#{1,6}\s|\n\s*>|\|")
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def _absence_corpus() -> dict[str, str]:
+    """{repo-relative path: the text this arm reads}, with the YAML files cut to their headers."""
+    corpus: dict[str, str] = {}
+    for glob in ABSENCE_MD_GLOBS:
+        for path in sorted(REPO.glob(glob)):
+            if path.is_file():
+                corpus[path.relative_to(REPO).as_posix()] = path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+    for path in sorted(REPO.glob(ABSENCE_YAML_GLOB)):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        # Header comment only: the leading run of `#` and blank lines. The data below it is
+        # generated (`requirements.yaml` is 216 KB of extracted spec text) and its `text:` scalars
+        # quote the specs, which say things like "there is no ..." about the system rather than
+        # about the tree.
+        header: list[str] = []
+        for line in text.splitlines():
+            if line.strip() and not line.lstrip().startswith("#"):
+                break
+            header.append(line)
+        corpus[path.relative_to(REPO).as_posix()] = "\n".join(header)
+    return corpus
+
+
+def _statements(text: str) -> list[tuple[int, str]]:
+    """(offset into `text`, one sentence) for every sentence, fences and strikethrough removed.
+
+    Both removals blank the span rather than deleting it, and both are LENGTH-PRESERVING (every
+    non-newline character becomes a space), so every offset -- and therefore every line number in a
+    finding -- still points at the real file. Deleting the span instead shifts everything after the
+    first fenced block, and a finding that names the wrong line is a finding nobody can act on.
+    """
+    def blank(m: re.Match[str]) -> str:
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    text = _CODE_FENCE.sub(blank, text)
+    text = _STRIKETHROUGH.sub(blank, text)
+
+    chunks: list[tuple[int, str]] = []
+    pos = 0
+    for m in _HARD_BREAK.finditer(text):
+        chunks.append((pos, text[pos : m.start()]))
+        pos = m.end()
+    chunks.append((pos, text[pos:]))
+
+    out: list[tuple[int, str]] = []
+    for start, chunk in chunks:
+        flat = chunk.replace("\n", " ")
+        at = 0
+        for m in _SENTENCE_END.finditer(flat):
+            out.append((start + at, flat[at : m.start()]))
+            at = m.end()
+        out.append((start + at, flat[at:]))
+    return [(off, s) for off, s in out if s.strip()]
+
+
+def _claimed_path(token: str) -> str | None:
+    """The repo path a backticked token names, or None if it does not name one."""
+    t = token.strip().rstrip(".,;:").strip()
+    if not t or " " in t or len(t) < 3:
+        return None
+    if t.startswith(("http", "$", "-", "<", "#", "@")) or t.endswith(("(", ")")):
+        return None
+    if "/" in t or t.endswith(PATH_EXTENSIONS):
+        return t.rstrip("/")
+    return None
+
+
+def _path_is_present(token: str) -> str | None:
+    """What in the working tree answers to `token`, or None.
+
+    Generous on purpose, in the same way `check_closed_lessons_are_executable` is generous about a
+    lesson's citations: a bare filename resolves against any file of that name, and a relative path
+    resolves against any path that ends with it. LSN-062's whole shape is a claim made about a NAME,
+    so a name that resolves to something is at minimum a claim a reader cannot check by eye. The
+    finding prints both the token as written and what it resolved to, so a genuine miss is one glance
+    to dismiss.
+
+    Enumerated from the WORKING TREE via `gitcorpus.repo_files`, never `git ls-files` alone: a file
+    this unit just created is not in the index, and it is the newest claims that are most likely to
+    be stale ([[LSN-050]]).
+    """
+    if any(ch in token for ch in "*?["):
+        # A glob names a set, not a path. Resolve it as one rather than skipping it -- an empty
+        # match is an honest absence.
+        return next((p.relative_to(REPO).as_posix() for p in REPO.glob(token)), None)
+    if (REPO / token).exists():
+        return token
+    files, dirs = _tree_index()
+    if "/" in token:
+        for rel in files:
+            if rel.endswith("/" + token):
+                return rel
+        for d in dirs:
+            if d.endswith("/" + token):
+                return d
+        return None
+    for rel in files:
+        if rel.rsplit("/", 1)[-1] == token:
+            return rel
+    for d in dirs:
+        if d.rsplit("/", 1)[-1] == token:
+            return d
+    return None
+
+
+_TREE_INDEX: tuple[list[str], list[str]] | None = None
+
+
+def _tree_index() -> tuple[list[str], list[str]]:
+    """(every file in the working tree, every directory implied by one), enumerated once.
+
+    Cached because `repo_files` shells out to git and this arm asks the question once per claim.
+    """
+    global _TREE_INDEX
+    if _TREE_INDEX is None:
+        files = repo_files(REPO)
+        dirs = set()
+        for rel in files:
+            parts = rel.split("/")
+            dirs.update("/".join(parts[:i]) for i in range(1, len(parts)))
+        _TREE_INDEX = (files, sorted(dirs))
+    return _TREE_INDEX
+
+
+def _absence_claims(text: str) -> list[tuple[int, str, str, bool, str]]:
+    """Every claim in `text` that a named path is absent.
+
+    Returns (offset, path token, the phrase that asserts absence, historical?, the sentence).
+
+    **Tense, which is the subtle part, and the decision is written down here.** A past-tense claim
+    ("`x` did not exist", "`x` was absent") can be true of the tree it was written against and false
+    of the tree today, so it cannot be judged the same way. It is NOT exempted: a reader at ORIENT
+    reads a phase file as a description of the world they are about to work in, which is precisely
+    how LSN-062 happened -- the false claim was read, believed, and scheduled against four separate
+    times before anyone ran `ls`. A past-tense claim about a path that is present today therefore
+    still produces a finding, with its own message asking for a date qualifier or a rewrite rather
+    than for a deletion.
+
+    The one exemption is an ISO date IN THE SAME SENTENCE. "On 2026-07-20 `x` did not exist" is a
+    statement about a tree this arm cannot see and cannot contradict, and the date is what stops a
+    later reader from taking it as present tense. The date must be in the sentence, not the
+    paragraph, the section heading or the commit: an inferable date is exactly what every one of
+    these sentences already had, and it did not help.
+    """
+    claims: list[tuple[int, str, str, bool, str]] = []
+    for off, sentence in _statements(text):
+        # (phrase pattern, past tense?, does the path FOLLOW the phrase?)
+        for pattern, historical, prefix in (
+            (ABSENT_NOW_RE, False, False),
+            (ABSENT_THEN_RE, True, False),
+            (ABSENT_PREFIX_NOW_RE, False, True),
+            (ABSENT_PREFIX_THEN_RE, True, True),
+        ):
+            for m in pattern.finditer(sentence):
+                if _ATTRIBUTED.search(sentence[: m.start()]):
+                    continue
+                if any(
+                    q.start() <= m.start() and m.end() <= q.end()
+                    for q in _QUOTED.finditer(sentence)
+                ):
+                    continue
+                if prefix:
+                    hit = _RIGHT_PATHS.match(sentence[m.end() :])
+                    if not hit or _BAD_FILLER.search(hit.group(1)):
+                        continue
+                    tokens, after = hit.group(2), sentence[m.end() :][hit.end() :]
+                else:
+                    hit = _LEFT_PATHS.search(sentence[: m.start()])
+                    if not hit or _BAD_FILLER.search(hit.group(2)):
+                        continue
+                    tokens, after = hit.group(1), sentence[m.end() :]
+                # "`verify-phase8.sh` is absent from the chain" is a claim about a chain file, not
+                # about the tree, and it is true. A scoping preposition after the phrase means the
+                # sentence never asserted the path is missing from the repository at all.
+                if _RIGHT_SCOPE.match(after):
+                    continue
+                if historical and _IN_SENTENCE_DATE.search(sentence):
+                    continue
+                for raw in re.findall(r"`([^`\n]+)`", tokens):
+                    token = _claimed_path(raw)
+                    if token:
+                        claims.append(
+                            (off + m.start(), token, m.group(0), historical, sentence.strip())
+                        )
+    return claims
+
+
+# The in-file control corpus. `invariants-gate.py` has no `--negative-control` mode -- its arms are
+# controlled from `dev/test_invariants_gate.py` -- but a control that lives in another file is a
+# control someone can forget to run, and this arm's whole risk is a window that quietly stops
+# discriminating. So the rows run on every invocation, ahead of the corpus, and a disagreement is a
+# FAILURE OF THIS ARM rather than a finding about the tree.
+#
+# Each row is (a synthetic document, the paths it must be understood to claim absent). The paths
+# below are deliberately a mix of real (`verification/traceability.yaml`, `dev/L0-CHAIN.txt`) and
+# invented (`verification/nonesuch.yaml`), because the property under test here is ATTACHMENT --
+# which path the phrase is about -- and not presence, which the corpus arm exercises for real.
+ABSENCE_CONTROLS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # 1. The incident itself, verbatim in shape.
+    ("`verification/traceability.yaml` does not exist.", ("verification/traceability.yaml",)),
+    # 2. Two words away from row 1 and the opposite claim. A paragraph-wide regex fires on both.
+    ("`verification/traceability.yaml` exists, at 71 KB and 177 entries.", ()),
+    # 3. Both claims in ONE sentence. The phrase belongs to the nearer path, and attaching it to
+    #    the first backtick in the sentence would report a true statement as a lie.
+    (
+        "`dev/L0-CHAIN.txt` exists and `verification/nonesuch.yaml` does not exist.",
+        ("verification/nonesuch.yaml",),
+    ),
+    # 4. Sentence bounding. The path is in the previous sentence and the claim is about a property.
+    (
+        "`dev/L0-CHAIN.txt` is the single definition site. "
+        "The requirement mapping does not exist.",
+        (),
+    ),
+    # 5. No path anywhere: ignored in silence, never guessed at.
+    ("The `R-<doc>.<section>-<n>` requirement space does not exist.", ()),
+    # 6. Prefix phrasing, where the path follows the phrase.
+    ("There is no `verification/nonesuch.yaml` in the tree.", ("verification/nonesuch.yaml",)),
+    # 7. Prefix phrasing whose subject is a noun, with a path later in the sentence.
+    ("There is no reading of that which does not condemn `dev/L0-CHAIN.txt`.", ()),
+    # 8. Scoped to a container: a membership claim, not a claim about the tree.
+    ("`verify-phase8.sh` is absent from the chain.", ()),
+    # 9. Attributed and quoted: a report of a claim, which is how a correction is written.
+    (
+        'The split note said `verification/traceability.yaml` "does not exist".',
+        (),
+    ),
+    # 10. Struck through: a corrected record is what this arm is asking for.
+    ("~~`verification/traceability.yaml` does not exist~~ — corrected the same day.", ()),
+    # 11. Fenced: a transcript quotes the world at capture time.
+    ("```\nls: `verification/traceability.yaml` does not exist\n```", ()),
+    # 12. Past tense with no date: still a claim, still checked (with the other message).
+    ("`dev/L0-CHAIN.txt` did not exist when the phase was planned.", ("dev/L0-CHAIN.txt",)),
+    # 13. Past tense with an ISO date in the same sentence: a claim about a tree this arm cannot
+    #     see, and the reader has been told which tree.
+    ("On 2026-07-20 `dev/L0-CHAIN.txt` did not exist.", ()),
+    # 14. A wrapped sentence. The corpus hard-wraps at ~100 columns; splitting on newlines would
+    #     drop this claim entirely and the arm would go quiet without going red.
+    (
+        "`verification/coverage.yaml`, which §8.1 names as the baseline's\n"
+        "home, is genuinely absent.",
+        ("verification/coverage.yaml",),
+    ),
+    # 15. A coordinated list shares one phrase, and every member of it is a claim. Taking only the
+    #     nearest path would leave the first half of the sentence unchecked.
+    (
+        "`verification/nonesuch.yaml` and `verification/alsonot.yaml` do not exist.",
+        ("verification/nonesuch.yaml", "verification/alsonot.yaml"),
+    ),
+    # 16-18 are the `_BAD_FILLER` rows: the path is the NEAREST one to the phrase in all three and
+    # is still not what the phrase is about. Without them, neutering `_BAD_FILLER` to match nothing
+    # leaves every other row in this table green -- rows 3 and 7 are held by the regex's own
+    # `[^`]`/20-character bounds, not by the filler rule -- and the arm would start reporting true
+    # sentences as lies with no control objecting.
+    #
+    # 16. LEDGER.md:88, verbatim in shape. The thing that did not exist is the replayer.
+    (
+        "The package is built on the three promises `internal/broker/undo` makes to a replayer "
+        "that did not exist.",
+        (),
+    ),
+    # 17. A contrast inside one sentence: the path is the half that IS there.
+    ("`dev/L0-CHAIN.txt` is the single definition site, but the mapping does not exist.", ()),
+    # 18. LESSONS.md:1069's shape — a colon, then an unrelated path.
+    ("Scoped by what it does, so there is no exemption ladder: `dev/L0-CHAIN.txt` is exempt.", ()),
+    # 19. Long but grammatically clean filler. Nothing in `_BAD_FILLER` objects to this sentence, so
+    #     only the 60-character bound on `_LEFT_PATHS` keeps the phrase off the path. Widen that
+    #     bound and this row is the one that notices.
+    (
+        "`dev/L0-CHAIN.txt` is the file the harness reads before every unit of work begins and "
+        "the requirement mapping does not exist.",
+        (),
+    ),
+    # 20. Two table cells. A ledger row is a dozen independent statements on one line; joining them
+    #     invents a sentence nobody wrote, and it is the shape half this corpus is written in.
+    ("| `dev/L0-CHAIN.txt` | the requirement mapping does not exist |", ()),
+    # 21. Attributed and NOT quoted — pins the attribution exemption on its own.
+    (
+        "The unit published in a ledger cell that `verification/traceability.yaml` does not exist.",
+        (),
+    ),
+    # 22. Quoted and NOT attributed — pins the quotation exemption on its own.
+    (
+        'A phase-file row carried `verification/traceability.yaml` "does not exist" forward.',
+        (),
+    ),
+)
+
+
+def _absence_control_failures() -> list[str]:
+    """The arm proving it still discriminates, before it is allowed to judge the corpus."""
+    failures: list[str] = []
+    for doc, expected in ABSENCE_CONTROLS:
+        got = tuple(token for _off, token, _phrase, _hist, _s in _absence_claims(doc))
+        if got != expected:
+            failures.append(
+                f"CONTROL ROW FAILED: {doc.splitlines()[0][:80]!r} should be read as claiming "
+                f"{list(expected)} absent and was read as claiming {list(got)}. The window that "
+                f"decides which path a negation is about has stopped discriminating, so this arm's "
+                f"verdict on the real corpus means nothing (LSN-062)."
+            )
+    return failures
+
+
+def check_absent_path_claims_are_true() -> list[str]:
+    """LSN-062. "That file does not exist" is a checkable claim, so it gets checked.
+
+    Over `docs/build/*.md`, `.claude/harness/*.md` and the header comments of `verification/*.yaml`:
+    a sentence asserting that a named repo path is absent must be true of the working tree.
+
+    Three properties, in the order they can fail:
+
+      1. The control rows above still discriminate "`X` does not exist" from "`X` exists" and attach
+         the phrase to the right path. A window that has stopped discriminating produces green for
+         a reason unrelated to the corpus.
+      2. Enough candidate claims were found to believe the scanner ran at all. The floor is on
+         candidates, because a true absence claim is the normal and desirable case here.
+      3. No claim names a path that is present.
+
+    What this arm cannot do, stated so nobody reads its green as more than it is: it checks the
+    NAME, and LSN-062 was a name standing in for a property. A record that says "the requirement
+    mapping does not exist" is unreachable from here and would have been unreachable then. What it
+    does catch is the cheap half -- the half that costs one `ls` and was not run.
+    """
+    failures = _absence_control_failures()
+    if failures:
+        return failures
+
+    examined = 0
+    for rel, text in sorted(_absence_corpus().items()):
+        for off, token, phrase, historical, sentence in _absence_claims(text):
+            examined += 1
+            resolved = _path_is_present(token)
+            if not resolved:
+                continue
+            line = text.count("\n", 0, off) + 1
+            where = f"{rel}:{line}" if rel.endswith(".md") else f"{rel}:{line} (header comment)"
+            named = f"`{token}`" + ("" if resolved == token else f" (resolves to {resolved})")
+            quoted = sentence if len(sentence) <= 160 else sentence[:157] + "..."
+            if historical:
+                failures.append(
+                    f"{where} says {named} \"{phrase}\", and it is in the tree today. A past-tense "
+                    f"absence claim with no date in the same sentence is read as present tense at "
+                    f"the next ORIENT — which is how LSN-062 scheduled work against a file that had "
+                    f"existed for a phase. Date it in this sentence or rewrite it. Claim: {quoted!r}"
+                )
+            else:
+                failures.append(
+                    f"{where} says {named} \"{phrase}\", and it is in the tree. LSN-062: an absence "
+                    f"claim has no backstop — nothing fails when a file you declined to open is "
+                    f"actually there — and it is what the next unit schedules against. Correct the "
+                    f"sentence (strike it through, or say which property is missing rather than "
+                    f"which file). Claim: {quoted!r}"
+                )
+
+    if examined < ABSENCE_CLAIM_FLOOR:
+        failures.append(
+            f"VACUOUS: the scanner attached a path to only {examined} absence claim(s) across "
+            f"{len(_absence_corpus())} corpus file(s); the floor is {ABSENCE_CLAIM_FLOOR} and this "
+            f"tree had nine when the arm was written. The records did not stop making these claims "
+            f"— the sentence splitter or the path attacher stopped seeing them, and a scanner that "
+            f"matches nothing reports the same green as one that checked everything."
+        )
+    return failures
+
 
 CHECKS = [
     (
@@ -3588,6 +4169,10 @@ CHECKS = [
     ("LSN-005 — destructive-test guards stay anchored", check_destructive_guards_are_anchored),
     ("LSN-018 — build targets name their cluster", check_make_targets_are_context_explicit),
     ("V-MET-006 / LSN-008 — deferrals name a blocker", check_deferrals_name_blockers),
+    (
+        "every results.csv row parses to its eight declared columns",
+        check_results_rows_have_eight_fields,
+    ),
     ("09 §12 / LSN-046 — † checks are deferred by ID", check_dagger_checks_are_deferred_by_id),
     (
         "LSN-001/002/003 — L2 scripts declare and back their preconditions",
@@ -3649,6 +4234,10 @@ CHECKS = [
     (
         "planning defect 4 — every phase gate runs its own 09 §10 ratchet",
         check_phase_gate_runs_its_own_ratchet,
+    ),
+    (
+        "LSN-062 — a record claiming a path is absent is checked against the tree",
+        check_absent_path_claims_are_true,
     ),
 ]
 
