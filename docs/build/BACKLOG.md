@@ -140,15 +140,10 @@ _(empty)_
 
 ## Scheduled
 
-| ID    | Title                                                                                              | Kind                   | Scheduled into                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | On         |
-| ----- | -------------------------------------------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| B-003 | Ruling on the deferred `/replay` question: reshape V-BRK-021, do not narrow it                     | finding (human ruling) | **`phase-9.md` P9-T7c-2c**, inserted as the next unit — ahead of the two remaining tasks, because it is L0 and Phase 9's own ordering rule puts the remaining L0 work in front of the remaining L2 work. The **implementation** of `/replay` and `/approve` is explicitly NOT in it; that stays in Phase 10 beside P10-T4 / P10-T7, as the item's own point 3 asks                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | 2026-07-30 |
-| B-005 | Run the builds on a provisioned, warm builder instead of standing one up per build                 | task                   | **The next improvement pass, step (1) only — the measurement.** Its steps (2) and (3) are implementation and may not be scheduled into a pass; the numbers the pass produces schedule their own unit. The item's own gate ("measure with the leak cleaned up") is satisfied for free by the ordering: the next pass fires at the Phase 9 milestone, which is after B-004. The **Spotlight sub-finding** (63 975 indexed entries under `GOCACHE`, `.metadata_never_index` as the cheap test) travels with this item, not with B-004 — the indexer orphans nothing                                                                                                                                                                                                                                                                                                                                           | 2026-07-30 |
-| B-007 | A retired grant's residue on the scratch cluster still confers the journal verbs                   | finding                | **The next improvement pass**, all three of its consequences. The mechanization is a check ("no RBAC object outside the rendered set grants an agent identity the journal verbs") and a provisioning-lifecycle rule, which is a pass's subject and not a unit's. The **live-install look** rides with it as a read-only `auth can-i` / `get role` comparison against `platform-agent-host` — verification only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 2026-07-31 |
-| B-008 | A negative control cannot see the probe→suite line-tag contract                                    | finding                | **The next improvement pass.** An L0 line asserting that the tag set `broker_refuse_probe.py` can emit equals the tag set `broker-refuse-l2.sh` reads, generalised across all three probe/suite pairs. A check change, added to `dev/L0-CHAIN.txt` at its one definition site                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | 2026-07-31 |
-| B-010 | The router crashloop's two survivors: no ledger row for it, and the live install unlooked-at       | finding (split)        | **The Phase 9 `harness-milestone`**, for the Deferrals row — the milestone is the step that writes deferrals, and this is a known-state disclosure rather than a repair. **The next improvement pass** for the live-install read-only look, riding with B-007's, which targets the same cluster with the same `auth can-i` / `get` shape. The crashloop ITSELF is refused — see B-009 in `## Refused`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 2026-07-31 |
-| B-011 | The LSN-060 gate arm detects a control mode by substring, so naming the flag in prose is a finding | finding                | **The next improvement pass.** Recognise a control mode by its HANDLER — the flag reaching an argument parse or a `case` on `$1` — rather than by the string appearing anywhere in the file, comments included. A check change at one definition site, which is a pass's subject and not a unit's; Guardrail 9 kept it out of the unit that tripped it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | 2026-07-31 |
-| B-012 | `dev/mutate.py` has no suite kind for a check whose catcher is its own `--negative-control`        | finding                | **The next improvement pass.** A new suite kind in the sanctioned runner is a tool change at one definition site, which is a pass's subject and not a unit's — and the item is evidence _about_ units rather than work inside one. Sized as it argues: `"kind": "command"`, `run` a command, `catcher` a needle that must appear in its output, which is the `unittest`/`go` paths' rule 5 (`rc != 0` is not a catch) expressed for a check that reports in prose. The pass also owes it a second half the item does not ask for: `harness-run` §5 currently reads as though `dev/mutate.sh` is a legitimate destination for a check-only unit, and once the runner can host these sweeps it is not — the two units that fell back are the corpus for that edit. Rides with **B-008** and **B-011**, which are the same shape (a check about checks, one definition site) and touch the neighbouring files | 2026-07-31 |
+| ID    | Title                                                                                        | Kind                   | Scheduled into                                                                                                                                                                                                                                                                                                                                                                                        | On         |
+| ----- | -------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| B-003 | Ruling on the deferred `/replay` question: reshape V-BRK-021, do not narrow it               | finding (human ruling) | **`phase-9.md` P9-T7c-2c**, inserted as the next unit — ahead of the two remaining tasks, because it is L0 and Phase 9's own ordering rule puts the remaining L0 work in front of the remaining L2 work. The **implementation** of `/replay` and `/approve` is explicitly NOT in it; that stays in Phase 10 beside P10-T4 / P10-T7, as the item's own point 3 asks                                    | 2026-07-30 |
+| B-010 | The router crashloop's two survivors: no ledger row for it, and the live install unlooked-at | finding (split)        | **The Phase 9 `harness-milestone`**, for the Deferrals row — the milestone is the step that writes deferrals, and this is a known-state disclosure rather than a repair. **The next improvement pass** for the live-install read-only look, riding with B-007's, which targets the same cluster with the same `auth can-i` / `get` shape. The crashloop ITSELF is refused — see B-009 in `## Refused` | 2026-07-31 |
 
 ### B-003 — Ruling on the deferred `/replay` question: reshape V-BRK-021, do not narrow it
 
@@ -269,106 +264,6 @@ L0 and L2 with only L1 evidence on file, while the deferral row records it green
 readings need reconciling either way, and that reconciliation belongs to P9-T9, not here. This item
 is a spec/check reshape only.
 
-### B-005 — Run the builds on a provisioned, warm builder instead of standing one up per build
-
-The item asks two things and gates the second on the first, and that gate is what decides the
-destination. Step **(1) measure** is diagnosis — split the wall clock into codegen / compile /
-envtest-startup / test-execution, and check whether `-count=1` is defeating the Go test cache for no
-reason. Diagnosis is precisely what an improvement pass does, so step (1) is scheduled there. Steps
-**(2) a warm `buildx` builder** and **(3) a dedicated build cluster** are implementation and cost
-money per hour, and `harness-improve` §5 forbids a pass from doing either. So the pass produces the
-numbers and a costed comparison of all three candidates (scratch-hosted, dedicated,
-Cloud-Build-as-is) and **stops**; whichever the numbers favour becomes its own unit with its own
-guard work. Pre-deciding that in the drain would be answering the question the item exists to ask.
-
-The item's closing constraints are carried forward verbatim rather than re-derived: `gke-scratch-*`
-stays the only legal mutating target; anything new pushes to the same Artifact Registry so
-`reload-images.sh` can still read the digest back and **deploy by digest**; and if the answer is a
-dedicated build cluster, it needs its own name and its own guard, because the `gke-scratch-*`
-anchored `case` is a **destructive-target allowlist** and a build cluster is not a destructive
-target. Inheriting that pattern would quietly mark the one machine that must not be wiped as safe to
-wipe.
-
-**The Spotlight sub-finding rides with this item, not with B-004.** 63 975 indexed entries under
-`~/Library/Caches/go-build` means every build feeds `mdworker_shared` thousands of files, and the
-cheap test is a `.metadata_never_index` marker in `GOCACHE` and possibly `k8s-operator/bin`. It is
-filed here because it is a **build-cost** finding: the indexer orphans nothing and reaps its workers
-correctly, which the item established and recorded so the unit would not re-investigate it. B-004 is
-about processes that outlive their parent; this is about work the machine is doing on purpose.
-
-**As filed, verbatim.**
-
-- **Kind:** task
-- **Where:** `k8s-operator/Makefile` (`test`, `build`, `setup-envtest`), `dev/cluster/reload-images.sh`,
-  `make cloud-build-push`, `dev/L2-CHAIN.txt` — and the two clusters that already exist
-- **Why it matters:** `make -C k8s-operator test` is slow enough to be felt in every unit, and the
-  harness runs it at CHECKPOINT for any unit touching `k8s-operator/**`, so the cost is paid per
-  unit for the whole remaining build. It is not one cost either: it is `controller-gen`, then
-  `go build`, then an envtest control plane (etcd + kube-apiserver) started per package, on an arm64
-  laptop, for a project whose every deploy target is amd64. This repo already refuses host-arch
-  **image** builds for exactly that mismatch and routes them to Cloud Build; nothing has asked the
-  same question about the **test** path.
-
-  Two things are being asked, and the first should gate the second. **(1) Measure.** Split the wall
-  clock into codegen / compile / envtest-startup / test-execution, because which one is the bill
-  changes the fix — and one candidate fix is free: the harness passes `-count=1` in places, which
-  defeats Go's test cache. **(2) Then try a provisioned builder rather than a per-build one.** A
-  persistent `docker buildx` builder as a pod in `gke-scratch-kube-agents-dev` is cheap to stand up
-  (`docker buildx create --driver kubernetes`), is natively amd64 so it satisfies the host-arch
-  refusal, and keeps a warm layer cache across builds — which `cloud-build-push` cannot, since every
-  invocation starts from a cold worker. The same "already provisioned, kept warm" argument applies
-  to the envtest control plane and the Go build cache, and those may be the larger win if the
-  measurement says compile and envtest startup dominate.
-
-  Constraints to respect rather than rediscover: `gke-scratch-*` is the only legal target for
-  anything mutating (`platform-agent-host` is verification-only, and any new script needs the
-  anchored destructive-guard `case`); the builder must still push to the same Artifact Registry so
-  `reload-images.sh` can read the digest back and **deploy by digest**; and `pause.sh`/`resume.sh`
-  scale the scratch node pools to zero between campaigns, so a persistent builder either tolerates
-  being scaled away or changes what "paused" costs — worth pricing that idle cost as part of the
-  answer.
-
-  **(3) And a third option the first two should not foreclose: a separate, dedicated build cluster.**
-  `gke-scratch-kube-agents-dev` is available, but availability is not the same as suitability, and
-  there are three reasons it may be the wrong host for a thing whose whole value is being warm and
-  always there. It is the **destructive-test target** — the one cluster the harness is allowed to
-  break — so a builder living in it is inside the blast radius of the tests it exists to serve, and
-  a teardown script doing its job correctly can take the build path down with it. It is **paused to
-  zero between campaigns**, which is precisely when a warm cache would otherwise be earning its
-  keep, so the builder is cold exactly as often as the scratch cluster is idle. And its lifecycle is
-  owned by `dev/cluster/up.sh` — a cluster that can be recreated from scratch by design is a poor
-  place to keep the one thing that must not be.
-
-  So the measurement in (1) should also answer whether the builder wants its own home: a small,
-  long-lived, amd64, node-pool-pinned cluster (or a plain node pool with its own lifecycle, if a
-  whole cluster is not worth its floor cost) whose only job is `buildx` + the Go build cache +
-  possibly a warm envtest control plane, never a test target, never torn down by a campaign. If that
-  is the answer, it needs its own name and its own guard: the `gke-scratch-*` anchored `case` is a
-  **destructive-target allowlist**, and a build cluster is not a destructive target — it must not
-  quietly inherit the pattern that says it is safe to wipe, and `platform-agent-host` must stay
-  equally out of reach. Price all three (scratch-hosted, dedicated, Cloud-Build-as-is) against the
-  measured bill before choosing; the point of this item is the numbers, not the destination.
-
-- **Priority:** normal
-- **Added:** 2026-07-30
-
-### B-007 — A retired grant's residue on the scratch cluster still confers the journal verbs
-
-**Severity: not a live security regression, and the argument is the one that matters.** The
-residue grants the actor **exactly the verbs the shipped per-tier Role already grants it** —
-`actionrecords get/list/watch/create` and `actionrecords/status get/update/patch`. No authority is
-conferred that a correct install does not confer, so nothing is over-permissioned today. What is
-broken is **revocability**: an object no template renders cannot be narrowed by re-provisioning,
-so the first future attempt to tighten the actor grant will be a silent no-op wherever this
-residue lives. It becomes a regression the day someone tries; it is not one now. Recorded this
-precisely because "an unowned RBAC object grants the journal verbs" reads like a `now` at a
-glance, and the drain protocol says the harness must say which it is.
-
-### B-008 — A negative control cannot see the probe→suite line-tag contract
-
-**Severity: a check gap and nothing else.** The suite it concerns **deferred** rather than passing,
-which is the correct verdict for a property that could not be evaluated.
-
 ### B-010 — The router crashloop's two survivors: no ledger row, and the live install unlooked-at
 
 **What B-010 keeps.** Two survivors the refusal does not dispose of. (1) None of the above is in
@@ -379,72 +274,6 @@ The live install has never been checked for the same gap; that is a read-only lo
 B-007's improvement-pass work because that already points the same `auth can-i` / `get` shape at a
 cluster.
 
-### B-011 — The LSN-060 gate arm detects a control mode by substring
-
-**Severity: not a live security regression.** It describes a gate arm that is too eager — it
-fails builds it should pass, never the reverse — so its failure mode is friction, not
-permissiveness.
-
-**Why B-011 waits for the pass rather than landing now.** It is a change to a check at its one
-definition site, motivated by a failure the unit in front of it hit — Guardrail 9's exact case. The
-unit worked around it in a way that is better on its own terms (matching the invocation's shape, not
-the flag's spelling), so nothing is blocked by the delay.
-
-**As filed, verbatim.**
-
-- **Kind:** finding
-- **Where:** `dev/tests/invariants-gate.py:2955` (`check_negative_controls_exercise_the_statement_under_test`)
-- **Why it matters:** the arm's test for "this suite has a control mode" is
-  `if "--negative-control" not in text: continue` — a substring search over the whole file. Any
-  script that merely _mentions_ the flag is then required to carry a
-  `NEGATIVE CONTROL DOES NOT EXERCISE:` block describing a mode it does not have. It fired on
-  `dev/verify/verify-phase9.sh` during `P9-T9b-5b-ii-b-2`, whose new §G arm has to reason about
-  whether a claimant's control runs at L0. Worked around in that unit by matching the invocation's
-  _shape_ instead (`<suite>.sh <flag>` on a live `L0-CHAIN.txt` line), which is defensible on its own
-  terms — the flag is a convention, the property is "reached from the no-cluster chain" — but the
-  gate arm should recognise a mode by its **handler** (a `case`/`if` on `$1`, or the flag appearing
-  in an argument parse) rather than by the string appearing anywhere, including in a comment. As it
-  stands the arm taxes writing about controls, and the cheapest way to satisfy it is to stop naming
-  them. Guardrail 9 kept the fix out of that unit.
-- **Priority:** normal
-- **Added:** 2026-07-31
-
-### B-012 — `dev/mutate.py` has no suite kind for a check whose catcher is its own `--negative-control`
-
-Written by `harness-run` during `P9-T11a-2`, which is the practice this file has since
-retracted — see the rule in [What the harness does with it](#what-the-harness-does-with-it). The
-item itself is sound and stays scheduled; where it should have been filed is `LEDGER.md` plus a task
-in `docs/build/phase-9.md`.
-
-**Why it is not the unit that found it.** `P9-T11a-2` was a check-only unit under Guardrail 9, and
-adding a suite kind to `dev/mutate.py` in the middle of it would have meant using a brand-new,
-unexercised runner to produce that unit's own non-vacuity evidence. A sweep whose runner has never
-been run before is not evidence; the failure mode is precisely LSN-048's — an exit code nobody has
-established is the suite's.
-
-**Why an improvement pass and not `P9-T11c`.** Nothing in the T11 ladder is blocked on it. Both units
-that hit the gap got their evidence, through the fallback the skill itself names, and both recorded
-the mutants and their verdicts. What is broken is the _cost_ of doing so, and a recurring cost paid
-by the harness rather than by the product is the improvement pass's whole subject.
-
-**2026-07-31, from `P9-T11c″` — a third option the filing did not consider, and the item still
-stands.** That unit's check was the same shape: a phase-gate arm whose only catcher was its own
-`--negative-control`, so by this item's reasoning it was a third member of the corpus. It is not.
-The unit needed to assert the arm on a tree the repository has not reached yet, so it gave the
-future trees a `_control_against()` helper and two committed `unittest` cases — which moved the
-catcher **into** a unittest suite, and `verification/mutants/V-MET-014.json` then ran under the
-existing `"kind": "unittest"` at 6/6 with no runner change and no `dev/mutate.sh` fallback.
-
-What that changes for the pass is the framing, not the schedule. **A check whose only catcher is its
-own control is often a check that has not been given a catcher yet** — the control is a mode of the
-script, and a test that drives that script is an ordinary suite member. Before building
-`"kind": "command"`, the pass should ask of each corpus member whether the cheaper move is available
-to it, because a runner kind that reads a needle out of prose is a weaker contract than a test
-function: it can only assert that a string appeared, where a `unittest` case can assert the property.
-If both remaining members can take a unittest catcher the item may end up **refused with an
-argument** rather than built. The second half — the `harness-run` §5 edit — is untouched by this and
-still owed either way. The corpus is unchanged at two units: `P9-T11a-2` and `P9-T11a-3`.
-
 ---
 
 ## Refused
@@ -452,6 +281,7 @@ still owed either way. The corpus is unchanged at two units: `P9-T11a-2` and `P9
 | ID    | Title                                                                                          | Why not                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | On         |
 | ----- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | B-009 | `kubeagents-router` has been in CrashLoopBackOff on the scratch cluster for at least four days | **It is the documented and correct outcome on an inner-loop cluster, and the tree says so at bring-up.** `dev/cluster/up.sh:280` prints a banner headed "THE ROUTER CRASHLOOPS HERE, AND THAT IS THE CORRECT OUTCOME, not a broken bring-up", and carries the opposite banner for the case where it comes up — which it calls a ledger edit. `config/router/deployment.yaml` ships `KAGE_PROJECT_ID` and `KAGE_INBOUND_SUBSCRIPTION` as EMPTY strings **deliberately**, per V-CMP-003, so the failure names the variable to set instead of letting a placeholder flow into the Pub/Sub client and resurface as a missing-credentials error; the ServiceAccount carries no Workload Identity annotation for the same reason. Wiring them needs a real Pub/Sub subscription and a GSA — L3 work on a live install, not something an inner-loop cluster can or should invent. `provision_03` step 5 is what sets them. **The item's third question is answered NO here rather than queued:** router readiness does not belong in `dev/L2-CHAIN.txt`, because a chain line asserting a pod the design expects to crashloop would assert the opposite of the design, and the routing logic is already proven hermetically against the `pstest` fake (`go test ./internal/router/`). What the item got RIGHT is split out as the scheduled B-010: nothing in `LEDGER.md` records any of this, so ORIENT cannot learn it without reading `up.sh`, and the live install has never been checked for the same gap | 2026-07-31 |
+| B-012 | `dev/mutate.py` has no suite kind for a check whose catcher is its own `--negative-control`    | **Refused, and the evidence is that the fallback the item is built on was never needed.** The item asks for a `"kind": "command"` in `dev/mutate.py` for a check whose only catcher is its own `--negative-control`. But `verification/mutants/V-MET-014.json` **already sweeps** `dev/tests/negative-controls-name-their-rule.py` under the existing `"kind": "unittest"`, 9/9 caught, via `class PhaseRatchetIsAsserted` in `dev/test_invariants_gate.py`, whose `_control_against()` runs the control against a synthesised repository and hands back `(rc, output)`. Both units that concluded "my check reports in prose, so no kind fits" had that route available. The difference is not stylistic: **a needle asserts that a string appeared; a test function asserts the property** — and a prose needle structurally cannot express "the edit did not take," which is exactly [[LSN-063]]'s rule 1 and the reason a `command` kind would have imported the failure it was meant to catch. **The half the item did not ask for landed anyway**: `harness-run` §5 no longer reads as though `dev/mutate.sh` is a legitimate destination for a check-only unit, and names both units as the corpus. Re-read at the next pass, as every refusal is: if a check appears whose property genuinely has no test-function form, this becomes right                                                                                                                                                     | 2026-08-01 |
 
 ### B-009 — `kubeagents-router` has been in CrashLoopBackOff on the scratch cluster for four days
 
@@ -497,14 +327,54 @@ for a reason the tree already documents as correct.
 
 ---
 
+### B-012 — `dev/mutate.py` has no suite kind for a check whose catcher is its own `--negative-control`
+
+Written by `harness-run` during `P9-T11a-2`, which is the practice this file has since
+retracted — see the rule in [What the harness does with it](#what-the-harness-does-with-it). The
+item itself is sound and stays scheduled; where it should have been filed is `LEDGER.md` plus a task
+in `docs/build/phase-9.md`.
+
+**Why it is not the unit that found it.** `P9-T11a-2` was a check-only unit under Guardrail 9, and
+adding a suite kind to `dev/mutate.py` in the middle of it would have meant using a brand-new,
+unexercised runner to produce that unit's own non-vacuity evidence. A sweep whose runner has never
+been run before is not evidence; the failure mode is precisely LSN-048's — an exit code nobody has
+established is the suite's.
+
+**Why an improvement pass and not `P9-T11c`.** Nothing in the T11 ladder is blocked on it. Both units
+that hit the gap got their evidence, through the fallback the skill itself names, and both recorded
+the mutants and their verdicts. What is broken is the _cost_ of doing so, and a recurring cost paid
+by the harness rather than by the product is the improvement pass's whole subject.
+
+**2026-07-31, from `P9-T11c″` — a third option the filing did not consider, and the item still
+stands.** That unit's check was the same shape: a phase-gate arm whose only catcher was its own
+`--negative-control`, so by this item's reasoning it was a third member of the corpus. It is not.
+The unit needed to assert the arm on a tree the repository has not reached yet, so it gave the
+future trees a `_control_against()` helper and two committed `unittest` cases — which moved the
+catcher **into** a unittest suite, and `verification/mutants/V-MET-014.json` then ran under the
+existing `"kind": "unittest"` at 6/6 with no runner change and no `dev/mutate.sh` fallback.
+
+What that changes for the pass is the framing, not the schedule. **A check whose only catcher is its
+own control is often a check that has not been given a catcher yet** — the control is a mode of the
+script, and a test that drives that script is an ordinary suite member. Before building
+`"kind": "command"`, the pass should ask of each corpus member whether the cheaper move is available
+to it, because a runner kind that reads a needle out of prose is a weaker contract than a test
+function: it can only assert that a string appeared, where a `unittest` case can assert the property.
+If both remaining members can take a unittest catcher the item may end up **refused with an
+argument** rather than built. The second half — the `harness-run` §5 edit — is untouched by this and
+still owed either way. The corpus is unchanged at two units: `P9-T11a-2` and `P9-T11a-3`.
+
 ## Done
 
-| ID    | Title                                                                                             | Landed as                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | On         |
-| ----- | ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| B-001 | Name the broker as the renderer in P11-T4                                                         | 07 §2 **P11-T4** rewritten: the skill gathers intent and calls the broker, the broker renders. States why the cheapest reading of "convert the skills" moves a grant-minting renderer into the pod's blast radius and collapses the first of 03 §4.2's two layers. Improvement pass 2026-07-29                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | 2026-07-29 |
-| B-002 | One definition site for the tier template, as **P10-T0**                                          | 07 §2 gains **P10-T0**, load-bearing, immediately ahead of P10-T1 — one renderer for the child CR, both identities, RBAC and the literal allow-list `vap-agent-scope` compiles, in broker code. Improvement pass 2026-07-29                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | 2026-07-29 |
-| B-004 | Reap the envtest control planes — `make -C k8s-operator test` leaks etcd + kube-apiserver per run | **[[LSN-059]]**, opened and closed in one unit (2026-07-30). `dev/reap-envtest.sh` — left-edge anchored on the asset root, `ppid == 1` so a concurrent `make test` survives — wired into `k8s-operator/Makefile` as a **prerequisite** of `test` (runs after however the previous run died) plus a `trap … EXIT INT TERM`. Held by `invariants-gate.py` `check_envtest_control_planes_are_reaped` (five sub-properties) and `dev/test_reap_envtest.py` (18 behavioural tests on real processes), both on `dev/L0-CHAIN.txt`. The caller's own timeout is refused with an argument and recorded in `binding.md` §Build instead: 2m09s measured, ≥5 minutes required                                                                                                                                                                                                                                                                                                                                                                                                   | 2026-07-30 |
-| B-006 | 06 §4.4 row 3 promises an auto-pause the broker never performs                                    | **`phase-9.md` P9-T9c**, split at IMPLEMENT into two units, both landed 2026-07-31. **`-1`** — the row-3 refusal now carries its own `AutoPause` to the HTTP boundary, where `refuse()` records a pause request on the refusal's own `ActionRecord` through the same `escalate.Recorder.Pause` seam row 9 uses; 4/4 mutants caught. **`-2`** — `status.broker.journalReachable` is written by the **operator**, which reading 06 §2.2.1 and §2.2 together showed is the only principal that may (no grant anywhere reaches `agents/status`), from three conjoined observations against the etcd 05 §1.2 co-locates the journal with, on a 60 s clock because the field has no watch behind it; 8/8 mutants caught, and `journal_reachability.go` is classified RENDERING in V-RUN-012 so a probe can never read the brake and latch the pause it causes. The **check** question did NOT close here and travels to the next improvement pass: 09 has no ID covering row 3, and `dev/verify/broker-refuse-l2.sh` already induces the condition an assertion would ride | 2026-07-31 |
+| ID    | Title                                                                                              | Landed as                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | On         |
+| ----- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| B-001 | Name the broker as the renderer in P11-T4                                                          | 07 §2 **P11-T4** rewritten: the skill gathers intent and calls the broker, the broker renders. States why the cheapest reading of "convert the skills" moves a grant-minting renderer into the pod's blast radius and collapses the first of 03 §4.2's two layers. Improvement pass 2026-07-29                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 2026-07-29 |
+| B-002 | One definition site for the tier template, as **P10-T0**                                           | 07 §2 gains **P10-T0**, load-bearing, immediately ahead of P10-T1 — one renderer for the child CR, both identities, RBAC and the literal allow-list `vap-agent-scope` compiles, in broker code. Improvement pass 2026-07-29                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | 2026-07-29 |
+| B-004 | Reap the envtest control planes — `make -C k8s-operator test` leaks etcd + kube-apiserver per run  | **[[LSN-059]]**, opened and closed in one unit (2026-07-30). `dev/reap-envtest.sh` — left-edge anchored on the asset root, `ppid == 1` so a concurrent `make test` survives — wired into `k8s-operator/Makefile` as a **prerequisite** of `test` (runs after however the previous run died) plus a `trap … EXIT INT TERM`. Held by `invariants-gate.py` `check_envtest_control_planes_are_reaped` (five sub-properties) and `dev/test_reap_envtest.py` (18 behavioural tests on real processes), both on `dev/L0-CHAIN.txt`. The caller's own timeout is refused with an argument and recorded in `binding.md` §Build instead: 2m09s measured, ≥5 minutes required                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 2026-07-30 |
+| B-005 | Run the builds on a provisioned, warm builder instead of standing one up per build                 | **Step (1) only — the measurement — and it produced a finding larger than the item's own hypothesis.** `make -C k8s-operator test` costs 137.8s cold / 125.8s warm on an M3, and the warm/cold delta is ~nil, which is the whole story. The bill is **85% envtest control-plane bring-up**: 35 starts (not the Makefile comment's 14), 23 of them in `internal/controller` alone, ~5.0s each — codegen is 4–6%, compile ~6%, assertions ~4%. `-count=1` is **not** the cause: six real sites, worth under 3 seconds in total, and all six are correctly placed (four run `go test -tags l2` against a live GKE cluster, which is in no input hash Go computes, so caching them would assert about a different cluster on a different day). The cause is that `make manifests` runs `npx prettier --write config/crd/bases/*.yaml` on every invocation, Go keys read files by size+mtime, and the two packages that read that directory **from inside a test function** (`internal/controller`, `internal/router`) can therefore never hit the cache — together 100% of the warm-run wall time. A fully-cached `go test` over all 38 packages costs **3.58s**, so the prize is 126–138s → ~9–12s, local and free. All three costed remote-builder candidates remove **0%** of this bill (they address the image bill `make test` never touches), and the only amd64 datapoint available — CI median 315s vs 140s locally — says relocating envtest would roughly double it. **Spotlight sub-finding measured and dismissed**: 2.16 CPU-seconds across a 139.9s run, ~0.02% of available CPU; `.metadata_never_index` was not created. Steps (2)/(3) are implementation and are scheduled as their own unit, per the item's own terms | 2026-08-01 |
+| B-006 | 06 §4.4 row 3 promises an auto-pause the broker never performs                                     | **`phase-9.md` P9-T9c**, split at IMPLEMENT into two units, both landed 2026-07-31. **`-1`** — the row-3 refusal now carries its own `AutoPause` to the HTTP boundary, where `refuse()` records a pause request on the refusal's own `ActionRecord` through the same `escalate.Recorder.Pause` seam row 9 uses; 4/4 mutants caught. **`-2`** — `status.broker.journalReachable` is written by the **operator**, which reading 06 §2.2.1 and §2.2 together showed is the only principal that may (no grant anywhere reaches `agents/status`), from three conjoined observations against the etcd 05 §1.2 co-locates the journal with, on a 60 s clock because the field has no watch behind it; 8/8 mutants caught, and `journal_reachability.go` is classified RENDERING in V-RUN-012 so a probe can never read the brake and latch the pause it causes. The **check** question did NOT close here and travels to the next improvement pass: 09 has no ID covering row 3, and `dev/verify/broker-refuse-l2.sh` already induces the condition an assertion would ride                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | 2026-07-31 |
+| B-007 | A retired grant's residue on the scratch cluster still confers the journal verbs                   | **[[LSN-070]]**, opened by the survey, plus a live measurement that reframed the item. The residue confers **no verb the shipped per-tier Role does not** — measured on the scratch cluster against `team-x`'s residue-free actor as a live control — so this is an **unrevocability** defect, not an escalation, and a future narrowing of the actor grant would be a silent no-op for two of three tiers. The **live-install look** rode with it and is clean, because the objects were never installed there. What the survey found that the item did not ask for: `12c509d` retired the object from **one** renderer and **five other files still render it**, including the assets an agent proposes in `propose-cluster-admin` / `propose-developer-team`, so the GitOps path creates it fresh today. Also surfaced: `kubectl auth can-i <resource>.<group>` silently degrades to a **core-group** query when the type is not served (`auth can-i get zzznotathing.kubeagents.x-k8s.io` returns `yes` on both clusters) — checked, and `actor-grant-sweep-l2.sh` is already immune because it excludes unservable rows in both directions from `api-resources -o name`. The product fixes are implementation and are scheduled as their own unit                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | 2026-08-01 |
+| B-008 | A negative control cannot see the probe→suite line-tag contract                                    | `dev/tests/probe-tags-match-their-suite.py`, on `dev/L0-CHAIN.txt` at its one definition site. The contract is deliberately **asymmetric**: a tag a suite READS and its probe cannot emit is a failure, because the read is dead and the arm comparing it to an expectation quietly stops asserting; a tag a probe EMITS and nobody reads is advisory, because journalling a diagnostic is allowed. Both ends derived, never listed ([[LSN-036]]) — 5 participating suites, 10 pairs, 8 probes, three distinct accessor shapes with the tag in **different argument positions** per suite. It recovered the largest pair in the tree, `broker-auth-l2.sh` ↔ `broker_probe.py`, which the item's own survey had called orphaned: the binding is the **default** of `BROKER_DRIVER_PROBE` in `dev/lib/broker-driver.sh`, and the suite is the one that never calls `broker_driver_use_probe` to replace it. A suite with no accessor is announced as non-participating rather than passing silently; a participating pair whose probe emits nothing is a FAIL ([[LSN-035]]). 6 control rows with per-row needles                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 2026-08-01 |
+| B-011 | The LSN-060 gate arm detects a control mode by substring, so naming the flag in prose is a finding | `handles()` in `dev/tests/negative-controls-name-their-rule.py` — one recogniser, both languages, no roster of script names or flag spellings anywhere. Python through the AST, seeded at `sys.argv` and closed to a fixpoint through assignments, loop targets, parameter defaults and the call-site half of `main(sys.argv[1:])`; shell through a quote-aware lex that blanks comments and heredoc bodies and carries quote state across lines. A handler needs a satisfying pattern **and** a non-empty body, and the pattern must reject four decoys, so `*)` is a default arm rather than a mode. 13 new dispatch-shape control rows, 17 mutants, 17 caught; classification unchanged on the real tree in both directions. **The defect the item names lived one file over**, in `invariants-gate.py`'s LSN-060 arm, which now imports `handles()` by path rather than reimplementing it — proven both ways against a synthesised tree. **And the same bug turned up a second time, unprompted**: `dev/tests/cli-contract.py` gated its corpus on `"ArgumentParser" in text`, so the rewritten enforcer's synthetic argparse **fixtures** admitted it as a CLI, and since it has no `--help` the probe read zero flags out of its ordinary output and reported `dev/L0-CHAIN.txt:283` as a contract violation — a false finding against a working line, and a previously-green check going red. `builds_a_parser()` answers by AST, and that corpus gained a floor above zero while it was open                                                                                                                                                                                                                                | 2026-08-01 |
 
 ### B-001 · B-002 — Render the child tier bundle in broker code, not in a provisioning skill
 
@@ -690,3 +560,133 @@ pointed at it.
 none, adding one edits the conformance spec, and `harness-improve` §5 makes that a pass's work
 rather than a unit's — so P9-T9c will be implemented against a spec sentence (06 §4.4 row 3) with
 its verification bound at the pass. That is recorded here rather than discovered at P9-T9c's PLAN.
+
+### B-005 — Run the builds on a provisioned, warm builder instead of standing one up per build
+
+The item asks two things and gates the second on the first, and that gate is what decides the
+destination. Step **(1) measure** is diagnosis — split the wall clock into codegen / compile /
+envtest-startup / test-execution, and check whether `-count=1` is defeating the Go test cache for no
+reason. Diagnosis is precisely what an improvement pass does, so step (1) is scheduled there. Steps
+**(2) a warm `buildx` builder** and **(3) a dedicated build cluster** are implementation and cost
+money per hour, and `harness-improve` §5 forbids a pass from doing either. So the pass produces the
+numbers and a costed comparison of all three candidates (scratch-hosted, dedicated,
+Cloud-Build-as-is) and **stops**; whichever the numbers favour becomes its own unit with its own
+guard work. Pre-deciding that in the drain would be answering the question the item exists to ask.
+
+The item's closing constraints are carried forward verbatim rather than re-derived: `gke-scratch-*`
+stays the only legal mutating target; anything new pushes to the same Artifact Registry so
+`reload-images.sh` can still read the digest back and **deploy by digest**; and if the answer is a
+dedicated build cluster, it needs its own name and its own guard, because the `gke-scratch-*`
+anchored `case` is a **destructive-target allowlist** and a build cluster is not a destructive
+target. Inheriting that pattern would quietly mark the one machine that must not be wiped as safe to
+wipe.
+
+**The Spotlight sub-finding rides with this item, not with B-004.** 63 975 indexed entries under
+`~/Library/Caches/go-build` means every build feeds `mdworker_shared` thousands of files, and the
+cheap test is a `.metadata_never_index` marker in `GOCACHE` and possibly `k8s-operator/bin`. It is
+filed here because it is a **build-cost** finding: the indexer orphans nothing and reaps its workers
+correctly, which the item established and recorded so the unit would not re-investigate it. B-004 is
+about processes that outlive their parent; this is about work the machine is doing on purpose.
+
+**As filed, verbatim.**
+
+- **Kind:** task
+- **Where:** `k8s-operator/Makefile` (`test`, `build`, `setup-envtest`), `dev/cluster/reload-images.sh`,
+  `make cloud-build-push`, `dev/L2-CHAIN.txt` — and the two clusters that already exist
+- **Why it matters:** `make -C k8s-operator test` is slow enough to be felt in every unit, and the
+  harness runs it at CHECKPOINT for any unit touching `k8s-operator/**`, so the cost is paid per
+  unit for the whole remaining build. It is not one cost either: it is `controller-gen`, then
+  `go build`, then an envtest control plane (etcd + kube-apiserver) started per package, on an arm64
+  laptop, for a project whose every deploy target is amd64. This repo already refuses host-arch
+  **image** builds for exactly that mismatch and routes them to Cloud Build; nothing has asked the
+  same question about the **test** path.
+
+  Two things are being asked, and the first should gate the second. **(1) Measure.** Split the wall
+  clock into codegen / compile / envtest-startup / test-execution, because which one is the bill
+  changes the fix — and one candidate fix is free: the harness passes `-count=1` in places, which
+  defeats Go's test cache. **(2) Then try a provisioned builder rather than a per-build one.** A
+  persistent `docker buildx` builder as a pod in `gke-scratch-kube-agents-dev` is cheap to stand up
+  (`docker buildx create --driver kubernetes`), is natively amd64 so it satisfies the host-arch
+  refusal, and keeps a warm layer cache across builds — which `cloud-build-push` cannot, since every
+  invocation starts from a cold worker. The same "already provisioned, kept warm" argument applies
+  to the envtest control plane and the Go build cache, and those may be the larger win if the
+  measurement says compile and envtest startup dominate.
+
+  Constraints to respect rather than rediscover: `gke-scratch-*` is the only legal target for
+  anything mutating (`platform-agent-host` is verification-only, and any new script needs the
+  anchored destructive-guard `case`); the builder must still push to the same Artifact Registry so
+  `reload-images.sh` can read the digest back and **deploy by digest**; and `pause.sh`/`resume.sh`
+  scale the scratch node pools to zero between campaigns, so a persistent builder either tolerates
+  being scaled away or changes what "paused" costs — worth pricing that idle cost as part of the
+  answer.
+
+  **(3) And a third option the first two should not foreclose: a separate, dedicated build cluster.**
+  `gke-scratch-kube-agents-dev` is available, but availability is not the same as suitability, and
+  there are three reasons it may be the wrong host for a thing whose whole value is being warm and
+  always there. It is the **destructive-test target** — the one cluster the harness is allowed to
+  break — so a builder living in it is inside the blast radius of the tests it exists to serve, and
+  a teardown script doing its job correctly can take the build path down with it. It is **paused to
+  zero between campaigns**, which is precisely when a warm cache would otherwise be earning its
+  keep, so the builder is cold exactly as often as the scratch cluster is idle. And its lifecycle is
+  owned by `dev/cluster/up.sh` — a cluster that can be recreated from scratch by design is a poor
+  place to keep the one thing that must not be.
+
+  So the measurement in (1) should also answer whether the builder wants its own home: a small,
+  long-lived, amd64, node-pool-pinned cluster (or a plain node pool with its own lifecycle, if a
+  whole cluster is not worth its floor cost) whose only job is `buildx` + the Go build cache +
+  possibly a warm envtest control plane, never a test target, never torn down by a campaign. If that
+  is the answer, it needs its own name and its own guard: the `gke-scratch-*` anchored `case` is a
+  **destructive-target allowlist**, and a build cluster is not a destructive target — it must not
+  quietly inherit the pattern that says it is safe to wipe, and `platform-agent-host` must stay
+  equally out of reach. Price all three (scratch-hosted, dedicated, Cloud-Build-as-is) against the
+  measured bill before choosing; the point of this item is the numbers, not the destination.
+
+- **Priority:** normal
+- **Added:** 2026-07-30
+
+### B-007 — A retired grant's residue on the scratch cluster still confers the journal verbs
+
+**Severity: not a live security regression, and the argument is the one that matters.** The
+residue grants the actor **exactly the verbs the shipped per-tier Role already grants it** —
+`actionrecords get/list/watch/create` and `actionrecords/status get/update/patch`. No authority is
+conferred that a correct install does not confer, so nothing is over-permissioned today. What is
+broken is **revocability**: an object no template renders cannot be narrowed by re-provisioning,
+so the first future attempt to tighten the actor grant will be a silent no-op wherever this
+residue lives. It becomes a regression the day someone tries; it is not one now. Recorded this
+precisely because "an unowned RBAC object grants the journal verbs" reads like a `now` at a
+glance, and the drain protocol says the harness must say which it is.
+
+### B-008 — A negative control cannot see the probe→suite line-tag contract
+
+**Severity: a check gap and nothing else.** The suite it concerns **deferred** rather than passing,
+which is the correct verdict for a property that could not be evaluated.
+
+### B-011 — The LSN-060 gate arm detects a control mode by substring
+
+**Severity: not a live security regression.** It describes a gate arm that is too eager — it
+fails builds it should pass, never the reverse — so its failure mode is friction, not
+permissiveness.
+
+**Why B-011 waits for the pass rather than landing now.** It is a change to a check at its one
+definition site, motivated by a failure the unit in front of it hit — Guardrail 9's exact case. The
+unit worked around it in a way that is better on its own terms (matching the invocation's shape, not
+the flag's spelling), so nothing is blocked by the delay.
+
+**As filed, verbatim.**
+
+- **Kind:** finding
+- **Where:** `dev/tests/invariants-gate.py:2955` (`check_negative_controls_exercise_the_statement_under_test`)
+- **Why it matters:** the arm's test for "this suite has a control mode" is
+  `if "--negative-control" not in text: continue` — a substring search over the whole file. Any
+  script that merely _mentions_ the flag is then required to carry a
+  `NEGATIVE CONTROL DOES NOT EXERCISE:` block describing a mode it does not have. It fired on
+  `dev/verify/verify-phase9.sh` during `P9-T9b-5b-ii-b-2`, whose new §G arm has to reason about
+  whether a claimant's control runs at L0. Worked around in that unit by matching the invocation's
+  _shape_ instead (`<suite>.sh <flag>` on a live `L0-CHAIN.txt` line), which is defensible on its own
+  terms — the flag is a convention, the property is "reached from the no-cluster chain" — but the
+  gate arm should recognise a mode by its **handler** (a `case`/`if` on `$1`, or the flag appearing
+  in an argument parse) rather than by the string appearing anywhere, including in a comment. As it
+  stands the arm taxes writing about controls, and the cheapest way to satisfy it is to stop naming
+  them. Guardrail 9 kept the fix out of that unit.
+- **Priority:** normal
+- **Added:** 2026-07-31

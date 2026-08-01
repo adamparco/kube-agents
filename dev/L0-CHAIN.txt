@@ -473,6 +473,41 @@ bash dev/lib/shipped-render.sh --negative-control
 # wrong moment.
 python3 dev/tests/phase-ratchet-is-asserted.py --phase 9 --negative-control
 
+# --- An object retired from one renderer is retired from all of them ([[LSN-070]]) ----------------
+# `12c509d` retired the namespaced half of the 06 §2.2.1 broker-operations grant from the two INSTALL
+# templates, wrote the retirement into both headers, and stayed green. A read-only survey on
+# 2026-08-01 found both objects standing on gke-scratch, because the retirement had happened on the
+# install path and nowhere else: `propose-cluster-admin` and `propose-developer-team` still CREATE
+# them, fresh, every time an agent provisions a tier. "No template renders that object" was true of
+# `k8s-operator/scripts/` and false of the repository. The general shape is an object retired from
+# one of several renderers, where the other renderer is the one nobody was editing and frequently
+# the one a cluster is actually built from.
+#
+# The property is derived, never curated ([[LSN-036]]): for every RBAC object NAME the install path
+# renders, the set of KINDS it renders under that name must be a superset of the kinds rendered
+# under that name anywhere else. No object name and no file path is hardcoded, and the control's
+# second row is the same defect after a rename. All normalisation is on the pattern side -- an
+# install name globs its `${...}` / `@@...@@` spans so two spellings of one object compare -- and a
+# pattern an arbitrary decoy satisfies is DROPPED, loudly, without which `${AGENT_ACTOR_KSA}` owns
+# every name in the tree and today's thirteen findings become zero. Scoping to install-owned names
+# is what keeps the sixteen `vaptest-*` VAP fixtures out. Every floor is a FAIL, not a skip
+# ([[LSN-035]]), and a document the reader cannot parse is a finding rather than an exclusion.
+#
+# The LIVE arm is not on this chain, and that is a debt with a due date, not a design. It is RED on
+# today's tree with 13 real findings across 10 files, and this chain is a required PR check, so
+# landing it now would redden every unrelated commit and destroy the per-commit attribution
+# CHECKPOINT exists to produce ([[LSN-055]]). The precedent above -- `phase-ratchet-is-asserted.py`,
+# control-only for the same reason -- does NOT transfer cleanly and should not be read as making
+# this routine: that arm is red BY CONSTRUCTION and cannot go green until a phase closes, whereas
+# this one is red because of a bounded bug in ten files. A control-only entry whose reason has
+# evaporated is exactly the drift that comment warns about, and an unpaired `¬` is [[LSN-035]] at
+# chain level. The live line is the acceptance test of the fix unit scheduled in `BACKLOG.md` B-007,
+# and it lands in that unit's own PR; deleting the 13 documents was simulated in memory and takes
+# the check to 0 findings with no `VACUOUS:` and no edit to the check. [[LSN-070]] stays OPEN until
+# the line below is joined by its live twin. Until then the live arm is runnable by hand and needs
+# no wiring to be useful to whoever takes the fix.
+python3 dev/tests/retired-objects-are-not-rendered.py --negative-control
+
 # --- V-MET-001: the catalog and the code agree about what is implemented --------------------------
 # 09 §8's row is two directions between two sets -- every check ID in §6 exists in the implemented
 # suite, and every implemented test declares a known check ID -- and until
