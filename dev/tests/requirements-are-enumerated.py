@@ -404,13 +404,11 @@ def dump_requirements(entries: dict[str, dict]) -> str:
 # section states the numbers precisely so that they are falsifiable, and a check that never reads
 # 5m/10m/90s/30s/15s/20m/2m cannot fail when a constant drifts from the table.
 #
-# Published gaps -- eight requirements deliberately left unmapped, because no catalog row
-# asserts them. Four in 06:
+# Published gaps -- six requirements deliberately left unmapped, because no catalog row
+# asserts them. Three in 06:
 #   R-06.2.3-6   "developer-team actor: none in v1". Nothing asserts the ABSENCE of a
 #                developer-team actor GSA; every containment check asserts what a principal
 #                cannot do, not that a principal does not exist.
-#   R-06.4.2-17  a `fieldPaths` entry beginning with `/` is rejected at ChangePolicy admission.
-#                No check asserts ChangePolicy dialect admission at all.
 #   R-06.4.2-44  the live-Secret digest comparison method,
 #                `sha256(secretNamespace || 0x1f || value)`.
 #   R-06.4.2-45  digests are never journaled or logged; `reasons[]` names the source Secret and
@@ -422,7 +420,7 @@ def dump_requirements(entries: dict[str, dict]) -> str:
 # `classify.AllFloorRuleIDs`, and the corpus carries nine cases for it -- so V-MET-005 and
 # V-GAT-001 reach it by exactly the argument that maps every one of its siblings, and singling it
 # out was a curation error, not a stricter reading. Closing 44/45 is still a catalog change.
-# And four elsewhere:
+# And three elsewhere:
 #   R-03.4.3-8   no write to an `Agent` CR whose identity is an ANCESTOR of the writer's.
 #                V-CTN-007 covers the writer's OWN CR and V-CTN-025 the brake field on a child's;
 #                nothing walks `parentRef` upward on a write.
@@ -431,10 +429,23 @@ def dump_requirements(entries: dict[str, dict]) -> str:
 #                section 4.2 -- the live-object form is a deferred capability with no check.
 #   R-05.1.2-2   snapshots are stripped of `managedFields` and of `Secret` `data`, with a
 #                per-key digest instead of material. Same hole as R-06.4.2-44/45, one layer down.
-#   R-07.5-4     "authority never precedes machinery" -- a PRE-MERGE check must fail any change
-#                granting an agent identity a write verb before the broker, classifier, journal
-#                and undo path exist. V-CTN-004 asserts the reader holds no write verb; no check
-#                asserts the ORDERING gate itself.
+#
+# Two of the eight closed on 2026-07-31, and both closed as CATALOG rows over machinery that had
+# been in the tree for units -- unmapped only because no check ID claimed it. That is the shape of
+# most of what is left, and it is worth naming: an obligation with no `checks:` entry is not
+# evidence that the property is unbuilt, and reading it that way is how a build re-implements what
+# it already has.
+#   R-07.5-4  -> V-CTN-038. "Authority never precedes machinery" is invariant 7 of
+#               `dev/tests/invariants-gate.py`, on `dev/L0-CHAIN.txt` since P8. What it lacked was
+#               a control: no agent identity has ever held a write verb, so the enforcing branch
+#               had never once executed and every green came from the input being absent. The row
+#               and the control landed together, because a catalog ID over an unexercised branch is
+#               V-MET-014's failure wearing someone else's name.
+#   R-06.4.2-17 -> V-CTR-021. Asserted at three layers already (`ValidateDottedPath`,
+#               `ValidateChangeRule`, and the webhook's per-index loop) plus the matcher's own
+#               refusal, and the seven-mutant sweep is what shows no single layer is load-bearing
+#               alone. The gap entry above read "no check asserts ChangePolicy dialect admission at
+#               all", which was true of the CATALOG and false of the tree.
 #
 # {len(entries)} requirements.
 

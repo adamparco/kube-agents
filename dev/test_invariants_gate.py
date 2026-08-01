@@ -145,6 +145,197 @@ class MachineryProbeNegativeControls(unittest.TestCase):
             self.assertTrue(found, why)
 
 
+_AGENT_ROLE_WRITE = """apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeagents-actor-platform
+  labels:
+    kube-agents/tier: platform
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch"]
+"""
+_AGENT_ROLE_READ = """apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeagents-reader-platform
+  labels:
+    kube-agents/tier: platform
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+"""
+_AGENT_ROLE_WILDCARD = """apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeagents-actor-platform
+  labels:
+    kube-agents/tier: platform
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["*"]
+"""
+
+
+class WriteVerbsNeverPrecedeMachinery(unittest.TestCase):
+    """V-CTN-038's `¬`. Invariant 7 (07 §5), four properties, each control naming its own finding.
+
+    Until this class, invariant 7 was the only arm of the gate whose *decision* had no control. Its
+    probe did — `MachineryProbeNegativeControls` above breaks `check_machinery_probes_resolve`,
+    which is the [[LSN-038]] repair — but that check answers "can I find the machinery", not "what
+    do I do when a write verb turns up". Those are different questions and the second one had never
+    been asked of a mutated input.
+
+    Not, as it first appeared, because the tree holds no agent-identity write verb — it holds eleven
+    documents that do, the three `actor-grant-*.yaml.template`s among them. The gate is green for the
+    other conjunct: `missing_machinery()` has returned `[]` since P8 closed the undo path, so
+    `if not absent: continue` is reached on every run and the `failures.append` below it on none. The
+    conclusion is the same and the reason matters, because a control written against the wrong reason
+    would have asserted a prohibition this check deliberately does not make. A gate whose enforcing
+    branch is unexecuted is a gate whose greens are produced by one conjunct alone, and it is the day
+    a piece of machinery is removed or renamed — not the day a write verb lands — that finds out.
+
+    Both of the check's inputs are module-level calls — `agent_rbac_documents()` and
+    `missing_machinery()` — so replacing those two names substitutes the whole world it can see,
+    exactly as `TestOnlyGrantsAreConfined` does with `read_repo_files`. Nothing is written to the
+    tree, so a control that fails partway cannot leave an agent-identity over-grant behind it; and
+    the two axes can be varied independently, which is the only way to show that the check is a
+    conjunction rather than "any write verb fails".
+
+    The four properties:
+
+      P1  a non-read verb on an agent identity, with machinery absent, is a finding naming the
+          file, the verb and what is missing;
+      P2  the same verb with the machinery present is NOT a finding — invariant 7 is about ordering,
+          and a check that refused write verbs outright would be a different, stricter rule that
+          Phase 10 could not satisfy;
+      P3  a read-only grant is never a finding, however absent the machinery;
+      P4  an empty corpus is `VACUOUS:`, not green — [[LSN-035]], and the failure mode the whole
+          class exists for.
+    """
+
+    def setUp(self):
+        self._docs = gate.agent_rbac_documents
+        self._absent = gate.missing_machinery
+
+    def tearDown(self):
+        gate.agent_rbac_documents = self._docs
+        gate.missing_machinery = self._absent
+
+    def _run(self, docs, absent):
+        gate.agent_rbac_documents = lambda: [
+            (gate.REPO / rel, 0, text) for rel, text in docs
+        ]
+        gate.missing_machinery = lambda: list(absent)
+        return gate.check_write_verbs_have_machinery()
+
+    # -- the positive arm, against the tree as it stands ------------------------------------
+
+    def test_the_real_tree_satisfies_invariant_7(self):
+        # Named for the property and not `test_the_real_tree_is_green`, which is what it wanted to
+        # be called: `TestOnlyGrantsAreConfined` already has a test by that name, the assertion
+        # ratchet's unit is `file::name` over a SET, and two classes in one file sharing a name
+        # collapse to one entry -- so either could be deleted with the ratchet green.
+        self.assertEqual([], gate.check_write_verbs_have_machinery())
+
+    def test_the_real_tree_is_green_for_the_reason_it_claims(self):
+        # Three very different trees print the same tick: one with no agent RBAC at all, one whose
+        # grants are read-only, and one whose write grants are legal because the machinery is
+        # complete. Only the third is what this tree actually is, so the green is decomposed rather
+        # than trusted. If the `missing_machinery()` assertion fails, invariant 7 has a real finding
+        # to make and the gate is red. If the last one fails, the tree has become the read-only one
+        # and the docstring above is describing something else.
+        docs = gate.agent_rbac_documents()
+        self.assertTrue(docs, "no agent-identity RBAC in the tree; the check is over nothing")
+        self.assertEqual([], gate.missing_machinery())
+        writes = [
+            (path.relative_to(gate.REPO).as_posix(), verb)
+            for path, _n, doc in docs
+            for _line, verb in gate._verbs_in(doc)
+            if verb not in gate.READ_VERBS
+        ]
+        self.assertTrue(
+            writes,
+            "no agent identity holds a non-read verb, so this tree is green by the read-only "
+            "conjunct and the docstring above is describing a different tree",
+        )
+
+    # -- P1: authority after machinery is the whole invariant ---------------------------------
+
+    def test_p1_a_write_verb_with_machinery_absent_is_a_finding(self):
+        problems = self._run(
+            [("k8s-operator/config/rbac/actor_platform.yaml", _AGENT_ROLE_WRITE)],
+            ["undo path"],
+        )
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("'patch'", problems[0])
+        self.assertIn("undo path", problems[0])
+        self.assertIn("authority never precedes machinery", problems[0])
+        self.assertIn("actor_platform.yaml", problems[0])
+
+    def test_p1_a_wildcard_verb_is_a_write_verb(self):
+        # `*` is not in READ_VERBS, so it must land in the enforcing branch. Spelled out because
+        # `*` is the grant a template renders when someone writes `verbs: ["*"]` meaning "the ones
+        # I already have", and a set-membership test that happened to be inverted would let the
+        # single most dangerous verb through while catching `patch`.
+        problems = self._run(
+            [("dev/rbac.yaml", _AGENT_ROLE_WILDCARD)],
+            ["Action Broker", "undo path"],
+        )
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("'*'", problems[0])
+        self.assertIn("Action Broker, undo path", problems[0])
+
+    def test_p1_every_absent_item_is_named_not_just_the_first(self):
+        # The finding is what a human acts on. "the machinery does not exist: undo path" sends them
+        # to build one thing; three are missing.
+        problems = self._run(
+            [("k8s-operator/config/rbac/actor_platform.yaml", _AGENT_ROLE_WRITE)],
+            ["Action Broker", "risk classifier", "undo path"],
+        )
+        self.assertEqual(1, len(problems), problems)
+        for name in ("Action Broker", "risk classifier", "undo path"):
+            self.assertIn(name, problems[0])
+
+    # -- P2: ordering, not prohibition --------------------------------------------------------
+
+    def test_p2_the_same_write_verb_with_machinery_present_is_allowed(self):
+        # The discrimination the class turns on. Without this arm P1's red is equally consistent
+        # with a check that fails on every write verb forever, which is not invariant 7 and would
+        # have to be deleted in Phase 10 rather than satisfied.
+        self.assertEqual(
+            [], self._run([("k8s-operator/config/rbac/actor_platform.yaml", _AGENT_ROLE_WRITE)], [])
+        )
+
+    # -- P3: read verbs are not authority -----------------------------------------------------
+
+    def test_p3_a_read_only_grant_is_never_a_finding(self):
+        self.assertEqual(
+            [], self._run([("k8s-operator/config/rbac/reader_platform.yaml", _AGENT_ROLE_READ)],
+                          ["Action Broker", "risk classifier", "ActionRecord journal", "undo path"])
+        )
+
+    # -- P4: an empty corpus is VACUOUS, not green --------------------------------------------
+
+    def test_p4_no_agent_rbac_at_all_is_vacuous(self):
+        problems = self._run([], ["undo path"])
+        self.assertEqual(1, len(problems), problems)
+        self.assertTrue(problems[0].startswith("VACUOUS:"), problems[0])
+        self.assertIn(gate.TIER_LABEL, problems[0])
+
+    def test_p4_vacuity_is_reported_even_when_the_machinery_is_all_present(self):
+        # The dangerous spelling is `if not docs and absent`. With the machinery in place the check
+        # would then return `[]` for a tree that has lost its tier labels entirely — a green that
+        # means the discriminator broke, arriving in exactly the state (all machinery built) that
+        # the repo is in from Phase 9 on.
+        problems = self._run([], [])
+        self.assertEqual(1, len(problems), problems)
+        self.assertTrue(problems[0].startswith("VACUOUS:"), problems[0])
+
+
 class InvokedByGoTests(unittest.TestCase):
     """`_invoked_by` had a Python-shaped hole: `make test` names no file, so no Go test counted.
 

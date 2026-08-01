@@ -180,6 +180,10 @@
   runs: "bash dev/verify/actor-overlay-admission-l2.sh gke-scratch-kube-agents-dev"
   asserts_in: "dev/verify/actor-overlay-admission-l2.sh"
 
+"V-CTN-038":
+  runs: "python3 dev/tests/invariants-gate.py"
+  asserts_in: "dev/tests/invariants-gate.py"
+
 "V-CTR-001":
   unimplemented: "No test asserts this property. The green rows' evidence_ref is `go test ./...` over every package -- which attests that the suite passes, not that every shipped `Agent` CR validates and that apply->get->re-apply is a no-op diff. There is no `k8s-operator/config/samples/`, and no test reads the shipped CRs and round-trips them. Found by P9-T11g-2a; the row needs correcting or the check needs building, and which one is a separate unit."
 
@@ -222,6 +226,15 @@
 "V-CTR-020":
   runs: "python3 -m unittest discover dev"
   asserts_in: "dev/test_apply_change_skill.py"
+
+# Three layers refuse a JSON Pointer where a dotted path belongs, and the named file is only the
+# first: `classify.ValidateChangeRule` is the second and `PointerPrefixMatch` the third. The row
+# names admission because that is the layer 06 §4.2 specifies a message for; the comment above
+# TestValidateChangePolicyRejectsAJSONPointerFieldPath names the other two, and
+# verification/mutants/V-CTR-021.json is what shows none of them is load-bearing alone.
+"V-CTR-021":
+  runs: "make -C k8s-operator test"
+  asserts_in: "k8s-operator/internal/webhook/changepolicy_webhook_test.go"
 
 "V-GAT-001":
   runs: "make -C k8s-operator test"

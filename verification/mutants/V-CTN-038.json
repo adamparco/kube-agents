@@ -1,0 +1,118 @@
+{
+  "_comment": "Mutation sweep for V-CTN-038 -- authority never precedes machinery (07 §5), invariant 7 of dev/tests/invariants-gate.py. Run: python3 dev/mutate.py verification/mutants/V-CTN-038.json. Every row names the test that must fail; see dev/mutate.py for why rc != 0 is not a catch. This arm is the one arm of the gate whose ENFORCING BRANCH the tree has never executed: no agent identity holds a write verb today, so `if not absent: continue` is reached on every run and the finding below it on none. Mutating the branch is the only way to establish that a green here is the property holding rather than the input being absent.",
+  "suite": {
+    "kind": "unittest",
+    "dir": ".",
+    "packages": ["discover", "-p", "test_invariants_gate.py", "dev"]
+  },
+  "mutants": [
+    {
+      "id": "M1-the-vacuity-arm-is-deleted",
+      "why": "THE defect the class exists for. With the arm gone a tree that lost its tier labels -- or a `kind: Role` regex that stopped matching -- returns [] and prints the same green tick as a tree whose grants are all read-only. [[LSN-035]]: in this repo VACUOUS is a failure, and the only way to keep it one is to run the empty corpus.",
+      "catcher": "test_p4_no_agent_rbac_at_all_is_vacuous",
+      "edits": [
+        {
+          "file": "dev/tests/invariants-gate.py",
+          "find": "    if not docs:\n        return [\n            \"VACUOUS: no agent-identity RBAC found at all. Either the tree lost its tier labels or \"\n            f\"the '{TIER_LABEL}' discriminator no longer matches the VAP. Check \"\n            \"examples/gitops-repo/clusters/cluster-a/bootstrap/20-policy/vap-agent-readonly.yaml.\"\n        ]\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M2-vacuity-is-only-reported-when-machinery-is-missing",
+      "why": "The dangerous spelling, and it is dangerous precisely NOW: from Phase 9 on all four machinery items exist, so `not docs and missing_machinery()` is false for an empty corpus and the gate reports green on a tree that can no longer see any agent RBAC. Deliberately invisible to M1's catcher, which supplies absent machinery.",
+      "catcher": "test_p4_vacuity_is_reported_even_when_the_machinery_is_all_present",
+      "edits": [
+        {
+          "file": "dev/tests/invariants-gate.py",
+          "find": "    if not docs:\n        return [\n",
+          "replace": "    if not docs and missing_machinery():\n        return [\n"
+        }
+      ]
+    },
+    {
+      "id": "M3-the-enforcing-branch-is-never-reached",
+      "why": "`if True: continue` is what the code already does on every real run, made unconditional. A write verb on an agent identity with no undo path -- the exact situation 07 §5 forbids -- then produces no output at all.",
+      "catcher": "test_p1_a_write_verb_with_machinery_absent_is_a_finding",
+      "edits": [
+        {
+          "file": "dev/tests/invariants-gate.py",
+          "find": "            if not absent:\n",
+          "replace": "            if True:\n"
+        }
+      ]
+    },
+    {
+      "id": "M4-ordering-becomes-prohibition",
+      "why": "The other end of the same line. Invariant 7 is about ORDER: a write verb is legal once the machinery is there, and Phase 10 grants one. A gate that fails on every write verb regardless would have to be deleted rather than satisfied, and it would read as green-and-strict until the day it blocked correct work.",
+      "catcher": "test_p2_the_same_write_verb_with_machinery_present_is_allowed",
+      "edits": [
+        {
+          "file": "dev/tests/invariants-gate.py",
+          "find": "            if not absent:\n",
+          "replace": "            if False:\n"
+        }
+      ]
+    },
+    {
+      "id": "M5-read-verbs-become-findings",
+      "why": "Over-reporting is the loud direction, but it is also the direction that gets a gate switched off: every reader ServiceAccount in the tree would fail invariant 7 while the machinery is being built.",
+      "catcher": "test_p3_a_read_only_grant_is_never_a_finding",
+      "edits": [
+        {
+          "file": "dev/tests/invariants-gate.py",
+          "find": "            if verb in READ_VERBS:\n                continue\n",
+          "replace": "            if False:\n                continue\n"
+        }
+      ]
+    },
+    {
+      "id": "M6-the-wildcard-verb-is-classed-as-a-read",
+      "why": "`*` is the single most dangerous grant and the one a set-membership test is most likely to be wrong about. Adding it to READ_VERBS lets `verbs: [\"*\"]` through while `patch` is still caught, so every other control in the class stays green.",
+      "catcher": "test_p1_a_wildcard_verb_is_a_write_verb",
+      "edits": [
+        {
+          "file": "dev/tests/invariants-gate.py",
+          "find": "READ_VERBS = {\"get\", \"list\", \"watch\"}\n",
+          "replace": "READ_VERBS = {\"get\", \"list\", \"watch\", \"*\"}\n"
+        }
+      ]
+    },
+    {
+      "id": "M7-only-the-first-absent-item-is-named",
+      "why": "The finding is what a human acts on. Naming one of three missing items sends them to build one thing and re-run into the same red, which is how a correct gate acquires a reputation for moving the goalposts.",
+      "catcher": "test_p1_every_absent_item_is_named_not_just_the_first",
+      "edits": [
+        {
+          "file": "dev/tests/invariants-gate.py",
+          "find": "                f\"makes a write survivable does not exist: {', '.join(absent)}. \"\n",
+          "replace": "                f\"makes a write survivable does not exist: {absent[0]}. \"\n"
+        }
+      ]
+    },
+    {
+      "id": "M8-the-finding-stops-saying-where",
+      "why": "`agent_rbac_documents()` scans the whole tree including templates. A finding that names the verb but not the file leaves the reader grepping for which of them granted it, and the answer may be a `.yaml.template` that only exists after envsubst.",
+      "catcher": "test_p1_a_write_verb_with_machinery_absent_is_a_finding",
+      "edits": [
+        {
+          "file": "dev/tests/invariants-gate.py",
+          "find": "                f\"{rel} (doc {n}) grants agent identity the verb '{verb}', but the machinery that \"\n",
+          "replace": "                f\"an agent identity is granted the verb '{verb}', but the machinery that \"\n"
+        }
+      ]
+    },
+    {
+      "id": "M9-the-finding-stops-naming-the-rule",
+      "why": "[[LSN-035]] in its narrow form: a control that only asks whether the list is non-empty cannot tell which property fired. The 07 §5 citation is what makes this finding distinguishable from the other fifteen the gate can emit.",
+      "catcher": "test_p1_a_write_verb_with_machinery_absent_is_a_finding",
+      "edits": [
+        {
+          "file": "dev/tests/invariants-gate.py",
+          "find": "                f\"07 §5 — authority never precedes machinery.\"\n",
+          "replace": "                f\"See the invariant list.\"\n"
+        }
+      ]
+    }
+  ]
+}

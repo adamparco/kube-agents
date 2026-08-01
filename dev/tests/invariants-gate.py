@@ -294,12 +294,27 @@ def _current_phase() -> int | None:
 
 
 def check_write_verbs_have_machinery() -> list[str]:
-    """Invariant 7. An agent with write RBAC and no journal is worse than either system.
+    """Invariant 7 / V-CTN-038. An agent with write RBAC and no journal is worse than either system.
 
     Whole-tree, not diff-vs-base. A diff check answers "did THIS PR add one", which reads green for
     a write verb that reached main while the gate was not wired up -- and this gate was not wired up
     until today, so that is not hypothetical. The state check has no base-ref dependency and cannot
     be satisfied by merging in two steps.
+
+    **Ordering, not prohibition.** The `if not absent: continue` below is the whole distinction: the
+    same verb that fails today passes once the broker, classifier, journal and undo path all exist,
+    so Phase 10 satisfies this arm rather than deleting it.
+
+    Its negative control is `WriteVerbsNeverPrecedeMachinery` in `dev/test_invariants_gate.py`, and
+    it was written late, in P9-T11g-2b-ii-2c-ii-b-1, for a reason worth keeping. Eleven agent-RBAC
+    documents in this tree DO carry a non-read verb -- the three actor-grant templates, the two
+    broker-operations grants, a VAP positive fixture and `dev/verify/fixtures/`. The gate is green
+    anyway, and correctly so, because `missing_machinery()` has returned `[]` since P8 closed the
+    undo path. But that means the `failures.append` below has never once executed against the real
+    corpus: every green this arm has produced came from the machinery being complete, and nothing
+    established that the finding it would raise otherwise is well-formed, names the file, or names
+    more than the first absent item. The control asserts that branch directly; the sweep is
+    verification/mutants/V-CTN-038.json.
     """
     failures = []
     docs = agent_rbac_documents()
@@ -1515,10 +1530,13 @@ def _dagger_pass_failures(dagger: list[str]) -> list[str]:
     This arm exists because the tree had one. `results.csv` row 47 (2026-07-27, P8-T9) recorded
     `"V-CTR-002, V-CTN-021"` as **pass** at L2, on evidence -- `webhook-negatives-l2.sh` -- that
     proves V-CTR-002's property exactly and says nothing whatever about V-CTN-021's, which is
-    conformance of all 39 cells of the 02 §7 boundary matrix. There is no V-CTR-021 (not-a-check-id
-    -- 09 §6 has never defined it, which is the point of the sentence), so this is not
-    a one-letter slip from the neighbouring ID; the ID that got recorded exists, is BLOCKING-ALWAYS,
-    and was not run. It went unnoticed for two days and it was **masking a second defect**: the
+    conformance of all 39 cells of the 02 §7 boundary matrix. It is not a one-letter slip from the
+    neighbouring ID: nothing named V-CTR-021 existed on 2026-07-27, so nobody typed one letter
+    wrong; the ID that got recorded exists, is BLOCKING-ALWAYS, and was not run. (V-CTR-021 was
+    later defined -- P9-T11g-2b-ii-2c-ii-b-1, the path-dialect row -- which changes nothing about
+    the 07-27 row and is why this paragraph now dates the claim instead of asserting a permanent
+    absence. An argument resting on an ID being unused expires the moment the ID is issued.)
+    It went unnoticed for two days and it was **masking a second defect**: the
     BLOCKING-ALWAYS arm of `check_deferrals_name_blockers` short-circuits on "green somewhere", so
     the phase-expiry clause written in the same sitting as this one could never fire, and testing
     that clause is what surfaced the false green. A false pass does not sit still -- it silences
@@ -3599,7 +3617,10 @@ def check_phase_gate_publishes_the_coverage_remainder() -> list[str]:
 
 
 CHECKS = [
-    ("invariant 7 — authority never precedes machinery", check_write_verbs_have_machinery),
+    (
+        "invariant 7 / V-CTN-038 — authority never precedes machinery",
+        check_write_verbs_have_machinery,
+    ),
     ("LSN-038 — the machinery probes resolve against the tree", check_machinery_probes_resolve),
     ("invariant 8 / V-MET-003 — assertion ratchet", check_assertion_ratchet),
     (

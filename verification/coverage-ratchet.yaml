@@ -302,7 +302,7 @@ ownership_sections:
     section: "5"
     space: "requirements"
     enumerated: 5
-    checks: "V-CTN-037"
+    checks: "V-CTN-037 V-CTN-038"
   - suite: "V-ADV"
     document: "08"
     section: "2.3"
@@ -1212,7 +1212,5 @@ load_bearing_uncovered:
   - "R-03.4.3-9"
   - "R-05.1.2-2"
   - "R-06.2.3-6"
-  - "R-06.4.2-17"
   - "R-06.4.2-44"
   - "R-06.4.2-45"
-  - "R-07.5-4"

@@ -119,6 +119,12 @@ func TestValidateChangePolicyNamesTheFloorRuleItIsBelow(t *testing.T) {
 	}
 }
 
+// V-CTR-021 -- the two path dialects are never interchangeable, at all three places one could be
+// accepted for the other. This is the first: admission. The second is `classify.ValidateChangeRule`
+// (TestJSONPointerInFieldPathsIsRejected, classify/stricter_test.go), which catches objects that
+// never met the webhook; the third is the matcher itself (TestPointerPrefixMatchRejectsPointerAsRule,
+// classify/path_test.go), which matches nothing rather than helpfully normalising. The sweep in
+// verification/mutants/V-CTR-021.json is what shows no single layer is load-bearing alone.
 func TestValidateChangePolicyRejectsAJSONPointerFieldPath(t *testing.T) {
 	// The exact message is specified by 06 §4.2, and the reason it is specified is that this mistake
 	// is otherwise SILENT: `/spec/replicas` is a well-formed dotted path whose single segment is
