@@ -473,8 +473,8 @@ issue-repo argument and the App token needs scope on both.
 
 _Resolved: the GitOps repo, via the existing `resolve_repo()`._ No new argument, no second token
 scope, no second place to look. One divergence surfaced while implementing and is recorded here
-rather than fixed: `audit_pr.py:688` derives the repo from the working directory's `origin` remote,
-while `agents/platform/skills/github-issue-resolver/scripts/resolver.py:17` derives it from the
+rather than fixed: `audit_report.py`'s `resolve_repo()` derives the repo from the working directory's
+`origin` remote, while `github-issue-resolver/scripts/resolver.py`'s `get_target_repo()` derives it from the
 `Git Repo:` line of `/opt/data/SETTINGS.md`. The same repository in practice, two sources of truth
 for it. Noted, not unified — out of scope for this change.
 
@@ -499,7 +499,7 @@ documentation that caused it. Corrected as part of this change.
 open issues. It must be taught to skip `agent:audit` issues, or it will try to "resolve" every ledger
 the audits publish. This is a hard prerequisite, not a follow-up.
 
-_Resolved: yes, and it is a one-token fix._ `resolver.py:183` filtered only `status:in-progress`,
+_Resolved: yes, and it is a one-token fix._ The `resolver.py` poll query filtered only `status:in-progress`,
 `status:escalation-needed`, `agent:ignore`, and `status:resolved`. A ledger issue matched that poll
 query on sight: it would be claimed, investigated, and closed as `status:resolved`, so the resolver
 would silently eat every ledger the audits publish. `-label:agent:audit` is added to the poll query,
