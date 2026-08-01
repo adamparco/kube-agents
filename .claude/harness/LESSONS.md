@@ -98,8 +98,9 @@ will start selecting.
 | **LSN-067** | checks, verification, L2, broker, idempotency, false-red, self-concealing | `brake-l2.sh` submitted a **fixed** envelope eleven times and got one `actionId` — 1 `accepted`, 10 `deduplicated`. 06 §4.1's idempotency key is a sha256 over identity + operations + dryRun, so a probe with a constant target IS the same action every time, and every arm after the first was answered by the first submission's record: two arms red where the stale answer disagreed, nine vacuously green where it agreed | **open** | Fixed by parameterising the probe's target name (`PROBE_TARGET_NAME` → `BROKER_DRIVER_TARGET_NAME` → `brake-l2-shadow-target-$SUBMIT_N`), default preserved so single-submission callers are byte-identical; proposed for the next improvement pass: `broker_driver_run` itself asserts `distinct(actionId) == submissions` |
 | **LSN-068** | fixtures, verification, L2, networkpolicy, dns, install-path, prose-is-not-mechanization | The operator's `<agent>-to-broker` policy is **Egress-only**, so it makes the reader pod default-deny for every other egress including DNS; rule 1 of the tier allowlist owns DNS and `provision_13` applies it, which a scratch cluster never runs. `startup-ordering-l2.sh` read `context deadline exceeded` on the init container's first probe while the broker Deployment said 1/1/1 — and the opposite arm, which expects that timeout, was passing for free. `broker-driver.sh`'s header had stated the whole fact in an earlier phase | **open** | Fixture now seeds the tier allowlist through `common.sh:render_egress_policy` (rule 9 included — the broker carries `kube-agents/tier` too). Proposed: a shared `dev/lib/shipped-render.sh`; a declared precondition 'this namespace models an installed agent'; and a product-side check that every Agent's namespace admits DNS |
 | **LSN-069** | networkpolicy, install-path, provisioning, dataplane-v2, broker, silent-failure, product-defect | Rule 9 pinned the `kubernetes` **ClusterIP** and the **kubeconfig endpoint**; GKE Dataplane V2 DNATs before scoring egress, so the packet carries the **`endpoints/kubernetes`** address (10.150.0.9 scratch / 10.150.0.2 live) which `resolve_apiserver_cidrs` never read. The broker blocks in `startSources()` BEFORE its listener opens, so the symptom is an EMPTY log and `connection refused` on both probes | **open** | `resolve_apiserver_cidrs` now reads `endpointslices` (then `endpoints`) first and emits all three /32s, deduplicated. Proved by adding one /32 to the live namespace: broker `1/1` in one probe period. Separate finding: the LIVE `platform-egress` has no rule 9 at all and three agent gateways run under it |
+| **LSN-070** | rbac, retirement, install-path, gitops, agent-authored-assets, revocation | A retirement was applied to ONE renderer and read as a repo-wide fact. `12c509d` deleted the namespaced `Role kubeagents-broker-operations` and the `RoleBinding ${AGENT_READER_KSA}-broker-operations` from `k8s-operator/scripts/`, and the note that closed it said no template renders them. **Five other files still do** — the reference GitOps tree and, with production consequence, the assets an agent PROPOSES in `propose-cluster-admin` and `propose-developer-team`. A tier brought up through the GitOps path creates the retired object fresh, from a template, today. Two lifecycle gaps hold it there: `kubectl apply` never deletes what a template STOPPED rendering, and `delete_agent_identity` deletes the identically-named **ClusterRoleBinding** and not the namespaced RoleBinding | **open** | Measured on the scratch cluster 2026-08-01: the residue confers **no verb the shipped per-tier Role does not**, confirmed against `team-x`'s residue-free actor as a live control, so this is an **unrevocability** defect and not an escalation — and a future narrowing of the actor grant would be a silent no-op for two of three tiers. Mechanization in flight: `dev/tests/retired-objects-are-not-rendered.py`, deriving the property that the kinds rendered under a name by the install path must cover the kinds rendered under that name anywhere else |
 
-**Open: 8 of 69**.
+**Open: 9 of 70**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -4065,3 +4066,87 @@ server through the policy) is stronger and belongs with [[LSN-068]]'s item 3.
 reasoned carefully about exactly this failure and still enumerated wrong — a correct argument over
 an incomplete set) · [[LSN-006]] (an ADMIT arm reads identically against an absent policy; here a
 rendered rule read identically to a matching one).
+
+---
+
+## LSN-070 — The retirement was applied to one renderer, and the object it retired is still rendered by five others — including the assets an agent proposes
+
+**Tags:** rbac, retirement, install-path, gitops, agent-authored-assets, revocation, provisioning-lifecycle
+**Opened:** 2026-08-01 (improvement pass 07, from [[B-007]]) · **Status:** open
+
+A read-only survey of `gke-scratch-kube-agents-dev` went looking for one thing and found a different,
+larger one.
+
+**What the survey was sent for.** Three RBAC objects sit in `kubeagents-system` that no template in
+`k8s-operator/scripts/` renders: `Role/kubeagents-broker-operations` and the two RoleBindings
+`platform-agent-broker-operations` and `cluster-admin-agent-broker-operations`. Commit **`12c509d`**
+(P9-T9b-5b-0-ii-b, 2026-07-31) deleted them from `broker-operations-grant.yaml.template` and
+`agent-identity.yaml.template`. They were created by the last apply before that commit, on
+2026-07-30, and `kubectl apply` does not delete what a template stopped rendering.
+
+**The first thing worth recording is what the survey did NOT find.** Every ALLOW those three objects
+confer is reachable through the shipped per-tier Role's own RoleBinding independently — the residue's
+rule set is a proper subset. The control is live, not argued: `team-x`'s actor was provisioned
+2026-07-31, **after** the retirement, has no residue in its namespace, and produces a byte-identical
+ten-answer `auth can-i` profile from the shipped Role alone. **No verb is granted only by the
+residue.** So this is not an escalation. It is an unrevocability defect, and the consequence is a
+tightening that cannot bite: narrow `actor-grant-platform.yaml.template` to drop `create` on
+`actionrecords`, re-run `provision_08`, and the platform actor still holds it — through the residue.
+A full `teardown_08` does not help, because `delete_agent_identity`
+(`k8s-operator/scripts/common.sh`) deletes the **ClusterRoleBinding** `${reader_ksa}-broker-operations`
+and not the identically-named namespaced **RoleBinding**, and nothing at all deletes the Role. The
+narrowing would half-work — real for `developer-team`, a no-op for the other two — which is worse
+than failing outright, because a half-worked tightening reads as a tightening.
+
+**The finding the item did not anticipate, and the one with production consequence.** The retirement
+was applied to `k8s-operator/scripts/` **only**. The retired namespaced Role and RoleBinding are
+still rendered by five files:
+
+| file | path |
+| --- | --- |
+| reference GitOps overlay | `examples/gitops-repo/policy/rbac-overlay/broker-operations.yaml` |
+| reference GitOps identity | `examples/gitops-repo/clusters/cluster-a/agents/identity/broker-operations.yaml` |
+| reference GitOps tier | `examples/gitops-repo/clusters/cluster-a/namespaces/team-x/50-developer-team-identity.yaml` |
+| **an agent's proposal asset** | `agents/platform/skills/propose-cluster-admin/assets/identity/broker-operations.yaml.tmpl` |
+| **an agent's proposal asset** | `agents/cluster-admin/skills/propose-developer-team/assets/50-developer-team-identity.yaml.tmpl` |
+
+The last two are the ones that matter. "No template renders that object" is true of the install path
+and **false of the path an agent takes when it provisions a tier**. A cluster brought up through
+`propose-cluster-admin` / `propose-developer-team` creates the residue *fresh, from a template*.
+
+**Which makes the live install a window, not a clean bill.** `platform-agent-host` is a pre-broker
+generation — `api-resources --api-group=kubeagents.x-k8s.io` returns `Agent` and nothing else, there
+is no ActionRecord CRD, there are no actor identities, and the string `actionrecords` appears in none
+of its RBAC. It is clean **because the objects have never been installed there**. If its upgrade to
+the Phase 9 generation runs `k8s-operator/scripts/`, it is born clean; if it runs the agent-proposed
+assets above, it is born **with the residue**, permanently, on a cluster that is never torn down. On
+scratch an unrevocable grant is disposed of by `dev/cluster/down.sh`. In production it is unrevocable
+*and* undisposable, and removing it by hand on the live cluster is exactly the operation the guard
+rails exist to make rare.
+
+**A methodological trap, found by measurement, that any check in this area must know.**
+`kubectl auth can-i <verb> <resource>.<group>` **silently degrades to a core-group (`""`) query when
+the resource type is not served**, and an identity holding a wildcard core-group read then answers
+`yes`. Control: `auth can-i get zzznotathing.kubeagents.x-k8s.io --as=…cluster-admin-agent` returns
+**`yes`** on both clusters. Any actor-grant sweep pointed at a cluster without the ActionRecord CRD
+reports false positives. `actor-grant-sweep-l2.sh` is already immune — it reads
+`api-resources -o name` into `served.txt` and drops unservable rows **in both directions**, on the
+[[LSN-035]] argument that a `no` for a reason that is not about authority satisfies a negative row
+vacuously — which is the same guard arriving from the other side, and is the reason this trap is
+recorded here rather than opened as a defect.
+
+**Why no check caught it, and what will.** Every existing check reads *one* renderer. V-CMP's
+reference-render suite scores the install path; the GitOps tree is scored for what it *contains*, not
+for what the install path has *stopped* containing. Nothing in the repo holds the two renderers
+against each other, which is the whole class: **a retirement is a property of the repository, and it
+was asserted about a directory.** The mechanization derives rather than curates ([[LSN-036]]) — for
+every object name the install path renders, the kinds it renders under that name must cover the kinds
+rendered under that name anywhere else in the tree. `kubeagents-broker-operations` is `{ClusterRole}`
+on the install path and `{ClusterRole, Role}` elsewhere; the `-broker-operations` binding is
+`{ClusterRoleBinding}` against `{ClusterRoleBinding, RoleBinding}`. Both fall out with no list of
+names in the check.
+
+**Related:** [[LSN-036]] (no curated roster — the reason the check derives the pair sets) ·
+[[LSN-062]] (a harness record asserting a repo-wide absence that was only true of one directory —
+the same error about scope, one layer up) · [[LSN-019]] (prose on the artifact is not a
+mechanization: the retirement's own note said no template renders them).

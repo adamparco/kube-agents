@@ -414,6 +414,31 @@ bash dev/verify/workload-pair-l2.sh --negative-control
 # a broker that degraded in place returns.
 bash dev/verify/brake-l2.sh --negative-control
 
+# --- The shared libraries the L2 suites source, scored where no cluster is ------------------------
+# These two are not suites and own no check ID; they are the layer underneath the suites above, and
+# they are on this chain for the same reason those are. A library that every L2 suite sources is a
+# library whose defects arrive at every L2 suite at once, and its only live exercise is a cluster
+# run — which happens at most once a day and cannot be asked for on a PR.
+#
+# l2-lock is the [[LSN-066]] mechanization: a per-machine advisory lock keyed by kubectl context, so
+# two L2 suites can never score the same cluster at once. The lesson is what happens when they do —
+# V-CTN-001, BLOCKING-ALWAYS, went red with `readers=4` and 102 failures against a ServiceAccount
+# another correct suite had just created, and BOTH of the obvious repairs (widen the expectation,
+# ignore unknown readers) weaken the check that caught it. 8 rows, and the two that carry the design
+# are the last pair: two different contexts must NOT block each other, and the same context must
+# still block immediately afterwards — the second is the only row that proves the first discriminated
+# the KEY rather than a lock that had quietly stopped working.
+bash dev/lib/l2-lock.sh --negative-control
+# shipped-render is [[LSN-068]] item 1 and [[LSN-069]]'s assertion in one file: a fixture that needs
+# the tier egress allowlist renders it through the SHIPPED `render_egress_policy` and never a copy
+# ([[LSN-024]]), and the manifest is scored against `endpoints/kubernetes` before it is emitted, so
+# no fixture can forget to ask. The predicate is AT LEAST ONE rendered rule-9 address is an endpoint
+# address, not every one: `resolve_apiserver_cidrs` emits three /32s on purpose because it cannot
+# know where a given dataplane scores egress relative to DNAT, so an every-address predicate fails on
+# a CORRECT render. What failed on 2026-08-01 is that NONE of them was, and the control's
+# `the-predicate-is-at-least-one-not-every-address` row is the only one a subset predicate fails.
+bash dev/lib/shipped-render.sh --negative-control
+
 # --- The phase ratchet, derived rather than remembered (planning defect 4) ------------------------
 # The CHECK ITSELF is not on this chain, and that is deliberate. `phase-ratchet-is-asserted.py
 # --phase 9` is RED today by construction: 38 of Phase 9's 75 required check IDs have no green row

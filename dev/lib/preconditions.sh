@@ -736,3 +736,103 @@ EOT
   export "$_key=1"
   return 0
 }
+
+# --- P11 -------------------------------------------------------------------------------------------
+#
+# The namespace models an INSTALLED agent, not merely an empty namespace with an Agent CR in it.
+#
+# Written on 2026-08-01, after `startup-ordering-l2.sh` (V-RUN-005) spent a session reporting a
+# product defect that did not exist ([[LSN-068]]). The operator's `<agent>-to-broker` policy
+# (`buildAgentToBrokerPolicy` in `pair_netpol.go`) is **Egress-only** and renders exactly one rule —
+# TCP 8443 to the actor pod. In Kubernetes a pod selected by ANY egress policy becomes default-deny
+# for EVERY other egress, DNS included. The operator is right to render only the hop it owns; rule 1
+# of the per-tier allowlist is what carries DNS, and that allowlist is applied by
+# `provision_13_apply_network_policies.sh`, which `dev/cluster/up.sh` does not run. So the moment the
+# controller reconciles an Agent into a namespace no install path ever touched, the pair loses name
+# resolution — with no error anywhere, because a name that does not resolve is a timeout.
+#
+# THE FALSE RED WAS THE CHEAP HALF. The expensive half is that the OTHER arm passed. Arm (a) expects
+# `wait-for-broker` to time out and the pair to converge to observe-and-report; on a namespace with
+# no DNS it gets that timeout for free, and would go on passing if `wait-for-broker` were deleted
+# outright ([[LSN-035]]: a vacuous pass is a failure here). One missing rule produced one red arm and
+# one arm passing for a reason unrelated to its property.
+#
+# AND IT WAS ALREADY WRITTEN DOWN. `dev/lib/broker-driver.sh`'s header, committed phases earlier,
+# states the whole mechanism in a paragraph. A suite written after that paragraph paid the full cost
+# anyway, because a paragraph in one file is not reachable from another ([[LSN-019]]). This function
+# is that paragraph made callable.
+#
+# rc 0 = a policy in this namespace admits DNS to the tier's pods
+# rc 2 = it does not (COULD-NOT-RUN, never rc 1) — an unseeded namespace is not a failed security
+#        property, and a caller that maps this to FAIL re-creates the exact confusion above: it would
+#        report "the broker never became reachable" about a cluster that was never asked.
+#
+# Seeding is deliberately NOT done here. `dev/lib/shipped-render.sh` renders the tier allowlist
+# through the SHIPPED `render_egress_policy` ([[LSN-024]]); a precondition that quietly repaired the
+# environment would make the difference between "installed" and "not installed" invisible to the
+# transcript, which is the difference this whole lesson is about.
+p11_assert_namespace_admits_dns() {
+  local K="$1" ns="${2:-}" tier="${3:-}"
+  local line name sel rules types examined=0 admitting=""
+
+  if [ -z "$ns" ] || [ -z "$tier" ]; then
+    echo "P11-CANNOT-RUN: p11_assert_namespace_admits_dns needs <kubectl> <namespace> <tier>." >&2
+    echo "  The TIER is required, not optional. Without it this can only ask 'does some policy here" >&2
+    echo "  admit DNS to somebody', and a DNS rule that does not select the agent's pods is exactly" >&2
+    echo "  as useless as no DNS rule at all — while reading, from the outside, like a green." >&2
+    return 2
+  fi
+
+  # One line per policy: name, podSelector.matchLabels as JSON, one [ports] group per egress rule,
+  # and policyTypes. An empty selector renders empty and means "every pod in the namespace"; an
+  # egress rule with no `ports` renders `[]` and admits every port, DNS included.
+  while IFS="$(printf '\t')" read -r name sel rules types; do
+    [ -n "$name" ] || continue
+    examined=$((examined + 1))
+
+    local verdict="" selects=no admits=no
+    if [ -z "$sel" ]; then
+      selects=yes
+    elif printf '%s' "$sel" | grep -q "\"kube-agents/tier\":\"$tier\""; then
+      selects=yes
+    fi
+    # `Egress` must be in policyTypes: an explicitly Ingress-only policy carrying an `egress:` block
+    # admits nothing, and the block reads like it does.
+    if printf '%s' "$types" | grep -q '"Egress"'; then
+      case "$rules" in
+      *'[]'*) admits=yes ;;
+      *'53/UDP'*) admits=yes ;;
+      esac
+    fi
+
+    if [ "$selects" = yes ] && [ "$admits" = yes ]; then
+      verdict="ADMITS DNS to tier=$tier"
+      admitting="$admitting $name"
+    elif [ "$selects" = yes ]; then
+      verdict="selects tier=$tier but admits no port 53"
+    elif [ "$admits" = yes ]; then
+      verdict="admits DNS but not to tier=$tier (selector $sel)"
+    else
+      verdict="neither selects tier=$tier nor admits DNS"
+    fi
+    echo "  P11: $ns/$name — $verdict"
+  done <<EOT
+$($K -n "$ns" get networkpolicies \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.podSelector.matchLabels}{"\t"}{range .spec.egress[*]}[{range .ports[*]}{.port}/{.protocol}{","}{end}]{end}{"\t"}{.spec.policyTypes}{"\n"}{end}' 2>/dev/null)
+EOT
+
+  if [ -n "$admitting" ]; then
+    echo "P11 ok: $ns models an installed agent —${admitting} admits DNS to tier=$tier ($examined policies examined)"
+    return 0
+  fi
+
+  echo "P11-CANNOT-RUN: namespace '$ns' does not model an installed agent ($examined NetworkPolicies" >&2
+  echo "  examined, none admitting port 53 to tier=$tier)." >&2
+  echo "  The operator is about to render <agent>-to-broker, an EGRESS-ONLY policy selecting the" >&2
+  echo "  reader half with exactly one rule. A pod selected by any egress policy is default-deny for" >&2
+  echo "  every other egress, so the pair will silently lose DNS and the transcript will read as a" >&2
+  echo "  broker that never came up. Rule 1 of the per-tier allowlist carries DNS and is applied by" >&2
+  echo "  provision_13_apply_network_policies.sh, which dev/cluster/up.sh does not run ([[LSN-068]])." >&2
+  echo "  Seed it through dev/lib/shipped-render.sh before creating the Agent CR." >&2
+  return 2
+}
