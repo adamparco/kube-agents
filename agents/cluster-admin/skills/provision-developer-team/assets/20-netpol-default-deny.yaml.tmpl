@@ -1,0 +1,50 @@
+# netpol-tenant-default-deny.yaml.template
+#
+# The namespace isolation BASELINE for a tenant namespace (03 §3, §10; Phase 3), rendered by
+# `provision_13_apply_network_policies.sh` and applied by it. THIS FILE IS THE SOURCE. Two copies
+# are DERIVED from it and must never be hand-edited: the committed exemplar under
+# examples/gitops-repo/ (checked byte-for-byte by dev/tests/reference-render.py) and the
+# matching provision-developer-team skill asset with the tenant namespace parameterised (checked by
+# dev/test_skill_templates.py). Edit this template, then regenerate both.
+#
+# An empty podSelector selects EVERY pod in the namespace; policyTypes [Ingress, Egress] with NO
+# ingress/egress rules makes the namespace default-deny in BOTH directions. From this zero-trust floor,
+# reachability is added back explicitly: the sibling per-tier egress policy opens exactly the egress the
+# agent pod needs, and tenant workloads add their own allow-policies. NetworkPolicies are additive (a
+# pod's allowed traffic is the UNION of every policy that selects it), so this baseline can only ever be
+# loosened by a named, reviewed policy — never silently.
+#
+# WHY THE INSTALL PATH APPLIES THIS *AFTER* THE ALLOWLIST, AND *AFTER* THE POD IS READY. Additivity
+# means the final state does not depend on apply order, but the intermediate states do, and both other
+# orders are bad. Applying this floor before the agent pod exists blackholes DNS and the in-cluster
+# inference hop, so the pod never becomes Ready and `wait_for_k8s_resource ... Available` fails on a
+# 300s timeout whose message says nothing about NetworkPolicy. Applying the floor before the allowlist
+# opens a window where a Ready pod is fully cut off. Allowlist-then-floor has no such window: the pod
+# goes unrestricted -> allowlisted -> allowlisted-and-ingress-denied, and is never denied traffic it is
+# about to be allowed.
+#
+# Consequences that make this the load-bearing isolation control (03 §11 negatives):
+#   - The Developer Team Agent cannot reach pods in OTHER team namespaces (team-y, …): no egress rule
+#     admits them, and each tenant namespace default-denies ingress.
+#   - The agent pod has NO inbound reachability from anywhere (kubelet health probes come from the node
+#     and are not subject to NetworkPolicy; the controller reads pod/Service status via the API server,
+#     not a pod-to-pod connection; work is PULLED over PubSub egress, never pushed in).
+#   - The cloud metadata server and arbitrary hosts stay unreachable — they are simply absent from the
+#     egress allowlist (there is deliberately no 0.0.0.0/0 rule anywhere).
+#
+# ENFORCEMENT IS A PROPERTY OF THE CNI. kindnet accepts this object and enforces nothing; only Calico
+# or GKE Dataplane V2 turn it into dropped packets. Its presence is not containment (LSN-006).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: @@NAMESPACE@@
+  labels:
+    kube-agents/tenant: @@NAMESPACE@@
+    app.kubernetes.io/managed-by: gitops
+spec:
+  podSelector: {} # every pod in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress/egress rules => deny all in both directions (the union starts empty).

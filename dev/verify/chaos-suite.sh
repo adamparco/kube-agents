@@ -8,18 +8,30 @@
 # is guarded to a scratch cluster.
 #
 #   C1  Controller DOWN -> running pods CONTINUE + NO new reconciles + reconcile RESUMES on restart.
+#         V-ISO-001 (09 §6.4, BLOCKING-ALWAYS): "agents and brokers keep executing; no new reconciles".
 #         Scale kubeagents-controller-manager -> 0. A Running stand-in pod stays UID-stable + Ready
-#         (running pods continue). Delete the REAL cluster-admin agent Deployment while the controller is
-#         down -> it is NOT recreated (no reconcile without the controller; deleting a Deployment does not
-#         touch the Agent CR webhook, so this is a clean "no reconcile" probe — creating a CR while the
-#         webhook-serving controller is down would instead be rejected at admission, a different thing).
-#         Scale -> original replicas; the controller re-acquires leadership and RECREATES the Deployment
-#         (reconcile resumes / provisioning resumes). 05 §8 "kill the controller"; 04 §6 controller row;
-#         Accept (b) new provisioning pauses+resumes.
+#         (running pods continue) and so does the REAL BROKER pod — the "and brokers" half of the row,
+#         asserted on the deployed broker rather than a stand-in because that pod is the one thing in
+#         the pair whose image actually pulls on a scratch cluster, so its Ready condition is real
+#         evidence and not a proxy for one. Delete the REAL cluster-admin agent Deployment while the
+#         controller is down -> it is NOT recreated (no reconcile without the controller; deleting a
+#         Deployment does not touch the Agent CR webhook, so this is a clean "no reconcile" probe —
+#         creating a CR while the webhook-serving controller is down would instead be rejected at
+#         admission, a different thing). Then delete the BROKER Deployment too, in its own window and
+#         after the continuity claim above has been made, because deleting it takes its pod with it and
+#         one window cannot carry both claims. Scale -> original replicas; the controller re-acquires
+#         leadership and RECREATES BOTH Deployments (reconcile resumes / provisioning resumes). 05 §8
+#         "kill the controller"; 04 §6 controller row; Accept (b) new provisioning pauses+resumes.
 #   C2  Controller UP -> it RELAUNCHES agent pods.
-#         Delete the REAL agent Deployment -> the controller recreates it promptly (owns lifecycle).
-#         Delete a running stand-in POD -> its Deployment recreates the pod (standard self-heal). 05 §8
-#         "kill the controller ... controller relaunches"; 04 §6 "controller relaunches the pod"; Accept (c).
+#         V-ISO-002 (09 §6.4, BLOCKING-ALWAYS): "relaunches both workloads, rebinds both SAs".
+#         Delete the REAL agent Deployment and the REAL broker Deployment -> the controller recreates
+#         BOTH promptly, each ownerReferenced to the Agent CR (owns lifecycle). Then the SA half:
+#         the recreated gateway Deployment binds `spec.security.serviceAccountName` and the recreated
+#         broker Deployment binds `status.broker.actorServiceAccount`, both READ BACK OFF THE CR rather
+#         than spelled out here — a hardcoded expectation would keep passing after the operator stopped
+#         deriving them, which is the whole property. Delete a running stand-in POD -> its Deployment
+#         recreates the pod (standard self-heal). 05 §8 "kill the controller ... controller relaunches";
+#         04 §6 "controller relaunches the pod"; Accept (c).
 #   C3  Cluster Admin DOWN -> its Developer Team Agents KEEP RUNNING (no cascade) + cluster-admin relaunched.
 #         With a cluster-admin + a developer-team stand-in both Running, delete the cluster-admin pod. The
 #         dev-team pod is UID-stable + never NotReady across the whole window (polled). The cluster-admin
@@ -36,6 +48,20 @@
 # real hub-hosted inference/Minty over private networking" needs a real hub + inference across two clusters
 # — C4 proves the load-bearing half (cluster state + workloads survive hub loss) on the one L2 cluster
 # and defers the agent-reasoning-pause. Never asserted green here.
+#
+# CH6 IS NOT HERE, AND THAT IS NOT A GAP — IT IS SOMEBODY ELSE'S ARM. 09 §10 puts V-ISO-001, V-ISO-002 AND
+# V-ISO-006 in Phase 9's ratchet, and the first two are C1 and C2 above. The third is 05 §8 CH6, "journal
+# store down": make ActionRecord writes fail, the broker refuses to execute rather than executing
+# unjournaled, and restoring the journal restores service without a broker restart. It is proven by
+#   ==> dev/verify/broker-refuse-l2.sh, arms B and C <==
+# and it belongs there rather than here for a reason worth writing down. Every scenario in THIS file is a
+# fault induced by killing a POD and observed on Kubernetes objects; CH6's fault is an RBAC revocation
+# aimed at one identity, and its observation is an HTTP refusal and the presence or absence of an
+# ActionRecord carrying a trace id a probe minted. That needs the broker driver, the shipped transport and
+# the third probe — the entire apparatus broker-refuse-l2.sh already stands up for V-BRK-018. Re-staging it
+# here would be a second, thinner copy of a suite that exists, and the copy would be the one that rots.
+# The pointer is what stops the next reader concluding, from a chaos suite that covers CH1-CH4, that CH6
+# was forgotten.
 #
 # FIXTURES (D1): controller *reconcile-behaviour* (C1 no-reconcile/resume, C2 Deployment relaunch) uses the
 # REAL Agent CR + REAL controller — applied by THIS script and removed on exit, so the suite runs
@@ -89,12 +115,23 @@ CM_NS=kubeagents-system
 CM=kubeagents-controller-manager
 REAL_NS=kubeagents-system
 REAL_DEPLOY=cluster-admin-cluster-a-gateway   # owned by Agent CR cluster-admin-cluster-a
+REAL_BROKER=cluster-admin-cluster-a-broker    # the actor half of the same pair, same owner
 REAL_CR=cluster-admin-cluster-a
+# The two names above are the pair, and they are spelled differently on purpose: `broker_manifests.go`
+# names the agent's Deployment `<agent>-gateway` and the broker's Deployment `<agent>-broker`, while the
+# broker's SERVICE is also `<agent>-broker`. A single `<agent>-` prefix match would collapse the two, so
+# both are pinned literally and neither is derived from the other.
+#
 # This suite APPLIES the two manifests below (see the block after P1) and deletes the CR on exit. It
 # is a fixture, and it is NOT the subject under test: C1/C2 claim things about how the CONTROLLER
-# reconciles when it is killed, and the CR is only the object it reconciles. Its image never has to
-# pull for any assertion here to hold -- what is read is the Deployment object and, at the end, the
-# existence of a pod OBJECT.
+# reconciles when it is killed, and the CR is only the object it reconciles. The GATEWAY image never
+# has to pull for any assertion here to hold -- what is read is the Deployment object and, at the end,
+# the existence of a pod OBJECT. On a scratch cluster it in fact does not pull: the CR names
+# `ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0`, which is not the image this repo builds and
+# pushes, so the gateway pod sits in ImagePullBackOff indefinitely. That is why C1's continuity claim is
+# made against the BROKER pod, whose image is the operator's own and does pull, and against a stand-in --
+# never against a Ready gateway, which would be a claim this cluster cannot support and would read as a
+# cascade failure rather than as the fixture gap it is.
 #
 # It is applied rather than assumed because until now this script read whatever CR verify-phase2.sh
 # left on the cluster. That worked on disposable Kind clusters, where phase 2 always ran first into a
@@ -228,6 +265,20 @@ wait_deploy_present() {
   return 1
 }
 
+# Wait until a Deployment reports at least one AVAILABLE replica. args: <ns> <deploy> <timeout-s> -> rc 0
+# Distinct from wait_deploy_present, which only wants the object: C1's continuity claim needs a pod that is
+# actually Ready BEFORE the controller is killed, or "the broker pod stayed Ready throughout the outage"
+# degrades into "the broker pod was never Ready and nothing changed", which polls green.
+wait_deploy_available() {
+  local ns="$1" dep="$2" to="$3" waited=0 avail
+  while [ "$waited" -lt "$to" ]; do
+    avail="$($K -n "$ns" get deploy "$dep" -o jsonpath='{.status.availableReplicas}' 2>/dev/null)"
+    [ -n "$avail" ] && [ "$avail" -ge 1 ] 2>/dev/null && return 0
+    sleep 3; waited=$((waited+3))
+  done
+  return 1
+}
+
 # Wait for a NEW ready pod (name != old) for a stand-in. args: <label> <old-pod> <timeout-s> -> rc 0 + prints name
 wait_new_ready_pod() {
   local label="$1" old="$2" to="$3" waited=0 cur
@@ -313,6 +364,20 @@ if ! $K -n "$REAL_NS" get deploy "$REAL_DEPLOY" >/dev/null 2>&1; then
   note "$REAL_DEPLOY absent at start; waiting for the controller to reconcile it first…"
   wait_deploy_present "$REAL_NS" "$REAL_DEPLOY" 60 || bad "C1 precondition: real agent Deployment $REAL_DEPLOY never appeared (controller not reconciling?)"
 fi
+
+# The broker half of V-ISO-001. Resolved by OWNERSHIP (p3_pod_of_deploy), not by label: the pair's pods
+# both answer to `kube-agents/agent=<agent>` and a label read would pin whichever one listed first.
+# Measured at ~50s to Available on gke-scratch-kube-agents-dev, so the 180s bound is slack, not a guess.
+c1_broker_pod=""
+if wait_deploy_available "$REAL_NS" "$REAL_BROKER" 180; then
+  c1_broker_pod="$(p3_pod_of_deploy "$K" "$REAL_NS" "$REAL_BROKER" 60)" || c1_broker_pod=""
+fi
+if [ -n "$c1_broker_pod" ]; then
+  note "broker pod pinned for the outage window: $c1_broker_pod"
+else
+  bad "C1 precondition: the broker Deployment $REAL_BROKER never had an available pod, so V-ISO-001's 'and brokers keep executing' half cannot be observed"
+fi
+
 c1_pod="$(pod_of standin-selfcheck)"
 if [ -n "$c1_pod" ] && $K -n "$REAL_NS" get deploy "$REAL_DEPLOY" >/dev/null 2>&1; then
   # Kill the controller.
@@ -332,18 +397,46 @@ if [ -n "$c1_pod" ] && $K -n "$REAL_NS" get deploy "$REAL_DEPLOY" >/dev/null 2>&
   else
     bad "C1(i): stand-in pod did not stay Ready while the controller was down"
   fi
+  # (i-b) the "and brokers" half of V-ISO-001, over the SAME window as (i) and (ii): the deployed broker
+  # pod is untouched by the controller's absence. The broker holds the only write path to the cluster, so
+  # "the controller is down" meaning "nothing can execute" is the cascade this row exists to rule out.
+  if [ -n "$c1_broker_pod" ]; then
+    if assert_pod_stable "$REAL_NS" "$c1_broker_pod" 10 2; then
+      pass "C1(i-b): the deployed BROKER pod $c1_broker_pod stays Ready throughout the controller outage (brokers keep executing — V-ISO-001)"
+    else
+      bad "C1(i-b): the broker pod did not stay Ready while the controller was down — killing the controller took the write path with it (V-ISO-001)"
+    fi
+  else
+    bad "C1(i-b): no broker pod was pinned, so 'brokers keep executing' did not run — not a pass (V-ISO-001)"
+  fi
   if assert_deploy_absent "$REAL_NS" "$REAL_DEPLOY" 10 2; then
     pass "C1(ii): the deleted agent Deployment is NOT recreated while the controller is down (no new reconciles)"
   else
     bad "C1(ii): agent Deployment was recreated with the controller down (unexpected reconcile — Accept b)"
   fi
-  # (iii) resume: bring the controller back; it re-acquires leadership and recreates the Deployment.
+  # (ii-b) the same no-reconcile probe on the BROKER Deployment, in its OWN window and deliberately after
+  # (i-b): deleting this Deployment garbage-collects the pod (i-b) just spent 20s asserting was stable, so
+  # the two claims cannot share a window. Ordering them is the whole reason this is a second block.
+  $K -n "$REAL_NS" delete deploy "$REAL_BROKER" --wait=true --timeout=60s >/dev/null 2>&1
+  if assert_deploy_absent "$REAL_NS" "$REAL_BROKER" 10 2; then
+    pass "C1(ii-b): the deleted BROKER Deployment is NOT recreated while the controller is down (no new reconciles — V-ISO-001)"
+  else
+    bad "C1(ii-b): broker Deployment was recreated with the controller down (unexpected reconcile — V-ISO-001)"
+  fi
+  # (iii) resume: bring the controller back; it re-acquires leadership and recreates BOTH Deployments.
+  # Both, and reported separately: a run that rebuilt the gateway and silently left the broker missing is
+  # a half-recovered pair, and one combined verdict would print the same PASS either way.
   $K -n "$CM_NS" scale deploy "$CM" --replicas="$CM_ORIG_REPLICAS" >/dev/null 2>&1
   $K -n "$CM_NS" rollout status deploy/"$CM" --timeout=120s >/dev/null 2>&1
   if wait_deploy_present "$REAL_NS" "$REAL_DEPLOY" 120; then
     pass "C1(iii): controller back up -> reconcile RESUMES, agent Deployment recreated (provisioning resumes)"
   else
     bad "C1(iii): controller restart did NOT recreate the agent Deployment within 120s (reconcile did not resume)"
+  fi
+  if wait_deploy_present "$REAL_NS" "$REAL_BROKER" 120; then
+    pass "C1(iii-b): controller back up -> the BROKER Deployment is recreated too (the PAIR resumes, not half of it — V-ISO-001)"
+  else
+    bad "C1(iii-b): controller restart did NOT recreate the broker Deployment within 120s (the pair came back without its write path — V-ISO-001)"
   fi
 else
   bad "C1: preconditions unmet (stand-in pod or real agent Deployment missing) — skipped"
@@ -370,6 +463,68 @@ if $K -n "$REAL_NS" get deploy "$REAL_DEPLOY" >/dev/null 2>&1; then
 else
   bad "C2(i): real agent Deployment absent before the test — skipped"
 fi
+# (i-b) the same relaunch claim for the BROKER Deployment — "relaunches both workloads" (V-ISO-002).
+# The ownerRef verdict here is a `bad`, not the note-and-pass (i) above settles for: this row is
+# BLOCKING-ALWAYS and the arm is new, so it starts strict rather than inheriting a leniency that predates
+# it. An unowned broker Deployment is not a cosmetic difference — it is one the controller will not
+# garbage-collect when the Agent CR goes, leaving a live write path behind a deleted agent.
+#
+# Deleted here rather than leaned on from C1(iii-b): that block asserts the pair comes back after an
+# OUTAGE, which is a different claim from "a live controller replaces a workload deleted underneath it".
+# Skipping the delete would make this arm a re-read of C1's result wearing C2's label.
+$K -n "$REAL_NS" delete deploy "$REAL_BROKER" --wait=true --timeout=60s >/dev/null 2>&1
+if wait_deploy_present "$REAL_NS" "$REAL_BROKER" 90; then
+  bowner="$($K -n "$REAL_NS" get deploy "$REAL_BROKER" -o jsonpath='{.metadata.ownerReferences[0].name}' 2>/dev/null)"
+  if [ "$bowner" = "$REAL_CR" ]; then
+    pass "C2(i-b): the BROKER Deployment is present and owned by Agent CR $REAL_CR (both workloads relaunched — V-ISO-002)"
+  else
+    bad "C2(i-b): the broker Deployment's ownerRef is '${bowner:-<none>}', not $REAL_CR — it will outlive its Agent CR (V-ISO-002)"
+  fi
+else
+  bad "C2(i-b): the controller did NOT bring the broker Deployment back within 90s — only half the pair was relaunched (V-ISO-002)"
+fi
+# (i-c) "rebinds both SAs" — the second clause of V-ISO-002, and the half a relaunch check cannot see.
+# BOTH expectations are read back off the Agent CR, never spelled out here: the reader SA from
+# `spec.security.serviceAccountName` and the actor SA from `status.broker.actorServiceAccount`, which is
+# where `agent_controller.go` publishes the name it resolved. Hardcoding `cluster-admin-cluster-a-actor`
+# would turn this into a check on the fixture's spelling that stays green after the operator stops
+# deriving the binding at all -- and deriving it is the property. Empty and `default` are called out by
+# name because both are what a pod gets when nothing bound anything, and both would otherwise compare
+# equal to an equally empty expectation.
+#
+# `status.broker` is POLLED and not read once. `spec` above it is safe to read straight — it is what
+# this suite applied — but `.status.broker.actorServiceAccount` is written by the controller AFTER the
+# reconcile that C2(i-b) just triggered by deleting the broker Deployment underneath it. A single read
+# here races that write, and losing the race yields an empty string, which is one branch away from
+# being reported as "the CR publishes no actor ServiceAccount name" — a controller bug, printed
+# because a read arrived early. That failure mode is precisely what P9's polled-status invariant in
+# `invariants-gate.py` exists to catch, and it caught this line.
+exp_reader="$($K -n "$REAL_NS" get agent "$REAL_CR" -o jsonpath='{.spec.security.serviceAccountName}' 2>/dev/null)"
+exp_actor=""
+for _ in $(seq 1 30); do
+  exp_actor="$($K -n "$REAL_NS" get agent "$REAL_CR" -o jsonpath='{.status.broker.actorServiceAccount}' 2>/dev/null)"
+  [ -n "$exp_actor" ] && break
+  sleep 2
+done
+got_reader="$($K -n "$REAL_NS" get deploy "$REAL_DEPLOY" -o jsonpath='{.spec.template.spec.serviceAccountName}' 2>/dev/null)"
+got_actor="$($K -n "$REAL_NS" get deploy "$REAL_BROKER" -o jsonpath='{.spec.template.spec.serviceAccountName}' 2>/dev/null)"
+sa_ok=1
+for _pair in "reader:$exp_reader:$got_reader:$REAL_DEPLOY" "actor:$exp_actor:$got_actor:$REAL_BROKER"; do
+  IFS=: read -r _which _exp _got _dep <<<"$_pair"
+  if [ -z "$_exp" ]; then
+    bad "C2(i-c): the Agent CR publishes no $_which ServiceAccount name, so there is nothing to have rebound to (V-ISO-002)"; sa_ok=0; continue
+  fi
+  if [ "$_exp" = default ] || [ "$_got" = default ]; then
+    bad "C2(i-c): the $_which binding is 'default' (expected '$_exp', $_dep has '${_got:-<empty>}') — an unbound pod, not a rebound one (V-ISO-002)"; sa_ok=0; continue
+  fi
+  if [ "$_got" != "$_exp" ]; then
+    bad "C2(i-c): the relaunched $_dep binds '${_got:-<empty>}' but the CR says the $_which SA is '$_exp' — the controller relaunched the workload without rebinding its identity (V-ISO-002)"; sa_ok=0; continue
+  fi
+  if ! $K -n "$REAL_NS" get sa "$_exp" >/dev/null 2>&1; then
+    bad "C2(i-c): $_dep binds $_which SA '$_exp', which does not exist — the pod will never get a token (V-ISO-002)"; sa_ok=0; continue
+  fi
+done
+[ "$sa_ok" -eq 1 ] && pass "C2(i-c): both relaunched Deployments rebound the SAs the CR names — gateway->$exp_reader, broker->$exp_actor, both existing and neither 'default' (V-ISO-002)"
 # (ii) delete a running stand-in pod; its Deployment recreates a new Ready pod (self-heal).
 c2_pod="$(pod_of standin-selfcheck)"
 if [ -n "$c2_pod" ]; then
@@ -478,6 +633,11 @@ echo "  inference/Minty over private networking) → needs a second cluster. C4 
 echo "  half (cluster state + workloads survive hub loss) here."
 echo
 echo "===================================================================="
-if [ "$fail" -eq 0 ]; then echo " Phase 6 chaos suite: ALL CHECKS PASSED"; else echo " Phase 6 chaos suite: FAILURES ABOVE (see HALT conditions)"; fi
+if [ "$fail" -eq 0 ]; then
+  echo " Phase 6 chaos suite: ALL CHECKS PASSED"
+  echo " PROVEN: V-ISO-001 (C1) · V-ISO-002 (C2) at L2 — the controller/broker pair under 05 §8 CH1+CH2"
+else
+  echo " Phase 6 chaos suite: FAILURES ABOVE (see HALT conditions)"
+fi
 echo "===================================================================="
 exit "$fail"

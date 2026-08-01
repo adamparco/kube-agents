@@ -30,6 +30,11 @@ import (
 // V-CTR-015 (L1, 06 §4.4): the nine fail-closed rules are one decision function, each rule refuses
 // in the absence of its own input, and the absence of each input is exercised.
 //
+// V-CTR-016 (L1, 09 §6.9) is the same tests read the other way round: `C-UC`'s preconditions are
+// ONE shared predicate and every one of them refuses in isolation against a baseline that is
+// accepted -- TestBrakeHealthyBaselineAllows is that baseline, TestBrakeZeroValueRefuses is the
+// zero-valued record, and TestBrakeEachRuleFiresInIsolation is the in-isolation half.
+//
 // The tests are structured around one idea: for every rule there is a HEALTHY baseline that is
 // allowed, and the test removes exactly one input from it. That is what makes the assertions mean
 // something -- a test suite where every case refuses proves nothing, because a `Decide` that
@@ -411,6 +416,14 @@ func TestBrakeEachRuleFiresInIsolation(t *testing.T) {
 			}
 			if d.Refusal.Detail != d.Detail {
 				t.Error("the Refusal detail and the decision Detail must be the same sentence")
+			}
+			// The decision is consumed by the step that asked for it; the Refusal is what travels to
+			// the HTTP boundary where the pause can actually be requested. If the two disagree, the
+			// row's auto-pause is decided here and dropped there -- which is exactly how row 3
+			// shipped refusing correctly and pausing nothing (B-006).
+			if d.Refusal.AutoPause != d.AutoPause {
+				t.Errorf("Refusal.AutoPause = %v but the decision says %v; the field did not survive the return",
+					d.Refusal.AutoPause, d.AutoPause)
 			}
 		})
 	}

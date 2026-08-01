@@ -59,7 +59,20 @@ from broker_client import BrokerConfig
 
 # The object the operation aims at. Absent before the run, and it is the whole point that it is
 # still absent after: see `target_configmap()`.
-TARGET_NAME = "broker-execute-l2-shadow-target"
+#
+# OVERRIDABLE, BECAUSE THE IDEMPOTENCY KEY IS COMPUTED OVER THE OPERATIONS. 06 §9's key is a hash of
+# identity + operations + dryRun, so two probes that name the same target ARE the same action, and
+# the broker answers the second one `200 decision=deduplicated` with the FIRST one's actionId. That
+# is correct broker behaviour and it is invisible to a caller that only checks the status code. A
+# suite submitting the probe once (`broker-execute-l2.sh`) never meets it; a suite submitting it
+# eleven times across a fault injection (`brake-l2.sh`) got ONE actionId and ten deduplications, so
+# every "the envelope is accepted again now the freeze is lifted" arm was answered by a record
+# minted before the freeze existed ([[LSN-067]]).
+#
+# The default is the historical constant, so the single-submission callers are byte-identical.
+TARGET_NAME = (
+    os.environ.get("PROBE_TARGET_NAME", "").strip() or "broker-execute-l2-shadow-target"
+)
 
 
 def emit(

@@ -1,4 +1,4 @@
-# Broker operations grant — 06 §2.2.1. THE INSTALL-PATH COPY.
+# Broker operations grant — the CLUSTER-SCOPED half of 06 §2.2.1. THE INSTALL-PATH COPY.
 #
 # Rendered by `render_broker_operations_grant` in common.sh and applied by every step that installs
 # an agent tier. `examples/gitops-repo/policy/rbac-overlay/broker-operations.yaml` is the reference
@@ -6,6 +6,27 @@
 # `dev/tests/actor-grant-single-sourced.py` (V-BRK-013), in both directions — neither is checked
 # against the other, because two copies that agree with each other and disagree with the spec is the
 # failure mode a copy-to-copy check cannot see.
+#
+# ── THE NAMESPACED HALF IS RETIRED (P9-T9b-5b-0-ii-b), THIS ONE IS NOT ─────────────────────────
+# This file used to carry a second document: a tier-neutral `Role kubeagents-broker-operations` with
+# the journal and the approval roster, bound per namespace from agent-identity.yaml.template. Every
+# triple of it now lands in the per-tier `actor-grant-<tier>.yaml.template` beside this one, stamped
+# `kube-agents/tier`, because V-BRK-013 property 4 holds the UNION OF A TIER'S OBJECTS to that tier's
+# profile and an unstamped shared object belongs to every tier and is therefore evidence for none.
+# Two objects granting one thing is also the drift surface this whole check exists to close.
+#
+# The ClusterRole below survives that argument, and the reason is the developer-team tier. 06 §2.2
+# makes its template a `Role` and `vap-agent-readonly` validation 2 denies a ClusterRole labelled
+# `kube-agents/tier: developer-team`, so the three cluster-scoped kinds here — `tokenreviews`,
+# `fleetfreezes`, `changepolicies` — cannot be granted to that tier by any object the tier may own.
+# A namespace-scoped tier needs a cluster-scoped grant it does not own, and the only admissible one
+# is an object wearing no tier label at all. Losing this is not a narrowing: 06 §2.2.1 says a tier
+# that cannot read `fleetfreezes` fails closed permanently (06 §4.4), which bricks it.
+#
+# On a cluster provisioned before that change the old Role and its RoleBinding are still standing.
+# They grant exactly what the tier Role now grants, so they are stale rather than dangerous;
+# `delete_agent_identity` removes the binding by its old name, and the Role is left as the fleet
+# object it always was.
 #
 # WHY THIS FILE EXISTS AT ALL. Until P9-T7d-5 the grant existed only under examples/, and nothing on
 # the install path applied it. Every actor identity the broker resolves by name would have been
@@ -21,10 +42,11 @@
 # which is why that policy's match condition tests for either label rather than for tier alone.
 #
 # THE SPLIT IS THE API'S OWN SEAM. tokenreviews, fleetfreezes and changepolicies are cluster-scoped
-# and cannot be granted by a namespaced Role; actionrecords, actionrecords/status, agents and
-# approvalrosters are namespaced. The split is chosen so that every verb in the grant that changes
-# PERSISTED state lands in the namespaced half: an actor appends to the journal in its own namespace
-# and nowhere else. `create tokenreviews` is the one write verb above, and it stores nothing.
+# and cannot be granted by a namespaced Role; actionrecords, actionrecords/status and approvalrosters
+# are namespaced and now live in the per-tier Role. The split is chosen so that every verb in the
+# grant that changes PERSISTED state lands in the namespaced half: an actor appends to the journal in
+# its own namespace and nowhere else. `create tokenreviews` is the one write verb here, and it stores
+# nothing.
 #
 # NOT HERE, DELIBERATELY: `update` and `delete` on `actionrecords`. The broker appends and advances
 # `status`; it can never rewrite or remove a record, including its own (06 §2.2.1, 03 §3.3 rule 4).
@@ -69,27 +91,4 @@ rules:
   # update, stay below, bound by a RoleBinding, for the reason stated there.
   - apiGroups: ["kubeagents.x-k8s.io"]
     resources: ["agents"]
-    verbs: ["get", "list", "watch"]
----
-# The namespaced half. One instance per namespace that hosts an agent, which is why this template is
-# rendered once per tier rather than once per install: `kubeagents-system` serves the platform and
-# cluster-admin tiers, and each tenant namespace needs its own.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: kubeagents-broker-operations
-  namespace: ${AGENT_NAMESPACE}
-  labels:
-    kube-agents/role: actor
-rules:
-  # step 11: the journal. `create` but never `update`/`delete`.
-  - apiGroups: ["kubeagents.x-k8s.io"]
-    resources: ["actionrecords"]
-    verbs: ["get", "list", "watch", "create"]
-  - apiGroups: ["kubeagents.x-k8s.io"]
-    resources: ["actionrecords/status"]
-    verbs: ["get", "update", "patch"]
-  # step 7: approval input.
-  - apiGroups: ["kubeagents.x-k8s.io"]
-    resources: ["approvalrosters"]
     verbs: ["get", "list", "watch"]

@@ -187,15 +187,22 @@ func renderConfigYAML(agent *agentv1alpha1.Agent) string {
 		},
 		// NOTE: the remote `gke` MCP proxy (container.googleapis.com) is intentionally NOT wired here.
 		// It exposes cluster-mutating tools (e.g. create_cluster), and a remote MCP's toolset cannot be
-		// subset client-side, so it is dropped entirely to keep the agent read-only (03 §4, 06 §9). This
-		// render is runtime-authoritative (mounted over /opt/data/config.yaml), so dropping it here is
-		// what actually makes the deployed agent read-only. Provisioning becomes "author KCC/Terraform +
-		// open a PR" via the submit-suggestion skill; the CI/CD actuation pipeline applies on merge.
-		// developer_knowledge above is a read-only knowledge API and stays.
+		// subset client-side, so it is dropped entirely (03 §4, 06 §9). This render is
+		// runtime-authoritative (mounted over /opt/data/config.yaml), so dropping it here is what
+		// actually denies the pod an in-process write path.
+		//
+		// That is not the same as "the agent is read-only". The agent PROCESS holds the reader identity
+		// and can mutate nothing itself; mutation LEAVES the pod as an Action Envelope submitted to the
+		// Action Broker, which classifies it, executes it under its own actor identity and journals it
+		// with an undo handle (06 §2.2.1, §4.1). What must never appear in this config is a tool that
+		// mutates from INSIDE the pod: such a call bypasses that seam, so it is unclassified,
+		// unjournaled, and cannot be undone.
+		//
+		// developer_knowledge above is a read API and stays.
 	}
 	cfg.PlatformToolsets = map[string][]string{
 		// mcp-gke is intentionally absent: it is the toolset for the dropped cluster-mutating `gke`
-		// remote MCP server (see NOTE above). Keeping the agent read-only (03 §4, 06 §9).
+		// remote MCP server (see NOTE above). The pod keeps no in-process write path (03 §4, 06 §9).
 		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
 		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
 	}
@@ -394,8 +401,17 @@ func buildDeployment(agent *agentv1alpha1.Agent, configHash, fluentBitHash, sett
 		},
 		{
 			// AGENT_TIER is the persona/containment level (agentindex.EffectiveTier; empty -> platform).
-			// submit-suggestion reads it to namespace its PR branches (<tier>-agent/…), so a cluster-admin
-			// pod's proposals land under cluster-admin-agent/ and never masquerade as the platform tier.
+			//
+			// Nothing in this repository reads it. Its one consumer was submit-suggestion's resolve_tier
+			// (flag > $AGENT_TIER > platform), which namespaced PR branches by tier; that skill went away
+			// with the proposal path. Its replacement does not use it either — apply-change composes the
+			// idempotency key from KUBEAGENTS_AGENT_IDENTITY (broker_client.py), which carries the tier
+			// AND the scope leaf, because the tier alone is identical for two agents of one tier. And
+			// telemetry reports the tier through OTEL_RESOURCE_ATTRIBUTES, computed from the same `tier`
+			// value a few lines below rather than read back out of here.
+			//
+			// It stays because it is the pod's own statement of which persona it is running, in the one
+			// place an operator shelling into the container would look. Do not build an identity from it.
 			Name:  "AGENT_TIER",
 			Value: string(tier),
 		},
@@ -622,7 +638,8 @@ func buildBaseContainers(agent *agentv1alpha1.Agent, image string, pullPolicy co
 			MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
 			SubPath:   "config.yaml",
 			// Runtime-authoritative config is operator-rendered and must not be mutable by the agent
-			// process (defense in depth for the read-only invariant, 03 §4).
+			// process: a pod that can rewrite its own config.yaml can wire itself a mutating tool and
+			// route around the broker seam entirely (defense in depth, 03 §4).
 			ReadOnly: true,
 		},
 		{
@@ -996,11 +1013,12 @@ func buildDefaultVolumes(agent *agentv1alpha1.Agent) []corev1.Volume {
 	return volumes
 }
 
-// buildPlatformExplorerRole generates the custom ClusterRole manifest
 // NOTE: buildPlatformExplorerRole / buildClusterRoleBinding were removed in P1-T4. The controller no
-// longer mints agent RBAC at runtime; the read-only agent identity (explorer ClusterRole + binding)
-// is pre-created via GitOps (examples/gitops-repo/policy/rbac-overlay/) and enforced by
-// vap-agent-readonly. Do not reintroduce a runtime RBAC-minting path here (08 §4, 03 §4).
+// longer mints agent RBAC at runtime; the agent pod's READER identity (explorer ClusterRole +
+// binding, get/list/watch only) is pre-created via GitOps (examples/gitops-repo/policy/rbac-overlay/)
+// and enforced by vap-agent-readonly. Write authority is not absent from the system, it is held
+// elsewhere: on the separate actor ServiceAccount the broker runs as, never on the agent's. Do not
+// reintroduce a runtime RBAC-minting path here (08 §4, 03 §4).
 
 // Helper to calculate the SHA256 hash of ConfigMap Data for rolling restarts.
 func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {

@@ -419,6 +419,22 @@ func (in BrakeInputs) IsUndo() bool { return in.Trigger == agentv1alpha1.ActionT
 // able to distinguish the two and back off differently. The truth is in the Rule and the Detail,
 // which is where an operator looks and a client does not.
 func Decide(in BrakeInputs) BrakeDecision {
+	d := decide(in)
+	// ONE definition site for "a refusal carries its own decision's auto-pause".
+	//
+	// A BrakeDecision is consumed by the step that asked for it and then goes out of scope; the
+	// Refusal is what travels, as the error, all the way to the HTTP boundary where the side effect
+	// can actually happen. Copying here rather than at row 3 means a future row that auto-pauses
+	// cannot be wired half-way -- which is precisely how row 3 shipped: `AutoPause: true` was set,
+	// the pipeline captured only `d.Effect`, and the field was read by nothing while the caller was
+	// being told "and the agent is being paused" (B-006).
+	if d.Refusal != nil {
+		d.Refusal.AutoPause = d.AutoPause
+	}
+	return d
+}
+
+func decide(in BrakeInputs) BrakeDecision {
 	journalOK := in.Journal.ok()
 
 	switch in.Stage {

@@ -94,8 +94,9 @@ config, by design.
 
 - **`platform_control`** — In-pod Python MCP server
   ([`platform_mcp_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/platform_mcp_server.py)).
-  Chat message routing, session state, and agent-internal ops. Env vars are injected from the pod's
-  environment.
+  Chat message routing, session state, agent-internal ops, and the `plan_action` / `submit_action`
+  tools the `apply-change` skill uses to reach the Action Broker. Env vars are injected from the
+  pod's environment.
 - **`agent_common`** — Shared utilities available to every tier (`agent_common_server.py`).
 - **`developer_knowledge`** — Google's remote documentation MCP endpoint, reached through
   `mcp_http_bridge.py`: a small stdio-to-HTTP bridge that runs in the pod. It is read-only
@@ -106,9 +107,11 @@ accommodates long reasoning chains.
 
 :::caution[No cluster-mutating MCP]
 Earlier drafts proxied a remote GKE MCP endpoint that could create and modify clusters. It is
-deliberately gone. The agent is read-only at the cloud boundary; the only write path is the
-`submit-suggestion` skill, which opens a reviewed GitOps PR. See
-[Read-only by construction](/kube-agents/concepts/platform-agent/).
+deliberately gone, and nothing replaced it in this config: the identity on the agent pod holds no
+write verb on anything. The agent still acts — mutation leaves the pod as an **Action Envelope**
+submitted through `platform_control` to the tier's **Action Broker**, a separate workload holding the
+only write identity in the scope. See [Declarative workflow](/kube-agents/concepts/declarative-workflow/)
+and [Read-only by construction](/kube-agents/concepts/platform-agent/).
 :::
 
 ### `platform_toolsets`

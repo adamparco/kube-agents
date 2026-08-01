@@ -35,7 +35,7 @@ spec:
   deployment: { ... } # container image, pull policy, resources
   security: { ... } # service account + Workload Identity
   integration: { ... } # Google Chat, Slack, GitHub
-  iac: { ... } # which IaC artifact this agent authors when it proposes a change
+  iac: { ... } # the IaC artifact format this agent authors — kcc (default) or terraform
 ```
 
 ## `spec.tier`
@@ -50,8 +50,10 @@ Defaults to `platform`. **Immutable after creation** — a CEL rule on the field
 because the tier is what every downstream containment decision is derived from. To re-tier an agent,
 delete it and create a new one.
 
-Every tier is read-only at the cloud boundary. The only write path is a reviewed GitOps PR applied by
-the CI/CD pipeline.
+Every tier's **agent** identity is read-only at the cloud boundary. Writes are performed by that
+agent's Action Broker, a separate workload with a separate ServiceAccount reconciled from the same
+`Agent` CR — one CR renders two workloads and two identities. The agent reaches it only by submitting
+an Action Envelope.
 
 ## `spec.scope` and `spec.parentRef`
 

@@ -44,7 +44,29 @@ const agentFinalizer = "kubeagents.x-k8s.io/finalizer"
 type AgentReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// APIReader reads straight from the API server, bypassing the manager's cache. Used for
+	// exactly one thing — the journal reachability probe (`journal_reachability.go`) — because a
+	// probe answered from an informer cache measures the cache, not the store. Filled in by
+	// SetupWithManager when nil; a nil reader makes the probe report unreachable, never reachable.
+	APIReader client.Reader
+
+	// Authorizer creates `SubjectAccessReview`s for the same probe. Also filled in by
+	// SetupWithManager when nil.
+	Authorizer journalAuthorizer
 }
+
+// brokerHealthRequeue is how often an otherwise-quiet Agent is reconciled so that
+// `status.broker.journalReachable` keeps meaning something.
+//
+// The field is a liveness claim, and every other input to `updateStatusReady` arrives on a watch:
+// a Deployment going unready wakes the controller, a Service being edited wakes the controller.
+// The journal going unreachable wakes nothing — it changes no object this controller owns or
+// watches — so without a clock the value would be as old as the last unrelated edit. Sixty seconds
+// is chosen against the consequence rather than against load: row 3 auto-pauses the agent, so the
+// fleet-level signal that explains the pause should not lag it by minutes. Two tiny requests per
+// agent per minute is the whole cost.
+const brokerHealthRequeue = 60 * time.Second
 
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agents,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agents/status,verbs=get;update;patch
@@ -60,6 +82,15 @@ type AgentReconciler struct {
 // longer mints agent RBAC at runtime (P1-T4, 08 §4); the read-only agent identity is pre-created via
 // GitOps (policy/rbac-overlay/) and enforced by vap-agent-readonly. Do not re-add RBAC write verbs.
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
+// The journal reachability probe (06 §4.4 row 3, journal_reachability.go). `actionrecords` is
+// already listed by the journal, undo and retention controllers — repeated here because this
+// controller genuinely reads it and a marker that lives only next to another controller is a grant
+// this one is borrowing by accident. `subjectaccessreviews` is new and is CREATE-only by nature:
+// the API server answers the review, it persists nothing, and it confers no authority — asking
+// "may that ServiceAccount write the journal" is the only way the operator can observe the broker's
+// authority rather than its own.
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=actionrecords,verbs=get;list;watch
+// +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
 // The mesh keypairs (08 §2.3, P9-T7d). The controller writes cert-manager Certificates and holds NO
 // verb on the Secrets those Certificates produce — 08 §2.7 withholds get/list/watch on Secrets from
 // this controller entirely, because a list verb in a namespace hosting an agent would hand it every
@@ -140,8 +171,12 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
-	// 7. Update status phase to Ready
-	return ctrl.Result{}, r.updateStatusReady(ctx, instance)
+	// 7. Update status phase to Ready, and come back on the clock: `status.broker.journalReachable`
+	// is the one field here with no watch behind it. See brokerHealthRequeue.
+	if err := r.updateStatusReady(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: brokerHealthRequeue}, nil
 }
 
 // handleDeletion runs when an Agent is being deleted. The controller no longer mints RBAC or a
@@ -395,13 +430,22 @@ func (r *AgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1a
 		condMsg = "Agent is running in observe-and-report mode: " + brokerMsg
 	}
 
+	// 06 §4.4 row 3. The reasoning for why the controller — not the broker — writes this, and for
+	// what the three observations behind it can and cannot see, is in `journal_reachability.go`.
+	journalReachable, journalWhy := r.journalReachable(ctx, agent, brokerReady)
+	if !journalReachable && journalWhy != "" && (agent.Status.Broker == nil || agent.Status.Broker.JournalReachable) {
+		// Logged on the EDGE only. This runs on a timer (brokerHealthRequeue), so logging every
+		// pass would emit a line a minute per agent for as long as an outage lasts and bury the
+		// transition that says when it started.
+		logf.FromContext(ctx).Info("broker journal is not reachable; the broker is fail-closed and executing nothing (06 §4.4 row 3)",
+			"agent", agent.Name, "namespace", agent.Namespace, "reason", journalWhy)
+	}
+
 	newBroker := &agentv1alpha1.BrokerStatus{
 		Endpoint:            brokerEndpoint(agent),
 		ActorServiceAccount: actorServiceAccountName(agent),
 		Ready:               brokerReady,
-		// JournalReachable stays at its fail-closed zero until the broker itself reports it
-		// (06 §4.4). The controller cannot observe it — it would have to ask the broker, and the
-		// broker answering "yes" to the controller proves nothing about the broker's own writes.
+		JournalReachable:    journalReachable,
 	}
 
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
@@ -549,6 +593,17 @@ func (r *AgentReconciler) updateStatusDegraded(ctx context.Context, agent *agent
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// The two journal-probe dependencies are defaulted here rather than required of every caller,
+	// because this is the one place that has a manager to take them from. They are still checked
+	// at the point of use: a reconciler built by hand and never set up reports the journal
+	// unreachable, which is the fail-closed answer, not a silent fallback to the cached client.
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+	if r.Authorizer == nil {
+		r.Authorizer = mgr.GetClient()
+	}
+
 	// The controller does not own the agent ServiceAccount or any RBAC — those are pre-created and
 	// GitOps-managed (P1-T4/T5). It watches only the workload resources it renders.
 	return ctrl.NewControllerManagedBy(mgr).

@@ -6,11 +6,18 @@
 # get/list/watch and nothing else, ever. The ACTOR is held by the broker pod and is the only identity
 # in the tier that can change anything.
 #
-# In phase 9 the actor's authority is exactly 06 §2.2.1's broker-operations grant and nothing more:
-# it can append to its own journal, read the brake, read its own pause state, and authenticate the
-# caller. The per-tier tenant template of 06 §2.2 — the rules that let the platform actor create a
-# cluster through KCC — is P10-T1. Until then this identity can write nothing but ActionRecords,
-# which is the correct order: the machinery that makes a write survivable ships before the write.
+# In phase 9 the actor can WRITE nothing but ActionRecords, which is the correct order: the
+# machinery that makes a write survivable ships before the write. The rules that let a platform
+# actor create a cluster through KCC are the write half of 06 §2.2's template and belong to P10-T1;
+# until then admission refuses them outright.
+#
+# What it may READ grew in P9-T9b-5b-0-ii-b. The install path now renders the READ half of that same
+# template beside §2.2.1's grant, so on a provisioned cluster this actor also lists Secrets and reads
+# RBAC — the authority the material-egress scan of 06 §4.2 fails closed without. THIS OVERLAY DOES
+# NOT CARRY THAT READ HALF, deliberately: the install-path copy is
+# k8s-operator/scripts/actor-grant-platform.yaml.template, held to 06 §2.2 by V-BRK-013, and
+# generating the tier templates into this reference tree is P10-T1's job, not a hand-written fourth
+# copy of them.
 #
 # The controller REFERENCES both SAs (serviceAccountName); it never mints RBAC (08 §4). The
 # `kube-agents/tier` and `kube-agents/role` labels are the selectors vap-agent-readonly uses.

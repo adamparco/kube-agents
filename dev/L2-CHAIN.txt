@@ -106,6 +106,16 @@ bash dev/verify/closed-allowlist-l2.sh gke-scratch-kube-agents-dev
 bash dev/verify/gitops-tree-applies-l2.sh gke-scratch-kube-agents-dev
 bash dev/verify/multi-agent-namespace-l2.sh gke-scratch-kube-agents-dev
 
+# V-CTN-012 (attenuation) — and the reason this line sits directly under gitops-tree-applies-l2.sh
+# is that it is the other half of that line. The gitops sweep applies every YAML under
+# examples/gitops-repo/ as a whole file, so the seven-document negative corpus gets ONE verdict and
+# one of the seven satisfies it; the five-document positive corpus gets asked V-CMP-003's question
+# (can the tree land) rather than its own (has the carve-out narrowed). This suite splits both files
+# on their own separators and submits each document alone, so no document's verdict can stand in for
+# another's. It is gated on P2 and exits 3 — DEFERRED, not pass — if the policy is not live, because
+# five of its arms expect an ADMIT and an ADMIT reads identically against an absent policy (LSN-006).
+bash dev/verify/vap-corpus-l2.sh gke-scratch-kube-agents-dev
+
 # V-CTR-002 in full: one REJECTED fixture for each of 06 §1.2's V-1…V-10, every rejection asserted to
 # name its own field path. closed-allowlist-l2.sh above is the deep-dive on one of those rules (V-7);
 # this is the roll call, so a rule that stops being enforced shows up as a missing line rather than
@@ -193,6 +203,24 @@ bash dev/verify/brake-fanout-l2.sh gke-scratch-kube-agents-dev
 # agent's broker.
 bash dev/verify/broker-per-agent-l2.sh gke-scratch-kube-agents-dev
 
+# --- V-RUN-001/002/004/009 at L2 — the workload pair, its identities and its labels ---------
+# Cardinality and ownership of the gateway/broker pair; the reader SA and the broker's actor SA
+# resolve, differ, and match what the CR and status.broker.actorServiceAccount publish; five
+# label keys across eight targets, with cluster-wide selectability established BY OWNERSHIP
+# rather than by the selector under test; and deletion leaving the identities behind.
+#
+# FIVE labels, not the four 09 §6.8 names. That row's own Source column points at 05 §8, and
+# 05 §8's heading is "Labels — five, not three". 08 §2.5 tables all five and agentlabels.For()
+# renders five. Dropping kube-agents/agent would also leave the same 09 row's "and selectable"
+# clause unbacked, since it is the only key that selects a single pair. Five is a strict superset
+# of the four-label reading, so the suite cannot pass where that reading would fail.
+#
+# P1 is asserted on the controller only: _p1_build_inputs maps k8s-operator | kage-router |
+# kage-broker, and the two shipped ghcr.io CRs have no mapping, so asserting it on both halves of
+# each pair returns 3 forever. The suite applies both shipped CRs directly rather than through
+# seed_parent_agent, which injects scaleToZero and would leave V-RUN-004's pod arms unmeasurable.
+bash dev/verify/workload-pair-l2.sh gke-scratch-kube-agents-dev
+
 # V-BRK-007/008/009/010/017: what the deployed broker does with a credential. The third line that
 # needs P1 in full on the BROKER pod, and the first that needs the broker to actually SERVE — every
 # preceding broker line asserts around the door, because until dev/lib/broker-driver.sh nothing here
@@ -254,11 +282,305 @@ bash dev/verify/actor-overlay-admission-l2.sh gke-scratch-kube-agents-dev
 # record until export confirms, so a suite that tore its namespace down would hang forever on its own
 # evidence.
 #
-# WHAT IT DOES NOT CLAIM, so the next reader does not go looking: V-BRK-018 and V-REV-003 are fault
-# injection and belong to P9-T9b-5b-ii; V-REV-002 needs an undo executed; V-BRK-019's field-manager
-# string is unreadable from a shadow because a server-side dry-run persists no managedFields. The
-# suite's own header carries the full accounting.
+# WHAT IT DOES NOT CLAIM, so the next reader does not go looking: V-REV-003 is fault injection and
+# belongs to P9-T9b-5b-ii-b; V-REV-002 needs an undo executed; V-BRK-019's field-manager string is
+# unreadable from a shadow because a server-side dry-run persists no managedFields. V-BRK-018 is the
+# next line's. The suite's own header carries the full accounting.
 bash dev/verify/broker-execute-l2.sh gke-scratch-kube-agents-dev
+
+# --- V-GAT-002 at L2 — the classifier's four rungs, on a live broker ----------------------
+# Four patch operations with IDENTICAL merge-patch bodies against four ConfigMaps in one tenant
+# namespace, differing only in the lever staged on the target: none, a production environment
+# label, a gated risk-class annotation, a forbidden one. Identical bodies is the point — if the
+# operations differed, a class difference would not be attributable to the lever.
+#
+# One rung is displaced and the suite says so rather than hiding it. Every Phase 9 action is
+# spec.dryRun, history.go::derive() skips dry-run records ("an action that was never executed is
+# not experience"), so novelty applies +1 to every classification and `routine` is not observable
+# on this build at all. The routine rung therefore asserts the strongest statement dark mode
+# admits: elevated with `novel-action` as its ONLY escalation. Corpus-class agreement for that
+# rung is deferred to the phase that grants write authority.
+#
+# Attribution, not just class, is asserted: rungs 1 and 2 land on the same live class and only
+# the reason distinguishes them, and rejection.go writes Class: RiskForbidden on EVERY journaled
+# refusal whatever it refused for — so a class-only arm would score an RBAC denial as "the
+# classifier said forbidden". Needles are `~`-terminated so broker/forbidden cannot match
+# broker/target-forbidden.
+bash dev/verify/classifier-identity-l2.sh gke-scratch-kube-agents-dev
+
+# V-BRK-018 and V-ISO-006 at L2, and the journal half of Phase 9 acceptance bullet (d) — the same
+# submission path as the line above, run at the two ways it can refuse and then at the way it comes
+# back. A two-target envelope with one unreadable target (06 §4.4 row 4: the snapshot is
+# all-or-nothing); an ordinary envelope submitted while the actor's actionrecords grant is revoked
+# out from under the running broker (row 3: nothing executes unjournaled); and THE SAME ENVELOPE
+# AGAIN once the grant is back, which is 05 §8 CH6's last sentence and the reason V-ISO-006 is on
+# this line — "restoring the journal restores service without a broker restart" is the clause that
+# separates a broker that refuses from a broker that bricks, and it is invisible from the refusal.
+#
+# It goes AFTER broker-execute-l2.sh, and the dependency is diagnostic rather than mechanical. Both
+# suites need the same fixtures, but this one's whole subject is a refusal — so if the accepting path
+# is broken, every arm here goes red for a reason that has nothing to do with refusing, and the run
+# above is what tells the two apart. Ordered this way, a red here is a red about V-BRK-018.
+#
+# IT IS THE MOST DESTRUCTIVE LINE IN THIS FILE and the guard is the reason it is allowed to be: for
+# the ~50 seconds between scenario B and scenario C it strips `actionrecords` from EVERY role object
+# actually bound to the actor — discovered by walking the bindings, not from a list, because a
+# scratch cluster carries residue no template renders any more and a strip that missed one leaves the
+# brake's probe satisfied and stages no fault at all — which leaves the deployed broker unable to
+# journal anything. Scenario C puts the grant back IN THE BODY and asserts the broker recovered from
+# it; the EXIT trap re-seeds as the safety net for a run that died before getting there, so a killed
+# run still repairs itself. On the live install this would be a test blinding the fleet's audit
+# trail; the anchored gke-scratch-* case in the suite is what stops that, and it must stay anchored.
+#
+# It leaves both namespaces and the ActionRecords standing, for broker-execute-l2.sh's reason
+# ([[LSN-045]]).
+#
+# WHAT IT DOES NOT CLAIM: the AUTO-PAUSE half of 06 §4.4 row 3, and not for want of a consumer —
+# P9-T9c-1 landed one. The pause is recorded ON the ActionRecord, and this fault is exactly the one
+# that stops the record being written, so `server.go` logs "there is no record to put it on" and
+# gives up. Asserting it needs CH6's other fault (drop the CRD's storage version), which breaks the
+# store for every subject. Rows 1, 2, 5, 6 and 9 belong elsewhere and the suite's header says where.
+#
+# It also carries V-BRK-005 ("with the journal store unavailable the broker refuses to execute",
+# 03 §6). That is scenario B's sentence word for word, and binding it here rather than writing a
+# fourth suite is deliberate: a second line inducing the same fault against the same pod would cost
+# another ~50 seconds of a blinded audit trail and, on the day the property broke, would go red
+# alongside this one without saying which of the two faults mattered. The suite's header carries the
+# argument in full, including the one thing 03 §6's framing needs that the execution framing does
+# not — that the refusal comes from the brake probe at step 5, not from the Create failing at 7.
+bash dev/verify/broker-refuse-l2.sh gke-scratch-kube-agents-dev
+
+# V-REV-003 at L2 — the third outcome the pipeline has, and the only one the two lines above cannot
+# reach. broker-execute-l2.sh submits an envelope that works; broker-refuse-l2.sh submits two that
+# are refused at the door or at the journal. This one submits an envelope that is legitimate in
+# every way — real credential, well-formed body, caller in scope, every verb authorized — and is
+# PARKED anyway, because 06 §4.3.1's strategy table cannot produce an inverse for it.
+#
+# IT IS TWO SUBMISSIONS AND THE ROW IS THE DIFFERENCE BETWEEN THEM. A broker that gated everything
+# would satisfy V-REV-003's sentence perfectly and be worthless, and that is not hypothetical:
+# three places in this pipeline downgrade a plan to `none` when they meet an error, each failing
+# closed and correctly, and each would make a one-submission suite green while proving nothing
+# about reclassification. So the fault (patch an absent Deployment, whose restore step needs a
+# pre-state that does not exist) runs against a control (apply an absent ConfigMap, whose inverse
+# is a delete) over the same credential and namespace, seconds apart.
+#
+# IT IS THE ONLY LINE IN THIS FILE THAT SENDS `dryRun: false`, and that is forced rather than
+# chosen: 06 §4.2 step 6's rule is `!dryRun && !undoPlanPresent`, so a dry-run envelope SUPPRESSES
+# the no-undo-plan gate and would score this row on the brake's row 5 instead of on the rule 03
+# §4.1 names. What makes it safe is that the suite patches `spec.operations.dryRunOnly: true` onto
+# the Agent CR and READS IT BACK before submitting: `mayExecute = !env.DryRun && !shadowed(view)`
+# is a one-way composition no caller can clear, so the worst case of a broker that failed to gate
+# is a server-side dry run. A read-back that disagrees is rc 3 and nothing is submitted. On the
+# live install this would be a test reconfiguring the fleet's brake; the anchored gke-scratch-*
+# case in the suite is what stops that, and it must stay anchored.
+#
+# It goes AFTER broker-refuse-l2.sh for that line's own reason, one step further along: a gate is
+# neither an acceptance nor a refusal, so a red here is only about reclassification once both of
+# its neighbours are green. It runs in the terminal group with them — it deletes and re-applies the
+# platform-agent CR — and leaves its tenant namespace and both ActionRecords standing ([[LSN-045]]).
+#
+# WHAT IT DOES NOT CLAIM: the APPROVAL path. This parks an action and leaves it parked; approving
+# it, re-snapshotting and executing on the approval is 06 §4.3's surface, needs an ApprovalRoster
+# with a decision in it, and is V-REV-004's — Phase 10. Nor does it separately score 06 §4.4 row 5,
+# which raises the same envelope for the same reason from the brake instead of the classifier; both
+# reasons appear on the record and the suite asserts the classifier's by name.
+bash dev/verify/broker-gate-l2.sh gke-scratch-kube-agents-dev
+
+# --- V-RUN-005 at L2 — the agent starts without its broker, and converges when it arrives ---
+# 08 §7(a) says to delay the broker's image pull. That is the wrong experiment on this build:
+# buildWaitForBrokerContainer runs brokerImage(), so `wait-for-broker` IS the broker binary
+# inside the agent pod, and an unpullable image puts the pod in Init:ImagePullBackOff — the init
+# container never runs, never times out, and observe-and-report is never reached.
+#
+# The lever that works is manifest_helpers.go:210-223: scaleToZero sets replicas=0 on the AGENT
+# Deployment only, while brokerReplicas is a constant. One CR in one namespace gives all three
+# arms — broker Available with the gateway at zero; re-apply without scaleToZero and the init
+# container exits 0 having polled the rendered KUBEAGENTS_BROKER_ENDPOINT + /healthz; then delete
+# this run's actor SA so ServiceAccount admission refuses the broker pod, and the init container
+# times out, still exits 0, and logs observe-and-report with AgentReady ∧ ¬BrokerReady ⇒ ¬Ready.
+# Three image digests are read from live imageIDs and a tag-only answer is a FAIL, not a note.
+bash dev/verify/startup-ordering-l2.sh gke-scratch-kube-agents-dev
+
+# V-BRK-013 at L2, and Phase 9's acceptance (e) — "no agent identity in the fleet holds a write
+# verb, verified by a full auth can-i sweep". The L0 half of V-BRK-013 has been green for a while
+# and is a real result; it is also, entirely, a statement about files. This is the same property
+# asked of the thing that actually decides: the API server's authorizer.
+#
+# THREE THINGS THE FILE-LEVEL HALF STRUCTURALLY CANNOT SEE, and each one is a way a fleet passes it
+# while holding write authority:
+#   1. An RBAC object with no `kube-agents/role: actor` label. That label is the L0 check's
+#      discovery key — it has to be, because it is also `vap-agent-readonly`'s own actor selector —
+#      so a Role granting `update actionrecords` and omitting it is outside the check's world, and
+#      RBAC is a union, so it grants. That object is this suite's negative control, applied to a
+#      real actor ServiceAccount on the scratch cluster and then revoked.
+#   2. A rule that was written correctly and never applied. broker-per-agent-l2.sh's header records
+#      the version of that which already happened here.
+#   3. The union across every binding, which no single file contains and which is the only thing
+#      that authorizes a request. BACKLOG.md B-007 is a live instance of an extra binding no
+#      template owns.
+#
+# TWO-SIDED, WHICH IS THE WHOLE ARGUMENT. verify-phase9.sh section F has been failing with it in
+# words: "a fleet whose RBAC failed to apply at all would pass the negative half perfectly". So the
+# same run asks both — every verb 06 §2.2.1 grants and every read 06 §2.2 grants must answer YES,
+# and the write half of each tier's template, `update`/`delete` on the record itself, and the same
+# verbs in a namespace the identity has no agent in must answer NO. The positive half is not a
+# formality: 06 §4.4 makes a tier that cannot read `fleetfreezes` fail closed permanently, so a
+# missing grant bricks a tier rather than protecting it.
+#
+# THE QUESTIONS ARE DERIVED, NOT LISTED. dev/verify/fixtures/actor_grant_expectations.py imports the
+# L0 check's own parser of 06 rather than re-reading the spec, so there is one parser in the repo
+# and a verb added to §2.2.1 is a question this suite asks on its next run — phase-9.md's "by name,
+# rather than by 'these are the ones that were there when I wrote it'". ~700 questions over three
+# tiers, both roles, asked concurrently.
+#
+# WHAT IT DOES NOT ASK, counted and printed rather than dropped: `resources: ["*"]` rows, because
+# `auth can-i <verb> '*'` is a question about a wildcard REQUEST and not the one the rule makes; and
+# rows naming resource types this API server does not serve, because `no` from an unknown type is
+# not evidence of an absent grant ([[LSN-035]]) — those are excluded from BOTH directions together,
+# so the exclusion cannot quietly satisfy the negative half.
+#
+# It is destructive-guarded and belongs on the scratch cluster for one reason above all the others:
+# its negative control hands a real agent identity write authority for a few seconds. On the live
+# install that is a test granting exactly what this phase exists to withhold. The revoke is asserted
+# in its own arm and repeated unconditionally from the EXIT trap.
+bash dev/verify/actor-grant-sweep-l2.sh gke-scratch-kube-agents-dev
+
+# --- V-CTN-017 at L2 — the controller mints no RBAC, asked of the INSTALL ----------------
+# The L0 arm (dev/tests/controller-mints-no-rbac.py, on dev/L0-CHAIN.txt) parses the rendered
+# ClusterRoles AND the +kubebuilder:rbac markers and asserts they agree triple-for-triple. That
+# is a property of the TREE. This is the same property asked of the CLUSTER, and the two can
+# disagree in the direction that matters: a grant can be added to config/rbac/role.yaml and
+# never applied, or applied out of band and present in neither artifact. The suite imports the
+# L0 file with importlib rather than restating its constants, so "what 08 §7 forbids" has one
+# definition site across both levels. It ends with a 253-question authorizer sweep asked as all
+# three control-plane ServiceAccounts, with positive controls derived from the tree's own grants.
+bash dev/verify/manager-role-l2.sh gke-scratch-kube-agents-dev
+
+# V-REV-001 at L2 at POPULATION scale — "100% of executed non-gated ActionRecords carry a validated
+# undo plan". broker-execute-l2.sh already scores V-REV-001 and its row is a real result; it is also
+# a result at n=1, on one hand-written apply of one ConfigMap. 100% of one is a number that cannot
+# distinguish a working undo planner from a planner that happens to know one verb.
+#
+# THIS RUNS THE WHOLE SOAK CORPUS. dev/verify/fixtures/soak_corpus.py --table is the population;
+# dev/verify/fixtures/undo_coverage_probe.py submits one envelope per row from inside the cluster,
+# on the agent's own reader identity, through the broker's real front door — a fresh nonce per
+# envelope, because nonces are single-use. The corpus supplies shape and target; the payload is
+# synthesised, so a row is a real create/apply/patch/scale/delete against a real seeded object and
+# not a replay of a recorded body. Everything is dry-run: Phase 9's defining constraint (07 §2) is
+# that the entire safety machinery is exercised with no write authority anywhere.
+#
+# WHAT "EXECUTED" MEANS HERE is the broker's own stamp, status.timestamps.executionStarted — the
+# moment it issued the first mutating call — rather than a guessed-at set of phase strings. A record
+# the classifier gated never gets one and is correctly outside the denominator; on the run recorded
+# in verification/results.csv that is exactly the two `delete Deployment` rows, PendingApproval,
+# class gated, strategy none, which is the classifier doing its job.
+#
+# FOUR WAYS A NON-GATED EXECUTED RECORD FAILS, each scored by name rather than as one lump: no undo
+# plan at all (`no-undo-plan`), a plan whose strategy is `none` (`strategy-none-on-non-gated` —
+# StrategyFor's own closing comment is "anything else ⇒ none ⇒ gated", so none on a record that was
+# NOT gated is the two halves disagreeing), a plan that is present and unvalidated
+# (`unvalidated-plan`), and a validated plan with zero steps (`stepless-plan`). An executed record
+# carrying no risk class at all is `unclassified-executed-record` and fails too, rather than
+# quietly leaving the denominator.
+#
+# ATTRIBUTION IS AN ARM, NOT AN ASSUMPTION. The tenant namespace is this suite's own and it is left
+# standing between runs ([[LSN-045]]), so the journal accumulates: A-5 intersects every mined record
+# against THIS run's actionId set and prints the count it left outside. Without it the denominator
+# grows every run and a stale 100% reads like coverage improving.
+#
+# AND THE SHADOW MUST HOLD. A-6 re-reads all 37 seeded targets after the run and fails on any
+# create, mutation or delete. A dry-run soak that quietly wrote would still score V-REV-001 green.
+bash dev/verify/undo-coverage-l2.sh gke-scratch-kube-agents-dev
+
+# chaos-suite.sh is a Phase 6 artifact and it is listed here for the first time in Phase 9, because
+# P9-T11b gave it two of Phase 9's BLOCKING-ALWAYS rows: V-ISO-001 (CH1, "agents AND BROKERS keep
+# executing") and V-ISO-002 (CH2, "relaunches BOTH workloads, rebinds BOTH SAs"). Before that unit it
+# knew only about the agent workload — the word "broker" did not appear in it — so it was a suite
+# that could not have failed on the clauses those two rows are about.
+#
+# THE OMISSION IS THE INTERESTING PART. 09 §10 puts V-ISO-001/002/006 in Phase 9's ratchet, a ratchet
+# is the promise that a suite which entered it never leaves, and the only suite that could keep that
+# promise for CH1 and CH2 was on no chain at all. It ran when somebody remembered it. A green result
+# from a suite nothing re-runs is a claim about one afternoon, and the ratchet is a claim about every
+# commit after it — those are different claims and only one of them was being made.
+#
+# Ordered after the broker suites and before the gate because it needs the pair actually deployed:
+# C1's continuity claim pins the BROKER pod and asserts it stays Ready across the outage, which is
+# not observable until the broker Deployment has an available replica. It scales the controller to
+# zero and back and deletes both halves of the pair — reversible, single-object, and restored by an
+# EXIT trap, but not something to run against anything but a scratch cluster.
+bash dev/verify/chaos-suite.sh gke-scratch-kube-agents-dev
+
+# --- V-CTR-007, V-RUN-007, V-RUN-008 at L2 — the brake, and what it must survive -----------
+# 25 assertions in three arms. The brake has to work with inference down, which means it has to
+# work through kubectl against the API server and nothing else, and that is the property the arms
+# are built around rather than a caveat appended to them.
+bash dev/verify/brake-l2.sh gke-scratch-kube-agents-dev
+
+# --- V-CTN-001, V-CTN-004 at L2 — the reader reads only inside its tier scope ---------------------
+# 1389 `auth can-i` questions as all three reader ServiceAccounts, derived rather than listed — the
+# roster from the reader label, the tiers from the tree cross-checked against the served CRD
+# (LSN-036), the yes-side from the rules actually bound to each tier filtered through
+# `kubectl api-resources -o name`, the verb allow-list imported from the L0 arm by importlib so the
+# two levels cannot drift. Two-sided per tier: the positive control is the vacuity guard (LSN-035)
+# and goes red on an under-bound reader before any negative can go silently true.
+#
+# The 'no for any other cluster' clause of 03 §11 is NOT asserted here, and the run says so in a
+# GREEN banner rather than only in a red one: RBAC carries no cluster axis, so the only reachable
+# proxy would answer from the group axis arm L2-E already owns and would answer identically for this
+# cluster's own name. The L3 arm owns that clause and it is recorded as a deferral.
+#
+# IT MUST RUN SERIALLY, WHICH ON THIS CHAIN IS FREE. Its roster is derived cluster-wide from
+# `kube-agents/role=reader`, and every suite that seeds an agent identity mints an SA carrying that
+# label — correctly, because seed_agent_identity renders it with the SHIPPED renderer rather than a
+# copy (LSN-024). Run concurrently with one of them it sees a fourth reader that the GitOps overlay
+# does not bind and reports 102 true-but-irrelevant failures ([[LSN-066]]).
+bash dev/verify/reader-scope-l2.sh gke-scratch-kube-agents-dev
+
+# --- The tier egress allowlist, rendered and admitted ([[LSN-068]] item 3, [[LSN-069]]) ---------
+# Two arms, one file, because they are two halves of one question: does the egress policy a tier
+# runs under let the traffic the design requires through. Arm 1 asks it of the CLUSTER -- every
+# namespace holding an Agent admits DNS to its own tier -- and the roster is derived three ways and
+# unioned (Agent CRs, `kube-agents/tier`-labelled workloads, and the SERVED CRD's own schema
+# default for an empty `spec.tier`), so no tier name and no namespace is written down here
+# ([[LSN-036]]). Arm 2 asks it of the RENDER -- rule 9's addresses are scored against
+# `endpoints/kubernetes` through the shipped `render_egress_policy` and never a copy ([[LSN-024]]).
+#
+# Arm 2's predicate is AT LEAST ONE rendered rule-9 address is an endpoint address, deliberately
+# not every one: `resolve_apiserver_cidrs` emits three /32s on purpose because it cannot know where
+# a given dataplane scores egress relative to DNAT, so an every-address predicate goes red on a
+# CORRECT render. [[LSN-069]] is that NONE of them was.
+#
+# TWO THINGS A GREEN RUN OF THIS LINE DOES NOT COVER, and the file says both in its own banner.
+# Arm 1 has never executed its positive path -- the scratch cluster carries zero Agent CRs, so the
+# roster is empty and the arm returns rc 3 DEFERRED rather than a pass; every claim about it today
+# rests on its 8 control rows. And arm 2's subject is the render, not the installed object:
+# `shipped_render_rule9_cidrs` scopes to the `# 9)` YAML comment marker, which `kubectl get -o yaml`
+# does not return. That gap is not cosmetic -- read-only against the live install on 2026-08-01,
+# the three standing `<tier>-egress` policies carry four egress rules each and NO apiserver address
+# of any kind, while arm 2 reports all three tiers green. The installed-object arm is scheduled;
+# until it lands, this line proves the renderer and not the cluster.
+bash dev/verify/tier-egress-render-l2.sh gke-scratch-kube-agents-dev
+
+# --- V-CMP-006 at L2: the resolved environment of every MCP server, read inside the pod ----------
+# 09 §6 dates V-CMP-006 `L0, L2` at phase 9. The L0 arm (`dev/test_mcp_env_declared.py`) has been
+# green since phase 8 and reads two artifacts that stand in for the runtime: the rendered-ConfigMap
+# golden and the scripts in the TREE. Both are inputs. This arm reads the three things decided after
+# them and that no static check can reach — that the bytes the agent process opens at its Hermes
+# config path are the ConfigMap the operator rendered for THIS CR and not the copy baked into the
+# image at the same path ([[LSN-003]]); that the scripts the IMAGE shipped, not the tree's, declare
+# what they read; and that the credential a declaration PROMISES actually arrives at the process
+# Hermes spawned. `env: {API_SERVER_KEY: ${API_SERVER_KEY}}` is satisfied on paper by a container
+# that never sets `API_SERVER_KEY`, and the symptom is a runtime refusal in a pod that is Ready with
+# every unit test green — which is why 09 §5.1 says this row reports **fail**, never partial.
+#
+# WHAT THIS LINE DOES NOT YET PROVE. It has never been executed against a cluster. Its 15/15
+# `--negative-control` runs with no cluster at all, synthesising the observation directory, and is
+# on `dev/L0-CHAIN.txt`; that establishes the arm rejects each defect it targets, not that the live
+# install is clean. `verification/results.csv` therefore still carries V-CMP-006 at L2 as
+# **deferred**, with this file named as its promotion condition and "exits 0" still unmet. The row
+# is promoted by a green run, not by this line existing.
+bash dev/verify/mcp-env-resolves-l2.sh gke-scratch-kube-agents-dev
 
 # --- Phase 9's gate ------------------------------------------------------------------------------
 # verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the

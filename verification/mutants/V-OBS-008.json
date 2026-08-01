@@ -1,0 +1,123 @@
+{
+  "_comment": "V-OBS-008 -- a journaled Secret pre-state is digest-only, and the replayer recognises it as such (05 §1.2). Two halves, and the second is why the check exists: journal.Sanitize WRITES the `sha256:` marker and undo.RedactedSecretKeys READS it, across a package boundary neither side's suite crosses. M5 and M6 break one end each. Only ./internal/journal/ runs, which is deliberate -- the undo-side mutants must be caught by the journal-side test that joins them, not by undo's own suite.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./internal/journal/"]
+  },
+  "mutants": [
+    {
+      "id": "M1-managed-fields-survive",
+      "why": "server-side-apply bookkeeping stays in the snapshot, dwarfing the object and pushing honest snapshots over the inline limit",
+      "catcher": "TestJournaledSecretBodyCarriesNoMaterialAnywhere",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/snapshot.go",
+          "find": "\tunstructured.RemoveNestedField(out.Object, \"metadata\", \"managedFields\")\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M2-last-applied-annotation-survives",
+      "why": "the annotation is a second, UNDIGESTED copy of the Secret; leaving it makes the redaction cosmetic",
+      "catcher": "TestJournaledSecretBodyCarriesNoMaterialAnywhere",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/snapshot.go",
+          "find": "\tunstructured.RemoveNestedField(out.Object, \"metadata\", \"annotations\", \"kubectl.kubernetes.io/last-applied-configuration\")\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M3-string-data-not-digested",
+      "why": "stringData holds material as written rather than base64, so skipping it puts plaintext straight into etcd",
+      "catcher": "TestJournaledSecretBodyCarriesNoMaterialAnywhere",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/snapshot.go",
+          "find": "\t\tfor _, field := range []string{\"data\", \"stringData\"} {\n\t\t\traw, found, err := unstructured.NestedMap(out.Object, field)",
+          "replace": "\t\tfor _, field := range []string{\"data\"} {\n\t\t\traw, found, err := unstructured.NestedMap(out.Object, field)"
+        }
+      ]
+    },
+    {
+      "id": "M4-digest-is-of-the-key-not-the-value",
+      "why": "a digest over the key name still looks per-key and still redacts, but two keys holding the same credential no longer agree -- so no candidate value can ever be proved to be the right one at restore",
+      "catcher": "TestJournalSecretDigestIsPerKeyOverTheStoredValue",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/snapshot.go",
+          "find": "\t\t\t\ts, ok := v.(string)",
+          "replace": "\t\t\t\ts, ok := v.(string)\n\t\t\t\t_ = s"
+        },
+        {
+          "file": "k8s-operator/internal/journal/snapshot.go",
+          "find": "\t\t\t\tdigested[k] = \"sha256:\" + Digest([]byte(s))",
+          "replace": "\t\t\t\tdigested[k] = \"sha256:\" + Digest([]byte(k))"
+        }
+      ]
+    },
+    {
+      "id": "M5-journal-side-marker-drifts",
+      "why": "the journal still redacts, but the rollback replayer no longer recognises the redaction and applies the digests as if they were values -- destroying the credential and reporting a completed undo",
+      "catcher": "TestJournalRedactionIsRecognisedByTheReplayer",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/snapshot.go",
+          "find": "\t\t\t\tdigested[k] = \"sha256:\" + Digest([]byte(s))",
+          "replace": "\t\t\t\tdigested[k] = \"digest:\" + Digest([]byte(s))"
+        }
+      ]
+    },
+    {
+      "id": "M6-replayer-side-marker-drifts",
+      "why": "the same divergence from the other end: undo stops looking for what the journal writes, and every journaled Secret becomes replayable as digests",
+      "catcher": "TestJournalRedactionIsRecognisedByTheReplayer",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/undo/sanitize.go",
+          "find": "const secretDigestMarker = \"sha256:\"",
+          "replace": "const secretDigestMarker = \"sha256sum:\""
+        }
+      ]
+    },
+    {
+      "id": "M7-replayer-ignores-string-data",
+      "why": "a redacted stringData key is not reported, so the replayer refuses on some keys of a Secret and silently writes hex into the rest",
+      "catcher": "TestJournalRedactionIsRecognisedByTheReplayer",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/undo/sanitize.go",
+          "find": "\tvar keys []string\n\tfor _, field := range []string{\"data\", \"stringData\"} {",
+          "replace": "\tvar keys []string\n\tfor _, field := range []string{\"data\"} {"
+        }
+      ]
+    },
+    {
+      "id": "M8-secret-branch-never-taken",
+      "why": "the whole redaction is skipped and the Secret is journaled as material, which is the failure the requirement exists to prevent",
+      "catcher": "TestJournaledSecretBodyCarriesNoMaterialAnywhere",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/snapshot.go",
+          "find": "\tif out.GetKind() == \"Secret\" {",
+          "replace": "\tif out.GetKind() == \"NotASecret\" {"
+        }
+      ]
+    },
+    {
+      "id": "M9-every-annotation-dropped",
+      "why": "over-stripping is the other way to be wrong: an undo that restored an object without its annotations restores a different object",
+      "catcher": "TestJournaledSecretBodyCarriesNoMaterialAnywhere",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/journal/snapshot.go",
+          "find": "\tunstructured.RemoveNestedField(out.Object, \"metadata\", \"annotations\", \"kubectl.kubernetes.io/last-applied-configuration\")",
+          "replace": "\tunstructured.RemoveNestedField(out.Object, \"metadata\", \"annotations\")"
+        }
+      ]
+    }
+  ]
+}

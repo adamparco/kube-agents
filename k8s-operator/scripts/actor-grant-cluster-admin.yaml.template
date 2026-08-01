@@ -1,0 +1,143 @@
+# cluster-admin ACTOR tenant grant — the READ half of 06 §2.2's cluster-admin template, joined with
+# 06 §2.2.1's broker-operations grant. THE INSTALL-PATH COPY.
+#
+# Rendered by `render_actor_grant cluster-admin <namespace> <leaf>` in common.sh. The header of
+# actor-grant-developer-team.yaml.template carries the parts of the argument common to all three
+# tiers — what "the READ half" means rule by rule, why the write half is unrendered, and why there is
+# no `kube-agents/scope` label. What follows is what is specific to a cluster-scoped tier.
+#
+# ── WHY TWO OBJECTS AND NOT ONE ────────────────────────────────────────────────────────────────
+# 06 §2.2 spells this tier's template as a ClusterRole, and everything it grants is a read over a
+# cluster's worth of objects, so it belongs in one. §2.2.1's grant does not: two of its verbs —
+# `create actionrecords` and the `actionrecords/status` update — change PERSISTED state, and
+# broker-operations-grant.yaml.template states the rule they follow in as many words. A
+# ClusterRoleBinding over them "would make the fleet's journal writable from any tenant, which is the
+# fleet-wide-writer shape V-BRK-012 forbids one layer down". So the grant keeps the split it already
+# had: cluster-scoped reads and the TokenReview above, the journal and the roster below, bound in
+# this agent's namespace only.
+#
+# V-BRK-013 property 4 asks the UNION of this tier's actor objects to equal its profile, precisely
+# because the grant is split this way — a per-object equality would forbid the split that 06 §2.2.1
+# and 08 §2.4 both require.
+#
+# ── THE WILDCARD RULE ──────────────────────────────────────────────────────────────────────────
+# `apiGroups: ["", "apps", "batch", "autoscaling", "policy"]` over `resources: ["*"]` is transcribed
+# from 06 §2.2 unchanged, narrowed to read verbs. It is admissible under `vap-agent-readonly`
+# validation 3 only through the read disjunct: the literal allow-list contains no `*`, so
+# `apps/*:get` is admitted because `get` is a read verb and for no other reason. A write verb on the
+# same rule would be denied by the same expression — which is the mechanism, not merely the
+# intention, that keeps this tier's write half dark until P10-T1.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ${AGENT_ACTOR_KSA}
+  labels:
+    kube-agents/tier: cluster-admin
+    kube-agents/role: actor
+rules:
+  # ── The READ half of 06 §2.2, cluster-admin ───────────────────────────────────────────────────
+  # Tenancy: namespaces and their guardrails.
+  - apiGroups: [""]
+    resources: ["namespaces", "resourcequotas", "limitranges", "serviceaccounts", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies", "ingresses", "ingressclasses"]
+    verbs: ["get", "list", "watch"]
+  # Tenant RBAC + child (developer-team) identity provisioning. NAMESPACED RBAC ONLY.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch"]
+  # Workloads across the cluster (add-ons and tenant remediation) — see the header on the wildcard.
+  - apiGroups: ["", "apps", "batch", "autoscaling", "policy"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  # Nodes: the read half of cordon/label/drain. The `pods/eviction` rule of 06 §2.2 is `create` only
+  # and so has no read half at all — it is absent rather than narrowed.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csidrivers", "volumeattachments"]
+    verbs: ["get", "list", "watch"]
+  # Node pools for its own cluster, via KCC.
+  - apiGroups: ["container.cnrm.cloud.google.com"]
+    resources: ["containernodepools"]
+    verbs: ["get", "list", "watch"]
+  # Provisioning its children (developer-team Agent CRs).
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["agents"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["get", "list", "watch"]
+  # ── 06 §2.2.1, the cluster-scoped half ────────────────────────────────────────────────────────
+  # step 1: authenticate the calling agent. Creates nothing; TokenReview is a request object.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # step 5: the brake. MUST be readable by every tier (06 §4.4).
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["fleetfreezes"]
+    verbs: ["get", "list", "watch"]
+  # step 4: classification input.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["changepolicies"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ${AGENT_ACTOR_KSA}
+  labels:
+    kube-agents/tier: cluster-admin
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ${AGENT_ACTOR_KSA}
+subjects:
+  - kind: ServiceAccount
+    name: ${AGENT_ACTOR_KSA}
+    namespace: ${AGENT_NAMESPACE}
+---
+# ── 06 §2.2.1, the namespaced half ──────────────────────────────────────────────────────────────
+# The journal and the approval roster. Same rules as the tier-neutral Role this supersedes, now
+# stamped with the tier so that V-BRK-013 can hold the union of this tier's objects to its profile —
+# an unstamped shared object belongs to every tier and is therefore evidence for none.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ${AGENT_ACTOR_KSA}
+  namespace: ${AGENT_NAMESPACE}
+  labels:
+    kube-agents/tier: cluster-admin
+    kube-agents/role: actor
+rules:
+  # step 11: the journal. `create` but never `update`/`delete` (06 §2.2.1, 03 §3.3 rule 4).
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords/status"]
+    verbs: ["get", "update", "patch"]
+  # step 7: approval input.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["approvalrosters"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ${AGENT_ACTOR_KSA}
+  namespace: ${AGENT_NAMESPACE}
+  labels:
+    kube-agents/tier: cluster-admin
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ${AGENT_ACTOR_KSA}
+subjects:
+  - kind: ServiceAccount
+    name: ${AGENT_ACTOR_KSA}
+    namespace: ${AGENT_NAMESPACE}

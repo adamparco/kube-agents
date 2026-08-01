@@ -23,6 +23,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/agentlabels"
@@ -187,7 +188,10 @@ func (s *Store) Create(ctx context.Context, ar *agentv1alpha1.ActionRecord) erro
 	for k, v := range Labels(ar) {
 		ar.Labels[k] = v
 	}
+	// Snapshotted BEFORE the Create, because the Create's reply body overwrites `ar.Status` with
+	// what the server kept -- which, for a subresource, is nothing. See the restore below.
 	want := ar.Status.Phase
+	born := ar.Status.DeepCopy()
 	if err := s.client.Create(ctx, ar); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			// Idempotent by construction: the same action id names the same record. Report it as
@@ -208,10 +212,21 @@ func (s *Store) Create(ctx context.Context, ar *agentv1alpha1.ActionRecord) erro
 	// leaving it empty inverted the two. Every parked record read back `status.phase: ""` while its
 	// label said `PendingApproval`, so 06 §4.3's ChatOps row (`PendingApproval -> Pending/Rejected`,
 	// and nothing else) had no `PendingApproval` to transition out of.
-	if want == "" {
+	// The same drop takes the whole status block, not just the phase, and the restore below has to
+	// put the whole block back. `status.timestamps.submitted` and `.classified` are composed by the
+	// broker at 06 §4.2 step 6 and are the half of the lifecycle clock that PRECEDES execution -- so
+	// they belong to the write-ahead record, the artifact whose durability V-BRK-006 is about. A
+	// record that becomes durable without them is durable without the evidence it exists to carry,
+	// and the broker then crashed on the nil `status.timestamps` at step 8 rather than merely
+	// losing it.
+	//
+	// Restoring only `phase` here was the narrower reading of the very defect the comment above
+	// describes: the code already knew the server drops the status block, and put one field back.
+	mergeOwnedStatus(&ar.Status, born)
+	ar.Status.Phase = want
+	if want == "" && !hasOwnedStatus(born) {
 		return nil
 	}
-	ar.Status.Phase = want
 	if err := s.client.Status().Update(ctx, ar); err != nil {
 		return fmt.Errorf("journal: create ActionRecord %s/%s: recording initial phase %q: %w (the action must not execute -- fail closed, 03 §6)", ar.Namespace, ar.Name, want, err)
 	}
@@ -231,6 +246,9 @@ func (s *Store) Get(ctx context.Context, namespace, actionID string) (*agentv1al
 // SetPhase writes a phase transition to status and keeps the status LABEL in step, in one call, so
 // the two cannot drift. It re-reads before writing: status conflicts are routine when the broker and
 // a controller both touch a record, and a conflict loop is far cheaper than a lost transition.
+//
+// It also carries the caller's OUTCOME -- see mergeOwnedStatus. A phase is a summary of an outcome,
+// and writing the summary while dropping the thing it summarises is what this used to do.
 func (s *Store) SetPhase(ctx context.Context, ar *agentv1alpha1.ActionRecord, phase agentv1alpha1.ActionPhase, message string) error {
 	var live agentv1alpha1.ActionRecord
 	if err := s.client.Get(ctx, client.ObjectKeyFromObject(ar), &live); err != nil {
@@ -243,6 +261,7 @@ func (s *Store) SetPhase(ctx context.Context, ar *agentv1alpha1.ActionRecord, ph
 	if err := agentv1alpha1.ValidateActionPhaseTransition(live.Status.Phase, phase); err != nil {
 		return fmt.Errorf("journal: refusing phase change on %s/%s: %w", ar.Namespace, ar.Name, err)
 	}
+	mergeOwnedStatus(&live.Status, &ar.Status)
 	live.Status.Phase = phase
 	live.Status.Message = message
 	if err := s.client.Status().Update(ctx, &live); err != nil {
@@ -260,11 +279,94 @@ func (s *Store) SetPhase(ctx context.Context, ar *agentv1alpha1.ActionRecord, ph
 	}
 	live.Labels[StatusLabel] = labelValue(string(phase))
 	if err := s.client.Update(ctx, &live); err != nil {
+		if apierrors.IsForbidden(err) {
+			// The one caller that cannot make this write is the BROKER, and it cannot make it by
+			// design: 06 §2.2.1 grants `actionrecords` only `get list watch create` plus
+			// `actionrecords/status get update patch`. `update` on the main resource is withheld on
+			// purpose -- the broker appends and advances status, and may never rewrite or remove a
+			// record -- and a label lives in metadata, so the index write is an `update` and always
+			// will be. Treating that as fatal made every terminal transition the broker took return
+			// a 500 for an action that had already executed AND already been journaled: the
+			// authoritative `status.phase` landed on the line above, through the subresource the
+			// grant does allow. Reporting that as a failure is not caution, it is a false negative
+			// in the audit trail, and it is the direction that loses truth.
+			//
+			// So: log and continue, exactly as the comment above promises. The reconciler's
+			// repairStatusLabel runs in the operator, which does hold `update`, and brings the index
+			// back into step on the next reconcile of this record.
+			//
+			// Narrow to Forbidden on purpose. A Conflict or a 500 here is a transient the caller may
+			// want to see; a Forbidden is the RBAC model working as specified, and the only way to
+			// "fix" it at the call site would be to widen a grant the spec closed deliberately.
+			logf.FromContext(ctx).V(1).Info(
+				"the status label could not be synced and will be repaired by the reconciler; status.phase is authoritative and already written (06 §4.3)",
+				"actionRecord", ar.Namespace+"/"+ar.Name, "phase", string(phase), "label", StatusLabel, "reason", err.Error())
+			// Deliberately NOT adopting live.Labels: the label write did not land, and handing the
+			// caller a copy that says it did would make an in-memory read of the index disagree with
+			// the server. Only status is adopted, because only status was written.
+			ar.Status = live.Status
+			return nil
+		}
 		return fmt.Errorf("journal: sync %s label on %s/%s: %w", StatusLabel, ar.Namespace, ar.Name, err)
 	}
 	ar.Status = live.Status
 	ar.Labels = live.Labels
 	return nil
+}
+
+// mergeOwnedStatus copies the status fields the OWNING BROKER owns from the caller's copy onto the
+// freshly-read live copy, leaving every field another principal owns exactly as the server has it.
+//
+// 06 §4.3's principals table is the whole specification of this function:
+//
+//	the owning broker SA      phase, observedGeneration, applied, verification, recovery, report,
+//	                          timestamps, message
+//	the undo controller       phase (to Undone only), undoneBy, contested, message
+//	the ChatOps gateway       approvals, phase, contested (clear only)
+//	the retention controller  nothing
+//
+// So `approvals`, `contested`, `undoneBy` and `exported` are never touched here: they belong to
+// other writers, they are read fresh from the server on the line above, and copying the caller's
+// idea of them back would be this broker overwriting a decision it did not make.
+//
+// WHY THIS EXISTS. `SetPhase` re-reads the record and writes `live`, so every status field the
+// caller had composed on its own copy was silently discarded -- and the pipeline composes four of
+// them: `status.applied` at step 9, `status.verification` and `status.recovery` at step 11, and the
+// lifecycle clock throughout. Only `phase` and `message` were ever reaching etcd. A live record from
+// `broker-execute-l2.sh` on 2026-07-31 read back with `phase: DryRun`, a message, and nothing else:
+// no timestamps, no applied set, no verification block. The audit trail said an action happened and
+// could not say what it did. `status.timestamps.executionStarted` is also V-BRK-006's L2 evidence,
+// so the write-ahead ordering had nothing to compare against and the check could not run at all.
+//
+// Nil-guarded per field rather than copied wholesale: a caller that never set a field must not blank
+// what the server holds, and `SetPhase` is used for plain transitions as well as for terminal ones.
+// hasOwnedStatus answers whether there is anything for the post-Create status write to carry. A
+// record born with neither a phase nor a composed outcome needs no second round trip, and skipping
+// it keeps Create a single call on the path that does not need two.
+func hasOwnedStatus(st *agentv1alpha1.ActionRecordStatus) bool {
+	return st != nil && (st.Timestamps != nil || len(st.Applied) > 0 || st.Verification != nil ||
+		st.Recovery != nil || st.Report != nil || st.ObservedGeneration != 0)
+}
+
+func mergeOwnedStatus(live, caller *agentv1alpha1.ActionRecordStatus) {
+	if caller.Timestamps != nil {
+		live.Timestamps = caller.Timestamps
+	}
+	if len(caller.Applied) > 0 {
+		live.Applied = caller.Applied
+	}
+	if caller.Verification != nil {
+		live.Verification = caller.Verification
+	}
+	if caller.Recovery != nil {
+		live.Recovery = caller.Recovery
+	}
+	if caller.Report != nil {
+		live.Report = caller.Report
+	}
+	if caller.ObservedGeneration != 0 {
+		live.ObservedGeneration = caller.ObservedGeneration
+	}
 }
 
 // List returns records in a namespace matching the given label selectors. A nil selector lists all.

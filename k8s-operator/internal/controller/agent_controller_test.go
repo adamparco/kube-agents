@@ -379,8 +379,16 @@ func TestAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
-	if res.RequeueAfter != 0 {
-		t.Errorf("expected RequeueAfter 0, got %v", res.RequeueAfter)
+	// The RuntimeClass exists, so the 30 s degraded retry must NOT fire. What does fire is the
+	// broker-health clock (brokerHealthRequeue) — a different fact with a different period, and the
+	// assertion names both so that "no degraded retry" cannot be satisfied by the reconcile simply
+	// having stopped coming back at all.
+	if res.RequeueAfter == 30*time.Second {
+		t.Error("RequeueAfter is the 30s degraded retry, but the RuntimeClass exists and nothing is degraded")
+	}
+	if res.RequeueAfter != brokerHealthRequeue {
+		t.Errorf("RequeueAfter = %v, want the broker-health period %v: status.broker.journalReachable has no watch behind it and goes stale without the clock",
+			res.RequeueAfter, brokerHealthRequeue)
 	}
 
 	// Verify Deployment was created with RuntimeClassName "gvisor"

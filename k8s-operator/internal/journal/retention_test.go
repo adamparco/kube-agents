@@ -16,6 +16,10 @@ limitations under the License.
 
 package journal
 
+// V-REV-008 (L1, 09 §6.3): undo retention honours the class-based TTL and a record is not GC'd
+// before export confirms. The table below is the L1 half; the L4 (wall-clock) instance watches a
+// real retention controller. Registered in verification/implementations.yaml.
+
 import (
 	"strings"
 	"testing"

@@ -15,20 +15,23 @@
 #              test_inject_auth (S1 — /sessions + /inject reject no/invalid bearer & owner mismatch) +
 #              test_inject_render (S2 — {kind:alert|github|escalation} render, unknown kind → 400).
 #   P4-K2 (b)  An escalation written by a lower tier is picked up by its parent — never a direct call.
-#              HERMETIC: test_raise_escalation (writes knowledge/escalation/<slug>.md via submit-suggestion
-#              --dry-run; parent re-derives its own scope, ignores `to:`) + read_knowledge retrieves it.
 #              STRUCTURAL (invariant 3): the child egress NetworkPolicy carries NO parent-tier destination
 #              (no agent→agent path); cross-tier flow is GitOps remote + loopback only.
+#              The skill-level half was test_raise_escalation, which tested a module the P13-T5 persona
+#              conversion deleted (`raise-escalation` → `escalate`); its property now lives in
+#              dev/tests/mesh-skills-encode-the-contract.py on the L0 chain, and the invocation is gone
+#              from this gate rather than left pointed at a file that errors at import.
 #   P4-K3 (c)  An agent retrieves a runbook via the OKF read-only path (can never become a write path).
 #              HERMETIC: test_read_knowledge (sparse knowledge/-ONLY checkout — clusters/ never materializes,
 #              read script hard-refuses push/commit) + okf-validate PASS on the seeded tree.
 #   P4-K4 (d)  Per-tier heartbeats run SCOPED audits; anything to change goes through propose→review.
 #              HERMETIC: test_heartbeat_sops (cluster-admin=one cluster, dev-team=one namespace w/ over-reach
-#              guard; NO_REPLY when healthy; change → submit-suggestion, never a direct mutation; backstop).
+#              guard; NO_REPLY when healthy; change → apply-change, never a direct mutation; backstop).
 #   P4-K5 (e)  Inject drift → the Platform Agent opens a corrective PR unprompted, never a direct fix.
 #              HERMETIC: test_detect_drift (desired-authoritative, server-default-tolerant read-only diff;
-#              drifted live object still present — detect-and-propose, never fix) + test_submit_suggestion
-#              (--dry-run halts after the local branch+commit, before git push / gh pr create).
+#              drifted live object still present — detect-and-propose, never fix). The second half was
+#              test_submit_suggestion, whose module the P13-T5 conversion deleted (`submit-suggestion` →
+#              `apply-change`); dev/test_apply_change_skill.py carries that behaviour now.
 #   REGRESS    LIVE on the deployed Phase-3 stack: negative-attenuation.sh (03 §11 — write / impersonate
 #              / wrong-scope DENIED) + read-only per-tier SAR still holds (invariant 1 under a push trigger);
 #              08 §7 controller-mints-no-RBAC (go golden — controller ClusterRole has no rbac apiGroup).
@@ -128,8 +131,8 @@ note "LIVE Event→session spawn needs the Phase-4 watcher image deployed (dev/c
 
 # --- P4-K2 (b): escalation round-trip is indirect (GitOps/OKF only, invariant 3) ---------------
 echo; echo "== P4-K2 (b): escalation written by a child, picked up by parent — never a direct call =="
-pytest_ok "raise-escalation writes escalation/<slug>.md via submit-suggestion --dry-run; parent re-derives own scope" \
-          "dev/test_raise_escalation.py"
+# RETIRED: dev/test_raise_escalation.py tested the deleted raise-escalation module; the escalate half
+# is now covered by dev/tests/mesh-skills-encode-the-contract.py, which is on the L0 chain.
 # Structural invariant 3: the child egress allowlist has NO parent-tier destination (no agent→agent path).
 # Strip full-line comments (they legitimately name other tiers in prose), then look for a tier SELECTOR.
 if grep -vE '^[[:space:]]*#' "$DEVEG" | grep -qE 'kube-agents/tier:[[:space:]]*(cluster-admin|platform)'; then
@@ -163,8 +166,8 @@ pytest_ok "heartbeat SOPs: cluster-admin=cluster / dev-team=namespace-only (over
 echo; echo "== P4-K5 (e): drift detection — read-only diff → corrective-PR artifact, never a direct fix =="
 pytest_ok "detect-drift: desired-authoritative server-default-tolerant read-only diff; drifted object still present" \
           "dev/test_detect_drift.py"
-pytest_ok "submit-suggestion --dry-run halts after local branch+commit — no git push, no gh pr create" \
-          "dev/test_submit_suggestion.py"
+# RETIRED: dev/test_submit_suggestion.py tested the deleted submit-suggestion module; the
+# apply-change skill replaced it and dev/test_apply_change_skill.py carries the same behaviour.
 
 # ============================ LIVE REGRESSION (L2, load-bearing) ============================
 # Runs against the already-deployed Phase-3 stack (no Phase-4 image needed). Skips (flagged, non-fatal to

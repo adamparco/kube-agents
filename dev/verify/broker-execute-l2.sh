@@ -125,6 +125,20 @@ DRIVER_CM=broker-execute-l2-code
 UNTRUSTED_SECRET=broker-execute-l2-untrusted
 PROBE=dev/verify/fixtures/broker_execute_probe.py
 
+# NEGATIVE CONTROL DOES NOT EXERCISE: (LSN-060, and this suite is the lesson.) The control
+# SYNTHESISES the record document — thirteen mutated JSONs handed straight to the assertion block —
+# so everything upstream of the assertions is unmeasured by it:
+#   - the envelope build and the HTTP POST to the deployed broker (L2-0). A synthesised document
+#     is not a broker's output; the ¬ arm cannot tell a running broker from an absent one
+#   - the API-server lookup of the record by name (L2-1). This is not hypothetical: the arm asked
+#     for the RAW action id for as long as it existed, against objects named `ar-<lowercase ULID>`
+#     (`journal.RecordName`, 06 §4.3), and could not have found a record against any commit. The
+#     ¬ arm was 13/13 green throughout, because it never ran the line
+#   - the P1 digest arms and the broker's Availability, which run before either mode
+#   - the read of the TARGET object (L2-3b). The control mutates the record's own document to
+#     claim a mutation happened; it never asks the cluster whether one did
+# What it does prove, and all it proves: the assertion block is not always-green — each of the
+# thirteen defects is caught by the arm that targets it, named in the output.
 fail=0
 
 # EVERY ARM IS COUNTED, AND THE COUNT IS ASSERTED AT THE END. `broker-auth-l2.sh` carries the full
@@ -436,7 +450,12 @@ cleanup() {
   echo "  and a suite that tried would hang on its own evidence. The record is also the artifact a"
   echo "  human reads when this run goes red."
 }
-trap cleanup EXIT
+# P12 ([[LSN-066]]): this trap is installed AFTER p10_assert_control_plane_healthy, whose
+# p12_assert_exclusive_l2 took the one-suite-per-cluster lock and put `_l2_lock_exit_handler` on
+# EXIT. Replacing that trap here would leak the lock to the next acquirer's stale break, so the
+# release is chained in. It cannot change this script's exit status: bash runs the EXIT trap with
+# the pending status and only an explicit `exit` inside the trap overrides it.
+trap 'cleanup; l2_lock_release' EXIT
 
 # ------------------------------------------------------------------------------------------------
 # Fixtures
@@ -582,6 +601,13 @@ broker_driver_untrusted_keypair "$K" "$NS" "$UNTRUSTED_SECRET" || {
 # a second agent that the fixtures never seeded would fail the token mint for no purpose.
 driver_out="$(broker_driver_run "$K" "$NS" "$AGENT" "$AGENT" "$DRIVER_POD" "$DRIVER_CM" "$UNTRUSTED_SECRET")"
 driver_rc=$?
+if [ "$driver_rc" -eq 4 ]; then
+  echo "FAIL: two submissions collided onto one actionId ([[LSN-067]]). The experiment RAN and the"
+  echo "  instrument read it, so this is a measurement and not an inability to measure: every arm"
+  echo "  after the first was answered by the first submission's record, and the verdicts taken"
+  echo "  through it are void. A FAIL, never a DEFERRED (09 §11.8)."
+  exit 1
+fi
 if [ "$driver_rc" -ne 0 ]; then
   echo "DEFERRED: the driver pod could not be run to completion, so no envelope was ever submitted."
   echo "  An inability to run the experiment, not a property that failed (P10's distinction)."
@@ -667,24 +693,37 @@ pass "the envelope was accepted — HTTP $sub_status, decision '$(field shadow-s
 echo
 echo "== L2-1: the ActionRecord the broker named is in the API server =="
 
+# THE OBJECT NAME IS NOT THE ACTION ID. `journal.RecordName` is `"ar-" + strings.ToLower(actionID)`
+# (06 §4.3, k8s-operator/internal/journal/ulid.go) — lowercased because an object name must be a DNS
+# subdomain, and a ULID is uppercase. This line asked for the raw id for as long as it has existed
+# and could not have found the record against ANY commit; it went unnoticed because the only thing
+# that had ever exercised it was `--negative-control`, which synthesises the record document and
+# feeds it straight to the assertion block, never touching the lookup. An arm whose ¬ form skips the
+# very statement under test is an arm nothing has measured.
+#
+# Derived here rather than read off the reply on purpose: the reply is the broker's claim, and the
+# whole point of L2-1 is to check that claim against the API server. Deriving the name the same way
+# the broker's own code derives it keeps the two joined by the rule, not by a returned string.
+record_name="ar-$(printf '%s' "$action_id" | tr '[:upper:]' '[:lower:]')"
+
 # Polled (P9). The reply is the broker's word that it wrote the record; the poll is the API server's.
 # 30s because a durable write that has not landed in half a minute is not slow, it is absent — and
 # the poll must not be generous enough to hide a broker that reports before it writes.
 RECORD=""
 deadline=$((SECONDS + 30))
 while [ "$SECONDS" -lt "$deadline" ]; do
-  RECORD="$($K -n "$record_ns" get actionrecord "$action_id" -o json 2>/dev/null)"
+  RECORD="$($K -n "$record_ns" get actionrecord "$record_name" -o json 2>/dev/null)"
   [ -n "$RECORD" ] && break
   sleep 2
 done
 
 if [ -z "$RECORD" ]; then
-  bad "the broker answered with actionId '$action_id' in namespace '$record_ns' and no such ActionRecord exists 30s later. The reply named a journal entry that was never written."
+  bad "the broker answered with actionId '$action_id' in namespace '$record_ns' and no ActionRecord named '$record_name' exists 30s later. The reply named a journal entry that was never written."
   echo
   echo "  what IS in $record_ns:"
   $K -n "$record_ns" get actionrecords 2>&1 | sed 's/^/    /'
 else
-  pass "ActionRecord $record_ns/$action_id exists — read from the API server, not from the reply body"
+  pass "ActionRecord $record_ns/$record_name exists — read from the API server, not from the reply body"
 fi
 
 # ------------------------------------------------------------------------------------------------
@@ -714,6 +753,21 @@ if [ "$assertions" -ne "$EXPECTED_ASSERTIONS" ]; then
   echo
   bad "only $assertions of $EXPECTED_ASSERTIONS assertions ran. The verdict below would be about arms that never executed."
 fi
+
+# ------------------------------------------------------------------------------------------------
+# [[LSN-067]] once for the whole run, not once per arm. The driver's action ledger is cumulative
+# across this entire process, so this is the only place the whole population can be counted at once.
+# broker_driver_run already asserts after every submission, but every call site in this file maps a
+# non-zero driver rc to DEFERRED — an inability to run the experiment — and THIS verdict is not
+# that: it says the submissions did run and did not mint one action each, so an arm above was
+# answered by a record some other submission minted. Scored so it reaches the exit code.
+#
+# AFTER the assertion-count guard, so a red here can never make that guard report "only N of M" with
+# N greater than M. BEFORE the ledger is deleted, which cleanup does from the EXIT trap — i.e. after
+# this line. Zero submissions returns 0 and prints NOT-EVALUATED: this is the instrument check, not
+# a claim that anything was submitted.
+broker_driver_assert_distinct_actions ||
+  bad "LSN-067: the submissions this run made did not mint one distinct actionId each, so at least one arm above was scored against another submission's record. The instrument failed; the verdicts measured through it are void."
 
 echo
 echo "===================================================================="

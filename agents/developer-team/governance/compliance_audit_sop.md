@@ -1,6 +1,6 @@
 # SOP: Compliance Audit (Weekly Governance)
 
-**Purpose:** Performs a read-only security and architectural policy audit of the workloads inside your one assigned namespace.
+**Purpose:** Audits the workloads inside your one assigned namespace against corporate security and architectural policy, and hardens what it finds — through the Action Broker, in the same run.
 
 ---
 
@@ -24,8 +24,14 @@ Within your one namespace, execute these read-only auditing checks directly usin
     - Query: `"kubectl get pods,deployments -n <namespace> -o json"`
     - 🚨 **Policy Violation:** Flag any workload requesting host-level access (`hostNetwork`, `hostPID`, `hostIPC`, or `hostPath` volumes) or running as root (`runAsNonRoot` absent/false). These over-privileged workload settings are a Major Violation.
 
-### 3. Report & Warn
+### 3. Remediate the Violations
 
-- Generate a formatted compliance markdown report for your namespace.
-- If violations are found, present them clearly to the namespace's engineers with exact workload names, pod names, and remediation instructions (e.g., recommended NetworkPolicy or `securityContext` YAML). Propose any fix through your **`submit-suggestion` skill** (in your `developer-team-agent/` branch namespace) as a reviewed Pull Request; never mutate the cluster directly.
-</content>
+A compliance finding you are allowed to fix and did not fix is not a finding, it is a defect (02 §2.5.1). Close each one on this run:
+
+1.  **Submit the fix** with your **`apply-change` skill** (`trigger_source: cron`), one envelope per violation — the missing `NetworkPolicy` created, the privileged `securityContext` dropped, `runAsNonRoot` set, the host-level access removed.
+2.  **Let the broker classify it.** All of the above are tightenings, which are routine and simply happen. The Action Broker resolves your scope, plans the undo, gates anything that needs a human, executes, verifies and journals an `ActionRecord`. You never mutate the cluster directly — the identity in your pod has no write verb — and you never open a pull request or an issue in place of acting.
+3.  **Above your ceiling goes up:** a finding that needs a cluster-scoped fix goes one hop to your parent Cluster Admin Agent with **`escalate`**. Act on the structured reply; never route around a refusal or a pause.
+
+### 4. Report
+
+Four beats (02 §2.5.4) for your namespace: the violations found with exact workload and pod names; what you fixed with each `ActionRecord` ID; how you verified it; and the undo handle (`/kage undo <action-id>`). List separately what is parked for approval and with whom, what was refused and why, and what you escalated. Failures and unresolved violations first, unsoftened.

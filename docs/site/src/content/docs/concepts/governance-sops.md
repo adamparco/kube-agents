@@ -13,7 +13,7 @@ The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kub
 
 ### `blueprint_sync_sop.md`
 
-Daily audit of clusters against master blueprint definitions. Flags drift (a cluster running with a different node pool spec than its blueprint) and — via the declarative workflow — proposes reconciliation.
+Daily audit of clusters against master blueprint definitions. Flags drift (a cluster running with a different node pool spec than its blueprint) and — via the declarative workflow — submits the correction, one envelope per cluster. Drift _inside_ a cluster belongs to that cluster's agent and is delegated in one hop.
 
 Invoked by the [`blueprint-sync`](/kube-agents/concepts/autonomous-watchdogs/) watchdog at 09:00 daily.
 
@@ -31,7 +31,7 @@ Invoked by the [`fleet-wide-cost-analysis`](/kube-agents/concepts/autonomous-wat
 
 ### `global_capacity_orchestrator_sop.md`
 
-Hourly cross-cluster utilization audit. Identifies hot regions and cold regions; proposes rebalancing (moving workloads, adjusting HPA, changing compute classes) via the declarative workflow.
+Hourly cross-cluster utilization audit. Identifies hot regions and cold regions; submits the rebalancing (capacity-pool and ComputeClass adjustments) via the declarative workflow. Adding capacity is routine; taking it away from a running workload is classified accordingly.
 
 Invoked by the [`global-capacity-orchestrator`](/kube-agents/concepts/autonomous-watchdogs/) watchdog hourly.
 
@@ -43,7 +43,7 @@ Invoked by the [`lifecycle-deprecation-manager`](/kube-agents/concepts/autonomou
 
 ### `obtainability_audit_sop.md`
 
-Daily audit for rigid capacity allocations — pods that pin to a specific machine type when a `ComputeClass` would give them flexibility. Auto-generates YAML patches to migrate workloads onto flexible capacity pools.
+Daily audit for rigid capacity allocations — pods that pin to a specific machine type when a `ComputeClass` would give them flexibility. Submits the patches that migrate workloads onto flexible capacity pools, one envelope per workload.
 
 Invoked by the [`obtainability-audit`](/kube-agents/concepts/autonomous-watchdogs/) watchdog daily at 12:00.
 
@@ -55,7 +55,7 @@ Invoked by the [`policy-propagation`](/kube-agents/concepts/autonomous-watchdogs
 
 ### `security_patch_orchestrator_sop.md`
 
-Daily CVE scan against node OS and workload images. Coordinates staggered emergency GKE upgrade rollouts (canary, then rolling) when critical CVEs land. Escalates for human confirmation before triggering any upgrade.
+Daily CVE scan against node OS and workload images. Carries out staggered emergency GKE upgrade rollouts (dev/staging, a 30-minute health soak, then production) when critical CVEs land. The production control-plane upgrade is **gated** — the broker parks it for a human on the approval roster and nothing changes until that person approves.
 
 Invoked by the [`security-patch-orchestrator`](/kube-agents/concepts/autonomous-watchdogs/) watchdog daily at 11:00.
 
@@ -71,19 +71,19 @@ Each SOP is a Markdown file with a small number of sections (loose convention, n
 
 1. **Scope** — which clusters, namespaces, or resource kinds the SOP covers.
 2. **Procedure** — the exact diagnostic queries the agent should run and what to look for.
-3. **Remediation policy** — what to do with findings (open a PR, post to Chat, both).
+3. **Remediation policy** — what to do with findings (submit the fix, delegate it to the tier that owns it, post to Chat).
 
 The cron watchdog invokes the SOP by prompting the agent to "read `/opt/defaults/governance/<sop>.md` and execute". The SOP is loaded once, executed, and the run terminates when the SOP's completion criteria are met.
 
 ## SOPs vs. skills
 
-- A **skill** is a reusable capability (how to onboard an app, how to submit a PR, how to query costs).
+- A **skill** is a reusable capability (how to onboard an app, how to submit a change, how to query costs).
 - An **SOP** composes skills into a fleet-wide procedure with a policy for when to act.
 
-`fleet_wide_cost_analysis_sop.md` uses the `gke-cost-analysis` skill; `security_patch_orchestrator_sop.md` uses `gke-cluster-lifecycle`; `blueprint_sync_sop.md` uses `submit-suggestion` for its remediation step.
+`fleet_wide_cost_analysis_sop.md` uses the `gke-cost-analysis` skill; `security_patch_orchestrator_sop.md` uses `gke-cluster-lifecycle`; `blueprint_sync_sop.md` uses `apply-change` for its remediation step.
 
 ## Where to go next
 
 - [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) — the schedules that invoke SOPs.
 - [Skill catalog](/kube-agents/skills/) — the capabilities SOPs compose.
-- [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — how SOP-generated remediations become PRs.
+- [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — how SOP-generated remediations become executed changes.

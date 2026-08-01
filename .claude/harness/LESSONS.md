@@ -88,8 +88,20 @@ will start selecting.
 | **LSN-057** | harness, checks, corpus-discovery, false-positive, LSN-035 | `negative-controls-name-their-rule.py` discovered its corpus as *every `dev/tests/*.py` containing the string `--negative-control`*. The moment a check appeared that SEARCHES other files for that flag — `invariants-gate.py`'s new LSN-053 arm — the substring swept the searcher in and reported it as a control file with no control. The file's own docstring had already argued **WHY BEHAVIOURAL AND NOT STRUCTURAL** for the scoring half while the discovery half stayed textual | **closed** | `dev/tests/negative-controls-name-their-rule.py` (on `dev/L0-CHAIN.txt`): discovery is now a behaviour — a file is in the corpus if its own argv handling dispatches on the flag (`"--negative-control" in argv` and its spellings, or an `add_argument`) or if a usage line offers the flag against the file's own name. Splitting the two signals bought a new property for free — a usage line that offers the flag with nothing dispatching on it is its own finding, because the documented command then runs the ordinary check and prints its ordinary PASS. Two new cases in the file's own `--negative-control`, one of them the exact searcher that caused this |
 | **LSN-058** | harness, tooling, false-red, concurrency, go | CHECKPOINT now requires both the L0 chain and `make -C k8s-operator test` ([[LSN-052]]/[[LSN-054]]), so the obvious saving is to run them at once. Doing that produced a red naming a file nobody wrote: five python suites create temp directories **inside** `k8s-operator/`, `controller-gen` runs with `paths="./..."`, and the directory is deleted while it is reading — `tmp109n_mmw/main.go:1: no such file or directory`, then `Error: not all generators ran successfully`. It points at no defect and vanishes on a serial re-run | **closed** | `dev/test_action_envelope.py`, `dev/test_envelope_wire_keys.py`, `dev/test_invariants_gate.py` (all three on `dev/L0-CHAIN.txt`): every `TemporaryDirectory(dir=…k8s-operator…)` takes `prefix="."`. Go tooling skips dot-directories under `./...`; Python globbing does not, so the suites that need to SEE the directory still do. Verified by re-running the two commands concurrently — the pairing that produced the red — and getting `GO=0 PYTHON=0` |
 | **LSN-059** | harness, tooling, resource-leak, envtest, self-reinforcing | `make -C k8s-operator test` measures **2m09s** warm against a caller whose default time bound is **two minutes**, so it is killed seconds from finishing — and envtest starts a real etcd **and** kube-apiserver per test binary, stopped in `TestMain` after `m.Run()` returns, which a `SIGKILL` never reaches. The machine accumulated **32** adopted control planes, 30 at `ppid=1`, holding **1375 MB** of 16 GB, oldest ~31h. Nothing on the machine reaps them, no exit code mentions them, and every suite stays green: the only symptom is that the machine gets slower — which makes the next run likelier to hit the same bound and abandon the next cohort | **closed** | `dev/reap-envtest.sh` — anchored at the left edge of the asset root ([[LSN-005]] applied to a process) and predicated on `ppid == 1`, so a concurrent `make test` is never touched — wired into `k8s-operator/Makefile` as a **prerequisite** of `test` (the load-bearing half: it runs after however the previous run died) plus a `trap … EXIT INT TERM` (the tidy half). `dev/tests/invariants-gate.py` (`check_envtest_control_planes_are_reaped`, L0-CHAIN) holds all five halves including the two safety predicates inside the script; `dev/test_reap_envtest.py` (18 behavioural tests on real processes, `unittest discover dev`, L0-CHAIN); controls in `dev/test_invariants_gate.py`. The caller's own timeout is **not** mechanizable from this tree — argued in the body |
+| **LSN-060** | verification, negative-control, l2, self-concealing | `broker-execute-l2.sh`'s L2-1 arm looked the ActionRecord up by raw action id. The object name is `journal.RecordName` = `"ar-" + strings.ToLower(actionID)` (06 §4.3), so the lookup **could not have found a record against any commit** — yet the suite had never reported it, because the only thing that had ever exercised that arm was `--negative-control`, which **synthesises the record document** and feeds it straight to the assertion block. The ¬ form skipped the very statement under test, so 13/13 green measured an arm that had never run | **closed** | The arm derives `record_name` from the action id and the lookup is now exercised by the live path (`dev/verify/broker-execute-l2.sh`, PASS L2-1 naming `ar-01kyv…`). `dev/tests/invariants-gate.py` (`check_negative_controls_exercise_the_statement_under_test`, L0-CHAIN) fails any `--negative-control` block that synthesises an input the live path obtains from the cluster, unless the arm names the statement it is skipping |
+| **LSN-061** | go, kubernetes, api-semantics, subresource, silent-loss | `status` is a **subresource**: a Create keeps spec and metadata and **discards the whole status block**. `journal.Store.Create` had known that since Phase 5 — it re-writes `status.phase` afterwards — and put back exactly **one field** of the block it knew had been dropped. Everything else the broker composes at 06 §4.2 step 6 went with it, including the lifecycle clock the write-ahead rule exists to make observable; and the Create's reply body **overwrote the caller's copy**, so the pipeline reached step 8 holding a nil `status.timestamps` and **panicked on a live cluster** at the one moment a failure is unrecoverable. Symmetrically, `SetPhase` re-read the record and wrote the LIVE copy, discarding every field the caller had composed | **closed** | `mergeOwnedStatus` — the six fields 06 §4.3 assigns the owning broker SA, nil-guarded per field, snapshotted **before** the Create — used by both `Create` and `SetPhase` (`k8s-operator/internal/journal/store.go`). `state.clock()` makes the pipeline's stamping nil-safe. The journal package's fake client has modelled the subresource drop since it was written (`dropStatusLikeTheApiServer`); the pipeline's fake now models it too under `dropStatusOnCreate`. `verification/mutants/V-BRK-006.json` 15/15, M13/M14/M15 targeting exactly this. Run by `make -C k8s-operator test` (the L1 half) and by `dev/verify/broker-execute-l2.sh` (L2-CHAIN line 261), whose L2-2 arm is the property itself: `creationTimestamp` from the API server against `status.timestamps.executionStarted` from the broker |
+| **LSN-062** | records, verification, orient | A harness record states that a file "does not exist", and the file is right there. `P9-T11g-2a`'s split note said `verification/traceability.yaml` did not exist. It had existed since `P8-T10` — 71 KB, 177 entries, V-MET-011's artifact, green on every run. The question actually asked was *"does 09 §8's `R-<doc>.<section>-<n>` requirement mapping exist?"* — a correct **no** — and the answer was written down against the **filename §8 happens to use for it** rather than against the question. The unit's conclusion survived; its published reason did not, and it shipped in a commit message, a phase-file row and a ledger cell before the next ORIENT caught it | closed | `invariants-gate.py` `check_absent_path_claims_are_true` (pass 07). Past tense + an ISO date **in the same sentence** is the only exemption; three real findings in `docs/build/phase-9.md` on day one |
+| **LSN-063** | checks, verification, mutation-testing | A negative-control row prints `MISS`, and the mutation it names never applied | closed | `dev/mutate.py`, exercised by `dev/test_mutate_sweep.py` under `python3 -m unittest discover dev` — `DID_NOT_APPLY` shared by three arms, of which `Snapshot.unchanged()` is the only form-independent one, plus `sweep`'s `known_tests()` refusal and a summary that always prints the BROKEN count (pass 07) |
+| **LSN-064** | checks, verification, L2, shell | Every assertion ran on the right-hand side of a pipe, so `fail=1` landed in a subshell and the suite could not go red | closed | `cluster-check-hygiene.py` `check_pipeline_failure_flag` (pass 07). Quote-aware lexer, per-script derived candidate set, and it flags the LAST component too — the literal reading of this lesson would have been green on the defect it is named for |
+| **LSN-065** | checks, verification, L2, shell, self-concealing | `IFS=$'\t' read … <<<"$(fn)"` — an assignment prefix is already in effect while the here-string operand is expanded, so the function ran with `IFS=<tab>`, unquoted `$K` stopped splitting on spaces, and every `kubectl` became one command name that does not exist. The `2>/dev/null` on each status read ate the `command not found`, so a live cluster was reported as a pod with no phase and a CR with no conditions — the exact shape the suite exists to report | closed | `cluster-check-hygiene.py` `check_assignment_prefix_redirect` (pass 07). Found a live third instance at `actor-grant-sweep-l2.sh:704`, left strict and WAIVED by script so the fix makes the waiver stale |
+| **LSN-066** | verification, L2, concurrency, false-red, derived-rosters | `reader-scope-l2.sh` (V-CTN-001, BLOCKING-ALWAYS) went red with 102 failures against a ServiceAccount owned by a **different L2 suite running at the same time**. Neither artifact is wrong: the roster is derived from the reader label ([[LSN-036]]) and the fixture carries that label because it is rendered by the shipped renderer ([[LSN-024]]). Both obvious repairs are refused — one re-introduces LSN-024, the other weakens a BLOCKING-ALWAYS check | closed | Precondition **P12** — `preconditions.sh` `p12_assert_exclusive_l2`, called from the top of `p10_assert_control_plane_healthy` and taking `l2-lock.sh`'s `l2_lock_guard` keyed on the `--context` in the invocation itself. One definition site, inheriting the roster `check_l2_scripts_assert_cluster_health` already enforces. `invariants-gate.py` `check_l2_lock_is_wired` asserts the three links **and** that no post-lock `EXIT` trap drops the release (seventeen did; bash replaces the handler) · `test_invariants_gate.py` `L2LockIsWired`, nine arms |
+| **LSN-067** | checks, verification, L2, broker, idempotency, false-red, self-concealing | `brake-l2.sh` submitted a **fixed** envelope eleven times and got one `actionId` — 1 `accepted`, 10 `deduplicated`. 06 §4.1's idempotency key is a sha256 over identity + operations + dryRun, so a probe with a constant target IS the same action every time, and every arm after the first was answered by the first submission's record: two arms red where the stale answer disagreed, nine vacuously green where it agreed | closed | `broker-driver.sh` `broker_driver_assert_distinct_actions` (reached from `dev/verify/brake-l2.sh` and six sibling suites on `dev/L2-CHAIN.txt`), called by `broker_driver_run` after every submission and once more terminally by each of the seven submitting suites. Its failure returns **rc 4, not rc 1**, and all nine call sites give rc 4 its own arm: a measured collision is a FAIL, where rc 1 is the driver that would not run and maps to DEFERRED. Sharing one code would have filed a measurement as an inability to measure — a deferral with no external blocker (09 §11.8) on a BLOCKING-ALWAYS suite |
+| **LSN-068** | fixtures, verification, L2, networkpolicy, dns, install-path, prose-is-not-mechanization | The operator's `<agent>-to-broker` policy is **Egress-only**, so it makes the reader pod default-deny for every other egress including DNS; rule 1 of the tier allowlist owns DNS and `provision_13` applies it, which a scratch cluster never runs. `startup-ordering-l2.sh` read `context deadline exceeded` on the init container's first probe while the broker Deployment said 1/1/1 — and the opposite arm, which expects that timeout, was passing for free. `broker-driver.sh`'s header had stated the whole fact in an earlier phase | closed | All three landed: `dev/lib/shipped-render.sh` (one renderer, [[LSN-024]]) · precondition **P11**, `preconditions.sh` `p11_assert_namespace_admits_dns`, tier argument REQUIRED · and the product-side arm, `dev/verify/tier-egress-render-l2.sh` arm 1, on `dev/L2-CHAIN.txt`. P11 also parses its jsonpath by splitting on TAB **by hand**: `IFS=<tab> read` collapses runs of tabs, and the live install's `default-deny-all` really does emit three consecutive ones, which made the empty-podSelector branch unreachable |
+| **LSN-069** | networkpolicy, install-path, provisioning, dataplane-v2, broker, silent-failure, product-defect | Rule 9 pinned the `kubernetes` **ClusterIP** and the **kubeconfig endpoint**; GKE Dataplane V2 DNATs before scoring egress, so the packet carries the **`endpoints/kubernetes`** address (10.150.0.9 scratch / 10.150.0.2 live) which `resolve_apiserver_cidrs` never read. The broker blocks in `startSources()` BEFORE its listener opens, so the symptom is an EMPTY log and `connection refused` on both probes | closed | `common.sh` `resolve_apiserver_cidrs` reads `endpointslices` (then `endpoints`) first and emits all three /32s, deduplicated — proved by adding one /32 to the live namespace: broker `1/1` in one probe period. Held by `dev/verify/tier-egress-render-l2.sh` arm 2, on `dev/L2-CHAIN.txt`, which asserts the rendered rule 9 covers an address the API server actually answers on. Its subject is the RENDER; the installed object is a separate arm and the live `platform-egress` has no rule 9 at all, scheduled as **P10-T0c** |
+| **LSN-070** | rbac, retirement, install-path, gitops, agent-authored-assets, revocation | A retirement was applied to ONE renderer and read as a repo-wide fact. `12c509d` deleted the namespaced `Role kubeagents-broker-operations` and the `RoleBinding ${AGENT_READER_KSA}-broker-operations` from `k8s-operator/scripts/`, and the note that closed it said no template renders them. **Five other files still do** — the reference GitOps tree and, with production consequence, the assets an agent PROPOSES in `propose-cluster-admin` and `propose-developer-team`. A tier brought up through the GitOps path creates the retired object fresh, from a template, today. Two lifecycle gaps hold it there: `kubectl apply` never deletes what a template STOPPED rendering, and `delete_agent_identity` deletes the identically-named **ClusterRoleBinding** and not the namespaced RoleBinding | **open** | Measured on the scratch cluster 2026-08-01: the residue confers **no verb the shipped per-tier Role does not**, confirmed against `team-x`'s residue-free actor as a live control, so this is an **unrevocability** defect and not an escalation — and a future narrowing of the actor grant would be a silent no-op for two of three tiers. Mechanization in flight: `dev/tests/retired-objects-are-not-rendered.py`, deriving the property that the kinds rendered under a name by the install path must cover the kinds rendered under that name anywhere else |
+| **LSN-071** | verification, negative-control, regex, forbidden-set, cloud-cli, check-that-lies | The FORBIDDEN-command scan for a mutating `gcloud` matched only the two-token `gcloud <noun> <verb>` shape, and essentially every mutating gcloud command an agent would reach for is **three** tokens. It read green for its whole life because no fixture ever spelled a real one; the miss surfaced only when a control row was written with the canonical `gcloud container clusters update prod` and **did not fire**. A forbidden-set pattern is only as strong as the most realistic spelling anyone tried against it | **open** | Disclosed in-file at `dev/test_apply_change_skill.py:344-350`; the control row stands at a form the pattern does claim to catch, so nothing reads green that is not. Not fixed in-unit under Guardrail 9 — the unit that found it is a persona conversion, and editing the check there is the exact coupling the guardrail forbids. Owed at the next improvement pass: widen to `gcloud(\s+[a-z0-9-]+){1,3}\s+(create\|delete\|update\|patch\|set\|enable\|disable\|add\|remove\|import\|deploy)\b`, derive the verb set from the world rather than from the assertion, add one control row per token depth, then sweep every other forbidden-set pattern in the corpus for the same shape |
 
-**Open: 0 of 59**.
+**Open: 2 of 71**.
 
 **The threshold was crossed and this file is the result** (`binding.md` §Thresholds: _"> 5 open ⇒
 the next invocation is an improvement pass and nothing else"_). The improvement pass of 2026-07-25
@@ -3443,3 +3455,809 @@ killed exactly the three orphans and left the live pair alone — the live test 
 Finally, end to end: two orphans created, `make -C k8s-operator test` run, whose first line was
 `reap-envtest: reaped 2 envtest process(es) (~263 MB); 1 needed SIGKILL after 5s.`, the suite green,
 the exit trap reporting nothing left to reap, and `--list` afterwards returning 0.
+
+## LSN-060 — The negative control skipped the statement under test, so 13/13 measured nothing
+
+**Tags:** verification, negative-control, l2, self-concealing
+**Opened:** 2026-07-31 (P9-T9b-5b-0-iii)
+**Status:** closed — mechanized in the same unit
+
+**What happened.** `dev/verify/broker-execute-l2.sh`'s L2-1 arm asks the API server for the
+ActionRecord the broker just created, then hands the document to a shared assertion block that L2-2
+through L2-5 read. It looked the record up by the **raw action id**. Object names are
+`journal.RecordName(actionID)` = `"ar-" + strings.ToLower(actionID)` — 06 §4.3, lowercased because a
+name must be a DNS subdomain and a ULID is uppercase. That lookup could not have found a record
+against **any** commit in the history of the file.
+
+It had never been reported, because the only thing that had ever exercised the arm was
+`--negative-control`. The control **synthesises** the record document — thirteen mutated JSON
+documents, each fed straight to the assertion block — and never touches the lookup. So the suite had
+a green 13/13 for an arm whose live statement had not once executed, and the first live run reported
+`no such ActionRecord exists` **directly above a listing that showed the record**.
+
+**The general shape.** A negative control proves the assertion block is not always-green. It proves
+nothing about any statement it bypasses in order to inject its input, and the statements it bypasses
+are exactly the ones that acquire the thing being asserted about: the API call, the parse, the
+lookup. Those are also, in an L2 suite, where the interesting failures live — a synthesised document
+is by construction well-formed and correctly named.
+
+**An arm whose ¬ form skips the statement under test is an arm nothing has measured**, and it reads
+in the output exactly like an arm that passed.
+
+**Mechanization.** `dev/tests/invariants-gate.py` →
+`check_negative_controls_exercise_the_statement_under_test` (L0-CHAIN). It fails any suite whose
+`--negative-control` block constructs an input the live path obtains from the cluster, unless the
+arm carries a comment naming the statement it is deliberately skipping and why. The L2-1 lookup now
+derives `record_name` at the call site — derived rather than read off the broker's reply, because
+the reply is the broker's claim about where it wrote and the point of the arm is to check it — and
+the live run's PASS line names `ar-01kyveh3ngd099sz5dpntwfbyz`.
+
+**Related:** [[LSN-048]] (a `-run` pattern that matched nothing scored three mutants as survivors) —
+same family: the measurement apparatus reporting on work it never did.
+
+## LSN-061 — `status` is a subresource, and Create put back one field of the block it knew was dropped
+
+**Tags:** go, kubernetes, api-semantics, subresource, silent-loss
+**Opened:** 2026-07-31 (P9-T9b-5b-0-iii)
+**Status:** closed — mechanized in the same unit
+
+**What happened.** Three defects, one root, found in sequence over a single unit.
+
+First: `status.timestamps` had been a declared CRD field since Phase 5 with **three readers and no
+writer**. `budget.go`'s window, `cooldown.go`'s `(verified, submitted)` pair and
+`JournalReconciler.exportLateness`'s four-way fallback all degrade *silently* when it is absent, so
+nothing ever went red. V-BRK-006's L2 clause — the write-ahead record is durable **before** the
+mutation — had no `executionStarted` to compare `metadata.creationTimestamp` against, so the one
+ordering the rule exists to establish was unobservable in production.
+
+Second: `journal.SetPhase` re-reads the record into `live` and writes **that**, so everything the
+pipeline had composed on its own copy was discarded — `status.applied` from step 9,
+`status.verification` and `status.recovery` from step 11. A live record read back with a phase, a
+message and nothing else: an audit trail that said an action had happened and could not say what it
+did.
+
+Third, and the one that bit hardest: `status` is a **subresource**. The API server keeps spec and
+metadata from a Create and discards the whole status block. `Store.Create` had known that for five
+phases — there is a paragraph of comment above the line where it re-writes `status.phase` afterwards
+— and it put back exactly **one field** of the block it knew had been dropped. The birth beats
+(`submitted`, `classified`) therefore never became durable on the write-ahead record, which is
+precisely the artifact whose durability V-BRK-006 is about. And the Create's reply body **overwrote
+the caller's `ar.Status`**, so the pipeline reached step 8 holding a nil `status.timestamps` and
+stamped straight through it. The broker **panicked on `gke-scratch-kube-agents-dev`** at the one
+moment a failure is unrecoverable: the journal already said `Executing`, nothing had executed, and
+no code path will ever advance that record.
+
+**What generalises.**
+
+- **A field the API server drops is dropped in full.** Restoring the field you happened to notice
+  reads, in code review, exactly like handling the drop. The comment above the fix was *correct* and
+  the fix under it was one-sixth of the job.
+- **A degraded reader is not a failing reader.** Four-way fallbacks and zero-value windows are how a
+  never-written field survives five phases with a green suite. Every fallback is a place a missing
+  writer can hide.
+- **Fail closed means refuse, not die.** A nil dereference between "the journal is durable" and
+  "the executor ran" is strictly worse than the missing datum it crashes about.
+- **A fix and its overcorrection are the same unit of work.** Copying the caller's whole status back
+  would have blanked `approvals`, `contested` and `undoneBy` — three fields 06 §4.3 hands to *other*
+  principals — letting a phase change silently reverse a human approval. The mutation sweep's M8
+  exists because the obvious repair for M7 is the more dangerous bug.
+
+**Mechanization.** `mergeOwnedStatus` in `k8s-operator/internal/journal/store.go` carries exactly the
+six fields 06 §4.3 assigns to the owning broker SA, nil-guarded per field, and is used by **both**
+`Create` (snapshotted *before* the call, since the reply overwrites) and `SetPhase`. `state.clock()`
+in the pipeline creates the block if absent so the stamping cannot dereference nil. The journal
+package's fake client has modelled the subresource drop since it was written
+(`dropStatusLikeTheApiServer`) — that is why the journal tests could catch it; the pipeline's fake
+store now models it too, behind `dropStatusOnCreate`, defaulting off so the default fake remains the
+store's real contract. `verification/mutants/V-BRK-006.json`, **15/15 caught**: M7 (SetPhase drops
+the outcome), M8 (the wholesale overcorrection), M9 (the unguarded per-field copy, which **escaped**
+the first sweep), M13 (Create restores only the phase — the tree as it shipped), M14 (the snapshot
+taken one line too late, which restores an empty block and looks exactly like a working restore),
+M15 (the panic itself).
+
+**Related:** [[LSN-052]] / [[LSN-054]] (a green package that ran nothing) — the same failure mode one
+layer up: the apparatus reporting success for work that did not happen.
+
+---
+
+## LSN-062 — "That file does not exist" was written about a file that does
+
+**Tags:** records, verification, orient
+**Opened:** 2026-07-31 (P9-T11g-2a → caught at P9-T11g-2b's ORIENT)
+**Status:** closed — `check_absent_path_claims_are_true` in `dev/tests/invariants-gate.py`, on
+`dev/L0-CHAIN.txt` (improvement pass 07, `c66f481`). The corpus is `docs/build/*.md`,
+`.claude/harness/*.md` and the header block of `verification/*.yaml`, enumerated through
+`gitcorpus.repo_files` ([[LSN-050]]). A **past-tense** claim carrying an ISO date **in the same
+sentence** is exempt; a present-tense one is not, whatever date it carries, because it asserts about
+the current tree. That distinction is not pedantry — the first three repairs were written in present
+tense with the date appended and the arm correctly fired on all three. Three real findings on the
+day it landed, all in `docs/build/phase-9.md`, all rewritten to say when they were true rather than
+to claim they still are. 22 in-file control rows, 14-mutation sweep, 14/14 caught.
+
+**What happened.** `P9-T11g-2` was scheduled as _"one tool over `verification/traceability.yaml`, not
+four"_. Splitting it, the unit published — in a phase-file row, a ledger cell, an outcome section and
+a commit message — that `verification/traceability.yaml` **does not exist**. It has existed since
+`P8-T10` (`ead358e`): 71 KB, 177 entries, V-MET-011's artifact, green on the L0 chain every run.
+
+**How a false claim survived a unit that was otherwise careful.** The question the unit actually
+worked on was _"does 09 §8's `R-<doc>.<section>-<n>` requirement→check mapping exist?"_, and the
+answer to that is a correct and well-evidenced **no** — a repo-wide search returns two hits, both
+sentences in §8 that _define_ the scheme. The unit then wrote that answer down **against the filename
+§8 happens to use for the mapping**. Every subsequent sentence was consistent, because the reasoning
+was about the property and only the label was wrong.
+
+**The general shape.** _An absence is asserted about a NAME, but established about a PROPERTY._ The
+two coincide often enough that the substitution is invisible: here the file's existence and the
+requirement space's existence really are different facts, and only one was checked. `ls` was never
+run. The correction cost nothing and the claim cost a commit message that cannot be edited.
+
+Note the near-miss on the other side. Had the unit believed the file existed and been wrong, the
+error would have surfaced the moment something tried to read it. **Claims of absence have no such
+backstop** — nothing fails when you decline to open a file — so they are the direction that needs a
+check rather than a habit.
+
+**Proposed mechanization** (improvement pass; a check change, not this unit's): an L0 lint over
+`docs/build/*.md`, `.claude/harness/*.md` and the header comments of `verification/*.yaml` that finds
+a repo-relative path asserted absent — `does not exist`, `is absent`, `is not in the tree`,
+`nothing at` — within a sentence of a backticked path, and fails when the path is present in the
+tree. Struck-through text (`~~…~~`) is exempt, since a corrected claim is how the record is supposed
+to look. Cheap to write, and it polices exactly the class of statement that schedules work.
+
+**Related:** [[LSN-019]] (prose on the artifact is not a mechanization) — the same gap between what a
+document says and what is true, in the opposite direction.
+
+---
+
+## LSN-063 — A negative-control mutation that stopped applying reported MISS, not BROKEN
+
+**Tags:** checks, verification, mutation-testing
+**Opened:** 2026-07-31 (P9-T11g-2b-ii-2a)
+**Status:** closed — `dev/mutate.py`, at one definition site (improvement pass 07, `c66f481`). Rule 1
+(a mutation that did not apply scores `BROKEN`, never `MISS`) is one statement, `DID_NOT_APPLY`,
+shared by three arms: the spec-time refusal of `find == replace`, the post-`replace` comparison in
+`apply_edit`, and `Snapshot.unchanged()`, which compares every touched file byte-for-byte after all
+of a mutant's edits. Only the third is form-independent, and only the third can see one edit undoing
+another. Rule 2 (a catcher naming no test that exists is `BROKEN SWEEP:`, exit 2) is `sweep`'s
+up-front `known_tests()` refusal. Rule 3: the summary always prints `N/M caught · X ESCAPED ·
+Y BROKEN`, and BROKEN exits 2 — a run cannot report a clean sweep over mutants it never measured.
+Verified against the corpus that motivated it: `verification/mutants/V-MET-014.json` → `9/9 caught ·
+0 ESCAPED · 0 BROKEN`, and `python3 -m unittest dev.test_mutate_sweep` → 26 tests OK.
+
+**What happened.** `P9-T11g-2b-ii-2a` curated 222 of document 06's requirements into
+`verification/requirements.yaml`, which moved `verification/coverage.yaml`'s `totals.covered` from
+`0` to `222`. V-MET-009's negative control then went red on one row: _"a requirement is marked
+covered without a check"_. The mutation was
+`t.replace("  covered: 0", "  covered: 12", 1)` — a literal keyed to the value the tree happened to
+hold on the day the control was written. With no `covered: 0` left to find, the replace returned the
+string unchanged, the control re-ran the check against the **unmutated** tree, the check correctly
+found nothing, and the row printed **`MISS`**.
+
+**Why that is worse than a red.** `MISS` means _the check let the defect through_ — a finding about
+the check under test, and the thing `harness-run` §5 says to fix. What actually happened is that no
+defect was ever applied: the sweep could not evaluate the mutant, which is **`BROKEN`**, and
+[[LSN-048]] and [[LSN-049]] both say in as many words that a `BROKEN` row is not a finding. The two
+verdicts point at opposite repairs. `MISS` invites strengthening the check — which here would have
+produced a check that passes on the first run, looks exactly like the fix, and leaves the mutant
+still unmeasured, which is [[LSN-048]] arriving a third time through a different door.
+
+**The general shape.** _A mutation keyed to a literal from the tree is a mutation with an expiry
+date, and it expires silently._ Every value a control hardcodes — a count, an ID, a date, a first
+list entry — is a bet that the tree will not move past it, and the whole point of a ratchet is that
+the tree moves. The control cannot tell the difference between "the defect was injected and the
+check missed it" and "nothing was injected" unless it is made to look.
+
+**Mechanized here.** `dev/tests/requirements-are-enumerated.py`'s control loop now compares each
+mutated input tuple against the base and prints `BROKEN` — counted as a failure, with its own
+message — when they are equal. The offending mutation was also rewritten to increment whatever
+`covered:` it finds rather than match a literal `0`, so it cannot expire again. Both were exhibited:
+the repaired row is `caught`, and a deliberately no-op probe row prints `BROKEN  … the mutation did
+not change its input; nothing was evaluated`.
+
+**It recurred in the next unit, in the sibling file.** `P9-T11g-2b-ii-2b` curated the remaining
+worklist, which moved the per-document floors — and V-MET-008's control went `10/11` with
+`MISS  the floor is raised above the coverage under it`. That mutation was
+`t.replace('  "02":\n    covered: 0', ..., 1)`: the same shape, the same literal `0`, expired by the
+same edit, one file over. It now carries both repairs (increment-what-you-find, and the `BROKEN`
+guard, probed). **Two of twenty-one loops are guarded; eighteen are not**, and the lesson has now
+been paid for twice inside two units — which is the argument for the shared helper rather than for
+repairing the third one when it fires.
+
+**And a third time, one unit later, in a form the guard does not catch.**
+`P9-T11g-2b-ii-2c-ii-a` added a paragraph to `verification/requirements.yaml`'s curation header —
+seven lines — and V-MET-002's control went red on _"the enumeration artifact is truncated"_, whose
+mutation was `"\n".join(t.splitlines()[:400])`. The cut had been a clean entry boundary on the day it
+was written; with the header a different length it landed **mid-entry**, and the mutant tripped the
+parser (`R-02.2.5.5-8 has no text:`) instead of the floor it was written to trip. This one **did**
+change its input, so the `args == base` guard passed it through: the failure is not an unapplied
+mutation but an applied one that **stopped meaning what it said**. The needle caught it — the row
+demanded `VACUOUS: the enumeration yielded` and got a parse error — which is [[LSN-035]]'s
+name-the-rule requirement doing the work the equality guard could not. Repaired by anchoring the cut
+on the key regex (`t[: [m.start() for m in re.finditer(r'^"R-', t, re.M)][5]]`) so truncation stays
+truncation however the header moves. **The scope is therefore wider than the guard:** a literal line
+number, offset or slice index is the same expiry-dated bet as a literal count, and the mechanization
+below has to cover both — the guard for mutations that stop applying, and the per-row needle
+([[LSN-035]]) for mutations that still apply and now mean something else.
+
+**Proposed mechanization** (improvement pass; a check change across 18 files, so not this unit):
+eighteen other harnesses carry a `negative_control()` loop and none of them has the guard.
+`dev/tests/negative-controls-name-their-rule.py` is already the meta-lint over controls and is the
+place for it — either it requires the guard in each loop, or the loop moves to one shared helper the
+meta-lint can point at. The second is better: a guard eighteen files each implement is eighteen
+chances to implement it wrong.
+
+**Related:** [[LSN-048]] (a `-run` pattern that matched nothing scored three unevaluated mutants as
+survivors) · [[LSN-049]] (an applier that died and its `0` was read as the suite passing) ·
+[[LSN-035]] (a check that goes quiet reads identically to a passing one).
+
+## LSN-064 — Every assertion was on the right-hand side of a pipe, so the suite could not go red
+
+**Tags:** checks, verification, L2, shell
+**Opened:** 2026-07-31 (P9-T11g-4)
+**Status:** closed — `check_pipeline_failure_flag` in `dev/tests/cluster-check-hygiene.py`, on
+`dev/L0-CHAIN.txt` (improvement pass 07, `c1b6b84`). Built on a quote-aware lexer rather than line
+regexes; a first regex prototype produced ~30 false positives out of awk programs and prose inside
+quotes and missed heredoc bodies entirely. The candidate variable set is **derived per script** —
+the names that script's own exit path depends on, unioned with failure-shaped names, intersected
+with names actually assigned, minus anything bound to `mktemp` ([[LSN-036]]). **The arm flags the
+LAST pipeline component too**, exempting it only where the script really sets `shopt -s lastpipe`
+(none does): the literal "not the last one" reading of this lesson would have been green on the very
+defect the lesson is named for, because `reject()` sat in the final component. Floors on the
+subject: 120 pipelines across 20 failure-flag scripts, against 374 and 62 today. Negative control 12
+→ 27 rows.
+
+**What happened.** `P9-T11g-4` bound two BLOCKING-ALWAYS rows, V-CTN-015 and V-CTN-016, to arms that
+had been running in `dev/verify/webhook-negatives-l2.sh` since P8-T9. Binding them meant breaking
+the suite on purpose to see it fail, and it would not. The suite printed four `FAIL:` lines and
+exited **0**, under a banner reading `V-CTR-002: PASS`.
+
+Nearly every assertion in that file is invoked as `child_yaml … | reject …`. In bash **every**
+component of a pipeline runs in a subshell, so the `fail=1` inside `reject` and `admit` was assigned
+in a child process and discarded when it exited. The suite had 31 assertions and no way to report
+any of them.
+
+```
+$ bash -c 'fail=0; bad(){ fail=1; }; echo x | bad; echo "fail=$fail"'
+fail=0
+```
+
+**Why it survived.** `V-CTR-002` was recorded green at L2 on the strength of that exit code, and
+`dev/L2-CHAIN.txt` gates on it. Nothing was wrong with the arms — all 31 really do pass today, which
+is why no run ever looked odd. A suite that cannot fail is indistinguishable from a suite that is
+passing, from the outside, forever. It was found only because a new row was being bound and the
+binding required a negative control; had the two IDs been recorded against the existing arms without
+one, three check IDs would now rest on an exit code that is a constant.
+
+**The fix, and why it is a file.** `bad` appends to a `mktemp` `FAILFILE`; the exit code is derived
+from it once at the end and never assigned by an assertion. A file survives the subshell, and `bad`
+is the single choke point every `reject`, `admit` and inline failure already goes through — so call
+sites that do not exist yet are covered without each one having to remember. Restructuring the 31
+call sites away from pipes was the alternative and is worse: it is 31 chances to get it wrong, and
+the 32nd assertion someone adds next year reintroduces the bug.
+
+**Negative control** (run in-tree — `REPO_ROOT` derives from `${BASH_SOURCE[0]}`, so a `/tmp` copy
+cannot source `dev/lib/preconditions.sh` and exits 2 before reaching any arm): one piped assertion
+mutated to expect a field path the API server cannot produce → **rc 1**, banner
+`V-CTR-002 · V-CTN-015 · V-CTN-016: FAIL — 1 failed assertion(s)`. The same mutation before the fix
+gave rc 0 and a PASS banner.
+
+**Scope.** A scan of every `dev/**/*.sh` for the shape — a helper that assigns a failure counter,
+invoked on the right-hand side of a real single pipe, `||` excluded — found **no other instance**.
+`dev/verify/multi-agent-namespace-l2.sh` matched a first, cruder pass and is a false positive:
+`cmd | $K apply … || bad "…"` runs `bad` as the RHS of `||`, which is the current shell, not the
+pipeline.
+
+**Proposed mechanization** (improvement pass): that scan, as an L0 lint under `dev/tests/`, on
+`dev/L0-CHAIN.txt`. It is ~40 lines of Python and it is cheap, but the reason to have it is not the
+one instance it found — it is that the failure mode is silent by construction and the next one will
+also be found only by accident. Pair it with the weaker, broader property behind it: **a suite whose
+exit code cannot be made non-zero by any single-assertion mutation is not a check.** The lint is the
+tractable half of that.
+
+**Related:** [[LSN-035]] (a check that goes quiet reads identically to a passing one — this is the
+same lesson at the level of the process exit code rather than the assertion) · [[LSN-049]] (an
+applier that died and its `0` was read as the suite passing) · [[LSN-019]] (prose on the artifact is
+not a mechanization).
+
+---
+
+## LSN-065 — `IFS=$'\t' read … <<<"$(fn)"` ran the function with IFS already set, and every cluster read came back empty
+
+**Tags:** checks, verification, L2, shell, self-concealing
+**Opened:** 2026-07-31 (P9-T11h) · **Status:** closed — `check_assignment_prefix_redirect` in
+`dev/tests/cluster-check-hygiene.py`, on `dev/L0-CHAIN.txt` (improvement pass 07, `c1b6b84`). It
+refuses a `VAR=… cmd` prefix on any command whose input-redirection operand is computed — a
+here-string, an unquoted-delimiter heredoc, or a process substitution containing `$(`, a backtick or
+`${`. **It found a live third instance the by-hand scan had missed**:
+`dev/verify/actor-grant-sweep-l2.sh:704` runs `IFS=$'\x1f' read … <<<"$(printf … | tr …)"` — the
+identical construct, survivable there only because the substitution calls externally-resolvable
+commands rather than the unquoted `$K` that made the original catastrophic. The property was left
+strict and the site **waived, not exempted**: the waiver is keyed on the script, so fixing the site
+makes the waiver stale and the check red, and a passing run prints `1 WAIVED:` so green is never
+read as clean. `chaos-suite.sh:513` is confirmed safe and carries an inverse control row, so its
+silence is a decision rather than blindness.
+
+`startup-ordering-l2.sh` reported, on a live cluster, that the agent pod had no `.status.phase`,
+that its container published no `restartCount`, and that the Agent CR carried none of the three 08
+§7(c) conditions. Both directions — broker-first and agent-first — failed with the same four
+problems, and the run took six minutes longer than it should have because each read polled its full
+timeout before giving up. At the same moment, from another shell, all three values read back
+instantly and correctly: `Running`, `0`, `AgentReady=True BrokerReady=False Ready=False`.
+
+The suite was not observing the cluster at all. Four call sites had this shape:
+
+```bash
+IFS=$'\t' read -r phase restarts <<<"$(pod_transcript "$agent_pod")"
+```
+
+A variable assignment written as a **command prefix is already in effect while the redirection
+operand is expanded**, so `pod_transcript` runs with `IFS=<tab>`. Every helper in the file reaches
+the cluster through unquoted `$K`, which holds `kubectl --context gke-scratch-kube-agents-dev`.
+Unquoted expansion splits on `IFS` — and with `IFS` no longer containing a space, that is **one
+word**: a command named `kubectl --context gke-scratch-kube-agents-dev`. No such command exists,
+the `2>/dev/null` every status read carries eats the `command not found`, and the function returns
+empty strings.
+
+Reduced to four lines:
+
+```bash
+K="echo hello"; f() { $K world; }
+out="$(f)"; IFS=$'\t' read -r a <<<"$out"   # a=[hello world]
+IFS=$'\t' read -r b <<<"$(f)"               # bash: echo hello: command not found · b=[]
+```
+
+**Why it is worse than a wrong answer.** The failure produces exactly the output shape the suite
+exists to report. An empty phase renders as `the agent pod is in phase '<unreadable>', not Running`;
+absent conditions render as `AgentReady=<unset>` under a paragraph quoting 08 §2.4 on fleets blinded
+by a broker outage. A blind instrument and a broken product are the same four lines of red. Two
+sibling helpers in the same file — `wait_agent_image_id`, `wait_init_terminated` — are
+character-for-character the same read against the same pod and both PASSED, because they are called
+without the prefix; that near-identity is what made the fault read as a property of the cluster.
+
+**Fixed** by substituting into a plain variable first and reading from the variable, at all four
+sites. `chaos-suite.sh:513` already had the safe shape (`IFS=: read … <<<"$_pair"`), and a
+repo-wide scan found no third instance.
+
+A second, unrelated defect surfaced in the same run and is fixed with it: `broker_ready_now` applied
+its `:-0` default to the **subject** of the sanitising `case`, so an empty read arrived at the case
+as the string `0`, matched neither arm, left the variable empty, and the `-gt` below died with
+`integer expression expected`. The sanitiser sanitised a copy.
+
+**Proposed mechanization** (improvement pass): an L0 lint under `dev/tests/`, on `dev/L0-CHAIN.txt`,
+failing any `<<<` here-string whose operand contains a command substitution **when the same simple
+command carries a variable-assignment prefix**. It is a two-line regex over `dev/**/*.sh` and it
+generalises one step further, which is the version worth writing: **an assignment prefix on a
+command whose redirection operand is computed is a scope bug whether or not the variable is `IFS`.**
+
+**Related:** [[LSN-064]] (the sibling — there the suite could not go red; here it could not see, and
+both were found only because a human read the transcript) · [[LSN-035]] (a check that goes quiet
+reads identically to a passing one) · [[LSN-060]] (the negative control skipped the statement under
+test, so green measured nothing).
+
+---
+
+## LSN-066 — A derived roster is a shared-cluster global, and two L2 suites at once made a BLOCKING-ALWAYS check red
+
+**Tags:** verification, L2, concurrency, false-red, derived-rosters
+**Opened:** 2026-07-31 (P9-T11h) · **Status:** closed — precondition **P12**, `p12_assert_exclusive_l2` in
+`dev/lib/preconditions.sh`, called from the top of `p10_assert_control_plane_healthy`; enforced by
+`check_l2_lock_is_wired` in `dev/tests/invariants-gate.py` (improvement pass 07)
+
+`reader-scope-l2.sh` (V-CTN-001, **BLOCKING-ALWAYS**) came back rc 1 with `readers=4` and 102
+failures, every one of them against `system:serviceaccount:startup-ordering-l2:platform-agent` — a
+ServiceAccount belonging to a **different L2 suite that happened to be running at the same time**.
+Re-run after that namespace went away: rc 0, 1389 questions, 8/8 arms, identical per-arm scales.
+
+Neither suite is wrong, and this is the part worth keeping. `reader-scope-l2.sh` derives its roster
+cluster-wide from `kube-agents/role=reader` rather than from a curated list, which is [[LSN-036]]
+applied correctly — a listed roster is a roster someone must remember to extend.
+`startup-ordering-l2.sh` mints its fixture identity through `seed_agent_identity`, which calls
+`render_agent_identity` out of the **shipped** `k8s-operator/scripts/common.sh`, so the fixture
+carries the same labels the real install carries — which is [[LSN-024]] applied correctly, because a
+hand-written stand-in is a fixture that can pass while the shipped identity is broken. The label
+that makes the fixture honest is the same label that makes it visible to the derived roster.
+
+So the tempting fixes are both wrong. Making the fixture drop the reader label re-introduces
+[[LSN-024]]. Narrowing the roster to namespaces the GitOps overlay covers **weakens a
+BLOCKING-ALWAYS check** — a reader identity nobody bound, standing in a namespace nobody expected, is
+precisely what V-CTN-001 exists to find, and it should stay findable. The defect is in neither
+artifact: it is that **two L2 suites were run concurrently**, which `dev/L2-CHAIN.txt` never does and
+which nothing forbade.
+
+**Fixed for the chain** by the chain already being serial, and recorded where a future reader will
+meet it: the `reader-scope-l2.sh` block in `dev/L2-CHAIN.txt` states the constraint and why the
+obvious repairs are refused.
+
+**Proposed mechanization** (improvement pass): an advisory lock, taken by every script on
+`dev/L2-CHAIN.txt` against a single well-known file, so a second concurrent L2 suite blocks rather
+than producing a red that points at the wrong artifact. Cheap, and it fails safe — the lock is
+per-machine, and the cluster guard is unaffected. The general property behind it: **a check that
+derives its subject set from cluster state is measuring every other tenant of that cluster too.**
+
+**Related:** [[LSN-036]] (derive the roster, never curate it — the rule that makes this possible) ·
+[[LSN-024]] (fixtures render through the shipped renderer — the rule that makes it visible) ·
+[[LSN-048]] (a BROKEN row leaves the mutant unmeasured — a red that names the wrong thing costs the
+same session either way).
+
+---
+
+## LSN-067 — Eleven submissions, one action: the idempotency key is a hash of the operations, so a suite that re-submits the same probe measures the first answer ten more times
+
+**Tags:** checks, verification, L2, broker, idempotency, false-red, self-concealing
+**Opened:** 2026-07-31 (P9-T11h) · **Status:** closed — `broker_driver_assert_distinct_actions` in `dev/lib/broker-driver.sh`,
+returning **rc 4** so a measured collision is a FAIL and not a DEFERRED, with an rc-4 arm at all
+nine call sites (improvement pass 07)
+
+`brake-l2.sh` (V-CTR-007, V-RUN-007, V-RUN-008) came back with two FAILs, both on a **positive** arm
+— B-7 and the V-RUN-008 release arm, each of which submits an envelope after clearing a fault and
+asserts the broker now accepts it. Both reported `outcome='http' status='200' decision='deduplicated'`
+where the arm wanted `202 accepted`. Read as a product finding, that is "the brake does not release":
+the freeze is lifted, the grant is restored, and the broker still will not take work.
+
+The product was correct. Counted across the whole transcript: **11 submissions, one `actionId`
+(`01KYXM37W6Z6NN4P9SRKASRP1X`), 1 `accepted` and 10 `deduplicated`.**
+
+`action_envelope.compute_idempotency_key(agent_identity, operations, dry_run)` is a sha256 over
+exactly those three things, and `CompareIdempotencyKey` on the broker side recomputes it rather than
+trusting what it was sent. The probe submits a fixed operation — `apply` a ConfigMap named by the
+module constant `TARGET_NAME` — as one fixed identity, always `dryRun: true`. So every submission in
+the run is, by the spec's own definition, **the same action**, and 06 §4.1's dedup path answers the
+second and subsequent ones `200 decision=deduplicated` carrying the **first** submission's record.
+This is not the anti-replay guard: that keys on `(identity, traceId, idempotencyKey)` and each
+submission carries a fresh trace, which is precisely the distinction `antireplay.go:224-227` draws —
+same triple is a replay, same key in a new trace is a retry, and a retry gets the original record.
+
+**Why it survives a careful reading of the arm.** Every arm checked the status code and the decision
+word against what it expected _for that arm_, and a dedup is a 200, not an error. The arm asserting
+"still refused during the freeze" was answered by a record minted **before** the freeze existed, and
+passed. The arms asserting "accepted again now the fault is cleared" were answered by the same
+pre-freeze record, and failed — so the suite went red on the two arms where the stale answer
+happened to disagree, and **green on the arms where the stale answer happened to agree**. Nine
+passing arms in that run measured one submission. A suite reporting a mix of red and green is the
+last shape anyone re-reads for "did the instrument observe anything at all".
+
+**Fixed** by making the target name a parameter rather than a constant:
+`broker_execute_probe.py`'s `TARGET_NAME` now reads `PROBE_TARGET_NAME` from the environment,
+`dev/lib/broker-driver.sh` plumbs it through as `BROKER_DRIVER_TARGET_NAME`, and `brake-l2.sh`'s
+`submit()` sets `brake-l2-shadow-target-$SUBMIT_N`. The default is the historical constant, so
+`broker-execute-l2.sh` — which submits once and is green — is byte-identical. Varying the target
+varies the operations, which varies the key, which is the only honest way to ask the question twice:
+the alternative, varying the identity or the dryRun flag, would change what is under test.
+
+**Proposed mechanization** (improvement pass): the general property is that **a suite submitting a
+fixed envelope more than once is measuring one action N times**, and it is checkable without
+understanding any arm — count `distinct(actionId)` across a transcript and compare it to the number
+of submissions. Two places it could live: an assertion inside `broker_driver_run` itself, which
+would catch every current and future caller, or a `dev/tests/` lint refusing a `submit`-style helper
+in `dev/verify/**` that is called more than once without something per-call in the operations. The
+first is cheaper and cannot be forgotten by a new suite; prefer it.
+
+**Related:** [[LSN-064]] (the suite could not go red) · [[LSN-065]] (the suite could not see) —
+with this one, three instrument defects in a single unit, each producing output shaped exactly like
+a genuine product defect. [[LSN-035]] (in this repo a vacuous pass is a failure: nine of the arms
+here were vacuous and reported green) · [[LSN-048]] (a row that did not evaluate its subject is not
+a finding).
+
+---
+
+## LSN-068 — The operator's pair policy is the first artifact that makes an agent pod default-deny on egress, so in any namespace where `provision_13` has not run it silently takes DNS away — and the fact was already written down, in prose, in a sibling file
+
+**Tags:** fixtures, verification, L2, networkpolicy, dns, install-path, prose-is-not-mechanization
+**Opened:** 2026-08-01 (P9-T11g-4b) · **Status:** closed — precondition **P11** plus `dev/lib/shipped-render.sh` and arm 1 of
+`dev/verify/tier-egress-render-l2.sh`, on `dev/L2-CHAIN.txt` (improvement pass 07)
+
+`startup-ordering-l2.sh` (V-RUN-005) went red on arm (a) — _the agent starts first, the broker is
+not there yet_ — with a transcript that read like a product defect and was not one:
+
+```
+broker-first: the init container logged 'observe', not the 'broker is ready' line
+init_exit=0 init_log=observe phase=Running restarts=0 AgentReady=True BrokerReady=True Ready=True
+```
+
+Everything is healthy and the caller still never saw the broker. A read-only watcher caught the
+decisive frame: the init container's **first** probe, and the broker Deployment at the same instant.
+
+```
+| DEBUG setup broker not ready yet {"url": "https://ordering-agent-broker.startup-ordering-l2.svc...:8443/healthz",
+                                    "attempt": 1, "err": "... context deadline exceeded"}
+-- broker deploy at this moment --
+| ordering-agent-broker    1     1        1
+```
+
+**The name never resolved.** `buildAgentToBrokerPolicy` (`pair_netpol.go`) renders an **Egress-only**
+policy selecting the reader half with exactly one rule — TCP 8443 to the actor pod. In Kubernetes,
+a pod selected by _any_ egress policy becomes default-deny for _every other_ egress, DNS included.
+The operator is right to render only the hop it owns, and its header says so: _"Two policies
+selecting the same pod ADD their allowances… `<agent>-to-broker` admits the agent's egress hop to
+that port, which the tier allowlist does not cover."_ Rule 1 of that tier allowlist is
+`netpol-agent-egress.yaml.template`'s DNS rule, whose own comment is _"Without this, every
+name-based egress fails before it starts"_ — and it is applied by
+`provision_13_apply_network_policies.sh`, which `dev/cluster/up.sh` does not run. On the scratch
+cluster the only NetworkPolicy that existed at all was `team-x/default-deny-all`. The live install
+carries all three tier policies, so this is not a live regression; it is what an agent gets in a
+namespace the install path never touched.
+
+**IT ALSO MADE THE OTHER ARM VACUOUS**, which is the part that matters more than the red one. Arm
+(a) _expects_ wait-for-broker to time out and the pair to converge to observe-and-report. On a
+namespace with no DNS it gets that timeout for free, and would go on passing if `wait-for-broker`
+were deleted outright. One red arm and one arm passing for the wrong reason, from a single missing
+rule ([[LSN-035]]).
+
+**Not a check to weaken, and not an operator bug.** The smallest diff to green was to stop asserting
+the broker-first ordering; the correct diff was to make the fixture a namespace an install path
+actually produces. `seed_tier_egress_policy` now applies the tier allowlist through
+**`common.sh:render_egress_policy`** — the same function `provision_13` calls, never a copy
+([[LSN-024]]) — sourced in a subshell because `common.sh` installs its own `trap cleanup EXIT` at
+load and would otherwise replace the suite's namespace teardown with a `tput cnorm`. Rule 9 is
+rendered too: the tier selector is `kube-agents/tier`, which the **broker** pod carries, so applying
+the allowlist without the API-server rule would have taken TokenReview, the FleetFreeze read and the
+ActionRecord write away from the broker and traded one silent network failure for another.
+
+**THE PART THAT IS ACTUALLY THE LESSON.** This was already known. `dev/lib/broker-driver.sh`'s
+header, committed in an earlier phase, states it exactly:
+
+> `<agent>-to-broker` makes every reader-labelled pod default-deny on egress with exactly one hole —
+> TCP 8443 to the actor half — and there is no DNS rule in it anywhere. A real agent pod gets DNS
+> from the per-tier install-time egress policy, which `provision_13` applies and a scratch cluster
+> does not carry.
+
+A suite written after that paragraph paid the full cost anyway, because a paragraph in one file is
+not reachable from another file ([[LSN-019]]: prose on the artifact is not a mechanization). Two
+suites have now solved the same problem two different ways — `broker-driver.sh` with `hostAliases`
+short-circuiting DNS and declaring the non-claim, this one by seeding the real policy — and a third
+(`tenant-isolation-l2.sh`) already had its own `render()` wrapper around `common.sh`. Three call
+sites, no shared helper.
+
+**Proposed mechanization** (improvement pass), in preference order:
+
+1. **`dev/lib/shipped-render.sh`** — one helper that sources `common.sh` in a subshell with the trap
+   cleared and calls a named renderer, replacing the wrapper in `tenant-isolation-l2.sh`, the new
+   one here, and whatever the next suite would have written. Note while extracting it that
+   `tenant-isolation-l2.sh`'s `render()` does **not** clear the EXIT trap, so `tput cnorm` can land
+   on the same stdout the manifest is captured from — latent, not currently biting.
+2. **A precondition, not a paragraph.** `P11: the namespace models an installed agent` — assert that
+   a namespace about to hold an Agent CR carries a policy admitting DNS, or seed one, and fail with
+   the sentence above rather than with a timeout 120 seconds later. Every L2 suite that stands up an
+   Agent in a fresh namespace has this precondition today and none of them declares it.
+3. **A product-side check** (own ID, V-ISO or V-CTN family): every namespace holding an Agent CR also
+   holds a policy admitting DNS for the pods the pair policy selects. This is the only one of the
+   three that would catch a real install — a second developer-team tenant namespace created after
+   `provision_13` last ran gets the pair policy from the controller and the tier policy from nobody.
+
+**Related:** [[LSN-024]] (render through the shipped renderer) · [[LSN-019]] (prose is not a
+mechanization) · [[LSN-035]] (a vacuous pass is a failure here) · [[LSN-006]] (an ADMIT arm reads
+identically against an absent policy — this is its egress-side twin: a DENY that reads identically
+against an absent policy).
+
+---
+
+## LSN-069 — Rule 9 pinned two addresses no packet ever carries: the kube-apiserver's egress address is `endpoints/kubernetes`, not the ClusterIP a pod dials and not the endpoint the kubeconfig names
+
+**Tags:** networkpolicy, install-path, provisioning, dataplane-v2, broker, silent-failure, product-defect
+**Opened:** 2026-08-01 (P9-T11g-4b) · **Status:** closed — `resolve_apiserver_cidrs` in `k8s-operator/scripts/common.sh`, held by
+arm 2 of `dev/verify/tier-egress-render-l2.sh` on `dev/L2-CHAIN.txt`; the live install's missing
+rule 9 is scheduled as **P10-T0c** (improvement pass 07)
+
+Seeding the shipped tier egress allowlist into an L2 fixture ([[LSN-068]]) took the broker down
+instead of fixing it, in a way with no error message anywhere:
+
+```
+ordering-agent-broker   0/1  Running  3 restarts
+Readiness probe failed: dial tcp 10.68.0.61:8443: connect: connection refused
+Liveness probe failed:  dial tcp 10.68.0.61:8443: connect: connection refused
+kubectl logs <broker>   ->  (empty)
+kubectl logs <broker> -p ->  (empty)
+```
+
+**No logs at all, and the port refused.** `cmd/broker/main.go`'s `run()` calls
+`startSources(ctx, sources)` — the brake read — **before** `httpServer.ListenAndServeTLS`, with the
+comment _"A broker that is accepting submissions while its brake has never been read is a broker
+whose first few actions were decided by a source that had nothing in it."_ That ordering is correct
+and it is why the symptom carries no information: the process is alive, blocked on the API server,
+has not reached its own `setupLog.Info("starting kage-broker", …)` line, and the kubelet is killing
+it on the liveness probe. A reader sees a crash-looping broker with an empty log.
+
+**The tier policy selects the broker too.** Its selector is `kube-agents/tier`, which the broker pod
+carries — `render_apiserver_block`'s header says so explicitly and is the reason rule 9 exists at
+all. So applying the allowlist without a correct rule 9 closes TokenReview (step 1), the FleetFreeze
+read (step 5) and the ActionRecord write (step 11).
+
+**Rule 9 was rendered. It named the wrong addresses.** `resolve_apiserver_cidrs` produced two /32s
+from two sources — the `kubernetes` Service ClusterIP and the host out of the kubeconfig's `server:`
+URL — on the stated argument that _"whether NetworkPolicy evaluates egress before or after that
+translation is dataplane-specific, so a policy naming only one of the two fails on the other."_ The
+argument is sound and the enumeration was short by one:
+
+| source | scratch | live |
+| --- | --- | --- |
+| `svc/kubernetes` ClusterIP (dialled) | 34.118.224.1 | 34.118.224.1 |
+| kubeconfig `server:` (public endpoint) | 35.221.35.254 | 34.145.154.119 |
+| **`endpoints/kubernetes` (what the packet carries)** | **10.150.0.9** | **10.150.0.2** |
+
+GKE Dataplane V2 DNATs the ClusterIP in eBPF **before** egress policy is scored, so the address the
+policy sees is the control plane's node-network address — a third form, on neither list, and not
+derivable from either.
+
+**Measured, not reasoned.** With the rendered policy in place and the broker crash-looping, one
+extra NetworkPolicy admitting `10.150.0.9/32:443` was applied to the same namespace and nothing
+else changed. The broker went `1/1 Running` inside one probe period. Policies union, so that single
+/32 is the entire difference.
+
+**Fixed** in `common.sh:resolve_apiserver_cidrs`: source 2 now reads `endpointslices` for the
+`kubernetes` Service first (`endpoints` as fallback — v1 Endpoints is deprecated from 1.33 and warns
+on stderr on every read), and emits endpoint-first, then the ClusterIP, then the kubeconfig host,
+deduplicated. All three are kept: the original argument for the two that did not match still stands,
+this script cannot know where a given dataplane scores egress, and three /32s on 443 is a narrow
+price for not needing to be right about it. Removing the two would be a second guess.
+
+**A SECOND, SEPARATE FINDING ON THE LIVE INSTALL, which this is the wrong unit to act on.**
+`platform-agent-host`'s `platform-egress` has **four** egress rules — DNS, the control namespace on
+:80/:8080, the Google restricted VIP, GitHub — and **no rule 9 and no WI metadata block at all**. It
+is a pre-rule-9 render that has never been re-applied, and three tier-labelled agent gateways are
+running under it right now. Nothing visibly breaks because inference is in-cluster on :80 (rule 2),
+so what is actually closed is the half `render_apiserver_block` calls out: _"The READER needs it too,
+for every kubectl-shaped skill it runs; that half has been latent since Phase 5."_ Re-running
+`provision_13` against the live cluster is an outer-loop action, recorded as a `finding` row rather
+than taken here.
+
+**Why no check caught it, and what would have.** V-CMP's reference-render suite checks that rule 9
+renders **when an address is supplied** and that `resolve_apiserver_cidrs` **fails closed when none
+is** — both true throughout, because both are properties of the renderer and neither is a property
+of the answer. The gap is between "a rule was rendered" and "the rule matches the traffic", and only
+a cluster can close it. Proposed mechanization (improvement pass): an L2 arm that, for each address
+in a rendered rule 9, asserts it appears in `endpoints/kubernetes` — cheap, needs no traffic, and
+would have gone red on both clusters. A traffic-level arm (a tier-labelled pod that reaches the API
+server through the policy) is stronger and belongs with [[LSN-068]]'s item 3.
+
+**Related:** [[LSN-068]] (the fixture that had to seed this policy at all) · [[LSN-019]] (the header
+reasoned carefully about exactly this failure and still enumerated wrong — a correct argument over
+an incomplete set) · [[LSN-006]] (an ADMIT arm reads identically against an absent policy; here a
+rendered rule read identically to a matching one).
+
+---
+
+## LSN-070 — The retirement was applied to one renderer, and the object it retired is still rendered by five others — including the assets an agent proposes
+
+**Tags:** rbac, retirement, install-path, gitops, agent-authored-assets, revocation, provisioning-lifecycle
+**Opened:** 2026-08-01 (improvement pass 07, from [[B-007]]) · **Status:** open
+
+A read-only survey of `gke-scratch-kube-agents-dev` went looking for one thing and found a different,
+larger one.
+
+**What the survey was sent for.** Three RBAC objects sit in `kubeagents-system` that no template in
+`k8s-operator/scripts/` renders: `Role/kubeagents-broker-operations` and the two RoleBindings
+`platform-agent-broker-operations` and `cluster-admin-agent-broker-operations`. Commit **`12c509d`**
+(P9-T9b-5b-0-ii-b, 2026-07-31) deleted them from `broker-operations-grant.yaml.template` and
+`agent-identity.yaml.template`. They were created by the last apply before that commit, on
+2026-07-30, and `kubectl apply` does not delete what a template stopped rendering.
+
+**The first thing worth recording is what the survey did NOT find.** Every ALLOW those three objects
+confer is reachable through the shipped per-tier Role's own RoleBinding independently — the residue's
+rule set is a proper subset. The control is live, not argued: `team-x`'s actor was provisioned
+2026-07-31, **after** the retirement, has no residue in its namespace, and produces a byte-identical
+ten-answer `auth can-i` profile from the shipped Role alone. **No verb is granted only by the
+residue.** So this is not an escalation. It is an unrevocability defect, and the consequence is a
+tightening that cannot bite: narrow `actor-grant-platform.yaml.template` to drop `create` on
+`actionrecords`, re-run `provision_08`, and the platform actor still holds it — through the residue.
+A full `teardown_08` does not help, because `delete_agent_identity`
+(`k8s-operator/scripts/common.sh`) deletes the **ClusterRoleBinding** `${reader_ksa}-broker-operations`
+and not the identically-named namespaced **RoleBinding**, and nothing at all deletes the Role. The
+narrowing would half-work — real for `developer-team`, a no-op for the other two — which is worse
+than failing outright, because a half-worked tightening reads as a tightening.
+
+**The finding the item did not anticipate, and the one with production consequence.** The retirement
+was applied to `k8s-operator/scripts/` **only**. The retired namespaced Role and RoleBinding are
+still rendered by five files:
+
+| file | path |
+| --- | --- |
+| reference GitOps overlay | `examples/gitops-repo/policy/rbac-overlay/broker-operations.yaml` |
+| reference GitOps identity | `examples/gitops-repo/clusters/cluster-a/agents/identity/broker-operations.yaml` |
+| reference GitOps tier | `examples/gitops-repo/clusters/cluster-a/namespaces/team-x/50-developer-team-identity.yaml` |
+| **an agent's proposal asset** | `agents/platform/skills/provision-cluster-admin/assets/identity/broker-operations.yaml.tmpl` |
+| **an agent's proposal asset** | `agents/cluster-admin/skills/provision-developer-team/assets/50-developer-team-identity.yaml.tmpl` |
+
+The last two are the ones that matter. "No template renders that object" is true of the install path
+and **false of the path an agent takes when it provisions a tier**. A cluster brought up through
+`provision-cluster-admin` / `provision-developer-team` creates the residue *fresh, from a template*.
+(Both skills were named `propose-*` when this was written; P13-T5 renamed the directories on
+2026-08-01 and the paths above are repointed, because this lesson is **open** and its mechanization
+has to be aimed at files that exist.)
+
+**Which makes the live install a window, not a clean bill.** `platform-agent-host` is a pre-broker
+generation — `api-resources --api-group=kubeagents.x-k8s.io` returns `Agent` and nothing else, there
+is no ActionRecord CRD, there are no actor identities, and the string `actionrecords` appears in none
+of its RBAC. It is clean **because the objects have never been installed there**. If its upgrade to
+the Phase 9 generation runs `k8s-operator/scripts/`, it is born clean; if it runs the agent-proposed
+assets above, it is born **with the residue**, permanently, on a cluster that is never torn down. On
+scratch an unrevocable grant is disposed of by `dev/cluster/down.sh`. In production it is unrevocable
+*and* undisposable, and removing it by hand on the live cluster is exactly the operation the guard
+rails exist to make rare.
+
+**A methodological trap, found by measurement, that any check in this area must know.**
+`kubectl auth can-i <verb> <resource>.<group>` **silently degrades to a core-group (`""`) query when
+the resource type is not served**, and an identity holding a wildcard core-group read then answers
+`yes`. Control: `auth can-i get zzznotathing.kubeagents.x-k8s.io --as=…cluster-admin-agent` returns
+**`yes`** on both clusters. Any actor-grant sweep pointed at a cluster without the ActionRecord CRD
+reports false positives. `actor-grant-sweep-l2.sh` is already immune — it reads
+`api-resources -o name` into `served.txt` and drops unservable rows **in both directions**, on the
+[[LSN-035]] argument that a `no` for a reason that is not about authority satisfies a negative row
+vacuously — which is the same guard arriving from the other side, and is the reason this trap is
+recorded here rather than opened as a defect.
+
+**Why no check caught it, and what will.** Every existing check reads *one* renderer. V-CMP's
+reference-render suite scores the install path; the GitOps tree is scored for what it *contains*, not
+for what the install path has *stopped* containing. Nothing in the repo holds the two renderers
+against each other, which is the whole class: **a retirement is a property of the repository, and it
+was asserted about a directory.** The mechanization derives rather than curates ([[LSN-036]]) — for
+every object name the install path renders, the kinds it renders under that name must cover the kinds
+rendered under that name anywhere else in the tree. `kubeagents-broker-operations` is `{ClusterRole}`
+on the install path and `{ClusterRole, Role}` elsewhere; the `-broker-operations` binding is
+`{ClusterRoleBinding}` against `{ClusterRoleBinding, RoleBinding}`. Both fall out with no list of
+names in the check.
+
+**Related:** [[LSN-036]] (no curated roster — the reason the check derives the pair sets) ·
+[[LSN-062]] (a harness record asserting a repo-wide absence that was only true of one directory —
+the same error about scope, one layer up) · [[LSN-019]] (prose on the artifact is not a
+mechanization: the retirement's own note said no template renders them).
+---
+
+## LSN-071 — The forbidden-`gcloud` pattern matched a shape no real gcloud command has
+
+**Tags:** verification, negative-control, regex, forbidden-set, cloud-cli, check-that-lies
+**Opened:** 2026-08-01 (P13-T5, the persona conversion) · **Status:** open
+
+`dev/test_apply_change_skill.py` scans every `apply-change` SKILL.md for commands the skill must
+never issue. One row of that forbidden set is
+
+```
+(r"gcloud\s+\w+\s+(create|delete|update|patch|set)\b", "a mutating gcloud shell-out")
+```
+
+and it has been green since it was written, on three tier copies, through every run of the L0 chain.
+
+**How the miss surfaced.** Not from a failure — from writing the check's *negative control*. The
+first draft of the control line used `gcloud container clusters update prod`, which is the canonical
+GKE mutation and the single most likely thing an agent would actually reach for. The control
+reported the mutant **uncaught**. The pattern wants `gcloud <one word> <verb>`; `gcloud container
+clusters update` is `gcloud <two words> <verb>`, and so is nearly the whole surface worth forbidding:
+
+| the pattern catches | the pattern misses |
+| --- | --- |
+| `gcloud projects create` | `gcloud container clusters create \| delete \| update` |
+| `gcloud services enable`¹ | `gcloud compute instances create \| delete` |
+| | `gcloud iam service-accounts create` |
+| | `gcloud container node-pools create \| delete` |
+
+¹ and only because `enable` is not in the verb list, so this one is missed too.
+
+**Why it stayed green, which is the part worth keeping.** A forbidden-set check has no positive
+subject. It passes when it finds nothing, and finding nothing is also what it does when it is
+looking for a string no one writes. Every fixture in the suite had been written *by someone reading
+the pattern*, so every fixture matched it: the corpus was derived from the assertion instead of from
+the world. That is the same failure as [[LSN-057]] (a corpus discovered by mention) and
+[[LSN-060]] (a control that skipped the statement under test) arriving through a third door — and it
+is the door a **negative control is supposed to be** the guard for, which is why the control is what
+caught it.
+
+**Why it was not fixed where it was found.** Guardrail 9: the unit that found it was a persona
+conversion, and widening a check inside the unit whose implementation motivated the widening is the
+coupling the guardrail exists to break. What the unit did instead: the control row now stands at
+`gcloud projects create kage-scratch`, a form the pattern genuinely claims to catch and deliberately
+the *weakest* mutating gcloud command that could stand in that slot, and the whole finding is
+written into the file at `dev/test_apply_change_skill.py:344-350` so the next reader meets it before
+the pattern.
+
+**The mechanization owed.** Widen the pattern to `gcloud(\s+[a-z0-9-]+){1,3}\s+(create|delete|
+update|patch|set|enable|disable|add|remove|import|deploy)\b`, then re-derive rather than re-guess:
+the honest form of this check enumerates the mutating verb set from something outside the check, and
+the control gains a row per token-depth so a future narrowing to two tokens fails. **Then look for
+the same shape elsewhere** — every other forbidden-set row in the tree whose fixtures were written
+from the pattern rather than from a real command, starting with the `kubectl` rows beside it, which
+are two-token by nature and therefore probably fine, and `dev/tests/devteam-has-no-cloud-actor.py:189`,
+which pins `gcloud iam service-accounts` explicitly and is therefore evidence that somebody already
+knew the three-token shape existed.
+
+**Related:** [[LSN-035]] (a vacuous pass is a failure, not a pass) · [[LSN-057]] (corpus discovered
+by mention) · [[LSN-060]] (the control skipped the statement under test) · [[LSN-063]] (a needle at
+zero occurrences is BROKEN, not a survivor — the same "nothing matched" ambiguity, on the mutation
+side rather than the assertion side).

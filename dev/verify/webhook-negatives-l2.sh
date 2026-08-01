@@ -2,6 +2,31 @@
 # webhook-negatives-l2.sh — V-CTR-002 in full: every one of 06 §1.2's rules V-1…V-10 has a negative
 # test that is REJECTED, and the rejection NAMES THE FIELD PATH (Phase 8, P8-T9).
 #
+# It also carries V-CTN-015 and V-CTN-016 at L2, bound 2026-07-31 (P9-T11g-4).
+#
+# WHY TWO CONTAINMENT ROWS LIVE IN A CONTRACT SUITE
+#   09 §6 lines 321-322 are `V-CTN-015 | (tier, scope) cardinality: a duplicate Agent CR is rejected
+#   ¬ | 08 §7 | L2 | 8` and `V-CTN-016 | Developer-team placement: metadata.namespace must equal
+#   spec.scope.namespace ¬ | 08 §7 | L2 | 8`. Those are the V-5 and V-4 arms below, sentence for
+#   sentence, and they have been running since P8-T9 under V-CTR-002's name alone.
+#
+#   The two rows are not a restatement of V-CTR-002. V-CTR-002 asks a CONTRACT question — does every
+#   rule in 06 §1.2 have a negative test whose rejection names its field path — and it would stay
+#   green if the placement rule were re-scoped to something harmless, as long as the rejection kept
+#   naming `metadata.namespace`. V-CTN-015 and V-CTN-016 ask the CONTAINMENT question 08 §7 asks: a
+#   developer-team agent that is not in the namespace it scopes has its pod rendered outside the
+#   tenant's isolation controls, and a duplicate (tier, scope) means two actor identities answering
+#   for one scope with no arbiter between them. Same arms, and the reason both IDs point here is that
+#   one execution is better evidence than two — but a reader who breaks the rule must see all three
+#   rows go red, not one.
+#
+#   BOTH ARMS GAINED A POSITIVE CONTROL WHEN THE IDS WERE BOUND, because both are ¬ rows in 09 §6 and
+#   09 line 292 is explicit: "Negative controls are mandatory for every check marked ¬. A check that
+#   only demonstrates the happy path is not evidence for a security or safety property." Read in the
+#   direction that matters here, a check that only demonstrates the REJECTION is not evidence either
+#   — an over-blocking rule refuses the fixture and every legitimate object beside it. V-4 also had
+#   its parent changed; the arm says why.
+#
 # P8-T1 delivered the V-7 slice (dev/verify/closed-allowlist-l2.sh) and recorded V-CTR-002 as
 # `partial` with the gap named: V-6, V-8 and V-10 were not implemented in the webhook at all, so
 # there was nothing to negatively test. P8-T9 implements those three rules and this script closes
@@ -63,9 +88,22 @@ PROJECT=vctr-l2-negatives
 PARENT=wn-platform-parent
 TEAM_NS=wn-team-x
 
-fail=0
+# WHY THE FAILURE FLAG IS A FILE AND NOT A VARIABLE. Nearly every assertion in this file is invoked
+# as `child_yaml ... | reject ...`, and in bash EVERY component of a pipeline runs in a subshell. A
+# `fail=1` set inside `reject` is therefore assigned in a child process and discarded when it exits.
+# Until 2026-07-31 this suite printed `FAIL:` lines and exited 0 with a PASS banner — the exit code
+# no consumer could distinguish from a clean run, on the line `dev/L2-CHAIN.txt` uses to gate V-CTR-002
+# and (from this unit) V-CTN-015 and V-CTN-016. It was found by breaking the suite on purpose while
+# binding those two IDs, which is the only reason it was found at all: a suite that cannot go red
+# looks exactly like a suite that is passing.
+#
+# A file survives the subshell. `bad` is the single choke point — every `reject`, `admit` and inline
+# failure goes through it — so recording there covers call sites that do not exist yet.
+FAILFILE="$(mktemp)"
 pass() { echo "PASS: $1"; }
-bad()  { echo "FAIL: $1"; fail=1; }
+bad()  { echo "FAIL: $1"; echo x >>"$FAILFILE"; }
+# The count is read once at the end; `fail` is derived, never assigned by an assertion.
+failures() { [ -s "$FAILFILE" ] && wc -l <"$FAILFILE" | tr -d ' ' || echo 0; }
 cd "$REPO_ROOT" || exit 1
 
 echo "===================================================================="
@@ -136,10 +174,16 @@ EOF
 }
 
 cleanup() {
-  $K delete agent "$PARENT" "wn-platform-parent-eq" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
+  $K delete agent "$PARENT" "wn-platform-parent-eq" "wn-cluster-admin-parent" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1
   $K delete namespace "$TEAM_NS" --ignore-not-found --wait=false >/dev/null 2>&1
+  rm -f "$FAILFILE"
 }
-trap cleanup EXIT INT TERM
+# P12 ([[LSN-066]]): this trap is installed AFTER p10_assert_control_plane_healthy, whose
+# p12_assert_exclusive_l2 took the one-suite-per-cluster lock and put `_l2_lock_exit_handler` on
+# EXIT. Replacing that trap here would leak the lock to the next acquirer's stale break, so the
+# release is chained in. It cannot change this script's exit status: bash runs the EXIT trap with
+# the pending status and only an explicit `exit` inside the trap overrides it.
+trap 'cleanup; l2_lock_release' EXIT INT TERM
 
 # P3: delete any leftover from an earlier run rather than reusing it — a grandfathered parent may
 # predate the rules under test.
@@ -288,11 +332,46 @@ echo; echo "== V-4) a developer-team Agent lives in the namespace it scopes =="
 
 # metadata.namespace = kubeagents-system, scope.namespace = wn-team-x. Without this clause the pod
 # would be rendered OUTSIDE the tenant's isolation controls (03 §3, §11).
-child_yaml wn-v4 developer-team "$NS" "$PARENT" \
+#
+# THE PARENT HERE IS A CLUSTER-ADMIN, AND THAT IS THE POINT. This arm read
+# `child_yaml wn-v4 developer-team "$NS" "$PARENT"` until 2026-07-31 — a developer-team child
+# parented by the PLATFORM agent. That fixture is the same shape as V-6(b) forty lines down, which
+# exists precisely to prove that a developer-team child skipping a level is refused. So it violated
+# two rules, and its refusal was two rules deep: exactly the [[LSN-035]] shape this file's own header
+# warns about, in the file that warns about it. The rejection stayed attributable only because the
+# webhook aggregates and the message happened to keep naming `metadata.namespace`.
+#
+# `cluster-admin` is the tier immediately above `developer-team`, so with $CA_PARENT the ONLY rule
+# this object violates is placement. The admitted control below is the other half: the same child
+# with `metadata.namespace` corrected must be accepted, which is what proves the placement clause
+# caused the refusal rather than something else about a fixture nobody re-derived.
+# It also needs a cluster of its own. `cluster-1` is the cluster four other arms below scope their
+# cluster-admin fixtures to, and (tier, scope) is unique — V-5's rule, asserted twenty lines up —
+# so a persisted cluster-admin at (project, cluster-1) makes every one of them collide and be
+# refused for cardinality instead of for the clause it names. Two of those arms are negatives, which
+# would have gone green on the wrong rejection; one is a positive control, which goes red. That is
+# the same LSN-035 hazard as the parent tier, reached through the fixture's scope rather than its
+# shape, and it is why this parent lives at `cluster-v4` alone.
+CA_PARENT=wn-cluster-admin-parent
+CA_CLUSTER=cluster-v4
+$K delete agent "$CA_PARENT" -n "$NS" --ignore-not-found >/dev/null 2>&1
+if out="$(child_yaml "$CA_PARENT" cluster-admin "$NS" "$PARENT" \
   "    projectId: $PROJECT
-    clusterName: cluster-1
+    clusterName: $CA_CLUSTER" | $K apply -f - 2>&1)"; then
+  child_yaml wn-v4 developer-team "$NS" "$CA_PARENT" \
+    "    projectId: $PROJECT
+    clusterName: $CA_CLUSTER
     namespace: $TEAM_NS" \
-  | reject "V-4 (placement)" "metadata.namespace"
+    | reject "V-4 (placement)" "metadata.namespace"
+  child_yaml wn-v4-ok developer-team "$TEAM_NS" "$CA_PARENT" \
+    "    projectId: $PROJECT
+    clusterName: $CA_CLUSTER
+    namespace: $TEAM_NS" \
+    | admit "V-4 (same child, placed in the namespace it scopes)"
+else
+  bad "V-4: could not create the cluster-admin fixture parent, so the placement rule cannot be"
+  bad "  attributed to itself: $out"
+fi
 
 # --- V-5: (tier, scope) cardinality -------------------------------------------------------------------
 echo; echo "== V-5) exactly one non-terminating Agent per (tier, scope) =="
@@ -320,6 +399,14 @@ spec:
         name: platform-agent-secrets
         key: API_SERVER_KEY
 EOF
+
+# The positive control, and the reason V-5 needs one more than most arms here. "Exactly one
+# non-terminating Agent per (tier, scope)" fails in two directions, and only one of them is visible
+# from the negative: a rule that refused EVERY second platform Agent, regardless of scope, would make
+# the arm above green and the product unusable. This is a platform Agent for a DIFFERENT project,
+# submitted while $PARENT is standing — the cardinality key is (tier, scope), so it must be admitted.
+child_yaml_platform wn-v5-other-scope "$NS" "    projectId: $PROJECT-other" \
+  | admit "V-5 (second platform Agent, different scope)"
 
 # --- V-6: the cross-object ceiling ----------------------------------------------------------------------
 echo; echo "== V-6) child scope ⊂ parent scope, and the parent tier is the one immediately above =="
@@ -539,10 +626,17 @@ child_yaml_platform wn-ok-budget "$NS" "    projectId: $PROJECT-okbudget" \
 
 echo
 echo "===================================================================="
-if [ $fail -eq 0 ]; then
+fail="$(failures)"
+if [ "$fail" -eq 0 ]; then
   echo " V-CTR-002: PASS — V-1…V-10 all negatively tested, every rejection named its field path"
+  echo " V-CTN-015: PASS — a duplicate (platform, $PROJECT) Agent is rejected naming spec.scope,"
+  echo "   and a second platform Agent in a DIFFERENT scope is still admitted"
+  echo " V-CTN-016: PASS — a developer-team Agent whose metadata.namespace is not its"
+  echo "   spec.scope.namespace is rejected naming metadata.namespace, under a cluster-admin parent"
+  echo "   so placement is the only rule it violates; the corrected child is admitted"
 else
-  echo " V-CTR-002: FAIL — see the FAIL lines above"
+  echo " V-CTR-002 · V-CTN-015 · V-CTN-016: FAIL — $fail failed assertion(s), see the FAIL lines above"
 fi
 echo "===================================================================="
-exit $fail
+[ "$fail" -eq 0 ] || exit 1
+exit 0

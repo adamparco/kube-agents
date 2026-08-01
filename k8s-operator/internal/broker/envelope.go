@@ -297,6 +297,18 @@ type Refusal struct {
 	// status code -- which cannot distinguish a freeze that clears in an hour from one with no
 	// expiry at all.
 	RetryAfterSeconds int
+
+	// AutoPause asks rung 5 for the brake on the way out.
+	//
+	// 06 §4.4 row 3 is the only refusal that carries it: a broker that cannot reach the journal
+	// refuses AND the agent is auto-paused, because one refused submission is a blip and an agent
+	// that has gone dark is a fleet-level fact. It rides on the Refusal for the same reason
+	// `Journal` does -- the brake is what knows the row, the HTTP boundary is where the side effect
+	// happens, and a switch on `Reason` at the write site would be a second copy of 06 §4.4's table.
+	//
+	// Set by `Decide`, never by hand: the brake decision owns whether a row auto-pauses, and this
+	// field is that decision's `AutoPause` copied onto the value that survives the return.
+	AutoPause bool
 }
 
 func (r *Refusal) Error() string { return r.Reason + ": " + r.Detail }

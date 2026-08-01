@@ -1,0 +1,99 @@
+{
+  "_comment": "Mutation sweep for V-CTR-021 -- the two path dialects of 06 §4.2 are never interchangeable. Run: python3 dev/mutate.py verification/mutants/V-CTR-021.json. Every row names the test that must fail; see dev/mutate.py for why rc != 0 is not a catch. Both packages are swept together because the property spans them: the predicate lives in `classify`, the enforcement point the requirement names is `ChangePolicy` admission in `webhook`, the rule validator refuses a second time, and the matcher's own refusal is the reason a path that got past all three still cannot silently match. A sweep of one package alone would score green while a layer in the other was gone.",
+  "suite": {
+    "kind": "go",
+    "dir": "k8s-operator",
+    "packages": ["./internal/broker/classify/", "./internal/webhook/"]
+  },
+  "mutants": [
+    {
+      "id": "M1-the-predicate-stops-rejecting-a-leading-slash",
+      "why": "THE defect the clause exists for. `/spec/replicas` is a WELL-FORMED dotted path whose single segment is literally named `/spec/replicas`, so with the guard gone it admits, stores, lists -- and matches nothing, forever. A gate that has silently stopped gating is indistinguishable from a gate with nothing to catch.",
+      "catcher": "TestValidateDottedPath",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/path.go",
+          "find": "\tif strings.HasPrefix(p, \"/\") {\n\t\treturn fmt.Errorf(\"expected a dotted field path, not a JSON Pointer\")\n\t}\n",
+          "replace": ""
+        }
+      ]
+    },
+    {
+      "id": "M2-admission-stops-checking-field-paths",
+      "why": "The predicate survives and the requirement's named enforcement point stops calling it. `ValidateChangeRule` still refuses the rule, so the policy is still rejected -- which is why this has to be caught on the FIELD PATH and not on the refusal: the author is told rules[0] is wrong and not which of its paths.",
+      "catcher": "TestValidateChangePolicyRejectsAJSONPointerFieldPath",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/webhook/changepolicy_webhook.go",
+          "find": "\t\tfor j, fp := range r.When.FieldPaths {\n\t\t\tif err := classify.ValidateDottedPath(fp); err != nil {\n\t\t\t\terrs = append(errs, field.Invalid(p.Child(\"when\", \"fieldPaths\").Index(j), fp, err.Error()))\n\t\t\t}\n\t\t}\n",
+          "replace": "\t\t_ = r.When.FieldPaths\n"
+        }
+      ]
+    },
+    {
+      "id": "M3-the-message-drifts-from-the-one-06-4.2-specifies",
+      "why": "06 §4.2 specifies the wording, and it specifies it because the mistake is silent: the message is the entire user-facing explanation of a dialect confusion. A paraphrase is a spec drift no compiler and no schema can see.",
+      "catcher": "TestValidateChangePolicyRejectsAJSONPointerFieldPath",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/path.go",
+          "find": "return fmt.Errorf(\"expected a dotted field path, not a JSON Pointer\")",
+          "replace": "return fmt.Errorf(\"field paths must be dotted, not JSON Pointers\")"
+        }
+      ]
+    },
+    {
+      "id": "M4-the-error-loses-the-offending-index",
+      "why": "`when.fieldPaths` is a list. Reporting against the rule tells an author with six paths that one of them is a Pointer, and 06 §4.2's whole argument is that the reader cannot see which -- the two dialects look alike, which is how the entry got written. Two edits, because dropping the index alone leaves `j` unused and Go refuses to compile it -- a BROKEN row measures nothing (LSN-048).",
+      "catcher": "TestValidateChangePolicyRejectsAJSONPointerFieldPath",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/webhook/changepolicy_webhook.go",
+          "find": "\t\tfor j, fp := range r.When.FieldPaths {\n",
+          "replace": "\t\tfor _, fp := range r.When.FieldPaths {\n"
+        },
+        {
+          "file": "k8s-operator/internal/webhook/changepolicy_webhook.go",
+          "find": "field.Invalid(p.Child(\"when\", \"fieldPaths\").Index(j), fp, err.Error())",
+          "replace": "field.Invalid(p, fp, err.Error())"
+        }
+      ]
+    },
+    {
+      "id": "M5-the-defect-is-reported-twice",
+      "why": "The rule-level validator refuses the same path. With the dedup guard gone the author reads two errors for one mistake, goes looking for a second problem, and discounts the specific field-level message as a restatement of the generic one.",
+      "catcher": "TestValidateChangePolicyRejectsAJSONPointerFieldPath",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/webhook/changepolicy_webhook.go",
+          "find": "\t\t\tif !alreadyReported(errs, p) {\n",
+          "replace": "\t\t\tif true {\n"
+        }
+      ]
+    },
+    {
+      "id": "M6-the-rule-validator-stops-refusing-the-wrong-dialect",
+      "why": "The second of the two refusals admission performs, and the one nothing user-facing would notice going: with the webhook's own loop intact a policy author sees the same single error, so only a test aimed at `ValidateChangeRule` can see this. It is also the layer a direct write or a pre-webhook object reaches.",
+      "catcher": "TestJSONPointerInFieldPathsIsRejected",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/rule.go",
+          "find": "\tfor _, p := range r.When.FieldPaths {\n\t\tif err := ValidateDottedPath(p); err != nil {\n\t\t\treturn fmt.Errorf(\"rule %q: when.fieldPaths[%q]: %w\", r.ID, p, err)\n\t\t}\n\t}\n",
+          "replace": "\t_ = r.When.FieldPaths\n"
+        }
+      ]
+    },
+    {
+      "id": "M7-the-matcher-helpfully-normalises-a-pointer-into-a-rule",
+      "why": "The other direction, and the most plausible defect in the set: be liberal in what you accept. Translating `/spec/replicas` into `spec.replicas` at match time makes the dialects interchangeable exactly where 06 §4.2 says they never are -- and it makes every rejection above look like pedantry, which is how they get removed next.",
+      "catcher": "TestPointerPrefixMatchRejectsPointerAsRule",
+      "edits": [
+        {
+          "file": "k8s-operator/internal/broker/classify/path.go",
+          "find": "func PointerPrefixMatch(dotted string, pointer string) (bool, error) {\n\tsegs, err := parseDottedPath(dotted)\n",
+          "replace": "func PointerPrefixMatch(dotted string, pointer string) (bool, error) {\n\tsegs, err := parseDottedPath(strings.ReplaceAll(strings.TrimPrefix(dotted, \"/\"), \"/\", \".\"))\n"
+        }
+      ]
+    }
+  ]
+}

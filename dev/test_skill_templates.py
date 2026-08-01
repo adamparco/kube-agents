@@ -6,7 +6,7 @@ as a committed exemplar — drifts, and drifts asymmetrically: the copy a human 
 stays right while the copy that lands on the cluster goes wrong. It bound those two
 together (dev/tests/reference-render.py) and nobody looked for a third copy.
 
-There is a third copy. The cluster-admin agent's `propose-developer-team` skill
+There is a third copy. The cluster-admin agent's `provision-developer-team` skill
 carries its own `assets/*.tmpl` of the tenant quota, the default-deny floor, the
 egress allowlist and the service aliases, and that is the copy a REAL TENANT gets:
 the skill renders it into a GitOps PR, a human approves it, and CI/CD applies it.
@@ -55,7 +55,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "k8s-operator" / "scripts"
-SKILL = REPO / "agents/cluster-admin/skills/propose-developer-team"
+SKILL = REPO / "agents/cluster-admin/skills/provision-developer-team"
 ASSETS = SKILL / "assets"
 RENDERER = SKILL / "scripts" / "render_developer_team.py"
 

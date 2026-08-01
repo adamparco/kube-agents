@@ -105,20 +105,20 @@ fail on.
 
 ## 4. What upstream has that this fork keeps, changes, or drops
 
-| Upstream capability                                     | Here                                                                                                                                                                                                                  |
-| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Hermes agent runtime, MCP servers, GKE hosted MCP       | **Kept unchanged**                                                                                                                                                                                                    |
-| `SOUL.md` personas, governance SOPs, `SKILL.md` bundles | **Kept**, retiered and rewritten. Persona rewrite to the imperative operating character is Phase 13                                                                                                                   |
-| Cron watchdogs (`cron/jobs.json`)                       | **Kept and generalized** — upstream has one (platform, plus a chat default); this fork has one per tier                                                                                                               |
-| Read-only Kubernetes RBAC that cannot read Secrets      | **Kept for the agent pod, permanently.** The reader identity never gains a write verb in any phase. Write authority lives on a _different_ ServiceAccount in a _different_ pod                                        |
-| Envoy credential-proxy sidecar (credential isolation)   | **Superseded by a stronger form.** The agent pod holds no credential to proxy: the broker is a separate pod with its own identity, so the isolation is a process and RBAC boundary rather than a network interception |
-| gVisor / GKE Sandbox RuntimeClass                       | **Kept**, plus restricted PSS, read-only root filesystem, and enforced per-tier NetworkPolicies proven by the dataplane                                                                                               |
-| GitOps-PR-only mutation                                 | **Replaced.** Retained in a different role as **write-behind IaC sync** (Phase 14) — the repo is updated _after_ the fact so the customer's IaC does not drift, rather than gating the change                         |
-| Customer CI/CD on the critical path                     | **Demoted to optional and off the critical path**                                                                                                                                                                     |
-| Mirror repo                                             | **Demoted**                                                                                                                                                                                                           |
-| Chat Agent                                              | **Removed** — replaced by the deterministic router                                                                                                                                                                    |
-| Google Chat + Slack ChatOps                             | **Kept**, restructured. Slack-first with Google Chat parity, both normalized into one internal message and one dispatch path (Phase 15)                                                                               |
-| Provisioning scripts, `make gcp-provision`              | **Kept and extended** — 13 ordered steps, each with a matching teardown                                                                                                                                               |
+| Upstream capability                                     | Here                                                                                                                                                                                                                               |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hermes agent runtime, MCP servers, GKE hosted MCP       | **Kept unchanged**                                                                                                                                                                                                                 |
+| `SOUL.md` personas, governance SOPs, `SKILL.md` bundles | **Kept**, retiered and rewritten. The persona rewrite to the imperative operating character (P13-T5) was pulled forward and landed in Phase 9 — all three `SOUL.md` files, the skill re-allocation, and the four skill conversions |
+| Cron watchdogs (`cron/jobs.json`)                       | **Kept and generalized** — upstream has one (platform, plus a chat default); this fork has one per tier                                                                                                                            |
+| Read-only Kubernetes RBAC that cannot read Secrets      | **Kept for the agent pod, permanently.** The reader identity never gains a write verb in any phase. Write authority lives on a _different_ ServiceAccount in a _different_ pod                                                     |
+| Envoy credential-proxy sidecar (credential isolation)   | **Superseded by a stronger form.** The agent pod holds no credential to proxy: the broker is a separate pod with its own identity, so the isolation is a process and RBAC boundary rather than a network interception              |
+| gVisor / GKE Sandbox RuntimeClass                       | **Kept**, plus restricted PSS, read-only root filesystem, and enforced per-tier NetworkPolicies proven by the dataplane                                                                                                            |
+| GitOps-PR-only mutation                                 | **Replaced.** Retained in a different role as **write-behind IaC sync** (Phase 14) — the repo is updated _after_ the fact so the customer's IaC does not drift, rather than gating the change                                      |
+| Customer CI/CD on the critical path                     | **Demoted to optional and off the critical path**                                                                                                                                                                                  |
+| Mirror repo                                             | **Demoted**                                                                                                                                                                                                                        |
+| Chat Agent                                              | **Removed** — replaced by the deterministic router                                                                                                                                                                                 |
+| Google Chat + Slack ChatOps                             | **Kept**, restructured. Slack-first with Google Chat parity, both normalized into one internal message and one dispatch path (Phase 15)                                                                                            |
+| Provisioning scripts, `make gcp-provision`              | **Kept and extended** — 13 ordered steps, each with a matching teardown                                                                                                                                                            |
 
 ---
 
@@ -194,23 +194,45 @@ Legend: ✅ built · 🟡 Phase 9, in progress · ⬜ designed and scheduled · 
 
 ## 6. Skill inventory
 
-|                 | Upstream  | Fork                                                                                                                                      |
-| --------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| Platform        | 17 skills | 24 — adds `apply-change`, `detect-drift`, `propose-cluster-admin`, `read-knowledge`, and the workload skills                              |
-| Cluster (Admin) | 6         | 12 — adds `apply-change`, `propose-developer-team`, `raise-escalation`, `read-knowledge`, `submit-suggestion`, and platform-domain skills |
-| Developer Team  | n/a       | 8                                                                                                                                         |
-| Chat            | 0         | n/a                                                                                                                                       |
+Upstream ships **23 distinct skills** over two tiers; the fork ships **26 distinct skills** over
+three. Skills are allocated to the tier whose authority they need, so a skill can appear on more than
+one tier — the per-tier counts below sum to more than 26 for that reason.
 
-New skill _classes_ that have no upstream analogue: **`apply-change`** (the sole path from an agent's
-reasoning to a mutation), **`raise-escalation`** (structured upward hand-off), **`read-knowledge`**,
-and the **`propose-*`** cascade skills that create the next tier down.
+|                 | Upstream  | Fork                                                                                                      |
+| --------------- | --------- | --------------------------------------------------------------------------------------------------------- |
+| Platform        | 17 skills | **12** — fleet-scope work only, plus `provision-cluster-admin` and `delegate`                             |
+| Cluster (Admin) | 6         | **13** — cluster internals, plus `provision-developer-team`, `delegate` and `escalate`                    |
+| Developer Team  | n/a       | **12** — the seven workload skills, plus `escalate`                                                       |
+| Chat            | 0         | n/a — the Chat Agent is gone; `kage-router` is deterministic Go and loads no skills                       |
+| _Shared_        | —         | 4 of the 26 sit on all three tiers: `apply-change`, `detect-drift`, `gke-observability`, `read-knowledge` |
 
-Upstream's `manage-cluster` and `cluster-agent-lifecycle` are the ancestors of the cascade path;
-`workload-rebalancing` was folded into `gke-workload-scaling`.
+The delta is 4 upstream skills dropped and 7 new ones added: 23 − 4 + 7 = 26.
 
-> **Known gap, scheduled:** the Developer Team tier currently holds none of the seven workload skills
-> its persona is assigned — they sit on Platform. The skill re-allocation lands in Phase 13 with the
-> persona rewrite.
+**Dropped:** `submit-suggestion` (the PR-opening mutation path this fork replaces),
+`manage-cluster` and `cluster-agent-lifecycle` (ancestors of the cascade path), and
+`workload-rebalancing` (folded into `gke-workload-scaling`).
+
+**New skill _classes_ with no upstream analogue:**
+
+- **`apply-change`** — the sole path from an agent's reasoning to a mutation. Not a rename of
+  `submit-suggestion`: that skill opened a pull request, this one submits an **Action Envelope** to
+  the tier's Action Broker, which classifies it, plans an undo, executes it, and journals an
+  `ActionRecord`.
+- **`escalate`** and **`delegate`** — the two mesh directions. One hop up to `parentRef`, one hop
+  down to a direct child; the callee re-authorizes in its own scope and no authority is lent.
+  Upstream coordinates through a shared kanban board instead.
+- **`read-knowledge`** — read-only retrieval from the Operational Knowledge Framework.
+- **`provision-cluster-admin`** / **`provision-developer-team`** — the F4 cascade that creates the
+  next tier down. These still render a GitOps bundle for a human to review; they are the one place
+  the fork keeps the propose-and-review shape, because minting a subordinate's identity at runtime
+  is the thing the containment model exists to prevent.
+
+The rest of the delta is **re-allocation, not new code**. Upstream puts every workload skill on
+Platform; this fork moves them to the tier whose scope they act in — `gke-app-onboarding`,
+`gke-manifest-generation`, `gke-productionize`, `gke-inference-quickstart` down to Developer Team,
+and `gke-backup-dr`, `gke-compute-classes`, `gke-networking-edge` down to Cluster Admin. Platform
+shrinks from 17 to 12 as a result. That is the point: a namespace-scoped agent that holds
+`gke-cluster-lifecycle` is a containment claim nobody can check.
 
 ---
 

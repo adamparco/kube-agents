@@ -100,8 +100,9 @@ func TestClusterAdminRender_LoadBearing(t *testing.T) {
 
 	env := envMap(main)
 
-	// submit-suggestion namespaces its PR branches by AGENT_TIER; cluster-admin proposals must land under
-	// cluster-admin-agent/ and never masquerade as the platform tier.
+	// AGENT_TIER is the pod's own statement of which persona it is running (agent_manifests.go records why
+	// nothing reads it today). A cluster-admin pod rendering "platform" here would be misdescribing its own
+	// containment level in the one place an operator inside the container would look.
 	if got := env["AGENT_TIER"]; got != "cluster-admin" {
 		t.Errorf("AGENT_TIER = %q, want cluster-admin", got)
 	}

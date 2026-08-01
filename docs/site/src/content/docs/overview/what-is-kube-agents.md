@@ -32,7 +32,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 ### 4. GitHub Token Minter (Minty)
 
-Short-lived GitHub App installation tokens signed via GCP KMS and delivered through Workload Identity. This lets the `submit-suggestion` skill (and the `github-issue-resolver` watchdog) open pull requests against your GitOps repo without a long-lived PAT. Source: [`k8s-operator/config/integrations/github/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github).
+Short-lived GitHub App installation tokens signed via GCP KMS and delivered through Workload Identity. This lets the write-behind IaC mirror, the provisioning bundles the cascade skills render, and the `github-issue-resolver` watchdog reach your GitOps repo without a long-lived PAT. It is not on the change path — an agent's mutation goes to its Action Broker. Source: [`k8s-operator/config/integrations/github/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github).
 
 ## What actually runs after `./provision.sh`
 

@@ -19,7 +19,7 @@ A standard operating procedure in `agents/platform/governance/`. Codifies how a 
 
 ### Skill
 
-A Claude-style `SKILL.md` bundle in `agents/platform/skills/`. Loaded on demand based on its frontmatter `description`.
+A Claude-style `SKILL.md` bundle in `agents/<tier>/skills/`. Loaded on demand based on its frontmatter `description`. Skills are allocated to the tier whose authority they match, so an agent only sees its own set.
 
 ### Watchdog
 
@@ -27,7 +27,15 @@ A cron-scheduled job in `agents/platform/cron/jobs.json` that fires a pre-author
 
 ### Declarative workflow
 
-The GitOps PR path all infrastructure changes take. Enforced by `SOUL.md` and implemented via the `submit-suggestion` skill + Minty.
+The path every infrastructure change takes: the agent describes the desired state as an **Action Envelope** and submits it with `apply-change`; its **Action Broker** classifies, gates, executes, verifies and journals it. Git is a write-behind mirror or an executing GitOps engine, never the gate.
+
+### Action Broker
+
+The companion workload beside each agent pod, holding the **actor** identity — the only write identity in that agent's scope. It derives `(tier, scope)` from the authenticated caller rather than from the envelope, plans an undo before executing, and journals an `ActionRecord`.
+
+### Action Envelope
+
+The declarative request an agent submits to its broker: `intent`, `operations`, and `trigger_source` (which of `chat`, `undo`, `watch`, `alert`, `cron`, `delegation`, `escalation` put the agent in motion). It carries no field for the agent's own tier, scope, risk class, or approval.
 
 ## Runtime and framework
 
@@ -49,7 +57,7 @@ Open-source inference server for local model serving. Alternative to LiteLLM whe
 
 ### Minty (GitHub Token Minter)
 
-In-cluster broker that mints short-lived GitHub App installation tokens via GCP KMS. Lets `submit-suggestion` open PRs without a long-lived credential.
+In-cluster broker that mints short-lived GitHub App installation tokens via GCP KMS. Lets the write-behind IaC mirror, the rendered provisioning bundles, and `github-issue-resolver` reach GitHub without a long-lived credential. Unrelated to the Action Broker, and not on the change path.
 
 ## Related Kubernetes-native agent projects
 

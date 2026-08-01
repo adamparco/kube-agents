@@ -5,7 +5,7 @@
 
 Companion to `dev/mutate.sh`, which is the general "snapshot files, run a command, always put them
 back" tool. This is the layer above it: the thing every unit kept re-authoring from scratch, and
-kept re-earning a lesson from. Three of them, in four units:
+kept re-earning a lesson from. Four of them, and the last one was paid for three times:
 
   [[LSN-047]]  A throwaway driver snapshotted two files named `cooldown.go` into one directory keyed
                by BASENAME, and restored the wrong one over the other. `dev/mutate.sh` already did
@@ -23,11 +23,26 @@ kept re-earning a lesson from. Three of them, in four units:
                surrounding invocation still exited 0. The sweep read that 0 as "the suite passed
                with the mutation in place" and invented a hole in a property the suite catches
                cleanly.
+  [[LSN-063]]  A negative control's mutation was `t.replace("  covered: 0", "  covered: 12", 1)` --
+               a literal keyed to the value the tree happened to hold the day the control was
+               written. Curation moved `covered` off zero, the replace matched nothing and returned
+               the string UNCHANGED, the control re-ran the check against the unmutated tree, the
+               check correctly found nothing, and the row printed `MISS`. `MISS` means "the check
+               let the defect through", so the action it recommends is to go strengthen the check --
+               which produces a check that passes on the first run, looks exactly like the fix, and
+               leaves the mutant unmeasured. That is [[LSN-048]] arriving through a third door. It
+               has now happened three times, in three files, and been hand-repaired three times: a
+               literal line number, offset or slice index expires exactly the way a literal count
+               does.
 
-All three reduce to one root: **the sweep scored an exit code it had not established was the test
-suite's.** `rc == 0` in a mutation sweep is produced by a pipeline of things that are not the test
-suite -- a `-run` filter, a shell parse, an applier, an `&&` -- and any of them can hand back a 0
-meaning "I did nothing".
+The first three reduce to one root: **the sweep scored an exit code it had not established was the
+test suite's.** `rc == 0` in a mutation sweep is produced by a pipeline of things that are not the
+test suite -- a `-run` filter, a shell parse, an applier, an `&&` -- and any of them can hand back a
+0 meaning "I did nothing".
+
+LSN-063 is the same root approached from the other end: **the sweep scored a mutation it had not
+established was applied.** An unmutated tree is green for the most boring reason there is, and every
+verdict read off it is fiction.
 
 So this runner refuses to produce a number it cannot back:
 
@@ -35,17 +50,26 @@ So this runner refuses to produce a number it cannot back:
      JSON and are applied by `str.replace` in this process. Nothing is interpolated into a command
      line, so a needle may contain quotes, backslashes, newlines, `$` -- anything Go source can.
   2. **The applier refuses unless the needle appears EXACTLY once.** A stale needle scores BROKEN,
-     never a silent escape, and an ambiguous one never lands in two places at once.
-  3. **The mutation is observed to have landed** before anything is scored. The applier's failure
-     and the suite's success are different outcomes and never share an exit code.
+     never a silent escape, and an ambiguous one never lands in two places at once. Zero
+     occurrences is LSN-063's shape: the replace returns the file unchanged and the suite is then
+     re-run against the tree it was already green on.
+  3. **A mutation that did not move the bytes is BROKEN, and that rule has ONE definition site.**
+     Three arms, deliberately in one vocabulary rather than three, because a rule stated three ways
+     is a rule that gets re-argued instead of read: the spec-time `find == replace` refusal, the
+     applier's comparison of the rewritten text against what it read, and -- once every edit of a
+     mutant has been applied -- a byte comparison of each touched file against the snapshot taken
+     before it. The third arm is form-independent by construction: whatever edit forms are added
+     later, the bytes either moved or they did not, and it is the only arm that can see one edit
+     undoing another. This is LSN-063 mechanized here rather than in the eighteenth control loop
+     that would otherwise have to remember it.
   4. **No `-run` pattern.** The whole package's tests run for every mutant. A spec that tries to
      narrow the run is rejected: filtering is how LSN-048 happened, and running everything is also
      what makes rule 5 meaningful.
   5. **Every mutant names the test that must fail, and that test must actually exist.** The
-     catchers are checked against `go test -list` BEFORE the first mutation, so a misremembered
-     name is a refusal up front rather than a survivor at the end. `rc != 0` is not a catch: a
-     mutant that reddens the package via a DIFFERENT test than the one it names has found
-     something, but not the thing the row claims, and that scores as an escape.
+     catchers are checked against `go test -list` (or the unittest loader) BEFORE the first
+     mutation, so a misremembered name is a refusal up front rather than a survivor at the end.
+     `rc != 0` is not a catch: a mutant that reddens the package via a DIFFERENT test than the one
+     it names has found something, but not the thing the row claims, and that scores as an escape.
   6. **Restore is a byte copy** of a snapshot taken here, keyed by position, on success, on
      failure and on signal. Never `git checkout` / `git restore` / `git stash` -- see
      [[LSN-030]] and [[LSN-022]] for the two hours that rule cost.
@@ -60,15 +84,19 @@ So this runner refuses to produce a number it cannot back:
 Three verdicts, not two:
 
   caught   the package went red AND the named catcher was among the failures
-  ESCAPED  the mutation landed, the package built, and the suite stayed green (or went red without
+  ESCAPED  the mutation landed, the mutant built, and the suite stayed green (or went red without
            the named catcher). A real hole, or a real mis-attribution.
-  BROKEN   the sweep could not evaluate the mutant -- stale needle, mutant that does not compile,
-           unknown catcher. Scored as NEITHER caught nor survived so the denominator cannot
-           silently shrink.
+  BROKEN   the sweep could not evaluate the mutant -- stale needle, a mutation that moved no bytes,
+           a mutant that does not compile, a catcher that cannot exist. Scored as NEITHER caught
+           nor survived so the denominator cannot silently shrink.
 
-A BROKEN row is not a finding. The natural move on an apparent survivor is to go strengthen a test,
-and doing that to a BROKEN row produces a test that passes immediately, looks exactly like the fix,
-and leaves the mutant unmeasured. Fix the row, then re-run.
+Every run prints all three counts whether or not they are zero, and exits non-zero if any row is
+ESCAPED or BROKEN.
+
+A BROKEN row is not a finding -- it is the sweep saying it could not evaluate the mutant. The
+natural move on an apparent survivor is to go strengthen a test, and doing that to a BROKEN row
+produces a test that passes immediately, looks exactly like the fix, and leaves the mutant
+unmeasured. Fix the row, then re-run.
 
 Spec format:
 
@@ -95,6 +123,27 @@ Spec format:
 
 For `"kind": "unittest"`, `packages` is the list of `python3 -m unittest` targets (e.g.
 `["discover", "dev"]`) and `dir` is the repo root.
+
+**There is deliberately no `"kind": "command"`, and this is where you would come looking for it.**
+B-012 proposed one for the growing class of checks in `dev/tests/*.py` and `dev/verify/*.sh` that
+report in prose and whose only catcher is their own `--negative-control`. It is refused, because the
+premise is wrong: *a check whose only catcher is its own control is usually a check that has not
+been given a catcher yet.* The control is a mode of the script, the script imports, and a test that
+drives it is an ordinary member of the `unittest` suite -- see `PhaseRatchetIsAsserted` in
+`dev/test_invariants_gate.py`, whose `_load_phase_ratchet()` and `_control_against()` do exactly
+that for `dev/tests/phase-ratchet-is-asserted.py`, and `verification/mutants/V-MET-014.json`, which
+then sweeps that script under the existing `"kind": "unittest"` with no runner change at all.
+
+The move is also strictly stronger. A needle asserts that a STRING APPEARED; a test function
+asserts the PROPERTY. `parse_ratchet` accumulating every phase <= N is a thing a test can call and
+check; "the output mentioned the prior-row case" is a thing a reworded diagnostic silently breaks,
+and rule 5 -- the guard that makes a misremembered catcher a refusal instead of a survivor -- has
+nothing to check a free-text needle against. Give the check a test, then sweep the test.
+
+The `dev/verify/*.sh` half of that class was never really in the corpus: an L2 suite needs a cluster
+per mutant, which is not a thing this runner can drive at all. Their in-suite equivalent is
+`nc_score` in `dev/verify/brake-l2.sh`, which reaches the same rules the same way -- and which is
+the fourth hand-written copy of rule 3, after the three in `dev/tests/`.
 
 Exit: 0 = every mutant caught. 1 = at least one ESCAPED. 2 = at least one BROKEN, or the sweep
 could not run at all (red baseline, unreadable spec, unknown catcher).
@@ -124,9 +173,32 @@ PY_FAIL = re.compile(r"^(?:FAIL|ERROR):\s+(\w+)", re.M)
 # package under test or one of its dependencies is the one that broke.
 GO_BUILD_FAILED = ("[build failed]", "build failed", "cannot find package", "# command-line-arguments")
 
+# Rule 3, stated once. Every arm that can notice a mutation which did not move the bytes ends its
+# refusal with this sentence, because a rule phrased three ways is a rule that gets re-argued from
+# scratch by whoever meets the second phrasing first.
+DID_NOT_APPLY = (
+    "the mutation did not change its input; nothing was evaluated. A mutation keyed to a literal "
+    "the tree happened to hold has an expiry date and it expires SILENTLY: the replace returns the "
+    "text unchanged, the suite is re-run against the unmutated tree, and the green that comes back "
+    "reads as a survivor. That is BROKEN, not a finding (LSN-063)."
+)
+
 
 class Broken(Exception):
     """The sweep cannot evaluate something. Never scored as a result."""
+
+
+def shown(f: pathlib.Path) -> object:
+    """`f` repo-relative when it can be, `f` otherwise.
+
+    `relative_to` and not `os.path.relpath`, guarded: an absolute `file` in a spec can point
+    outside the repo, and a ValueError raised by a pretty-printer inside an error path replaces a
+    readable refusal with a stack trace.
+    """
+    try:
+        return f.relative_to(REPO)
+    except ValueError:
+        return f
 
 
 # ------------------------------------------------------------------------------------------------
@@ -274,8 +346,9 @@ def load_spec(path: pathlib.Path) -> tuple[object, list[dict]]:
             for field in ("file", "find", "replace"):
                 if field not in e:
                     raise Broken(f"mutant {m['id']}: edit missing `{field}`")
+            # Rule 3's spec-time arm: the one no-op that can be refused without touching the tree.
             if e["find"] == e["replace"]:
-                raise Broken(f"mutant {m['id']}: find == replace, so nothing is mutated")
+                raise Broken(f"mutant {m['id']}: find == replace, so nothing is mutated. {DID_NOT_APPLY}")
     return suite, mutants
 
 
@@ -285,12 +358,19 @@ def load_spec(path: pathlib.Path) -> tuple[object, list[dict]]:
 
 
 def apply_edit(edit: dict) -> None:
-    """Rewrite one file. Refuses unless the needle appears exactly once.
+    """Rewrite one file. Refuses unless the needle appears exactly once and the bytes then move.
 
     Exactly-once is doing three jobs. It turns a stale needle into a refusal instead of a no-op
     that scores as an escape. It stops one mutation landing in two places, where the second site
     is the one that reddens the suite and the report names the first. And it is the observation
     that the mutation LANDED, which is the thing LSN-049's `&&` chain never made.
+
+    The comparison after the replace is rule 3's second arm, in the same vocabulary as the other
+    two. Today it is unreachable -- a unique needle, replaced by text the spec has already been
+    made to prove is different, always moves the file -- and it is stated anyway, because
+    "unreachable" is a property of the edit forms that exist right now and this is the rule, not
+    the special case. The next edit form (a regex, an offset, a slice) gets it for free instead of
+    re-earning LSN-063 for a fourth time.
     """
     path = REPO / edit["file"]
     try:
@@ -301,10 +381,15 @@ def apply_edit(edit: dict) -> None:
     if n != 1:
         raise Broken(
             f"the needle occurs {n} times in {edit['file']}, want exactly 1. "
-            f"A stale needle is a BROKEN row, never a survivor:\n"
+            f"A stale needle is a BROKEN row, never a survivor: at zero the replace hands back the "
+            f"file unchanged and the suite is re-run against the tree it was already green on "
+            f"(LSN-063); at two the mutation lands twice and the row names the wrong site.\n"
             f"        {edit['find'].splitlines()[0][:100] if edit['find'] else ''}"
         )
-    path.write_text(src.replace(edit["find"], edit["replace"]), encoding="utf-8")
+    out = src.replace(edit["find"], edit["replace"])
+    if out == src:
+        raise Broken(f"{edit['file']}: {DID_NOT_APPLY}")
+    path.write_text(out, encoding="utf-8")
 
 
 class Snapshot:
@@ -322,15 +407,25 @@ class Snapshot:
         for i, f in enumerate(files):
             if not f.is_file():
                 shutil.rmtree(self.dir, ignore_errors=True)
-                # `relative_to` and not `os.path.relpath`, guarded: an absolute `file` in the spec
-                # can point outside the repo, and a ValueError from the pretty-printer would
-                # replace this refusal with a stack trace.
-                try:
-                    shown: object = f.relative_to(REPO)
-                except ValueError:
-                    shown = f
-                raise Broken(f"no such file: {shown}")
+                raise Broken(f"no such file: {shown(f)}")
             shutil.copy2(f, self.dir / str(i))
+
+    def unchanged(self) -> list[pathlib.Path]:
+        """The snapshotted files whose bytes are IDENTICAL to the copy taken here.
+
+        Rule 3's third and form-independent arm. `apply_edit` can only see the edit in front of it,
+        so a mutant whose second edit undoes its first leaves the applier satisfied and the tree
+        unmutated -- and the sweep then measures the baseline a second time and calls the green a
+        survivor. Bytes cannot be argued with, and they stay true whatever edit forms arrive later.
+
+        Every file here is one some edit named, so an identical one means that file's mutation was
+        reverted or never landed. Called before `restore`, which deletes the copies.
+        """
+        return [
+            f
+            for i, f in enumerate(self.files)
+            if f.read_bytes() == (self.dir / str(i)).read_bytes()
+        ]
 
     def restore(self) -> None:
         if self.restored:
@@ -361,6 +456,8 @@ def score(mutant: dict, rc: int, out: str, built: bool, suite) -> tuple[str, str
 
 
 def sweep(suite, mutants: list[dict], verbose: bool) -> int:
+    # Rule 5, and rule 3's sibling: a mutant whose catcher cannot exist has not been evaluated
+    # either, so it is refused BEFORE the first mutation rather than reported at the end.
     known = suite.known_tests()
     unknown = sorted({m["catcher"] for m in mutants} - known)
     if unknown:
@@ -393,6 +490,14 @@ def sweep(suite, mutants: list[dict], verbose: bool) -> int:
         try:
             for e in m["edits"]:
                 apply_edit(e)
+            # Rule 3's third arm, and the reason it is here rather than in `apply_edit`: the applier
+            # proves each EDIT moved the file it touched, which is not the claim the sweep is about
+            # to score. The claim is that the MUTANT moved the tree.
+            reverted = snap.unchanged()
+            if reverted:
+                raise Broken(
+                    ", ".join(str(shown(f)) for f in reverted) + f": {DID_NOT_APPLY}"
+                )
         except Broken as exc:
             verdict, detail = "BROKEN", str(exc)
         else:
@@ -412,18 +517,19 @@ def sweep(suite, mutants: list[dict], verbose: bool) -> int:
     escaped = [r for r in results if r[1] == "ESCAPED"]
     broken = [r for r in results if r[1] == "BROKEN"]
 
-    print(f"\n{len(caught)}/{len(results)} caught", end="")
-    if escaped:
-        print(f" · {len(escaped)} ESCAPED", end="")
-    if broken:
-        print(f" · {len(broken)} BROKEN", end="")
-    print()
+    # All three counts, always, including the zeros. A summary that prints only the verdicts it has
+    # cannot be read as a statement about the ones it does not: `6/6 caught` and
+    # `6/6 caught · 0 ESCAPED · 0 BROKEN` differ in whether the reader has to know that.
+    print(
+        f"\n{len(caught)}/{len(results)} caught · {len(escaped)} ESCAPED · {len(broken)} BROKEN"
+    )
 
     if broken:
         print(
-            "\nBROKEN rows are not findings. Fix the row and re-run. Strengthening a test against a "
-            "BROKEN row produces a test that passes on the first try, looks exactly like the fix, "
-            "and leaves the mutant unmeasured (LSN-048)."
+            "\nBROKEN rows are not findings -- they are the sweep saying it could not evaluate the "
+            "mutant. Fix the row and re-run. Strengthening a test against a BROKEN row produces a "
+            "test that passes on the first try, looks exactly like the fix, and leaves the mutant "
+            "unmeasured (LSN-048, LSN-063)."
         )
         return 2
     return 1 if escaped else 0

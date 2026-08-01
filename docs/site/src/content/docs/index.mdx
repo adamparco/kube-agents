@@ -1,11 +1,11 @@
 ---
 title: kube-agents
-description: An autonomous agentic harness for Kubernetes. Proactive fleet audits, declarative GitOps remediation, and ChatOps in one place.
+description: An autonomous agentic harness for Kubernetes. Proactive fleet audits, brokered and reversible remediation, and ChatOps in one place.
 template: doc
 tableOfContents: false
 hero:
   title: kube-agents
-  tagline: An autonomous agentic harness for Kubernetes. Watchdogs run in the background, remediation lands as pull requests, and Chat notifies you when it does.
+  tagline: An autonomous agentic harness for Kubernetes. Watchdogs run in the background, remediation is executed by a broker that classifies and can undo it, and Chat tells you what changed.
   actions:
     - text: Quick start
       link: /kube-agents/install/quickstart-gke/
@@ -25,7 +25,7 @@ import { Aside, CardGrid, LinkCard } from "@astrojs/starlight/components";
 
 ## What it is
 
-`kube-agents` runs an autonomous Platform Agent inside your Kubernetes cluster. It listens on Google Chat (and optionally Slack), executes a growing library of Kubernetes skills on demand, and on its own schedule runs background watchdogs that audit the fleet, propose fixes as GitHub pull requests, and post proactive alerts back to Chat.
+`kube-agents` runs an autonomous Platform Agent inside your Kubernetes cluster. It listens on Google Chat (and optionally Slack), executes a growing library of Kubernetes skills on demand, and on its own schedule runs background watchdogs that audit the fleet, fix what they find, and post proactive alerts back to Chat. The agent pod itself holds no write credential: every change is an **Action Envelope** submitted to an **Action Broker** beside it, which classifies the risk, plans an undo, executes, verifies, and journals the result.
 
 It ships as a small set of components:
 
@@ -45,7 +45,7 @@ It ships as a small set of components:
 <CardGrid>
   <LinkCard
     title="Proactive autonomy"
-    description="Scheduled watchdogs (blueprint sync, compliance audit, security patches, cost analysis, capacity orchestration…) run without prompting. Findings become GitOps PRs and Chat alerts."
+    description="Scheduled watchdogs (blueprint sync, compliance audit, security patches, cost analysis, capacity orchestration…) run without prompting. Findings become brokered changes with an undo handle, plus Chat alerts."
     href="/kube-agents/overview/proactive-autonomy/"
   />
   <LinkCard
@@ -57,19 +57,14 @@ It ships as a small set of components:
 
 ## What the agent can do out of the box
 
-A growing library of skills ships in `agents/platform/skills/`. Full [skill catalog](/kube-agents/skills/) has descriptions and source links.
+26 skills ship in `agents/<tier>/skills/`, each allocated to the tier whose authority it needs. Full [skill catalog](/kube-agents/skills/) has descriptions and source links.
 
-| Group                     | Skills                                                                             |
-| ------------------------- | ---------------------------------------------------------------------------------- |
-| Cluster lifecycle         | `gke-cluster-creator`, `gke-cluster-lifecycle`, `gke-multi-tenancy`                |
-| Workloads                 | `gke-app-onboarding`, `gke-workload-scaling`, `gke-workload-troubleshooting`       |
-| Cost and capacity         | `gke-cost-analysis`, `gke-compute-classes`, `gke-productionize`, `gke-reliability` |
-| Security and compliance   | `gke-workload-security`, `gke-backup-dr`                                           |
-| Networking and storage    | `gke-networking-edge`, `gke-storage`                                               |
-| AI and inference          | `gke-inference-quickstart`                                                         |
-| Observability             | `gke-observability`, `kube-agents-observability`                                   |
-| Manifests and remediation | `gke-manifest-generation`, `submit-suggestion`                                     |
-| Meta                      | `github-issue-resolver`                                                            |
+| Tier                               | Skills                                                                                                                                                                                                 |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Platform** (project, 12)         | `gke-cluster-creator`, `gke-cluster-lifecycle`, `gke-cost-analysis`, `gke-multi-tenancy`, `github-issue-resolver`, `kube-agents-observability`, `provision-cluster-admin`, `delegate` + shared         |
+| **Cluster Admin** (cluster, 13)    | `gke-compute-classes`, `gke-networking-edge`, `gke-storage`, `gke-backup-dr`, `gke-reliability`, `gke-multi-tenancy`, `provision-developer-team`, `delegate`, `escalate` + shared                      |
+| **Developer Team** (namespace, 12) | `gke-app-onboarding`, `gke-manifest-generation`, `gke-productionize`, `gke-inference-quickstart`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`, `escalate` + shared |
+| _Shared by all three_              | `apply-change`, `detect-drift`, `gke-observability`, `read-knowledge`                                                                                                                                  |
 
 ## Architecture at a glance
 
@@ -87,24 +82,28 @@ flowchart LR
     subgraph Cluster
         OP[k8s-operator]
         PA["Platform Agent<br/>(k8s-deployment)"]
+        AB["Action Broker<br/>(actor identity)"]
         LM[LiteLLM / vLLM]
         MT[Minty<br/>GitHub token minter]
     end
 
     subgraph External
         LLM[Gemini / Anthropic / OpenAI / Gemma]
-        GH[GitHub<br/>GitOps repo]
+        GH[GitHub<br/>IaC mirror / GitOps repo]
     end
 
     GC -->|Pub/Sub| PA
     SL -->|Socket Mode| PA
     CR -->|scheduled prompts| PA
     OP -->|reconciles Agent CR| PA
+    OP -->|reconciles the broker| AB
     PA -->|Completions API| LM
     LM --> LLM
-    PA -->|submit-suggestion skill| MT
+    PA -->|reads only| K8S[Kubernetes API]
+    PA -->|apply-change skill<br/>Action Envelope| AB
+    AB -->|scoped writes| K8S
+    AB -.->|write-behind mirror| MT
     MT -->|short-lived token| GH
-    PA -->|Kubernetes MCP| K8S[Kubernetes API]
     PA -.->|proactive alert| GC
     PA -.->|proactive alert| SL
 ```

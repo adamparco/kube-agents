@@ -85,7 +85,7 @@ func TestGateway_AuditAttributionSurface(t *testing.T) {
 	t.Run("delivered turn ties Sender to TraceID and carries it to dispatch (attribution)", func(t *testing.T) {
 		// Phase 5 T-A (acceptance d): the per-turn trace id is recorded on the audit record alongside the
 		// requester (tying who↔which-turn) AND handed to the dispatcher, which the production dispatcher
-		// stamps as kage_trace_id so the agent can echo it as the PR Trace-Id trailer.
+		// stamps as kage_trace_id so the agent can echo it onto the Action Envelope it submits to the broker.
 		idx := NewIndex()
 		idx.Upsert(agentCR("cluster-a-agent", "cluster-admin", "proj-x", "cluster-a", "", "topic-ca", []string{"users/alice"}))
 		sink := &capturingSink{}

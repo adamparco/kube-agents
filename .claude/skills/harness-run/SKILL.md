@@ -37,6 +37,16 @@ Context does not survive; files do. "I remember where I was" is false.
    `dev/tests/invariants-gate.py` fails the build on exactly that: an item added before
    `Last drained` and still sitting in the inbox.
 
+   **The harness never writes to the inbox** — it only reads and drains it. Not a finding of its
+   own, not a note to its next self, not an item it plans to drain in the same session. That channel
+   is a human's, and it is destroyed by sharing: the moment the harness can file there, an item in
+   the inbox stops meaning _a person wants something_ and `Last drained` stops measuring whether the
+   harness is listening. Harness findings are recorded in the ledger, and the work they imply is
+   scheduled as a task in the phase breakdown — the same two destinations every other harness
+   finding uses. The sections _below_ the inbox (`## Scheduled`, `## Refused`, `## Done`) are the
+   harness's half of that file and it writes them freely, following the structure rules the file
+   states.
+
    **Then commit the drain, before SELECT — its own commit, on the phase branch.** Not at
    CHECKPOINT. The drain is the one artifact ORIENT is required to _write_, and everything after it
    moves `HEAD`: a branch creation, a `git stash pop`, a `gh pr merge`. An uncommitted drain has
@@ -143,6 +153,25 @@ matched nothing and scored three unevaluated mutants as survivors ([[LSN-048]]),
 containing `""` that closed a `bash -c` string so the applier died and its 0 was read as the suite
 passing ([[LSN-049]]). `dev/mutate.sh` is still the right tool for a one-off "break this, run that,
 put it back"; it is the layer below, and it cannot see any of the three.
+
+**"My check reports in prose, so no `kind` fits" is the wrong conclusion, and two units reached it.**
+Both `P9-T11a-2` and `P9-T11a-3` swept `dev/tests/phase-ratchet-is-asserted.py` by hand through
+`dev/mutate.sh`, using sentences out of its `--negative-control` output as catchers, on the reasoning
+that a check whose only output is prose has nothing a runner can assert against. It does. **Give the
+check a `unittest` catcher: import the script as a module, call the function under test, and assert
+the property.** That path was already committed for that exact script — `dev/test_invariants_gate.py`
+holds `class PhaseRatchetIsAsserted`, whose `_control_against()` runs its `negative_control()` against
+a synthesised repository and hands back `(rc, output)` — and `verification/mutants/V-MET-014.json`
+already sweeps mutations of it under the existing `"kind": "unittest"`. The fallback was never
+needed.
+
+The difference is not stylistic. **A needle asserts that a string appeared; a test function asserts
+the property.** One of those two units recorded that two of its mutants "ESCAPE on an unperturbed
+input" — that is [[LSN-063]], the mutation never applied, and a prose needle structurally cannot
+express it, because there is no sentence whose absence means _the edit did not take_. `dev/mutate.py`
+now refuses that case up front (`DID_NOT_APPLY`, scored `BROKEN`) and refuses a catcher naming a test
+that does not exist, and neither guard has anything to check a free-text needle against. A sweep that
+routes around the runner routes around both.
 
 Each row names the test that must fail, and `rc != 0` is not a catch. Three verdicts: `caught`,
 `ESCAPED`, `BROKEN`. **A `BROKEN` row is not a finding** — it is the sweep saying it could not

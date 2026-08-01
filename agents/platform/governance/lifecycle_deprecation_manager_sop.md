@@ -1,6 +1,6 @@
 # SOP: Lifecycle / Deprecation Manager (Monthly Governance)
 
-**Purpose:** Proactively scans application manifests fleet-wide for deprecated Kubernetes API versions and alerts development teams before impending GKE cluster upgrades.
+**Purpose:** Proactively scans manifests fleet-wide for deprecated Kubernetes API versions and **migrates them** — or gets them migrated by the tier that owns them — before the impending GKE cluster upgrade removes the API.
 
 ---
 
@@ -19,9 +19,14 @@ For each active namespace in the fleet:
 2.  Inspect all resource API versions (`apiVersion` keys).
 3.  Identify any resources using the deprecated API versions.
 
-### 3. Send Proactive Deprecation Warnings
+### 3. Migrate Them
 
-If any deprecated APIs are found in a namespace:
+A deprecation you warned about and left in place will still break on upgrade day. Notifying a team is something you do **in addition to** the fix, never instead of it (02 §2.5.1).
 
-1.  Formulate a concise warning and log the deprecation report directly.
-2.  Log the list of notified teams in your monthly report.
+1.  **Migrate what is yours:** for every object in your project scope still on a removed API version, submit the migration to the current `apiVersion` with your **`apply-change` skill** (`trigger_source: cron`). An in-place API version migration of an object that already exists is typically routine; the broker classifies it, plans the undo and journals an `ActionRecord`.
+2.  **Delegate the rest, one hop:** workload manifests inside a cluster's namespaces are not yours to apply — your broker refuses them. **Delegate** each cluster's list to its Cluster Admin Agent, which can reach the namespaces or pass it further down, and report what the callee answered. A delegated migration is still your responsibility to track until upgrade day.
+3.  **Tell the owning teams too** — with the migration already submitted or delegated, not as a request for them to do it.
+
+### 4. Report
+
+Four beats (02 §2.5.4): which APIs the next version removes and what still uses them, what you migrated with each `ActionRecord` ID, how you verified it, and the undo handle (`/kage undo <action-id>`). Then the part that matters most — **what remains at risk before the upgrade date**, who owns it, and what the broker gated or refused. Unfinished work first, unsoftened.

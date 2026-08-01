@@ -32,25 +32,43 @@ WHAT IS SHIPPED CODE AND WHAT IS THE FIXTURE
     material and the endpoint still taken from the shipped `BrokerConfig`. Every one of them is a
     claim about what the SERVER refuses, which is where the claim belongs.
 
+THE SURFACE SCAN IS A SECOND SUBJECT IN THE SAME POD (V-BRK-021's L2 half, P9-T9b-5b-ii-b-2)
+    Everything above asks "what does the broker do with a credential". The scan at the bottom asks
+    a different question with the credential already satisfied: "what else is there to talk to".
+    It shares this pod because the two need exactly the same thing to be asked at all — a
+    mesh-signed certificate, an audience-bound token, and the hostAliases short-circuit — and a
+    second driver pod would double the cost of the run to re-derive material this one already
+    holds. Its scenarios are namespaced by prefix (`route:`, `method:`, `nonce-method:`, `query:`,
+    `header:`, `port:`) so the suite can find them without a second copy of the list living in the
+    shell.
+
+    Every scan request carries the agent's OWN good certificate and OWN good token. That is what
+    makes a 404 attributable to the ROUTE SET: a probe refused 401 or 403 would have been refused
+    by the authenticator, and would prove nothing about whether the route exists.
+
 OUTPUT CONTRACT, read by `dev/verify/broker-auth-l2.sh`
     One JSON object per line on stdout, and nothing else on stdout:
         {"scenario": str,
-         "outcome":  "http" | "transport-error" | "probe-error",
+         "outcome":  "http" | "transport-error" | "probe-error" | "port-open" | "port-closed",
          "status":   int | null,      # HTTP status, when one was received
          "reason":   str,             # the broker's machine-readable refusal reason, when parsed
          "detail":   str}             # prose: the broker's message, or the exception
     `transport-error` means no HTTP status was ever received — the connection did not become a
     usable TLS session. For the mTLS negatives that IS the pass condition, and it is a distinct
     outcome from an HTTP refusal precisely so the suite cannot accept one for the other.
+    `port-open` / `port-closed` are the raw-TCP outcomes of the `port:` scenarios, which never
+    speak HTTP at all and so cannot honestly borrow either of the other two words.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import socket
 import ssl
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import action_envelope
@@ -138,12 +156,29 @@ def _body_of(reader: object) -> tuple[dict[str, object], str]:
     return (parsed, text) if isinstance(parsed, dict) else ({}, text)
 
 
-def raw_get(scenario: str, url: str, *, ctx: ssl.SSLContext | None, token: str | None) -> None:
-    """One GET, with exactly the credentials named, and every failure mode reported as itself."""
-    req = urllib.request.Request(url, method="GET")
+def raw_request(
+    scenario: str,
+    url: str,
+    *,
+    ctx: ssl.SSLContext | None,
+    token: str | None,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    body: bytes | None = None,
+) -> None:
+    """One request, with exactly the credentials, method, headers and body named.
+
+    The generalisation of `raw_get`, added for the surface scan: that scan's whole subject is
+    requests the shipped client cannot make — a PUT to the mutating route, a query parameter on it,
+    a bypass header on any route. The shipped client offers none of those, deliberately, and adding
+    a seam to it here would be adding a seam an agent could reach (see the module docstring).
+    """
+    req = urllib.request.Request(url, method=method, data=body)
     req.add_header("Accept", "application/json")
     if token is not None:
         req.add_header("Authorization", "Bearer " + token)
+    for name, value in (headers or {}).items():
+        req.add_header(name, value)
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as resp:
             body, text = _body_of(resp)
@@ -155,6 +190,11 @@ def raw_get(scenario: str, url: str, *, ctx: ssl.SSLContext | None, token: str |
         emit(scenario, outcome="http", status=exc.code, reason=str(body.get("reason", "")), detail=(str(body.get("message", "")) or text)[:400])
     except Exception as exc:  # noqa: BLE001 — the class name IS the evidence for a transport negative
         emit(scenario, outcome="transport-error", detail=f"{type(exc).__name__}: {exc}"[:400])
+
+
+def raw_get(scenario: str, url: str, *, ctx: ssl.SSLContext | None, token: str | None) -> None:
+    """One GET, with exactly the credentials named. The original five rows' entry point, unchanged."""
+    raw_request(scenario, url, ctx=ctx, token=token, method="GET")
 
 
 def read_file(path: str) -> str:
@@ -189,6 +229,207 @@ def probe_target_operation() -> list[dict[str, object]]:
             },
         }
     ]
+
+
+# ------------------------------------------------------------------------------------------------
+# V-BRK-021's L2 half — the shipped binary's surface, asked of the binary rather than of the tree
+# ------------------------------------------------------------------------------------------------
+#
+# The L0 half (`server_test.go`, `TestNoDebugRoutes` and its four siblings) asserts these same
+# properties against an in-process `Server` built from the tree, and says in its own header why:
+# "claims of that shape cannot be proved by probing a running process — a probe only covers the
+# routes somebody thought to try". That is true and it is why the L0 half is the derivation, not
+# this. What THIS covers is the other direction, which no source scan can reach: the properties
+# hold on the IMAGE THE CONTROLLER HANDED OUT, behind the real TLS listener, at the digest P1
+# pinned. A build-tag-guarded skip path is invisible to a test compiled without the tag, and a
+# route added by a base image or a sidecar is invisible to a scan of this package.
+
+# Paths that must not be routes. The first seventeen are `TestNoDebugRoutes`'s list, kept in step
+# deliberately: the L0 and L2 halves of one row disagreeing about what a back door looks like would
+# make the pair weaker than either. The last two are the sharp ones and are NOT in the L0 list —
+# 05 §1.3 names `approve` and `replay` as future doors into this corridor, and V-BRK-021's re-entry
+# clause is recorded at L0 as "a conditional whose population is empty". Empty is a claim about the
+# deployed server, so it is asserted here, against one.
+SURFACE_PATHS = [
+    "/debug/pprof/",
+    "/debug/vars",
+    "/metrics",
+    "/admin",
+    "/apply",
+    "/exec",
+    "/v1alpha1",
+    "/v1alpha1/",
+    "/v1alpha1/apply",
+    "/v1alpha1/actions/force",
+    "/v1alpha1/actions/",
+    "/v1alpha1/actions/anything",
+    "/v1/actions",
+    "/",
+    "/v1alpha1/undo",
+    "/v1alpha1/classify",
+    "/v1alpha1/execute",
+    "/v1alpha1/approve",
+    "/v1alpha1/replay",
+]
+
+# Methods the mutating route must refuse. HEAD is deliberately absent: an HTTP HEAD reply carries no
+# body by definition, so the broker's `reason` field cannot be read back, and an arm that could only
+# assert the status would be a weaker arm wearing the same name. The L0 half covers HEAD, where a
+# recorder can see the code without a body.
+SURFACE_METHODS = ["GET", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+# Query parameters on the mutating route. Three shapes: an override a caller would try, a flag that
+# would flip the one control this whole phase is built on, and an innocuous one. `pretty=true` is
+# the load-bearing member — it is what separates an allowlist of zero from a denylist of the names
+# somebody thought of, and a broker that refused only the first two would pass an arm without it.
+SURFACE_QUERIES = ["force=true", "dryRun=false", "pretty=true"]
+
+# The ten reserved headers of `server.go`'s `bypassHeaders`. A second copy, and the suite asserts
+# the count so that the two moving apart is a failure rather than a silently smaller scan.
+SURFACE_BYPASS_HEADERS = [
+    "X-Kube-Agents-Bypass",
+    "X-Kube-Agents-Force",
+    "X-Kube-Agents-Skip-Journal",
+    "X-Kube-Agents-Skip-Verify",
+    "X-Kube-Agents-Emergency",
+    "X-Kube-Agents-Risk-Class",
+    "X-Kube-Agents-Tier",
+    "X-Kube-Agents-Scope",
+    "X-Kube-Agents-Approved",
+    "X-Kube-Agents-Dry-Run",
+]
+
+# Ports other than the envelope port. Each is a default something real listens on: 6060 is Go's
+# net/http/pprof, 2345 is Delve's headless remote debugger, 9090 and 8080 are the metrics and
+# debug ports of half the operator ecosystem, 9443 is controller-runtime's webhook port, and 8000
+# is what a hand-rolled HTTP server binds when nobody chose.
+SURFACE_PORTS = [6060, 2345, 8080, 8081, 9090, 9443, 8000]
+PORT_TIMEOUT = 5.0
+
+
+def probe_port(host: str, port: int, *, expect_open: bool) -> None:
+    """One raw TCP connect, reported as itself and never as an HTTP outcome.
+
+    WHAT THIS MEASURES, AND WHAT IT CANNOT. A closed port and a port the `<agent>-to-broker` egress
+    NetworkPolicy drops are not distinguishable from here: the first is a reset and the second is a
+    timeout, but both arrive as "did not connect", and treating a timeout as proof that nothing is
+    listening would be reading the policy's verdict as the process's. So the claim this supports is
+    the reachability one, which is also the one that matters for non-skippability: from where an
+    agent actually stands, there is exactly one port to talk to. Whether the broker process also
+    binds a port no agent can reach is a different and weaker question, and it is the pod's
+    container spec — read by the suite off the API server — that speaks to it.
+    """
+    scenario = f"port:{port}"
+    try:
+        with socket.create_connection((host, port), timeout=PORT_TIMEOUT):
+            emit(
+                scenario,
+                outcome="port-open",
+                detail=f"TCP connect to {host}:{port} succeeded ({'expected' if expect_open else 'UNEXPECTED'})",
+            )
+    except Exception as exc:  # noqa: BLE001 — the class name is the evidence
+        emit(scenario, outcome="port-closed", detail=f"{type(exc).__name__}: {exc}"[:200])
+
+
+def surface_scan(cfg: BrokerConfig, client: object, ctx: ssl.SSLContext, token: str) -> None:
+    """Everything V-BRK-021 says does not exist, asked of a broker that is running."""
+    actions_url = cfg.endpoint + broker_client.ACTIONS_PATH
+    healthz_url = cfg.endpoint + "/healthz"
+
+    # (1) Non-routes. Full good credentials, so a 404 is the route set answering.
+    for path in SURFACE_PATHS:
+        raw_request(f"route:{path}", cfg.endpoint + path, ctx=ctx, token=token, method="GET")
+
+    # (2) The mutating route's method set, and the nonce route's. A nonce route that accepted POST
+    #     would be a second door on a path nobody would think to inventory.
+    for method in SURFACE_METHODS:
+        raw_request(f"method:{method}", actions_url, ctx=ctx, token=token, method=method)
+    for method in ("POST", "PUT", "DELETE"):
+        raw_request(
+            f"nonce-method:{method}",
+            cfg.endpoint + broker_client.NONCE_PATH,
+            ctx=ctx,
+            token=token,
+            method=method,
+        )
+
+    # (3) Query parameters, each carrying a REAL envelope built by the shipped builder and a FRESH
+    #     nonce. Both matter. A `{}` body would come back 400 too — as `invalid-envelope` — and an
+    #     arm reading only the status could not tell the two apart; a reused nonce would come back
+    #     as a replay refusal, which is a different 400 again. The differential that makes this an
+    #     assertion about the QUERY is that the same builder's envelope without one reached the
+    #     pipeline in the `envelope-accepted` scenario above.
+    for query in SURFACE_QUERIES:
+        scenario = f"query:{query}"
+        try:
+            envelope = action_envelope.build_envelope(
+                agent_identity=cfg.identity,
+                intent="broker-auth-l2 surface scan",
+                operations=probe_target_operation(),
+                requester={"kind": "system", "id": "broker-auth-l2"},
+                trigger={"source": "cron"},
+                trace=broker_client.session_trace(),
+                nonce=client.fetch_nonce(),  # type: ignore[attr-defined]
+                rationale="V-BRK-021: a well-formed envelope must still be refused when the request carries a query parameter.",
+                dry_run=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            emit(scenario, outcome="probe-error", detail=f"{type(exc).__name__}: {exc}"[:400])
+            continue
+        raw_request(
+            scenario,
+            actions_url + "?" + query,
+            ctx=ctx,
+            token=token,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(envelope).encode("utf-8"),
+        )
+
+    # (4) The ten bypass headers, on `/healthz` and with NO Authorization header at all.
+    #
+    #     The route and the missing token are both deliberate. `/healthz` is the one route that is
+    #     unauthenticated by necessity — the kubelet has no projected token — and it returns a
+    #     constant, so it is the route on which a header check placed inside a handler, or behind
+    #     authentication, would be absent. A 400 here can only have come from `ServeHTTP` ahead of
+    #     the mux, which is exactly where V-BRK-021 requires it to be: a route added tomorrow
+    #     inherits it without anyone remembering to.
+    for header in SURFACE_BYPASS_HEADERS:
+        raw_request(
+            f"header:{header}",
+            healthz_url,
+            ctx=ctx,
+            token=None,
+            method="GET",
+            headers={header: "true"},
+        )
+    # And one on the mutating route, so the property is not read as a quirk of the health route.
+    raw_request(
+        "header-actions:X-Kube-Agents-Bypass",
+        actions_url,
+        ctx=ctx,
+        token=token,
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Kube-Agents-Bypass": "true"},
+        body=b"{}",
+    )
+    # The differential: the SAME route, same credentials, no header. It must answer 200. Without
+    # this the ten arms above are satisfied by a broker that 400s everything, including a broker
+    # whose health route is broken — and a suite of eleven refusals with no acceptance in it is the
+    # vacuity LSN-024 is about, restated one layer down.
+    raw_request("healthz-clean", healthz_url, ctx=ctx, token=None, method="GET")
+
+    # (5) Reachable ports. The SAN is what the pod's hostAliases entry maps to the broker Service's
+    #     ClusterIP, so this dials the same address the TLS scenarios did.
+    host = urllib.parse.urlsplit(cfg.endpoint).hostname or cfg.san
+    probe_port(host, broker_port_of(cfg), expect_open=True)
+    for port in SURFACE_PORTS:
+        probe_port(host, port, expect_open=False)
+
+
+def broker_port_of(cfg: BrokerConfig) -> int:
+    """The envelope port, off the endpoint the controller rendered (P6) — never a literal 8443."""
+    return urllib.parse.urlsplit(cfg.endpoint).port or 443
 
 
 def main() -> int:
@@ -309,6 +550,15 @@ def main() -> int:
     else:
         emit("peer-mismatch", outcome="probe-error", detail=f"{ENV_FOREIGN_TLS_DIR} is unset")
         emit("foreign-caller", outcome="probe-error", detail=f"{ENV_FOREIGN_TLS_DIR} is unset")
+
+    # --- V-BRK-021 at L2: the surface of the binary the controller handed out ---------------------
+    # LAST, and not because it is least. Every scenario above is one request with one credential and
+    # cannot fail in a way that skips a later one; the scan makes forty-odd requests and dials eight
+    # ports, and a hang in it would otherwise take the five credential rows down with it. Emitting
+    # is line-buffered and flushed, so a scan that dies half way still leaves the rows above intact
+    # and leaves its own arms reporting nothing — which the suite scores as a FAILURE, not a
+    # smaller pass.
+    surface_scan(cfg, client, own_ctx, own_token)
 
     return 0
 

@@ -32,7 +32,8 @@
 #      BLOCKING-ALWAYS, which is why this section has no deferral arm that reaches a green.
 #   E. Accept (d) — pause and freeze with the inference stack down; refusal with no journal --------
 #      brake-fanout-l2.sh (V-REV-006) is the brake half and it is live. The journal-unavailable half
-#      is the broker's, and it lands with broker-execute-l2.sh; detected by artifact, like B.
+#      is the broker's: broker-refuse-l2.sh revokes the actionrecords grant out from under a running
+#      broker and reads the 503. Detected by artifact AND by chain membership, then run.
 #   F. Accept (e) — no agent identity anywhere in the fleet holds a write verb --------------------
 #      A full two-sided `auth can-i` sweep, which is actor-grant-sweep-l2.sh, T9b-5's. The L0 half —
 #      that the grant has exactly one definition site — is actor-grant-single-sourced.py in
@@ -43,6 +44,15 @@
 #   H. The ratchet — full prior regression --------------------------------------------------------
 #      verify-phase8.sh on the same cluster => phases 2–7, chaos C1–C4, 03 §11 negatives, goldens,
 #      `go test ./...`, the phase-7 seam artifacts and all six Phase-8 suites.
+#   J. THIS phase's ratchet, derived rather than remembered ---------------------------------------
+#      Sections B–F run the Accept list. Section H runs the PRIOR ratchet. Until 2026-07-31 nothing
+#      ran Phase 9's OWN ratchet, and 23 of its 75 required check IDs — 8 BLOCKING-ALWAYS — had never
+#      been run at all while every section above stayed green. This is planning defect 4, whose
+#      declared resolution ("verify-phase9.sh runs the ratchet, not the Accept list") went into the
+#      acceptance table and never into this script. Section J is that resolution, and it derives the
+#      required set from 09 §10 + the phase file rather than from a list in here, because a list in
+#      here is one more place to forget. It is RED today by construction, exactly as B, E, F and G
+#      are, and its redness IS the worklist. See dev/tests/phase-ratchet-is-asserted.py.
 #
 # DEFERRED, NOT FAKED (recorded, never asserted green): printed in section I, and each one is a row
 # in docs/build/LEDGER.md with a named external blocker. Nothing in section I is counted as a pass,
@@ -221,12 +231,17 @@ while read -r c; do
     tail -12 "/tmp/p9-l0-${l0_n}.log"
   fi
 done < dev/L0-CHAIN.txt
-# 43 is the count on the day this gate was written, not a round number and not a floor with slack in
-# it. A floor below the real count tolerates exactly the change it exists to notice — L2_CHAIN_FLOOR
-# spent three phases at 6 against a 14-line chain for want of this sentence. Raise it in the same
-# commit that adds a line; lower it only in the commit that argues a line out (V-MET-014).
-if [ "$l0_n" -lt 43 ]; then
-  bad "L0-CHAIN.txt yielded only $l0_n runnable lines; there were 43 when this gate was written. The"
+# 57 is the count today, not a round number and not a floor with slack in it. A floor below the real
+# count tolerates exactly the change it exists to notice — L2_CHAIN_FLOOR spent three phases at 6
+# against a 14-line chain for want of this sentence. Raise it in the same commit that adds a line;
+# lower it only in the commit that argues a line out (V-MET-014).
+#
+# IT WAS 43 AGAINST A 56-LINE CHAIN UNTIL 2026-07-31, which is thirteen lines of slack and the exact
+# failure the sentence above describes, arriving in the file that describes it. The rule is prose,
+# and prose on the artifact is not a mechanization ([[LSN-019]]) — a lint that derives this floor
+# rather than remembering it is queued for the improvement pass.
+if [ "$l0_n" -lt 57 ]; then
+  bad "L0-CHAIN.txt yielded only $l0_n runnable lines; there were 57 when this gate was written. The"
   bad "  chain shrank, so 'L0 green' now covers less than it says (V-MET-014)."
 elif [ "$l0_bad" -eq 0 ]; then
   pass "L0 chain green — $l0_n/$l0_n (incl. classifier corpus, undo corpus, model-free classifier, pause≠scale-to-zero, scope label, one-broker-per-agent, broker supply chain, actor grant, journal/VAP parity)"
@@ -299,14 +314,29 @@ if p1_gated E "an operator build nobody can name"; then
   run_l2 brake-fanout dev/verify/brake-fanout-l2.sh "$DEV_CTX" \
     "pause and freeze fan out to every agent in scope and take effect with the inference stack down (V-REV-006)"
 fi
-# The second half of (d) is the broker's, not the brake's, and it is the same artifact as section B.
-if [ -f "$EXEC" ]; then
-  pass "Accept (d) journal half: $EXEC exists and carries the journal-unavailable refusal (run in section B)"
-else
-  bad "Accept (d) HALF UNPROVEN: 'the broker refuses to act when the journal is unavailable' has no"
-  bad "  L2 instance. V-BRK-023 proved at L1+envtest that a Confirmer refuses all four flavours of"
-  bad "  unavailable, but nothing has yet taken the journal away from a RUNNING broker and watched it"
-  bad "  decline. That arm belongs to $EXEC (P9-T9b-5)."
+# The second half of (d) is the broker's, not the brake's: taking the journal away from a RUNNING
+# broker and watching it decline.
+#
+# THIS ARM POINTED AT THE WRONG FILE UNTIL 2026-07-31, AND PASSED. It tested `[ -f "$EXEC" ]` and
+# then asserted, in its own PASS line, that broker-execute-l2.sh "carries the journal-unavailable
+# refusal" — which that suite does not and never claimed to: it submits one envelope that WORKS and
+# says so in its own header ("Nothing here fails, on purpose"). A detector aimed at the wrong
+# artifact reads exactly like a detector that is satisfied, which is [[LSN-060]]'s shape arriving
+# through a different door. Retargeted at the suite that actually carries the property, in the same
+# unit that built it, and strengthened while it was open: existence alone was never enough, because
+# a suite in no chain line is evidence nobody gathers (section G's argument, applied here).
+REFUSE="dev/verify/broker-refuse-l2.sh"
+if [ ! -f "$REFUSE" ]; then
+  bad "Accept (d) HALF UNPROVEN: there is no $REFUSE. V-BRK-023 proved at L1+envtest that a Confirmer"
+  bad "  refuses all four flavours of unavailable, but nothing has yet taken the journal away from a"
+  bad "  RUNNING broker and watched it decline. brake-fanout-l2.sh above is the BRAKE half of (d) and"
+  bad "  does not reach the broker; broker-execute-l2.sh is the accepting path and refuses nothing."
+elif ! grep -qF "$REFUSE" dev/L2-CHAIN.txt; then
+  bad "Accept (d) journal half: $REFUSE exists but is in no live line of dev/L2-CHAIN.txt, so nothing"
+  bad "  runs it as part of an L2 run. Evidence that is not in the chain is evidence nobody gathers."
+elif p1_gated E "an operator build nobody can name"; then
+  run_l2 broker-refuse "$REFUSE" "$DEV_CTX" \
+    "the actionrecords grant is revoked out from under a RUNNING broker and it refuses 503 journal-unavailable rather than executing unjournaled; and a two-target envelope with one unreadable target applies neither (Accept d journal half, V-BRK-018)"
 fi
 
 # ==== F. Accept (e) — no agent identity anywhere in the fleet holds a write verb ====================
@@ -334,23 +364,166 @@ echo; echo "== G. Phase-9 completeness — BLOCKING-ALWAYS gaps in this phase's 
 # handed out. L1 evidence exists (row 54) and is not one of the required levels, so it does not
 # discharge this.
 #
-# Detected as: some dev/verify/*-l2.sh claims the ID, and that script is in L2-CHAIN.txt. Both halves
-# matter. A script that claims it but is in no chain is evidence nobody runs; a chain line that runs
-# a script claiming nothing is a chain that has grown a line without growing a claim.
-b21="$(grep -l 'V-BRK-021' dev/verify/*-l2.sh 2>/dev/null | head -1)"
-if [ -n "$b21" ] && grep -qF "$b21" dev/L2-CHAIN.txt; then
-  pass "V-BRK-021 L2: claimed by $b21, which is a live line of dev/L2-CHAIN.txt (L0 half green since 2026-07-30)"
-elif [ -n "$b21" ]; then
-  bad "V-BRK-021 L2: $b21 claims the ID but is in no live line of dev/L2-CHAIN.txt, so nothing runs"
-  bad "  it as part of an L2 run. Evidence that is not in the chain is evidence nobody gathers."
+# THIS ARM WAS A FALSE PASS UNTIL 2026-07-31, for the third time in this file and by the third
+# route. It discovered the claimant with `grep -l 'V-BRK-021' dev/verify/*-l2.sh | head -1`, and the
+# tree's one match was broker-refuse-l2.sh — in a comment saying it does NOT carry the property
+# ("→ P9-T9b-5b-ii-b, with V-BRK-021's L2 surface scan"). That file is a live L2-CHAIN.txt line, so
+# both halves of the old test were satisfied by a note recording the absence of the thing under
+# test. Same shape as the Accept (d) arm above and the guard-1 arm below: a detector aimed at a NAME
+# is indistinguishable, in its own output, from a detector that is satisfied.
+#
+# Retargeted to discover by the PROPERTY, which for a surface scan is the refusal vocabulary the
+# SHIPPED server answers with. A claimant is a suite that:
+#   - is a live line of dev/L2-CHAIN.txt, so the live tree runs it against a deployed broker, AND is
+#     also run by a live line of dev/L0-CHAIN.txt under a FLAG rather than a cluster context, so the
+#     ¬ tree runs on every PR. Both, because a check split off from its implementation has two trees
+#     to be green on, and a scan with no committed ¬ row is a scan whose own arms have never been
+#     shown to fail. The L0 clause matches the SHAPE of the invocation — an `-l2.sh` reached from the
+#     no-cluster chain can only be running its control mode, since every other path takes a context —
+#     rather than the control flag's spelling, which is a convention and not the property;
+#   - has ONE function whose body scans all four vocabularies at once — unknown path, wrong method,
+#     query parameter, bypass header. One function and not four, because "the suite mentions 404
+#     somewhere" is true of every suite that has ever seen a 404;
+#   - reads both port outcomes in that same body, so a scan that can only ever report "closed" —
+#     which is also what a scan pointed at nothing reports — does not count; and
+#   - compares a COUNT against a floor, which is the line between scanning a surface and spot-
+#     checking the one route somebody remembered. Bounded, and stated as such: a regex over one
+#     function body cannot attribute a floor to a dimension, so this clause says the scan bounds its
+#     own size SOMEWHERE, not that each of the five dimensions carries a floor of its own. The suite
+#     carries five; keeping them five is that suite's own arms, not this gate's.
+#
+# Every one of the four reason strings is RESOLVED out of k8s-operator/internal/broker/*.go from the
+# code path that emits it, never spelled here — the guard-1 arm's constant-resolution trick, applied
+# to four. Rename a reason in the server without renaming it in the suite and this arm fails, rather
+# than quietly unhooking and going green on a suite that now matches nothing.
+#
+# The verdict travels through a file rather than `$(...)` because /bin/bash 3.2 — what macOS ships
+# and what this script is run under — mis-parses a heredoc nested inside a command substitution and
+# reports the whole file as an unterminated quote. The guard-1 arm below uses `if python3 - <<PY`
+# for the same reason; this one needs a sentence out of the detector as well as its verdict, so the
+# sentence goes to a file and the verdict stays in the exit status.
+B21_OUT=/tmp/p9-b21-verdict.txt
+if python3 - >"$B21_OUT" 2>&1 <<'PY'
+import pathlib, re, sys
+
+
+def die(msg):
+    print(msg)
+    sys.exit(1)
+
+
+root = pathlib.Path(".")
+l2p, l0p = root / "dev/L2-CHAIN.txt", root / "dev/L0-CHAIN.txt"
+srvp = root / "k8s-operator/internal/broker/server.go"
+envp = root / "k8s-operator/internal/broker/envelope.go"
+for p in (l2p, l0p, srvp, envp):
+    if not p.exists():
+        die(f"cannot resolve the property — {p} is missing, so nothing here was checked")
+
+srv, envsrc = srvp.read_text(), envp.read_text()
+
+# What the shipped server answers, per code path. Not a list of strings this gate believes in.
+PATHS = {
+    "an unknown path": (srv, r"http\.StatusNotFound,\s*Response\{\s*Reason:\s*\"([^\"]+)\""),
+    "a wrong method": (srv, r"http\.StatusMethodNotAllowed,\s*Response\{\s*Reason:\s*\"([^\"]+)\""),
+    "a query parameter": (srv, r"len\(r\.URL\.Query\(\)\)\s*>\s*0.*?Reason:\s*\"([^\"]+)\""),
+    "a bypass header": (envsrc, r"ReasonBypassKey\s*=\s*\"([^\"]+)\""),
+}
+vocab = {}
+for what, (src, pat) in PATHS.items():
+    m = re.search(pat, src, re.S)
+    if not m:
+        die(
+            f"cannot resolve what the shipped server answers for {what}, so this arm would be "
+            "scanning a vocabulary of its own invention"
+        )
+    vocab[what] = m.group(1)
+
+# The bypass rejection has to run AHEAD of the mux or the scan's unauthenticated-route evidence is
+# a property of one handler rather than of the server.
+if not re.search(
+    r"func \(s \*Server\) ServeHTTP.*?rejectBypassHeaders\(r\).*?s\.mux\.ServeHTTP", srv, re.S
+):
+    die(
+        "server.go no longer rejects bypass headers ahead of the mux, so a refusal on an "
+        "unauthenticated route no longer attributes to the server"
+    )
+
+
+def live(p):
+    return [ln.strip() for ln in p.read_text().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+l2_lines, l0_lines = live(l2p), live(l0p)
+FUNC = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{")
+
+claimant = None
+for suite in sorted(root.glob("dev/verify/*-l2.sh")):
+    rel = suite.as_posix()
+    if not any(rel in ln for ln in l2_lines):
+        continue
+    text = suite.read_text()
+    lines = text.splitlines()
+    bodies, name, buf = {}, None, []
+    for line in lines:
+        m = FUNC.match(line)
+        if m:
+            name, buf = m.group(1), []
+        elif name is not None and line.startswith("}"):
+            bodies[name] = "\n".join(buf)
+            name = None
+        elif name is not None:
+            buf.append(line)
+    for fn, body in bodies.items():
+        if not all(f'"{v}"' in body for v in vocab.values()):
+            continue
+        if "port-open" not in body or "port-closed" not in body:
+            continue
+        if not re.search(r"\-lt|\-ne", body):
+            continue
+        # A function nothing calls checks nothing (the CHECKS-table clause of the guard-1 arm).
+        called = [
+            ln
+            for ln in lines
+            if re.search(rf"\b{re.escape(fn)}\b", ln)
+            and not ln.lstrip().startswith("#")
+            and not FUNC.match(ln)
+        ]
+        if not called:
+            continue
+        claimant = (rel, fn)
+        break
+    if claimant:
+        break
+
+if not claimant:
+    die(
+        "no live line of dev/L2-CHAIN.txt runs a suite that scans the deployed surface — one "
+        "function answering for all of "
+        + ", ".join(f"{w} ({v})" for w, v in vocab.items())
+        + ", both port outcomes, and a count against a floor"
+    )
+
+rel, fn = claimant
+if not any(re.search(rf"{re.escape(rel)}\s+--\S+", ln) for ln in l0_lines):
+    die(
+        f"{rel} carries the scan in {fn}() and runs at L2, but no live line of dev/L0-CHAIN.txt "
+        "runs it under a flag, so the control tree that shows those arms can fail runs nowhere"
+    )
+print(f"{rel}:{fn}()")
+PY
+then
+  pass "V-BRK-021 L2: $(tail -1 "$B21_OUT") scans the deployed surface in the vocabulary server.go emits, runs from dev/L2-CHAIN.txt, and its ¬ runs from dev/L0-CHAIN.txt (L0 half green since 2026-07-30)"
 else
-  bad "V-BRK-021 L2 MISSING: no dev/verify/*-l2.sh claims it. Its L0 half is green (results.csv row"
-  bad "  138, P9-T7c-2c) and 09 §6 requires L0 AND L2. The L2 half is the clause the L0 half cannot"
-  bad "  reach: debug routes, override query params and the ten X-Kube-Agents-* bypass headers all"
-  bad "  404/405 against a RUNNING broker, exactly one listening port on the pod, and no"
-  bad "  build-tag-guarded skip path in the image the controller handed out. A source scan proves"
-  bad "  what the tree says; only a probe proves what was shipped. V-BRK is BLOCKING-ALWAYS and may"
-  bad "  not be deferred (09 §9.6). P9-T9b-5."
+  # A traceback lands here too, through the 2>&1 — a detector that crashed is a detector that
+  # measured nothing, and it must read as such rather than as a missing artifact.
+  bad "V-BRK-021 L2 UNPROVEN: $(tail -1 "$B21_OUT")"
+  bad "  Its L0 half is green (results.csv row 138, P9-T7c-2c) and 09 §6 requires L0 AND L2. The L2"
+  bad "  half is the clause the L0 half cannot reach: debug routes, override query params and the"
+  bad "  ten X-Kube-Agents-* bypass headers all 404/405 against a RUNNING broker, one reachable"
+  bad "  port on the pod, and no build-tag-guarded skip path in the image the controller handed"
+  bad "  out — a skip path compiled out of \`go test\` is invisible to any source scan. V-BRK is"
+  bad "  BLOCKING-ALWAYS and may not be deferred (09 §9.6). P9-T9b-5b-ii-b-2."
 fi
 # Planning defect 2, guard 1 — "the single worst outcome of this decision", in that paragraph's own
 # words. The tenant test-only overlay grants write verbs to a fixture identity; the guard is the lint
@@ -441,6 +614,41 @@ defer "P9-T7d-4 — the broker's egress to the API server has no NetworkPolicy o
 echo "           finding, not a deferral with an external blocker: it is unscheduled work, and it is"
 echo "           recorded in the ledger as such. Named here because a reader of a green Phase-9 gate"
 echo "           would otherwise reasonably conclude the broker's network surface had been examined."
+
+# ==== J. This phase's own ratchet, derived from 09 §10 ==============================================
+echo; echo "== J. 09 §10 phase-9 ratchet — every required check ID has a green results row (09 §9.4) =="
+if python3 dev/tests/phase-ratchet-is-asserted.py --phase 9 >/tmp/p9-ratchet.log 2>&1; then
+  pass "$(tail -3 /tmp/p9-ratchet.log | tr -d '\n')"
+else
+  bad "the Phase 9 ratchet is not asserted — required check IDs have no green row in"
+  bad "  verification/results.csv. This is the section that would have caught planning defect 4;"
+  bad "  the list below is the worklist, not a formatting problem. A BLOCKING-ALWAYS member may not"
+  bad "  be deferred to close the phase (09 §9.6)."
+  sed 's/^/    /' /tmp/p9-ratchet.log
+fi
+
+# ==== K. V-MET-002 — full coverage of the load-bearing suites =======================================
+# Until 2026-07-31 this was the ONLY place V-MET-002 ran: red by construction until the 09 §6
+# catalog grew the rows asserting the published remainder, and a required PR check that stays red
+# for a phase reddens every unrelated commit. The remainder is now zero, the live arm is a line on
+# dev/L0-CHAIN.txt, and `invariants-gate.py`'s arm that protected this section retired in the same
+# commit that moved the line.
+#
+# The section STAYS, and not out of sentiment. Section J above reports V-MET-002 as green or not
+# from the results file; this section is what says WHICH obligations are uncovered, by ID and in
+# their own words, so a red is legible without opening three artifacts. That was worth having when
+# the number was sixteen and it will be worth having the next time it is not zero -- 09 §8.1's
+# draw-down does not end at Phase 9, it ends at every phase that adds an owned section.
+echo; echo "== K. V-MET-002 — every load-bearing-owned requirement maps to >=1 check (09 §8) =="
+if python3 dev/tests/load-bearing-coverage-is-full.py >/tmp/p9-vmet002.log 2>&1; then
+  pass "$(tail -1 /tmp/p9-vmet002.log)"
+else
+  bad "V-MET-002 is red — obligations owned by V-CTN/V-BRK/V-REV/V-ISO/V-ADV map to no check."
+  bad "  09 §8.1 dates this to 'before Phase 10 grants the first write credential', so it is the"
+  bad "  last of the draw-down and not a deferral: a BLOCKING-ALWAYS check may not be deferred at"
+  bad "  all (09 §9.6). Close each by mapping an honest catalog row, or by adding one to 09 §6."
+  sed 's/^/    /' /tmp/p9-vmet002.log
+fi
 
 echo
 echo "===================================================================="

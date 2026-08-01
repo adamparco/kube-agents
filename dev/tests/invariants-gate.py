@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import importlib.util
 import json
 import re
 import subprocess
@@ -40,6 +41,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gitcorpus import read_repo_files, repo_files  # noqa: E402
+
+# B-011: "does this script have a `--negative-control` mode?" is answered by ONE recogniser, the
+# one in the check whose whole subject is negative controls. Asking it with `FLAG in text` -- which
+# is what this file did until 2026-08-01 -- makes a comment, a usage string or an error message
+# indistinguishable from a dispatch arm, so documenting the flag in prose becomes a finding and the
+# only way to clear it is to stop mentioning it. `handles()` parses instead: Python through the AST,
+# shell through a quote-aware lex, and it returns `None` when the file will not parse so a syntax
+# error is a finding rather than a silent exclusion ([[LSN-038]]).
+#
+# The import goes through `importlib` because the module's filename is hyphenated, which is the
+# repo's convention for a check script and is not a legal identifier. Loading it by path keeps the
+# convention and keeps the recogniser at one definition site; copying `handles()` here would restore
+# exactly the two-implementations-of-one-question state B-011 was filed about.
+_ncntr_spec = importlib.util.spec_from_file_location(
+    "negative_controls_name_their_rule",
+    Path(__file__).resolve().parent / "negative-controls-name-their-rule.py",
+)
+_ncntr = importlib.util.module_from_spec(_ncntr_spec)
+_ncntr_spec.loader.exec_module(_ncntr)
+_dispatches_a_control = _ncntr.handles
 
 REPO = Path(__file__).resolve().parents[2]
 LESSONS = REPO / ".claude/harness/LESSONS.md"
@@ -294,12 +315,27 @@ def _current_phase() -> int | None:
 
 
 def check_write_verbs_have_machinery() -> list[str]:
-    """Invariant 7. An agent with write RBAC and no journal is worse than either system.
+    """Invariant 7 / V-CTN-038. An agent with write RBAC and no journal is worse than either system.
 
     Whole-tree, not diff-vs-base. A diff check answers "did THIS PR add one", which reads green for
     a write verb that reached main while the gate was not wired up -- and this gate was not wired up
     until today, so that is not hypothetical. The state check has no base-ref dependency and cannot
     be satisfied by merging in two steps.
+
+    **Ordering, not prohibition.** The `if not absent: continue` below is the whole distinction: the
+    same verb that fails today passes once the broker, classifier, journal and undo path all exist,
+    so Phase 10 satisfies this arm rather than deleting it.
+
+    Its negative control is `WriteVerbsNeverPrecedeMachinery` in `dev/test_invariants_gate.py`, and
+    it was written late, in P9-T11g-2b-ii-2c-ii-b-1, for a reason worth keeping. Eleven agent-RBAC
+    documents in this tree DO carry a non-read verb -- the three actor-grant templates, the two
+    broker-operations grants, a VAP positive fixture and `dev/verify/fixtures/`. The gate is green
+    anyway, and correctly so, because `missing_machinery()` has returned `[]` since P8 closed the
+    undo path. But that means the `failures.append` below has never once executed against the real
+    corpus: every green this arm has produced came from the machinery being complete, and nothing
+    established that the finding it would raise otherwise is well-formed, names the file, or names
+    more than the first absent item. The control asserts that branch directly; the sweep is
+    verification/mutants/V-CTN-038.json.
     """
     failures = []
     docs = agent_rbac_documents()
@@ -741,6 +777,104 @@ def _backlog_section(text: str, name: str) -> str | None:
 
 HARNESS_RUN_SKILL = REPO / ".claude/skills/harness-run/SKILL.md"
 
+FENCE = re.compile(r"^```.*?^```", re.M | re.S)
+ARCHIVE_SECTIONS = ("Scheduled", "Refused", "Done")
+
+
+def _heading_ids(title: str) -> list[str] | None:
+    """The ids a `### ` heading declares, or None if it declares none.
+
+    `B-007 — <title>` -> ["B-007"]; `B-001 · B-002 — <title>` -> ["B-001", "B-002"].
+    """
+    lhs, sep, rest = title.partition(" — ")
+    if not sep or not rest.strip():
+        return None
+    parts = [p.strip() for p in lhs.split("·")]
+    if not parts or not all(re.fullmatch(r"B-\d{3}", p) for p in parts):
+        return None
+    return parts
+
+
+def _backlog_structure(bodies: dict[str, str]) -> list[str]:
+    """`### ` headings carry ids outside the inbox, carry none inside it, and match the tables.
+
+    Two halves of this file are written by different authors and only one of them is indexed. The
+    tables are the index a drain writes; the `### ` subsections are where the argument lives. Left
+    unbound they drift, and every way they drift is silent:
+
+    - A subsection titled like an inbox item (`### Reap the envtest control planes …`) is
+      indistinguishable from an undrained item. Both halves of this file then read as an inbox, and
+      the one signal it exists to carry — "a human wants something" — stops being legible.
+    - An item that moves `Scheduled` -> `Done` while its reasoning stays behind leaves the file
+      asserting two states for one id. Four subsections were filed under `## Scheduled` for items
+      that had already landed or been refused before this check existed.
+    - A row with no subsection is a scheduling decision with no argument, which is the one thing
+      `## Refused` promises never to be.
+
+    So: outside `## Inbox` a heading names its ids and nothing else, inside it a heading names no
+    id (a human does not assign them), and the id sets on both sides of each section are equal.
+    """
+    failures: list[str] = []
+
+    skill = HARNESS_RUN_SKILL.read_text() if HARNESS_RUN_SKILL.exists() else ""
+    if not re.search(r"never writes to (?:the |`?## )?[Ii]nbox", skill):
+        failures.append(
+            f"{HARNESS_RUN_SKILL.relative_to(REPO)} §1 step 6 no longer tells the harness it never "
+            f"writes to the inbox. That is the sentence the loop actually reads at ORIENT; the "
+            f"inbox-side half of this check enforces it, and a gate whose procedure has been "
+            f"deleted reads as an unexplained rule."
+        )
+
+    for title in INBOX_ITEM.findall(FENCE.sub("", bodies["Inbox"])):
+        if _heading_ids(title.strip()) or re.match(r"^B-\d{3}\b", title.strip()):
+            failures.append(
+                f'inbox item "{title.strip()}" carries a `B-nnn` id. Ids are assigned by the drain, '
+                f"so an id in the inbox means either a human assigned one (and may have collided "
+                f"with a real item) or the harness filed here, which it may not do — its findings "
+                f"go to LEDGER.md and its work to a task in docs/build/phase-<N>.md."
+            )
+
+    total_subsections = 0
+    for name in ARCHIVE_SECTIONS:
+        body = FENCE.sub("", bodies[name])
+        rows = set(BACKLOG_ID.findall(body))
+        headed: set[str] = set()
+        for title in INBOX_ITEM.findall(body):
+            ids = _heading_ids(title.strip())
+            if ids is None:
+                failures.append(
+                    f'`## {name}` has a subsection "### {title.strip()}" that names no id. Every '
+                    f"`### ` heading outside `## Inbox` reads `B-nnn — <title>` (or "
+                    f"`B-nnn · B-nnn — <title>` where one argument resolves two items); a heading "
+                    f"without one is shaped exactly like an undrained inbox item."
+                )
+                continue
+            total_subsections += 1
+            headed.update(ids)
+
+        for bid in sorted(rows - headed):
+            failures.append(
+                f"{bid} has a row in `## {name}` and no `### {bid} — …` subsection there. A row is "
+                f"the index; the subsection is the argument. A decision recorded with no argument "
+                f"cannot be re-read at the next improvement pass, which is what `## Refused` "
+                f"promises and what a drain owes every item it schedules."
+            )
+        for bid in sorted(headed - rows):
+            failures.append(
+                f"{bid} has a `### ` subsection in `## {name}` and no row in that section's table. "
+                f"Either the item moved section and its reasoning stayed behind — so the file now "
+                f"asserts two states for one id — or it has fallen out of the index entirely."
+            )
+
+    if not total_subsections:
+        failures.append(
+            f"VACUOUS: no `### B-nnn — …` subsection exists anywhere in "
+            f"{BACKLOG.relative_to(REPO)}, so the row/subsection agreement above compared two "
+            f"empty sets and this check asserted nothing."
+        )
+
+    return failures
+
 
 def _drain_is_committed(text: str, inbox: str, drained_on: str) -> list[str]:
     """A drain that exists only in the working tree has not happened yet (LSN-043).
@@ -838,6 +972,9 @@ def check_backlog_is_drained() -> list[str]:
     happening), if an inbox item has no `Added` (same — an undated item can never be found stale),
     or if a `B-nnn` id appears twice across the tables (a reused id makes the trail ambiguous about
     which item actually landed).
+
+    `_backlog_structure` then holds the other half of the protocol — who writes which section, and
+    that each table agrees with the subsections beneath it.
     """
     if not BACKLOG.exists():
         return [
@@ -891,6 +1028,15 @@ def check_backlog_is_drained() -> list[str]:
             )
 
     failures.extend(_drain_is_committed(text, bodies["Inbox"], drained_on))
+    failures.extend(_backlog_structure(bodies))
+
+    if "## How this file is structured" not in text:
+        failures.append(
+            f"{BACKLOG.relative_to(REPO)}: the `## How this file is structured` section is gone. "
+            f"It is where the four rules `_backlog_structure` enforces are written down for the "
+            f"human who has to satisfy them; without it the gate's failures name a convention with "
+            f"no definition site."
+        )
 
     seen = {}
     for name in ("Scheduled", "Refused", "Done"):
@@ -1395,6 +1541,78 @@ def _results_rows() -> list[dict[str, str]]:
         return list(csv.DictReader(fh))
 
 
+RESULTS_COLUMNS = ("date", "phase", "check_id", "level", "target", "result", "evidence_ref", "notes")
+
+
+def check_results_rows_have_eight_fields() -> list[str]:
+    """Every `results.csv` row parses to exactly the eight columns the header declares.
+
+    Nothing asserted this, and on 2026-08-01 two of 243 rows did not. One was written with **no
+    `notes` column at all** -- seven fields, so `csv.DictReader` handed every consumer
+    `notes=None`. The other was written with an **unquoted** notes field carrying fourteen embedded
+    commas, so it parsed to **twenty-two** fields and its reasoning was being read as columns 8
+    through 22, with the surplus swept into `DictReader`'s `None` key where no arm looks.
+
+    The reason this is worth an arm rather than a one-time repair is what it does NOT break.
+    `date`, `phase`, `check_id`, `level`, `target`, `result` and `evidence_ref` all survive both
+    shapes intact, because both defects land at or after the last delimiter a reader depends on --
+    so the assertion ratchet, the deferral arms, the phase ratchet and the coverage gates all read
+    a malformed row correctly and stay green. The only column that silently rots is the one that
+    carries the reasoning, which is the column a future ORIENT reads to find out why a verdict was
+    recorded. A defect that damages only the explanation is exactly the defect no verdict-shaped
+    check can see.
+
+    This arm is about **shape**, not content: it makes no claim about what any field says. The
+    fix for a wrong field is a `**correction**` row (see `_dagger_pass_failures`); the fix for a
+    row that does not parse is to re-emit that row with correct quoting, which changes no field's
+    visible text and is therefore not a rewrite of history.
+    """
+    if not RESULTS_CSV.exists():
+        return [f"{RESULTS_CSV.relative_to(REPO)} does not exist, so no verdict has a home."]
+    with RESULTS_CSV.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))
+    if not rows:
+        return [f"{RESULTS_CSV.relative_to(REPO)} is empty; an empty verdict ledger is not a pass."]
+
+    failures = []
+    header = tuple(c.strip() for c in rows[0])
+    if header != RESULTS_COLUMNS:
+        failures.append(
+            f"verification/results.csv header is {header!r}, expected {RESULTS_COLUMNS!r}. "
+            "Every arm that reads this file keys on those names."
+        )
+    # LSN-035: an empty corpus is a failure, not a vacuous pass. The file had 243 data rows when
+    # this floor was written; 50 leaves room for a retire-and-rebuild without letting a truncated
+    # read report green.
+    body = rows[1:]
+    if len(body) < 50:
+        failures.append(
+            f"verification/results.csv parsed to only {len(body)} data row(s). The ledger is "
+            "append-only and had 243 on 2026-08-01, so this is a truncated or unparseable read, "
+            "not a small ledger."
+        )
+    for i, row in enumerate(body, start=2):
+        if len(row) == len(RESULTS_COLUMNS):
+            continue
+        cid = row[2] if len(row) > 2 else "<unparseable>"
+        if len(row) < len(RESULTS_COLUMNS):
+            why = (
+                "a trailing column was omitted, so every consumer reads it as absent rather than "
+                "empty"
+            )
+        else:
+            why = (
+                "a field carrying commas was written unquoted, so its text is being read as "
+                f"columns {len(RESULTS_COLUMNS)}-{len(row)}"
+            )
+        failures.append(
+            f"verification/results.csv row {i} ({cid}) parses to {len(row)} field(s), not "
+            f"{len(RESULTS_COLUMNS)}: {why}. Re-emit the row with correct quoting -- that preserves "
+            "every field's visible text, so it repairs the encoding without rewriting the verdict."
+        )
+    return failures
+
+
 def _dagger_pass_failures(dagger: list[str]) -> list[str]:
     """The other half: a † check may not be recorded as **passing**.
 
@@ -1405,9 +1623,13 @@ def _dagger_pass_failures(dagger: list[str]) -> list[str]:
     This arm exists because the tree had one. `results.csv` row 47 (2026-07-27, P8-T9) recorded
     `"V-CTR-002, V-CTN-021"` as **pass** at L2, on evidence -- `webhook-negatives-l2.sh` -- that
     proves V-CTR-002's property exactly and says nothing whatever about V-CTN-021's, which is
-    conformance of all 39 cells of the 02 §7 boundary matrix. There is no V-CTR-021, so it is not
-    a one-letter slip from the neighbouring ID; the ID that got recorded exists, is BLOCKING-ALWAYS,
-    and was not run. It went unnoticed for two days and it was **masking a second defect**: the
+    conformance of all 39 cells of the 02 §7 boundary matrix. It is not a one-letter slip from the
+    neighbouring ID: nothing named V-CTR-021 existed on 2026-07-27, so nobody typed one letter
+    wrong; the ID that got recorded exists, is BLOCKING-ALWAYS, and was not run. (V-CTR-021 was
+    later defined -- P9-T11g-2b-ii-2c-ii-b-1, the path-dialect row -- which changes nothing about
+    the 07-27 row and is why this paragraph now dates the claim instead of asserting a permanent
+    absence. An argument resting on an ID being unused expires the moment the ID is issued.)
+    It went unnoticed for two days and it was **masking a second defect**: the
     BLOCKING-ALWAYS arm of `check_deferrals_name_blockers` short-circuits on "green somewhere", so
     the phase-expiry clause written in the same sitting as this one could never fire, and testing
     that clause is what surfaced the false green. A false pass does not sit still -- it silences
@@ -1605,7 +1827,36 @@ CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
 # way this ratchet is ever allowed to move upward.
 # Raised 17 -> 18 on 2026-07-30 (P9-T9b-5b-i): broker-execute-l2.sh, acceptance bullet (a). Same
 # commit as the line, same rule.
-L2_CHAIN_FLOOR = 18
+# Raised 18 -> 19 on 2026-07-31 (P9-T9b-5b-ii-a): broker-refuse-l2.sh, V-BRK-018 and the journal half
+# of acceptance bullet (d). Same commit as the line, same rule.
+# Raised 19 -> 20 on 2026-07-31 (P9-T9b-5b-ii-b-1): broker-gate-l2.sh, V-REV-003 — the gated outcome,
+# which neither the accepting line nor the refusing one can reach. Same commit as the line, same rule.
+# Raised 20 -> 21 on 2026-07-31 (P9-T9b-5c): actor-grant-sweep-l2.sh, V-BRK-013's L2 half and Phase 9
+# acceptance (e). The first line in the chain whose subject is the API server's AUTHORIZER rather
+# than a workload — everything above asks what some pod did with the authority it holds, and this
+# one asks what authority exists. Same commit as the line, same rule.
+# Raised 21 -> 22 on 2026-07-31 (P9-T8b-4b-ii-2b-ii-b): undo-coverage-l2.sh, V-REV-001 at population
+# scale. The line above it already scores V-REV-001 and is green; this one is the same check with a
+# denominator of 35 instead of 1, which is the difference between "the undo planner worked once" and
+# "the undo planner covers the corpus". Same commit as the line, same rule.
+# Raised 22 -> 29 on 2026-07-31 (P9-T11g-4a and P9-T11h), in one move, and the count is OBSERVED
+# rather than incremented — read back out of _l2_chain_scripts() after the lines landed, because six
+# suites arrived across two units and an arithmetic floor would have been wrong in whichever
+# direction the last author guessed. The six: vap-corpus-l2.sh (V-CTN-012), manager-role-l2.sh
+# (V-CTN-017 at L2), classifier-identity-l2.sh (V-GAT-002), startup-ordering-l2.sh (V-RUN-005),
+# workload-pair-l2.sh (V-RUN-001/002/004/009) and brake-l2.sh (V-CTR-007, V-RUN-007/008). Same rule
+# as every line above: the floor moves in the commit that adds the chain line, never after it.
+# Raised 29 -> 30 on 2026-07-31 (P9-T11h): reader-scope-l2.sh, V-CTN-001 and the L2 half of
+# V-CTN-004. V-CTN-001 is BLOCKING-ALWAYS and was the last row of the phase-9 required set still not
+# green; a floor that did not move with it would let the line be deleted without anything going red.
+# Raised 30 -> 31 on 2026-08-01 (improvement pass 07): tier-egress-render-l2.sh, the [[LSN-068]]
+# item 3 and [[LSN-069]] mechanization. Both floors move together a ninth time.
+# Raised 31 -> 32 on 2026-08-01 (P13-T5's checkpoint): mcp-env-resolves-l2.sh, V-CMP-006's L2 arm.
+# The line is on the chain and has NEVER been run against a cluster — results.csv still carries the
+# row as deferred. The floor still moves now, in the commit that adds the line, because what it
+# guards is the line's presence and not the row's verdict: an arm that is deleted before its first
+# live run leaves no red anywhere, and that is the exact silence this ratchet exists to break.
+L2_CHAIN_FLOOR = 32
 # How many scripts the TRANSITIVE scope held when it was widened (2026-07-25, P8-T8). A separate
 # ratchet from the one above because the two guard different things: L2_CHAIN_FLOOR notices a line
 # leaving L2-CHAIN.txt, this one notices a claim-making script leaving the closure — including one
@@ -1620,7 +1871,27 @@ L2_CHAIN_FLOOR = 18
 # they will not always, and the day they diverge is the day one of the two is doing work.
 # Raised 26 -> 27 on 2026-07-30 (P9-T9b-5b-i): broker-execute-l2.sh, also named on a chain line, so
 # both floors move together a second time.
-L2_SCOPE_FLOOR = 27
+# Raised 27 -> 28 on 2026-07-31 (P9-T9b-5b-ii-a): broker-refuse-l2.sh, named on a chain line; a third
+# time together, and still not a rule that they must be.
+# Raised 28 -> 29 on 2026-07-31 (P9-T9b-5b-ii-b-1): broker-gate-l2.sh, named on a chain line; a fourth
+# time together.
+# Raised 29 -> 30 on 2026-07-31 (P9-T9b-5c): actor-grant-sweep-l2.sh. It joins the closure twice over
+# — named on an L2 chain line AND reached from verify-phase9.sh section F, which has been detecting
+# it by artifact and failing while it was absent. A fifth time together.
+# Raised 30 -> 31 on 2026-07-31 (P9-T8b-4b-ii-2b-ii-b): undo-coverage-l2.sh, named on an L2 chain
+# line. A sixth time together.
+# Raised 31 -> 37 on 2026-07-31 (P9-T11g-4a and P9-T11h): the same six suites, all named on chain
+# lines, so the two floors move together a seventh time — and this is the run that shows why they are
+# still two numbers. The chain gained six lines and the closure gained six scripts, but the closure
+# count is read from _l2_scripts_in_scope() and not derived from the other, so the day a suite joins
+# by being SOURCED rather than named, only this one moves.
+# Raised 37 -> 38 on 2026-07-31 (P9-T11h): reader-scope-l2.sh, named on an L2 chain line. Both floors
+# move together an eighth time.
+# Raised 38 -> 39 on 2026-08-01 (improvement pass 07): tier-egress-render-l2.sh, named on an L2
+# chain line. A ninth time together.
+# Raised 39 -> 40 on 2026-08-01 (P13-T5's checkpoint): mcp-env-resolves-l2.sh, named on an L2 chain
+# line. A tenth time together.
+L2_SCOPE_FLOOR = 40
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:
@@ -2110,6 +2381,130 @@ def check_l2_scripts_assert_cluster_health() -> list[str]:
             f"{P10_CALLER_FLOOR} when this was written. Either the closure shrank or the kubectl "
             f"predicate stopped matching, and in both cases this check is now reporting green "
             f"about nothing. Move this floor in the same commit that removes the script."
+        ]
+    return failures
+
+
+# ---------------------------------------------------------------------------------------------
+#
+# P12 / LSN-066. The one-suite-per-cluster lock is wired, and nothing quietly un-wires it.
+#
+# The obvious lint here -- "every L2 script calls l2_lock_guard" -- would be RED against a correct
+# tree. The lock is taken from ONE definition site: p10_assert_control_plane_healthy calls
+# p12_assert_exclusive_l2, which calls l2_lock_guard, and the 30-odd suites reach it transitively
+# because check_l2_scripts_assert_cluster_health above already forces every cluster-reading script
+# in the L2 closure to call P10. Writing a second, per-script roster would duplicate that one and
+# then disagree with it. So this asserts the three LINKS of the chain instead, plus the one thing a
+# single definition site cannot defend on its own:
+#
+# THE TRAP. `l2_lock_guard` installs its release as an EXIT trap and chains whatever trap was
+# already set. A suite that installs its own EXIT trap AFTER taking the lock therefore REPLACES the
+# release, and the lock survives the process. That is not a correctness hole -- the next acquirer
+# breaks it as stale -- but "BROKE A STALE LOCK" printed on every line of the chain is a warning
+# that means nothing (the V-MET-014 / LSN-035 shape), and a reused pid turns it into a half-hour
+# hang and a false red on a BLOCKING-ALWAYS suite. Seventeen suites had exactly this ordering.
+#
+# ORDER IS THE WHOLE PREDICATE, so a trap BEFORE the first P10 / l2_lock_guard line is not a
+# finding: that is the trap the lock chains, not the one that stomps it. Nine suites in the corpus
+# are in that shape today and must stay green. TOP-LEVEL only (column 0): an indented `trap - EXIT`
+# inside a function or subshell is scoped to it and never touches the script's own handler.
+P12_CALL = re.compile(r"(?<![\w-])p12_assert_exclusive_l2\s+\S")
+LOCK_GUARD_CALL = re.compile(r"(?<![\w-])l2_lock_guard\s+\S")
+LOCK_TAKEN = re.compile(r"(?<![\w-])(?:p10_assert_control_plane_healthy|l2_lock_guard)\s+\S")
+TOP_LEVEL_EXIT_TRAP = re.compile(r"^trap\s+.*(?<![\w-])EXIT(?![\w-])")
+# Seventeen suites install an EXIT trap after taking the lock. A floor, not a ratchet: the count is
+# not a property worth defending, but a rule that matches nothing has stopped being evidence.
+POST_LOCK_TRAP_FLOOR = 17
+# Module-level so the unit tests can repoint them at a synthetic library. The property is about the
+# SHAPE of the wiring, not about today's `dev/lib/`, and an arm that edited the real file to prove
+# a link is load-bearing would be mutating the thing every other check in this file reads.
+L2_LOCK_LIB = REPO / "dev" / "lib" / "l2-lock.sh"
+PRECONDITIONS_LIB = REPO / "dev" / "lib" / "preconditions.sh"
+
+
+def check_l2_lock_is_wired() -> list[str]:
+    """P12 / LSN-066. The lock's three links hold, and no post-lock EXIT trap drops the release."""
+    failures: list[str] = []
+    lib, pre = L2_LOCK_LIB, PRECONDITIONS_LIB
+    if not lib.exists() or not pre.exists():
+        return [
+            f"VACUOUS: {lib.relative_to(REPO)} or {pre.relative_to(REPO)} is missing, so the P12 "
+            f"lock this check is about does not exist to be wired. If either moved, move this "
+            f"check with it -- in the same commit."
+        ]
+
+    lib_code = _code_lines(lib.read_text())
+    for fn in ("l2_lock_guard", "l2_lock_release"):
+        if f"{fn}()" not in lib_code and f"{fn} ()" not in lib_code:
+            failures.append(
+                f"dev/lib/l2-lock.sh no longer defines {fn}. Every link below points at it, and "
+                f"a suite that sources the library and calls a function it does not define takes "
+                f"no lock while reporting that it did (LSN-066)."
+            )
+
+    pre_code = _code_lines(pre.read_text())
+    # Link 1: P10 calls P12. This is what makes the lock universal without a second roster.
+    p10_body = pre_code.split("p10_assert_control_plane_healthy()", 1)
+    if len(p10_body) < 2:
+        failures.append(
+            "dev/lib/preconditions.sh no longer defines p10_assert_control_plane_healthy, which "
+            "is the single site the P12 lock is taken from. Without it every L2 suite reads a "
+            "shared cluster unserialized (LSN-066)."
+        )
+    elif not P12_CALL.search(p10_body[1]):
+        failures.append(
+            "p10_assert_control_plane_healthy no longer calls p12_assert_exclusive_l2. That call "
+            "is the ONLY thing that makes the one-suite-per-cluster lock universal: the suites "
+            "reach it transitively through P10, which check_l2_scripts_assert_cluster_health "
+            "already requires of every cluster-reading script. Remove it and 30 suites silently "
+            "stop locking, with no per-script diff to notice (LSN-066)."
+        )
+    # Link 2: P12 actually takes the lock, rather than merely being called.
+    p12_body = pre_code.split("p12_assert_exclusive_l2()", 1)
+    if len(p12_body) < 2:
+        failures.append(
+            "dev/lib/preconditions.sh no longer defines p12_assert_exclusive_l2, which P10 calls "
+            "and binding.md §Preconditions P12 names."
+        )
+    elif not LOCK_GUARD_CALL.search(p12_body[1].split("\np10_assert", 1)[0]):
+        failures.append(
+            "p12_assert_exclusive_l2 no longer calls l2_lock_guard, so it is a precondition that "
+            "asserts nothing -- the exact shape of an artifact nothing runs (LSN-019)."
+        )
+
+    # Link 3: nobody stomps the release.
+    trapped = 0
+    for p in sorted(_l2_scripts_in_scope()):
+        if not p.exists():
+            continue
+        lines = _code_lines(p.read_text()).splitlines()
+        taken = next((i for i, ln in enumerate(lines) if LOCK_TAKEN.search(ln)), None)
+        if taken is None:
+            continue
+        post = [
+            (i, ln)
+            for i, ln in enumerate(lines)
+            if i > taken and TOP_LEVEL_EXIT_TRAP.match(ln)
+        ]
+        if post:
+            trapped += 1
+        for _, ln in post:
+            if "l2_lock_release" not in ln:
+                failures.append(
+                    f"{p.relative_to(REPO)} installs a top-level EXIT trap AFTER taking the P12 "
+                    f"lock and does not chain l2_lock_release: `{ln.strip()}`. bash REPLACES the "
+                    f"handler, so this discards the release the lock installed and the lock "
+                    f"survives the process -- every later suite then prints 'BROKE A STALE LOCK', "
+                    f"and a reused pid turns that into a full-timeout hang and a false red. Write "
+                    f"it as `trap 'yourcleanup; l2_lock_release' EXIT` (LSN-066)."
+                )
+    if trapped < POST_LOCK_TRAP_FLOOR:
+        return [
+            f"VACUOUS: only {trapped} L2 script(s) install an EXIT trap after taking the P12 lock; "
+            f"there were {POST_LOCK_TRAP_FLOOR} when this was written. Either the closure shrank "
+            f"or the trap/lock predicates stopped matching, and in both cases the trap arm above "
+            f"is now green about nothing. Move this floor in the same commit that removes the "
+            f"script."
         ]
     return failures
 
@@ -2891,6 +3286,104 @@ def check_mutation_specs_declare_required_env() -> list[str]:
     return failures
 
 
+VERIFY_DIR = REPO / "dev/verify"
+
+
+def check_negative_controls_exercise_the_statement_under_test() -> list[str]:
+    """LSN-060: a ¬ form that synthesises its input measures nothing about how the input is obtained.
+
+    `broker-execute-l2.sh` looked its ActionRecord up by the RAW action id. Object names are
+    `journal.RecordName(actionID)` = `"ar-" + lower(actionID)` (06 §4.3, lowercased because a name
+    must be a DNS subdomain and a ULID is uppercase), so that lookup could not have found a record
+    against any commit. The suite never said so: the only thing that had ever exercised the arm was
+    `--negative-control`, which synthesises thirteen record documents and feeds them straight to the
+    assertion block, never touching the lookup. 13/13 green, for a statement that had not once run.
+
+    Two properties, because the general one is a write-it-down and the specific one is a diff.
+
+    1. Every suite with a `--negative-control` mode carries a `NEGATIVE CONTROL DOES NOT EXERCISE:`
+       block naming the live statements its synthesised path bypasses. Forced, not inferred -- the
+       same move [[LSN-051]] makes for a §8.5 halt: you cannot enumerate a bypass you never looked
+       for, and being made to write the list down is where the omission becomes visible.
+
+    2. No script fetches an `actionrecord` by interpolating a bare action id. That is the exact
+       defect, it is a one-line grep, and it is the half a reviewer cannot be relied on to catch
+       because the correct and incorrect forms differ by four characters.
+    """
+    scripts = sorted(VERIFY_DIR.glob("*.sh"))
+    if not scripts:
+        return ["VACUOUS: no suites under dev/verify/"]
+
+    marker = "NEGATIVE CONTROL DOES NOT EXERCISE:"
+    # `get actionrecord "$action_id"` and friends: a lookup whose name argument is an id variable.
+    by_raw_id = re.compile(
+        # The trailing boundary is load-bearing: without it `$REC_QUIET_IDLE` matches on its `ID`
+        # and `brake-fanout-l2.sh` -- which derives its names correctly via `rec_name` -- is
+        # reported as the defect. A check whose first finding is a false positive teaches the next
+        # reader to skim its output.
+        r"""(?:get|delete|patch)\s+actionrecords?(?:\.agents\.gke\.io)?\s+"?\$\{?"""
+        r"""(\w*(?:action_?)?[iI][dD])\}?"?(?![\w-])""",
+    )
+
+    failures, saw_control = [], False
+    for path in scripts:
+        text = path.read_text(encoding="utf-8")
+        rel = path.relative_to(REPO).as_posix()
+
+        for m in by_raw_id.finditer(text):
+            line = text[: m.start()].count("\n") + 1
+            failures.append(
+                f"{rel}:{line} looks an ActionRecord up by `${m.group(1)}`. The object name is "
+                f'`journal.RecordName` = `"ar-" + lower(actionID)` (06 §4.3), so this cannot find a '
+                f"record. Derive it: `record_name=\"ar-$(printf '%s' \"$action_id\" | "
+                f'tr \'[:upper:]\' \'[:lower:]\')\"` (LSN-060).'
+            )
+
+        # B-011: by HANDLER, not by substring. `None` means the file would not lex, which is a
+        # finding of its own -- a suite that cannot be parsed is a suite whose control mode nobody
+        # can see, and silently skipping it is how the corpus shrinks without anyone noticing.
+        dispatches = _dispatches_a_control(path, text)
+        if dispatches is None:
+            failures.append(
+                f"{rel} could not be lexed to decide whether it dispatches a "
+                f"`--negative-control` mode, so it was neither checked nor excluded. Fix the "
+                f"script or the recogniser in `negative-controls-name-their-rule.py`; do not "
+                f"leave it unclassified (LSN-038)."
+            )
+            continue
+        if not dispatches:
+            continue
+        saw_control = True
+        if marker not in text:
+            failures.append(
+                f"{rel} has a `--negative-control` mode and no `{marker}` block. A control that "
+                f"synthesises its input proves the ASSERTIONS are not always-green and proves "
+                f"nothing about the statements it bypassed to inject that input -- which are the "
+                f"API call, the parse and the lookup, i.e. where an L2 suite actually fails. List "
+                f"them in a comment so the next reader can see what the 13/13 does not cover "
+                f"(LSN-060)."
+            )
+            continue
+        after = text.split(marker, 1)[1]
+        listed = [
+            ln.strip().lstrip("#").strip()
+            for ln in after.splitlines()[1:]
+            if ln.lstrip().startswith("#")
+        ]
+        if not any(item.startswith(("-", "*")) and len(item) > 3 for item in listed):
+            failures.append(
+                f"{rel} carries `{marker}` with no entries under it. An empty list is the claim "
+                f"that the control exercises everything, which is the claim LSN-060 was about."
+            )
+
+    if not saw_control:
+        failures.append(
+            "VACUOUS: no suite under dev/verify/ declares a `--negative-control` mode, so the "
+            "declaration half of this check measured nothing."
+        )
+    return failures
+
+
 def check_checkpoint_commits_reach_ci() -> list[str]:
     """LSN-055: one push per branch is one CI run for every commit on it.
 
@@ -3196,8 +3689,644 @@ def check_envtest_control_planes_are_reaped() -> list[str]:
     return failures
 
 
+# Repointed by dev/test_invariants_gate.py's controls, which is why they are constants.
+VERIFY_DIR = REPO / "dev" / "verify"
+RATCHET_RUNNER = REPO / "dev" / "tests" / "phase-ratchet-is-asserted.py"
+
+
+def check_phase_gate_runs_its_own_ratchet() -> list[str]:
+    """Planning defect 4 / LSN-019: every `verify-phase<N>.sh` runs the 09 §10 ratchet for ITS phase.
+
+    On 2026-07-31 `harness-milestone` was invoked for Phase 9 with all 70 in-phase leaf units done,
+    and stopped at §1: **23 of the 75 check IDs the phase requires had never been run**, 8 of them
+    from BLOCKING-ALWAYS suites. Every section of `verify-phase9.sh` was passing or failing for
+    reasons unrelated to them, because the script names 18 check IDs and has no V-ISO section at
+    all. A gate that never names an ID cannot go red for it.
+
+    The gap had been PREDICTED. `docs/build/phase-9.md` § "Planning defect 4", written 2026-07-27,
+    counts seventeen unrun ratchet checks and declares the resolution: *"verify-phase9.sh runs the
+    ratchet, not the Accept list."* The acceptance table was amended, which is half of it. The
+    script was not, which is the half that runs. [[LSN-019]] again -- prose on the artifact is not a
+    mechanization, and here the prose was a correct description of a live defect.
+
+    So the mechanization has to be about the SCRIPT, and it has to be about every phase gate rather
+    than the one that got caught, because the next phase's gate is written by copying this one.
+    Three things, each covering a different way the arm could be present and inert:
+
+      1. Every `dev/verify/verify-phase<N>.sh` invokes `phase-ratchet-is-asserted.py`.
+      2. It passes `--phase <N>` matching the script's OWN number. A gate that audits phase 8's
+         ratchet is a gate that passes while its own phase is unproven, and the two lines differ by
+         one character.
+      3. The invocation's failure is a `bad`/failure, not a bare informational echo. An arm whose
+         red does not reach the exit code is a comment.
+
+    Phases before the arm existed are exempt by an explicit list rather than by a floor: a floor
+    silently exempts every phase added below it, and the whole point is that a new gate inherits
+    the obligation. Adding a phase to that list is a conversation, which is what it should be.
+    """
+    failures: list[str] = []
+    runner = RATCHET_RUNNER
+    if not runner.exists():
+        return [
+            f"{runner.relative_to(REPO)} does not exist. It is the derived form of the 09 §10 "
+            f"ratchet, and without it every phase gate is back to a hand-written check list "
+            f"(planning defect 4)."
+        ]
+
+    # Gates written before 2026-07-31, when this obligation did not exist. Not a floor: a floor
+    # would exempt phase 16 as readily as phase 2.
+    grandfathered = {"2", "3", "4", "5", "6", "7", "8"}
+
+    gates = sorted(VERIFY_DIR.glob("verify-phase*.sh"))
+    if not gates:
+        return ["dev/verify/ has no verify-phase*.sh at all -- this check matched nothing"]
+
+    checked = 0
+    for gate in gates:
+        m = re.match(r"verify-phase(\d+)\.sh$", gate.name)
+        if not m or m.group(1) in grandfathered:
+            continue
+        checked += 1
+        phase = m.group(1)
+        text = gate.read_text(encoding="utf-8")
+        invocations = [
+            line
+            for line in text.splitlines()
+            if "phase-ratchet-is-asserted.py" in line and not line.lstrip().startswith("#")
+        ]
+        if not invocations:
+            failures.append(
+                f"{gate.relative_to(REPO)} never invokes dev/tests/phase-ratchet-is-asserted.py, so "
+                f"nothing in it checks phase {phase}'s OWN 09 §10 ratchet. Sections that run the "
+                f"Accept list and the PRIOR ratchet both stay green while required check IDs go "
+                f"unrun -- that is exactly how planning defect 4 survived to the milestone."
+            )
+            continue
+        if not any(re.search(rf"--phase\s+{phase}(\s|$)", line) for line in invocations):
+            failures.append(
+                f"{gate.relative_to(REPO)} invokes phase-ratchet-is-asserted.py but not with "
+                f"`--phase {phase}`. A gate that audits another phase's ratchet passes while its "
+                f"own is unproven, and the two lines differ by one character."
+            )
+        # 3. The red has to reach the exit code. The gate scripts report failure through `bad`.
+        window = "\n".join(
+            text.splitlines()[
+                max(0, text.splitlines().index(invocations[0]) - 2) : text.splitlines().index(
+                    invocations[0]
+                )
+                + 12
+            ]
+        )
+        if "bad " not in window:
+            failures.append(
+                f"{gate.relative_to(REPO)}'s ratchet invocation does not reach `bad` within twelve "
+                f"lines, so a failed ratchet audit prints and does not fail the gate. An arm whose "
+                f"red does not reach the exit code is a comment."
+            )
+
+    if not checked:
+        failures.append(
+            "every verify-phase*.sh in the tree is grandfathered out of the ratchet obligation, so "
+            "this check evaluated nothing. Remove a phase from `grandfathered` or delete the check "
+            "-- a check with an empty corpus reports the same green as one that passed."
+        )
+    return failures
+
+
+# RETIRED 2026-07-31: `check_phase_gate_publishes_the_coverage_remainder`.
+#
+# It asserted that every non-grandfathered `verify-phase<N>.sh` invokes
+# `dev/tests/load-bearing-coverage-is-full.py` and lets its red reach `bad`. That obligation existed
+# for exactly one reason: V-MET-002 is BLOCKING-ALWAYS and was NOT a line on `dev/L0-CHAIN.txt`,
+# because it was red by construction until the 09 §6 catalog grew the rows asserting its published
+# remainder. The phase gate was therefore the only place it ran, and a section is one delete away
+# from a BLOCKING-ALWAYS check that runs nowhere -- V-MET-007's failure wearing a script's clothes.
+#
+# The remainder reached zero on 2026-07-31 and the live arm moved onto `dev/L0-CHAIN.txt`. The chain
+# file now answers "does V-MET-002 run", which is a stronger answer than this arm gave: it is the
+# single definition site every L0 consumer reads, and it is a required PR check rather than a
+# milestone-time script. The arm's own docstring specified this retirement and specified that it
+# happen in the commit that moves the chain line, so the two never both fail to cover it. That is
+# what happened; `git log -S check_phase_gate_publishes_the_coverage_remainder` has the pair.
+#
+# This is a retirement with a named replacement, not a deletion (invariants §8).
+
+
+# ---------------------------------------------------------------------------------------------
+# LSN-062 — a record that says a path is absent is checked against the tree
+# ---------------------------------------------------------------------------------------------
+#
+# `P9-T11g-2a`'s split note published -- in a phase-file row, a ledger cell, an outcome section and
+# a commit message -- that `verification/traceability.yaml` **does not exist**. It had existed since
+# `P8-T10` (`ead358e`): 71 KB, 177 entries, V-MET-011's artifact, green on the L0 chain every run.
+# The question the unit had actually answered was "does 09 §8's `R-<doc>.<section>-<n>` requirement
+# mapping exist?", a correct and well-evidenced **no**, and the answer was written down against the
+# FILENAME §8 happens to use for that mapping. Every sentence after it stayed consistent, because
+# only the label was wrong.
+#
+# Why this direction and not the other. A claim that a file EXISTS has a backstop: the next thing
+# that opens it fails. A claim that a file is ABSENT has none -- nothing fails when you decline to
+# run `ls` -- and it is load-bearing, because "X does not exist" is how work gets scheduled. So the
+# absent direction gets a check rather than a habit.
+#
+# The corpus is the three places the harness keeps records that later units read as fact:
+# `docs/build/*.md`, `.claude/harness/*.md`, and the header comment of `verification/*.yaml`. Both
+# markdown globs are DELIBERATELY NON-RECURSIVE. `docs/build/archive/` is a frozen record of closed
+# phases whose sentences are true of the tree they describe and were never meant to be re-read as
+# present tense; a live phase file is the opposite, and is exactly where the incident happened.
+
+ABSENCE_MD_GLOBS = ("docs/build/*.md", ".claude/harness/*.md")
+ABSENCE_YAML_GLOB = "verification/*.yaml"
+
+# The non-vacuity floor, and it is a floor on CANDIDATES EXAMINED, not on findings. The normal case
+# in this corpus is a TRUE absence claim -- "there is no `deploy/kubeagents-broker`", "`k8s-operator/
+# config/samples` holds no Agent" -- so a findings-based floor would demand the records stay wrong.
+# On 2026-08-01 the scanner attached a path to nine claims across BUILD-REVIEW.md, LEDGER.md,
+# HARNESS.md and phase-9.md. Four is a little under half of that: high enough that the two ways this
+# arm dies quietly (the sentence splitter stops splitting, the path attacher stops attaching -- both
+# send the count to zero or one) fail loudly, and low enough that correcting or striking every
+# finding this arm currently raises, plus a few more, does not turn a clean-up into a red gate.
+# [[LSN-035]]/[[LSN-036]]: a scanner that silently stopped matching prints the same green as one
+# that examined the corpus.
+ABSENCE_CLAIM_FLOOR = 4
+
+# What counts as "a repo path" when it appears in backticks. Either it has a separator, or it ends
+# in an extension this repo actually uses. Design point: THE ARM ONLY FIRES ON A CLAIM THAT NAMES A
+# PATH. "The requirement mapping does not exist" is a claim about a property, it is very likely to
+# be true, and there is nothing here to resolve -- guessing which artifact a prose noun refers to is
+# the exact substitution (a NAME asserted, a PROPERTY established) that LSN-062 is about. Such a
+# sentence is ignored in silence, on purpose.
+PATH_EXTENSIONS = (
+    ".md", ".py", ".sh", ".go", ".yaml", ".yml", ".json", ".txt", ".csv", ".toml", ".tpl",
+    ".template", ".mod", ".sum", ".tf", ".cfg", ".ini", ".env", ".lock",
+)
+
+# Present tense: the claim is about the tree as it stands, which is the tree this arm can see.
+_ADVERB = r"(?:\s+(?:\w+ly|yet|still|now|ever|then))"
+_ABSENT_NOW = (
+    r"(?:does|do)\s+not" + _ADVERB + r"{0,2}\s+(?:yet\s+)?exists?"
+    r"|(?:doesn't|don't)" + _ADVERB + r"{0,2}\s+exists?"
+    r"|(?:is|are)" + _ADVERB + r"{0,2}\s+absent"
+    r"|(?:is|are)\s+not" + _ADVERB + r"{0,2}\s+(?:in the tree|present in the tree|in the repo|on disk)"
+    r"|(?:has|have)\s+never\s+existed"
+    r"|no\s+longer\s+exists?"
+)
+# Past tense. Handled, not exempted -- see `_absence_claims`.
+_ABSENT_THEN = (
+    r"(?:did|would)\s+not" + _ADVERB + r"{0,2}\s+(?:yet\s+)?exists?"
+    r"|didn't" + _ADVERB + r"{0,2}\s+exists?"
+    r"|(?:was|were)" + _ADVERB + r"{0,2}\s+absent"
+    r"|(?:was|were)\s+not" + _ADVERB + r"{0,2}\s+(?:in the tree|present in the tree|in the repo|on disk)"
+    r"|had\s+never\s+existed"
+    r"|no\s+longer\s+existed"
+)
+# The path follows these instead of preceding them.
+_ABSENT_PREFIX_NOW = r"there\s+(?:is|are)\s+no(?!\w)|nothing\s+at|no\s+such\s+file(?:\s+at)?|no\s+such\s+path|no\s+file\s+at"
+_ABSENT_PREFIX_THEN = r"there\s+(?:was|were)\s+no(?!\w)"
+
+ABSENT_NOW_RE = re.compile(_ABSENT_NOW, re.I)
+ABSENT_THEN_RE = re.compile(_ABSENT_THEN, re.I)
+ABSENT_PREFIX_NOW_RE = re.compile(_ABSENT_PREFIX_NOW, re.I)
+ABSENT_PREFIX_THEN_RE = re.compile(_ABSENT_PREFIX_THEN, re.I)
+
+# A coordinated run of backticked tokens (`a.py`, `b.py` and `c.py`) touching the phrase, plus the
+# filler allowed between the two. THE WINDOW IS THE POINT. "`X` does not exist" and "`X` exists"
+# differ by two words, and a regex that scans a paragraph for a path and a negation independently
+# fires on both -- so the path must be the thing the phrase is predicated OF, not merely nearby.
+# `_BAD_FILLER` is what makes the join legal: no second backticked token (a nearer path would be the
+# real subject), no colon, no coordinating conjunction that switches subject, no `exists`/`present`
+# (the sentence is drawing a contrast and the phrase belongs to the other half), and no
+# `<article> <noun> that/which` -- a fresh head noun means the phrase is about the noun, not the
+# path. That last one is not hypothetical: LEDGER.md:88 reads "the three promises
+# `internal/broker/undo` makes to a replayer that did not exist", where the absent thing is the
+# replayer.
+_LEFT_PATHS = re.compile(r"((?:`[^`\n]+`)(?:\s*(?:,|and|or|nor|·)\s*`[^`\n]+`)*)([^`]{0,60})$")
+# The prefix form gets a much shorter window than the suffix form, because "there is no" is followed
+# by its subject immediately and anything longer is a different noun. HARNESS.md:98 -- "there is no
+# reading of that which is not \"read and ignored\"" -- has a backticked path thirty characters
+# later and is not a claim about it.
+_RIGHT_PATHS = re.compile(r"^([^`]{0,20}?)((?:`[^`\n]+`)(?:\s*(?:,|and|or|nor|·)\s*`[^`\n]+`)*)")
+_BAD_FILLER = re.compile(
+    r"`|:|\b(?:but|while|whereas|though|although|because|since|however|whose|if|unless|"
+    r"exists?|present)\b|"
+    r"\b(?:a|an|the|its|their|this|these|those|another|his|her|our|your)\s+[\w'’-]+\s+"
+    r"(?:that|which|who)\b",
+    re.I,
+)
+# A scoping preposition right after the phrase means the sentence never claimed the path is missing
+# from the REPOSITORY: "`verify-phase8.sh` is absent from the chain" is a true statement about
+# `dev/L2-CHAIN.txt`. The negative lookahead keeps the three scopes that ARE the tree.
+_RIGHT_SCOPE = re.compile(
+    r"^\W{0,3}(?:from|in|on|under|within|among|outside|beyond|between|across)\b"
+    r"(?!\s+(?:disk|the tree|the repo|the repository|the working tree|the worktree|the filesystem))",
+    re.I,
+)
+# A claim ATTRIBUTED to someone else, or quoted, is a report of a claim and not one. The corpus
+# needs this: LESSONS.md's own body for LSN-062 has to be able to say that a unit "published that
+# `verification/traceability.yaml` does not exist", and phase-9.md's correction block has to be able
+# to quote the retracted sentence. Stated limit: an attributed sentence is not checked at all, so
+# "the ledger says `x` does not exist" escapes even when it is the record's own live claim. Narrow
+# on purpose -- speech and record verbs only, not `reads`/`names`/`shows`.
+_ATTRIBUTED = re.compile(
+    r"\b(?:said|says|stated|states|claimed|claims|wrote|published|publishes|reported|asserted|"
+    r"insisted|believed|thought|assumed|told|quoted|quotes)\b",
+    re.I,
+)
+_QUOTED = re.compile(r"\"[^\"\n]*\"|“[^”\n]*”")
+# A struck-through claim is a CORRECTED claim, and a corrected record is what this arm wants the
+# tree to look like. Exempt per LSN-062's own proposal. Fenced blocks are command transcripts and
+# diffs -- quoted material, not the record's assertion -- and `ls: no such file` in captured output
+# is a fact about the moment it was captured.
+_STRIKETHROUGH = re.compile(r"~~.*?~~", re.S)
+_CODE_FENCE = re.compile(r"^```.*?^```", re.M | re.S)
+# An ISO date in the SAME sentence. See `_absence_claims` for what it buys and why the sentence is
+# the unit.
+_IN_SENTENCE_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+# Hard breaks that end a statement regardless of punctuation: a blank line, a list bullet, a
+# heading, a blockquote marker, and a table-cell pipe. Everything between two hard breaks is
+# re-flowed (single newlines become spaces) before sentence splitting, because this corpus hard-
+# wraps prose at ~100 columns -- splitting on `\n` would put the path and the phrase of a wrapped
+# sentence in different windows and lose the claim. `.replace("\n", " ")` is length-preserving, so
+# every offset still maps back to a real line number.
+_HARD_BREAK = re.compile(r"\n\s*\n|\n\s*(?:[-*+]|\d+\.)\s|\n#{1,6}\s|\n\s*>|\|")
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def _absence_corpus() -> dict[str, str]:
+    """{repo-relative path: the text this arm reads}, with the YAML files cut to their headers."""
+    corpus: dict[str, str] = {}
+    for glob in ABSENCE_MD_GLOBS:
+        for path in sorted(REPO.glob(glob)):
+            if path.is_file():
+                corpus[path.relative_to(REPO).as_posix()] = path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+    for path in sorted(REPO.glob(ABSENCE_YAML_GLOB)):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        # Header comment only: the leading run of `#` and blank lines. The data below it is
+        # generated (`requirements.yaml` is 216 KB of extracted spec text) and its `text:` scalars
+        # quote the specs, which say things like "there is no ..." about the system rather than
+        # about the tree.
+        header: list[str] = []
+        for line in text.splitlines():
+            if line.strip() and not line.lstrip().startswith("#"):
+                break
+            header.append(line)
+        corpus[path.relative_to(REPO).as_posix()] = "\n".join(header)
+    return corpus
+
+
+def _statements(text: str) -> list[tuple[int, str]]:
+    """(offset into `text`, one sentence) for every sentence, fences and strikethrough removed.
+
+    Both removals blank the span rather than deleting it, and both are LENGTH-PRESERVING (every
+    non-newline character becomes a space), so every offset -- and therefore every line number in a
+    finding -- still points at the real file. Deleting the span instead shifts everything after the
+    first fenced block, and a finding that names the wrong line is a finding nobody can act on.
+    """
+    def blank(m: re.Match[str]) -> str:
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    text = _CODE_FENCE.sub(blank, text)
+    text = _STRIKETHROUGH.sub(blank, text)
+
+    chunks: list[tuple[int, str]] = []
+    pos = 0
+    for m in _HARD_BREAK.finditer(text):
+        chunks.append((pos, text[pos : m.start()]))
+        pos = m.end()
+    chunks.append((pos, text[pos:]))
+
+    out: list[tuple[int, str]] = []
+    for start, chunk in chunks:
+        flat = chunk.replace("\n", " ")
+        at = 0
+        for m in _SENTENCE_END.finditer(flat):
+            out.append((start + at, flat[at : m.start()]))
+            at = m.end()
+        out.append((start + at, flat[at:]))
+    return [(off, s) for off, s in out if s.strip()]
+
+
+def _claimed_path(token: str) -> str | None:
+    """The repo path a backticked token names, or None if it does not name one."""
+    t = token.strip().rstrip(".,;:").strip()
+    if not t or " " in t or len(t) < 3:
+        return None
+    if t.startswith(("http", "$", "-", "<", "#", "@")) or t.endswith(("(", ")")):
+        return None
+    if "/" in t or t.endswith(PATH_EXTENSIONS):
+        return t.rstrip("/")
+    return None
+
+
+def _path_is_present(token: str) -> str | None:
+    """What in the working tree answers to `token`, or None.
+
+    Generous on purpose, in the same way `check_closed_lessons_are_executable` is generous about a
+    lesson's citations: a bare filename resolves against any file of that name, and a relative path
+    resolves against any path that ends with it. LSN-062's whole shape is a claim made about a NAME,
+    so a name that resolves to something is at minimum a claim a reader cannot check by eye. The
+    finding prints both the token as written and what it resolved to, so a genuine miss is one glance
+    to dismiss.
+
+    Enumerated from the WORKING TREE via `gitcorpus.repo_files`, never `git ls-files` alone: a file
+    this unit just created is not in the index, and it is the newest claims that are most likely to
+    be stale ([[LSN-050]]).
+    """
+    if any(ch in token for ch in "*?["):
+        # A glob names a set, not a path. Resolve it as one rather than skipping it -- an empty
+        # match is an honest absence.
+        return next((p.relative_to(REPO).as_posix() for p in REPO.glob(token)), None)
+    if (REPO / token).exists():
+        return token
+    files, dirs = _tree_index()
+    if "/" in token:
+        for rel in files:
+            if rel.endswith("/" + token):
+                return rel
+        for d in dirs:
+            if d.endswith("/" + token):
+                return d
+        return None
+    for rel in files:
+        if rel.rsplit("/", 1)[-1] == token:
+            return rel
+    for d in dirs:
+        if d.rsplit("/", 1)[-1] == token:
+            return d
+    return None
+
+
+_TREE_INDEX: tuple[list[str], list[str]] | None = None
+
+
+def _tree_index() -> tuple[list[str], list[str]]:
+    """(every file in the working tree, every directory implied by one), enumerated once.
+
+    Cached because `repo_files` shells out to git and this arm asks the question once per claim.
+    """
+    global _TREE_INDEX
+    if _TREE_INDEX is None:
+        files = repo_files(REPO)
+        dirs = set()
+        for rel in files:
+            parts = rel.split("/")
+            dirs.update("/".join(parts[:i]) for i in range(1, len(parts)))
+        _TREE_INDEX = (files, sorted(dirs))
+    return _TREE_INDEX
+
+
+def _absence_claims(text: str) -> list[tuple[int, str, str, bool, str]]:
+    """Every claim in `text` that a named path is absent.
+
+    Returns (offset, path token, the phrase that asserts absence, historical?, the sentence).
+
+    **Tense, which is the subtle part, and the decision is written down here.** A past-tense claim
+    ("`x` did not exist", "`x` was absent") can be true of the tree it was written against and false
+    of the tree today, so it cannot be judged the same way. It is NOT exempted: a reader at ORIENT
+    reads a phase file as a description of the world they are about to work in, which is precisely
+    how LSN-062 happened -- the false claim was read, believed, and scheduled against four separate
+    times before anyone ran `ls`. A past-tense claim about a path that is present today therefore
+    still produces a finding, with its own message asking for a date qualifier or a rewrite rather
+    than for a deletion.
+
+    The one exemption is an ISO date IN THE SAME SENTENCE. "On 2026-07-20 `x` did not exist" is a
+    statement about a tree this arm cannot see and cannot contradict, and the date is what stops a
+    later reader from taking it as present tense. The date must be in the sentence, not the
+    paragraph, the section heading or the commit: an inferable date is exactly what every one of
+    these sentences already had, and it did not help.
+    """
+    claims: list[tuple[int, str, str, bool, str]] = []
+    for off, sentence in _statements(text):
+        # (phrase pattern, past tense?, does the path FOLLOW the phrase?)
+        for pattern, historical, prefix in (
+            (ABSENT_NOW_RE, False, False),
+            (ABSENT_THEN_RE, True, False),
+            (ABSENT_PREFIX_NOW_RE, False, True),
+            (ABSENT_PREFIX_THEN_RE, True, True),
+        ):
+            for m in pattern.finditer(sentence):
+                if _ATTRIBUTED.search(sentence[: m.start()]):
+                    continue
+                if any(
+                    q.start() <= m.start() and m.end() <= q.end()
+                    for q in _QUOTED.finditer(sentence)
+                ):
+                    continue
+                if prefix:
+                    hit = _RIGHT_PATHS.match(sentence[m.end() :])
+                    if not hit or _BAD_FILLER.search(hit.group(1)):
+                        continue
+                    tokens, after = hit.group(2), sentence[m.end() :][hit.end() :]
+                else:
+                    hit = _LEFT_PATHS.search(sentence[: m.start()])
+                    if not hit or _BAD_FILLER.search(hit.group(2)):
+                        continue
+                    tokens, after = hit.group(1), sentence[m.end() :]
+                # "`verify-phase8.sh` is absent from the chain" is a claim about a chain file, not
+                # about the tree, and it is true. A scoping preposition after the phrase means the
+                # sentence never asserted the path is missing from the repository at all.
+                if _RIGHT_SCOPE.match(after):
+                    continue
+                if historical and _IN_SENTENCE_DATE.search(sentence):
+                    continue
+                for raw in re.findall(r"`([^`\n]+)`", tokens):
+                    token = _claimed_path(raw)
+                    if token:
+                        claims.append(
+                            (off + m.start(), token, m.group(0), historical, sentence.strip())
+                        )
+    return claims
+
+
+# The in-file control corpus. `invariants-gate.py` has no `--negative-control` mode -- its arms are
+# controlled from `dev/test_invariants_gate.py` -- but a control that lives in another file is a
+# control someone can forget to run, and this arm's whole risk is a window that quietly stops
+# discriminating. So the rows run on every invocation, ahead of the corpus, and a disagreement is a
+# FAILURE OF THIS ARM rather than a finding about the tree.
+#
+# Each row is (a synthetic document, the paths it must be understood to claim absent). The paths
+# below are deliberately a mix of real (`verification/traceability.yaml`, `dev/L0-CHAIN.txt`) and
+# invented (`verification/nonesuch.yaml`), because the property under test here is ATTACHMENT --
+# which path the phrase is about -- and not presence, which the corpus arm exercises for real.
+ABSENCE_CONTROLS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # 1. The incident itself, verbatim in shape.
+    ("`verification/traceability.yaml` does not exist.", ("verification/traceability.yaml",)),
+    # 2. Two words away from row 1 and the opposite claim. A paragraph-wide regex fires on both.
+    ("`verification/traceability.yaml` exists, at 71 KB and 177 entries.", ()),
+    # 3. Both claims in ONE sentence. The phrase belongs to the nearer path, and attaching it to
+    #    the first backtick in the sentence would report a true statement as a lie.
+    (
+        "`dev/L0-CHAIN.txt` exists and `verification/nonesuch.yaml` does not exist.",
+        ("verification/nonesuch.yaml",),
+    ),
+    # 4. Sentence bounding. The path is in the previous sentence and the claim is about a property.
+    (
+        "`dev/L0-CHAIN.txt` is the single definition site. "
+        "The requirement mapping does not exist.",
+        (),
+    ),
+    # 5. No path anywhere: ignored in silence, never guessed at.
+    ("The `R-<doc>.<section>-<n>` requirement space does not exist.", ()),
+    # 6. Prefix phrasing, where the path follows the phrase.
+    ("There is no `verification/nonesuch.yaml` in the tree.", ("verification/nonesuch.yaml",)),
+    # 7. Prefix phrasing whose subject is a noun, with a path later in the sentence.
+    ("There is no reading of that which does not condemn `dev/L0-CHAIN.txt`.", ()),
+    # 8. Scoped to a container: a membership claim, not a claim about the tree.
+    ("`verify-phase8.sh` is absent from the chain.", ()),
+    # 9. Attributed and quoted: a report of a claim, which is how a correction is written.
+    (
+        'The split note said `verification/traceability.yaml` "does not exist".',
+        (),
+    ),
+    # 10. Struck through: a corrected record is what this arm is asking for.
+    ("~~`verification/traceability.yaml` does not exist~~ — corrected the same day.", ()),
+    # 11. Fenced: a transcript quotes the world at capture time.
+    ("```\nls: `verification/traceability.yaml` does not exist\n```", ()),
+    # 12. Past tense with no date: still a claim, still checked (with the other message).
+    ("`dev/L0-CHAIN.txt` did not exist when the phase was planned.", ("dev/L0-CHAIN.txt",)),
+    # 13. Past tense with an ISO date in the same sentence: a claim about a tree this arm cannot
+    #     see, and the reader has been told which tree.
+    ("On 2026-07-20 `dev/L0-CHAIN.txt` did not exist.", ()),
+    # 14. A wrapped sentence. The corpus hard-wraps at ~100 columns; splitting on newlines would
+    #     drop this claim entirely and the arm would go quiet without going red.
+    (
+        "`verification/coverage.yaml`, which §8.1 names as the baseline's\n"
+        "home, is genuinely absent.",
+        ("verification/coverage.yaml",),
+    ),
+    # 15. A coordinated list shares one phrase, and every member of it is a claim. Taking only the
+    #     nearest path would leave the first half of the sentence unchecked.
+    (
+        "`verification/nonesuch.yaml` and `verification/alsonot.yaml` do not exist.",
+        ("verification/nonesuch.yaml", "verification/alsonot.yaml"),
+    ),
+    # 16-18 are the `_BAD_FILLER` rows: the path is the NEAREST one to the phrase in all three and
+    # is still not what the phrase is about. Without them, neutering `_BAD_FILLER` to match nothing
+    # leaves every other row in this table green -- rows 3 and 7 are held by the regex's own
+    # `[^`]`/20-character bounds, not by the filler rule -- and the arm would start reporting true
+    # sentences as lies with no control objecting.
+    #
+    # 16. LEDGER.md:88, verbatim in shape. The thing that did not exist is the replayer.
+    (
+        "The package is built on the three promises `internal/broker/undo` makes to a replayer "
+        "that did not exist.",
+        (),
+    ),
+    # 17. A contrast inside one sentence: the path is the half that IS there.
+    ("`dev/L0-CHAIN.txt` is the single definition site, but the mapping does not exist.", ()),
+    # 18. LESSONS.md:1069's shape — a colon, then an unrelated path.
+    ("Scoped by what it does, so there is no exemption ladder: `dev/L0-CHAIN.txt` is exempt.", ()),
+    # 19. Long but grammatically clean filler. Nothing in `_BAD_FILLER` objects to this sentence, so
+    #     only the 60-character bound on `_LEFT_PATHS` keeps the phrase off the path. Widen that
+    #     bound and this row is the one that notices.
+    (
+        "`dev/L0-CHAIN.txt` is the file the harness reads before every unit of work begins and "
+        "the requirement mapping does not exist.",
+        (),
+    ),
+    # 20. Two table cells. A ledger row is a dozen independent statements on one line; joining them
+    #     invents a sentence nobody wrote, and it is the shape half this corpus is written in.
+    ("| `dev/L0-CHAIN.txt` | the requirement mapping does not exist |", ()),
+    # 21. Attributed and NOT quoted — pins the attribution exemption on its own.
+    (
+        "The unit published in a ledger cell that `verification/traceability.yaml` does not exist.",
+        (),
+    ),
+    # 22. Quoted and NOT attributed — pins the quotation exemption on its own.
+    (
+        'A phase-file row carried `verification/traceability.yaml` "does not exist" forward.',
+        (),
+    ),
+)
+
+
+def _absence_control_failures() -> list[str]:
+    """The arm proving it still discriminates, before it is allowed to judge the corpus."""
+    failures: list[str] = []
+    for doc, expected in ABSENCE_CONTROLS:
+        got = tuple(token for _off, token, _phrase, _hist, _s in _absence_claims(doc))
+        if got != expected:
+            failures.append(
+                f"CONTROL ROW FAILED: {doc.splitlines()[0][:80]!r} should be read as claiming "
+                f"{list(expected)} absent and was read as claiming {list(got)}. The window that "
+                f"decides which path a negation is about has stopped discriminating, so this arm's "
+                f"verdict on the real corpus means nothing (LSN-062)."
+            )
+    return failures
+
+
+def check_absent_path_claims_are_true() -> list[str]:
+    """LSN-062. "That file does not exist" is a checkable claim, so it gets checked.
+
+    Over `docs/build/*.md`, `.claude/harness/*.md` and the header comments of `verification/*.yaml`:
+    a sentence asserting that a named repo path is absent must be true of the working tree.
+
+    Three properties, in the order they can fail:
+
+      1. The control rows above still discriminate "`X` does not exist" from "`X` exists" and attach
+         the phrase to the right path. A window that has stopped discriminating produces green for
+         a reason unrelated to the corpus.
+      2. Enough candidate claims were found to believe the scanner ran at all. The floor is on
+         candidates, because a true absence claim is the normal and desirable case here.
+      3. No claim names a path that is present.
+
+    What this arm cannot do, stated so nobody reads its green as more than it is: it checks the
+    NAME, and LSN-062 was a name standing in for a property. A record that says "the requirement
+    mapping does not exist" is unreachable from here and would have been unreachable then. What it
+    does catch is the cheap half -- the half that costs one `ls` and was not run.
+    """
+    failures = _absence_control_failures()
+    if failures:
+        return failures
+
+    examined = 0
+    for rel, text in sorted(_absence_corpus().items()):
+        for off, token, phrase, historical, sentence in _absence_claims(text):
+            examined += 1
+            resolved = _path_is_present(token)
+            if not resolved:
+                continue
+            line = text.count("\n", 0, off) + 1
+            where = f"{rel}:{line}" if rel.endswith(".md") else f"{rel}:{line} (header comment)"
+            named = f"`{token}`" + ("" if resolved == token else f" (resolves to {resolved})")
+            quoted = sentence if len(sentence) <= 160 else sentence[:157] + "..."
+            if historical:
+                failures.append(
+                    f"{where} says {named} \"{phrase}\", and it is in the tree today. A past-tense "
+                    f"absence claim with no date in the same sentence is read as present tense at "
+                    f"the next ORIENT — which is how LSN-062 scheduled work against a file that had "
+                    f"existed for a phase. Date it in this sentence or rewrite it. Claim: {quoted!r}"
+                )
+            else:
+                failures.append(
+                    f"{where} says {named} \"{phrase}\", and it is in the tree. LSN-062: an absence "
+                    f"claim has no backstop — nothing fails when a file you declined to open is "
+                    f"actually there — and it is what the next unit schedules against. Correct the "
+                    f"sentence (strike it through, or say which property is missing rather than "
+                    f"which file). Claim: {quoted!r}"
+                )
+
+    if examined < ABSENCE_CLAIM_FLOOR:
+        failures.append(
+            f"VACUOUS: the scanner attached a path to only {examined} absence claim(s) across "
+            f"{len(_absence_corpus())} corpus file(s); the floor is {ABSENCE_CLAIM_FLOOR} and this "
+            f"tree had nine when the arm was written. The records did not stop making these claims "
+            f"— the sentence splitter or the path attacher stopped seeing them, and a scanner that "
+            f"matches nothing reports the same green as one that checked everything."
+        )
+    return failures
+
+
 CHECKS = [
-    ("invariant 7 — authority never precedes machinery", check_write_verbs_have_machinery),
+    (
+        "invariant 7 / V-CTN-038 — authority never precedes machinery",
+        check_write_verbs_have_machinery,
+    ),
     ("LSN-038 — the machinery probes resolve against the tree", check_machinery_probes_resolve),
     ("invariant 8 / V-MET-003 — assertion ratchet", check_assertion_ratchet),
     (
@@ -3208,6 +4337,10 @@ CHECKS = [
     ("LSN-005 — destructive-test guards stay anchored", check_destructive_guards_are_anchored),
     ("LSN-018 — build targets name their cluster", check_make_targets_are_context_explicit),
     ("V-MET-006 / LSN-008 — deferrals name a blocker", check_deferrals_name_blockers),
+    (
+        "every results.csv row parses to its eight declared columns",
+        check_results_rows_have_eight_fields,
+    ),
     ("09 §12 / LSN-046 — † checks are deferred by ID", check_dagger_checks_are_deferred_by_id),
     (
         "LSN-001/002/003 — L2 scripts declare and back their preconditions",
@@ -3220,6 +4353,10 @@ CHECKS = [
     (
         "LSN-026 / P10 — L2 scripts assert the cluster can run the experiment",
         check_l2_scripts_assert_cluster_health,
+    ),
+    (
+        "LSN-066 / P12 — the one-suite-per-cluster lock is wired and not stomped",
+        check_l2_lock_is_wired,
     ),
     (
         "LSN-027 — cluster-creating scripts measure their substrate first",
@@ -3251,6 +4388,10 @@ CHECKS = [
     ),
     ("LSN-055 — a CHECKPOINT commit reaches CI", check_checkpoint_commits_reach_ci),
     (
+        "LSN-060 — a negative control exercises the statement under test",
+        check_negative_controls_exercise_the_statement_under_test,
+    ),
+    (
         "LSN-051 — a §8.5 halt quotes both sides of the contradiction",
         check_spec_contradiction_halts_cite_both_sides,
     ),
@@ -3261,6 +4402,14 @@ CHECKS = [
     (
         "LSN-059 — a killed test run's control planes are reaped by the next one",
         check_envtest_control_planes_are_reaped,
+    ),
+    (
+        "planning defect 4 — every phase gate runs its own 09 §10 ratchet",
+        check_phase_gate_runs_its_own_ratchet,
+    ),
+    (
+        "LSN-062 — a record claiming a path is absent is checked against the tree",
+        check_absent_path_claims_are_true,
     ),
 ]
 

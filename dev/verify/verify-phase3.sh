@@ -144,7 +144,12 @@ cleanup() {
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
   unseed_parent_agents "$K" "${SEEDED[@]:-}"
 }
-trap cleanup EXIT
+# P12 ([[LSN-066]]): this trap is installed AFTER p10_assert_control_plane_healthy, whose
+# p12_assert_exclusive_l2 took the one-suite-per-cluster lock and put `_l2_lock_exit_handler` on
+# EXIT. Replacing that trap here would leak the lock to the next acquirer's stale break, so the
+# release is chained in. It cannot change this script's exit status: bash runs the EXIT trap with
+# the pending status and only an explicit `exit` inside the trap overrides it.
+trap 'cleanup; l2_lock_release' EXIT
 
 # --- setup: the two ancestors the dev-team CR hangs beneath (06 §1.2 V-6) ----------------------
 # NOT a check. Applied platform-first, because the cluster-admin manifest is a child too and would be
@@ -279,7 +284,7 @@ if command -v python3 >/dev/null 2>&1; then
   # only symptom was "no identity file" below. Hence the rc capture — a renderer that fails must say
   # WHY, not leave the next reader to guess from an absent file. Mechanized in
   # dev/tests/cli-contract.py, which now fails L0 if any caller passes a flag no parser has.
-  render_err="$(agents/cluster-admin/skills/propose-developer-team/scripts/render_developer_team.py \
+  render_err="$(agents/cluster-admin/skills/provision-developer-team/scripts/render_developer_team.py \
       --cluster cluster-a --namespace team-x --project-id demo-proj --location us-central1 \
       --team-lead-chat-id users/1 --hub-inference-cidr 10.8.0.16/32 --hub-minty-cidr 10.8.0.32/32 \
       --mcp-cidrs 10.8.0.64/32 --repo-root "$TMP" 2>&1 >/dev/null)"; render_rc=$?

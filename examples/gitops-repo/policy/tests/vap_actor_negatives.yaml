@@ -15,8 +15,14 @@
 # is excluded from the actuation pipeline's apply paths; it is fixture input for the negative suite.
 #
 # Rule mapping (see vap-agent-readonly.yaml):
-#   docs 1-7 -> validation #3 (the actor allow-list)  message contains "actor RBAC may grant only"
-#   doc 8    -> validation #1 (read-verb allow-list)  message contains "read verbs"
+#   docs 1-6 -> validation #3 (the actor allow-list)  message contains "broker-operations grant"
+#   doc 7    -> validation #1 (read-verb allow-list)  message contains "agent RBAC may grant"
+#
+# There were eight docs until P9-T9b-5b-0-ii-b. The one that left — a tenant resource with READ verbs
+# only — is now vap_actor_positive.yaml's DOC 5, because validation 3 leads with a read disjunct and
+# admits it; that file's header carries the argument and what took over the bound. Nothing else here
+# moved: `*` as a VERB is not a read verb, an empty apiGroups list is still vacuity, and every write
+# below is still outside the grant.
 ---
 # DOC 1 — `update` on actionrecords. EXPECT: DENIED by validation #3.
 # The single most important negative in the file. 06 §2.2.1: "the broker appends to the journal and
@@ -69,24 +75,7 @@ rules:
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create"] # tenant write -> DENIED
 ---
-# DOC 4 — a tenant resource with READ verbs only. EXPECT: DENIED by validation #3.
-# The actor arm is an allow-list over (group, resource, verb) TRIPLES, not a write filter. An actor
-# identity is not a reader with extras: reading is the reader SA's job, and an actor Role that grants
-# `get secrets` widens the blast radius of the one credential in the system that can change things.
-# A carve-out written as "deny non-read verbs outside the grant" would admit this.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: vaptest-actor-tenant-read
-  namespace: team-x
-  labels:
-    kube-agents/role: actor
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch"] # read, but not in the grant -> DENIED
----
-# DOC 5 — wildcards. EXPECT: DENIED by validation #3.
+# DOC 4 — wildcards. EXPECT: DENIED by validation #3.
 # `*` is absent from the allow-list as a group, a resource and a verb, so the wildcard escape is
 # closed by construction rather than by a separate rule that could be forgotten. RBAC expands `*` at
 # evaluation time, not at admission time, so nothing downstream would have caught this.
@@ -101,7 +90,7 @@ rules:
     resources: ["*"] # -> DENIED
     verbs: ["*"] # -> DENIED
 ---
-# DOC 6 — nonResourceURLs. EXPECT: DENIED by validation #3.
+# DOC 5 — nonResourceURLs. EXPECT: DENIED by validation #3.
 # A rule with `nonResourceURLs` has no apiGroups and no resources, so a triple-based allow-list has
 # nothing to test and would vacuously admit it: `r.apiGroups.all(...)` over an empty list is TRUE in
 # CEL. That is why validation 3 leads with `!has(r.nonResourceURLs)` and requires all three lists to
@@ -117,11 +106,31 @@ rules:
   - nonResourceURLs: ["/healthz", "/metrics"] # -> DENIED
     verbs: ["get"]
 ---
-# DOC 7 — an empty apiGroups list. EXPECT: DENIED by validation #3.
-# The same vacuity, reached a different way: `apiGroups: []` with a real resource and verb. Without
-# the `size(...) > 0` guards this rule passes every `.all()` in validation 3 while granting nothing
-# today — and grants whatever a later mutation puts in the list, from an object that admission has
-# already blessed once.
+# DOC 6 — an empty apiGroups list. EXPECT: DENIED by structural schema validation.
+#
+# This document declared `DENIED by validation #3` until 2026-07-31, when it was submitted ALONE for
+# the first time and never reached the policy:
+#
+#   The Role "vaptest-actor-empty-groups" is invalid: rules[0].apiGroups: Required value:
+#   resource rules must supply at least one api group
+#
+# The reasoning it was written under is sound and unchanged — without the `size(...) > 0` guards, an
+# empty list passes every `.all()` in validation 3 while granting nothing today, and grants whatever
+# a later mutation puts in the list from an object admission has already blessed. What is false is
+# that a resource rule can BE that shape. RBAC's structural schema requires at least one entry in
+# each of `apiGroups`, `resources` and `verbs` (all three probed against the API server on the same
+# day), so the `.all()`-over-empty escape is unreachable on a resource rule regardless of the policy.
+#
+# It is kept, not deleted, and it is kept as a NEGATIVE. Three layers refuse this object — schema,
+# then policy, then RBAC — and the outermost one is doing the work; a document pinned to that fact
+# fails loudly if the schema ever relaxes, which is the only way the escape reopens. What it must
+# not do is keep claiming validation #3: the blob-form sweep read "the file was refused" and scored
+# this as a policy test for as long as it existed, which is the whole reason the per-document runner
+# (`dev/verify/vap-corpus-l2.sh`, V-CTN-012) was built.
+#
+# The vacuity class itself is still tested, and by a document that does reach admission: DOC 5's
+# `nonResourceURLs` rule, which the schema exempts from all three requirements and validation #3
+# refuses on its own.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -134,7 +143,7 @@ rules:
     resources: ["actionrecords"]
     verbs: ["create"]
 ---
-# DOC 8 — an UNLABELLED-role object with a write verb. EXPECT: DENIED by validation #1.
+# DOC 7 — an UNLABELLED-role object with a write verb. EXPECT: DENIED by validation #1.
 # The asymmetry check, and the reason the read-only arm is written `variables.isActor || …` rather
 # than gated on `role: reader`. An agent RBAC object that forgets its role label must stay under the
 # blanket write denial. If the arms were `role == 'reader'` and `role == 'actor'`, this object would

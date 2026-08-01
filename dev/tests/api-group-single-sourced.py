@@ -71,6 +71,22 @@ NON_GROUP_ATTRIBUTES = frozenset(
 # would be deleted within a week.
 SCANNED_SUFFIXES = {".go", ".yaml", ".yml", ".json", ".sh"}
 
+# Generated verbatim mirrors of spec prose. Same rationale as excluding markdown above — these are
+# quotations of docs/design, not facts the cluster acts on — but they carry a scanned suffix, so
+# the suffix rule cannot reach them.
+#
+# `verification/requirements.yaml` (V-MET-009) enumerates every normative statement in 01-08, and
+# 06 §8's observability table names eleven OTel attribute keys: `kubeagents.action_id`,
+# `kubeagents.risk_class`, and so on. The alternative — adding those eleven to
+# NON_GROUP_ATTRIBUTES — would be strictly worse: that set is closed on purpose, and widening it
+# would exempt those spellings in Go and YAML source too, where a typo in an attribute key is
+# exactly the silent defect the comment above describes. Excluding one generated file keeps the
+# closed set closed.
+#
+# An exact path, never a prefix: `verification/` will hold per-run manifests, and those are output
+# about the cluster rather than quotations of the spec.
+MIRRORED_SPEC_TEXT = frozenset({"verification/requirements.yaml"})
+
 # The minimum number of distinct files that must legitimately name the served group. Low enough not
 # to be a maintenance burden, high enough that a regex that stopped matching cannot pass.
 MIN_FILES_NAMING_THE_GROUP = 5
@@ -152,6 +168,8 @@ def main() -> int:
 
     for path in tracked_files():
         if path.suffix not in SCANNED_SUFFIXES or not path.is_file():
+            continue
+        if str(path.relative_to(REPO)) in MIRRORED_SPEC_TEXT:
             continue
         try:
             text = path.read_text()

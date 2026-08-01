@@ -24,6 +24,64 @@ found in this pass are ordering or scoping problems that would otherwise have su
 
 ## ▶️ RUNNING AGAIN, STILL OPEN — read this before resuming
 
+> **2026-07-31, the current state.** The **task ladder is finished** — 72 leaf units, 2 moved out of
+> the phase, 70 in-phase, all 70 done — and **the phase still cannot close.** `harness-milestone` was
+> invoked and stopped at its §1: **14 of the 55 required Phase 9 checks are asserted by nothing in
+> this tree**, 7 of them BLOCKING-ALWAYS. That is planning defect 4 arriving exactly as it predicted,
+> because its declared resolution ("`verify-phase9.sh` runs the ratchet, not the Accept list") was
+> written into the acceptance table and never into the script. The audit, the fourteen IDs and the
+> four units that close them are the last section of this file: **§ Milestone audit 2026-07-31**.
+> **`P9-T11a`, `P9-T11b-1` and `P9-T11a-2` are done (2026-07-31)** — the ratchet arm exists, and
+> deriving the requirement properly from 09 §10 rather than from the hand-written table restated the
+> gap against a denominator of **75**. `T11b-1` then took **V-ISO-001** and **V-ISO-002** green at L2
+> and, in doing so, found that the arm **under-counted green**: `parse_results` keyed on the raw
+> `check_id` cell, and **36 of the 160 rows in `results.csv` name more than one ID**, so every grouped
+> row was invisible to it — 10 IDs falsely reported unasserted, two of them `T11b-1`'s own, which is
+> why the fix was split out under Guardrail 9. `T11a-2` split the cell on the ID pattern and gave the
+> control the grouped-row cases it had never had: the arm now prints **28 not green / 12
+> BLOCKING-ALWAYS**, and that figure is the real worklist. **`P9-T11b-2` is done too** — V-ISO-006
+> green at L2, and not by the route the plan row described: binding arm B to the ID would have
+> recorded a green with CH6's recovery clause unasserted, so arm C was added and the arm now proves
+> the journal comes back without a broker restart. **`P9-T11a-3` is done** — researching `T11c` found
+> that all four of its check IDs carry 09 §6 Phase **10**, because the arm was reading §10's ratchet
+> table while ignoring §6's Phase column ("the roadmap phase _by which it must be green_") and
+> reading only ONE row of §10, though §10 opens _"once a suite enters the ratchet it never leaves"_.
+> Both halves are fixed and they pull opposite ways: 21 IDs out, **31 in**, ratchet 70 → **80**,
+> required 75 → **98**, and the gate got HARDER — **34 not green / 19 BLOCKING-ALWAYS**.
+> **`P9-T11c″` and `P9-T11c′` are done, in that order.** `T11c′` corrected this file's own
+> acceptance table, which demanded 16 IDs 09 §6 dates to phase 10, 14 or 15 — the required set is the
+> UNION of §10 and the table, so the table kept every one of them required. Retargeted, in their own
+> `##` section so the record and the requirement do not share a parse: required **98 → 82**, not
+> green **34 → 22**, BLOCKING-ALWAYS **19 → 11**. It also found two things nobody was looking for:
+> **17 of the 251 check IDs 09 mentions have no §6 catalog row** (three BLOCKING-ALWAYS), and **ten
+> required checks have no `results.csv` row at all**, nine BLOCKING-ALWAYS, every one of them a
+> phase-8 ratchet member — a phase that closed. It also broke the ratchet arm's negative control, so
+> it was reverted and **`T11c″` landed first**: three of the control's phase-filter cases picked
+> their victim from _"required but not named by the table"_ and went unstageable the moment the table
+> moved. A check split off under Guardrail 9 goes **before** the artifact that motivated it, not
+> after. **`P9-T11c‴` is done** — the other half of the same correction: the 43 IDs 09 §10 requires
+> at phase 9 that the table never named are now eight themed _(ratchet only)_ rows, property 4 is
+> silent, and the required set did not move (82 → 82) because nothing was added to the gate, the gate
+> was written down. **`P9-T11f` is done** — the 17 uncatalogued check IDs now have rows (a new 09
+> §6.15 for the fourteen V-CMP, three appended to the §8 V-MET table), and this time the required set
+> **did** move: **82 → 91** required, not green **22 → 26**, BLOCKING-ALWAYS not green **11 → 13** —
+> and the unit's own V-MET-010 run then closed one of the four it exposed, ending at **25 not green,
+> 12 BLOCKING-ALWAYS**. **`P9-T11g-1` is done** — and it found that `T11g`'s premise was wrong.
+> `T11g` was scheduled as _"eleven runs to record and two builds"_; auditing all thirteen showed
+> **one run and twelve builds**. Only V-MET-012 was implemented-and-unrecorded. `T11g-1` recorded it,
+> built the CRD-authority lint that closes **V-CTR-003 and V-CMP-011** together, and split the rest
+> into `T11g-2/3/4`: **25 → 22 not green, 12 → 11 BLOCKING-ALWAYS**. **`P9-T11g-2a` is done** — and
+> `T11g-2` split again, because its "one tool over `verification/traceability.yaml`" pointed at a
+> file that answers a different question — that one maps 01–08's **177 Verification bullets** and is
+> V-MET-011's, while 09 §8 asks for a mapping over **every normative statement**, ~538 of them, in an
+> `R-<doc>.<section>-<n>` ID space that has never been minted. `2a` built the link that _was_ a session's work:
+> `verification/implementations.yaml`, a curated `check-id → {runs, asserts_in}` registry, and the
+> V-MET-001 lint over it — which found V-CTR-001 green with nothing asserting it, two phase-12 rows
+> passing on spec citations rather than a command, and seven green checks whose implementation named
+> its own ID nowhere. **22 → 21 not green, 11 → 10 BLOCKING-ALWAYS**. **Resume at `harness-run`, unit
+> `P9-T11g-2b`** — V-MET-002/008/009, which need that requirement enumeration first. Then `T11g-3`,
+> `T11g-4`, `T11d`. Do not re-run `harness-milestone` until the T11 ladder is green. **Lifted 2026-08-01: the ladder IS green.** `T11g-4b` is done, `T11d` is dissolved into the `T11h` that delivered it, and `T11g-2b-ii-2b`'s tick had been left off a row its own body and `LEDGER.md` both called done. The stop-order outlived its three stale rows and, as written, forbade the operation it was pointing at.
+
 **Phase 9 is OPEN.** It was stopped here on 2026-07-30 by an explicit human instruction, after the
 unit `P9-T9b-5b-0-ii-a`, and **not** because the phase closed. The same person lifted the stop later
 the same day — _"run the harness until completion, start with the failed PR #83"_ — which also
@@ -48,15 +106,73 @@ An **improvement pass is due before the next unit**: `binding.md` §Thresholds s
 any halt is cleared"_. It has [[LSN-054]] and [[LSN-055]] queued, and LSN-054 is a correction to
 [[LSN-052]]'s proposed mechanization rather than an addition to it.
 
-**Resume at `P9-T9b-5b-0-ii-b`** — its section below states what it owes. In one sentence: three
-read-only per-tier actor templates carrying the READ half of 06 §2.2 ∪ §2.2.1 (profiles of 83 / 89 /
-68 triples against ceilings of 171 / 172 / 136), their bindings, and the
-`v in ['get', 'list', 'watch'] ||` disjunct in all three copies of `vap-agent-readonly` — as **one**
-unit, because 5b-0-i established that the render and the admission bound cannot be separated.
-Render **developer-team as a `Role`, never a `ClusterRole`**.
+**`P9-T9b-5b-0-ii-b` landed 2026-07-31** — the three read-only per-tier actor templates, their
+bindings, `render_actor_grant`, the wiring, and the `v in ['get', 'list', 'watch'] ||` disjunct in
+all three copies of `vap-agent-readonly`. V-BRK-013's tier arm now runs against the real tree rather
+than a synthetic, at the profiles 5b-0-ii-a computed a unit earlier (83 / 89 / 68 against ceilings of
+171 / 172 / 136), with developer-team a `Role` and never a `ClusterRole`. Its section is at the end
+of this file.
 
-V-BRK-013 is already green on both today's tree and the tree that unit will build, so its first run
-there is a real signal: if it goes red, the implementation is wrong, not the check ([[LSN-053]]).
+**`P9-T9b-5b-0-iii` landed 2026-07-31** — `dev/verify/broker-execute-l2.sh` is **10/10, rc 0,
+PROVEN**, and **V-BRK-006** (L2 clause) and **V-REV-001** (n=1) are scored `pass` in
+`verification/results.csv`. Its section is at the end of this file. It cost three defects that had
+been invisible for five phases; see [[LSN-060]] and [[LSN-061]].
+
+**`P9-T9b-5b-ii-a` landed 2026-07-31** — `dev/verify/broker-refuse-l2.sh` is **14/14, rc 0,
+PROVEN**: V-BRK-018 at L2 and the journal half of acceptance (d). `T9b-5b-ii` was split at SELECT
+into `ii-a` (the two refusals) and `ii-b` (V-REV-003 and V-BRK-021's surface scan); its section is
+at the end of this file.
+
+**`P9-T9b-5b-ii-b-1` landed 2026-07-31** — `dev/verify/broker-gate-l2.sh` is **16/16, rc 0,
+PROVEN** (negative control 39/39): **V-REV-003** at L2, the gated outcome neither the accepting line
+nor the refusing one can reach. `ii-b` was split at SELECT into `ii-b-1` (V-REV-003) and `ii-b-2`
+(V-BRK-021's surface scan **plus** the `verify-phase9.sh` §G retarget, which is a false pass today);
+its section is at the end of this file.
+
+**`P9-T9b-5b-ii-b-2` landed 2026-07-31** — `dev/verify/broker-auth-l2.sh` is **21/21, rc 0, PROVEN**
+(negative control 20/20): **V-BRK-021** at L2, the surface of the binary the controller handed out.
+Seven arms — nineteen non-routes 404, eight methods 405, three query parameters 400, all ten of
+`server.go`'s bypass headers 400 on an unauthenticated route with no token presented, the 200
+differential that makes those ten attributable to the headers, one reachable port of eight dialled,
+and the three-writer declared-port surface. The unit also closed `verify-phase9.sh` §G's V-BRK-021
+detector, **a false pass since it was written**: it discovered its claimant with
+`grep -l 'V-BRK-021' dev/verify/*-l2.sh`, and the tree's one match was `broker-refuse-l2.sh`'s
+comment saying it does _not_ carry the property. Its section is at the end of this file.
+
+**`P9-T9b-5c` landed 2026-07-31** — `dev/verify/actor-grant-sweep-l2.sh` is **13/13, rc 0, PROVEN**
+(negative control 16/16): **V-BRK-013** at L2, and with it Phase 9 acceptance bullet **(e)**. 647
+questions derived from 06 by the L0 check's own parser and asked of the live authorizer over all six
+labelled identities in three tiers — **204/204** grants held, **434/434** verbs refused, in one
+transcript, because a one-sided sweep passes perfectly against a fleet whose RBAC never applied. The
+`¬` is on the cluster: an **unlabelled** Role, invisible to both the L0 check and the VAP and fully
+effective, made A-4 and A-5 go red by name. Its section is at the end of this file.
+
+**`P9-T8b-4b-ii-2b-ii` was split at SELECT on 2026-07-31** into **`2b-ii-a`** (the derived soak
+corpus, L0) and **`2b-ii-b`** (the soak itself, V-REV-001 at L2); the split and its reasoning are in
+its own section at the end of this file. **`2b-ii-a` landed 2026-07-31** — `dev/verify/fixtures/soak_corpus.py`
+derives **37 envelopes** from the 181-case classifier corpus, filtered by what the shipped write
+overlay authorizes, `--self-test` **17/17** and a new L0 chain line; V-REV-001's denominator is no
+longer 1. **`2b-ii-b` landed 2026-07-31** — `dev/verify/undo-coverage-l2.sh` submits all 37 envelopes
+through the broker's real front door and scores **V-REV-001 at 35/35 = 100% across 3 verbs**, `¬`
+**17/17**, one new line in each chain. **`P9-T9c` was appended 2026-07-31** by the
+ORIENT drain of `BACKLOG.md` B-006 — 06 §4.4 row 3's auto-pause has no consumer; its section is at
+the end of this file. **`P9-T9c` was split at IMPLEMENT on 2026-07-31** into **`-1`** (the row-3
+auto-pause consumer) and **`-2`** (a writer for `status.broker.journalReachable`), because only the
+first had a seam to wire — see its section. **`-1` landed 2026-07-31**: the refusal that row 3
+produces now carries its own `AutoPause` to the HTTP boundary, where it is recorded on the refusal's
+own `ActionRecord` through the same `escalate.Recorder.Pause` seam row 9 uses; 4/4 mutants caught.
+**`-2` landed 2026-07-31**: `status.broker.journalReachable` is now written by the operator — the
+only principal that may, since no broker grant reaches `agents/status` — from three conjoined
+observations against the etcd 05 §1.2 puts the journal in, refreshed on a 60 s clock because the
+field has no watch behind it; 8/8 mutants caught. B-006 is closed on both halves.
+`P9-T9c` was the last task in the ladder as planned — and the ladder was not the whole phase.
+`harness-milestone` ran, stopped at §1, and opened **`P9-T11a`–`d`**; `T11a`, `T11b-1`, `T11a-2`,
+`T11b-2`, `T11a-3`, `T11c″`, `T11c′`, `T11c‴`, `T11f`, `T11g-1` and `T11g-2a` all closed the same
+day, and `T11c′` opened four more — `T11c″` (which it then had to wait for), `T11c‴`, `T11f` and
+`T11g`. `T11g` then split at ORIENT into `T11g-1`–`-4`, because its audit found twelve builds where
+the row had promised eleven runs, and `T11g-2` split again at IMPLEMENT into `-2a`/`-2b`, because it
+was scheduled over three artifacts that do not exist. **Resume at `harness-run`, unit `P9-T11g-2b`**
+(§ Milestone audit 2026-07-31, at the end of this file).
 
 The full resume point, including what comes after 5b-0-ii-b, is in the Current task cell of
 [`LEDGER.md`](LEDGER.md).
@@ -254,28 +370,119 @@ Two smaller notes in the same family:
 
 ## Acceptance → check binding (07 §2 "Accept", plus the 09 §10 ratchet)
 
-Every bullet binds to at least one check ID. No bullet is unbound. The last four rows are ratchet
-obligations with no corresponding Accept bullet — see planning defect 4.
+Every bullet binds to at least one check ID. No bullet is unbound. The rows below the Accept bullets
+are ratchet obligations with no corresponding Accept bullet — see planning defect 4.
 
-| Accept                                                                                                            | Check IDs                                                                   | Level      | Target                          |
-| ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ---------- | ------------------------------- |
-| **(a)** an envelope flows end-to-end in shadow mode → well-formed `ActionRecord` + valid undo plan                | V-CTR-005, V-REV-001, V-REV-004, V-BRK-015, V-GAT-019                       | L1, L2     | dev                             |
-| **(b)** classifier matches the fixture corpus (all four classes); `ChangePolicy` tightens, provably cannot loosen | V-GAT-001, V-GAT-002, V-GAT-009, V-GAT-010, V-GAT-017, V-GAT-021, V-GAT-022 | L0, L1, L2 | dev                             |
-| **(c)** an envelope claiming a scope other than the caller's is rejected                                          | **V-BRK-002**, V-BRK-007, V-BRK-008, V-BRK-009, V-BRK-010, V-BRK-017        | L1, L2     | dev                             |
-| **(d)** `pause`/`freeze` work with inference down; broker refuses when the journal is unavailable                 | **V-BRK-005**, V-RUN-007, V-RUN-008, V-RUN-012, V-RUN-013, **V-ISO-006**    | L0, L2     | dev                             |
-| **(e)** no agent identity in the fleet holds a write verb — full `auth can-i` sweep                               | V-CTN-004, **V-BRK-013**, V-BRK-001, V-BRK-012                              | L0, L2     | dev + live (sweep is read-only) |
-| _(ratchet only)_ the workload pair, its identities, labels, hardening, ordering                                   | V-RUN-001…006, V-RUN-009, V-RUN-010, V-RUN-011, V-RUN-014                   | L0, L2     | dev                             |
-| _(ratchet only)_ journal integrity, write-ahead, pipeline order and non-skippability                              | V-BRK-003, V-BRK-004, V-BRK-006, V-BRK-011, V-BRK-014, V-BRK-016, V-BRK-021 | L0, L1, L2 | dev (+ overlay)                 |
-| _(ratchet only)_ reversibility beyond coverage: correctness, attribution, rollback, retention                     | V-REV-002, V-REV-003, V-REV-005, V-REV-006, V-REV-007, V-REV-008, V-REV-009 | L1, L2     | dev (+ overlay)                 |
-| _(ratchet only)_ failure isolation with the pair deployed                                                         | **V-ISO-001**, **V-ISO-002**                                                | L2         | dev                             |
-| _(carried, not ratchet)_ the inter-agent credential seam                                                          | **V-CMP-006**                                                               | L0, L2, L3 | dev + live                      |
+**Corrected 2026-07-31, in three units, against 09 §6's Phase column.** The table's first draft was
+wrong in both directions: it named sixteen IDs that 09 §6 dates to phase 10, 14 or 15, and it omitted
+forty-three that 09 §10 requires at phase 9. Neither was visible while the required set was a hand
+list. `P9-T11c′` removed the sixteen; **`P9-T11c‴` added the forty-three, and the table is now
+complete** — `dev/tests/phase-ratchet-is-asserted.py --phase 9` reports property 4 silent, and the
+required set did not move (82 before, 82 after), because every one of the forty-three was already in
+the ratchet and only the phase file's own account of it was short. The reason the two halves are two
+units is in [_P9-T11c′_](#p9-t11c--the-sixteen-that-were-not-phase-9s--2026-07-31-) below.
+
+**Then `P9-T11f` moved it, and moving it was the point.** Giving 09 §6 a catalog row for the
+seventeen IDs it defined only in prose put ten of them into the suite expansion, and the two rows
+this table needed to stay complete are the measurement row (now `V-MET-001…014`) and a new
+completeness row. The gate got **bigger**: required **82 → 91**, not green **22 → 26**, of those
+BLOCKING-ALWAYS **11 → 13** — then the unit recorded its own V-MET-010 run and it closed at **25 not
+green, 12 BLOCKING-ALWAYS**. Unlike `P9-T11c‴`, where an unmoved required set was the evidence the
+unit was bookkeeping, here the movement **is** the result — four checks that a phase-9 gate could
+not previously fail on are now checks it can, and V-CMP-011 and V-CMP-020 are the two of them with
+no implementation at all. `P9-T11f`'s own section is
+[below](#p9-t11f--the-seventeen-09-defined-only-in-prose--2026-07-31-).
+
+The sixteen are recorded, individually and with their due phase, in
+[_Retargeted out of Phase 9_](#retargeted-out-of-phase-9-by-09-6) immediately below; they are named
+**there and not here** deliberately, because `dev/tests/phase-ratchet-is-asserted.py` reads every
+check ID in **this section** as one the phase requires, and an ID mentioned in a paragraph about its
+own postponement would go on being demanded by the paragraph ([[LSN-019]]'s shape, and the same trap
+`P9-T11a` fell into once already). Removing them does not unbind a single Accept bullet: (a), (b),
+(d) and (e) each keep three or more checks.
+
+| Accept                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Check IDs                                                                                                               | Level      | Target                          |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------- |
+| **(a)** an envelope flows end-to-end in shadow mode → well-formed `ActionRecord` + valid undo plan                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | V-CTR-005, V-REV-001, V-REV-004, V-BRK-015                                                                              | L1, L2     | dev                             |
+| **(b)** classifier matches the fixture corpus (all four classes); `ChangePolicy` tightens, provably cannot loosen                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | V-GAT-001, V-GAT-002, V-GAT-009, V-GAT-010, V-GAT-017                                                                   | L0, L1, L2 | dev                             |
+| **(c)** an envelope claiming a scope other than the caller's is rejected                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | **V-BRK-002**, V-BRK-007, V-BRK-008, V-BRK-009, V-BRK-010, V-BRK-017                                                    | L1, L2     | dev                             |
+| **(d)** `pause`/`freeze` work with inference down; broker refuses when the journal is unavailable                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | **V-BRK-005**, V-RUN-007, V-RUN-008, V-RUN-012, **V-ISO-006**                                                           | L0, L2     | dev                             |
+| **(e)** no agent identity in the fleet holds a write verb — full `auth can-i` sweep                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | **V-CTN-004**, **V-BRK-013**, V-BRK-012                                                                                 | L0, L2     | dev + live (sweep is read-only) |
+| _(ratchet only)_ the workload pair, its identities, labels, hardening, ordering                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | V-RUN-001…005, V-RUN-009, V-RUN-010, V-RUN-011                                                                          | L0, L2     | dev                             |
+| _(ratchet only)_ journal integrity, write-ahead, pipeline order and non-skippability                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | **V-BRK-006**, **V-BRK-011**, **V-BRK-014**, **V-BRK-021**                                                              | L0, L1, L2 | dev (+ overlay)                 |
+| _(ratchet only)_ reversibility beyond coverage: undo-plan correctness                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | **V-REV-003**                                                                                                           | L1, L2     | dev (+ overlay)                 |
+| _(ratchet only)_ failure isolation with the pair deployed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | **V-ISO-001**, **V-ISO-002**                                                                                            | L2         | dev                             |
+| _(ratchet only)_ the broker pipeline's own properties: every verb of the closed enum end to end, write-ahead as a read rather than a flag, novelty that cannot be switched off by omission, shadow mode that actually shadows, an identity resolved live, and the binary that ships being the one that was tested                                                                                                                                                                                                                                                                                                        | **V-BRK-022**, **V-BRK-023**, **V-BRK-024**, **V-BRK-025**, **V-BRK-026**, **V-BRK-027**                                | L1         | dev                             |
+| _(ratchet only)_ the agent↔broker seam: the idempotency key the agent computes, the single write path it is given, the identity it is told it will assume, and the keys a closed decoder accepts                                                                                                                                                                                                                                                                                                                                                                                                                         | **V-BRK-028**, **V-BRK-029**, **V-BRK-030**, **V-BRK-032**                                                              | L0, L1     | tree + dev                      |
+| _(ratchet only)_ refusal beats partial work: a permission boundary answers instead of crashing, and a snapshot-persist failure applies neither target                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | **V-BRK-018**, **V-BRK-031**                                                                                            | L1, L2     | dev                             |
+| _(ratchet only)_ reversibility beyond the undo plan: a `recreate` downgrade decided from live cluster state, and a rollback that replays the pre-state or refuses                                                                                                                                                                                                                                                                                                                                                                                                                                                        | **V-REV-010**, **V-REV-011**                                                                                            | L1, L2     | dev                             |
+| _(ratchet only)_ containment, carried in by 09 §10's phase-8 row: tier-scoped reads, attenuation, `(tier, scope)` cardinality, developer-team placement, a controller that mints no RBAC, and egress default-deny under Workload Identity                                                                                                                                                                                                                                                                                                                                                                                | **V-CTN-001**, **V-CTN-012**, **V-CTN-015**, **V-CTN-016**, **V-CTN-017**, **V-CTN-020**                                | L0, L2, L3 | dev + live                      |
+| _(ratchet only)_ a test-only RBAC grant never leaves `dev/`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | **V-CTN-037**                                                                                                           | L0         | tree                            |
+| _(ratchet only)_ the CRD contract and the brake: shipped CRs validate and re-apply clean, V-1…V-10 each carry a field-path negative, no authority fields in the schema, the `ActionRecord` lifecycle, the brake fail-closed on an unreadable `FleetFreeze`, 06 §4.4's nine rules as one decision function that refuses on absent input, `C-UC`'s preconditions as one shared predicate, an input source that tells the truth about what it could not read, row 7 asked about the action, no `*_ALLOW_ALL_USERS` escape hatch anywhere in the tree, and an `apply-change` skill that describes the write path that exists | V-CTR-001, V-CTR-002, V-CTR-003, V-CTR-006, V-CTR-007, V-CTR-014, V-CTR-015, V-CTR-016, V-CTR-017, V-CTR-018, V-CTR-020 | L0, L1, L2 | tree + dev                      |
+| _(ratchet only)_ the measurement suite — the checks that keep the other checks honest: ID coverage both ways, the traceability matrix in both directions, the two inventories that define "complete", the coverage and assertion ratchets, no reuse or renumbering, classifier/corpus sync, deferrals that name a blocker, no silently-skipped BLOCKING-ALWAYS run, the uncovered list published, the gated-rule set defined once, and negative-control discipline                                                                                                                                                       | **V-MET-001…014**                                                                                                       | L0         | tree                            |
+| _(ratchet only)_ completeness, carried in by 09 §10's phase-8 row: every first-party image published, no placeholder in an applied manifest, no authority field in the CRD schema, each tier's skill set exactly its own, every identity the broker names created by the install path, and an overlay that renders the install it claims to                                                                                                                                                                                                                                                                              | V-CMP-002, V-CMP-003, V-CMP-006, V-CMP-007, V-CMP-008, V-CMP-011, V-CMP-020                                             | L0, L2, L3 | tree + dev + live               |
+| _(ratchet only)_ the rows **this phase's own coverage draw-down added** to 09 §6, each dated phase 9 and therefore required here: authority never precedes machinery, the developer-team tier has no cloud actor identity, the two path dialects are never interchangeable, a secret digest cannot leave the broker's `classify` package, and the settle windows are the published ones. They reach the required set through 09 §10's suite names exactly as every other row does — naming them here is what keeps property 4 silent as the catalog grows                                                                | **V-CTN-038**, **V-CTN-039**, V-CTR-021, V-GAT-024, **V-REV-012**                                                       | L0         | tree                            |
 
 "dev" is `gke-scratch-kube-agents-dev` — the only destructive-test target. "live" is
 `platform-agent-host`, verification only. "overlay" is the test-only tenant grant of planning
-defect 2, applied and torn down inside one L2 script.
+defect 2, applied and torn down inside one L2 script. "tree" is a check whose whole property is a
+statement about the repository, provable at L0 with no cluster.
 
-V-BRK, V-REV and V-ISO are **BLOCKING-ALWAYS**: not one of the rows above may close as `deferred`.
-V-GAT and V-RUN are BLOCKING-PHASE and gate the milestone.
+V-CTN, V-BRK, V-REV, V-ISO, V-ADV and V-MET are **BLOCKING-ALWAYS**: not one of their rows may close
+as `deferred` (09 §9.6). V-GAT, V-RUN, V-CTR and V-CMP are BLOCKING-PHASE and gate the milestone.
+
+**The required set: 96.** `dev/tests/phase-ratchet-is-asserted.py --phase 9` derives it as 95 (09
+§10, every row ≤ 9, each suite expanded against §6 and filtered by its member's own due date) ∪ 96
+(this table). Exactly one ID comes from the table alone: **V-GAT-002**, which Accept (b) binds and
+which no §10 suite name reaches at phase 9. It moved 91 → 96 on 2026-07-31, when the coverage
+draw-down of `P9-T11g-2b-ii-2c` added five phase-9 rows to 09 §6 and property 4 caught all five
+before they could be required by the ratchet and named nowhere. **The table no longer under-names
+the ratchet**:
+property 4 is silent, and the union is now the table plus nothing, which is the state planning
+defect 4 asked for — a phase file that names every obligation it is closed against, rather than one
+that names the subset 07 chose to call "Accept".
+
+---
+
+## Retargeted out of Phase 9 by 09 §6
+
+Sixteen IDs the first draft of the table demanded at phase 9 that 09 §6's Phase column dates later.
+They are **not** dropped, weakened, retired or deferred: each keeps its ID, its level, its suite and
+its BLOCKING-ALWAYS class, and each is required at the phase named. This section sits outside the
+acceptance table on purpose — see the note above it.
+
+| Due | Check IDs                                             | Came from                         |
+| --- | ----------------------------------------------------- | --------------------------------- |
+| 10  | V-GAT-019                                             | Accept (a)                        |
+| 10  | V-GAT-021, V-GAT-022                                  | Accept (b)                        |
+| 10  | V-RUN-013                                             | Accept (d)                        |
+| 10  | V-BRK-001                                             | Accept (e)                        |
+| 10  | V-RUN-006                                             | the workload-pair ratchet row     |
+| 10  | V-BRK-003, V-BRK-004, V-BRK-016                       | the journal-integrity ratchet row |
+| 10  | V-REV-002, V-REV-005, V-REV-006, V-REV-007, V-REV-009 | the reversibility ratchet row     |
+| 14  | V-REV-008                                             | the reversibility ratchet row     |
+| 15  | V-RUN-014                                             | the workload-pair ratchet row     |
+
+Ten of the sixteen are BLOCKING-ALWAYS, which is why the retarget is a spec reading and not a
+judgement call: **09 §6's own preamble** calls each row's last cell _"the roadmap phase by which it
+must be green"_, and 09 §10 opens _"Once a suite enters the ratchet it never leaves"_ — the two
+sentences only cohere if a §10 suite name contributes the members §6 dates at or before the phase.
+`P9-T11a-3` confirmed that reading three independent ways before acting on it; the working is in
+[_P9-T11a-3_](#p9-t11a-3--the-column-the-ratchet-was-not-reading--2026-07-31-) above.
+
+**Four of the sixteen are already green** — V-GAT-021, V-GAT-022, V-REV-006, V-REV-008 — and a green
+row is never un-recorded by a retarget: it satisfies the later phase in advance. The other twelve
+become **Phase 10's** opening worklist (V-RUN-014 Phase 15's), recorded here rather than left to be
+rediscovered. Eight of those twelve are BLOCKING-ALWAYS: V-BRK-001, V-BRK-003, V-BRK-004, V-BRK-016,
+V-REV-002, V-REV-005, V-REV-007, V-REV-009.
+
+**This is the one edit in the T11 ladder that makes the gate smaller, so it is stated plainly rather
+than buried.** Required goes 98 → 82, not green 34 → 22, BLOCKING-ALWAYS not green 19 → 11. Set
+against the figures the ladder started from — 75 required, 27 not green, 11 BLOCKING-ALWAYS — the
+required set is still **larger** than the hand list it replaced, and the BLOCKING-ALWAYS worklist is
+the same size with **different members**: T11a-3's accumulation of the phase-1–8 §10 rows added
+V-CTN-001/012/015/016/017 and V-MET-001/002/008/009, and this correction removed the eight above.
+The count being unchanged is a coincidence of arithmetic; the worklist is not the same worklist.
 
 ---
 
@@ -2331,7 +2538,7 @@ the individual P8 suites. T9 must decide whether `verify-phase9.sh` becomes a li
 standing-regression line. The P1 narrowing at `L2-CHAIN:38-51` exempts the four Phase-9 client-side
 probes in writing, each naming **`broker-execute-l2.sh` as the successor that needs P1 in full**.
 
-**None of the five deliverables exist**, and `dev/verify/fixtures/` does not exist as a directory.
+**None of the five deliverables exist**, and on 2026-07-29 `dev/verify/fixtures/` did not exist as a directory. Both halves were true when written and neither is now — the directory arrived 2026-07-30 with the client-side probes.
 
 ---
 
@@ -2465,6 +2672,58 @@ if the same envelope succeeds when the journal is there, and 5b-ii's fixture is 
 one thing broken.
 
 **The denominator moves by one more.**
+
+---
+
+### P9-T9c — the auto-pause 06 §4.4 row 3 promises and nobody performs
+
+**Scheduled 2026-07-31 at ORIENT from [`BACKLOG.md`](BACKLOG.md) **B-006**.** Appended to the end of
+the Phase 9 ladder rather than inserted, so it displaces nothing: `5b-ii-b` → `5c` →
+`T8b-4b-ii-2b-ii` → **`T9c`** → `harness-milestone`.
+
+**What is wrong.** `broker-refuse-l2.sh` proved the journal-unavailable refusal live on 2026-07-31 —
+503, `reason: journal-unavailable`, zero `ActionRecord`s over 20 s, no object applied. That is the
+refusal half of 06 §4.4 row 3 and it is real. The **pause** half is not. `internal/broker/brake.go`
+sets `AutoPause: true` on the row-3 decision (`:456` and `:547`) and the reply the caller receives
+says _"and the agent is being paused"_ — but nothing in `internal/broker/pipeline/`, `server.go` or
+`cmd/broker/` reads the field, and `status.broker.journalReachable` has no writer
+(`agent_controller.go:402`). An agent whose journal has failed therefore keeps being asked and keeps
+refusing, one submission at a time, with no fleet-level signal that it has gone dark.
+
+**Why this is a gap and not unbuilt scope.** Row 9's auto-pause **is** wired —
+`internal/broker/verify/driver.go:400` calls `escalate.Recorder.Pause`. The mechanism exists and one
+of its two callers was never connected.
+
+**What to build.** Consume `AutoPause` on the row-3 path through the same `escalate.Recorder.Pause`
+seam row 9 uses, and give `status.broker.journalReachable` a writer. Do not change the refusal: the
+503 and its `retryAfterSeconds` are proven and are what keeps this fail-closed today.
+
+**Split into `-1` and `-2` at IMPLEMENT on 2026-07-31** (`harness-run` §2 sizing). The two halves
+looked like one task and are not: the pause has a seam (`escalate.Recorder`, already built and
+already driven by row 9) and needed wiring, while `journalReachable` has no transport at all. The
+broker cannot write `Agent` status — 06 §2.2.1 gives it `get, list, watch` on `agents` — and the one
+principal that can, `agent_controller`, rebuilds `BrokerStatus` from scratch on every reconcile and
+says in its own comment that it cannot observe the value. That is a design question, not a wiring
+job, and pinning it to the same unit as the wiring would have bought a worse answer to it.
+
+- **`-1` — the row-3 auto-pause consumer.** Done, below.
+- **`-2` — a writer for `status.broker.journalReachable`.** The open question, stated so `-2` does
+  not rediscover it: what carries "the journal is unreachable" from the only process that can
+  observe it to the only principal that can write it, given that the journal itself is the surface
+  that is down? A broker answering "yes" over HTTP proves nothing about its own writes (the
+  controller's comment); a broker answering "no" is an admission against interest and is credible.
+  A fail-closed zero and a probe that can only lower the value is one shape worth costing.
+
+**Verification is bound at the improvement pass, not here.** 09 has no check ID covering row 3's
+pause. Adding one edits the conformance spec, which `harness-improve` §5 makes a pass's work rather
+than a unit's, so this task is written against a spec sentence (06 §4.4 row 3) and B-006's check
+question travels separately. Recorded here so that P9-T9c's PLAN does not rediscover it.
+
+**Severity, classified at the drain: not a live security regression.** The absent behaviour fails
+open in availability terms and closed in safety terms — nothing executes, every submission is
+already refused. What is lost is observability and the truthfulness of the caller-facing message. It
+lands in Phase 9 rather than Phase 10 because the brake is P9-T6 and this phase's whole thesis is
+landing the safety machinery while the worst possible bug is still a no-op.
 
 ---
 
@@ -4515,3 +4774,3765 @@ survivor — compiles rather than runs, so it lists those six either way and sta
 - **[[LSN-055]]** — twenty-five CHECKPOINT commits, one push, one CI run, and the red belonged to a
   commit twenty back. Also establishes that LSN-052's candidate 2 (a push trigger on non-`main`
   branches) is necessary but **insufficient**: a trigger nothing triggers is still one run.
+
+---
+
+### P9-T9b-5b-0-ii-b — the read half is rendered, and admission is widened to admit it
+
+The other half of the split 5b-0-ii-a forced. That unit taught **V-BRK-013** the two shapes; this one
+builds the tree the second shape describes: three per-tier actor grants carrying the READ half of
+06 §2.2 joined with §2.2.1, their bindings, the renderer, the wiring, and the
+`v in ['get', 'list', 'watch'] ||` disjunct in all three copies of `vap-agent-readonly`. One unit,
+because either half alone is a red check — the render without the disjunct is an object no cluster
+would accept, and the disjunct without the render widens a policy nothing exercises.
+
+#### Three templates, and why they are not three copies of one shape
+
+Property 4 of V-BRK-013 holds the **union of a tier's objects** to that tier's profile, and validation
+2 of `vap-agent-readonly` denies a `ClusterRole` labelled `kube-agents/tier: developer-team`. Those
+two facts together fix the shape, and it is not uniform:
+
+| tier             | objects                                                                 | why                                                                                                                                                                                                                                                                                                   |
+| ---------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `developer-team` | one namespaced `Role` + `RoleBinding`, 89 triples                       | a namespace-scoped tier may not own a ClusterRole. Its three cluster-scoped grant rules are written out **inert** — a `Role` cannot grant `tokenreviews` — so the tier's union still equals its profile, and the tier-neutral `kubeagents-broker-operations` ClusterRole is what grants them for real |
+| `cluster-admin`  | `ClusterRole` (83 − journal) + `Role` (journal, roster) + both bindings | binding one per-tier ClusterRole cluster-wide would grant `create actionrecords` in **every** namespace, which is the fleet-wide-writer shape `agent-identity.yaml.template` already forbids and V-BRK-012 catches one layer down                                                                     |
+| `platform`       | same two-object split, 68 triples                                       | as above                                                                                                                                                                                                                                                                                              |
+
+Arithmetic, hand-checked against 06 §2.2 before anything was written and then confirmed by the check:
+developer-team 69 read + 20 grant = **89**; cluster-admin 69 + 20 − 6 overlap = **83**; platform
+54 + 20 − 6 = **68**. Exactly the numbers 5b-0-ii-a's profile computation printed a unit earlier.
+
+#### "Retire the shared pair" turned out to mean retiring one half of it
+
+The plan said retire the shared pair. Only the **namespaced** `Role kubeagents-broker-operations`
+could go: every triple of it now lands in a per-tier `Role`, stamped, and an unstamped shared object
+belongs to every tier and is therefore evidence for none of them under property 4. The **ClusterRole**
+survives, and the argument is written into its header rather than left implicit — `developer-team`
+cannot own a cluster-scoped object, so its `tokenreviews`, `fleetfreezes` and `changepolicies` can
+only come from an object wearing no tier label at all, and 06 §4.4 says a tier that cannot read
+`fleetfreezes` fails closed permanently. Dropping it would not be a narrowing; it would brick a tier.
+
+#### V-CMP-007 chose the renderer's shape
+
+`render_actor_grant <tier> <namespace> <leaf>` selects its template with a `case` over three
+**literal** filenames rather than interpolating `actor-grant-${tier}.yaml.template`. That is not
+style: V-CMP-007 property 1 requires every `*.yaml.template` basename under `k8s-operator/scripts/`
+to appear literally in text the install path executes, and a dynamic path would have made all three
+new templates read as files nothing renders — an install-path hole with a green check over it.
+
+`apply_agent_identity` now applies three streams in order (shared grant → tier grant → identity) in
+both its dry-run and live arms; `delete_agent_identity` removes all four new per-tier objects, whose
+names are a pure function of tier and leaf and would otherwise be inherited by the next install under
+the same name. `dev/lib/agent-fixtures.sh` renders the tier grant too — without it an L2 fixture would
+lose the journal `Role` entirely and the broker would fail step 11 with a 403 that looks like a bug in
+the broker.
+
+#### What the disjunct gave up, and what still holds
+
+Validation 3 now admits any read verb. 03 §4.3's obligation table assigns `vap-agent-scope` only
+_write_ obligations for actors, which is what licenses it; the read half is bounded instead by
+V-BRK-013's per-tier union equality, and by P10-T1 moving that bound into the cluster. One thing is
+genuinely conceded: a wildcard **group or resource** carrying only read verbs now passes admission,
+which 06 §2.2's platform template requires. A wildcard **verb** does not — `*` is not a read verb and
+no triple in the allow-list ends in `:*`.
+
+One negative fixture became a positive. `vap_actor_negatives.yaml` DOC 4 (`secrets` get/list/watch on
+an actor Role) asserted that the actor arm is a triple allow-list and not a write filter. That was
+right about the policy and wrong about the spec it enforces, so it moved to `vap_actor_positive.yaml`
+as DOC 5, with the flip and its replacement bound argued in the header rather than deleted — reverting
+the disjunct now fails a fixture that says which side of the change came back. The remaining docs
+renumber 5–8 → 4–7; none of them changes verdict.
+
+#### The far side of the two-trees discipline
+
+5b-0-ii-a committed negative-control rows that **synthesised** the tree this unit would build
+([[LSN-053]]). Landing it inverts them, and the inversion is where the interesting failure was: two
+rows scored `caught` for the wrong reason and one stopped firing entirely, because property 4 measures
+a **union** and a lamed synthetic beside a correct shipped template is still a complete union. Both
+missing-rule rows now perturb `actor-grant-platform.yaml.template` itself. The synthesis helper stays
+for the rows that need a **wrongly** rendered object — the whole template, a rule outside it, a
+mis-stamped tier, a namespace-scoped tier as a ClusterRole — since the shipped tree deliberately
+contains none of those. Row count unchanged at 20, no signal relaxed, and the two rows that existed
+only to describe the future tree became reachable regressions: the disjunct reverted in every copy,
+and the disjunct reverted in **one** copy while the others stay widened.
+
+#### What ran
+
+| Artifact                                           | Result                                                                                                                                        |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `actor-grant-single-sourced.py`                    | PASS — tier-stamped actor objects present for **all three** tiers, each union exactly its profile (83 / 89 / 68), 3 VAP copies `read-widened` |
+| `actor-grant-single-sourced.py --negative-control` | PASS — **20/20**, each caught by the property it targets                                                                                      |
+| `identity-has-install-path.py` (+ control)         | PASS — every roleRef resolves, 15 manifest-emitting functions reachable; **8/8** controls fire                                                |
+| `render_actor_grant` smoke                         | all three tiers render, names derived, no unsubstituted `${…}`, unknown tier exits non-zero                                                   |
+| full `dev/L0-CHAIN.txt`                            | clean (274 lines)                                                                                                                             |
+| `make -C k8s-operator test`                        | green, every package; `internal/controller` 127.0s                                                                                            |
+| `make validate`, shellcheck, prettier              | clean over the whole `origin/main...HEAD` set                                                                                                 |
+
+#### Verdicts
+
+| ID            | Level | Verdict | Note                                                                          |
+| ------------- | ----- | ------- | ----------------------------------------------------------------------------- |
+| **V-BRK-013** | L0    | `pass`  | the tier arm now runs against the real tree, not a synthetic; 20/20 control   |
+| **V-CMP-007** | L0    | `pass`  | three new templates on the install path, every roleRef resolving; 8/8 control |
+
+Now unblocked and owed by **5b-0-iii** (L2): **V-BRK-006** and **V-REV-001**. `broker-execute-l2.sh`
+stopped at step 3 because the platform actor could not list Secrets; it can now, on a cluster
+provisioned from this tree.
+
+---
+
+## P9-T9b-5b-0-iii — the L2 arm, and the three defects standing behind it
+
+**Landed 2026-07-31.** Commits `0fbe744`, `ce87423`. Branch `phase-9-actor-read-half`.
+
+### What was asked, and what it turned out to require
+
+The unit was one line of the ledger: re-run `broker-execute-l2.sh` past step 3 and score V-BRK-006
+and V-REV-001. Step 3 was indeed unblocked by 5b-0-ii-b's read grant. Four separate things then had
+to be true before the suite could return a verdict about the broker rather than about itself.
+
+**1 — Step 11 returned HTTP 500: `cannot update resource "actionrecords"`.** Diagnosed as an
+implementation defect and explicitly **not** a §8.5 spec contradiction. 06 §2.2.1 grants the broker
+`actionrecords get list watch create` plus `actionrecords/status get update patch`, and withholds
+`update` and `delete` on the resource itself deliberately — "the broker appends and advances
+`status`; it can never rewrite or remove a record". `journal.SetPhase` syncs a derived label index
+alongside the authoritative `status.phase`, and its own comment already promised that sync was
+best-effort. The code returned the error. So every terminal transition the broker took reported a
+500 for an action that had **already executed and already been journaled** — a false negative in the
+audit trail. Fixed by tolerating `IsForbidden` narrowly (a `Conflict` or a 500 is still returned);
+`JournalReconciler.repairStatusLabel` runs in the operator, which holds `update`, and repairs the
+index on the next reconcile. Confirmed live: the record read back with the label repaired.
+
+**2 — L2-1 could not have passed against any commit.** It asked the API server for the record by raw
+action id; object names are `journal.RecordName` = `"ar-" + lower(actionID)` (06 §4.3). The arm had
+never been measured, because the only thing exercising it was `--negative-control`, which synthesises
+the record document. Judged **not** a Guardrail 9 violation and argued in the ledger's decisions
+table: no implementation of this unit motivated the change, the arm could not have passed against any
+tree, and the fix makes an inoperative arm operative — the assertion count rises and nothing narrows.
+[[LSN-060]].
+
+**3 — `status.timestamps` had three readers and no writer.** Declared since Phase 5; read by
+`budget.go`'s window, `cooldown.go`'s `(verified, submitted)` pair and
+`JournalReconciler.exportLateness`'s four-way fallback, all of which degrade silently. V-BRK-006's L2
+clause compares `metadata.creationTimestamp` against `status.timestamps.executionStarted`, so its
+evidence had never existed. The pipeline now stamps five beats: `submitted` and `classified` on the
+write-ahead Create, `classified` taken at the **end** of step 4 so a submission refused as
+`forbidden` never claims it was classified; `executionStarted`, `executionEnded` and `verified` off
+the wall clock and never off `s.at`, which is frozen before step 3 and would fabricate a violation.
+`approved` stays nil — it belongs to the ChatOps gateway SA.
+
+**4 — and none of it would have reached etcd.** `SetPhase` re-read the record and wrote the _live_
+copy, discarding `status.applied`, `status.verification`, `status.recovery` and the clock; and
+`Store.Create` restored only `status.phase` after the API server's subresource drop, so the birth
+beats were never durable **and** the caller's copy came back nil — which panicked the broker at step
+8 on the first live run, between "the journal says `Executing`" and "anything has executed".
+`mergeOwnedStatus` carries exactly the six fields 06 §4.3 assigns the owning broker SA, nil-guarded
+per field, used by both `Create` (snapshotted _before_ the call, since the reply overwrites) and
+`SetPhase`; `state.clock()` makes the stamping nil-safe. [[LSN-061]].
+
+### Evidence
+
+| What                                                 | Result                                                                                                                                                              |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dev/verify/actor-overlay-admission-l2.sh`           | `P9-T9b-5a ruling: HOLDS` (chain order: it must precede the execute suite — the executor's step-8/9 apply uses `client.DryRunAll`)                                  |
+| `dev/verify/broker-execute-l2.sh`                    | **rc 0 · 10/10 assertions · PROVEN**. L2-2: created `06:43:23Z` (API server), execution began `06:43:23Z` (broker). L2-4: `strategy 'delete', validated, 1 step(s)` |
+| `dev/verify/broker-execute-l2.sh --negative-control` | **13/13**, run before and after every edit to the suite                                                                                                             |
+| `verification/mutants/V-BRK-006.json`                | **15/15 caught**. M9 escaped the first sweep and was closed with a new test rather than a strengthened old one                                                      |
+| `make -C k8s-operator test`                          | green, every package                                                                                                                                                |
+| `dev/L0-CHAIN.txt`                                   | green, 386 dev tests + 30 invariant checks                                                                                                                          |
+
+Images: operator `@sha256:69bedbec93b9`, broker `@sha256:85532a853384`, both `dev-ce87423`, deployed
+by digest via `dev/cluster/reload-images.sh`.
+
+### What this unit did **not** do
+
+- **V-REV-001 is n=1** — one single-target create. The wider `n` and the `undo <id>` round trip
+  (V-REV-002) are Phase 10.
+- **The write half stays dark.** Only the READ half of 06 §2.2 is rendered; `vap-agent-scope` arrives
+  with P10-T1. `actor-overlay.sh`'s four write negatives remain absolute for that reason.
+- **`status.approvals` is still written by nobody**, because its principal — the ChatOps gateway SA —
+  does not exist yet. `mergeOwnedStatus` is written to leave it alone when it does.
+
+---
+
+## P9-T9b-5b-ii-a — V-BRK-018 at L2, and the two objects that were not the grant
+
+**Landed 2026-07-31.** `dev/verify/broker-refuse-l2.sh` is **14/14, rc 0, PROVEN** on
+`gke-scratch-kube-agents-dev`. V-BRK-018 is scored `pass` at L2 and so is the journal half of
+Phase 9 acceptance (d). Two rows in `verification/results.csv`.
+
+### The split, recorded at SELECT
+
+`T9b-5b-ii` carried three subjects, the same way `T9b-5b` carried three before it: a snapshot-failure
+refusal, a journal-unavailable refusal, and V-BRK-021's surface scan. The first two are the same
+fixture with a different fault and read back through the same journal; the third is a scan of the
+served HTTP surface and shares nothing with them but the pod. So:
+
+| Unit            | What it is                                                                                             | Checks                                  | Level |
+| --------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------- | ----- |
+| **T9b-5b-ii-a** | `broker-refuse-l2.sh` — two refusals: a split snapshot and a journal revoked out from under the broker | V-BRK-018 (L2), Accept (d) journal half | L2    |
+| **T9b-5b-ii-b** | V-REV-003 (no generatable undo plan ⇒ reclassified gated) and V-BRK-021's L2 surface scan              | V-REV-003, V-BRK-021 (L2)               | L2    |
+
+### How V-BRK-018 is made non-vacuous under shadow mode
+
+The row says a snapshot-persist failure must refuse and leave **neither target applied**. Everything
+in Phase 9 is a server-side dry run, so neither target was ever going to exist and the two NotFounds
+that look like the assertion prove nothing. The property is carried by the **journal** instead:
+
+- a submission that gets **past** step 3 leaves a write-ahead record naming both real targets, with
+  captured pre-state;
+- a submission stopped **at** step 3 leaves exactly one record — `rejection.go`'s — whose
+  `spec.targets` is the single `refused-before-target-resolution` sentinel, with no `spec.preState`
+  and no `status.applied`.
+
+Those two worlds are distinguishable in the API server, which is where A-6 asserts. A-7's NotFound
+pair stays as the cheap direct half and does not carry the row.
+
+Finding the record needed a second decision: a refusal reply carries **no `actionId`**, so there is
+no handle to look one up by. The suite lists ActionRecords and matches `spec.trace.traceId`, which
+`rejection.go`'s `traceFromBody` copies off the caller's own envelope — and **A-2 asserts the
+missing `actionId`**, so the method's own premise is under test rather than assumed.
+
+### The fault that would not stage
+
+Scenario B revokes `actionrecords` from the actor while the broker is running. The first
+implementation stripped the two objects `actor-grant-platform.yaml.template` renders — the actor
+ClusterRole and the per-tier namespaced Role — and the authorizer still said `yes` after 60s. The
+suite deferred, correctly, rather than submitting into a healthy journal and reporting a 503 that was
+never coming.
+
+The cluster also carried `Role/kubeagents-broker-operations` and
+`RoleBinding/platform-agent-broker-operations` in `kubeagents-system`, granting the same verbs.
+**No current template renders either** — they are residue from before the split moved the namespaced
+verbs onto the per-tier Role, and `kubectl apply` does not delete what it stopped rendering. So the
+strip is now **discovery-based**: walk the actor's ClusterRoleBindings and RoleBindings, take every
+`roleRef` that carries `actionrecords`, snapshot each object, strip it. Three objects on this
+cluster; zero would be a deferral, because nothing to revoke is no fault to stage. Restore is the
+snapshots **and** a re-seed, in that order — a re-seed alone re-renders only the shipped objects, so
+an unowned object stripped here would have stayed stripped.
+
+Filed as a backlog finding rather than fixed here: the residue itself is a provisioning-lifecycle
+problem (a `teardown_NN` reaps what its own `provision_NN` created, never what a previous generation
+of the template created), and the live install should be **checked** for the same objects.
+
+### `verify-phase9.sh` section E was a false pass
+
+The Accept (d) arm tested `[ -f dev/verify/broker-execute-l2.sh ]` and, on finding it, reported the
+journal half proven — on the strength of a comment claiming that file "carries the journal-unavailable
+refusal", which it does not and never did. [[LSN-060]]'s shape through a different door: an artifact
+detector that names the wrong artifact is a detector of nothing. It now requires the file to exist,
+to appear in a live line of `dev/L2-CHAIN.txt`, **and** runs it.
+
+Retargeting a detector in the same unit that builds the artifact it detects is **Guardrail 9
+adjacent and deliberately on the right side of it**: the old arm passed unconditionally, the new one
+can fail, and no assertion was weakened to make anything green.
+
+### What this unit does not claim
+
+Row 3's **auto-pause**. `brake.go` sets `AutoPause: true` and the 503 the caller receives says "and
+the agent is being paused", but nothing consumes the field and `status.broker.journalReachable` has
+no writer. Row 9's auto-pause is wired, which is what makes this a gap rather than unbuilt scope.
+Backlog finding, 2026-07-31; not asserted by any arm here.
+
+---
+
+## P9-T9b-5b-ii-b-1 — V-REV-003 at L2: the third outcome, and the control that gives it meaning
+
+**Landed 2026-07-31.** `dev/verify/broker-gate-l2.sh` is **16/16, rc 0, PROVEN** on
+`gke-scratch-kube-agents-dev`; the negative control is **39/39**. **V-REV-003** is scored `pass` at
+L2 — one row in `verification/results.csv`. `dev/L2-CHAIN.txt` gains a line and both L2 ratchet
+floors move in the same commit (`L2_CHAIN_FLOOR` 19→20, `L2_SCOPE_FLOOR` 28→29).
+
+### The ii-b split, recorded at SELECT
+
+`T9b-5b-ii-b` carried two subjects and they share almost nothing. V-BRK-021 is a scan of the served
+HTTP surface and needs only a driver pod with credentials. V-REV-003 is fault injection and needs a
+tenant namespace, a write overlay, a shadow-mode patch on the Agent CR and a two-scenario probe. A
+unit that built both would spend its fixture budget twice over on a shared pod. So:
+
+| Unit              | What it is                                                                                              | Checks    |
+| ----------------- | ------------------------------------------------------------------------------------------------------- | --------- |
+| **T9b-5b-ii-b-1** | `broker-gate-l2.sh` — an envelope with no generatable undo plan, against a control whose plan generates | V-REV-003 |
+| **T9b-5b-ii-b-2** | V-BRK-021's L2 surface scan, added to `broker-auth-l2.sh`, **plus** retargeting `verify-phase9.sh` §G   | V-BRK-021 |
+
+`ii-b-2` owns the section G retarget because that detector is a **false pass today**: its only match
+in the tree is `broker-refuse-l2.sh`'s "does not claim" note about V-BRK-021, so it reports a
+claimant that does not exist. There is no V-REV-003 detector in section G at all, so this unit had
+no Guardrail-9 entanglement — nothing here changes a check to make anything green.
+
+### Two submissions, because the row is a difference
+
+A broker that gated **everything** satisfies V-REV-003's sentence perfectly and is worthless, and
+that is not hypothetical. Three places in this pipeline downgrade a plan to `none` on an error —
+`checkRecreatable` when the reference index cannot answer, `undo.Validate` with no dry-run client
+wired, `generateOne` on a missing snapshot. Each fails closed, correctly, and each would have made a
+one-submission suite green while proving nothing about reclassification. So there are two:
+
+- **F**, `patch` an `apps/v1 Deployment` **that does not exist**. `undo.StrategyFor` maps `patch` to
+  `restore` for either existence; `execute.capture` narrows the NotFound to `Existed: false` with a
+  nil pre-state; `generateOne`'s restore arm refuses on exactly that. Gated at step 7.
+- **C**, `apply` an absent ConfigMap. Its inverse is a `delete` step, `PlanDryRunner` treats a delete
+  step's NotFound as "would apply", the plan validates, the action is accepted and shadow-executed.
+
+**D-1 asserts the difference itself**, as its own arm rather than as an inference a reader makes from
+F-1 and C-1 sitting near each other. The two failures a per-scenario arm cannot see are "everything
+is gated" and "nothing is".
+
+### Three design choices that cost something
+
+**The fault is a Deployment, not a ConfigMap.** `classify/floor.go`'s `statefulKinds` contains
+`{Group:"", Kind:"ConfigMap"}`, so any ConfigMap operation able to produce this refusal would also be
+gated by `RuleDestructiveStatefulDelete` or a neighbour. A gate with two independent causes cannot
+attribute itself to either, and **F-5** — the arm that reads `spec.classification.reasons[]` and
+requires `no-undo-plan` among them — is the one that would have gone quiet. The patch body is one
+annotation for the same reason: a patch touching `securityContext`, `serviceAccountName` or a
+pod-security label draws `RuleSecurityLoosen` in alongside it. (The live run confirms the concern is
+real: the record's reasons are `no-undo-plan novel-action undo-plan-unusable` — three rules on an
+envelope chosen to minimise them.)
+
+**The control differs in verb and kind, which is a real cost.** The tightest control would be the
+same `patch` over a Deployment that _does_ exist — one variable. Rejected on the code: that plan's
+step is a server-side apply of the captured pre-state under the **agent's** field manager, over an
+object this suite created with `kubectl apply` and therefore owned by a different one.
+`PlanDryRunner.dryRunApply` passes no force flag, so a field-ownership conflict would downgrade the
+plan and gate the control — for an artifact of how the fixture was made. A control that can gate for
+a reason unrelated to the experiment is worse than one that differs in verb. `apply` an absent
+ConfigMap is borrowed from `broker_execute_probe` instead: the one operation already **proven** to
+reach the accepting path on this cluster, which is the point of it being a control.
+
+**The envelope sends `dryRun: false`, and this is the unit's one sharp edge.** 06 §4.2 step 6's rule
+is `UndoPlanGateApplies(dryRun, present) = !dryRun && !present` — **a dry run suppresses the
+no-undo-plan gate**, deliberately, and `pipeline.go` step 4 feeds it the envelope's own value rather
+than the effective one for that reason. A `dryRun: true` submission would still come back gated, via
+the brake's row 5 (`BrakeRuleUndoPlanUnusable`), and the suite would be scoring V-REV-003 on a rule
+03 §4.1 does not name. Sending false also makes "never auto-executes" a real request: the caller is
+asking the broker to execute, and the only thing between the ask and a write is the gate.
+
+What keeps it safe is **structural, not a promise**. The suite patches
+`spec.operations.dryRunOnly: true` onto the Agent CR and **reads it back from the API server** before
+either submission; `mayExecute = !env.DryRun && !shadowed(view)` is a one-way composition no caller
+can clear. A read-back that disagreed would have been rc 3 with nothing submitted. Because the broker
+starts from a CR carrying no `spec.operations` at all, the suite also waits **three brake cache TTLs
+(15s)** so the first envelope cannot be answered from a view filled before the patch landed. Phase 9's
+shape — "no write authority anywhere; the broker runs every action in dry-run" (07 §2) — is preserved.
+
+### What the suite states it does not claim
+
+- **The fault target's continued absence is over-determined.** Shadow mode alone produces it, and so
+  does the gate, and the two are indistinguishable from outside. "Never auto-executes" is carried by
+  **F-6** — no `status.applied`, no `spec.preState` — which is a claim about how far the _pipeline_
+  got and is false for any broker that reached step 8. F-7 is kept as the cheap direct half because a
+  gated action that created its target is a live safety defect worth a line.
+- **The approval path is not exercised.** This parks an action and leaves it parked. 06 §4.3's
+  surface needs an ApprovalRoster with a decision in it — Phase 10, V-REV-004.
+- **`status.operations.dryRunOnly` is not read, because nothing writes it.** `OperationsStatus`
+  exists in the API type and no controller populates it — the same gap `status.broker.journalReachable`
+  has. The read-back is against `spec`, which is also what `pipeline.shadowed` consults.
+- **06 §4.4 row 5 is not separately scored.** Both paths raise the same envelope and both reasons land
+  on the record; F-5 asserts the classifier's rule by name rather than the brake's absence.
+
+### P1 refused the first run, correctly
+
+The first live attempt failed at P1: the deployed operator was `dev-0ea4235-dirty`, two commits
+behind a tree at `9cb7465`. Neither commit touched Go — the binary was almost certainly identical —
+and P1 refused to guess anyway, which is the whole design. `dev/cluster/reload-images.sh all` rebuilt
+and deployed by digest; the scored run is at `dev-9cb7465-dirty-1785488736` on **both** pods.
+
+### A finding, not this unit's
+
+`kubeagents-router` is in `CrashLoopBackOff` on the scratch cluster —
+`missing required --project-id / KAGE_PROJECT_ID` — and has been since before this unit: every prior
+ReplicaSet is `0/0 created`. It is scratch-cluster configuration drift, not a regression this unit
+caused and not something any L2 chain line asserts. Recorded in the ledger's findings; it needs a
+ruling before the Phase 9 milestone, because a milestone run on a cluster with a dead router should
+say so out loud rather than not notice.
+
+---
+
+## P9-T9b-5b-ii-b-2 — V-BRK-021 at L2: the surface of the binary the controller handed out
+
+**Landed 2026-07-31.** `dev/verify/broker-auth-l2.sh` is **21/21, rc 0, PROVEN** on
+`gke-scratch-kube-agents-dev` (up from 14/14); the negative control is **20/20**. **V-BRK-021** is
+scored `pass` at L2 — one row in `verification/results.csv`. No new chain line: the suite that grew
+the scan was already a live line of `dev/L2-CHAIN.txt` and its `--negative-control` was already a
+live line of `dev/L0-CHAIN.txt`, so both floors stand.
+
+### Why this is not the L0 half again
+
+V-BRK-021's L0 half went green on 2026-07-30 (`P9-T7c-2c`, `results.csv` row 138), reshaped from a
+route COUNT into four derived properties of `Server.MutatingRoutes()`. That row's own note says what
+it does not settle, and 09 §6 gives the check **L0 and L2** rather than either alone. Three of the
+clause's properties are structurally unreachable from `go test`:
+
+- **A build-tag-guarded skip path is not in the binary the test builds.** `go test` compiles without
+  the tag, so a `//go:build !prod` bypass is invisible to every assertion in the package — including
+  the ones that read the route table.
+- **A listener that is not `internal/broker` is invisible to a scan of `internal/broker`.** A sidecar,
+  a profiler left in the base image, a debug server started from `main` — none of them appear in a
+  source property of the mux.
+- **05 §1.3's two future doors can only be shown empty on a deployed server.** `/v1alpha1/approve`
+  and `/v1alpha1/replay` are named in the route table as Phase 10 work. "The population is empty,
+  recorded as empty and never as satisfied" is a statement about what answers on the wire.
+
+So the L2 half asserts **the same properties of a different subject**: the image the controller
+handed out, at the digest P1 pinned, behind the real TLS listener, across the real Service and the
+real NetworkPolicy.
+
+### Where it was built, and why not somewhere new
+
+Extended `dev/verify/fixtures/broker_probe.py` and `dev/verify/broker-auth-l2.sh` rather than adding
+a suite. The probe already holds a mesh certificate, an audience-bound projected token and the
+`hostAliases` pin that makes the SAN resolve without a DNS rule; a second driver pod would re-derive
+all three to ask a cheaper question. `broker_probe.py` had exactly one consumer, so there was no
+second caller to keep in step.
+
+**Every scan request carries the agent's own good certificate and own good token.** That is the whole
+reason a 404 is attributable to the ROUTE SET rather than to the caller — an unauthenticated probe of
+an unknown path gets a refusal either way and cannot tell you which.
+
+### The seven arms
+
+| Arm | What it reads                                                                                  |
+| --- | ---------------------------------------------------------------------------------------------- |
+| a   | 19 non-routes — L0's 17 plus 05 §1.3's two future doors — all 404 `no-such-route`              |
+| b   | 8 methods — five on the actions route, three on the nonce route — all 405 `method-not-allowed` |
+| c   | 3 query parameters, all 400 `unsupported-query-parameter`                                      |
+| d   | all 10 of `server.go`'s `bypassHeaders`, 400 `bypass-key`, plus one on the mutating route      |
+| e   | the differential: the same route, same credentials, no header → 200 with an empty reason       |
+| f   | 8 ports dialled from inside the cluster; exactly one accepts                                   |
+| g   | container, Service and EndpointSlice each declare one port, and it is the same one             |
+
+Three of these are load-bearing in ways worth writing down.
+
+**(c) carries a real envelope.** Each query request submits an envelope built by the shipped builder
+with a fresh nonce. A `{}` body comes back 400 `invalid-envelope`, and an arm that read only the
+status could not tell the two apart — it would score a broker that ignores query strings entirely as
+a broker that refuses them. `pretty=true` is in the list for the same reason: an innocuous parameter
+is what separates an allowlist of zero from a denylist of the scary ones.
+
+**(d) presents no Authorization header at all**, on `/healthz`. A 400 in that condition can only have
+come from `ServeHTTP` ahead of the mux, which is where `rejectBypassHeaders` runs — so the arm is a
+property of the server rather than of one handler. The count is an **equality**, not a floor:
+`bypassHeaders` mirrors 06 §4.1's reserved body keys, and a scan of nine of them is a scan with a
+hole in a place the design enumerates.
+
+**(e) exists because (d) alone is satisfied by a broken broker.** Eleven refusals is also what a
+broker that 400s everything produces, including one whose health route has failed.
+
+### What the suite states it does not claim
+
+- **(f) is a reachability claim, and is written as one.** A port nothing listens on and a port the
+  `<agent>-to-broker` egress policy drops both arrive at the driver pod as "did not connect". Reading
+  the timeout as proof that no process is bound would be reading the NetworkPolicy's verdict as the
+  binary's. The claim is reachability from where an agent stands — which is the property
+  non-skippability actually needs — and **(g)** covers the other side from three independent
+  API-server writers rather than pretending the dial did.
+- **Nothing decompiles the image.** What is asserted is the observable consequence of a skip path on
+  the digest P1 pinned, not its absence from the object code.
+
+### The section G retarget — the third false pass in one file
+
+§G's V-BRK-021 detector was `grep -l 'V-BRK-021' dev/verify/*-l2.sh | head -1`, plus a check that the
+match is a live `L2-CHAIN.txt` line. The tree's one match was `broker-refuse-l2.sh` — in a comment
+recording that it does **not** carry the property ("→ P9-T9b-5b-ii-b, with V-BRK-021's L2 surface
+scan"), and that file is a live chain line. Both halves of the test were satisfied by a note about
+the absence of the thing under test.
+
+This is the same shape as the Accept (d) arm (retargeted 2026-07-31, one unit earlier) and the
+guard-1 arm (rewritten when it matched a function name and "was right by accident"). Three arms in
+one file, three different doors, one defect: **a detector aimed at a NAME is indistinguishable, in
+its own output, from a detector that is satisfied.**
+
+The replacement discovers by the **refusal vocabulary the shipped server answers with**, each of the
+four strings resolved out of `k8s-operator/internal/broker/*.go` from the code path that emits it —
+`http.StatusNotFound`'s `Response`, `http.StatusMethodNotAllowed`'s, the block guarded by
+`len(r.URL.Query()) > 0`, and `ReasonBypassKey`'s value. Rename a reason in the server without
+renaming it in the suite and the arm fails, rather than quietly unhooking and going green on a suite
+that now matches nothing. A claimant must also read both port outcomes in the same function body,
+bound its own size against a floor, be called from somewhere, be a live `L2-CHAIN.txt` line, **and**
+have its `--negative-control` be a live `L0-CHAIN.txt` line — both trees, as a gate rather than as a
+habit.
+
+**Guardrail 9 does not apply**, and it was checked before the edit rather than after: the detector
+was a false pass on the pre-unit tree, so retargeting it closes a known false pass instead of editing
+a check to make an implementation green. `ii-b-1`'s own split table assigned the retarget here.
+
+**Shown non-vacuous twice.** Against the real pre-unit tree — `git stash` of the two changed files,
+detector declines with "no live line of dev/L2-CHAIN.txt runs a suite that scans the deployed
+surface" — and against four clause mutants under `dev/mutate.sh`, **4/4 caught**: the port outcomes,
+every count floor, the ¬ chain line, and a server-side reason rename.
+
+One of those four escaped on its first run and the **mutant** was wrong, not the detector: it deleted
+one of five floors, and the clause only ever claimed the scan bounds its size _somewhere_ — a regex
+over one function body cannot attribute a floor to a dimension. Strengthening the arm until that
+mutant died would have been writing a claim to fit a test. The mutant was corrected to remove every
+count comparison, and the bound is now stated in the arm's own comment.
+
+### A note on `/bin/bash` 3.2
+
+The first draft put the detector in `verdict="$(python3 - <<'PY' … PY)"`. macOS ships bash 3.2, which
+mis-parses a heredoc nested inside a command substitution and reports the entire 600-line file as an
+unterminated quote — `bash -n` fails at EOF and names no useful line. The verdict now travels through
+a file and the pass/fail stays in the exit status, which is also the shape the guard-1 arm below it
+already used.
+
+---
+
+## P9-T9b-5c — V-BRK-013 at L2: Accept (e)'s two-sided sweep, asked of the authorizer
+
+**Landed 2026-07-31.** `dev/verify/actor-grant-sweep-l2.sh` is **13/13, rc 0, PROVEN** on
+`gke-scratch-kube-agents-dev`; the negative control is **16/16**. **V-BRK-013** is scored `pass` at
+L2 — one row in `verification/results.csv`. Three new chain lines: the suite itself on
+`dev/L2-CHAIN.txt` (floor 20 → 21, scope floor 29 → 30) and both `--negative-control` and
+`actor_grant_expectations.py --self-test` on `dev/L0-CHAIN.txt` (now 45 lines).
+
+Phase 9 acceptance **(e)** — "no agent identity in the fleet holds a write verb, verified by a full
+two-sided `auth can-i` sweep" — is the bullet this closes.
+
+### Why the L0 half was a real result and still could not answer this
+
+V-BRK-013's L0 half went green 2026-07-28 (`results.csv` row 82) via
+`dev/tests/actor-grant-single-sourced.py`. It reads files, and three things follow from that which
+only an authorizer can settle:
+
+- **An RBAC object that omits `kube-agents/role: actor` is invisible to it and fully effective.**
+  That label is the L0 check's discovery key — because it is also `vap-agent-readonly`'s actor
+  selector — and RBAC is a union, so an unlabelled Role grants exactly as much as a labelled one.
+  This is the suite's `¬`, and it is why the `¬` had to be on a cluster.
+- **A rule written correctly and never applied reads identically at L0.** V-BRK-012's L0 half was
+  green for weeks with no broker deployed anywhere.
+- **No file holds the union across every binding**, and the union is the only thing that authorizes
+  a request.
+
+### Two-sided, because `verify-phase9.sh` §F already said so in its own failure text
+
+A one-sided "no identity holds a write verb" sweep passes perfectly against a fleet whose RBAC never
+applied — every answer is `no`, including the ones that should not be. And 06 §4.4 makes the failure
+asymmetric in the other direction too: a _missing_ `fleetfreezes` read does not fail safe, it bricks
+a tier permanently, because the tier can no longer see the freeze it is supposed to respect. So the
+sweep asserts **204 grants held** and **434 verbs refused** in the same transcript, over the same
+identities, and A-7 requires each reader to hold at least one read so that its denials are denials
+rather than absence.
+
+### The questions are derived, not listed
+
+`actor_grant_expectations.py` — the L0 check's own parser of 06 §2.2 and §2.2.1 — emits the question
+table, so there is one parser of the grant in the repository and phase-9.md's "asserts the exclusion
+set **by name** rather than by 'these are the ones that were there when I wrote it'" holds
+mechanically. 647 questions were asked. Not asked, and both counted and printed rather than dropped:
+**121** wildcard rows (a wildcard _request_ is not the question the rule makes) and **55** rows
+naming types this API server does not serve (KCC, `gateway.networking`), excluded from **both**
+directions so the negative half cannot be padded by types nobody could grant.
+
+### The fixtures seed the readers too, and that is a claim about what is measured
+
+The first live run went red on A-7 for the platform reader, and the arm was right: `platform-agent-explorer`
+was absent from the cluster, because it ships only under `examples/gitops-repo/policy/rbac-overlay/`
+and the `clusters/cluster-a/…` apply path never reaches there. Roughly sixty of that identity's
+`reader-no-write` rows were passing vacuously. The fixture now applies all three tiers' explorer
+grants out of the shipped overlays — extracting only the `-explorer` documents, so the actor
+ServiceAccount in those same files, which carries a literal `PROJECT_ID` placeholder, is never
+applied. A sweep whose answer depends on which directory somebody applied in July is not measuring
+the repository.
+
+### Three defects this unit's own machinery had
+
+- **`IFS=$'\t' read` collapses runs of tabs.** Tab is an IFS _whitespace_ character, so every query
+  row with an empty `subresource` column parsed shifted left by one field, and the sweep asked
+  `auth can-i own fleetfreezes --subresource=get -n ''`. That answers a clean `no`, and a `no` is an
+  ordinary thing for this suite to record: the only visible symptom was three tiers apparently unable
+  to read `fleetfreezes` — **a defect wearing a finding's clothes**, and it cost a full live run.
+  Fixed by splitting on `\x1f`, which is not IFS whitespace. The analyzer now also rejects any column
+  holding a value outside its own alphabet, because a field-shifted row has the right _number_ of
+  columns and the wrong values in them, and `field-shifted-parse` is `¬` case 15.
+- **`cluster-check-hygiene.py` property 1b (LSN-044) failed the script on arrival.** Hoisting the
+  query into `ask_one` makes the resource word computed, which is exactly the refactor that lesson
+  names as the evasion of 1a's static ban on a literal slash. The landing spot is the expensive one:
+  434 of the 647 questions are negative, and a slashed word answers a confident `no` about an object
+  _named_ `status`. The remedy is `resource_word`, a **named** function rather than an inline `case`
+  so `--negative-control` can fire it without a cluster — a `*/*)` arm that never triggers reads
+  exactly like one whose pattern is wrong. It is `¬` case 16, and the only one that exercises a
+  function the live path calls.
+- **The `¬`'s decoy staged a fault nobody asked about.** The first decoy Role granted
+  `create deployments.apps`, and no row of cluster-admin's derived table asks that, so one of the two
+  planted grants could not flip an answer. The decoy's rules are now derived from the victim's own
+  query rows, and S-4 requires both to flip.
+
+### What the suite states it does not claim
+
+Wildcard rows, unservable types, and anything about agent-process behaviour: `auth can-i` answers for
+a subject, not for the code that runs as it. The `NEGATIVE CONTROL DOES NOT EXERCISE:` block
+(LSN-060) names the derivation, the `can-i` invocation itself, identity discovery, the served-type
+filter, P1 and the fixtures — everything upstream of the assertion block, which the `¬` synthesises
+past. S-4 is what covers the first three, and it is live-mode only: a decoy grant is a statement
+about an authorizer, and there is no authorizer at L0.
+
+### P9-T8b-4b-ii-2b-ii splits: 2b-ii-a is the corpus, 2b-ii-b is the soak
+
+**Sized at SELECT, 2026-07-31, and it is a session and a half.** A new L2 suite, a new corpus probe,
+a derived envelope corpus, a `--negative-control`, target seeding, journal mining over the executed
+population, guard 3 restated as a label assertion, and both chains rewired — the same magnitude as
+`P9-T9b-5c`, which took a whole session and produced one suite. Carrying it forward whole is the
+shape PROTOCOL §2 names: an oversized unit is not finished late, it is checkpointed half-done.
+
+| Unit                     | What                                                                                                                                                                                                                                                                                       | Checks              | Level |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------- | ----- |
+| **P9-T8b-4b-ii-2b-ii-a** | The soak **corpus**: derive the executable envelope population from `verification/fixtures/classifier-corpus.yaml`, filtered by what `dev/verify/fixtures/actor-tenant-write-grant.yaml` authorizes, with a `--self-test` carrying vacuity floors and negative arms. Hermetic, no cluster. | feeds **V-REV-001** | L0    |
+| **P9-T8b-4b-ii-2b-ii-b** | The **soak**: a corpus probe, `dev/verify/undo-coverage-l2.sh`, target seeding, journal mining over the `DryRun` population, guard 3 as a label assertion                                                                                                                                  | **V-REV-001**       | L2    |
+
+**The split is free, and that is a fact about P1 rather than a judgement.** `_p1_build_inputs()`
+(`dev/lib/preconditions.sh:62`) maps freshness per image: `k8s-operator | kage-router | kage-broker`
+resolve to the `k8s-operator` build context and everything else returns 1. A commit touching only
+`dev/`, `verification/` and `docs/` therefore does not invalidate the running broker's P1, so 2b-ii-b
+inherits 2b-ii-a's tree without a rebuild. Splitting a unit that _did_ touch the operator would cost
+a `cloud-build-push` between the halves; this one costs nothing.
+
+**Why the corpus is a unit and not a helper file.** It is the exact parallel of
+`actor_grant_expectations.py` preceding `actor-grant-sweep-l2.sh`, and three things live in it that
+have already gone wrong in this phase:
+
+- **It is where the population that makes V-REV-001 non-vacuous is established.** The phase has
+  reached an empty or n=1 population twice — `broker-execute-l2.sh` claims V-REV-001 today with
+  **n=1**, and its own `results.csv` note says so. A coverage check over one record is a check whose
+  denominator is a rounding artifact. 09 §11.11 keeps V-REV-001 and V-REV-002 apart "precisely
+  because the first is cheap and reassuring and the second is the one that matters"; a cheap check
+  over n=1 is not even reassuring.
+- **It is where LSN-036's headcount risk lives.** A corpus that is _derived_ can silently shrink to
+  nothing when its input moves; a corpus that is _listed_ goes stale without saying so. Deriving it
+  is the right call — the grant is shipped, the classifier corpus is spec-bound at 120–200 cases —
+  but a derivation with no floor under it is the worse of the two failures, because it presents an
+  empty result as a clean run.
+- **It is where the filter can quietly become a hardcoded kind list.** The authorized set must be
+  read out of the write overlay, subresource granularity included (`deployments/scale` is a separate
+  rule from `deployments`), so that narrowing the grant narrows the corpus. A hand-listed
+  `{ConfigMap, Deployment}` passes every test on the day it is written and stops tracking the grant
+  the first time the grant moves.
+
+**The one thing the corpus must NOT do.** It must not assert that the live broker's classification
+equals `expect.class`. The classifier corpus is a source of **envelopes**, not of expected classes:
+its cases are already-resolved inputs scored against the offline classifier, while the live broker
+classifies against production labels, live state and the seen/novel history of a real cluster. An
+equality assertion there would be a second V-MET-005 wearing V-REV-001's ID, and it would go red for
+reasons that say nothing about undo coverage. `expect.class` is used for exactly one thing: as the
+selection filter for the **non-gated** classes, because those are the population 09 §6.3 scopes the
+check to. What the soak reads back is the class the broker actually chose.
+
+### P9-T8b-4b-ii-2b-ii-a — outcome, 2026-07-31
+
+**V-REV-001's denominator went from 1 to 37, and the number is derived rather than written down.**
+`dev/verify/fixtures/soak_corpus.py` reads `verification/fixtures/classifier-corpus.yaml` (181
+cases), filters it by what `dev/verify/fixtures/actor-tenant-write-grant.yaml` actually authorizes,
+and emits the envelope population the soak will submit: **37 cases, 4 verbs, 2 kinds, both non-gated
+classes, both seed states.** `--self-test` is **17/17** and is a new `dev/L0-CHAIN.txt` line (45 →
+46). No `results.csv` row: this unit scores no check. It builds the population `2b-ii-b` will claim
+**V-REV-001** over, and a verdict row for a fixture would be a pass with no property behind it.
+
+#### The reject table is the deliverable as much as the selection is
+
+144 of the 181 cases are excluded, and every one of them carries exactly one reason from a **closed**
+set, with `selected + rejected == total` asserted:
+
+| reason                | n   | why it is not in the soak                                                                |
+| --------------------- | --- | ---------------------------------------------------------------------------------------- |
+| `class-gated`         | 80  | 09 §6.3 scopes V-REV-001 to the non-gated population; a gated action does not execute    |
+| `class-forbidden`     | 26  | never reaches the planner                                                                |
+| `not-authorized`      | 24  | the write overlay grants configmaps, deployments and deployments/scale, and nothing else |
+| `abort`               | 4   | the envelope is refused before classification                                            |
+| `class-unstated`      | 4   | the case asserts rules only; there is no class to filter on                              |
+| `multi-op`            | 3   | one target per record, because the seeding and the journal mining are both per-target    |
+| `unnamed-target`      | 2   | the executor snapshots by ref, and a ref with no name is not one                         |
+| `verb-not-executable` | 1   | `cloud` is not in the envelope schema's `VALID_OPS`                                      |
+
+A **derived** corpus fails the opposite way to a listed one. A listed corpus goes stale loudly; a
+derived one shrinks to nothing silently and prints the empty result as a clean run. The histogram is
+what makes a shrink visible as a reason that moved rather than as a smaller number with no
+explanation — and the arithmetic assertion is what stops a case being dropped by neither path.
+
+#### The floors are fired against an empty selection, not only against today's tree
+
+`floor_problems()` is a pure function of (selected, rejected, total, grant) precisely so the
+self-test can call it twice: once on the real derivation, which must return nothing, and once on a
+**synthesised empty selection**, which must return at least five complaints. A floor that has never
+been observed to fire is a floor whose threshold is a guess, and the collision floor is the case in
+point — nothing in the real corpus produces two cases with one target name, so without the synthetic
+arm that branch would ship unexecuted. Same for `MIN_SELECTED = 20`: it is set below the measured 37
+on purpose, because 09 §7.1 lets the classifier corpus move between 120 and 200 cases and a floor
+pinned to today's exact yield fails on somebody else's legitimate edit. Low enough not to be brittle,
+high enough that **n=1 — the thing this unit exists to fix — cannot pass**.
+
+#### The filter reads the grant, and there are three arms that prove it does
+
+The tempting shape is a hardcoded `{ConfigMap, Deployment}`. It passes every test the day it is
+written and stops tracking the grant the first time the grant moves. So the authorized set is read
+out of the overlay file, and the self-test mutates that file in memory:
+
+- Revoke `deployments` → all **33** non-scale Deployment cases drop, the ConfigMap cases are
+  untouched, **and the scale case stands**, because it rides on the separate `deployments/scale`
+  rule. An arm that expected the scale case to disappear would be asserting that the reader ignores
+  subresources.
+- Revoke `deployments/scale` → the scale case drops and `patch Deployment` stands.
+- Make every verb `get/list/watch` → **every** previously-selected case comes back rejected, and
+  by the name `not-authorized` rather than something vaguer.
+
+The RBAC verbs each envelope verb needs are read off what the executor's client actually calls
+(`execute/client.go`), not off the verb's name: `apply`/`create` go through a server-side-apply
+`Patch` and therefore need **patch + create**, and `scale` is an `Update` on the **`scale`
+subresource**. `get` is deliberately absent from the requirement — every op snapshots its pre-state,
+but that read belongs to the READ overlay, and asking the write overlay for it would reject every
+case for the wrong reason.
+
+#### The grant reader refuses what it does not understand
+
+`dev/tests/yamlsubset.py` cannot read the overlay and should not: it rejects flow collections by
+design, and the overlay is written in them because it is an RBAC manifest a human applies, not a
+corpus prettier reformats. So `load_grant` is a narrow three-line-form reader — and its one
+load-bearing property is that a rule it does **not** understand is an **error**. It counts
+`- apiGroups:` lines and requires that number to equal the number of triples it matched. A
+silently-skipped rule narrows the authorized set, which narrows the corpus, which shrinks
+V-REV-001's denominator: the exact failure this module exists to prevent, arriving through its own
+input reader.
+
+#### The one assertion this file must never make
+
+**It does not assert that the live class equals `expect.class`.** The corpus cases are inputs already
+resolved against a fixture world; the live broker classifies against production namespace labels,
+live object state and a real cluster's seen/novel history — and every selected case is re-addressed
+to the one tenant namespace the suite owns, which can by itself move a case across the production
+ladder. An equality assertion there would be a second V-MET-005 wearing V-REV-001's ID, going red for
+reasons that say nothing about undo coverage. `expect.class` does exactly one job: select the
+non-gated classes. **`2b-ii-b` reads back the class the broker chose and partitions on that.**
+
+`KIND_TO_RESOURCE` holds the one remaining hand-written mapping, and it is a naming convention rather
+than a policy statement — a Kind missing from it is rejected as `not-authorized`, the conservative
+answer. The silent-shrink hole is in the other direction, so a floor closes it: **every resource the
+grant names must be reachable from some Kind in the map**, which means adding `ingresses` to the
+overlay fails this file until it learns `Ingress`.
+
+### P9-T8b-4b-ii-2b-ii-b — outcome, 2026-07-31
+
+**V-REV-001 now has a denominator of 35 instead of 1, and the 100% means something it did not mean
+yesterday.** `dev/verify/undo-coverage-l2.sh` submits the whole derived corpus — **37 envelopes, one
+per row of `soak_corpus.py --table`** — from inside the cluster on the platform agent's own reader
+identity, through the broker's real front door, all dry-run. **35/35 = 100%** of executed non-gated
+`ActionRecord`s carry a validated undo plan, across **3 verbs**. `--negative-control` is **17/17**.
+Both chains gained a line (L0 46 → 47, L2 21 → 22) and both floors moved in this commit.
+
+Live run, `gke-scratch-kube-agents-dev`, rc 0, 9/9 assertions, banner PROVEN, on
+`k8s-operator@sha256:69bedbec93b9` and `kage-broker@sha256:85532a853384` with both P1 arms green:
+
+| arm     | property                           | result                                              |
+| ------- | ---------------------------------- | --------------------------------------------------- |
+| A-1     | submission floor                   | 37 of 37 accepted (floor 20)                        |
+| A-2     | every accepted action is journaled | 37/37 mined as `ar-<lowercase actionId>`            |
+| **A-3** | **V-REV-001**                      | **35/35 = 100%**, all four failure categories zero  |
+| A-4     | non-vacuity                        | 35 records, 3 verbs — above the 20/2 floors         |
+| A-5     | attribution                        | 37/37 attributed; 30 of the namespace's 67 excluded |
+| A-6     | the shadow held                    | all 37 seeded targets byte-identical                |
+
+#### The two records that are not in the denominator are the classifier working
+
+35, not 37. The missing pair is `gat-005` and `gat-100`, both `delete Deployment`, both
+`PendingApproval`, class **gated**, strategy `none`. A gated action never executes, so it never gets
+a `status.timestamps.executionStarted`, so it is correctly outside a claim scoped to _executed_
+records. That is the shape the suite has to be able to distinguish from the failure that looks
+identical from one field away — a record that executed and got `none` anyway — which is why
+`strategy-none-on-non-gated` is its own FAIL category rather than folded into "no plan".
+
+#### "Executed" is the broker's own stamp, not a guessed-at set of phase strings
+
+`status.timestamps.executionStarted != ""` is the moment the broker issued its first mutating call.
+The alternative — enumerating the phase values that mean executed — is a list that has to be kept in
+step with a state machine in the product, and the failure mode is that a renamed phase silently
+empties the denominator and prints 100% of nothing. Hence the DEFER arms: an empty executed
+population, a submission count below the accept floor, or a single-verb population all exit **3**
+with a named blocker. Three of the 17 `¬` cases assert exactly those, because a floor that has never
+been observed to fire is a guess.
+
+#### Four failure categories, scored separately, one of them derived from the product's own comment
+
+`no-undo-plan`, `strategy-none-on-non-gated`, `unvalidated-plan`, `stepless-plan` — plus
+`unclassified-executed-record`, which **fails** rather than quietly leaving the denominator. The
+second one is not a rule this suite invented: `undo.StrategyFor`'s closing comment is _"anything
+else ⇒ none ⇒ gated"_, so `none` on a record the classifier did **not** gate is the planner and the
+classifier disagreeing about the same action. A suite reporting one aggregate number could say a
+plan was missing but not which of the four ways it was missing, and those are four different bugs in
+four different places.
+
+#### Guard 3 could not be a label, and what replaced it is stronger
+
+The plan said _"guard 3 as a label assertion"_ — tag this run's records and mine by the tag. It is
+not available. `pipeline.chainID(env, actionID)` returns `undoOf(env)` or the actionId and **ignores
+the envelope's own `trigger.chainId`** for non-undo actions, and `journal.Labels()` writes only tier,
+scope, risk-class, trigger, chain-id, status and undo-of — **nothing a submitter chose**. So a
+suite cannot label a broker-written record at all.
+
+A-5 is set intersection on actionIds instead, and it names the failure better than the label would
+have. The tenant namespace is this suite's own and it is deliberately left standing between runs
+([[LSN-045]] — a namespace holding an `ActionRecord` is undeletable), so the journal accumulates:
+the run that produced this row found **67** records in `kubeagents-system` and put **30** of them
+outside the denominator by name. Without that arm the denominator grows every run and a stale 100%
+reads like coverage improving.
+
+#### The corpus supplies shape and target; the payload is synthesised
+
+A soak that replayed recorded bodies would be measuring the fixture. `undo_coverage_probe.py` takes
+the row's verb, kind and target from the corpus and **builds** the operation: a ConfigMap or
+Deployment desired-state for `create`/`apply`, a deterministic three-way rotation for `patch`, a
+replica count for `scale`. Deriving patch bodies from the corpus's `touchedPaths` was rejected —
+only 3 of the 37 rows carry one, and `gat-066`'s is the immutable `/spec/selector`. One op per
+envelope, one object per op, because both the seeding and the journal mining are per-target.
+
+Each envelope fetches its **own** nonce; they are single-use (`broker/antireplay.go`), so a shared
+one would have made the run a 1-accept, 36-replay-refusal transcript. A failed case emits its row
+and continues rather than aborting, so one bad envelope costs one row of the denominator instead of
+the whole population — and A-1's floor is what stops that degradation from passing quietly.
+
+#### A-6 exists because a dry-run soak that wrote would still score V-REV-001 green
+
+Everything above is a claim about records. None of it would notice the broker actually mutating the
+cluster. The suite snapshots all 37 seeded targets with two bulk reads before the run and two after,
+and fails on any create, mutation or delete — the same shadow property Phase 9's whole premise
+rests on (07 §2: the entire safety machinery exercised **with no write authority anywhere**).
+
+#### What this does not claim
+
+The plans are read, never **executed**. Correctness of an undo plan is V-REV-002 and the approval
+round trip is V-REV-004, both Phase 10; 09 §11.11 separates them from this one _"precisely because
+the first is cheap and reassuring and the second is the one that matters"_. This row is the cheap
+and reassuring one, and it is now cheap and reassuring about 35 records instead of one. Nor does the
+gated pair's exclusion assert that gating a `delete Deployment` is correct — `broker-gate-l2.sh`
+owns that property. And the suite never compares the live class to the corpus's `expect.class`, for
+the reason `2b-ii-a`'s section gives: every case is re-addressed to one tenant namespace, which can
+by itself move a case across the production ladder.
+
+#### One thing worth carrying forward: P1's commit half is HEAD-exact
+
+The first live run failed P1 with the deployed tag at `dev-0ea4235-dirty-*` against a tree at
+`cdad3b1`, and `git log 0ea4235..HEAD -- k8s-operator/` showed **zero** commits. That is not a bug.
+`_p1_build_inputs()` scopes only the **dirty-file** half of the check; `_p1_assert_tag_is_current`
+compares the deployed sha against `git rev-parse --short HEAD` and fails on any mismatch at all. So
+a commit touching nothing but `docs/` and `dev/` invalidates every image for every L2 suite still to
+come — which is the phase's own ordering rule ("L0/L1 before L2, because the tree must stop moving
+before images are built") stated from the other side. Remedied as documented, with
+`reload-images.sh operator` then `broker`, and both arms went green on the re-run.
+
+---
+
+### P9-T9c-1 — outcome, 2026-07-31
+
+**06 §4.4 row 3's second clause, wired.** The row is one sentence with an AND in it — _"Refuse to
+execute; set `status.broker.journalReachable: false`; auto-pause"_ — and only the first clause was
+true. `brake.go` set `AutoPause: true` on the row-3 decision, `pipeline.stepBrake` captured `d.Effect`
+and dropped the rest, and the caller was told _"and the agent is being paused"_ by a broker that
+paused nothing (B-006).
+
+**Where the pause goes, and why it is not a `client.Patch` on the Agent.** The broker has
+`get, list, watch` on `agents` and nothing more (06 §2.2.1, asserted by V-BRK-013, BLOCKING-ALWAYS),
+because 05 §1.7 wants "exactly one code path that stops an agent". So a pause is a _request_ written
+onto an `ActionRecord`'s `status.escalation`, which C-BR fans out into `spec.operations.paused` plus
+an Event. `internal/broker/escalate` already existed and row 9 already drove it; this unit connected
+the other caller.
+
+**The one structural problem, and its answer.** Row 3 fires at pipeline step 5. The action's own
+record is not durable until step 8. There is therefore no action record to hang the escalation on —
+so it rides the **refusal** record `server.refuse()` already writes via `ref.Journal`, which names
+the same agent and puts the refusal and the pause request on one object. `RejectionJournal.Reject`
+now returns the action id it minted; without it the boundary would have to re-derive a ULID it did
+not generate.
+
+| What changed                        | Where                                                                                           |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `Refusal.AutoPause`                 | `envelope.go` — carried like `Journal`/`SecurityEvent` are                                      |
+| `Decide` copies it onto the refusal | `brake.go` — one definition site; the decision is consumed locally, the refusal is what travels |
+| `Reject` returns the action id      | `rejection.go` — interface, Store impl, log impl                                                |
+| `Config.Pauser`, required           | `server.go` — `verify.Pauser`, the same type row 9 uses                                         |
+| `refuse()` consumes it              | `server.go` — `autoPause`, after journaling, never before                                       |
+| Wiring                              | `cmd/broker/main.go` — `&escalate.Recorder{Client: k8s, ...}`                                   |
+
+**What this half does NOT fix, and it is the reason for `-2`.** Row 3 fires when the brake's journal
+probe says the store is unreachable, and a store that cannot be listed usually cannot be written —
+so in the common case the refusal is not recorded, there is no id, and the pause request has nowhere
+to live. It is logged and the agent stays live. What it _does_ catch is the case that is most likely
+in practice: the probe is a periodic observation, so it can read unreachable for up to one interval
+after writes have recovered, and in that window the record lands and the agent is paused. The case
+it cannot catch is exactly why 06 §4.4 also asks for `status.broker.journalReachable` — a surface
+that does not depend on the journal being writable. That is `-2`.
+
+**Non-vacuity: 4 mutants, 4 caught, each by the arm that targets it** ([[LSN-035]]). Run through
+`dev/mutate.sh` — the one-off layer — rather than `dev/mutate.py`, because a sweep spec is keyed by
+check ID and 09 has no ID for row 3's pause yet (that question travels to the improvement pass with
+B-006).
+
+| Mutant                                              | Caught by                                                                                         |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `Decide` stops copying `AutoPause` onto the refusal | `TestBrakeEachRuleFiresInIsolation` (both row-3 arms) + `TestRow3RefusalAlsoRequestsTheAutoPause` |
+| `refuse()` never consumes `AutoPause`               | `TestRow3RefusalAlsoRequestsTheAutoPause` — `pause requests = 0, want 1`                          |
+| Every refusal auto-pauses                           | `TestAnOrdinaryRefusalDoesNotPause` — a bypass-key refusal is not a fleet incident                |
+| The pause is hung on an empty action id             | `TestRow3WithNoJournaledRecordCannotPause`                                                        |
+
+The second mutant is worth noting for the next person: the first form of it deleted the whole `if`
+block, which left `recordedActionID` declared-and-not-used, so Go refused to compile and the mutant
+scored as `BROKEN` rather than caught — the check was never asked anything ([[LSN-048]]). Rewritten
+as `if false && ref.AutoPause`, it compiles, runs, and fails the intended assertion.
+
+**The tests drive the real row-3 refusal**, built by `Decide(healthy())` with the journal signal
+removed, not a hand-written `Refusal`. A hand-written one would keep passing if the brake stopped
+setting the field, which is the regression most worth catching: the brake and the boundary have to
+agree about what row 3 _is_, and only one of them is under test at the boundary.
+
+**Verification.** `make -C k8s-operator test` green including the 116 s controller envtest; L0 chain
+**47/47**; invariants gate 30/30 after winding `dev/assertion-baseline.json` for the three new named
+tests (LSN-056). No check ID claimed — see the note in the task section above.
+
+### P9-T9c-2 — outcome, 2026-07-31
+
+**Row 3's middle clause, and the design question `-2` was split out to answer.** The question was
+_who writes `status.broker.journalReachable`_, and reading 06 §2.2.1 and §2.2 together answers it
+closed: the broker-operations grant is `[get, list, watch]` on `agents` and nothing else; the actor
+templates add `update, patch` on `agents` for the platform and cluster-admin tiers — for provisioning
+their **children** — and **nothing anywhere grants `agents/status`**, which is a subresource and
+therefore a separate grant ([[LSN-061]]). developer-team has no `agents` verb at all. No broker at
+any tier can write this field. The operator is the only principal that can, so the writer is a
+controller.
+
+**The objection that stood for five phases, and why it does not apply.** `agent_controller.go` has
+carried a comment since Phase 4 saying the controller "cannot observe" journal reachability. That is
+an argument against **one transport** — asking the broker over HTTP, where a broker answering "yes"
+proves nothing about the broker's own writes — not against the controller observing anything. What
+makes a controller-side observation evidence is 05 §1.2: the journal store is not a service, it is
+the `ActionRecord` CRD in the cluster's own etcd. _"For a Cluster Admin or Developer Team Agent the
+journal lives in the same etcd as the objects it describes"_; for the platform tier it lives in the
+hub cluster's etcd, which is where the operator runs. The store the broker probes and the store the
+operator probes are the same store, always.
+
+**Three observations, conjoined, every unknown false.**
+
+1. The broker Deployment is ready — already computed by `updateStatusReady`. This also covers total
+   loss of the broker's API path, because `brake.NewSource`'s startup `Refresh` is synchronous: a
+   broker that cannot read the API server dies at boot, not on the first envelope.
+2. An **uncached** `List` of `ActionRecord` in the agent's namespace, `Limit(1)` — deliberately the
+   same shape as `brake.Source.probe`. Uncached because a `List` served from an informer is the false
+   green `brake.MaxFreezeStaleness` already argues against; the nil-reader case fails closed rather
+   than falling back to the cached client.
+3. A `SubjectAccessReview` asking whether the actor ServiceAccount may `create actionrecords` there.
+   **This is the one that stops the whole thing being a proxy** — it is not the operator's
+   connectivity restated, it is the API server's authoritative answer about the _broker's_ authority,
+   obtained by the one principal that may ask.
+
+| What changed                                    | Where                                                                              |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------- |
+| The probe, and ~90 lines on why it lives here   | `journal_reachability.go` — new                                                    |
+| `APIReader` + `Authorizer` on the reconciler    | `agent_controller.go` — defaulted in `SetupWithManager`, fail-closed when nil      |
+| `JournalReachable` written into `BrokerStatus`  | `agent_controller.go` — `updateStatusReady`; the reason is logged on the EDGE only |
+| Periodic requeue, `brokerHealthRequeue` = 60 s  | `agent_controller.go` — the one status field with **no watch behind it**           |
+| `subjectaccessreviews: create`                  | `config/rbac/role.yaml`, regenerated — +6 lines, no other drift                    |
+| `journal_reachability.go` classified: RENDERING | `dev/tests/pause-is-not-scale-to-zero.py` — see below                              |
+
+**Why the clock.** A journal outage changes no object the controller owns or watches, so
+`journalReachable` is the only field in `updateStatusReady` that goes stale silently. The periodic
+requeue broke `agent_controller_test.go`'s `RequeueAfter != 0` assertion; rather than weaken it, it
+was **split into two stronger ones** — "not the 30 s degraded retry" (the original property, restated
+precisely, which `!= 0` only implied) and "is the broker-health period". Guardrail 9 forbids editing
+a check to accommodate an implementation; strengthening it to say what it meant is the other
+direction.
+
+**The check that caught the new file, and the latch it forecloses.** V-RUN-012 fails any unclassified
+file in `internal/controller`, which is the arm that stops the guard silently narrowing as the
+package grows — so the new file had to be declared. It landed in **RENDERING**, the strict arm, even
+though it renders no workload, because it is the one file where reading the brake would _close a
+latch_: row 3 auto-pauses on an unreachable journal, so a probe that also consulted `paused` ("a
+paused agent is not executing, don't bother probing") would report unreachable **because** it had
+been paused, and the pause would outlive the outage with no path back.
+
+**Non-vacuity: 8 mutants, 8 caught, each by the arm that targets it** ([[LSN-035]]). Through
+`dev/mutate.sh` for the same reason as `-1` — 09 has no check ID for row 3 yet.
+
+| Mutant                                           | Caught by                                                             |
+| ------------------------------------------------ | --------------------------------------------------------------------- |
+| `JournalReachable` dropped from `newBroker`      | `TestJournalReachableReachesAgentStatus/the_broker_may_write...`      |
+| Return true before the `SubjectAccessReview`     | 3 tests; `reviews issued = 0, want exactly 1`                         |
+| A failing `List` returns reachable               | `.../the_store_does_not_answer`                                       |
+| Nil dependencies return reachable                | all 3 subtests of `TestJournalProbeWithNoDependenciesWiredIs...`      |
+| `Resource: "actionrecords/status"` ([[LSN-044]]) | `review resource = .../actionrecords/status, want .../actionrecords`  |
+| The three ServiceAccount `Groups` dropped        | `review groups [] are missing "system:serviceaccounts"` ×3            |
+| The periodic requeue removed                     | `TestAgentReconciler_Reconcile_ExistingRuntimeClass`                  |
+| The probe reads `.Spec.Operations.Paused`        | V-RUN-012 property 3 — both the `.Spec.Operations` and `.Paused` arms |
+
+The fifth is worth keeping: it is LSN-044's exact shape, and the test that caught it is the one that
+pins the _question_ rather than the answer. `wantUser` in that test is a **literal**
+(`system:serviceaccount:team-x:developer-team-team-x-actor`) with a separate assertion that the
+fixture still produces it — built from `actorServiceAccountName(agent)` it would have been a value
+compared against itself, which can never report the wrong shape ([[LSN-034]]).
+
+**The recorded residue.** A broker whose pod-level network path to the API server breaks _after_ boot
+while its pod stays Ready. Its probes are `tcpSocket` on its own mTLS listener (which demands a
+client certificate the kubelet does not have), and a bound port says nothing about egress. In that
+state the broker knows and the operator does not. Closing it needs a transport from the broker to
+something the broker may write — and that list is exactly `actionrecords` and `actionrecords/status`,
+which _are_ the surface that is down. A heartbeat record would put a fourth kind of thing in an
+append-only audit trail whose contents are evidence. Rejected transports are enumerated in the file
+header so nobody re-derives them.
+
+**Verification.** `make -C k8s-operator test` green including the 125 s controller envtest, and
+`reap-envtest` reported nothing orphaned (B-004's fix, working); L0 chain **47/47** including
+V-RUN-012 and its negative control (8/8 breakages caught); invariants gate **30/30** after winding
+`dev/assertion-baseline.json` for the five new named tests (LSN-056); prettier clean over the full
+`origin/main...HEAD` set. No check ID claimed — 09 has no ID covering row 3, and the task section
+binds verification at the improvement pass. **The L2 opportunity to record there:**
+`dev/verify/broker-refuse-l2.sh` already induces exactly this condition, so an assertion on
+`status.broker.journalReachable` could ride it without new setup.
+
+---
+
+## Milestone audit 2026-07-31 — the ladder finished, the ratchet did not
+
+`harness-milestone` was invoked for Phase 9 and **stopped at §1**. Its four conditions were not all
+proven, and §1's instruction when any is unproven is _"stop and return to `harness-run`"_. No gate
+was run: §1 gates §2, and no amount of cluster time can change a fact established by reading the
+scripts. What follows is that reading.
+
+### The arithmetic first — the ladder really is done
+
+The ledger's Phase 9 row carried a stale leaf count (`56 of 60`) and said so. Reconciled by parsing
+every `P9-T…` ID in this file's task sections and reducing each to its parent, so that `T7c-2a`
+rolls up to `T7c-2` and not to `T7c`:
+
+|                                  |                                                                                        |
+| -------------------------------- | -------------------------------------------------------------------------------------- |
+| Leaf units in the Phase 9 ladder | **72**                                                                                 |
+| Moved out of the phase           | **2** — `T7c-2b` → Phase 10 (the `/replay` deferral, human-owned), `T8b-3b` → `P10-T3` |
+| In-phase leaves                  | **70**                                                                                 |
+| Done                             | **70**                                                                                 |
+
+So the _task ladder_ is complete. That is what made the stale count worth reconciling, and it is
+also why the next paragraph is the finding rather than a footnote: a finished ladder is exactly the
+condition under which a phase looks closeable.
+
+### The finding — 14 of the 55 required checks are asserted by nothing
+
+Every check ID in the "Acceptance → check binding" table above (Accept (a)–(e), the four ratchet-only
+rows, and the carried V-CMP-006) — 55 unique IDs — was audited against `verification/results.csv`
+and against every file in the tree that names it. Three populations came out:
+
+> **Superseded, and kept as the record of how the numbers moved.** This audit's denominator was the
+> hand-written table, and both the table and the derivation that reads it were wrong. `T11a` put the
+> figure at 38/17, `T11a-2` at 28/12, `T11a-3` at 34/19 against a required set of 98, and `T11c′` at
+> **22 not green of 82, 11 BLOCKING-ALWAYS**. The last is the live one; the sections at the end of
+> this file carry the working for each move.
+
+|                          | Count  | Meaning                                                                                                                                                            |
+| ------------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Green**                | 22     | a `pass` row with an `evidence_ref` (09 §9.4)                                                                                                                      |
+| **Asserted, unrecorded** | 19     | a test, script or policy in the tree names the ID; a gate run produces the row. Includes V-GAT-001 (only a `correction` row) and V-REV-007 (only a `decision` row) |
+| **Asserted by nothing**  | **14** | no `dev/` script, no Go test, no policy, no results row. Nothing in this tree can produce a verdict for these IDs                                                  |
+
+The fourteen, with the seven **BLOCKING-ALWAYS** ones in bold (09 §5: V-BRK, V-REV and V-ISO are
+BLOCKING-ALWAYS suites, and 09 §9.6 forbids deferring any of their members):
+
+| Check         | L      | 09 §6 text                                                                                                            |
+| ------------- | ------ | --------------------------------------------------------------------------------------------------------------------- |
+| **V-BRK-001** | L2     | From inside the agent container, a direct API write with the pod token fails ¬                                        |
+| **V-BRK-004** | L2     | A write with the `kube-agents/action-id` annotation stripped is rejected at admission ¬                               |
+| **V-BRK-016** | L2     | Post-execution journal failure — write lands, record cannot be completed: roll back, `RolledBack`, auto-pause, page ¬ |
+| **V-REV-009** | L2     | A destructive undo is itself gated — undoing a `create` whose plan deletes a bound PVC parks ¬                        |
+| **V-ISO-001** | L2     | CH1 controller down — agents **and brokers** keep executing; no new reconciles                                        |
+| **V-ISO-002** | L2     | CH2 controller up after loss — relaunches **both** workloads, rebinds **both** SAs                                    |
+| **V-ISO-006** | L2     | CH6 journal down — broker refuses to execute ¬                                                                        |
+| V-RUN-001     | L2     | Exactly two workloads per `Agent` CR, both owner-referenced; no third, no minted SA ¬                                 |
+| V-RUN-002     | L2     | Correct identity on each; neither settable to the other's value ¬                                                     |
+| V-RUN-004     | L2     | Labels `tier`/`scope`/`parent`/`role` on Deployments, pods and Services, and selectable                               |
+| V-RUN-005     | L2     | Startup ordering safe both directions; broker-first and agent-first both converge                                     |
+| V-RUN-006     | L2     | Agent with no broker fails closed into observe-and-report; no direct-write fallback ¬                                 |
+| V-RUN-009     | L2     | Deleting the CR removes both workloads and leaves both SAs intact                                                     |
+| V-RUN-014     | L0, L2 | One Socket Mode connection, fleet-wide; no agent pod holds an app token ¬                                             |
+
+Two of these need the record straightened rather than merely built:
+
+- **V-ISO-001/002 are cited in `pair_netpol.go` and `pair_netpol_test.go`, and both citations are
+  disclaimers.** `pair_netpol_test.go:35` says _"V-ISO-001/002 ask whether a packet is DROPPED, which
+  is L2 and belongs to P9-T9"_; `pair_netpol.go:68` records the same. A grep for the ID finds a file;
+  the file says it is not the assertion. That is the correct thing for those comments to say, and it
+  is why the audit had to read every hit rather than count them.
+- **`dev/verify/chaos-suite.sh` contains the word "broker" zero times.** Its C1 asserts that a
+  stand-in pod stays Ready, that the agent Deployment is not recreated, and that reconcile resumes.
+  Every one of those is about the agent. V-ISO-001's property is _"agents **and brokers**"_ and
+  V-ISO-002's is _"**both** workloads … **both** SAs"_. The suite predates the pair; it was never
+  wrong, it was written when there was one workload.
+
+### This is planning defect 4, arriving exactly as it predicted
+
+Defect 4, written at PLAN on 2026-07-27, says the ratchet contains _"seventeen ratchet checks unrun"_
+that no Accept bullet names, and declares the resolution: **"`verify-phase9.sh` runs the ratchet, not
+the Accept list."** The acceptance table above was amended with four ratchet-only rows, which is half
+the resolution. The other half was never built. `dev/verify/verify-phase9.sh` has sections A–I:
+A is the L0 chain, B–F are Accept (a)–(e), G is the phase's own unfinished work, H is _prior_
+regression via `verify-phase8.sh`, and I prints deferrals. **There is no section for V-ISO at all**,
+and the script names 18 check IDs in total against a ratchet of 55.
+
+This is [[LSN-019]]'s shape once more: prose on the artifact is not a mechanization. The resolution
+was written into a table a human reads and not into a script a machine runs, so the phase's own
+prediction of its own gap sat in the file the whole time and changed nothing. The count matching
+(17 predicted, 14 unasserted plus the 3 the disclaimers cover) is not a coincidence — it is the same
+list.
+
+### What the milestone did NOT do, deliberately
+
+- **No gate run.** `harness-milestone` §1 gates §2. Running the full gate would have consumed roughly
+  an hour of scratch-cluster time to rediscover, from a red section, what reading the scripts already
+  established — and it could not have discovered the 14, because a gate that never names an ID cannot
+  go red for it.
+- **No section-H back-fill, no ratchet extension, no `L2_CHAIN_FLOOR` move.** Same reason the
+  2026-07-30 merge did not: they would be unearned.
+- **No deferral rows.** Seven of the fourteen are BLOCKING-ALWAYS and 09 §9.6 forbids deferring them.
+  The other seven are ordinary scheduled work, not blocked on anything external.
+
+Precondition P1 was satisfied on the way in and is not wasted: all seven first-party images were
+rebuilt from `895aaf3` through Cloud Build and deployed **by digest** to `gke-scratch-kube-agents-dev`
+(`dev/cluster/reload-images.sh all`, exit 0). The cluster is at HEAD for whichever unit runs next.
+
+### The ladder this opens — P9-T11
+
+Four units, ordered so the gap becomes **detected** before it is closed. `T11a` is a check-only unit
+and is red by construction on today's tree; that is the point, and it is the same "detected rather
+than remembered" shape section G already uses. Guardrail 9 is satisfied structurally: `T11a` ships no
+implementation, and `T11b`–`T11d` ship no change to `T11a`'s arm.
+
+| Task                           | What to build                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Spec                             | Files                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Check IDs                                                                                          | Weight  |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- | ------- |
+| **P9-T11a** ✅                 | The ratchet arm planning defect 4 declared and never built. A new section in `verify-phase9.sh` that derives the Phase 9 ratchet from 09 §10 + the acceptance table and **fails on any member with no green `results.csv` row** — so the gate reports the gap instead of omitting it. Prints the three populations above. Red today, and its redness IS the worklist.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | 09 §10; planning defect 4        | `dev/verify/verify-phase9.sh` · possibly `dev/tests/` for the L0 half                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | V-MET-013, V-MET-014 (the arm is itself a check about checks)                                      | small   |
+| **P9-T11a-2** ✅               | **The ratchet arm under-counts green.** `parse_results` keys on the raw `check_id` cell, so a row naming `V-ISO-001, V-ISO-002` is filed under that literal string and matches neither ID. 36 of the 160 rows group IDs that way — it is the file's convention for a suite proving several rows at once, not an anomaly. Split the cell on the `V-XXX-nnn` pattern already in the module as `CHECK_ID`. Add a `--negative-control` case for a grouped row, since the current control only ever synthesises single-ID rows and is therefore blind to this.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | 09 §9.4                          | `dev/tests/phase-ratchet-is-asserted.py`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | V-MET-013, V-MET-014                                                                               | small   |
+| ~~**P9-T11b**~~                | **Split on 2026-07-31 into T11b-1 and T11b-2** (`harness-run` §2 Sizing — the row was weighted `large` and carries two independent suites, each needing its own destructive L2 run against the scratch cluster).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | 05 §8; 03 §4.1                   | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | —                                                                                                  | large   |
+| **P9-T11b-1** ✅               | V-ISO-001/002 — chaos for the **pair**. C1 and C2 asserted the agent workload only; extend both to the broker Deployment, both ServiceAccounts and both rebinds. Put `chaos-suite.sh` on `dev/L2-CHAIN.txt`, which it had never been on.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 05 §8                            | `dev/verify/chaos-suite.sh` · `dev/L2-CHAIN.txt`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | **V-ISO-001**, **V-ISO-002**                                                                       | medium  |
+| **P9-T11a-3** ✅               | **The ratchet arm ignores 09 §6's Phase column, and reads one row of 09 §10.** A bare suite name expanded to every member, so a shadow phase was asked for V-BRK-016 (the write lands), V-BRK-003 (real audit writes) and V-RUN-014 (§6: phase **15**); and §10's _"once a suite enters the ratchet it never leaves"_ was unimplemented, so V-CTN, V-CTR, V-CMP and V-MET — all in since phase 8 — were not required at all. Expand each suite against the catalog's due date, accumulate every row ≤ N, keep IDs §10 names outright unfiltered, and PRINT what the filter removed. 21 out, 31 in: **70 → 80**.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | 09 §6 preamble; 09 §10           | `dev/tests/phase-ratchet-is-asserted.py` · `dev/test_invariants_gate.py`                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | V-MET-013, V-MET-014                                                                               | small   |
+| **P9-T11b-2** ✅               | V-ISO-006 — CH6, journal down → broker refuses to execute. Arm B was bound to the ID it already proved, and **arm C was added**: CH6's last clause — restoring the journal restores service _without a broker restart_ — separates a broker that refuses from one that bricks, and arm B passes either way. Cross-reference added in `chaos-suite.sh` instead of a second, thinner CH6.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | 03 §4.1; 06 §4.4 row 3           | `dev/verify/broker-refuse-l2.sh` · `dev/verify/chaos-suite.sh`                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | **V-ISO-006**                                                                                      | small   |
+| **P9-T11c′** ✅                | **This file's own acceptance table demanded 16 IDs 09 §6 dates after phase 9** — V-BRK-001/003/004/016, V-GAT-019/021/022, V-REV-002/005/006/007/008/009, V-RUN-006/013/014. The required set is the UNION of §10 and this table, so the table kept every one of them required. Retargeted to the phase §6 names, recorded in their own `##` section so the record and the requirement do not share a parse. Required **98 → 82**, not green **34 → 22**, BLOCKING-ALWAYS **19 → 11**. Split out of `T11a-3` under Guardrail 9: that unit moved the measurement, this one moves the verdict.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 09 §6; 09 §10                    | `docs/build/phase-9.md`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | V-MET-013                                                                                          | small   |
+| **P9-T11c″** ✅                | **The control was coupled to the document it audits, in three places, and read 20/20 throughout.** `stage()`'s `name_in_table` PREPENDED instead of replacing; three victim pools filtered on _"not named by the table"_; and the under-naming case staged the live document. Completing the table took the control from 20/20 to **unstageable**. Repaired: one `victim_pools()` definition site for staging and audit, a stageability guard that re-runs the pools against a complete and a retargeted table on every ordinary run, and `_control_against()` in the unit suite so both future trees are committed cases rather than a `/tmp` probe ([[LSN-053]]). Check-only, no artifact change — and **landed before `T11c′`**, which is the unit's own finding. Followed by **`P9-T11c″-b`**: the repair had the same coupling in it, one level up — both future-tree fixtures and the guard derived their hypothetical table from the live one, so `T11c′` collapsed it. Fixed to derive from 09 alone, detector lifted out and tested; sweep 6/6 → **9/9**.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | [[LSN-053]]                      | `dev/tests/phase-ratchet-is-asserted.py`, `dev/test_invariants_gate.py`                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | V-MET-013, V-MET-014                                                                               | small   |
+| **P9-T11c‴** ✅                | **The acceptance table named 39 of the 82 obligations the phase is closed against.** The other 43 (V-BRK-018, V-BRK-022…032, V-CTN-001/012/015/016/017/020/037, V-CTR-001/002/003/006/007/014/015/016/017/018/020, V-MET-001…009/013/014, V-REV-010/011) reached the required set only through 09 §10's suite names, so the phase file both was and was not the record of what it owed. Added as eight themed _(ratchet only)_ rows, each carrying its level and target from 09 §6. **The required set did not move — 82 before, 82 after** — which is the whole point: nothing was added to the gate, the gate was written down. Property 4 silent; the union is now the table plus nothing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | 09 §10                           | `docs/build/phase-9.md`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | V-MET-013                                                                                          | small   |
+| **P9-T11f** ✅                 | **17 of the 251 check IDs 09 mentions have no 09 §6 catalog row** — 14 V-CMP (001–008, 010, 011, 020–023, prose bullets in §5) and **V-MET-010/011/012** (§14). §6 calls itself _"the authoritative index"_; a check absent from it is a check no suite-name expansion can reach, and both suites are in the phase-8 ratchet row. Three are BLOCKING-ALWAYS. All three are implemented — the hole is in the index, not the work — but a gate that cannot see a BLOCKING-ALWAYS check cannot fail on it. Catalogued: a new **§6.15** for the fourteen V-CMP, three rows appended to the §8 V-MET table, and every §5/§14 prose bullet de-bolded so each ID keeps one definition site. Required **82 → 91**, not green **22 → 26**, BLOCKING-ALWAYS not green **11 → 13**; the unit's own V-MET-010 run then closed one, ending at **25 / 12**.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | 09 §5, §6, §14                   | `docs/design/09-verification-and-validation.md` · `docs/build/phase-9.md`                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | V-MET-010, V-MET-013                                                                               | medium  |
+| ~~**P9-T11g**~~                | **Split at ORIENT on 2026-07-31 into `-1`…`-4`, because its premise was wrong.** The row promised _"eleven runs to be made, not rows to be written"_ and two builds. Auditing all thirteen against the tree found **one run and twelve builds**: only V-MET-012 was implemented-and-unrecorded. It also found a **fourteenth** not-green BLOCKING-ALWAYS check, **V-MET-002**, which this file names nowhere and which reaches the required set only through `T11c‴`'s themed `V-MET-001…009` ratchet row. Full audit in § `P9-T11g-1` below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | 09 §9.4; 09 §10                  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | → `T11g-1`…`T11g-4`                                                                                | —       |
+| **P9-T11g-1** ✅               | **The audit, the re-split, and the one artifact that closed two IDs.** Established for each of the thirteen whether its property is asserted anywhere: V-MET-012 is `dev/tests/spec-ids.py` and green on every run (recorded); everything else is unbuilt. Built `dev/tests/crd-has-no-authority-fields.py`, which closes **V-CTR-003 and V-CMP-011** together because 06 §10 states them in one sentence — five properties (no prohibited name at any depth under `spec`, no `x-kubernetes-preserve-unknown-fields` at any depth, a non-vacuity floor, **the Go source's JSON tags** since no PR check regenerates the CRD, and the L2 V-9 pruning arm still existing), `--negative-control` 6/6. Required 91 unchanged; not green **25 → 22**, BLOCKING-ALWAYS **12 → 11**.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | 06 §10; 09 §6.5, §6.15           | `dev/tests/crd-has-no-authority-fields.py` · `dev/L0-CHAIN.txt`                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | V-CTR-003, V-CMP-011, V-MET-012                                                                    | medium  |
+| ~~**P9-T11g-2**~~              | **Split at IMPLEMENT on 2026-07-31 into `-2a` and `-2b`, because the row's "one tool over `verification/traceability.yaml`" pointed at a file that answers a different question.** ~~Neither `verification/traceability.yaml` nor `verification/coverage.yaml` is in the tree~~ — **corrected 2026-07-31, same day, by the next unit's ORIENT: `verification/traceability.yaml` HAS existed since `P8-T10` (`ead358e`), 71 KB, 177 entries.** The split's conclusion survives the correction and its stated reason did not, which is the part worth keeping: `traceability.yaml` maps the **177 Verification bullets** of 01–08 to check IDs, and that is V-MET-011's artifact, already green. 09 §8 asks for something an order of magnitude larger — `R-<doc>.<section>-<n>` over **every normative statement** (must / never / always / is rejected / is a defect / may not, plus every mandated-behaviour table row), which §8.1 counts at ~538. That ID space has never been minted: repo-wide, the only two occurrences of `R-<doc>.<section>-<n>` are the two sentences in §8 that _define_ it. `verification/coverage.yaml` was genuinely absent on 2026-07-31, the day this row was written; it was created later that same day by `2153772`. V-MET-002/008/009 read a requirement→check mapping; V-MET-001 reads a check→implementation one; only the second was a session's work.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 09 §8, §8.1                      | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | → `T11g-2a`, `T11g-2b`                                                                             | —       |
+| **P9-T11g-2a** ✅              | **V-MET-001 — and the artifact it needed did not exist.** 09 §8 states it as two directions between two sets; nothing in the tree held the second one. The nearest thing was the ratchet's `hint: named by …` column, a `git grep` under a footer disclaiming it — **and that disclaimer was earned again this phase**: `T11g` was scheduled on the hint column promising eleven runs, and nine of the eleven were "named by" a parser fixture, by `binding.md` and the skills that _require_ the check, or by VAP corpora nothing runs. Built **`verification/implementations.yaml`** (a curated `check-id → {runs, asserts_in}` registry, 81 entries) and **`dev/tests/check-ids-have-implementations.py`**, seven properties: registry keys are §6 IDs; every `asserts_in` exists **and names its own check ID**; every `runs` appears verbatim on a chain (or is one of the two entry points no chain line carries) **and reaches the file it claims**; forward-phase-scoped over required∩green; every check-ID token in the test corpus is §6-defined; and the `unimplemented:` count is pinned at 1. `--negative-control` **8/8**. Three findings, below. Not green **22 → 21**, BLOCKING-ALWAYS **11 → 10**.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | 09 §8; 09 §9.4                   | `verification/implementations.yaml` · `dev/tests/check-ids-have-implementations.py` · `dev/L0-CHAIN.txt` · 6 test files given a check-ID declaration                                                                                                                                                                                                                                                                                                                                                                                       | V-MET-001                                                                                          | medium  |
+| ~~**P9-T11g-2b**~~             | **Split at SELECT on 2026-07-31, before any code, because the row was sized `large` and the sizing was real.** 09 §8's population is ~538 by the §8.1 shape; a mechanical count over 01–08 puts it near 900. Enumerating that, curating a requirement→check mapping over it, and building three BLOCKING-ALWAYS checks is not one session, and `harness-run` §2 forbids carrying an oversized unit forward. Split into the **denominator** (`-2b-i`) and the **numerator and its gates** (`-2b-ii`), with `-2b-0` falling out of `-2b-i` under Guardrail 9. The seam is load-bearing rather than convenient: V-MET-002 and V-MET-008 are both statements about a ratio, and neither can be built — or falsified — before the thing being divided by exists.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | 09 §8, §8.1                      | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | → `T11g-2b-0`, `T11g-2b-i`, `T11g-2b-ii`                                                           | —       |
+| **P9-T11g-2b-0** ✅            | **The spec-text exemption follows the content into a generated mirror.** Two L0 lints scan every tracked file for bytes that must not appear in source — the retired `ALLOW_ALL_USERS` hatch (V-CTR-002/V-CTR-014) and any `kubeagents.` domain the operator does not serve (LSN-032) — and both already exempt `docs/design/`, because a spec has to describe what was removed. `verification/requirements.yaml` is a verbatim mirror of those sentences under a scanned suffix, so both fired: 07 §2's acceptance text names `*_ALLOW_ALL_USERS` while describing its deletion, and 06 §8's observability table names eleven OTel attribute keys. **Split out under Guardrail 9** — a check may not change in the same unit as the work whose failure motivated it. Both entries are an **exact path, never a `verification/` prefix**, following the precedent set on 2026-07-26 when V-CTR-014's evidence rows moved into `results.csv`. For the group lint this is the narrower of the two fixes available: widening `NON_GROUP_ATTRIBUTES` would have exempted those eleven spellings in Go and YAML source too, and that set is closed precisely because an attribute-key typo is the same silent defect as a group typo. Over-breadth **probed, not assumed** — a sibling `verification/probe-sibling.yaml` carrying both an emission and `kubeagents.wrong.io` is still caught by both.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | 09 §8; LSN-032                   | `dev/tests/closed-allowlist.py` · `dev/tests/api-group-single-sourced.py`                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | V-CTR-002, V-CTR-014 (regression)                                                                  | small   |
+| **P9-T11g-2b-i** ✅            | **V-MET-009 — the denominator 09 §8 asks for did not exist.** _"Every normative requirement in 01–08 maps to at least one check ID"_ had no population behind it, so §8.1's _"roughly 45% uncovered"_ was a percentage with no list — the exact shape V-MET-009 forbids. Built **`verification/requirements.yaml`** (853 requirements, `R-<doc>.<section>-<n>`, generated), **`verification/coverage.yaml`** (the uncovered list published **by ID**), and **`dev/tests/requirements-are-enumerated.py`**, which is both enumerator and lint over its own output. Six properties: the enumeration is current against the specs **by text, not count**; IDs are well-formed and contiguous 1..n; coverage agrees with the enumeration; the uncovered list is **published, not counted**; it is complete and resolves; and the recorded §8.1 baseline matches the spec cell for cell. `--negative-control` **8/8**. Not green **21 → 20**, BLOCKING-ALWAYS **10 → 9**.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | 09 §8, §8.1, §9.4                | new `verification/requirements.yaml` · new `verification/coverage.yaml` · new `dev/tests/requirements-are-enumerated.py` · `dev/L0-CHAIN.txt` · `verification/implementations.yaml` · `verification/results.csv`                                                                                                                                                                                                                                                                                                                           | V-MET-009                                                                                          | medium  |
+| ~~**P9-T11g-2b-ii**~~          | **Split at SELECT on 2026-07-31, before any code, because the numerator is a curation job and the machinery is not.** The row asked for the curated `checks:` mapping **and** both gates. Measuring first: deriving ownership from 09 §6's `Source` cells puts **357 of the 853** requirements under V-CTN/V-BRK/V-REV/V-ISO/V-ADV — 267 table rows and 90 prose statements across 32 spec sections — and **V-MET-002 demands every one of them map to a real check**. Section-citation cannot be that mapping: a requirement is _owned_ precisely because some load-bearing check cites its section, so reusing the citation as coverage makes V-MET-002 green by construction — the exact false green 09 §8.1 distinguishes _fully covered_ from _partial_ to avoid. So the mapping has to be argued statement by statement, and that is not one session with margin on top of two BLOCKING-ALWAYS lints. **The seam is ownership-and-arrival versus the draw-down:** V-MET-008 needs ownership (it governs the requirements that are _not_ load-bearing) and needs no curation at all, because §8.1 scopes it to _"a **new** normative statement arrives with a check or a named deferral"_. V-MET-002 needs the curation and nothing else.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | 09 §8, §8.1                      | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | —                                                                                                  | —       |
+| **P9-T11g-2b-ii-1** ✅         | **Ownership, derived and published — and the ratchet that needs no curation.** Derive requirement→suite ownership from 09 §6's `Source` cells (`03 §11`, `03 §3.3, §4.3` — a bare `§` inherits the last document named in the cell), plus **§6.4's prose case**: the V-ISO table has no `Source` column at all and its section says _"CH1–CH9 as defined in 05 §8"_, so a derivation that reads only cells silently gives a BLOCKING-ALWAYS suite zero owned requirements. **A load-bearing suite that derives to zero owned sections is a hard failure**, not an empty set — that is the mechanized form of the resume note's warning that whoever declares ownership can make V-MET-002 green by declaring everything unowned. Then build **V-MET-008**: §8.1's arrival clause over a **digest baseline** — a committed set of content digests of the normative statements as they stand today, so a statement added later is detected by its text rather than by a positional ID that every insertion above it shifts — plus the fall-protection clause over `totals` and a `deferrals:` register in the shape V-MET-006 already asks for. Publishes the per-suite uncovered list **by ID**, which is V-MET-002's measurement without V-MET-002's gate.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | 09 §8, §8.1, §6.4                | `verification/coverage.yaml` · a coverage baseline file · `dev/tests/` · `dev/L0-CHAIN.txt`                                                                                                                                                                                                                                                                                                                                                                                                                                                | V-MET-008                                                                                          | medium  |
+| ~~**P9-T11g-2b-ii-2**~~        | **Split at SELECT on 2026-07-31, before any code, on a measurement and an ordering constraint.** The **measurement**: the 357 are not spread evenly — **227 of them are document 06 alone** (§1.1 19, §1.2 21, §2.2.1 1, §2.3 7, §4.1 39, §4.2 52, §4.3 43, §4.3.1 8, §4.4 18, §7 7, §9 12), against **130** across the other seven documents' 21 sections. Every mapping decision costs one read of the statement and one read of the candidate suite's assertion text, and the candidate sets are thin where the sections are fattest — 06 §4.2 is 52 requirements against **two** candidates (V-BRK-022, V-BRK-024), 03 §9 is 11 against one. That is not one session with margin. The **ordering constraint** is the sharper half: `check-ids-have-implementations.py` requires a check's `runs` command to appear verbatim on a chain, and the chain must be green — so **V-MET-002 cannot be added to `dev/L0-CHAIN.txt` until the worklist is already empty.** The gate is not the same unit as the draw-down; it is downstream of it. Split by document, then the gate.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | 09 §8, §8.1                      | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | → `T11g-2b-ii-2a`…`-2c`                                                                            | —       |
+| **P9-T11g-2b-ii-2a** ✅        | **The draw-down mechanism, and document 06's 227.** The mapping is curated **into `verification/requirements.yaml`'s own `checks:` lists** — no second file, on `verification/traceability.yaml`'s precedent (curated, one long header carrying the grouped arguments, no per-entry rationale), because a separate decision table would be a second definition site for the same fact and the lint would then have to keep two artifacts in step. `--emit` already merges rather than overwrites, so the curation survives regeneration; `coverage.yaml` and `coverage-ratchet.yaml` are re-emitted so the floor rises and the worklist shrinks. Then apply it to **06** — the broker contract, whose owning suite (V-BRK) is the one this phase built. **Two rules inherited from the split.** (1) **Section-citation is not coverage** — a requirement is _owned_ precisely because some load-bearing check cites its section, so reusing the citation as the mapping makes V-MET-002 green by construction; the grouped cases (§4.1's envelope field rows, §4.2's rule fields, §4.3's `ActionRecord` fields) are grouped decisions with one written argument each, not automatic ones. (2) **A requirement with no honest check is left unmapped** — the gap is the finding, and it is published by ID. Claimed check is **V-MET-008 as a regression**: the floor may rise, and the ratchet must still hold across the re-emit. **✅ DONE 2026-07-31 — 222 of 06's 227 mapped, worklist 357 → 135, floor 0 → 222.** Five requirements left unmapped and published by ID rather than closed with the nearest-looking row: `R-06.2.3-6` (nothing asserts the _absence_ of a developer-team actor GSA), `R-06.4.2-17` (no check asserts `ChangePolicy` dialect admission), and `R-06.4.2-30`/`-44`/`-45` — one hole, no catalog check reaching secret-material handling inside the code floor; closing it is a **catalog** change. The re-emit kept all 222, which is the merge property this row claimed V-MET-008 for. **And it caught a broken control:** moving `coverage.yaml`'s `covered` off `0` turned V-MET-009's mutation into a no-op that reported `MISS` where the truth was `BROKEN`; repaired both ways and **LSN-063** opened for the nineteen other control loops with the same exposure.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | 09 §8, §8.1                      | `verification/requirements.yaml` · `verification/coverage-ratchet.yaml` · `verification/coverage.yaml` · `dev/tests/`                                                                                                                                                                                                                                                                                                                                                                                                                      | V-MET-008 (regression)                                                                             | large   |
+| **P9-T11g-2b-ii-2b** ✅        | **The remaining 130, across seven documents and 21 sections.** 03 (55: §4.3 20, §9 11, §6 6, §8 6, §3.2 3, §3.1/§3.3/§4.1/§4.2 2 each, §1 1), 02 (27: §7 18, §6 8, §4 1), 04 (17, all §5.1), 05 (17: §1.2 9, §7 6, §1.3 2), 08 (7: §2.5 6, §2.3 1), 07 (5, all §5), 01 (2, §3). Same two rules, same mechanism — this row exists because the reading is per document and the documents are independent, not because the work differs. ✅ **DONE 2026-07-31.** 89 mapped here (118 with the 29 for 01 §3 and 02 §§4/6/7 done in the same session), coverage 222 → 340, floor 222 → 340, worklist 135 → **17**. Twelve further gaps published by ID rather than closed with the nearest-looking row: `R-03.4.3-8` (ancestor `Agent` CR), `R-03.4.3-9` (live tier template), `R-04.5.1-9`…`-16` (04 §5.1's **settle-window** table — V-PRO-013 exercises the _predicate_ table beside it), `R-05.1.2-2` (snapshot `Secret` digests), `R-07.5-4` (the _authority-never-precedes-machinery_ **ordering** gate). Each is a catalog change. Also repaired V-MET-008's floor mutation, which had expired against the literal it was keyed to — [[LSN-063]] recurring one unit after it was opened.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | 09 §8, §8.1                      | `verification/requirements.yaml` · `verification/coverage-ratchet.yaml` · `verification/coverage.yaml`                                                                                                                                                                                                                                                                                                                                                                                                                                     | V-MET-008 (regression)                                                                             | medium  |
+| ~~**P9-T11g-2b-ii-2c**~~       | **V-MET-002 itself.** Every load-bearing-owned requirement maps to ≥1 check; an unmapped one fails the build. Lands on `dev/L0-CHAIN.txt` only once `-2a` and `-2b` have emptied the worklist, per the ordering constraint above. If the worklist is **not** empty when this row is reached, that is the honest outcome and V-MET-002 stays red — 09 §8.1 dates the load-bearing draw-down to _"before Phase 10 grants the first write credential"_, and buying a green with a citation would be the false green that dating exists to prevent. A red BLOCKING-ALWAYS check at the milestone is a halt, not a deferral (09 §9.6). **Split at SELECT on 2026-07-31, before any code, on Guardrail 9.** The worklist was _not_ empty when this row was reached — sixteen obligations remain, and every one of them is unmapped because **no catalog row asserts the property**, not because a check is red (coverage ≠ greenness: V-MET-002 asks only that a requirement _maps to_ ≥1 catalog check). Closing them is therefore a **09 §6 catalog** change, which is exactly the artifact V-MET-002 measures — so writing the check and growing the thing it measures in one unit puts the check's author and its subject in the same diff, and the cheapest route to green becomes "measure less". Build the check first, red and honest, publishing all sixteen by ID; grow the catalog second. `-2c-i` carries the [[LSN-053]] obligation: it is green on the synthesised future tree as a committed `--negative-control` row.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | 09 §8, §8.1, §9.6                | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | → `T11g-2b-ii-2c-i`, `-2c-ii`                                                                      | —       |
+| **P9-T11g-2b-ii-2c-i** ✅      | **The check, red and honest.** `dev/tests/load-bearing-coverage-is-full.py` — three properties: **P1** non-vacuity (the load-bearing partition yielded ≥300 owned obligations, the enumeration ≥700 statements, no load-bearing suite owns nothing, the derivation resolved); **P2** every owned obligation maps to ≥1 check, one finding **per** unmapped obligation, by ID and in the statement's own words, never a count (09 §8.1's pairing with V-MET-009); **P3** every claimed ID resolves to a real 09 §6 catalog row. **Live arm is deliberately off `dev/L0-CHAIN.txt`**, on the `phase-ratchet-is-asserted.py` precedent recorded there: a required PR check that is red for a whole phase reddens every unrelated commit ([[LSN-055]]). It runs in `dev/verify/verify-phase9.sh` **section K**, and `invariants-gate.py::check_phase_gate_publishes_the_coverage_remainder` is what stops that section being deleted — two properties (invoked at all; its red reaches `bad` within twelve lines), seven control arms, grandfathering phases 2–8 by explicit list rather than by floor. The **`--negative-control` arm is on-chain** and runs against the **synthesised future tree** — `_future_tree()` fills each unmapped obligation's `checks:` with its first owner, asserts that base is GREEN before mutating (`BROKEN` if not), resolves its victim dynamically as the first owned obligation in document order, and scores **8/8** with the [[LSN-063]] no-op guard. **No `implementations.yaml` row and no `results.csv` row**: the registry's own rule is _"a check with no green row is absent, and that is correct — do not add a row for work you intend to do"_, and the absent pass row is precisely what `phase-ratchet-is-asserted.py` already reports. **✅ DONE 2026-07-31.** Live arm rc=1 publishing all sixteen; control 8/8; 32/32 invariant checks; 422 dev tests. **One correction landed with it:** `R-06.4.2-30` (`secret-material-egress`) was a curation error, not a stricter reading — it is a row of the same code-floor rule table as `secret-write` and `blast-radius-cap`, `RuleSecretMaterialEgress` is a member of `classify.AllFloorRuleIDs`, and the corpus carries nine cases for it, so V-MET-005 and V-GAT-001 reach it by exactly the argument that maps every sibling. Coverage 340 → **341**, worklist 17 → **16**. **And one finding for the improvement pass:** `verify-phase9.sh` section A's L0 line floor read `43` against a 56-line chain — thirteen lines of slack, the exact failure the sentence beside it describes. Raised to 57 and a derived-floor lint queued ([[LSN-019]]).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | 09 §8, §8.1, §9.6                | `dev/tests/load-bearing-coverage-is-full.py` · `dev/L0-CHAIN.txt` · `dev/verify/verify-phase9.sh` · `dev/tests/invariants-gate.py` · `dev/test_invariants_gate.py` · `verification/requirements.yaml` · `verification/coverage*.yaml`                                                                                                                                                                                                                                                                                                      | V-MET-008 (regression), V-MET-009 (regression)                                                     | medium  |
+| ~~**P9-T11g-2b-ii-2c-ii**~~    | **The sixteen, and the green.** Grow the 09 §6 catalog with the rows that close them — each a real, provable property with a suite, a Source, a level and a phase, never a row written to be cited. **Split three ways at SELECT on 2026-07-31, on harness-run §2 sizing, before any code.** Sixteen obligations across seven unrelated properties is not one unit: each closure is _read the requirement, find or build the machinery, argue the row_, and the arguments do not share a shape — a doc-drift lint over two tables, a catalog row pointed at a gate that already exists, and rows whose machinery has to be found first. Carrying them together would also hold V-MET-002 red until the last one lands, which is the whole worklist hostage to its hardest member. Split by **what the closure costs**, not by document: `-a` is one lint closing eight rows, `-b` is the rows whose machinery is already in the tree, `-c` is the remainder plus the green.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | 09 §6, §8, §8.1                  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | → `-2c-ii-a`, `-2c-ii-b`, `-2c-ii-c`                                                               | —       |
+| **P9-T11g-2b-ii-2c-ii-a** ✅   | **The settle windows — eight of the sixteen, one lint.** `R-04.5.1-9`…`-16` close together because they are one table. **V-REV-012** (09 §6.3, Source 04 §5.1, L0, phase 9): `dev/tests/settle-windows-match-the-spec.py` reads the durations out of 04 §5.1's **window** table and out of `k8s-operator/internal/broker/verify/predicate.go`'s `settleWindows` map and compares them cell for cell. Five properties: non-vacuity (exactly the eight labels parse, all three constants found, the ceiling sentence found, no spec label left unbound); every published row resolves to its code entries with the same duration, positionally where a row names N kinds; nothing in the map is unpublished; `MaxSettleWindow` equals the stated 30 minutes and no row exceeds it; `DefaultSettleWindow` equals the `Custom resource` row. **Why it is a check at all:** §5.1 holds **two** per-kind tables, V-PRO-013 owns the predicates, and the section says in as many words why it states numbers — _"'Bounded' on its own is unfalsifiable — any number satisfies it — so the windows are stated here rather than left to the implementation."_ A check that waits for a rollout to settle waits **some** window and cannot fail when a constant drifts. **✅ DONE 2026-07-31.** Live arm green, negative control **12/12 from both ends of the drift** — six mutations per artifact, because a doc-drift lint exercised on one side only is half a check. **Worklist 16 → 8, coverage 341 → 349, floor rebaselined, 04 covered 9 → 17.** Two sizing decisions are written into the check itself: **no floor on the code-entry count** (a broken parse already yields eleven findings naming eleven kinds, which is louder and better attributed than a count — and a floor at the map's real size would make the _falls through to the default_ branch unreachable by any single-entry deletion, which is protection no control can exercise), and the insert mutation is **anchored on `15s`** because both of §5.1's tables carry an `RBAC` row and the unanchored form edited the one this check does not read.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 09 §6.3, 04 §5.1                 | new `dev/tests/settle-windows-match-the-spec.py` · `docs/design/09-verification-and-validation.md` · `verification/requirements.yaml` · `verification/coverage.yaml` · `verification/coverage-ratchet.yaml` · `dev/L0-CHAIN.txt` · `verification/implementations.yaml` · `verification/results.csv`                                                                                                                                                                                                                                        | V-REV-012, V-MET-008/009/001 (regression)                                                          | medium  |
+| ~~**P9-T11g-2b-ii-2c-ii-b**~~  | **The rows whose machinery is already in the tree.** Four closures, each a **catalog** change pointed at code that exists rather than a new implementation — surveyed before the split so the unit is row-writing and not discovery. `R-07.5-4` (_authority never precedes machinery_) → `invariants-gate.py::check_write_verbs_have_machinery`; it is the instructive one, unmapped **only** because no catalog ID claims it. `R-06.4.2-17` (a `fieldPaths` entry beginning with `/` is rejected at `ChangePolicy` admission) → `ValidateDottedPath` plus `changepolicy_webhook.go:138`. `R-05.1.2-2` (snapshots stripped of `managedFields` and of `Secret` `data`, with a per-key digest instead of material) → `internal/journal/snapshot.go`. `R-06.4.2-44`/`-45` (the live-Secret digest **comparison method**, and that digests are never journaled or logged) → `internal/broker/classify/secretegress.go` (`DigestSet`, `NewDigestSet`, `DigestCacheTTLSeconds`). Each row must state a property the named code actually asserts **under test**: a row pointed at code with no assertion behind it is V-MET-014's failure wearing a catalog ID, and V-MET-001 refuses it unless the `runs:` line is on a chain. **Split two ways at IMPLEMENT on 2026-07-31, on harness-run §2 sizing.** The pre-split survey said "four catalog rows"; the machinery survey done at IMPLEMENT said two of the four need a **new assertion** and three need a Go mutation sweep (the existing sweeps in this tree run 6–22 mutants each), which is a different unit. The split axis is **whether the closure authors a new property assertion**: `-b-1` adds only negative controls over assertions that already exist, `-b-2` must write one, because `R-06.4.2-45` is a three-clause conjunction whose middle clause — _digests are computed in-broker, held in memory, **never journaled and never logged**_ — has no assertion anywhere in the tree, and a catalog row pointed at code with no assertion behind it is V-MET-014's failure wearing a catalog ID.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 09 §6, §8                        | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | → `-2c-ii-b-1`, `-2c-ii-b-2`                                                                       | —       |
+| **P9-T11g-2b-ii-2c-ii-b-1** ✅ | **The two that need only a control.** **V-CTN-038** (09 §6.1, Source 07 §5, L0, phase 9, ¬) closes `R-07.5-4`: no agent-identity `Role`/`ClusterRole` anywhere in the tree — `.yaml.template` included, because a verb that appears only after envsubst is still granted — carries a verb outside `get`/`list`/`watch` while the broker, risk classifier, `ActionRecord` journal or undo path is missing; `*` is a write verb; the finding names the file, the verb and **every** absent item; ordering, not prohibition, so Phase 10 satisfies the row rather than deleting it. **V-CTR-021** (09 §6.9, Source 06 §4.2, L1, phase 9, ¬) closes `R-06.4.2-17`: the two path dialects are never interchangeable at any of the three places one could be accepted for the other — admission (with the message 06 §4.2 specifies, against the offending **index**, exactly once), `ValidateChangeRule` for objects that never met the webhook, and the matcher, which matches **nothing** rather than helpfully normalising. **✅ DONE 2026-07-31.** Controls **9/9** and **7/7**. **Worklist 8 → 6, coverage 349 → 351.** Three findings are written into the artifacts rather than this row: (a) invariant 7's green came from `missing_machinery()` being empty, **not** from an absent write verb — eleven documents in this tree do grant one — so the branch that raises the finding had never executed and M7 shows it would have named only the first absent item; (b) `invariants-gate.py` carried a paragraph whose argument rested on nothing named V-CTR-021 existing, which issuing the ID expired, so it now dates the claim; (c) the assertion baseline was wound twice because the first winding happened mid-IMPLEMENT, before a test's name was final, and the deletion arm then reported a test gone that never reached a commit.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 09 §6.1, §6.9, 07 §5, 06 §4.2    | `docs/design/09-verification-and-validation.md` · `dev/tests/invariants-gate.py` · `dev/test_invariants_gate.py` · `dev/assertion-baseline.json` · new `verification/mutants/V-CTN-038.json` · new `verification/mutants/V-CTR-021.json` · `k8s-operator/internal/webhook/changepolicy_webhook_test.go` · `verification/requirements.yaml` · `verification/coverage.yaml` · `verification/coverage-ratchet.yaml` · `verification/implementations.yaml` · `dev/tests/requirements-are-enumerated.py` · `verification/results.csv`           | V-CTN-038, V-CTR-021, V-MET-001/003/008/009 (regression), V-MET-002 (red, expected)                | medium  |
+| **P9-T11g-2b-ii-2c-ii-b-2** ✅ | **The two that need a new assertion.** **V-OBS-008** (09 §6.10, Source 05 §1.2, L1, phase 9, ¬) closes `R-05.1.2-2`: a journal snapshot is stripped of `managedFields` and of `Secret` `data`, and a `Secret`'s pre-state is recorded as a **per-key** digest rather than material — `internal/journal/snapshot.go`, already asserted by `TestSanitizeStripsManagedFields`, `TestSanitizeStripsLastAppliedConfiguration` and `TestSanitizeDigestsSecretDataPerKey`, so this one is a control plus a sweep. **V-GAT-024** (09 §6.5, Source 06 §4.2, L1, phase 9, ¬) closes `R-06.4.2-44` and `-45`, and is the reason for the split: `-44` (the comparison method is a match against live `Secret` values, `sha256(secretNamespace ‖ 0x1f ‖ value)`, never a heuristic) is asserted, and so is `-45`'s third clause (`reasons[]` names the source `Secret` and key, never the value — `TestSecretHitNeverCarriesTheValue`), but `-45`'s **middle** clause is asserted by nothing. Planned closure: a **closed-allowlist** Go test in the shape `dev/tests/closed-allowlist.py` uses — `*DigestSet`'s exported method set is exactly `{Lookup, Len}` and neither returns a digest, and `SecretHit`'s field set is exactly `{Namespace, Secret, Key, Where, Form}` — which makes a digest **unreachable** outside package `classify` and therefore impossible to journal or log, rather than asserting that no current call site does it. Non-test `DigestSet` users are already confined to `internal/broker/classify/` and `internal/broker/livestate/`. **✅ DONE 2026-07-31.** Sweeps **9/9** and **10/10**. **Worklist 6 → 3, coverage 351 → 354.** Two things came out differently from the plan and both are recorded in the artifacts rather than here. (a) V-OBS-008 was surveyed as "a control plus a sweep" and is not: the three existing tests read named fields back out of the sanitized map, so material that escaped into an annotation or a nested list satisfies all of them, and — the real gap — **nothing joined the two packages**. `journal.Sanitize` writes the `sha256:` marker and `undo.RedactedSecretKeys` refuses on it; each side stated the contract in a doc comment from its own end and neither was a test. A drift there does not fail, it writes the hex of each value's own digest into the live Secret and reports a completed undo. The new file is an external test package (`journal_test`) so it may import `undo`, which imports `journal`. (b) V-GAT-024 grew a third property beyond the planned closed allowlist: the **formula** itself was unasserted — `Len()` was never pinned, so the `0x1f` separator and the closed set of three forms could both drift silently — and the package's freedom from a logger, which is what makes "never logged" a property of the code rather than of today's call sites. **FINDING, queued for the improvement pass:** `url.QueryEscape(testSecretValue) == testSecretValue`, so the `url` arm of `TestSecretMaterialMatchesEncodedForms` has taken its `t.Skip` on every run since it was written and has never asserted anything; changing the constant ripples through sixteen tests including the connection-string limitation fixture, so it is not this unit's to fix — the form is covered from here on by V-GAT-024's own fixture. | 09 §6.5, §6.10, 05 §1.2, 06 §4.2 | `docs/design/09-verification-and-validation.md` · new `k8s-operator/internal/broker/classify/digest_containment_test.go` · new `k8s-operator/internal/journal/snapshot_redaction_test.go` · `dev/assertion-baseline.json` · new `verification/mutants/V-OBS-008.json` · new `verification/mutants/V-GAT-024.json` · `verification/requirements.yaml` · `verification/coverage.yaml` · `verification/coverage-ratchet.yaml` · `verification/implementations.yaml` · `dev/tests/requirements-are-enumerated.py` · `verification/results.csv` | V-OBS-008, V-GAT-024, V-MET-001/003/008/009 (regression), V-MET-002 (red, expected)                | medium  |
+| ~~**P9-T11g-2b-ii-2c-ii-c**~~  | **The remainder, and the green.** The three with no machinery yet: `R-03.4.3-8` (no write to an `Agent` CR whose identity is an **ancestor** of the writer's — V-CTN-007 covers the writer's own CR, V-CTN-025 the brake field on a **child's**, and nothing walks `parentRef` upward), `R-03.4.3-9` (actor writes stay inside the **live** tier template — both template checks are the inlined-literal form, which is 03 §4.2's whole point), `R-06.2.3-6` (the **absence** of a developer-team actor GSA — every containment check asserts what a principal cannot do, never that a principal does not exist). Then, once the worklist is empty: turn **V-MET-002** green, **move its live arm onto `dev/L0-CHAIN.txt`**, add its `implementations.yaml` row, and **retire `check_phase_gate_publishes_the_coverage_remainder` in the same commit that moves the line** — so the two are never simultaneously absent and the arm is never uncovered.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | 09 §6, §8, §8.1, §9.6            | `docs/design/09-verification-and-validation.md` · `verification/requirements.yaml` · `dev/L0-CHAIN.txt` · `verification/implementations.yaml` · `dev/tests/invariants-gate.py` · `dev/test_invariants_gate.py` · `dev/verify/verify-phase9.sh`                                                                                                                                                                                                                                                                                             | V-MET-002, V-MET-008 (regression)                                                                  | ✅ done |
+| ~~**P9-T11g-3**~~ ✅ done      | **✅ done 2026-07-31.** Three L0 containment arms landed green; **V-CMP-020 is `deferred`**, committed **red on purpose** and deliberately off `dev/L0-CHAIN.txt` — blocker **07 P13-T5**, owner phase 13, promotion condition `python3 dev/tests/tier-skills-match-the-allocation.py` exits 0. The row's premise held for the two V-CTN arms and was wrong twice for V-CMP-020: 09 §6 dates it phase **8**, not 9, and 07 P13-T5's _"none of the seven workload skills"_ is stale — the tree already gives the Developer Team four. Also corrected here: the controller does **not** create ServiceAccounts; the marker is `serviceaccounts,verbs=get;list;watch`. Write-up in § `P9-T11g-3` below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | 02 §2.1; 03 §11; 08 §7           | new `dev/tests/` lints · `dev/L0-CHAIN.txt`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | V-CMP-020, V-CTN-004 (L0), V-CTN-017 (L0)                                                          | medium  |
+| ~~**P9-T11g-4**~~ ✅           | ~~**SPLIT 2026-07-31**~~ → **`P9-T11g-4a` DONE** (V-CTN-012, V-CTN-015, V-CTN-016, and V-BRK-005 bound opportunistically) · **`P9-T11g-4b` DONE 2026-08-01** (V-CTN-001, V-CTN-004 L2, V-CTN-017 L2 — `verification/results.csv` rows 232–243; V-CTN-017's L2 arm lands as a `finding`, 13 of 14 arms green). **The L2 containment arms on `gke-scratch-kube-agents-dev`.** **V-CTN-001** (reader SA reads only within tier scope; `no` in any other namespace/cluster/project), **V-CTN-012** (a `Role`/`ClusterRole` exceeding its tier template is denied by `vap-agent-scope` — the corpora at `examples/gitops-repo/policy/tests/vap_actor_{positive,negatives}.yaml` exist and **nothing on either chain runs them**, which is the finding), **V-CTN-015** (a duplicate `(tier, scope)` `Agent` CR is rejected), **V-CTN-016** (developer-team `metadata.namespace` must equal `spec.scope.namespace`), plus the L2 halves of **V-CTN-004** and **V-CTN-017**. All BLOCKING-ALWAYS. New `dev/verify/` script + `dev/L2-CHAIN.txt` line; L3 arm of V-CTN-001 is a deferral, not a pass.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 03 §4.2, §11; 08 §7              | new `dev/verify/*-l2.sh` · `dev/L2-CHAIN.txt`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | V-CTN-001, V-CTN-004 (L2), V-CTN-012, V-CTN-015, V-CTN-016, V-CTN-017 (L2)                         | large   |
+| ~~**P9-T11c**~~                | **Dissolved — `T11c′` landed.** All four of its check IDs carry 09 §6 Phase **10**: V-BRK-001 (pod-token direct write), V-BRK-004 (stripped `action-id` — its `vap-agent-scope`-class policy does not exist until P10-T1), V-BRK-016 (post-execution journal failure — the write lands, which phase 9 has no authority to do) and V-REV-009 (destructive-undo gate). None is a phase-9 obligation; each is a phase-10 one, and `T11c′` removed them from the required set on 2026-07-31. Do not build.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | 03 §4.1, §4.3, §6, §11           | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | all four → phase 10                                                                                | —       |
+| **P9-T11h** ✅                 | **Declared here on 2026-08-01, after the fact, because three files were already citing it.** `P9-T11h` is the L2 runtime sweep that ran beside `T11g-4b` on 2026-07-31 and delivered `dev/verify/workload-pair-l2.sh`, `dev/verify/startup-ordering-l2.sh` and `dev/verify/actor-grant-sweep-l2.sh` against `gke-scratch-kube-agents-dev`. It was executed and evidenced but never written down, and the omission was only visible from outside: `.claude/harness/LESSONS.md` opens [[LSN-065]], [[LSN-066]] and [[LSN-067]] with it, `dev/tests/invariants-gate.py` attributes four floor raises to it (lines 1842, 1849, 1876, 1881) and `dev/tests/cluster-check-hygiene.py`'s header names it as `startup-ordering-l2.sh`'s unit. A task ID cited by three files and declared by none is a hand-off recorded in prose and lost — the same shape as `verification/results.csv:71`, which is how the seven L2 arms in §the-gap below went missing. The row is written rather than the citations rewritten because the unit is real and its evidence is real; erasing the ID would erase the only record that the work had an owner.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | 05 §1.2; 06 §4.4                 | V-RUN-001, V-RUN-002, V-RUN-004, V-RUN-005, V-RUN-009                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | large                                                                                              |
+| ~~**P9-T11d**~~                | **Dissolved 2026-08-01 — every property it owned was delivered by `P9-T11h`, and its one remainder is dated to another phase.** The five bound IDs are green at L2 on `gke-scratch-kube-agents-dev`: `verification/results.csv` rows 232 (V-RUN-001), 233 (V-RUN-002), 234 (V-RUN-004, five label keys across eight targets), 235 (V-RUN-009) and 243 (V-RUN-005, both startup orders and agent-without-broker failing closed), plus CR deletion sparing the ServiceAccounts by uid. The row's last clause — _one fleet-wide Socket Mode connection_ — is **V-RUN-014**, which 09 §6 dates **phase 15** and which this file already defers at L3 with a named blocker; it was never phase 9's to deliver and the row should not have carried it. Dissolution, not deferral: the L2 blocker recorded for this row's original scope (no `de0486b` images in Artifact Registry, `kubeagents-router` in CrashLoopBackOff) was cleared by the `reload-images.sh` deploy-by-digest path, and the crashloop itself is the documented correct outcome on an inner-loop cluster — `BACKLOG.md` B-009. The workload pair at L2: two workloads owner-referenced and no third, non-interchangeable identities, the four labels selectable, both startup orders converging, agent-without-broker failing closed, CR deletion removing workloads and sparing SAs, and one fleet-wide Socket Mode connection.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | 08 §2.4, §7; 05 §8, C15          | `dev/verify/` (new pair suite) · `dev/L2-CHAIN.txt`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | V-RUN-001, V-RUN-002, V-RUN-004, V-RUN-005, V-RUN-009 (V-RUN-006 → phase 10, V-RUN-014 → phase 15) | large   |
+
+**Resume at `harness-run`, unit `P9-T11g-2`** (this section was written at `T11a` and said
+`P9-T11a`; `T11a`, `T11a-2`, `T11a-3`, `T11b-1`, `T11b-2`, `T11c″`, `T11c′`, `T11c‴`, `T11f` and
+`T11g-1` have closed since). The "fourteen" this
+section counted was itself a measurement of the uncorrected arm. After `T11a-3` fixed the derivation,
+`T11c′`/`T11c‴` fixed the table, `T11f` catalogued the seventeen and `T11g-1` closed three, the
+figure is **22 not green of 91 required, 11 BLOCKING-ALWAYS**. Eleven of the twenty-two are the
+`T11g` ladder's (`-2`, `-3`, `-4`), six are `T11d`'s V-RUN pair, and the sentence this section used
+to carry — _"eleven are asserted somewhere and recorded nowhere and only two are unbuilt"_ — was
+false. `T11g-1` audited it: **one** was asserted and unrecorded, twelve were unbuilt.
+
+---
+
+## P9-T11a — the ratchet arm, built · 2026-07-31 · ✅
+
+Planning defect 4's unbuilt half, shipped. `dev/tests/phase-ratchet-is-asserted.py` derives the
+phase's required check set instead of remembering it, and asks `verification/results.csv` for a green
+row per member.
+
+**The denominator was wrong, and the check is what corrected it.** The audit above counted against
+phase-9.md's own hand-written 55-ID acceptance table and reported **14 unasserted, 7
+BLOCKING-ALWAYS**. Deriving the requirement properly — expanding each suite named in 09 §10's phase-9
+row against the §6 catalog, honouring the `(L1)` qualifier on V-GAT — yields **70** IDs, and the
+union with the table yields **75**. Against that denominator the gap is:
+
+| Population                                                       | Count  |
+| ---------------------------------------------------------------- | ------ |
+| Required by 09 §10 ∪ phase-9.md                                  | **75** |
+| Green (`**pass**` with a non-empty `evidence_ref`)               | 37     |
+| Not green                                                        | **38** |
+| …of those, BLOCKING-ALWAYS (09 §9.6 forbids deferral)            | **17** |
+| Required by 09 §10 and absent from phase-9.md's acceptance table | **20** |
+
+The twenty the acceptance table omits are V-BRK-018/019/020/022/023/024/025/026/027/028/029/030/031/032, V-GAT-005, V-GAT-011, V-GAT-014, V-GAT-016, V-REV-010 and V-REV-011 — planning
+defect 4's exact shape, one phase later, found by the check written to end it. That is property 4,
+and it is the reason the check reads 09 §10 rather than trusting the acceptance table: a table can
+only omit what nobody re-derives. **Property 4 is orthogonal to property 2** — 15 of the 20 are
+already green, proved by work no Accept bullet ever named — so it measures the acceptance table's
+completeness, not the phase's. The five that are both omitted and not green are V-BRK-019,
+V-GAT-005, V-GAT-011, V-GAT-014 and V-GAT-016.
+
+**Property 4 read the whole file for one draft, and the control caught it.** The first implementation
+computed `ratchet - CHECK_ID.findall(phase_text)` and reported **4**, because sixteen of the twenty
+happen to be mentioned somewhere in this file's prose. Writing _this section_ — a paragraph naming
+four of them while explaining that nothing asserts them — then took the count to zero and turned control
+case 8 red. An ID named in a paragraph about how it is unasserted is not an ID bound to an acceptance
+bullet, and counting it would have been [[LSN-019]] committed inside the check written to end
+[[LSN-019]]'s previous recurrence. The property now reads the acceptance table, and the future-tree
+case injects its IDs **inside** that section rather than appending them to the file, because
+appending would satisfy a whole-file grep and not the property.
+
+**What it asserts.** Four properties, all in `scan_text()`: (1) the required set is derived and both
+sources parsed to something — a parse that silently matches nothing scores every unrun check as
+satisfied ([[LSN-048]]); (2) every member has a `pass` row carrying an `evidence_ref`, because 09
+§9.4 records a pass without one as `skipped`; (3) BLOCKING-ALWAYS members are counted separately,
+because "not green" and "not green and undeferrable" are different facts and one number hides the
+second inside the first; (4) the phase file's acceptance **table** does not under-name its own ratchet.
+
+**What it refuses to do is the load-bearing part.** It does not infer coverage from a file naming a
+check ID. `git grep V-ISO-001` finds `pair_netpol.go:68` and `pair_netpol_test.go:35`, and **both
+hits exist to disclaim the check** — they say V-ISO-001/002 ask whether a packet is dropped, which is
+L2 and belongs to P9-T9. A grep-based notion of "asserted" would have counted them as coverage and
+scored the gap smaller than it is. The naming scan survives only as an explicitly unweighted `hint`
+column that no verdict reads.
+
+**Where it runs.** Section **J** of `dev/verify/verify-phase9.sh`. Deliberately **not** on
+`dev/L0-CHAIN.txt`: the chain is a required PR check, and an arm that stays red until an entire phase
+closes reddens every unrelated commit's CI, destroying the per-commit attribution CHECKPOINT exists
+to produce ([[LSN-055]]). What keeps it from being quietly dropped is the pair — the `--negative-control`
+**is** on the chain (line 48), and `invariants-gate.py`'s new
+`check_phase_gate_runs_its_own_ratchet` asserts at L0 that every non-grandfathered
+`verify-phase<N>.sh` invokes the runner, with `--phase <N>` matching its own number, on an
+uncommented line, reaching a `bad ` arm within twelve lines. `grandfathered` is an explicit list of
+phases 2–8, not a floor, so phase 10's gate is covered the day its file is created.
+
+**The future tree ([[LSN-053]]).** This is a check split from the implementation whose absence
+motivated it, so green-on-today is half the evidence. Control case 5 synthesises the tree T11b–T11d
+will build — every required ID green, the phase file naming all 75 — and asserts the check **passes**
+there. Cases 6–8 then perturb that future tree one property at a time: a BLOCKING-ALWAYS demotion, an
+emptied `evidence_ref`, and a phase file back to under-naming. Without them, T11d's first green run
+would arrive looking like "my implementation broke the check", and the cheapest diff to green would
+be to edit the check.
+
+| Artifact                                 | State                                                              |
+| ---------------------------------------- | ------------------------------------------------------------------ |
+| `dev/tests/phase-ratchet-is-asserted.py` | new · `--phase 9` → **rc 1**, the worklist above · control **8/8** |
+| `dev/verify/verify-phase9.sh`            | section J wired, `bash -n` clean                                   |
+| `dev/tests/invariants-gate.py`           | `check_phase_gate_runs_its_own_ratchet` → **31/31**                |
+| `dev/test_invariants_gate.py`            | +11 named tests (9 gate-arm, 2 runner) → **88 OK**                 |
+| `dev/L0-CHAIN.txt`                       | 47 → **48** lines — the control, not the check                     |
+| `dev/assertion-baseline.json`            | wound for the 11 new tests ([[LSN-056]])                           |
+
+Guardrail 9 holds structurally: this unit ships no implementation, and T11b–T11d ship no change to
+this arm. Its redness is not a defect to fix — it is the worklist, and it goes green when the
+worklist is done.
+
+---
+
+## P9-T11b-1 — chaos for the pair · 2026-07-31 · ✅
+
+**V-ISO-001 and V-ISO-002 at L2, both BLOCKING-ALWAYS, both green.** The plan row was weighted
+`large` and was split under `harness-run` §2 Sizing: T11b-1 is the chaos suite, T11b-2 is CH6.
+
+### What was actually wrong
+
+`dev/verify/chaos-suite.sh` contained the word **broker** zero times. It is a Phase 6 artifact and it
+predates the pair, so C1 asserted "a running pod continues" against a stand-in and "no reconcile"
+against the agent's Deployment, and C2 asserted the agent's Deployment was relaunched. Both rows it
+was supposed to carry are about the half it did not know existed:
+
+- **V-ISO-001** — "agents **and brokers** keep executing; no new reconciles"
+- **V-ISO-002** — "relaunches **both** workloads, rebinds **both** SAs"
+
+A suite cannot fail on a clause it does not mention. Both rows would have gone green at the milestone
+on the strength of a suite that could not have detected either failure.
+
+### The arms added
+
+| Arm           | Claim                                                                                         | Row       |
+| ------------- | --------------------------------------------------------------------------------------------- | --------- |
+| **C1(i-b)**   | the deployed **broker pod** stays Ready across the whole controller outage                    | V-ISO-001 |
+| **C1(ii-b)**  | the deleted **broker Deployment** is not recreated while the controller is down               | V-ISO-001 |
+| **C1(iii-b)** | on restart the **broker** Deployment comes back too — the pair resumes, not half of it        | V-ISO-001 |
+| **C2(i-b)**   | a broker Deployment deleted under a **live** controller is recreated, ownerRef = the CR       | V-ISO-002 |
+| **C2(i-c)**   | both relaunched Deployments **rebind** the SAs the CR names, both existing, neither `default` | V-ISO-002 |
+
+**Three decisions worth their own sentence.**
+
+_The continuity claim is made against the real broker pod, not a stand-in._ The suite's D1 fixture
+rule says reconcile-behaviour uses the real CR and pod-continuity uses lightweight stand-ins, because
+the agent pod may never be schedulable. The broker is the exception and it is worth taking: its image
+is the operator's own and it reaches 1/1 Ready in ~50 s on the scratch cluster, so "brokers keep
+executing" is asserted on a broker rather than on a proxy for one.
+
+_C1(i-b) and C1(ii-b) cannot share a window._ Deleting the broker Deployment garbage-collects the pod
+that (i-b) spends 20 s asserting is stable. They are two blocks in a fixed order for that reason, and
+the comment at the site says so, because the natural cleanup is to merge them.
+
+_Both SA expectations are read back off the CR, never spelled out in the suite._ The reader SA comes
+from `spec.security.serviceAccountName` and the actor SA from `status.broker.actorServiceAccount`,
+which is where `agent_controller.go` publishes the name it resolved. Writing
+`cluster-admin-cluster-a-actor` into the check would have produced an arm that keeps passing after
+the operator stops deriving the binding — and deriving it is the entire property.
+
+### The suite was on no chain at all
+
+`chaos-suite.sh` was absent from `dev/L2-CHAIN.txt`. 09 §10 puts V-ISO-001/002/006 in Phase 9's
+ratchet; a ratchet is the promise that a suite which entered it never leaves; and the only suite that
+could keep that promise for CH1 and CH2 ran when somebody remembered it. Now listed, after the broker
+suites (it needs the pair deployed) and before the gate.
+
+### Non-vacuity
+
+`dev/mutate.sh` over `broker_manifests.go`, mutator written to a file so the needle never touches a
+shell ([[LSN-049]]), with the applier asserting the edit landed before anything ran. The broker pod's
+`ServiceAccountName: actorServiceAccountName(agent)` became `"default"`; operator rebuilt and
+redeployed by digest; suite re-run:
+
+```
+FAIL: C2(i-c): the actor binding is 'default' (expected 'cluster-admin-cluster-a-actor',
+      cluster-admin-cluster-a-broker has 'default') — an unbound pod, not a rebound one (V-ISO-002)
+```
+
+Caught **by the arm that targets it, matched by that arm's own needle** ([[LSN-035]]), and
+discriminated: C1(ii-b), C1(iii-b) and C2(i-b) stayed green, because they are object-level claims the
+SA does not touch. C1(i-b) went red as collateral — a broker pod bound to `default` never becomes
+available — which is honest, not a second catch. Source restored by byte-copy and the clean operator
+redeployed before the final run.
+
+### The gateway pod is in ImagePullBackOff, and it is not a defect
+
+Mid-unit the gateway pod sat at `Init:0/1` with `wait-for-broker` logging `context deadline exceeded`
+against the broker's FQDN, and the first diagnosis — that `<agent>-to-broker` is an Egress policy
+with no DNS rule, so the reader cannot resolve its own broker — **was wrong**. The init container
+completed with exit 0 once the broker became Ready; the deadline was one retry against a broker still
+starting. What actually stops the gateway is that the fixture CR names
+`ghcr.io/gke-labs/kube-agents/cluster-admin-agent:v0.1.0`, which is not an image this repo builds or
+pushes. No assertion here depends on a Ready gateway. **P9-T11d does** — "both startup orders
+converging" cannot be observed on a pod that never starts — so that unit begins by pointing the
+fixture at a real image, and should not begin by re-diagnosing the NetworkPolicy.
+
+### An invariant caught this unit's own race
+
+`invariants-gate.py`'s P9 arm — `.status` reads are polled, not slept on — failed the first draft at
+`chaos-suite.sh:481`: `status.broker.actorServiceAccount` was read once, immediately after C2(i-b)
+deleted the broker Deployment and triggered the reconcile that writes it. Losing that race yields an
+empty string, one branch away from being printed as _"the CR publishes no actor ServiceAccount
+name"_ — a controller bug, reported because a read arrived early. Now a bounded poll.
+
+| Artifact                    | Change                                                                  |
+| --------------------------- | ----------------------------------------------------------------------- |
+| `dev/verify/chaos-suite.sh` | +5 arms, `REAL_BROKER`, `wait_deploy_available`, the polled status read |
+| `dev/L2-CHAIN.txt`          | 22 → **23** lines — `chaos-suite.sh`, listed for the first time         |
+| `verification/results.csv`  | +1 row — V-ISO-001, V-ISO-002 at L2, `**pass**`                         |
+
+### And the ratchet arm did not credit the result
+
+Appending the row above moved nothing: the arm still printed 38 not green, 17 BLOCKING-ALWAYS. Its
+`parse_results` keys on the raw `check_id` cell, so `V-ISO-001, V-ISO-002` is filed under that literal
+string and matches neither ID. **38 of the 159 rows in `results.csv` group IDs that way** — it is the
+file's dominant convention when one suite proves several rows, not an anomaly this unit introduced.
+
+The under-count is material and it runs in the safe direction, which is why nobody noticed:
+
+|                           | printed | true   |
+| ------------------------- | ------- | ------ |
+| required (09 §10 ∪ table) | 75      | 75     |
+| not green                 | **38**  | **28** |
+| of those BLOCKING-ALWAYS  | **17**  | **12** |
+
+Ten IDs are falsely reported unasserted: V-BRK-002, V-BRK-015, V-GAT-001, V-GAT-010, V-GAT-011,
+V-GAT-017, V-GAT-021, V-ISO-001, V-ISO-002, V-REV-008. The 38/17 figure recorded at `f068d82` is
+therefore wrong in the same direction as the 14/7 it replaced — a hand-copied table gave a number too
+small, and a parser that cannot read its own file's convention gives one too large.
+
+**It is not fixed here.** Two of the ten are this unit's own rows, so repairing the check in the unit
+whose result it would credit is Guardrail 9 in its exact form: _"the smallest diff to green is editing
+the check"_. Scheduled as **`P9-T11a-2`**, which also owes the control a grouped-row case — the
+existing eight only ever synthesise single-ID rows, which is precisely why the control was blind to
+this.
+
+**Resume at `harness-run`, unit `P9-T11a-2`** — then `P9-T11b-2` (V-ISO-006, binding
+`broker-refuse-l2.sh` arm B to the ID it already proves).
+
+---
+
+## P9-T11a-2 — the cell is not the key · 2026-07-31 · ✅
+
+**V-MET-013, V-MET-014 at L0.** One line of the fix, and the whole of the unit is why it was not one
+line of `T11a`.
+
+`parse_results` filed each results row under its raw `check_id` cell. **36 of the 160 rows name more
+than one ID** — one suite run proves several catalog rows and gets one row citing one evidence
+reference, which is the file's convention for a suite run and not an anomaly. So
+`"V-ISO-001, V-ISO-002"` became a key that matched neither ID, and the arm reported both as never
+asserted on the morning after they went green at L2.
+
+| Population               | Printed | True   |
+| ------------------------ | ------- | ------ |
+| required (75)            | 75      | 75     |
+| green                    | 37      | **47** |
+| not green                | 38      | **28** |
+| of those BLOCKING-ALWAYS | 17      | **12** |
+
+The ten it had accused — V-BRK-002, V-BRK-015, V-GAT-001, V-GAT-010, V-GAT-011, V-GAT-017,
+V-GAT-021, V-ISO-001, V-ISO-002, V-REV-008 — are green and always were. **A check written to find
+unrun work that invents ten pieces of it is worse than no check**, because the ten are
+indistinguishable from the twenty-eight that are real, and the natural response to the list is to go
+and re-run things that have already been run.
+
+**What the fix decides, beyond splitting the cell.** Two suffixes appear in that column and they are
+not the same kind of thing. `(regression)` marks a re-run; `¬` is 09 §6's _negative-control
+mandatory_ marker, copied off the catalog row — a property of the **check**, not a claim that the
+row records only a control run. Both are stripped by the ID pattern, and for `V-CTR-002 ¬` that is
+correct: it is a result row for V-CTR-002. A cell naming no ID at all (`(L0 mechanization)`)
+contributes nothing, which is exactly what it did before under a key nothing could look up.
+
+**Why the control could not see this, which is the more interesting half.** All eight of `T11a`'s
+cases synthesised **one ID per row**. The control was therefore auditing the check against a shape
+its real input predominantly does not have — [[LSN-060]]'s family (the control skipped the statement
+under test), arriving through the _synthesiser_ rather than through a skipped statement. Three cases
+added, 8 → **11**, all three built on a `_synthesise_green_grouped` that writes the future tree the
+way `results.csv` is actually written, four IDs to a cell:
+
+| #   | Case                                                                      | Requires                                           |
+| --- | ------------------------------------------------------------------------- | -------------------------------------------------- |
+| 9   | the future tree, IDs grouped one row per suite run                        | **PASS** — a grouped row credits every ID it names |
+| 10  | one ID dropped from a grouped cell, cellmates untouched                   | caught by property 2                               |
+| 11  | a grouped row demoted to `**finding**`, taking its BLOCKING-ALWAYS member | caught by property 3                               |
+
+Case 10 is the guard against over-correcting: a split that credited by suite prefix, or that read
+the whole row, would pass 9 and fail 10.
+
+**The control's own victim locator had to change with it,** and that is a finding in miniature.
+`demote` and `strip_evidence` matched their victim by `r[2] == check_id`. Against a grouped cell that
+comparison is simply false, so cases 10 and 11 would have perturbed **nothing** and scored their
+untouched input as an escape — a hole reported in the check that is really a hole in the control.
+Both now locate by _the cell names this ID_.
+
+**Non-vacuity, and it is discrimination rather than detection.** `dev/mutate.sh` with the mutator in
+a file ([[LSN-049]]), each mutant caught by its own case and by no other:
+
+| Mutant                                                                    | Result                                                                        |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| **M1** `parse_results` back to keying on the raw cell                     | **10/11** — case 9 alone reddens; 1–8, 10, 11 unmoved                         |
+| **M2** the victim locator back to `==` instead of `in CHECK_ID.findall()` | **9/11** — cases 10 and 11 ESCAPE on an unperturbed input; case 9 stays green |
+
+**And the sweep could not be configured, only run.** `harness-run` §5 wants it through
+`dev/mutate.py` against a committed `verification/mutants/<CHECK-ID>.json`; that runner knows two
+suite kinds, `go` and `unittest`, and the catcher here is the check's own `--negative-control`, which
+is neither. So this unit fell back to `dev/mutate.sh` and hand-wrote an applier — the second unit in
+two to do so, after `T11b-1`'s broker-SA mutant. That is the re-authoring LSN-047, LSN-048 and
+LSN-049 were each paid for once, so it is **an inbox item rather than a paragraph** (`BACKLOG.md`,
+added 2026-07-31): a `"kind": "command"` suite whose catch condition is a needle in the command's
+output, which is what rule 5 already demands of the Go path.
+
+**Guardrail 9 held on both sides.** `T11b-1` found this and did not fix it, because two of the ten
+were its own rows. `T11a-2` fixes it and ships no implementation, so nothing in this unit can be
+credited by the arm it repairs.
+
+That last clause is measured, not asserted, because this unit's own results row is itself a grouped
+cell (`V-MET-013, V-MET-014`) and is therefore exactly the shape the fix makes readable. Re-scanning
+with the row removed gives the identical verdict — **28 not green, 12 BLOCKING-ALWAYS**, both IDs
+green either way — because prior rows had already proved them. The fix credits nothing of its own.
+
+Gate: control **11/11** · live arm rc 1 printing **28 / 12** (by construction — 28 checks are
+genuinely unrun, and its redness is the T11b–T11d worklist) · `invariants-gate.py` 31/31 ·
+`unittest discover dev` 397 OK · L0 chain 48/48.
+
+**Resume at `harness-run`, unit `P9-T11b-2`** — V-ISO-006, binding `broker-refuse-l2.sh` arm B to the
+ID it already proves.
+
+---
+
+## P9-T11b-2 — CH6, the journal half · 2026-07-31 · ✅
+
+**V-ISO-006 at L2, BLOCKING-ALWAYS, green.** The plan row said _bind, cross-reference, run, record_ —
+`broker-refuse-l2.sh` arm B already induced the exact fault and asserted the exact property, and
+nothing named the ID, so the row had no claimant and no `results.csv` line. The unit did that, and
+then did one thing the plan row did not ask for: it added **arm C**.
+
+### Why the plan row was not the whole unit
+
+05 §8 CH6 is five clauses, not one:
+
+> **CH6 — Journal store down.** Make `ActionRecord` writes fail … The broker **refuses to execute**
+> rather than executing unjournaled; auto-brake pauses the agent; the audit log shows zero mutations
+> by that actor identity during the window; the failure is reported to humans. **Restoring the
+> journal restores service without a broker restart.**
+
+Arm B asserts the refusal, the zero mutations and the report. Executing the plan row literally would
+have written a green V-ISO-006 with the last clause unasserted — and that clause is the one that
+separates _refuses_ from _bricks_. A broker that latches the fault and never recovers passes every
+assertion arm B makes. Arm C is that clause, and the code it needs already existed: the restore lived
+inside `cleanup()`, where its result was discarded. The change was to make it evidence.
+
+### The arms added
+
+| Arm     | Claim                                                                                           |
+| ------- | ----------------------------------------------------------------------------------------------- |
+| **C-1** | after the grant is restored the same envelope is **accepted** (202), not still 503              |
+| **C-2** | an `ActionRecord` now **exists** for the restored run's trace — service, not just a status code |
+| **C-3** | the **same broker pod** served both, at the same `restartCount` — recovery without a restart    |
+
+C-3 checks the pod **name first** and the restart count second, so a replacement is reported as a
+replacement rather than surfacing as a puzzling count mismatch, and `POD_AFTER` is re-resolved by
+ownership (`p3_pod_of_deploy`) so a pod that vanished lands in the REPLACED arm and not in the
+"could not observe" one.
+
+**A failed restore is `deferred` (rc 3), not red.** If the grant does not come back, arm C is
+submitting into the same fault arm B just measured and asserting the opposite outcome: that is the
+experiment failing, not the broker ([[LSN-026]]). rc 3, with the blocker named.
+
+**The third probe scenario is not `journal-gone` run twice.** `broker_refuse_probe.py` gains
+`journal-restored`, whose operations are byte-identical to `journal-gone`'s and deliberately so — the
+recovery claim is only worth something if the thing that succeeds afterwards is the thing that was
+refused before. What differs is `intent` and `rationale`, the two strings that land verbatim in the
+ActionRecord this run actually writes.
+
+### The auto-pause clause, corrected at the site
+
+The header used to say the auto-pause consumer did not exist. That was true when written and is not
+now — `P9-T9c-1` shipped it. The clause still cannot be asserted **in this fault**, for a different
+and better reason: the pause is recorded **on the ActionRecord** (`escalate.Recorder.record` Gets
+`journal.RecordName(actionID)`), and in this fault there is no record to put it on, because
+`StoreRejectionJournal.Reject` is the write that just failed. `server.go`'s `autoPause` says so
+itself and gives up — _"a refusal asked for an auto-pause and there is no record to put it on; the
+agent stays live"_. So B-3 reading zero and the pause being unobservable are the same fact, not two
+gaps. The paragraph now cites the lines instead of asserting the shape.
+
+### Non-vacuity, and the gap the control admits
+
+`--negative-control` went **25/25 → 34/34** with nine C-cases: baseline green, plus latched-503,
+missing status, wrong refusal reason, accepted-but-unjournaled, unknown count, pod replaced,
+container restarted, pod unobserved.
+
+The control **synthesises the four pod strings**, so it proves the arm discriminates and says nothing
+about whether `broker_restarts` and `p3_pod_of_deploy` read the pod that actually served the request.
+That gap is written into the suite's own "NEGATIVE CONTROL DOES NOT EXERCISE" section, and then
+closed live: mutant **M1** deletes the broker pod between the fault and the restore. Service still
+returns — a fresh broker with a restored grant accepts and journals — so **C-1 and C-2 stayed green
+and C-3 alone reddened by its own needle**, naming `…-k6pkd` before and `…-njdk2` after. That is
+precisely the run a suite without C-3 would have printed PROVEN for.
+
+### CH6 is not in the chaos suite, and that is not a gap
+
+`chaos-suite.sh` gains a cross-reference block rather than a CH6 arm. Re-staging the fault there
+would produce a second, thinner copy of a suite that already exists — and the copy is the one that
+rots. The block names `dev/verify/broker-refuse-l2.sh` arms B and C and says why.
+
+### Gate
+
+`bash dev/verify/broker-refuse-l2.sh gke-scratch-kube-agents-dev` → **rc 0, 17/17**, banner
+`PROVEN: V-BRK-018 · V-ISO-006 (05 §8 CH6) at L2 · the journal half of Phase 9 acceptance (d)`.
+Arm B: 503 `journal-unavailable`, **0** records for trace `e47e8e15…`. Arm C: **202**, actionId
+`01KYWDZK1DMFSC6XQ95T9AAW6V`, **1** record for trace `e8a2cdae…`, pod
+`platform-agent-broker-66fd9d45ff-rxg45` at `broker=0` on both sides.
+
+P1 green on **both** binaries — `k8s-operator@sha256:a7decacc29cb` and
+`kage-broker@sha256:cc49feaab631`, both rebuilt at `dev-1190585-dirty`. The first two live runs failed
+P1, once per image: `reload-images.sh operator` does not rebuild the broker, and there is no
+`deploy/kubeagents-broker` to `set image` on — `reload-images.sh broker` sets
+`KUBEAGENTS_BROKER_IMAGE` on the **controller**, which renders one broker per Agent CR.
+
+Control **34/34** · `invariants-gate.py` **31/31** (baseline wound for `$c_status`, [[LSN-056]]) ·
+L0 chain 48 clean · `unittest discover dev` **397 OK** · `make validate` clean · ratchet arm
+**27 not green / 11 BLOCKING-ALWAYS**, down from 28 / 12 · `results.csv` 161 → **162** rows.
+
+**Resume at `harness-run`, unit `P9-T11c`** — V-BRK-001, V-BRK-004, V-BRK-016 and V-REV-009 at L2,
+the four unasserted BLOCKING-ALWAYS broker/undo rows. Weighted `large`; expect to split it.
+
+---
+
+## P9-T11a-3 — the column the ratchet was not reading · 2026-07-31 · ✅
+
+Selected instead of `P9-T11c`, because researching `P9-T11c` found the defect that decides what
+`P9-T11c` even is: **all four of its check IDs carry 09 §6 Phase `10`.**
+
+### What was wrong
+
+`dev/tests/phase-ratchet-is-asserted.py` derived the phase requirement from 09 §10's ratchet table
+and threw away two things 09 says explicitly.
+
+**It ignored 09 §6's Phase column.** The catalog's preamble calls each row "the assertion in brief,
+the spec section that owns the rationale, the level, and **the roadmap phase by which it must be
+green**". A bare suite name in a §10 cell expanded to every member of that suite, so phase 9 —
+whose 07 §2 definition is _"no write authority anywhere"_ — was being asked for V-BRK-016
+(post-execution journal failure: the write lands and the record cannot be completed), V-BRK-003
+(real audit-log writes), V-BRK-004 (a `vap-agent-scope`-class admission policy that does not exist
+until P10-T1), and V-RUN-014, whose own catalog row dates it to **phase 15**.
+`dev/verify/broker-execute-l2.sh` had already written the conclusion down without anyone acting on
+it: _"V-BRK-019 (the field manager string) is not observable from a shadow."_
+
+**It read one row.** §10 opens: _"Which suites must be green at the end of each roadmap phase — and
+**stay** green thereafter. Once a suite enters the ratchet it never leaves."_ The arm read only the
+row for the phase on the command line, so phase 9 did not require V-CTN, V-CTR, V-CMP or V-MET at
+all, though all four entered at phase 8.
+
+### Why the Phase column is the right reading, and not a convenient one
+
+Three confirmations, none of which depend on wanting the answer:
+
+- **§10's later rows re-name members of suites already in the ratchet** — V-REV-008 at 14,
+  V-ADV-003/005 at 13, V-CTN-010/013/018/019 at 11. Under whole-suite expansion every one of those
+  is dead text, because those suites entered at 9, 10 and 8.
+- **The Phase column reconstructs §10's own prose qualifier, exactly.** `V-CTN (read-side)` at 8 and
+  `V-CTN (write-side)` at 10 partition the suite. Filtering V-CTN by `phase <= 8` yields precisely
+  the seven reader/attenuation/cardinality rows; `phase == 10` yields precisely the fifteen
+  actor-write and forbidden-rule rows. Two encodings of one partition, and only one is
+  machine-readable. The arm was discarding the machine-readable one and the prose one both.
+- The read that makes the gate _cheaper_ is the one the arm already had.
+
+### The shape of the correction
+
+The two halves pull in opposite directions, which is the point:
+
+|                                   |                                                                                                                         |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Ratchet (09 §10)                  | **70 → 80**                                                                                                             |
+| Required (§10 ∪ acceptance table) | 75 → **98**                                                                                                             |
+| Not green                         | 27 → **34**                                                                                                             |
+| …of those BLOCKING-ALWAYS         | 11 → **19**                                                                                                             |
+| Dropped by the phase filter       | **21** — V-BRK-001/003/004/016/019/020, V-GAT-005/011/014/016/019/021, V-REV-002/005/006/007/008/009, V-RUN-006/013/014 |
+| Added by accumulation             | **31** — V-CTN read-side (8), V-CTR core (12), the V-MET meta-suite (11)                                                |
+
+A change that made the gate cheaper would not have that shape. The gate got harder by seven checks
+and eight BLOCKING-ALWAYS ones.
+
+An ID §10 names **outright** is never phase-filtered: the explicit form is how §10 pulls a member
+forward or holds one back, and filtering it by the column it exists to override would make the
+explicit form unable to mean anything. At phase 9 that branch is inert — §10's only explicit IDs by
+then are `V-ISO-001/002/006` and §6 already dates all three to 9 — so the control cannot stage a
+case for it and does not pretend to.
+
+A catalog row with **no** Phase cell — the nine V-MET rows of §11, meta-checks that apply at every
+phase — is required wherever its suite is named. That exemption can only keep a check _in_, and it
+is counted and printed, never applied in silence.
+
+### The filter reports itself
+
+The phase filter is the only part of the derivation that makes the required set **smaller**, so it
+is the only part that can buy a green by being wrong. It prints what it removed and what it could
+not classify, on the green run as well as the red one, and three of the control's twenty lines
+assert that it does. A filter that removes 21 IDs and says nothing is indistinguishable from a
+smaller spec.
+
+### Control: 11 → 20
+
+Five new cases and three note assertions. The five perturb 09 §6 and 09 §10 themselves, which no
+earlier case did:
+
+1. **Pull forward** — rewrite V-BRK-019's Phase cell to `9`. The future tree must go red naming it.
+2. **Delete the Phase cell** — V-BRK-019 becomes undated. Still required, so still red.
+3. **Push later, half one** — a tree green for everything except V-BRK-018 must go red naming it.
+4. **Push later, half two** — the same tree, with §6 pushing V-BRK-018 to phase 99, must go
+   **green**. This is the arm that proves the filter _removes_ rather than merely being consulted;
+   without it, case 3 passes against a derivation that ignores the column.
+5. **Carried forward** — a tree green for everything except V-CTN-037, which the phase-**8** row
+   carries but §6 dates to **9**. Every accumulated row must filter against the phase under test,
+   not against its own number.
+
+Case 5 was added because the sweep found the hole. `M4` — each row filtered against `row_phase`
+instead of `phase` — silently removed 11 IDs from the required set and the control was **19/19
+green** through it.
+
+The property-2/3/4 sentences carry counts and not IDs, so cases whose whole claim is _"THIS ID
+became required"_ are matched against the named not-green population the report already prints.
+Matching them on "something went red" would score every perturbation as catching every property
+([[LSN-035]]).
+
+### The control derives its victims from the code under test, on purpose
+
+There is no synthesised stand-in for the derivation ([[LSN-060]]) — each victim is picked out of
+`parse_ratchet`'s own output. The cost is that a defect in the derivation can empty the pool a case
+needs, and an empty pool must never quietly shrink the control to the cases it can still stage. The
+`pick` helper raises with the **case's own name**, so three of the four mutants below are caught by
+a distinct message even though none of them reaches a case outcome.
+
+### Non-vacuity: `dev/mutate.sh`, mutator in a file ([[LSN-049]]), 4/4 caught
+
+| Mutant | The defect                                                                                                       | Caught by                                             |
+| ------ | ---------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| **M1** | accumulation dropped — only this phase's row is read (the arm exactly as it stood)                               | `no victim for the prior-row case`                    |
+| **M2** | the filter is consulted and never removes                                                                        | `no victim for the pull-forward case`                 |
+| **M3** | an undated row is dropped instead of required — the reading that would exempt every V-MET check from every phase | case 2 ESCAPES: `phase cell for V-BRK-019 is deleted` |
+| **M4** | each row filtered against **its own** phase instead of the phase under test                                      | `no victim for the carried-forward case`              |
+
+Four different needles. `rc != 0` is not a catch.
+
+One mutant was **discarded as equivalent** rather than recorded as a finding: reading the phase from
+the _first_ integer-shaped cell instead of the last changes nothing, because on every 09 §6 row the
+only bare-integer cell is the phase cell. A no-op mutant scored as an escape would have bought a
+"strengthening" that measured nothing.
+
+### What this unit deliberately did not do
+
+`docs/build/phase-9.md`'s acceptance table names **16** IDs that 09 §6 dates after phase 9 —
+V-BRK-001/003/004/016, V-GAT-019/021/022, V-REV-002/005/006/007/008/009, V-RUN-006/013/014 — and
+four of those are the _"(ratchet only)"_ rows `T11a` added on the belief the ratchet demanded them.
+The required set is the **union** of §10 and the table, so the table keeps every one of them
+required and this unit's 34-not-green figure is unchanged by the correction that is coming.
+
+That is the point. Correcting the table would move this unit's verdict as well as its measurement,
+and a unit that both moves the line and reports crossing it is Guardrail 9 in its exact shape — the
+same separation used for `T11a → T11a-2` and `T11b-1 → T11a-2`. The next unit owns the table, with
+these numbers in hand.
+
+### Gate
+
+`python3 dev/tests/phase-ratchet-is-asserted.py --phase 9 --negative-control` → **20/20**, rc 0 ·
+the live arm → rc 1, **34 of 98 not green, 19 BLOCKING-ALWAYS**, property 4 names **43** ·
+`dev/tests/invariants-gate.py` **31/31** (baseline wound for the one new named test, [[LSN-056]]) ·
+`python3 -m unittest discover dev` **398 OK** (was 397) · full `dev/L0-CHAIN.txt` **48/48** clean ·
+`results.csv` 162 → **164** rows.
+
+`dev/test_invariants_gate.py` gains
+`test_the_ratchet_accumulates_prior_phases_and_honours_the_due_date`, asserting the two properties
+on **named IDs** rather than on counts — a count assertion gets rewritten to whatever the code
+produced the next time 09 gains a row.
+
+**Resume at `harness-run`, unit `P9-T11c′`** — correct `docs/build/phase-9.md`'s acceptance table
+against the Phase column: retarget the sixteen later-dated IDs, and rewrite the four
+_"(ratchet only)"_ rows T11a added. Only then `P9-T11c` proper, which after that correction is
+V-BRK-001 at most and possibly nothing.
+
+---
+
+## P9-T11c″ — a 20/20 control that only worked while the document stayed wrong · 2026-07-31 · ✅
+
+**This unit was not planned. It was scheduled mid-CHECKPOINT, by `P9-T11c′` failing.**
+
+`P9-T11c′` — the section below, which landed after this one — corrected this file's acceptance table
+in one direction and wrote the other direction too: the 43 IDs the table omits. That paste was
+written, run, and reverted, because the ratchet arm's own negative control went from 20/20 to
+**unstageable**:
+
+```
+FAIL: negative control could not be staged: control: no victim for the push-later case
+```
+
+and two committed assertions in `dev/test_invariants_gate.py` went red behind it, the second masked
+by the first.
+
+### The coupling
+
+Three of the five phase-filter cases `P9-T11a-3` added pick their victim from _"required by the
+suite expansion and **not named by the acceptance table**"_. That pool is exactly the 43. Complete
+the table and all three pools empty at once, and `pick()` — added in `T11a-3` precisely so an empty
+pool could never quietly shrink the control — does what it was built to do and refuses to stage.
+
+Repairing that surfaced two more instances of the same shape, neither of which was known going in:
+
+| #   | Where                                               | What it did                                                                                                                                                                                                                                 |
+| --- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | `stage()`'s `name_in_table`                         | **Prepended** a synthetic row to the real acceptance section instead of **replacing** it, so every synthesised tree silently carried today's table as well. Invisible today; fatal once the table is complete.                              |
+| 2   | the `push-later` and two sibling pools              | Filtered on `c not in table`, the term that empties them.                                                                                                                                                                                   |
+| 3   | the case _"the phase file under-names its ratchet"_ | Staged **`phase_text` itself** and relied on it being wrong by 43 IDs. Passes today; **escapes** the moment the table is completed, then reports a hole in property 4 that is really the control describing a tree the repository has left. |
+
+The general shape is one sentence: **a control whose cases borrow the live artifact is a control
+that only works while that artifact stays wrong.** It reads 20/20 the whole time. That is the
+V-MET-014 failure mode — a suite of vacuous passes reading green — with the vacuity scheduled to
+arrive on a specific future commit rather than present today, which is strictly worse, because the
+commit that exposes it is the commit that gets blamed for it.
+
+### What changed
+
+- `name_in_table` replaces the acceptance section. `parse_acceptance_table` stops at the next
+  top-level `##`, so the replacement splices head + heading + synthetic row + the next `##` onward.
+- The five victim pools get **one definition site**, `victim_pools(tbl)`, used for both staging and
+  audit. An audit that re-states what it audits drifts away from it, and that drift is how the
+  `c not in table` terms survived a reviewer twice.
+- A **stageability guard** runs `victim_pools` against two synthetic tables on every ordinary run —
+  a complete one and one with every later-dated ID retargeted out — and fails if any pool empties.
+  It fires on the ordinary L0 run, not only on a tree nobody runs.
+- The under-naming case synthesises its own under-naming instead of borrowing the document's.
+- `phase_of()` uses `catalog.get`: `V-CMP-006` is named by the table and has no §6 row, so the first
+  draft of the guard died on `KeyError` — finding (1) of `T11c′` biting inside the fix for it.
+
+`_control_against()` in `dev/test_invariants_gate.py` hands the module a **temp repository** — the
+real 09 spec, the real `results.csv`, and a synthesised phase-9.md — so the two future trees are
+asserted as committed cases on every chain run rather than proved once in `/tmp`. That is
+`harness-run` §4's requirement read literally, and it is what caught instances 2 and 3.
+
+Two of that file's existing assertions were also decoupled from the artifact's current shape. A
+floor of `> 40` set just under the table's current 41 is a fingerprint of the document, not a
+property of the parser; it fell to `> 10`, and the six hardcoded `V-RUN-00n` membership assertions
+went, replaced by a fixture-based test of the two parse behaviours the phase file's structure
+actually depends on — a `###` subsection is still inside the acceptance section, and
+`V-RUN-001…005` expands to five.
+
+### The ordering, which is the finding
+
+`P9-T11c′` was **complete and verified** when its artifact change reddened those assertions. The
+cheapest path to green was a two-line edit to `dev/test_invariants_gate.py` in the same commit. That
+is Guardrail 9 verbatim, so the artifact was preserved to `/tmp`, reverted, and **this unit was
+built and landed first**.
+
+Guardrail 9 forbids changing a check in the same unit as the implementation whose failure motivated
+it. It does not say which of the two goes first, and the cheap reading is _"land the artifact, fix
+the check next"_. That reading is wrong, and this is what shows it. With the artifact in, the check
+unit's own justification becomes _"this assertion is red"_, the tree it must be green on is the only
+tree available, and the smallest diff to green is a retune — Guardrail 9's exact pressure, arriving
+one unit later wearing the face of a repair. Landing the check first inverts all of it: the
+assertion is green when the unit starts, so the unit has to argue the property rather than the
+symptom, and the future tree is genuinely absent, so it has to be synthesised and committed. Which
+is [[LSN-053]] asked for from the other side, and is what caught instances 2 and 3.
+
+**Where a check and its artifact must be split, the check is the earlier unit.** Recorded in the
+ledger's decisions table as a candidate edit to `PROTOCOL.md` §10.1 for the next improvement pass.
+
+### `P9-T11c″-b` — the fix for the coupling had the coupling in it
+
+The three-tree claim above was made, and for the unit suite on `T11c′`'s tree it was **wrong**. It
+was caught the only way it could be: `T11c′` re-landed its artifact and failed on the spot.
+
+```
+AssertionError: 39 not less than 39 : nothing to retarget -- the fixture proves nothing
+```
+
+Both future-tree fixtures, **and the stageability guard itself**, built their hypothetical
+acceptance table as _"the live table minus what 09 §6 dates after this phase"_. That is a proper
+subset today, so it looked fine. The moment `T11c′` performed exactly that subtraction on the real
+document there was nothing left to subtract: the hypothetical collapsed onto the live table, the
+fixture's own validity assertion fired, and the guard quietly went from auditing two trees to
+auditing one. **Borrow-the-artifact, one level up, sitting inside the fix for borrow-the-artifact.**
+
+- Both hypotheticals derive from **09 alone** — `complete` is the required set, `partial` is every
+  other member of it. Neither reads `phase-9.md`.
+- `assert_hypotheticals_distinct()` is lifted to module level and refuses two hypotheticals that
+  are the same set. That is what makes _"derive from 09"_ checkable **today** rather than on a
+  commit nobody has written yet, and it is the arm that catches the whole family.
+- `_fixture_tables()` is one definition site and takes the module as a parameter.
+
+The first sweep of the three new mutants **ESCAPED twice**, and neither was a `BROKEN` row: M9
+because `_fixture_tables` called `_load_phase_ratchet()` internally and so returned a fresh module
+that ignored the caller's patch, and M8 — remove the detector, restore the defect — because nothing
+tested the detector. A detector whose only evidence is _"the thing it detects is not happening
+today"_ can be deleted with every gate green. Both are caught now.
+
+**What this says about the unit above.** Its three-tree verification was run as _"the control, on
+three trees"_ and reported as _"the control and the suite, on three trees"_. The gap is small and it
+is exactly where the defect was. Re-run per-tree, both, it holds.
+
+### Gate
+
+Verified on **three trees** — today's (required 98 · not green 34 · BLOCKING-ALWAYS 19), `T11c′`'s
+(82 · 22 · 11) and `T11c‴`'s complete table (82 · 22 · 11, property 4 silent). Control **20/20** and
+the unit suite **OK** on each, each run separately against that tree on disk.
+
+`verification/mutants/V-MET-014.json` **9/9 caught** under `dev/mutate.py`'s existing
+`"kind": "unittest"`: three mutants restore the coupling directly, one proves the stageability guard
+is load-bearing on the ordinary run, one removes the guard as well to prove the committed future
+tree is an independent backstop rather than decoration, two attack the acceptance parse, and three
+were added by `T11c″-b` for the coupling that was still in the repair. `dev/assertion-baseline.json`
+wound to 1367 named tests ([[LSN-056]]) · `invariants-gate.py` **31/31** ·
+`unittest discover dev` OK · full `dev/L0-CHAIN.txt` **48/48** clean.
+
+**B-012 is narrowed, not closed.** It asks for a `"kind": "command"` suite kind for a check whose
+only catcher is its own `--negative-control`, and that suite kind still does not exist. This unit
+found a third option its filing did not consider — give the control's catcher to a unittest, and the
+existing `kind: unittest` hosts the sweep — and recorded it against the item for the pass to weigh
+before building a runner kind for two units.
+
+---
+
+## P9-T11c′ — the sixteen that were not Phase 9's · 2026-07-31 · ✅
+
+**Landed second, on top of `P9-T11c″`.** It was implemented first; see
+[_The ordering, which is the finding_](#the-ordering-which-is-the-finding) above for why it was
+reverted and re-landed rather than committed with the check repair it forced.
+
+`P9-T11a-3` corrected the **derivation**: 09 §6's Phase column is authoritative over a 09 §10 suite
+name, and every §10 row up to and including this one is in the phase's ratchet. It deliberately left
+the **artifact** alone, because phase-9.md's acceptance table is the other half of the union the arm
+computes, and a unit that both moves the line and reports crossing it is Guardrail 9 in its exact
+shape. This unit is that other half.
+
+### What changed
+
+Sixteen IDs left the acceptance table because 09 §6 dates them to phase 10, 14 or 15. They are not
+dropped: [_Retargeted out of Phase 9_](#retargeted-out-of-phase-9-by-09-6) records every one with
+its due phase and the row it came from, and each keeps its ID, level, suite and BLOCKING-ALWAYS
+class. Twelve of the sixteen are not yet green and become Phase 10's opening worklist.
+
+|                                  | Before | After  |
+| -------------------------------- | ------ | ------ |
+| required (ratchet ∪ table)       | 98     | **82** |
+| not green                        | 34     | **22** |
+| of those, BLOCKING-ALWAYS        | 19     | **11** |
+| table under-names the ratchet by | 43     | 43     |
+
+**They are named outside the acceptance section, not inside it.** `parse_acceptance_table` reads
+every `V-XXX-nnn` between the acceptance heading and the next `##`, so a paragraph explaining that
+V-BRK-016 is postponed would go on requiring V-BRK-016 — [[LSN-019]] arriving inside the correction
+that closes it, which is exactly the trap `P9-T11a` fell into when writing prose about four IDs took
+its own count to zero. The retarget list is therefore its own `##` section. That is a structural
+answer, not a stylistic one: the record and the requirement cannot share a parse.
+
+### Why the other half of the correction is a separate unit
+
+The table also **omits 43** IDs 09 §10 requires — the same defect mirrored, and completing it is one
+paste. That paste is not in this commit. It was written here, run, and reverted, because it took the
+ratchet arm's negative control from 20/20 to **unstageable** and reddened two committed assertions
+behind it — the discovery that became [`P9-T11c″`](#p9-t11c--a-2020-control-that-only-worked-while-the-document-stayed-wrong--2026-07-31-),
+which landed first and is written up above.
+
+The smallest diff to green was _editing the check_, which is Guardrail 9 verbatim. So the ladder is
+three units for one paste:
+
+- **`P9-T11c′`** (this one) retargets the sixteen. ✅
+- **`P9-T11c″`** repaired the control, check-only, green on today's tree and on two synthesised
+  future ones. ✅ — **landed before this unit**, which is the point: a check split off under
+  Guardrail 9 goes _first_, or its only available tree is the red one.
+- **`P9-T11c‴`** completes the table, against a control that can already stage on it. ✅ — landed
+  the same day, and the control that `T11c″` had already taught to stage a complete table stayed at
+  20/20 through it, which is what a correctly-ordered split buys.
+
+That is the price of the guardrail, and the guardrail is right: the alternative is a session in
+which the control was edited to accommodate the artifact and nobody can afterwards say which one was
+wrong. Here the control turned out to be wrong in **three** places, only one of which was visible
+from this unit.
+
+### The catalog gap this unit found
+
+`V-CMP-006` is required by this table and has **no row in 09 §6**, which is how the arm ended up
+reporting a required ID whose `phase` is `None` for a reason unrelated to §11. Counting properly:
+**17 of the 251 check IDs 09 mentions have no §6 catalog row** — 14 V-CMP (001–008, 010, 011,
+020–023) defined as prose bullets in §5, and **V-MET-010, V-MET-011, V-MET-012** defined in §14,
+_"Verification of this document"_.
+
+09 §6's preamble calls itself _"The authoritative index"_. Seventeen checks it does not index are
+seventeen checks no suite-name expansion can ever reach — and both suites are in the phase-8 ratchet
+row, so all seventeen are required at phase 9 and none of them is derivable. **Three are
+BLOCKING-ALWAYS.** All three are in fact implemented (`dev/tests/spec-ids.py` for V-MET-010/012,
+`verification/traceability.yaml` + its bidirectional lint for V-MET-011, built as P8-T10), so this
+is a hole in the index and not in the work — but a BLOCKING-ALWAYS check that the gate cannot see is
+a BLOCKING-ALWAYS check the gate cannot fail on, and the fact that these three happen to be green is
+not something the gate established. Recorded as a `finding` row against V-MET-010; scheduled as
+**`P9-T11f`**.
+
+**Closed by `P9-T11f` on 2026-07-31.** All seventeen now have a catalog row — the fourteen V-CMP in
+a new **§6.15**, the three V-MET appended to the §8 table where the rest of their suite lives — and
+the §5 and §14 prose bullets dropped their bold markers so each ID keeps exactly one definition site
+(V-MET-013 fails the build on a second). The gate grew by the ten of the seventeen whose due phase
+is ≤ 9: required **82 → 91**.
+
+### The other thing the corrected required set exposes
+
+Of the 22 checks now not green, **ten have no row in `verification/results.csv` at all**:
+V-CTN-001, V-CTN-004, V-CTN-012, V-CTN-015, V-CTN-016, V-CTN-017, V-CTR-003, V-MET-001, V-MET-008,
+V-MET-009. Nine of the ten are BLOCKING-ALWAYS, and every one of them belongs to a suite that
+entered the ratchet at **phase 8** — which closed. They are not unbuilt: V-CTN-012/017 and V-CTR-003
+are asserted by `vap-agent-scope` tests and `dev/tests/` lints on the L0/L2 chains, and V-MET-001/
+008/009 are `invariants-gate.py` arms. What is missing is the **record**, and 09 §9.4 is explicit
+that the record is the evidence. A phase-8 ratchet declared green over ten members with no results
+row is the same class of defect as this table's, one phase earlier, and it is only visible now
+because the accumulation exists to look for it. These are runs to be made, not rows to be written —
+scheduled as **`P9-T11g`**, ahead of the milestone.
+
+### Gate
+
+`python3 dev/tests/phase-ratchet-is-asserted.py --phase 9 --negative-control` → **20/20**, rc 0 ·
+the live arm → rc 1, **22 of 82 not green, 11 BLOCKING-ALWAYS**, property 4 names **43** ·
+`dev/tests/invariants-gate.py` **31/31** · `python3 -m unittest discover dev` **OK** · full
+`dev/L0-CHAIN.txt` **48/48** clean.
+
+The control's stageability guard, added by `T11c″`, is what makes that 20/20 mean something on this
+tree: it re-runs all five victim pools against a synthesised complete table on every ordinary run,
+so this unit's artifact change cannot quietly re-couple the control to the document it audits.
+`T11c″`'s two committed future-tree tests were written against **exactly this artifact** and were
+green before it landed — which is the whole reason it could land at all.
+
+`P9-T11c‴` — the other half of this correction — is written up immediately below.
+
+---
+
+## P9-T11c‴ — the forty-three the table owed and never named · 2026-07-31 · ✅
+
+The third rung of the ladder, and the one the other two were built to make safe. `T11a-3` corrected
+the derivation, `T11c″` decoupled the control from the document, `T11c′` removed the sixteen IDs the
+table demanded too early — and this unit adds the forty-three it required and never wrote down.
+
+### What the defect actually was
+
+Not a missing check. Every one of the forty-three was **already required and already gated**: they
+reach the required set through 09 §10's suite names, which is why the arm's `required` figure is
+unchanged at **82** across this commit. What was missing is the phase file's own account of them. A
+required set assembled as `ratchet ∪ table` where the table names 39 of 82 leaves the phase file
+saying two different things about what the phase owes, depending on which half you read — and the
+half a human reads is the table.
+
+That is planning defect 4 restated at the level of the artifact rather than the plan. §4's original
+form was _"Accept (a)–(e) does not cover the ratchet"_, answered by adding explicit ratchet-only
+rows. The answer was right and incomplete: nine rows were added and forty-three obligations were
+not, and nothing measured the gap until `T11a` built property 4.
+
+### What changed
+
+Eight themed `_(ratchet only)_` rows, each carrying the level and target 09 §6 gives its members:
+
+| Row                                             | IDs    | Level      |
+| ----------------------------------------------- | ------ | ---------- |
+| the broker pipeline's own properties            | 6      | L1         |
+| the agent↔broker seam                           | 4      | L0, L1     |
+| refusal beats partial work                      | 2      | L1, L2     |
+| reversibility beyond the undo plan              | 2      | L1, L2     |
+| containment, carried in by 09 §10's phase-8 row | 6      | L0, L2, L3 |
+| a test-only RBAC grant never leaves `dev/`      | 1      | L0         |
+| the CRD contract and the brake                  | 11     | L0, L1, L2 |
+| the measurement suite                           | 11     | L0         |
+| **total**                                       | **43** |            |
+
+Themed rather than one flat list, because the rows are what a reader uses to understand what the
+phase is closed against, and forty-three IDs in one cell is a list, not an account. The grouping is
+09 §6's own — each row's members share a spec section and a level.
+
+**`V-MET-001…009` is written as an ellipsis run**, which `parse_acceptance_table` expands
+deliberately (the same handling `V-RUN-001…005` already relies on). The bold markers sit outside the
+run — `**V-MET-001…009**`, never `**V-MET-001**…**009**` — because the expansion regex matches
+`V-MET-001…009` as one token and the second form silently contributes only the two endpoints. Seven
+IDs would have vanished into a formatting choice, and property 4 would have gone on naming them
+while the table appeared to carry them.
+
+### What did not change, and why that is the result
+
+|                                  | Before | After  |
+| -------------------------------- | ------ | ------ |
+| required (ratchet ∪ table)       | 82     | **82** |
+| not green                        | 22     | **22** |
+| of those, BLOCKING-ALWAYS        | 11     | **11** |
+| table under-names the ratchet by | 43     | **0**  |
+| table names                      | 39     | **82** |
+
+A unit whose entire artifact is documentation and whose gate figures are unchanged is exactly what
+"the table was short and the ratchet was not" predicts. If any of the first three numbers had moved,
+the claim would have been false and the paste wrong.
+
+### Gate
+
+`python3 dev/tests/phase-ratchet-is-asserted.py --phase 9 --negative-control` → **20/20**, rc 0 —
+unchanged through the artifact edit, which is `T11c″`'s stageability guard doing the job it was built
+for. The live arm → rc 1, **22 of 82 not green, 11 BLOCKING-ALWAYS, property 4 silent**; rc 1 is
+correct and expected, and it is properties 2 and 3 that keep it red — those are `P9-T11g`'s and
+`P9-T11d`'s work, not this unit's.
+
+`dev/tests/invariants-gate.py` **31/31** · `python3 -m unittest discover dev` **OK** · full
+`dev/L0-CHAIN.txt` clean · prettier over the branch diff.
+
+**Resume at `harness-run`, unit `P9-T11f`** — the 17 check IDs 09 mentions with no §6 catalog row,
+three of them BLOCKING-ALWAYS. Then `P9-T11g` (the ten unrecorded phase-8 ratchet members) and
+`P9-T11d` (the workload pair at L2, which must start by pointing the fixture at an agent image this
+repository actually builds).
+
+---
+
+## P9-T11f — the seventeen 09 defined only in prose · 2026-07-31 · ✅
+
+The fourth rung, and the first one that makes the gate **bigger**. `T11a-3` corrected the derivation,
+`T11c″` decoupled the control, `T11c′` removed the sixteen too-early IDs and `T11c‴` wrote down the
+forty-three the table owed. All four moved the account of the required set without changing which
+checks the project is obliged to. This unit changes that set: **82 → 91**.
+
+### What the defect actually was
+
+09 §6's preamble calls itself _"The authoritative index"_, and the phase ratchet is derived by
+expanding a §10 suite name against it. Seventeen of the 251 check IDs the document defines had no §6
+row — fourteen V-CMP as prose bullets in §5's three inventories, and V-MET-010/011/012 in §14,
+_"Verification of this document"_. Both suites are in the phase-8 ratchet row, so all seventeen were
+obligations of every phase from 8 on, and not one of them was reachable by the expansion. Three are
+BLOCKING-ALWAYS.
+
+The shape is worth naming because it is the opposite of the usual one. Nothing was unbuilt and
+nothing was failing — the fourteen V-CMP have their rationale in §5, and V-MET-010/011/012 all run
+today on the L0 chain. What was missing is the **index entry**, and an index entry is the only thing
+a suite-name ratchet can see. A gate that cannot see a BLOCKING-ALWAYS check cannot fail on it, and
+the fact that these happened to be green is not something the gate had established.
+
+### Why the bullets had to give up their bold markers
+
+`dev/tests/spec-ids.py` treats both a catalog row (`| V-CMP-001 | … |`) and a bold bullet
+(`- **V-CMP-001** — …`) as a **definition site**, and V-MET-013 fails the build when an ID has more
+than one. Adding a §6.15 row while leaving `- **V-CMP-001**` standing would have defined every one of
+the fourteen twice. So all seventeen prose bullets were converted to plain backticks
+(``- `V-CMP-001` — …``) first, and their `L2`/`L0` level annotations removed — the row is now the
+single place level and due phase are stated, and the bullet is prose that reads it.
+
+### Where each suite is catalogued, and why not both in one place
+
+| Suite         | Catalogued in                     | Because                                                          |
+| ------------- | --------------------------------- | ---------------------------------------------------------------- |
+| V-CMP-001…023 | **new §6.15**                     | its rationale is §5's inventories; §6.15 indexes, never restates |
+| V-CMP-024     | §6.14 (unchanged)                 | the coverage audit that found it put it there                    |
+| V-MET-010/012 | the **§8** table, after V-MET-007 | next to the traceability obligation they police, with 001–009    |
+| V-MET-011     | the **§8** table                  | same                                                             |
+| V-MET-013/014 | §6.14 (unchanged)                 | arrived with the coverage audit                                  |
+
+`parse_catalog` scans the **whole** document, so §6 vs §8 placement changes nothing the ratchet
+reads — it is a legibility choice, and it is recorded in §6's preamble so the next reader does not
+have to rediscover that "the authoritative index" is authoritative in two places.
+
+### The due phases were argued, not assigned
+
+The Phase cell is the only thing in a new row that moves the gate, so each of the fourteen was dated
+from the spec rather than from convenience. The rule the §6.15 preamble states: **a completeness
+check comes due when its population completes**, because an inventory check over a population that
+does not exist yet is vacuous, not passing.
+
+| Due | IDs                      | The population that has to exist first         |
+| --- | ------------------------ | ---------------------------------------------- |
+| 8   | V-CMP-002, 003, 011, 020 | images, manifests, the CRD schema, the tiers   |
+| 9   | V-CMP-006, 007, 008      | the broker's identities and the install render |
+| 12  | V-CMP-010                | the mesh contract                              |
+| 13  | V-CMP-005, 021, 022      | V-PRO and the provisioning pair                |
+| 14  | V-CMP-001, 004           | the observability pipeline and its exercisers  |
+| 15  | V-CMP-023                | the ChatOps verb surface                       |
+
+V-MET-010/011/012 carry **no Phase cell**, because the §8 table has no such column — they parse as
+`undated`, which the arm reads as _required at every phase naming the suite_, i.e. every phase from
+8 on. That is the honest reading of a check on the specification itself, and §8 now says so in
+prose rather than leaving it to be inferred from a missing column.
+
+### What moved, and this time the movement is the result
+
+|                              | Before | After the catalog edit | After this unit's runs |
+| ---------------------------- | ------ | ---------------------- | ---------------------- |
+| required (ratchet ∪ table)   | 82     | **91**                 | **91**                 |
+| not green                    | 22     | 26                     | **25**                 |
+| of those, BLOCKING-ALWAYS    | 11     | 13                     | **12**                 |
+| table under-names ratchet by | 0      | **0**                  | **0**                  |
+
+Ten of the seventeen are due at or before phase 9; the required set grew by **nine**, because
+V-CMP-006 was already in it through the acceptance table — the very anomaly `T11c′` reported as _"a
+required ID whose phase is `None`"_. Of the ten, five were already green (V-CMP-002, 003, 007, 008,
+V-MET-011) and four were not: **V-CMP-011, V-CMP-020, V-MET-010, V-MET-012**, the last two
+BLOCKING-ALWAYS.
+
+The middle column is the honest one to quote as the unit's effect on the gate, and the right column
+is where it closed: V-MET-010 is one of this unit's own claimed checks, its property is
+`dev/tests/spec-ids.py`, and running it is what closes the `finding` row `T11c′` opened against it.
+V-MET-012 is the same script and passes today, so it needs a results row and not a build; V-CMP-011
+and V-CMP-020 have **no implementation anywhere in the tree**. Those three go to `P9-T11g`.
+
+Property 4 stayed silent only because the acceptance table was extended in the same unit: ten new
+ratchet members would otherwise have left it under-naming again. Two rows absorbed them — the
+measurement row widened to `**V-MET-001…014**` (markers outside the ellipsis run, per `T11c‴`) and a
+new completeness row carrying the seven V-CMP due by 9. The `_(carried, not ratchet)_ V-CMP-006` row
+is gone: V-CMP-006 has a dated catalog row now and is genuinely ratchet.
+
+### One truth defect fixed, one left alone
+
+§14 still claimed V-MET-011 was _"not implemented; scheduled as P8-T10"_. It landed as P8-T10 in
+PR #29 (`ead358e`) and `verification/results.csv` records it **pass** on 2026-07-27. Corrected, and
+the closing paragraph now says all three run on the L0 chain.
+
+`dev/tests/phase-ratchet-is-asserted.py` carries a comment reading _"§11's V-MET table has no phase
+cell at all"_ — it is §8, not §11. Left alone deliberately: editing a check in the same unit that
+edits the artifact the check reads is Guardrail 9's exact shape, however cosmetic. Queued for the
+improvement pass.
+
+### Gate
+
+`python3 dev/tests/phase-ratchet-is-asserted.py --phase 9 --negative-control` → **20/20**, rc 0 —
+unchanged across a seventeen-row catalog edit, which is `T11c″-b`'s decoupling holding. The live arm
+→ rc 1, **25 of 91 not green, 12 BLOCKING-ALWAYS, property 4 silent**; rc 1 is correct and expected,
+and properties 2 and 3 are `P9-T11g`'s and `P9-T11d`'s work.
+
+`python3 dev/tests/spec-ids.py` → rc 0, all 8 arms PASS, **251 check IDs defined in 09** — unchanged,
+because nothing was added: seventeen definitions moved from prose into rows.
+
+`dev/tests/invariants-gate.py` **31/31** · `python3 -m unittest discover dev` **OK, 414 tests** ·
+full `dev/L0-CHAIN.txt` clean · prettier over the whole `origin/main...HEAD` changed set.
+
+**Resume at `harness-run`, unit `P9-T11g`** — now thirteen required checks with no green results row.
+~~Eleven are runs to be made; **V-CMP-011** and **V-CMP-020** are builds, and they are the only two
+obligations of this phase with no implementation at all.~~ **Wrong, and `T11g-1` found out how
+wrong: one run and twelve builds.** This sentence was written from the ratchet's `hint` column, which
+lists files that _name_ a check ID — and the column's own footer says it is unweighted and that a
+file naming an ID may be disclaiming it. Nine of the eleven were named only by parser fixtures, by
+`binding.md`, or by the skills that talk about the check. See § `P9-T11g-1`. Then `P9-T11d` (the
+workload pair at L2, which must start by pointing the fixture at an agent image this repository
+actually builds).
+
+---
+
+## P9-T11g-1 — the audit that found twelve builds where the row promised eleven runs · 2026-07-31 · ✅
+
+### What the row said, and what was actually there
+
+`P9-T11g` was scheduled by `T11f` with this text:
+
+> Eleven are **runs to be made, not rows to be written** — asserted by VAP tests, `dev/tests/` lints
+> and `invariants-gate.py` arms, and 09 §9.4 makes the record the evidence.
+
+That is a claim about the tree, and it was made without reading it. ORIENT read it instead. For each
+of the thirteen the question was the same — _name the artifact that asserts this property_ — and the
+answers were:
+
+| Check                           | Asserted by                                                                                                             | Verdict |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------- |
+| V-MET-012                       | `dev/tests/spec-ids.py`, two arms, green on the L0 chain since PR #29                                                   | **run** |
+| V-CTR-003, V-CMP-011            | nothing                                                                                                                 | build   |
+| V-CMP-020                       | nothing                                                                                                                 | build   |
+| V-MET-001, V-MET-008, V-MET-009 | nothing — their only hits are `binding.md`, the milestone/improve skills, and ratchet-parser fixtures                   | build   |
+| V-CTN-004, V-CTN-012, V-CTN-017 | nothing on either chain. No RBAC-parsing lint exists at L0; the VAP corpora that would cover 012 are **run by nothing** | build   |
+| V-CTN-001, V-CTN-015, V-CTN-016 | nothing — no `dev/verify/*-l2.sh` names or asserts any of the three                                                     | build   |
+
+**One run. Twelve builds.** And a fourteenth check nobody had listed: **V-MET-002**, BLOCKING-ALWAYS,
+not green, named nowhere in this file. It reaches the required set only through `T11c‴`'s themed
+`V-MET-001…009` ratchet row — which is the row working correctly, and is precisely why a themed row
+needs a task to answer it.
+
+### Where the wrong premise came from
+
+The ratchet arm prints a `hint: named by …` column, and the eleven-runs sentence is what that column
+looks like if you read it as coverage. The column's own footer says not to:
+
+> The `hint` column is UNWEIGHTED and no property reads it. A file naming a check ID may be
+> disclaiming it: `pair_netpol_test.go:35` names V-ISO-001/002 to say they are L2 and belong
+> elsewhere. Only a results row is evidence (09 §9.4).
+
+Every one of the nine mis-scheduled checks is a case of that. `V-CTN-004`'s hint names
+`.claude/harness/verify-phase.workflow.js` (a workflow that would run the check if it existed),
+`dev/test_invariants_gate.py` (a fixture string), and
+`examples/gitops-repo/policy/tests/vap_actor_negatives.yaml` — a corpus that is real, correct, and
+**executed by nothing**: grep finds it referenced only by `LEDGER.md`, this file, and itself.
+`V-MET-008`'s hint names `binding.md` and `harness-milestone/SKILL.md`, which are the two documents
+that _require_ the check. A check is not implemented by the sentence demanding it ([[LSN-019]]).
+
+### What was built
+
+`dev/tests/crd-has-no-authority-fields.py`, closing **V-CTR-003 and V-CMP-011 with one artifact**.
+09 states them separately — §6.5 as _"No authority fields in the CRD schema"_ citing 06 §10, §6.15 as
+_"holds none of the prohibited authority field names and sets no `x-kubernetes-preserve-unknown-fields`
+on `spec`"_ — but 06 §10 writes the property once, and V-MET-013 forbids two **definition sites** in
+09, not two IDs sharing an **implementation**. Two files reading the same YAML would give one
+sentence two chances to drift.
+
+Five properties, and three of them exist because the obvious version of this check is a grep that
+passes for the wrong reason:
+
+1. **Depth.** `spec.rbac` is the spelling review catches; `spec.security.rbac` is the one that merges.
+   The walk covers the whole `spec` subtree, 271 property names deep.
+2. **The schema stays closed.** One `x-kubernetes-preserve-unknown-fields` anywhere under `spec` and
+   pruning stops — at which point property 1 is asserting that a name is absent from a schema that no
+   longer decides what is present. Scoped to the Agent CRD deliberately: `actionrecords.yaml`
+   legitimately carries two, for the opaque payload and patch.
+3. **Non-vacuity.** The `spec` node must exist, be `type: object`, and carry at least 50 property
+   names. Six absent strings pass just as happily against a file the walk failed to read ([[LSN-035]]).
+4. **The Go source.** `config/crd/bases` is generated and **no PR check runs `make manifests` and
+   diffs the result** — verified, not assumed. So between adding `ScopeOverride string` to a type and
+   remembering to regenerate, properties 1–3 read the old bytes and pass. This is the arm with the
+   most reach and it is the one a grep-shaped check would not have.
+5. **The L2 arm still exists.** This check asserts a shape and cannot observe pruning;
+   `webhook-negatives-l2.sh`'s V-9 arm applies `spec.rbac` against a real API server and asserts it
+   comes back gone. Deleting the half that proves the mechanism must not be silent.
+
+The reader is a dependency-free structural walk, for the reason `spec-ids.py` and `yamlsubset.py`
+each have one: L0 installs nothing. `yamlsubset` itself cannot read a CRD — controller-gen folds Go
+doc comments into multi-line plain scalars, outside its accepted subset — and widening a parser two
+corpus lints depend on, to read a seventh file, is a change to **their** blast radius, not to this
+check's. A line the walk cannot classify raises rather than being skipped, because a walk that
+silently stops covering a region still returns a plausible-looking list of keys.
+
+### What moved
+
+|                           | before |  after |
+| ------------------------- | -----: | -----: |
+| required                  |     91 |     91 |
+| green                     |     66 |     69 |
+| not green                 |     25 | **22** |
+| of those BLOCKING-ALWAYS  |     12 | **11** |
+| property 4 (under-naming) |      0 |      0 |
+
+Three closed: V-MET-012 (BLOCKING-ALWAYS, a row it had been owed since PR #29), V-CTR-003 and
+V-CMP-011 (built here). The required set did not move, which is correct — nothing was added to the
+gate and nothing retargeted out of it.
+
+### Gate
+
+`python3 dev/tests/crd-has-no-authority-fields.py` → rc 0 · `--negative-control` → **6/6**, rc 0.
+Two of the six mutations differ only in depth (`properties.rbac` vs
+`properties.security.properties.actorServiceAccountName`), because a control that asks only _"did
+anything fail"_ cannot tell whether the nested arm executes at all ([[LSN-035]]) — and nested is the
+arm that would rot.
+
+`python3 dev/tests/negative-controls-name-their-rule.py` → PASS, and the new control is in its corpus.
+`python3 dev/tests/spec-ids.py` → rc 0, 8/8, **251 check IDs unchanged**.
+`dev/tests/invariants-gate.py` **31/31** · `python3 -m unittest discover dev` **414 OK** ·
+full `dev/L0-CHAIN.txt` clean · prettier over the whole `origin/main...HEAD` changed set.
+`phase-ratchet-is-asserted.py --phase 9` → rc 1 (**22 of 91 not green, 11 BLOCKING-ALWAYS**, property
+4 silent); rc 1 is correct and expected, and properties 2 and 3 are `T11g-2/3/4`'s and `T11d`'s work.
+`--negative-control` → **20/20**, rc 0.
+
+### Resume
+
+**`harness-run`, unit `P9-T11g-2`** — the measurement family: V-MET-001, **V-MET-002**, V-MET-008,
+V-MET-009. Four BLOCKING-ALWAYS checks about the check set itself, none implemented, and one tool
+over `verification/traceability.yaml` rather than four. Then `T11g-3` (V-CMP-020 and the L0 arms of
+V-CTN-004/017), `T11g-4` (the L2 containment arms on `gke-scratch-kube-agents-dev`, including a
+runner for the VAP corpora that nothing runs today), then `P9-T11d`.
+
+---
+
+## P9-T11g-2a — the check set had no record of what implements it · 2026-07-31 · ✅
+
+### Why the row split first
+
+`T11g-2` was scheduled as _"one tool over `verification/traceability.yaml`, not four"_. That file
+answers a **different question** from the one V-MET-002/008/009 ask.
+
+> **Correction, 2026-07-31, same day, by the next unit's ORIENT.** This section first said
+> `verification/traceability.yaml` _"does not exist"_. It does, and has since `P8-T10` (`ead358e`) —
+> 71 KB, 177 entries, V-MET-011's artifact and green on every run. The claim came from asking
+> whether §8's `R-` mapping existed and reporting the answer against the filename §8 happens to use
+> for it. The split's conclusion is unchanged and its reason is now the true one, below.
+
+`traceability.yaml` maps the **177 Verification bullets** of 01–08 to check IDs. 09 §8 asks for a
+mapping over **every normative statement** — must / never / always / is rejected / is a defect / may
+not, plus every mandated-behaviour table row — which §8.1 counts at **~538**. Those are two
+populations differing by a factor of three, and the larger one has never been enumerated: a
+repo-wide search for `R-<doc>.<section>-<n>` returns exactly two hits, and both are the sentences in
+§8 that _define_ the scheme. `verification/coverage.yaml`, which §8.1 names as the baseline's home,
+was genuinely absent on 2026-07-31, the day this analysis was written; it was created later that
+same day by `2153772`.
+
+So §8's chain is **requirement → check → implementation**: V-MET-002/008/009 read the first link and
+need the enumeration built first (`T11g-2b`), V-MET-011 already holds a 177-bullet slice of it, and
+the last link had no artifact at all. That last link is this unit.
+
+### Why a registry and not a grep
+
+`phase-ratchet-is-asserted.py` already prints a `hint: named by …` column, built from
+`git grep <check-id>`, under a footer that disclaims it in as many words: _"The `hint` column is
+UNWEIGHTED and no property reads it. A file naming a check ID may be disclaiming it."_
+
+**The disclaimer was earned again this phase, at a cost.** `T11g` was scheduled off that column,
+promising _"eleven runs to record and two builds"_. The tree held one run and twelve builds
+(§ `P9-T11g-1`). Nine of the eleven were "named by":
+
+- the ratchet's own `--negative-control` fixture (V-ADV-003, V-BRK-001);
+- `.claude/harness/binding.md` and the skills that _require_ the check (V-MET-002/008/009);
+- `examples/gitops-repo/policy/tests/vap_actor_{positive,negatives}.yaml` — corpora that are real,
+  correct, and **executed by nothing on either chain** (V-CTN-012);
+- `pair_netpol_test.go:35`, which names V-ISO-001/002 in order to say they belong at L2 and are
+  asserted elsewhere.
+
+A grep cannot separate an assertion from a citation from a disclaimer, and a second grep will not
+either. `verification/implementations.yaml` is a human's answer, written once; this check is what
+stops it drifting from the tree it describes.
+
+### The registry
+
+81 entries. Each is either `runs:` + `asserts_in:`, or a single `unimplemented:` string. Curated,
+not generated — the header says so at length, because the first draft _was_ generated by ranking
+grep hits and it got V-MET-013 (a prose mention), V-MET-014 (one of 21 compliance declarations
+rather than the enforcer), V-ISO-001 (the known disclaimer) and V-CTR-002 (only the V-7 slice)
+wrong. Seventeen entries carry a curated override for exactly that reason.
+
+### The check — seven properties
+
+| #   | Property                                                                                                                         | Why it is not redundant                                                                                                    |
+| --- | -------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 0   | The reserved `V-{XXX,QQQ,ZZZ}-*` fixture namespaces are still absent from 09 §6                                                  | Property 6's exit must not rot into a blind spot over a real suite code                                                    |
+| 2   | Every registry key is a 09 §6 ID                                                                                                 | A renamed or retired ID leaves a row pointing at nothing, which reads exactly like a row pointing at something             |
+| 3   | Every `asserts_in` exists **and names its own check ID**                                                                         | This is the half that makes a later grep honest — and it caught the seven anonymous implementations below                  |
+| 4   | Every `runs` is on `dev/L0-CHAIN.txt` / `dev/L2-CHAIN.txt` verbatim (or is one of the two entry points) **and reaches** the file | An implementation nothing runs is not an implementation — the VAP-corpus lesson, mechanized                                |
+| 5   | Every check required at this phase **and green** has a row                                                                       | Deliberately not "every required check": a check with no green row is the ratchet's population, and one gap wants one gate |
+| 6   | Every `V-XXX-nnn` token in the test corpus is defined in §6                                                                      | 09 §8's second clause, literally — over `dev/tests`, `dev/test_*.py`, `dev/verify` and every `k8s-operator` `*_test.go`    |
+| 7   | The `unimplemented:` count may not exceed 1                                                                                      | The 09 §8.1 / V-MET-003 shape: a gate that always fails is a gate someone disables, so the remainder is named and pinned   |
+
+Property 6 has two exits, and **both are counted and printed on the pass line** — an escape hatch
+nobody can see is how a check stops checking without ever going red. The reserved namespaces let a
+negative control invent IDs that will never be real; the `not-a-check-id` line marker covers the one
+case where naming a non-existent ID _is_ the sentence, which
+`invariants-gate.py`'s _"there is no V-CTR-021, so it is not a one-letter slip"_ is.
+
+The two entry points that appear on no chain line are `make -C k8s-operator test` (`binding.md`
+§Build's Go entry point, absent from L0 because it needs envtest) and
+`python3 -m unittest discover dev`. Both are named in the source with the reason.
+
+It imports `parse_catalog`, `parse_ratchet`, `parse_acceptance_table`, `parse_results`, `is_green`
+and `latest_phase` from `phase-ratchet-is-asserted.py` rather than re-deriving them: three
+definition sites of "required" and "green" are three chances for this check and the phase gate to
+disagree (V-MET-013).
+
+### Three findings
+
+1. **V-CTR-001 is green, required at phase 9, and nothing asserts it.** Its `evidence_ref` is
+   `go test ./...` over every package — which attests that the suite passes, not that every shipped
+   `Agent` CR validates and that apply→get→re-apply is a no-op diff. There is no
+   `k8s-operator/config/samples/`, and no test reads the shipped CRs and round-trips them. Recorded
+   as the registry's single `unimplemented:` row: **published, not hidden**. Correcting the results
+   row or building the check is its own unit.
+2. **V-CTN-035 and V-CTN-036 carry a `pass` whose `evidence_ref` is a list of spec citations**
+   (`01 §3, 02 §6/§10, 07 P11-T4/P12-T5/Accept (f), 09 rows 485–486 + phase-12 ratchet (ead358e)`),
+   not a command. Both are phase-12 checks and sit in the 66-not-required set, so neither is a
+   phase-9 halt — but a citation is not evidence (09 §9.4), and the same shape is what
+   [[LSN-046]] was opened for. Queued to the improvement pass.
+3. **Seven required-and-green checks did not declare their own check ID anywhere executable** —
+   V-BRK-023, V-CTR-016, V-CTR-017, V-CTR-018, V-GAT-001, V-MET-014, V-REV-008. Every one of them is
+   genuinely asserted; the pairing simply lived in nobody's head. Fixed in place: each now carries
+   the declaration in the file that asserts the property, written after reading the test names,
+   not inferred from the grep that found the file.
+
+### Gate
+
+`python3 dev/tests/check-ids-have-implementations.py` → rc 0 (81 IDs mapped; 112 distinct check IDs
+in the test corpus, all §6-defined; 4 reserved fixture tokens and 4 `not-a-check-id` lines, both
+counted on the pass line; 1 `unimplemented:` against a ceiling of 1).
+`--negative-control` → **8/8**, rc 0 — and the fixtures are read out of the tree
+(`_a_required_green`) rather than listed, so the control cannot go stale against it.
+
+`python3 dev/tests/negative-controls-name-their-rule.py` → PASS, **14** controls, the new one in its
+corpus. `python3 dev/tests/spec-ids.py` → rc 0, 251 check IDs unchanged.
+
+`phase-ratchet-is-asserted.py --phase 9` → rc 1 (**21 of 91 not green, 10 BLOCKING-ALWAYS**);
+rc 1 is correct and expected — properties 2 and 3 are `T11g-2b/3/4`'s and `T11d`'s work.
+
+### Resume
+
+**`harness-run`, unit `P9-T11g-2b-ii`** — see the section below. Then `T11g-3` (V-CMP-020 and the
+L0 arms of V-CTN-004/017), `T11g-4` (the L2 containment arms on `gke-scratch-kube-agents-dev`,
+including a runner for the VAP corpora that nothing runs today), then `P9-T11d`.
+
+---
+
+## P9-T11g-2b-0 — the spec-text exemption follows the content · 2026-07-31 · ✅
+
+Not a planned unit. `verification/requirements.yaml` is a verbatim mirror of the normative
+sentences in 01–08, and two L0 lints scan every tracked file for bytes that must not appear in
+source: the retired `ALLOW_ALL_USERS` hatch (`closed-allowlist.py`, V-CTR-002/V-CTR-014) and any
+`kubeagents.` domain the operator does not serve (`api-group-single-sourced.py`, LSN-032). Both
+already exempt `docs/design/` — a spec has to be able to describe what was removed and why — and
+both fired on the mirror the moment it existed: 07 §2's acceptance text names `*_ALLOW_ALL_USERS`
+while describing its deletion, and 06 §8's observability table names eleven OTel attribute keys
+(`kubeagents.action_id`, `kubeagents.risk_class`, …) that are not API groups.
+
+**Neither firing was a regression, and that is exactly why it needed its own unit.** Guardrail 9:
+a check may not change in the same unit as the work whose failure motivated it. So the corpus
+change landed first, alone, at `9137144`, and the enumeration followed.
+
+**The exemption follows the content.** This is not a new principle — `closed-allowlist.py` already
+carries `verification/results.csv` for the same reason, added 2026-07-26 when V-CTR-014's evidence
+rows moved out of the ledger into a CSV. Both new entries are an **exact path, never a
+`verification/` prefix**, and the file says why: that directory will hold per-run manifests written
+by whatever produced them, and a prefix would exempt those sight-unseen.
+
+**For the group lint, the path exclusion is the _narrower_ of the two available fixes.** The
+obvious alternative was to add the eleven attribute keys to `NON_GROUP_ATTRIBUTES`. That set is
+closed on purpose — its comment says a typo in an attribute key (`kubeagents.agnet_name`) is the
+same class of silent defect as a typo in a group, so a new attribute should be a conversation — and
+widening it would have exempted those eleven spellings in **Go and YAML source too**. Excluding one
+generated file keeps the closed set closed.
+
+**Over-breadth was probed, not argued.** A sibling `verification/probe-sibling.yaml` carrying both
+an `ALLOW_ALL_USERS` emission and `kubeagents.wrong.io` is still caught by both lints; the probe
+file was then removed and both returned to green. The mirror also cannot become a smuggling route
+on its own: its `text:` values are asserted equal to the spec's own sentences on every L0 run, so
+an emission would have to enter through `docs/design/` first — where it is already exempt, and
+where it would be read.
+
+**One gap, recorded rather than closed.** Neither lint has a `--negative-control` entry point of
+the shape [[LSN-035]] asks for, so this unit's over-breadth property is proven by a probe in one
+session rather than by a committed row that re-runs on every chain. Carried to the phase-9
+improvement pass.
+
+---
+
+## P9-T11g-2b-i — the denominator 09 §8 asks for did not exist · 2026-07-31 · ✅
+
+09 §8 is the obligation that makes "comprehensive" provable: _"Every normative requirement in 01–08
+maps to at least one check ID."_ That sentence needs a population, and the repo did not have one.
+So §8.1's _"roughly 45% of the set is uncovered at baseline"_ was a percentage with no list behind
+it — which is the precise shape V-MET-009 exists to forbid.
+
+### Why not `verification/traceability.yaml`
+
+Because it answers a different question, and §8 itself is the source of the confusion: §8 names
+`traceability.yaml` as the emission target for requirement → checks, while §14 and V-MET-011 use
+that same file for the **177 bullets of the six spec Verification sections**. Those are different
+populations — 177 bullets against 853 statements — and the collision is in the spec, not in the
+tree. It is an ambiguity rather than a contradiction (one file _could_ hold both), so it is not a
+§8.5 halt; it is a decision, recorded as one. A second ID space in that file would give
+V-MET-011's green a second thing to mean, so the enumeration went to a new
+`verification/requirements.yaml`.
+
+### What counts as a normative requirement
+
+09 §8 defines it: _"any statement using must / never / always / is rejected / is a defect / may
+not, and every row of every mandated-behaviour table."_ Mechanised as two rules — a **sentence**
+carrying one of those keywords, and **every data row of a mandated-behaviour table**. Fenced code
+is skipped (06 alone has 31 keyword-bearing lines inside fences). Sentence splitting protects
+inline code, links, `§4.4` references, decimals and abbreviations first, or a naive `.` split
+shreds them.
+
+**The "mandated-behaviour" qualifier was kept rather than quietly read as "every table".** Tables
+in **01** and **07** are excluded and they are the only exclusions: 01's are an audience map and a
+current-vs-intent delta, 07's are the phase task schedules and the standing-deferral register.
+Those describe what the _project_ will do, not what the _system_ must do, and no check will ever
+cover a row of a delivery schedule. Both exclusions are **counted and printed on the pass line**,
+because an escape hatch nobody can see is how a check stops checking without going red. Sentences
+in 01 and 07 still count — 07 §5's "tests are replaced, never deleted" is a real obligation, and
+09 §8.1 says V-MET-003 is its mechanised form.
+
+The six **Verification** sections are excluded wholesale, as V-MET-011's space, and the section
+list is imported from `dev/tests/spec-ids.py` rather than restated.
+
+### Calibration against §8.1 — and why two baselines are recorded
+
+§8.1 records **148** normative requirements for 02. Applying both rules to 02, counting every table
+row including its Verification section, gives **147**. The audit is very nearly reproducible there
+— and is _not_ uniformly reproducible: **78** for 05 against ~204, and **"96 (groups)"** for 06
+against ~374. That audit grouped some documents and enumerated others.
+
+So `verification/coverage.yaml` records **both**: §8.1's published audit, asserted cell for cell
+against the spec text so it cannot drift, and this enumeration's own count beside it. A ratchet
+needs a baseline in the same units as its measurement, so V-MET-008 will run against `totals`.
+Pinning it to §8.1's numbers against a different denominator would not be stricter or weaker — it
+would be incoherent.
+
+### The check — six properties
+
+| #   | Property                                                        | Why it is separate                                                                                                       |
+| --- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| 1   | The enumeration is current with the specs, compared **by text** | A count comparison passes when a sentence is reworded, and a reworded requirement is one a mapping now points at falsely |
+| 2   | IDs are well-formed and contiguous 1..n per section             | A gap means a mapping points at a requirement that is not there                                                          |
+| 3   | `coverage.yaml`'s totals agree with `requirements.yaml`         | The published artifact is derived; a stale derivation reads exactly like a current one                                   |
+| 4   | The uncovered list is **published by ID, not counted**          | V-MET-009 proper — a percentage with no visible remainder is how the audit stops silently                                |
+| 5   | The published list is complete and every ID resolves            | A truncated list reads exactly like a complete one                                                                       |
+| 6   | The recorded §8.1 baseline equals 09 §8.1's table               | The baseline is read out of the spec, so it cannot be edited into agreement                                              |
+
+`--negative-control` **8/8**: a spec statement left unenumerated, an enumerated one deleted, one
+silently reworded, the uncovered list replaced by its count, the list truncated, a requirement
+marked covered with no check behind it, the recorded §8.1 baseline edited away from the spec, and a
+section's ordinals made non-contiguous.
+
+### Two properties deliberately left to `-2b-ii`
+
+**`checks:` is curated and empty today.** 09 §8 says each check declares the requirement IDs it
+satisfies; that mapping is a human's answer, not an extraction, so `--emit` **merges** and never
+clobbers it. With it empty, every one of the 853 requirements publishes as uncovered. **That
+overstates the gap, and it is the direction that cannot manufacture a green.**
+
+**V-MET-002 and V-MET-008 are therefore still not green**, correctly. Recording a computed
+baseline of zero would have pinned V-MET-008's ratchet at the floor where it can never fall — a
+false green on a BLOCKING-ALWAYS check, which is the one outcome this unit had to avoid.
+
+### Gate
+
+Required **91** unchanged · green **70 → 71** · not green **21 → 20** · BLOCKING-ALWAYS not green
+**10 → 9**.
+
+Full L0 chain clean. `unittest discover dev` **414 OK**. `negative-controls-name-their-rule.py`
+PASS at **15** controls (was 14). `check-ids-have-implementations.py` PASS at **82** registry
+entries (was 81). `results.csv` **181 rows**, CRLF intact.
+
+`make -C k8s-operator test` was **not** run and is not owed: this unit touches `dev/`,
+`verification/` and `docs/build/` only, no Go tree.
+
+## P9-T11g-2b-ii-1 — ownership, derived from the catalog; and the ratchet that needs no curation
+
+**V-MET-008 is green.** `dev/tests/coverage-ratchet-holds.py` + `verification/coverage-ratchet.yaml`.
+
+**Ownership is derived, not declared.** 09 §8's two coverage gates are complements of one
+partition: V-MET-002 demands full coverage of the requirements _owned by_
+V-CTN/V-BRK/V-REV/V-ISO/V-ADV, V-MET-008 ratchets the rest. The incentive on a hand-drawn boundary
+is not symmetric — calling a section unowned shrinks the BLOCKING-ALWAYS obligation and grows the
+lenient one — so the partition is read out of 09 §6's `Source` column, which has been reviewed for
+four phases and moves when the catalog moves. 38 sections resolve; **420 of 1030 obligations are
+load-bearing-owned, 610 are elsewhere.** Prefix-inclusive and exact section matching agree at 420,
+and the pass line prints both so the day they diverge is visible.
+
+**The finding, and why section-level non-emptiness was not enough.** The row above asked for one
+hard failure: _a load-bearing suite that derives to zero owned sections_. Building it surfaced a
+second, one level down, that the first would have waved through. **V-ISO derives exactly one
+section** — `05 §8`, recovered from §6.4's prose because its table has no `Source` column at all —
+and `05 §8` is a **Verification section**, which `verification/requirements.yaml` excludes by
+design. Its obligations live in the other ID space, `verification/traceability.yaml`'s
+`<doc>§<sec>#<n>`, under V-MET-011. So a requirements-only reading gives V-ISO **one section and
+zero obligations**: V-MET-002 asks a BLOCKING-ALWAYS suite for nothing at all, and the pass line
+reads `V-ISO 1 section`, which is not zero and would not have failed. Both spaces are now read, a
+section resolves in whichever space its obligations live in, and non-emptiness is asserted at
+**both** granularities. V-ISO's eighteen `05§8#n` bullets are real, curated and already gated by
+V-MET-011; what the single-space reading would have destroyed is this check's ability to say so, and
+its ability to tell that case apart from a suite that owns nothing anywhere.
+
+**Arrival is keyed on text, not on IDs.** `R-<doc>.<section>-<n>` is positional, so inserting one
+`must` at the top of a section renumbers every statement below it — an ID-keyed arrival gate would
+fire on all of them and name the wrong sentence in every case. `baseline.digests` holds 853
+whitespace-normalised content digests instead: reordering changes nothing, an insertion adds exactly
+one, a rewording swaps one for one and reads as an arrival, which is the honest reading. The three
+exits are §8.1's own — map it to a check, name a deferral in V-MET-006's shape (blocker, owner,
+promotion), or `--rebaseline YYYY-MM-DD`, which is a visible diff. **`--rebaseline` refuses to lower
+a per-document floor**, so it can retire an obligation to _cover_ a statement but never retire
+coverage already achieved; property 5 asserts the floor from the other side on every run.
+
+**What is deliberately _not_ asserted here.** The floor and the arrival clause are scoped to
+`requirements.yaml`. A new Verification bullet is already an arrival gate — V-MET-011 fails the
+build on any bullet resolving to no check, in both directions — and a second gate over the same 177
+keys would add a second place to re-baseline, not a property. Recorded in the ledger's decisions
+table.
+
+**Verification.** `V-MET-008` **pass**, L0, tree. Negative control **11/11**: an arrival with no
+check and no deferral · a deferral missing its owner · V-ISO's prose source deleted (zero sections)
+· `traceability.yaml`'s `05§8` bullets deleted (one section, zero obligations — the same false green
+one level down) · a `Source` cell blanked · a recorded ownership row deleted · the load-bearing
+count edited · V-MET-002's worklist truncated · the floor raised above the coverage under it · the
+enumerator returning almost nothing · the arrival baseline emptied.
+
+Required **91** unchanged · green **71 → 72** · not green **20 → 19** · BLOCKING-ALWAYS not green
+**9 → 8**.
+
+Full L0 chain **0 failures**. `unittest discover dev` **414 OK**.
+`check-ids-have-implementations.py` PASS at **83** registry entries (was 82). `results.csv` **182
+rows**, CRLF intact.
+
+**The floor is 0 by construction, and this unit does not pretend otherwise.** V-MET-008 passes on
+the ratchet, the arrival clause and the ownership derivation — not on coverage. The 357
+requirements-space obligations the load-bearing suites own are published **by ID** in
+`load_bearing_uncovered:` as V-MET-002's worklist. V-MET-002 remains not green.
+
+`make -C k8s-operator test` was **not** run and is not owed: `dev/`, `verification/` and
+`docs/build/` only, no Go tree.
+
+### Resume
+
+**`harness-run`, unit `P9-T11g-2b-ii-2`** — curate `checks:` in `verification/requirements.yaml` for
+the **357** load-bearing-owned requirements, then build **V-MET-002** (BLOCKING-ALWAYS). The
+worklist is already published by ID; read it out of `verification/coverage-ratchet.yaml` rather than
+re-deriving it. Constraints inherited and worth not rediscovering:
+
+1. **Section-citation is not coverage.** A requirement is _owned_ precisely because some
+   load-bearing check cites its section, so reusing that citation as the mapping makes V-MET-002
+   green by construction — the false green §8.1 distinguishes _fully covered_ from _partial_ to
+   avoid. The mapping is per statement.
+2. **A requirement with no honest check is left unmapped and V-MET-002 stays red.** §8.1 dates the
+   load-bearing draw-down to _"before Phase 10 grants the first write credential"_; buying a green
+   with a citation is what that dating exists to prevent.
+3. **Ownership and the ratchet are done.** Do not re-derive either, and do not edit
+   `coverage-ratchet.yaml` by hand — the ownership half is recomputed and compared on every L0 run,
+   so a hand edit only produces a finding. As `checks:` fills in, re-run `--emit` to shrink the
+   published worklist; the floor rises with it and `--rebaseline` cannot lower it.
+
+Then `T11g-3` (V-CMP-020 and the L0 arms of V-CTN-004/017), `T11g-4` (the L2 containment arms on
+`gke-scratch-kube-agents-dev`, including a runner for the VAP corpora that nothing runs today),
+then `P9-T11d`.
+
+---
+
+## P9-T11g-2b-ii-2c-ii-c — the draw-down closes, and a control breaks on its own success · 2026-07-31 · ✅
+
+### The `-c-1` / `-c-2` split was planned and is recorded VOID
+
+The unit was sized as two commits — `-c-1` the three remaining mappings, `-c-2` the green and the
+arm move. It landed as **one**, and the reason is worth writing down rather than quietly dropping:
+
+- **V-MET-002's greenness is _caused by_ `-c-1`'s mappings.** There is no tree in which `-c-1` is
+  committed and V-MET-002 is still red, so `-c-2` has no independent precondition to establish.
+- The two halves **share `dev/L0-CHAIN.txt` and `verification/implementations.yaml`**, and splitting
+  a shared file across two commits needs interactive hunk staging, which this environment forbids.
+
+A split that cannot produce two distinct verifiable trees is not a split. Recorded here so the next
+reader does not go looking for a `-c-1` commit.
+
+### The three closures, and the one that was nearly wrong
+
+| Requirement  | Row           | Source  | Lvl | Phase  | What it asserts                                                           |
+| ------------ | ------------- | ------- | --- | ------ | ------------------------------------------------------------------------- |
+| `R-06.2.3-6` | **V-CTN-039** | 06 §2.3 | L0  | 9      | the developer-team tier has **no cloud actor identity**                   |
+| `R-03.4.3-8` | **V-CTN-040** | 03 §4.3 | L2  | **10** | no write to an `Agent` CR whose identity is an **ancestor** of the writer |
+| `R-03.4.3-9` | **V-CTN-041** | 03 §4.3 | L2  | **10** | actor writes stay inside the **live** tier template                       |
+
+**V-CTN-039 has a clause that is easy to drop and load-bearing.** "No cloud actor" must stay
+distinguishable from "no actor at all", so the row also requires the tier's **Kubernetes** actor
+grant to still exist. A check that only asserted absence would go green the day the developer-team
+actor was deleted outright — the greenest edit of all.
+
+**V-CTN-040 and V-CTN-041 are dated phase 10, and that is a legitimate closure.** The decision hung
+on `load-bearing-coverage-is-full.py`'s own docstring, which says it does not ask whether the mapped
+check is green, and that _"section citation is not coverage, and a requirement with no honest check
+is left unmapped rather than closed with the nearest-looking catalog row."_ **V-CTN-012 was sitting
+right there** for the live-tier-template obligation — an existing, green, phase-8 row about
+attenuation against a tier template — and taking it would have been precisely the nearest-looking
+catalog row. Both obligations are about the **write** side, which does not exist until Phase 10.
+
+Verified against the phase ratchet rather than assumed: `phase-ratchet-is-asserted.py` partitions
+V-CTN into `(read-side)` at phase 8 and `(write-side)` at phase 10, and both new rows landed in the
+_"68 suite members NOT required here"_ note. **A new V-CTN row dated phase 10 does not enter the
+phase-9 required set.**
+
+### The coordinated move, as one tree state
+
+Four edits that had to be simultaneous, because any ordering leaves the arm uncovered for a commit:
+
+1. `dev/L0-CHAIN.txt` — the live arm `python3 dev/tests/load-bearing-coverage-is-full.py` goes **on**
+   the chain, above the `--negative-control` line that was already there.
+2. `verification/implementations.yaml` — V-MET-002's row, `runs:` matching the chain line verbatim.
+3. `dev/tests/invariants-gate.py` — `check_phase_gate_publishes_the_coverage_remainder` **retired**
+   with `dev/L0-CHAIN.txt` named as its replacement (invariants §8: a retirement with a named
+   replacement, not a deletion). 32 checks → 31.
+4. `dev/test_invariants_gate.py` — its 8 tests deleted, 4 entries added to
+   `dev/assertion-baseline.json`'s `retired:`, baseline wound 1397 → 1393.
+
+**`dev/verify/verify-phase9.sh`'s section K was KEPT deliberately.** Section J reports _whether_
+V-MET-002 is green from the results file; section K is what says **which** obligations are uncovered,
+by ID and in their own words. 09 §8.1's draw-down does not end at Phase 9 — it ends at every phase
+that adds an owned section, so an empty worklist today is not a reason to delete the thing that
+prints tomorrow's.
+
+### The finding: a mutation keyed to a position, not a property
+
+Emptying the worklist turned one of V-MET-008's **own** control mutations into a `MISS`:
+
+```
+MISS    V-MET-002's worklist is truncated
+         expected a finding containing "is not V-MET-002's worklist"; got ["a new normative
+         statement arrived uncovered: R-02.2-4 is not in the arrival baseline recorded 2026-07-31…"]
+```
+
+`_mutate(base, 0, lambda t: "\n".join(t.splitlines()[:-30]) + "\n")` is a **positional** chop of
+`coverage-ratchet.yaml`'s tail. The worklist was the tail only while it was non-empty; with it empty
+the chop landed thirty lines into the arrival-baseline digests, a **different** arm fired, and the
+row reported _"the check let a defect through"_ over a defect that was never applied.
+
+**Guardrail 9 was weighed and does not bite.** The _live_ V-MET-008 arm was green throughout, so
+re-aiming was never the smallest diff to green for an implementation — what broke is a control whose
+target ceased to exist **because the unit succeeded**. Re-aimed rather than deleted, and aimed the
+other way: with the computed set empty the two artifacts can only disagree by the **file** publishing
+an ID the computation does not, so the mutation now injects one. It also survives the worklist coming
+back, where a positional chop only worked at one length.
+
+The adjacent _"the floor is raised"_ mutation in the same file already carried the precedent verbatim
+— _"a mutation keyed to `covered: 0` stops applying the day curation moves the floor off zero, and a
+no-op mutation scores MISS … over a defect that was never applied ([[LSN-063]])"_ — which is why the
+**class** goes to the improvement pass and not just the instance.
+
+### A second finding, second sighting
+
+Deleting 8 tests turned the assertion ratchet red and it named only **4**: the other four have
+duplicate names in other classes of the same file, so the `file::name` set collapses them. Already in
+the improvement queue; this is its second firing.
+
+### Property 4 of the phase ratchet, closed
+
+Five phase-9 IDs were required by 09 §10 and named **nowhere** in this file's acceptance table —
+**V-CTN-038**, **V-CTN-039**, V-CTR-021, V-GAT-024, **V-REV-012**, all added to 09 §6 by this phase's
+own coverage draw-down. A `_(ratchet only)_` row now names them. The required set moved **91 → 96**,
+and 96 = 95 (09 §10) ∪ 96 (the table).
+
+### Gate
+
+| Check     | Level | Result   | Evidence                                                                                 |
+| --------- | ----- | -------- | ---------------------------------------------------------------------------------------- |
+| V-MET-002 | L0    | **pass** | 420/420 owned obligations mapped; control 8/8; live arm now on `dev/L0-CHAIN.txt`        |
+| V-MET-008 | L0    | **pass** | coverage 357 against a floor of 349; worklist 0; control **11/11** after the re-aim      |
+| V-MET-001 | L0    | **pass** | 89 check IDs; 6 lines marked `not-a-check-id`; 1 `unimplemented:` against a ceiling of 1 |
+| V-MET-009 | L0    | **pass** | 853 enumerated, **357** covered (was 354), 496 published by ID                           |
+| V-MET-003 | L0    | **pass** | **31/31** invariant checks; baseline 143 files / **1393** named tests, 4 retired         |
+
+Full `dev/L0-CHAIN.txt`: **0 failures**, no `VACUOUS:`. Worklist **3 → 0**. Coverage **354 → 357**.
+
+### Resume — and four surveys that are already paid for
+
+The next four units were surveyed in parallel with this one. **Their conclusions are recorded here
+so nothing re-derives them**; several overturn what the task rows assume.
+
+**`P9-T11g-3` — the three L0 arms are already authored and sitting untracked in `dev/tests/`:**
+
+- `devteam-has-no-cloud-actor.py` (V-CTN-039) — 5 properties, control **15/15**. Excludes
+  `dev/tests/` from its own corpus, because a check about a forbidden identifier necessarily contains
+  it. Deliberately stays **silent** on the `kubeagents-devteam-<ns>-gsa` vs
+  `kubeagents-developer-team-gsa` drift — that is V-CTN-030's row at phase 11.
+- `reader-holds-only-read-verbs.py` (V-CTN-004 L0) — 7 properties, control **16/16**. The allow-list
+  `{get,list,watch}` **is** the property; `impersonate`/`escalate`/`bind` appear nowhere in the file.
+  **One decision to review:** wildcard `resources: ["*"]` is a finding only when the apiGroups axis is
+  also unbounded, because all nine reader roles carry it, 06 §2.2's platform read template requires
+  it, and V-CTN-004's own VAP fixture pins it as `EXPECT: ADMITTED`.
+- `controller-mints-no-rbac.py` (V-CTN-017 L0) — 9 properties, control **21/21**. Scans the rendered
+  ClusterRoles **and** the `+kubebuilder:rbac` markers **and** asserts they agree triple-for-triple
+  (110 each side today) — rendered-only misses a marker added without `make manifests`, markers-only
+  misses a hand-edit to the file `kustomize build` installs. **Correction to the task row:** the
+  controller does **not** create ServiceAccounts; the marker is `get;list;watch`.
+
+Still to do for each: two `dev/L0-CHAIN.txt` lines, an `implementations.yaml` row, a results row.
+
+**`V-CMP-020` is RED with 37 real findings and needs an orchestrator ruling.**
+`tier-skills-match-the-allocation.py` is authored and its control is 18/18, but the tree does not
+satisfy it: the Developer Team has **none** of the seven workload skills 02 §2.1 assigns it, and the
+Platform Agent carries the whole superset. 09 §6 dates V-CMP-020 at **phase 9**; the fix is
+`07 P13-T5`, at **phase 13**. V-CMP is BLOCKING-PHASE, not BLOCKING-ALWAYS, so a `deferred` with a
+named blocker is available — but the row's _phase_ is the thing that has to move, or the fix does.
+
+**`P9-T11g-4` — three of the six L2 arms already exist and claim no ID.** This is the same shape
+`-2c-ii-b-1` paid for: _an obligation with no `checks:` entry is a catalog fact, not evidence the
+property is unbuilt._
+
+- **V-CTN-015 and V-CTN-016** are asserted **today**, on the chain, by
+  `dev/verify/webhook-negatives-l2.sh` (`dev/L2-CHAIN.txt:114`) as rules **V-5** and **V-4** — each
+  via `reject()`, which fails both on admission and on a rejection whose message omits the expected
+  field path (`spec.scope`, `metadata.namespace`). The script names only `V-CTR-002`. What is missing
+  is the **`¬` half**: every existing arm is a rejection, so the absent control is the _positive_ (a
+  second Agent in a **different** scope admitted; a developer-team Agent in its own namespace
+  admitted). Section 12 already has per-tier positives to build on.
+- **V-CTN-012** is asserted by `dev/tests/negative-attenuation.sh`, reachable from the chain
+  transitively through `verify-phase7.sh`. **Trap:** the catalog names `vap-agent-scope` as the
+  denying policy and **that policy does not exist**, in the tree or on the cluster — it arrives at
+  `P10-T1`. The live cluster carries `kube-agents-agent-readonly` (3 validations). Say in the header
+  which policy the arm measures; do not let the two names silently differ.
+- **V-CTN-017's L2 arm** (parse the live `kubeagents-manager-role`) is the only one genuinely
+  unbuilt.
+
+**The VAP corpora are exercised, but only to "at least one".** `examples/gitops-repo/policy/tests/`
+holds `vap_actor_positive.yaml` (5 docs, all EXPECT ADMITTED) and `vap_actor_negatives.yaml` (7 docs,
+all EXPECT DENIED). Both headers name `tests/e2e/vap_negative_test.sh`, **which does not exist**. What
+_does_ touch them is `gitops-tree-applies-l2.sh`, which runs **one** `apply --dry-run=server` over the
+whole multi-doc file and requires one denial anywhere in it — so docs 2–7 could all be admitted and
+the line stays green. The runner to build splits on `^---$` and asserts **per document**, with the
+needles the corpus header already specifies (`"broker-operations grant"` for negatives 1–6,
+`"agent RBAC may grant"` for negative 7), the doc counts pinned at 5 and 7, and the whole section
+gated behind `p2_assert_policy_live` — an ADMIT arm reads identically against an absent policy
+([[LSN-006]]).
+
+**Six phase-9-required checks are owned by no task row.** Triaged:
+
+| Check                                 | State                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **V-CMP-006**                         | **green already, no results row.** `P9-T10` shipped fix and check in `9939ffe` and wrote no row. `dev/test_mcp_env_declared.py` 6/6. Cheapest item in the phase. Rule on the L2 arm (catalog says L0+L2) or defer it beside the standing L3 deferral.                                                                                                                                                              |
+| **V-BRK-005**                         | **green already, no results row — and the only BLOCKING-ALWAYS of the six.** `broker-refuse-l2.sh` arms **B** (journal-gone → HTTP 503 `journal-unavailable`, zero ActionRecords) and **C** (restored → HTTP 202) _are_ the assertion and its `¬` control; they ran 17/17 rc 0 on 2026-07-31 and were recorded under **V-ISO-006**. Bind the ID, re-run, record.                                                   |
+| **V-GAT-002**                         | **unbuilt, but cheapest of the three.** `undo-coverage-l2.sh` already carries the corpus's `expectClass` into the transcript and says in its own comment it is _"NOT an assertion"_. Add a per-class spot-check comparing it to `spec.classification.class`. Same commit: delete the dangling pointer to `dev/verify/classifier-corpus.sh` under suite prefix `V-CLS` — **neither the file nor the suite exists**. |
+| **V-CTR-007 + V-RUN-007 + V-RUN-008** | **unbuilt; ONE unit, a new `dev/verify/brake-l2.sh`.** They share every fixture: a deployed pair, a paused `Agent`, a `FleetFreeze`, the controller scaled to 0, and an RBAC revoke/restore cycle `broker-refuse-l2.sh` arms B/C already implement. Splitting them stands the same fixture up three times. Size `large`.                                                                                           |
+
+**Two lost hand-offs, both worth carrying to the next ORIENT.** `verification/results.csv:71` routed
+**seven** IDs to _"verify-phase9.sh in P9-T9"_ and nothing ever picked them up — T9b split five ways
+and no descendant claimed any. A "routed to a future task" note in results.csv **is not a task**, and
+this is the second time in the phase a hand-off recorded in prose was lost (the first was the `hint`
+column `P9-T11g-1` audited).
+
+**`P9-T11d` — the blocker is confirmed and larger than the row says.** There is **no agent image and
+no broker image in Artifact Registry for `de0486b`**; the newest are `dev-9cb7465-dirty-*` and
+`dev-cdad3b1-dirty-*`. `make docker-build*` exits 2 on this host, so the route is
+`bash dev/cluster/reload-images.sh all gke-scratch-kube-agents-dev` (Cloud Build, deploy-by-digest,
+and it sets `KUBEAGENTS_BROKER_IMAGE` on the **controller** — the CR cannot name the broker image by
+design). `multi-agent-namespace-l2.sh:60-98` is the working precedent for resolving a tier image and
+`DEFERRED:`-ing rather than failing when it is absent. **And a second, independent blocker:**
+`kubeagents-router` is in **CrashLoopBackOff, 137 restarts**, on `missing required --project-id /
+KAGE_PROJECT_ID` — a Deployment env/arg problem a rebuild will not fix, and the C15 "one fleet-wide
+Socket Mode connection" arm cannot run until it is set. Decide up front whether that fix is in the
+unit's diff or a named deferral. **Note also** that V-RUN-001/002/004/009 are pure _shape_ claims and
+inherit `multi-agent-namespace-l2.sh`'s licence to use _a_ pullable image, but **V-RUN-005 is a claim
+about the agent binary's `wait-for-broker` behaviour** and must pin the digest it actually ran.
+
+---
+
+## `P9-T11g-3` — three checks that assert an absence, and a fourth committed red on purpose
+
+**Landed 2026-07-31.** Required set 96; **green 77 → 80**, not green 19 → 16, BLOCKING-ALWAYS not
+green **8 → 6**. Implementations **89 → 92**. `dev/L0-CHAIN.txt` **60 → 66** executable lines — three
+live arms and three `--negative-control` arms, each preceded by a `# --- title ---` block naming the
+failure mode it exists for.
+
+| Check     | Level | Verdict      | Control | Evidence                                        |
+| --------- | ----- | ------------ | ------- | ----------------------------------------------- |
+| V-CTN-039 | L0    | **pass**     | 15/15   | `dev/tests/devteam-has-no-cloud-actor.py`       |
+| V-CTN-004 | L0    | **pass**     | 16/16   | `dev/tests/reader-holds-only-read-verbs.py`     |
+| V-CTN-017 | L0    | **pass**     | 21/21   | `dev/tests/controller-mints-no-rbac.py`         |
+| V-CMP-020 | L0    | **deferred** | 18/18   | `dev/tests/tier-skills-match-the-allocation.py` |
+| V-MET-001 | L0    | **pass**     | 8/8     | 92 IDs, 6 marked lines, ceiling 1               |
+| V-MET-003 | L0    | **pass**     | —       | 31/31 invariant checks, chain 0 failures        |
+
+The three V-CTN arms all keep an open **L2** half, which `P9-T11g-4` owns. Their rows are recorded at
+level `L0` and claim nothing about L2 — the ratchet counts a check green when it has any `pass` row
+with an `evidence_ref`, so the discipline that keeps that honest is the `level` column, not the
+verdict.
+
+### V-CTN-039 — the only row that asserts a principal does not exist
+
+Every other containment check in the catalog asserts what a **named** principal cannot do, and you
+can only sweep the verbs of an identity you can name. 06 §2.3's six-row Cloud IAM table gives the
+developer-team **actor** no GSA, and this check asserts the tree agrees: none of 8 actor-labelled
+ServiceAccounts (of 20) carries a Workload Identity annotation or a placeholder that renders one;
+none of 19 tier-classified GSA identifiers (of 45 swept) is `(developer-team, actor)`;
+`DEVELOPER_TEAM_ROLES` holds 3 roles and all three are read-only.
+
+Two arms on the annotation, because only one of the two **looks** like the annotation. The literal
+`iam.gke.io/gcp-service-account` key is the obvious one. The other is `${AGENT_READER_ANNOTATIONS}`
+moved onto the actor's ServiceAccount — a placeholder that renders the same binding at provision
+time, in a diff where the key itself never appears.
+
+The last property is what stops the check being satisfiable **by deletion**: the tier's _Kubernetes_
+actor grant must still exist. Without it, "the developer team has no cloud actor" and "the developer
+team has no actor at all" produce the same green, and the second one is a regression the check was
+built to notice.
+
+One control row is `ignored` on purpose. The developer-team **reader**'s GSA name drifts —
+`kubeagents-devteam-<ns>-gsa` in one place against `kubeagents-developer-team-gsa` in another — and
+that is **V-CTN-030**'s, at phase 11. This check asserts it stays **silent** on it, which is a
+property in its own right: a containment check that fires on its neighbour's defect is a check whose
+green means less than it appears to.
+
+### V-CTN-004 — an allow-list, because a deny-list already failed once
+
+`READ_VERBS = ("get", "list", "watch")` is the only verb list in the file, and `impersonate`,
+`escalate` and `bind` appear **nowhere** in it. That is deliberate and it is the mechanization of 09
+§11.4: the phase-0 finding was that a deny-list admitted `impersonate` because nobody thought to deny
+it. A deny-list is a list of the attacks you have already imagined.
+
+Nine reader `Role`/`ClusterRole`s across 17 install-path files, 10 rules, every verb inside the
+allow-list; no wildcard verb or apiGroup; no `aggregationRule`; 15 actor roles classified the other
+way over the same corpus; 23 agent-labelled RBAC files all accounted for.
+
+**"Universally" is bought by property 5, not by the verb sweep.** Every roleRef bound to a reader
+subject must resolve to a reader role. One word added to a `subjects:` list makes the reader SA a
+subject of the broker-operations binding, which holds `create` on the journal — and **no reader role
+changes**. A check that only sweeps the roles reads that diff as clean.
+
+One argued asymmetry, recorded rather than silently taken: a wildcard `resources: ["*"]` is a finding
+only when `apiGroups` is **also** unbounded. All nine reader roles carry it, 06 §2.2's read template
+requires it, and V-CTN-004's own VAP fixture (`vap_actor_positive.yaml` DOC 4) pins it
+`EXPECT: ADMITTED`. Flagging it would put the check in direct contradiction with the policy corpus
+it shares a check ID with.
+
+### V-CTN-017 — parse both artifacts, then assert they agree
+
+08 §7 says to assert this by **parsing** the generated RBAC rather than reading it. This parses both
+sides and then asserts they agree **triple for triple**: 4 control-plane roles under
+`k8s-operator/config/`, 22 rules, 141 `(group, resource, verb)` grants, against 28 `+kubebuilder:rbac`
+markers — **110 each side** on the `manager-role` comparison. No verb on an RBAC object, no write on
+an identity resource, no wildcard in any position, no `escalate`/`bind`/`impersonate`, all 5 roleRefs
+resolve, and no shipped Go file imports the RBAC API.
+
+Either artifact alone has a blind spot the other covers. Markers-only misses a hand-edit to the file
+`kustomize build` actually installs. Rendered-only misses a marker added without `make manifests` —
+where the grant lands later, in a commit that looks like formatting.
+
+Two rulings inside it. **Read verbs on RBAC objects are not permitted**, and that is 08's call: its
+"beyond `get;list;watch`" clause attaches to ServiceAccounts alone, not to RBAC. And
+`serviceaccounts/token` is forbidden **separately** from `serviceaccounts`, because TokenRequest
+returns the credential rather than the identity — a controller that may read a ServiceAccount and
+also mint tokens for it has the thing the read verb was supposed to be safe from.
+
+**Correction to this row's own premise:** the controller does **not** create ServiceAccounts. The
+marker is `serviceaccounts,verbs=get;list;watch`.
+
+### V-CMP-020 — `deferred`, committed, red, and off the chain
+
+`dev/tests/tier-skills-match-the-allocation.py` exits 1 on the tree with **37 findings**, and its
+negative control is **18/18** from both ends of the drift. Every one of the 37 is the persona
+conversion that 02 §2.1's own table — _"Renames the conversion must perform"_ — already describes:
+`submit-suggestion` → `apply-change`, `raise-escalation` → `escalate`, `propose-*` → `provision-*`,
+the new `delegate`. 02 §2.1 dates it in as many words: _"The old skills exist today under
+`agents/*/skills/`; [07](../design/07-implementation-roadmap.md) sequences the swap."_
+
+So this is not a defect the check found. It is a conversion the check will **verify**, and the honest
+state until then is `deferred` with a named blocker — not `pass`, and not a chain line that turns CI
+red for four phases over work nobody has been asked to do yet. V-CMP is BLOCKING-PHASE, not
+BLOCKING-ALWAYS, so 09 §9.6 permits the deferral.
+
+```
+Blocker:              07 P13-T5 (persona conversion)
+Owner:                phase 13
+Promotion condition:  `python3 dev/tests/tier-skills-match-the-allocation.py` exits 0
+```
+
+Committing the check **ahead** of its day is the point, and the file carries a header block saying so:
+it makes the promotion condition **a command rather than a paragraph**. It gets no
+`verification/implementations.yaml` row, which is the registry rule working exactly as written — _"a
+check with no green row is absent, and that is correct… do not add a row for work you intend to do."_
+Its `runs:` value would not have appeared on a chain, and V-MET-001 would have refused it.
+
+**Two corrections to the recon that produced it**, both from reading the source rather than the
+summary. 09 §6 dates this row at phase **8**, not 9. And 07 P13-T5's premise is partly stale: it says
+the Developer Team has _"none of the seven workload skills"_, but the tree already gives it
+`gke-networking-edge`, `gke-observability`, `gke-reliability` and `gke-storage`.
+
+### The cataloguing finding — recorded, not acted on
+
+09 §6.15 line 701 dates **V-CMP-020** at phase **8**. Line 702 dates **V-CMP-021** — the structurally
+identical row over jobs and SOPs, blocked by the **same** persona conversion, cited to the **same**
+§5.3 — at phase **13**. One of the two datings is wrong, and it is almost certainly V-CMP-020's.
+
+Correcting the phase cell would remove this row from the phase-8/9 required set, which is exactly the
+spec change **Guardrail 9** forbids inside the unit whose check it would green. Routed to
+`harness-improve` with both line numbers so the improvement pass does not have to rediscover the pair.
+
+Note the shape: this is the **third** time in phase 9 that a row's **phase**, not its assertion, was
+the thing that was wrong.
+
+## Unit `P9-T11g-4a` — four BLOCKING-ALWAYS rows at L2, and the arm that could not fail
+
+**Done 2026-07-31.** `P9-T11g-4` was **split** at SELECT, per `harness-run` §2 sizing: this unit
+took **V-CTN-012**, **V-CTN-015**, **V-CTN-016** and — opportunistically — **V-BRK-005**;
+**`P9-T11g-4b`** keeps **V-CTN-001** and the L2 halves of **V-CTN-004** and **V-CTN-017**. The split
+is recorded here rather than only in the ledger because the row above still reads as one unit.
+
+### V-CTN-012 — the actor VAP corpus, one document at a time
+
+`dev/verify/vap-corpus-l2.sh` (new, on `dev/L2-CHAIN.txt`) submits each of the seven documents in
+`examples/gitops-repo/policy/tests/vap_actor_{positive,negatives}.yaml` **individually** and pins
+**which validation refused it**, not merely that something did. Tally pinned at 5 by validation #3,
+1 by #1, 1 by the schema. Submitting the corpus as one stream — which is what a `kubectl apply -f`
+of the file does — cannot distinguish _refused by the attenuation clause_ from _refused by the
+read-verb clause_, and a corpus that is refused for the wrong reason is a corpus that will go green
+after the clause under test is deleted.
+
+**The binding rests on a stated reading, and the suite states it.** 03 §4.2 lines 245-253:
+`vap-agent-scope` is _"the same policy object as the read-only generation's `vap-agent-readonly`,
+**inverted**"_. Under that reading validation #3 of the deployed policy **is** the attenuation
+clause V-CTN-012 names, and the corpus tests it. The reading is written into the suite header, in a
+block titled _"THE READING THIS SUITE IS SCORED UNDER"_, with the quote — because a binding whose
+justification lives in a commit message is a binding a future reader cannot audit ([[LSN-019]]).
+A second header block names what the suite **corroborates but does not claim** (V-CTN-004,
+V-BRK-013), so nobody re-reads its output as evidence for rows it is not scored on.
+
+### The first run was red, and the fixture was wrong
+
+DOC 6 — `resources: []`, the `.all()`-over-empty vacuity escape — never reaches admission. The API
+server refuses it structurally:
+
+```
+rules[0].apiGroups: Required value: resource rules must supply at least one api group
+```
+
+Rather than edit the fixture to green, all three empty shapes (`apiGroups: []`, `resources: []`,
+`verbs: []`) were probed against the live API server. **All three are schema-refused**, so the
+vacuity escape is structurally unreachable on a resource rule — there is no document that reaches
+CEL with an empty list in it.
+
+The answer is a **third verdict class**, `schema`, which asserts three things: the submission
+failed; the message names the schema (`is invalid:.*Required value`); and the policy did **not**
+fire. That last one is what makes it a check rather than a shrug — **if the document ever reaches
+admission, the arm goes red**, which is exactly the day the property becomes testable again. The
+fixture's comment block was rewritten from five lines to twenty-four, quoting the refusal and
+pointing at DOC 5 as the reachable vacuity test. Recorded as a `**finding**`. **18/18.**
+
+**V-CTN-012's L0 half is a `**finding**`, not a `**deferred**`.** 09 §9.6 forbids deferring a
+BLOCKING-ALWAYS row _at all_, and that prohibition does not become negotiable one level at a time —
+a row deferred at L0 and passing at L2 reads, in every aggregate, as a row that was deferred. The
+L0 property is named for the future: the policy's inlined allow-list must equal the **rendered**
+tier template, which is blocked on P10-T1.
+
+### V-BRK-005 — an ID binding, not a new suite
+
+`broker-refuse-l2.sh` arm B (`journal-gone`) already asserts V-BRK-005's property word for word. A
+fourth suite would have re-established the same fixture, spent another ~50 s of blinded audit trail,
+and **halved the signal**: two suites asserting one property means a reader has to work out which
+one is authoritative. Four edits bind it — header, arm bullet, a block titled _"WHY ARM B ALSO
+CARRIES V-BRK-005, AND WHY THAT IS A BINDING AND NOT A SECOND CLAIM"_, and the banner. All arms
+(A, B-1..B-3, C-1..C-3) re-run green.
+
+### V-CTN-015 / V-CTN-016 — and the defect underneath them
+
+Both rows bind to arms that have been running in `dev/verify/webhook-negatives-l2.sh` since P8-T9.
+Binding them meant breaking them on purpose, per the `¬` marker (09 line 292), and **the suite would
+not go red.** It printed four `FAIL:` lines and exited **0**, under a banner reading
+`V-CTR-002: PASS`.
+
+```
+$ bash -c 'fail=0; bad(){ fail=1; }; echo x | bad; echo "fail=$fail"'
+fail=0
+```
+
+Nearly every assertion is invoked as `child_yaml … | reject …`. Bash runs **every** component of a
+pipeline in a subshell, so `fail=1` was assigned in a child process and discarded when it exited.
+Thirty-one assertions and no way to report any of them — and V-CTR-002 has been recorded green on
+that exit code, with `dev/L2-CHAIN.txt` gating on it, since phase 8.
+
+The fix moves the flag into a `mktemp` **FAILFILE** appended to by `bad`, the single choke point
+every `reject`, `admit` and inline failure already goes through. A file survives the subshell, and
+the choke point covers the 32nd call site nobody has written yet; restructuring the 31 existing call
+sites away from pipes is 31 chances to get it wrong and does nothing for the 32nd. Proved with an
+**in-tree** mutant → **rc 1**, banner `FAIL — 1 failed assertion(s)`. (A `/tmp` copy cannot be used:
+`REPO_ROOT` derives from `${BASH_SOURCE[0]}`, so the copy resolves `REPO_ROOT=/` and dies sourcing
+`//dev/lib/preconditions.sh` before reaching any arm.) A repo-wide scan for the shape — with the
+second `|` of `||` excluded by `(?<!\|)\|(?!\|)` — found **no second instance**.
+[[LSN-064]] opened; the scan as an L0 lint is an improvement-pass item.
+
+**This is strengthening, not weakening.** Guardrail 9's pressure runs the other way here: the suite
+was made _able_ to fail, the assertion count went up, and the change carries a negative control.
+
+**And my own regression, in the same run.** The persisted cluster-admin parent V-4 needs was first
+given `(cluster-admin, vctr-l2-negatives, cluster-1)`, which collides with V-6(a), V-6(e) ×2 and the
+final positive control under the (tier, scope) uniqueness rule. **Two of the four colliding arms are
+negatives** — they would have gone green on the wrong rejection, which is the same class of defect
+V-CTN-012's per-document runner exists to prevent, arriving from the fixture side. Fixed with
+`CA_CLUSTER=cluster-v4`, and the hazard written into a comment. Two positive controls added: V-4
+_same child, placed in the namespace it scopes_ (admitted), and V-5 _second platform Agent at a
+different scope_ (admitted). **31/31, rc 0.**
+
+### Numbers
+
+Implementations **92 → 97**; `dev/L2-CHAIN.txt` 66 → 67 executable lines; **green 80 → 85 of 96**;
+not green 16 → 11; **BLOCKING-ALWAYS not green 5 → 1**. Ten rows appended to
+`verification/results.csv` (six `**pass**`, three `**finding**`, one `**deferred**`).
+
+### Resume
+
+**`harness-run`, unit `P9-T11g-4b`** — **V-CTN-001** is the last BLOCKING-ALWAYS row not green, and
+a BLOCKING-ALWAYS check may not be deferred at all (09 §9.6), so it alone is the critical path to
+closing the phase. Its 09 row (line 307) requires `L2, L3` and carries `¬`. What exists today is
+partial and claims no ID: `dev/verify/verify-phase3.sh:215-236` asserts the property live for the
+**developer-team** tier only, and 03 §11 says _"for each agent"_; the _cluster_ clause (_"a Cluster
+Admin reader **no** for any other cluster"_) is unasserted at any level;
+`awk -F, '$3=="V-CTN-001"' verification/results.csv` returns zero rows. The remaining ten not-green
+rows (V-CMP-020, V-CTN-004 L2, V-CTN-017 L2, V-CTR-007, V-GAT-002, V-RUN-001/002/004/005/007/008/009)
+are BLOCKING-PHASE, where a named deferral is available when it is honest.
+
+## Unit `P9-T11g-4b` — the last BLOCKING-ALWAYS row, and three reds that were all telling the truth
+
+**Done 2026-08-01.** The second half of the split took **V-CTN-001** and the L2 halves of
+**V-CTN-004** and **V-CTN-017**, and then took every remaining L2-only row standing between the
+phase and its gate: **V-RUN-001/002/004/009** (the workload pair), **V-GAT-002** (the classifier's
+identity), **V-CTR-007 / V-RUN-007 / V-RUN-008** (the brake) and **V-RUN-005** (startup ordering).
+Six new suites, each with a cluster-free `--negative-control` mode; ten IDs bound in
+`verification/implementations.yaml`; fourteen rows appended to `verification/results.csv`.
+
+**Three of the six suites went red on their first run, and in all three cases the check was right
+and something else was wrong.** A different suite's fixture ([[LSN-066]]); the broker's own
+idempotency contract answering eleven questions with one action ([[LSN-067]]); and a namespace with
+no DNS, which turned out to sit on top of a shipped-path product defect nobody had a check for
+([[LSN-068]], [[LSN-069]]). That is the through-line of the unit, and none of the three was fixed by
+changing what the check asserts.
+
+### V-CTN-001 — 1389 questions asked of the authorizer, and it is green
+
+`dev/verify/reader-scope-l2.sh` (new, on `dev/L2-CHAIN.txt`) closes **the last BLOCKING-ALWAYS row
+in phase 9**. Eight arms over three tiers and three reader identities: the roster is complete and
+every tier's reader holds something (L2-A); every binding naming a reader points at that tier's
+reader role (L2-B); 267 in-scope reads are permitted (L2-C); 387 out-of-namespace reads are refused
+(L2-D); 246 out-of-resource reads are refused (L2-E); no reader grant is open-ended — no
+`aggregationRule`, no `resourceNames` (L2-G); and all **1389** questions were actually asked and
+answered (L2-H). **rc 0, 8/8.**
+
+**The arm asks the authorizer, not the RBAC objects.** L2-C/D/E are SubjectAccessReviews submitted
+as each reader ServiceAccount, so a grant arriving from a binding this suite never enumerated is
+still measured. Nothing in the file names a ServiceAccount, a namespace, a role or a resource: the
+tiers come from `agents/*/SOUL.md` cross-checked against the served `spec.tier` enum, the roster
+from the `kube-agents/role=reader` label, each tier's scope from the bindings that actually name its
+SA, and the resource universe from `kubectl api-resources` — 114 served resources across 26
+namespaces ([[LSN-036]]). L2-H exists because 1389 questions that were skipped and 1389 answered
+`no` are the same rc 0 otherwise; in this repo a vacuous pass is a failure ([[LSN-035]]).
+
+**Its L3 half is `deferred`, and the row defers the LEVEL, not the check.** 03 §11 ends _"…a Cluster
+Admin reader **no** for any other cluster"_, and that clause has no L2 expression: RBAC carries no
+cluster axis at all — a `SubjectAccessReview` names group, resource, subresource, namespace, name
+and verb, and nothing that names a cluster. The only object bearing another `clusterName` a reader
+could be asked about is an `Agent` CR, whose apiGroup no reader role grants, so the `no` would come
+from the group axis L2-E already owns and would read **identically for this cluster's own name**.
+That is a `no` produced by not asking, which is exactly what the row's `¬` exists to refuse. 09 §9.6
+forbids deferring a BLOCKING-ALWAYS check **at all**, and it does not become negotiable one level at
+a time — so the deferral is written against `L3 / platform-agent-host`, with the L2 row green
+directly above it, and the suite states the uncovered clause in a **green** banner rather than only
+in a red one. Promotion condition: two clusters registered under distinct `clusterName` values, and
+a refusal attributed to the cluster axis rather than to the resource axis.
+
+### V-CTN-004 at L2 — the allow-list is imported, not restated
+
+Arm L2-F, **489 questions**: every verb outside the read allow-list, asked as all three reader
+ServiceAccounts against every resource **inside their own scope**, refused without exception. Inside
+the scope is deliberate — a refusal outside it proves nothing about the verb, because the namespace
+axis would refuse a read there too.
+
+`READ_VERBS`, `ROLE_LABEL` and `TIER_LABEL` are imported by `importlib` from
+`dev/tests/reader-holds-only-read-verbs.py`, and `ESCALATION_VERBS`, `WILDCARD` and `RBAC_RESOURCES`
+from `dev/tests/controller-mints-no-rbac.py`. **A second copy of the verb allow-list at L2 is a
+second definition site**, and the failure it admits is the one that matters: L0 tightens, L2 does
+not, and the level that runs against a real authorizer keeps passing the old set. That is
+[[LSN-024]]'s shape applied to a constant rather than to a renderer. The non-read verb axis is
+derived from discovery too — the union of what each resource supports minus `READ_VERBS`, plus the
+three escalation verbs discovery never advertises, because a hand-written list of write verbs is a
+deny-list and 09 §11.4 is the record of a deny-list admitting `impersonate`.
+
+### V-CTN-017 at L2 — the tree is not the cluster, and that is the arm's whole job
+
+`dev/verify/manager-role-l2.sh` scored **13 of 14 arms PASS, rc 1**, and the row is a `**finding**`.
+L2-2 compares every Role and ClusterRole the install tree defines against the live object of the
+same name, both directions. `kubeagents-manager-role` carries `('authorization.k8s.io',
+'subjectaccessreviews', 'create')` in `k8s-operator/config/rbac/role.yaml` and **not on the
+cluster** — added by `895aaf3` (P9-T9c-2, the operator writes `journalReachable`) and never
+installed. A server-side dry-run comparison of the rendered install RBAC against the scratch cluster
+shows exactly that one grant and nothing else.
+
+**It was measured and deliberately not remediated in-unit.** Bringing the cluster up to the tree is
+the smallest diff to green, and making a check green by changing the thing it observes rather than
+the thing it is about is the shape PROTOCOL §10.1 forbids; it would also have destroyed the only
+evidence that the install had drifted for a day. It is not a controller defect either — the grant is
+correct, wanted, and already in the tree. The live consequence while it stands is worth naming: the
+operator cannot `SelfSubjectAccessReview`, so `895aaf3`'s `journalReachable` write path is inert on
+that cluster. Promotion condition: a redeploy through the sanctioned path, after which a re-run
+should be 14/14. V-CTN-017's L0 row is green and unaffected, and this row claims nothing about it.
+
+### The rows that came green first time, and why they still needed a control
+
+`workload-pair-l2.sh` closed **V-RUN-001/002/004/009** in one run against the two shipped CRs
+applied directly — not through `seed_parent_agent`, which injects `scaleToZero: true` and would have
+left V-RUN-004's pod-level arms unmeasurable. The pair is established **by ownerRef** and its
+completeness by set equality in both directions, so a third Deployment owned by the CR fails the arm
+rather than being ignored; V-RUN-002's load-bearing half is that the two identities **differ**,
+since a pair running as one SA satisfies every "the SA resolves" arm and destroys the separation 06
+§2.2 exists for; V-RUN-004 asserts **five** label keys across eight targets, because 09 §6.8's own
+Source column points at 05 §8, whose heading is _"Labels — five, not three"_; and V-RUN-009 pins the
+same `uid` on the surviving ServiceAccounts, not merely the same name, because a recreated SA of the
+same name is a different principal with a different token history.
+
+`classifier-identity-l2.sh` closed **V-GAT-002** at 10/10 by walking one rung per risk class — the
+class set read back from the **served** ActionRecord CRD, not from a list in the file. Each rung
+asserts a class **and** an attribution needle set, positive and negative, because rungs 1 and 2 land
+on the same live class and only the reason distinguishes "the classifier read the production label"
+from "novelty did all the work". One deferral sits **inside** a passing arm and is named rather than
+swallowed: `history.derive()` skips dry-run records — _"an action that was never executed is not
+experience"_ — so on a phase-9 build novelty applies `+1` to every classification and `routine` is
+not observable at all. The rung asserts the strongest statement dark mode admits, and corpus-class
+agreement for it is deferred to the phase that grants write authority. That deferral does not make
+the row deferred: V-GAT-002's property ran and held.
+
+### `brake-l2.sh`, and eleven submissions that were one action
+
+The brake suite closed **V-CTR-007, V-RUN-007 and V-RUN-008** at 25/25 — but its first run scored
+two FAILs, both on **positive** arms, both `outcome='http' status='200' decision='deduplicated'`
+where the arm wanted `202 accepted`. Read as a product finding that is _"the brake does not
+release"_: the freeze is lifted, the grant is restored, and the broker still will not take work.
+
+The product was correct. Counted across the whole transcript: **11 submissions, one `actionId`, 1
+`accepted` and 10 `deduplicated`.** 06 §9's idempotency key is a sha256 over identity + operations +
+dryRun, recomputed on the broker side rather than trusted, and the probe submitted a **fixed**
+operation as one fixed identity always in dry-run. Every submission in the run was, by the spec's
+own definition, the same action, and each was answered by the **first** submission's record. This is
+not the anti-replay guard, which keys on `(identity, traceId, idempotencyKey)` and correctly treats
+a fresh trace as a retry.
+
+**Why it survived a careful reading of the arms.** Each arm checked the status and the decision word
+against what it expected _for that arm_, and a dedup is a 200, not an error. The arm asserting
+"still refused during the freeze" was answered by a record minted **before** the freeze existed and
+passed. The arms asserting "accepted again now the fault is cleared" were answered by the same
+pre-freeze record and failed. So the suite went red on the two arms where the stale answer happened
+to disagree and **green on the nine where it happened to agree** — and a suite reporting a mix of
+red and green is the last shape anyone re-reads for _"did the instrument observe anything at all"_
+([[LSN-067]]). Fixed by parameterising the probe's target name through `PROBE_TARGET_NAME` →
+`BROKER_DRIVER_TARGET_NAME` → `brake-l2-shadow-target-$SUBMIT_N`, default preserved so
+`broker-execute-l2.sh` is byte-identical. Varying the target varies the operations, which varies the
+key; varying the identity or the dry-run flag would have changed what is under test. The second run
+scored **6 distinct actionIds and 0 FAILs**.
+
+### `reader-scope-l2.sh` went red against a fixture that belonged to another suite
+
+The V-CTN-001 run before the green one came back rc 1 with `readers=4` and **102 failures**, every
+one of them against `system:serviceaccount:startup-ordering-l2:platform-agent` — a ServiceAccount
+belonging to a **different L2 suite whose namespace was still terminating**. Re-run against a
+quiescent roster: rc 0, three readers, 1389 questions, identical per-arm scales.
+
+**Neither artifact is wrong, and both obvious repairs are refused.** `reader-scope-l2.sh` derives
+its roster cluster-wide from the reader label rather than curating one ([[LSN-036]] applied
+correctly); `startup-ordering-l2.sh` mints its fixture identity through `render_agent_identity` out
+of the shipped `common.sh`, so it carries the same labels a real install carries ([[LSN-024]]
+applied correctly). The label that makes the fixture honest is the label that makes it visible.
+Dropping it re-introduces LSN-024; narrowing the roster **weakens a BLOCKING-ALWAYS check** — a
+reader identity nobody bound, standing in a namespace nobody expected, is precisely what V-CTN-001
+exists to find. The defect is in neither artifact: two L2 suites were run concurrently, which
+`dev/L2-CHAIN.txt` never does and nothing forbade. The constraint and the two refusals are now
+written into that file's `reader-scope-l2.sh` block, and the general property is queued: **a check
+that derives its subject set from cluster state is measuring every other tenant of that cluster
+too** ([[LSN-066]]).
+
+### LSN-068 — the pair policy is what takes DNS away, and it was already written down
+
+`startup-ordering-l2.sh` (V-RUN-005) went red on arm (a) with a transcript that read like a product
+defect and was not one: the init container logged `observe`, not `broker is ready`, with
+`init_exit=0 phase=Running restarts=0 AgentReady=True BrokerReady=True Ready=True`. Everything
+healthy and the caller never saw the broker. A read-only watcher caught the decisive frame — the
+init container's first probe timing out against `.../healthz` at the same instant the broker
+Deployment read `1 1 1`.
+
+**The name never resolved.** `buildAgentToBrokerPolicy` renders an **Egress-only** policy selecting
+the reader half with exactly one rule, TCP 8443 to the actor pod — and in Kubernetes a pod selected
+by _any_ egress policy becomes default-deny for **every other** egress, DNS included. The operator
+is right to render only the hop it owns. Rule 1 of the per-tier allowlist is the DNS rule, whose own
+comment reads _"Without this, every name-based egress fails before it starts"_, and it is applied by
+`provision_13_apply_network_policies.sh`, which `dev/cluster/up.sh` does not run. On the scratch
+cluster the only NetworkPolicy in existence was `team-x/default-deny-all`.
+
+**It also made the opposite arm vacuous, which matters more than the red one.** Arm (a) _expects_
+`wait-for-broker` to time out and the pair to converge to observe-and-report. In a namespace with no
+DNS it gets that timeout for free, and **would have gone on passing if `wait-for-broker` were
+deleted outright**. One red arm and one arm passing for the wrong reason, from a single missing rule
+([[LSN-035]]).
+
+The smallest diff to green was to stop asserting the broker-first ordering. The correct diff was to
+make the fixture a namespace an install path actually produces: `seed_tier_egress_policy` now
+applies the tier allowlist through **`common.sh:render_egress_policy`** — the same function
+`provision_13` calls, never a copy ([[LSN-024]]) — sourced in a subshell because `common.sh`
+installs its own `trap cleanup EXIT` at load and would otherwise replace the suite's namespace
+teardown with a `tput cnorm`. Rule 9 is rendered too, because the tier selector is
+`kube-agents/tier`, which the **broker** pod also carries: seeding the allowlist without the
+API-server rule would have taken TokenReview, the FleetFreeze read and the ActionRecord write away
+from the broker and traded one silent network failure for another.
+
+**The part that is actually the lesson.** `dev/lib/broker-driver.sh`'s header, committed in an
+earlier phase, states the entire fact — that `<agent>-to-broker` makes every reader-labelled pod
+default-deny with exactly one hole and no DNS rule anywhere, and that a real agent pod gets DNS from
+the per-tier policy `provision_13` applies. A suite written **after** that paragraph paid the full
+cost anyway, because a paragraph in one file is not reachable from another ([[LSN-019]]). Three call
+sites now wrap `common.sh` three different ways — `broker-driver.sh` with `hostAliases`,
+`tenant-isolation-l2.sh` with its own `render()`, and this one — and there is no shared helper.
+
+### LSN-069 — rule 9 pinned two addresses no packet ever carries
+
+Seeding the shipped policy took the broker **down**, and the symptom carried no information at all:
+
+```
+ordering-agent-broker   0/1  Running  3 restarts
+Readiness/Liveness probe failed: dial tcp 10.68.0.61:8443: connect: connection refused
+kubectl logs <broker>     ->  (empty)
+kubectl logs <broker> -p  ->  (empty)
+```
+
+**No logs and a refused port, because the ordering is correct.** `cmd/broker/main.go`'s `run()`
+calls `startSources()` — the brake read — **before** `ListenAndServeTLS`, under the comment that _"a
+broker that is accepting submissions while its brake has never been read is a broker whose first few
+actions were decided by a source that had nothing in it."_ So the process was alive, blocked on the
+API server, had not reached its own `starting kage-broker` line, and the kubelet was killing it on
+the liveness probe. A reader sees a crash-looping broker with an empty log and nothing that says
+"network".
+
+Rule 9 **was** rendered. It named the wrong addresses. `resolve_apiserver_cidrs` emitted two /32s
+from two sources, on the stated and sound argument that a policy naming only one of the ClusterIP
+and the kubeconfig host fails wherever the dataplane scores egress on the other. The enumeration was
+short by one:
+
+| source                                               | scratch        | live           |
+| ---------------------------------------------------- | -------------- | -------------- |
+| `svc/kubernetes` ClusterIP (dialled)                 | 34.118.224.1   | 34.118.224.1   |
+| kubeconfig `server:` (public endpoint)               | 35.221.35.254  | 34.145.154.119 |
+| **`endpoints/kubernetes` (what the packet carries)** | **10.150.0.9** | **10.150.0.2** |
+
+GKE Dataplane V2 DNATs the ClusterIP in eBPF **before** egress policy is scored, so the address the
+policy sees is the control plane's node-network address — a third form, on neither list, and not
+derivable from either.
+
+**Proved by measurement, not by reasoning.** With the rendered policy in place and the broker
+crash-looping, **one** additional NetworkPolicy admitting `10.150.0.9/32:443` was applied to the
+same namespace and nothing else was changed. The broker went `1/1 Running` inside one probe period.
+Policies union, so that single /32 is the entire difference. Fixed in
+`common.sh:resolve_apiserver_cidrs`: source 2 now reads `endpointslices` for the `kubernetes`
+Service first (`endpoints` as fallback — v1 Endpoints is deprecated from 1.33 and warns on stderr on
+every read) and emits all three /32s deduplicated, **endpoint-first**, so a human comparing the
+rendered rule against `endpoints/kubernetes` sees the match on the first line. All three are kept:
+this script cannot know where a given dataplane scores egress, and three /32s on 443 is a narrow
+price for not needing to be right about it. Removing the two that did not match would be a second
+guess.
+
+**Why no check caught it.** V-CMP's reference-render suite asserts that rule 9 renders when an
+address is supplied and that `resolve_apiserver_cidrs` fails closed when none is — both true
+throughout, because both are properties of the renderer and neither is a property of the answer. The
+gap is between _a rule was rendered_ and _the rule matches the traffic_, and only a cluster closes
+it.
+
+### A second finding on the live install, recorded and deliberately not acted on
+
+While diagnosing the above, `platform-agent-host` was inspected read-only. All **three** live
+per-tier egress policies — `kubeagents-system/platform-egress`,
+`kubeagents-system/cluster-admin-egress`, `team-x/developer-team-egress` — carry exactly **four**
+egress rules each (DNS, the control namespace on 80/8080, the Google restricted VIP, four GitHub
+CIDRs) and **no rule 9 and no Workload Identity metadata block at all**. `endpoints/kubernetes` on
+that cluster is `10.150.0.2` and the string `10.150.0.2/32` appears in no NetworkPolicy on it. Three
+tier-labelled agent gateways are running under those policies right now, 4/4 and 0 restarts. They
+are a pre-rule-9 render that has never been re-applied.
+
+**Recorded as a `**finding**` on V-CTN-020 at L3 — not a `fail` and not a `pass`.** What was
+measured is the **artifact**: three rendered policies that do not match what the current renderer
+emits. V-CTN-020's property is a **runtime** one — egress default-deny holds while Workload Identity
+still functions — and 09 §4 is explicit that grepping a NetworkPolicy is not evidence for a runtime
+property. Establishing the traffic-level consequence means exec'ing into a live production pod, and
+the live install is verification-only.
+
+**And it is not a halt.** V-CTN-020 is green at L0 and at L2 and neither was re-run or disturbed;
+the check has never been recorded at L3, so there is no previously-green result for this target to
+regress. What the artifact does establish is narrow and worth saying: the half
+`render_apiserver_block`'s own header calls _"latent since Phase 5"_ — _"The READER needs it too,
+for every kubectl-shaped skill it runs"_ — is closed on the live install for all three tiers, and
+nothing visibly breaks only because inference is in-cluster on :80 via rule 2. The fix is an
+**outer-loop** action: re-run `provision_13` against `platform-agent-host` after this phase merges,
+so it renders through the corrected resolver. It is deliberately not taken inside a build unit.
+
+### V-RUN-005, and why the two arms measure each other
+
+`bash dev/verify/startup-ordering-l2.sh gke-scratch-kube-agents-dev` → **rc 0, 24 PASS / 0 FAIL**,
+both live orderings in one namespace against pinned digests (broker `sha256:0a426bb939fc`, agent
+`sha256:acc24a02395b` — a tag anywhere in this file is a FAIL, not a note, because
+`buildWaitForBrokerContainer` runs `brokerImage()` and the binary under test is the **broker**
+binary executing inside the **agent** pod). Arm (b): the broker serves with the gateway scaled to
+zero and no agent pod in existence, survives 60 s with zero restarts, and journals 0 ActionRecords
+and 0 envelope lines — it never initiates work, it waits. The agent then arrives, the shipped
+`wait-for-broker` gets a 200 over mTLS from inside the pair, and the CR converges to `Ready` via 08
+§7(c). Arm (a): the actor SA is deleted so ServiceAccount admission refuses the broker pod, the init
+container polls the full timeout, exits **0** having logged observe-and-report, and the agent runs
+with zero restarts — it degrades, it does not go blind. Arm (c): `AgentReady=True` with
+`BrokerReady=False` yields `Ready=False`, the conjunction actually biting.
+
+**Arm (a) is only worth anything because arm (b) exists.** It expects `wait-for-broker` to time out,
+so it is satisfied by any namespace where the broker's name does not resolve — including the one
+LSN-068 describes, and including one where the init container was deleted outright. It is
+non-vacuous here because **arm (b) resolved that same name, in that same namespace, under that same
+policy, and got a 200 back**. The rule 9 this run rendered was
+`10.150.0.9/32,34.118.224.1/32,35.221.35.254/32` and the broker came up first try.
+
+### The negative controls, on `dev/L0-CHAIN.txt` and not only on L2
+
+All six suites gained a `--negative-control` mode and all six are wired onto `dev/L0-CHAIN.txt`, so
+they run offline on every PR rather than at most once a day wherever a cluster happens to be.
+`startup-ordering-l2.sh` replays its verdict predicate against **9 synthesised transcripts** — seven
+broken orderings it must reject (init exit non-zero, agent crash-looping behind a dark broker, never
+left Init, exit 0 with neither terminal line, observe-and-report with the agent not ready,
+`Ready=True` while `BrokerReady=False`, broker-first with no 200) and the two correct ones it must
+accept. `brake-l2.sh` replays **39 rows** — 26 synthesised defects and 13 correct inputs — against
+the file's own `judge_*` functions rather than a second copy of them ([[LSN-024]]), each defect
+matched to its owning arm by needle so a defect caught by the wrong clause scores MISS ([[LSN-035]])
+and an input equal to the clean baseline scores BROKEN ([[LSN-063]]). Two of its rows are precisely
+why it belongs on L0: a retry answered `200 decision=deduplicated` must be **rejected** where an arm
+wants a fresh acceptance — LSN-067, mechanized — and a fail-closed refusal from a broker that
+**restarted** must trip only B-6, since its 403 is byte-identical to the one a broker that degraded
+in place returns. `workload-pair-l2.sh` carries 33 rows (23 defects, 10 correct),
+`manager-role-l2.sh` 13, and `reader-scope-l2.sh` 8 mutations, each caught by its owning arm and no
+other.
+
+**A committed control row beats a `/tmp` probe**, and the rule is `harness-run` §4: a probe proves
+the property once, to one session. Every one of these suites could have been mutated by hand at the
+terminal and every mutation would have been convincing at the time and gone by morning. A row on the
+chain fails the day an arm stops asserting, not the day someone thinks to look — which is the whole
+difference between `webhook-negatives-l2.sh` having been green on an exit code since phase 8 and
+this unit's six suites being able to say what they would have caught.
+
+### Numbers
+
+`verification/implementations.yaml` maps **108** distinct check IDs, ten of them bound here.
+`dev/L0-CHAIN.txt` is **72** executable lines and `dev/L2-CHAIN.txt` **30**, six added to each — one
+live line and one control line per new suite. **Green 85 → 95 of 96**; not green 11 → 1;
+**BLOCKING-ALWAYS not green 1 → 0**. The single row left is **V-CMP-020**, `deferred` with 07 P13-T5
+as its named blocker and phase 13 as its owner. Fourteen rows appended to `verification/results.csv`
+(eleven `**pass**`, two `**finding**`, one `**deferred**`), which now stands at **244** rows. Four
+lessons opened — [[LSN-066]] through [[LSN-069]] — taking open lessons to **8 of 69**.
+
+### Resume
+
+**`harness-improve`, and nothing else.** `binding.md` §Thresholds: _"**> 5 open** ⇒ the next
+invocation is an improvement pass and nothing else"_, and this unit took the count to **8**. It is
+not a judgement call and it is not deferrable past the milestone; the pass runs as its own unit and
+is never mixed with feature work. Four items enter its queue from here:
+
+1. **[[LSN-066]]** — an advisory lock taken by every script on `dev/L2-CHAIN.txt` against one
+   well-known file, so a second concurrent L2 suite blocks rather than producing a red that points
+   at the wrong artifact, **plus an _awaited_ teardown**: the collision here was against a namespace
+   that was still terminating, so a suite that deletes and returns is a suite that leaves its
+   fixtures visible to the next one.
+2. **[[LSN-067]]** — a `distinct(actionId) == submissions` assertion inside `broker_driver_run`
+   itself. It catches every current and future caller, needs no understanding of any arm, and cannot
+   be forgotten by a suite nobody has written yet; the alternative, a `dev/tests/` lint over
+   `dev/verify/**`, is strictly weaker.
+3. **[[LSN-068]]** — a shared `dev/lib/shipped-render.sh` that sources `common.sh` in a subshell
+   with the trap cleared and calls a named renderer, replacing three hand-rolled wrappers (note
+   while extracting it that `tenant-isolation-l2.sh`'s `render()` does **not** clear the EXIT trap,
+   so `tput cnorm` can land on the same stdout the manifest is captured from — latent, not currently
+   biting); a **declared precondition** _"this namespace models an installed agent"_, which every L2
+   suite that stands up an Agent in a fresh namespace has today and none of them declares; and a
+   product-side check, with its own ID, that every namespace holding an `Agent` CR admits DNS for
+   the pods the pair policy selects — the only one of the three that would catch a real install.
+4. **[[LSN-069]]** — an L2 arm asserting that every address in a rendered rule 9 appears in
+   `endpoints/kubernetes`. Cheap, needs no traffic, and **would have gone red on both clusters**.
+
+**Then `harness-milestone`** — the pre-merge gate (phase acceptance, phase ratchet, regression,
+invariants), the confirmation that no BLOCKING-ALWAYS check is deferred or quarantined, the PR with
+the verification table, and the merge that closes Phase 9.
+
+---
+
+## Milestone gate — the ratchet audit, and five things it found · 2026-08-01
+
+`harness-milestone` §2.1 asks for eight confirmations a green run can still hide. Seven came back
+clean and are tabulated in the PR. This section records what the eighth pass turned up, because four
+of the five items are **defects in the ratchet machinery itself** — a check that lies is the one
+class of finding that cannot be caught by running the checks harder, and [[LSN-001]]'s rule is fix,
+don't skip, not fix-here.
+
+**Clean, and by how much.** Assertion ratchet **1320 → 1401**, 81 added and 0 removed. Coverage
+**357** against a floor of **349**. V-MET-002 (420 obligations), V-MET-004, V-MET-006 and V-MET-014
+all green. Nothing was weakened anywhere in the phase diff: `L2_CHAIN_FLOOR` 18 → 31,
+`L2_SCOPE_FLOOR` 27 → 39, `EXPECTED_ASSERTIONS` 14 → 21, the 09 catalog 234 → 259 rows with **zero**
+phase or level changes, and 09 §10's ratchet table byte-identical. Zero `pass` rows carry an empty
+`evidence_ref`.
+
+### The five findings, and where each one goes
+
+**(1) `is_green()` cannot see a retraction — the one that matters.** `dev/tests/phase-ratchet-is-asserted.py`
+scores a check green on `any(result == "pass" and evidence…)`, and its `parse_results()` never reads
+the `level` column at all. So a `pass` that a later `**correction**` row retracts still scores
+green — and that is not hypothetical: **V-CMP-004 is live in exactly that state**. The correct
+semantics already exist one file over, in `invariants-gate.py`'s `_dagger_pass_failures`, which is
+what makes this a divergence between two readers of the same file rather than an open question about
+what the file means. **Routed to `harness-improve`, not fixed here** — Guardrail 9, and this is the
+sharpest possible instance of it: the check whose defect I would be repairing is the check that
+scores the phase I am trying to close.
+
+**(2) Nothing ever executes `--phase 8`.** `verify-phase8.sh` has no ratchet arm, and
+`check_phase_gate_runs_its_own_ratchet` carries `grandfathered = {"2".."8"}`. Run by hand, phase 8 is
+red on **three** checks — V-CMP-005, V-CMP-020, and **V-CMP-004, which the arm does not report**
+(finding 1 is why). A grandfather clause that was meant to stop old phases blocking new work has
+instead made a whole phase unmeasurable, and it hid a second finding while doing it.
+
+**(3) Phase 8 closed on an acceptance row that names a retracted check and a check with no row.**
+`docs/build/phase-8.md:342` binds V-CMP-004 (retracted) and V-CMP-005 (no row at all). This is the
+stale table that pulls V-CMP-005 into phase 8's required set in the first place — the finding above
+and this one are the same defect seen from two ends.
+
+**(4) The retirement inventory cannot tell a deletion from a duplication.** Commit `5b3dd27` removed
+eight tests from `dev/test_invariants_gate.py` and listed four as `retired`. The other four have
+duplicate names elsewhere in the file, so the `file::name` inventory key still resolves and the
+removal is invisible. The key needs to be position- or count-aware, or names need to be unique.
+
+**(5) 09 §9.6 paragraph 1, two residual defects.** Paragraph 2 is an unambiguous tightening and
+stands. Paragraph 1 documents pre-existing shipped code — the green-somewhere carve-out is on
+`origin/main` — but its sentence _"A check that is green at **no** level may not be deferred at all"_
+is written unscoped where the code scopes it to BLOCKING-ALWAYS, and **V-CMP-020 was a live
+counterexample in this very branch** until the P13-T5 conversion greened it. The not-yet-due
+carve-out is undocumented entirely. Prose that is stricter than its executable twin is the shape
+`check_deferrals_name_blockers` already warns about in `harness-improve` §3.3.
+
+**Disclosure, unrelated to the five:** `dev/L0-CHAIN.txt:461`'s comment reads "38 of Phase 9's 75"
+and the true figure is 1 of 96.
+
+### Where they go
+
+(1), (4) and (5) are check and spec defects and belong to the improvement pass this milestone runs
+before the PR — never to a feature unit, and (1) least of all. (2) and (3) are phase-8 debt that
+predates this branch; they are disclosed in the PR and scheduled, not silently carried. None of the
+five is a Phase 9 regression, and none of them is load-bearing on the Phase 9 acceptance table.
+
+## Unit `P13-T5` — the persona conversion, pulled forward four phases · 2026-08-01 · ✅
+
+The milestone halt above asked one question and got the expensive answer. 09 §6.15 requires
+V-CMP-020 — _"Each tier's `skills/` set matches its 02 §2.1 row exactly — nothing missing, nothing
+borrowed from another tier"_ — green by phase **8**; 07 §2 schedules the conversion that would make
+it true as **P13-T5**, five phases later. The harness recommended moving the one cell from `8` to
+`13` and was overruled, correctly: it is the beneficiary of that edit, and SELF-IMPROVEMENT §5 names
+a threshold change made while trying to get something to pass as the situation in which judgement is
+worst. So the work came forward instead. **Nothing in 09, in 07, in the check, or in any threshold
+was edited to produce the green.** The assertion that now exits 0 is byte-identical to the one that
+reported 37 findings, which is the only reason the pass means anything.
+
+**175 files, +5185 / −5863.** The tree ends at 26 skills over 12 rows — platform 12, cluster-admin
+13, developer-team 12.
+
+### What actually moved
+
+02 §2.1's own rename table drove all of it, and every one of the 37 findings was a row in that
+table rather than a defect the check had discovered:
+
+| Was                                       | Is                      | The change underneath the rename                                                                                                    |
+| ----------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `submit-suggestion`                       | `apply-change`          | An agent no longer opens a pull request. It submits an Action Envelope and the broker executes it, classified, journaled, undoable. |
+| `raise-escalation`                        | `escalate`              | An OKF entry the parent might later read becomes a synchronous one-hop call with six possible structured replies.                   |
+| —                                         | `delegate`              | New. The downward half of the mesh, which had no representation at all.                                                             |
+| `propose-cluster-admin`, `propose-*-team` | `provision-*`           | The verb was the whole problem: these skills render a tenancy, they do not ask for one.                                             |
+| seven workload skills under `platform/`   | under `developer-team/` | The Developer Team held none of the skills 02 §2.1 assigns it, while the Platform Agent carried the entire superset.                |
+
+The renames were the cheap part. The expensive part is that **`submit-suggestion` was a live Python
+import**: `detect-drift` imported it, both `propose-*` skills sat on it, two MCP servers stamped its
+git trailers, and the developer-team cron jobs invoked it by name. That coupling is also the answer
+to whether this could have waited for Phase 13 — it could not have been done cleanly there either,
+because the allocation and the conversion are the same edit seen from two sides.
+
+### The security decision that was not ours to make quietly
+
+`agents/platform/skills/provision-cluster-admin/assets/netpol-cluster-admin-egress.yaml.tmpl:77`
+punches a NetworkPolicy egress hole to GitHub, and the comment justifying it names
+`submit-suggestion` — the skill this unit deleted. **The hole is still open and this unit did not
+close it.** Closing an egress rule is a security-model change with a blast radius past the persona
+tree, and it belongs to P10/P11 where the network model is the subject. It is recorded here, in the
+PR, and in the backlog rather than silently narrowed or silently kept.
+
+The related fact is the one that resolved a genuine tension in the retirement. `test_submit_suggestion_still_ships`
+existed because P10-T3 argued the skill should stay; the argument's own conclusion now points the
+other way. Its write credential was a **GitHub token in an agent pod** — the one write path Phase 9's
+brokered-mutation property never covered, because it wrote to git rather than to a cluster. The arm
+was not deleted; it was inverted into `test_submit_suggestion_is_gone_from_every_tier`.
+
+### Coverage: what a conversion can silently take away
+
+The conversion deleted two whole unittest modules by deleting the code they imported. Both went red
+at import, which is the loud failure; the quiet one is that **a capability can lose its coverage
+without anyone touching a check** — not by deletion, but by the artifact the check was pointed at
+ceasing to be code. Cross-tier coordination went from a 215-line Python helper with a test module
+around it to four prose `SKILL.md` files, and for the length of one commit nothing in the repo could
+reach the contract at all.
+
+So `dev/tests/mesh-skills-encode-the-contract.py` is the named successor, and it is a check rather
+than a unittest module because its subject is prose. It asserts 02 §2.3 where the contract now
+lives: one hop to the counterpart **02 §6's lineage graph** gives that tier, the chain and loop guard
+at 06 §7's `MaxMeshDepth`, the callee re-authorizing (mTLS + `TokenReview`, untrusted `intent` and
+`rationale`, its own envelope through its own broker pipeline) over 02 §2.3's closed field list,
+authority never inherited, all six reply branches as a **set**, the tier grant in both directions,
+and the OKF withdrawn as the escalation channel. 66 distinct findings, 164 per-file evaluations per
+run, negative control **55/55**.
+
+Two details worth keeping. First, **every constant is derived at run time** ([[LSN-036]]) — the tier
+roster, the lineage edges, the branch list, the message fields, the mesh port and the depth cap all
+come out of 02 §1/§2.3/§6 and 06 §7, and a parser that stops matching is a `VACUOUS:` failure rather
+than a quiet pass ([[LSN-035]], [[LSN-038]]). Second, 02 §2.3 **bolds** exactly three of the six
+reply obligations, and the check reads that marking instead of repeating it: `refused`, `timeout` and
+`paused` must carry the spec's content words _and_ keep them emphasised.
+
+The control did real work rather than confirming a belief. It opened at 42/54 and caught four
+assertions that were looser than their own docstrings claimed — `envelope`+`own` was satisfied by
+every file's opening line about its own broker, and `attribution`+`ActionRecord` by the adjacent
+`traceId`/`requester` table rows. Both directions of the topology arm have their own row: a cloned
+`agents/platform/skills/escalate/` (a root acquiring an upward verb) and a deleted
+`agents/developer-team/skills/escalate/` (a tier losing one it holds).
+
+### Two gaps in the blueprint the check found, and the one it could not assert
+
+The leaf tier was the **only** one of the four mesh files with no cross-cluster prohibition. The
+other three close it in three different shapes; `developer-team/escalate` forbade a sibling Developer
+Team, its grandparent Platform, and another agent's broker, and said nothing about **a Cluster Admin
+Agent that is not its parent** — which is exactly the reach into another cluster the property is
+about. A fourth row now closes it, and a matching row closes the symmetric hole in
+`cluster-admin/escalate` ("a Platform Agent that is not your parent, or any agent in another project
+at all"), so the rule is one shape in four files and derivable rather than four phrasings and a
+phrase match.
+
+The OKF gloss disagreed with the spec in the majority's favour: three files said "SOPs, blueprints,
+**baselines**" and one said "**runbooks**". 02 §2.3 line 204 says runbooks, so the three were
+corrected, not the one.
+
+That correction then turned a negative-control row **BROKEN** — the row's needle quoted both lines
+of the bullet verbatim, including `baselines`. This is [[LSN-063]] behaving exactly as written: at
+zero occurrences the replace hands back the file unchanged and the suite re-runs against the tree it
+was already green on, so the row would have scored a survivor it never evaluated. The needle now
+stops at the end of the first line. **The row is not weaker for being shorter** — same bullet, same
+deletion, same P7 property — but it is no longer keyed to a sentence the spec owns and may correct
+again.
+
+**What the check deliberately does not claim.** Nothing in this tree implements the mesh: no
+`MeshRequest`, no `:8444` listener, no `internal/mesh/`. Every P2 and P3 property is asserted as
+_the blueprint states the contract_, never as _the runtime enforces it_. That a chain is actually
+rejected, that `TokenReview` actually runs, that the NetworkPolicy actually permits only these edges
+(03 §9) — all runtime properties, all outside this check, and its docstring says so. It stays L0 for
+that reason. When the transport lands, conformance rows verify the wire and this file keeps
+verifying that the agent was told the truth about it.
+
+### The retirement accounting
+
+Eighteen named tests were retired, every one against a replacement that exists and is green today
+(ratchet rule 1). Baseline **1401 → 1447**, and all 34 mechanized invariant checks pass.
+
+| Retired                                   | Replaced by                                                                                                     |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `dev/test_raise_escalation.py` (4)        | `dev/tests/mesh-skills-encode-the-contract.py`, arm by arm — P7, P5, P6 topology, P6 counterpart                |
+| `dev/test_submit_suggestion.py` (11)      | `dev/test_action_envelope.py` + `dev/test_envelope_wire_keys.py` + `dev/test_apply_change_skill.py`, arm by arm |
+| `dev/test_detect_drift.py` (3, of 3 → 64) | the rewritten suite in the same file                                                                            |
+
+Two of those mappings are stronger than what they replace, which is worth naming because a
+retirement table usually is not. The old attribution path **defaulted** a blank requester to
+`<tier>-agent (autonomous)`; the envelope **refuses** it (`test_an_empty_identity_is_refused_not_defaulted`).
+And the newline-injection guard was a strip on a git trailer; it is now a regex refusal at build
+time (`test_a_malformed_trace_id_is_refused`).
+
+One mapping is weaker on purpose. `test_helper_and_skill_identical_across_lower_tiers` asserted
+byte-identity, which was the right property for one shared Python helper and is the **wrong** one for
+four prose files: each must name its own counterpart, so identical copies are now the defect rather
+than the assertion.
+
+### Findings routed, not fixed here
+
+Guardrail 9 forbids changing a check in the same unit as the implementation whose failure motivated
+it, and four of these are check or spec defects.
+
+1. **The `gcloud` FORBIDDEN pattern misses every three-token mutating form.**
+   `gcloud\s+\w+\s+(create|delete|update|patch|set)\b` matches `gcloud projects create` and misses
+   `gcloud container clusters create|delete|update`, `gcloud compute instances create`,
+   `gcloud iam service-accounts create` and `gcloud container node-pools create` — essentially every
+   mutating command an agent would actually reach for. Found by writing a synthetic control that
+   failed `3 != 4`. **The regex was not strengthened.** The control was changed to a form the pattern
+   claims to catch, because a control tuned to a bug is how a bug gets a green test of its own.
+2. **V-CMP-021 has no implementation at all**, and now that 09 §6.15's `8` has been ruled correct
+   for V-CMP-020, **V-CMP-021's phase-13 dating is the suspect one** — the cataloguing finding at
+   `verification/results.csv:218` points the other way from where it was first written.
+3. **`dev/tests/cli-contract.py:93`** — the `MIN_CLIS` non-vacuity comment cites a basis the
+   restructure invalidated.
+4. **Three `detect_drift.py` defects.** Argparse usage errors exit **2**, colliding with "drift
+   found", while all three module docstrings and all three `SKILL.md` §2 promise `1 = error`; a cron
+   wrapper branching on 2 reads a usage error as a drifted fleet. And `untuned_alerts`
+   (developer-team) and `addon_versions` (cluster-admin) pass `target` through from the inventory
+   **verbatim**, with no scope validation — a poisoned inventory steers a target out of scope, and
+   the containment suite reads honest fixtures so it would not see it. The right test is a
+   poisoned-inventory case per tier; it would be red today, so it is scheduled rather than written.
+
+Two more are disclosed and deliberately untouched: the GitHub egress hole above, and
+`k8s-operator/api/v1alpha1/common_types.go:432,464`, where `IACSpec`'s doc comments still narrate
+"proposes via GitOps". That one is genuinely contested in the spec — 06 line 220 keeps
+`spec.iac.format` alive while lines 24 and 1121 redefine the repo as "a mirror, not a control path" —
+so the field is live and only its narrative is wrong. Editing a CRD field comment regenerates
+`config/crd/bases/…_agents.yaml`, which feeds the byte-locked `examples/gitops-repo/` exemplars, and
+two writers there breaks a green check.
+
+**Where each one went**, because "routed" is only true if it names a destination. `docs/build/BACKLOG.md`
+is not one of them: `binding.md` §State says the harness drains that file **at ORIENT and nowhere
+else**, so a harness-discovered finding written into it would be the harness filing tickets to
+itself in the one file reserved for a person.
+
+| Finding                                                      | Destination                                                                                                                                                                                       |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 — the `gcloud` pattern                                     | **[[LSN-071]]**, open, with the widening and the "look for the same shape elsewhere" sweep as the mechanization the next pass owes                                                                |
+| 2 — V-CMP-021 unimplemented, phase-13 dating now the suspect | The Phase 9 `harness-milestone` improvement pass, as an uncovered-requirement row — it is a scheduling question, not a repair                                                                     |
+| 3 — `cli-contract.py:93`'s invalidated `MIN_CLIS` basis      | The same pass, beside it: both are a check's stated basis outliving the thing it was derived from                                                                                                 |
+| 4 — the three `detect_drift.py` defects                      | **P10-T9**, new roadmap row. It is product code with an unasserted containment property, so the test comes first and it will be red                                                               |
+| 5 — the GitHub egress rule cut for a deleted skill           | **P10-T10**, new roadmap row, deliberately beside P10-T0c: that task re-applies the tier allowlists, and re-applying a rule whose stated basis is false is the moment the mistake becomes durable |
+| 6 — `examples/gitops-repo/` and the `IACSpec` narrative      | **P11-T7**, new roadmap row, riding P11-T4 — the cascade conversion is what decides what the published bundle is _for_, and rewriting the exemplar before then means guessing at it twice         |
+
+### The most dangerous thing in the sweep
+
+`scripts/sync-upstream-skills.py` carried a hardcoded `SKILL_MAPPINGS` that was all-`["platform"]`
+and `shutil.rmtree`s each destination before copying. Run once after this conversion, it would have
+re-created **nine** directories under `agents/platform/skills/` and re-reddened V-CMP-020 — proven,
+not inferred: the old script against a throwaway copy takes the check from PASS to 9 findings. It
+would also have reverted `gke-cluster-creator` and `gke-cluster-lifecycle` to upstream text, 423
+lines of kube-agents-specific rewriting, and **that half is invisible to V-CMP-020**, which reads
+directory names.
+
+Nothing triggers it — no workflow, no Makefile target, no cron, no chain line; `grep -r sync-upstream`
+over the repo returns zero hits outside a docstring that names it as a hazard. It is a human-run
+utility, which is the worst combination: destructive, unscheduled, and green.
+
+The table is gone. The script now imports 02 §2.1's parser and derives the allocation at run time
+([[LSN-036]]), with no fallback — a missing spec, a missing parser, an unparsed table or an empty
+tier each `SystemExit`s **before the first `rmtree`**. A run against a correct tree is now
+byte-identical to a no-op, and a run after deleting two skills recreates them in the correct tiers.
+
+### How this was built
+
+Six subagents on strictly disjoint write surfaces, each briefed with an explicit forbidden-file list,
+no git write commands, and no cluster access. Every shared definition site —
+`dev/L0-CHAIN.txt`, `verification/results.csv`, `verification/implementations.yaml`,
+`dev/assertion-baseline.json`, `docs/build/**` — was report-only for all six and written serially.
+That rule was not free: one agent's brief mentioned an "L0 sweep", and it had to be told mid-run to
+report replacement text rather than apply it. It complied. A second was redirected off minting
+`verification/mutants/V-CMP-025.json` — all 20 existing mutant specs are keyed to real 09 §6 IDs, and
+inventing one lands a check in a required set and in the phase ratchet, which is a spec edit wearing
+a filename.
+
+One agent died mid-response on an API error and was resumed from its transcript, told first to read
+its own diff off disk rather than trust its memory of what had landed.
+
+### Gate
+
+| Gate                                     | Result                                                                                      |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `phase-ratchet-is-asserted.py --phase 9` | **PASS — all 96 required checks green**, each with an `evidence_ref` (was 95/96)            |
+| `tier-skills-match-the-allocation.py`    | rc 0 — 26 skills over 12 rows; `--negative-control` **18/18**                               |
+| `mesh-skills-encode-the-contract.py`     | rc 0 — 4 files, 164 evaluations; `--negative-control` **55/55**                             |
+| `invariants-gate.py`                     | **34/34**                                                                                   |
+| `python3 -m unittest discover dev`       | green                                                                                       |
+| `make -C k8s-operator test`              | rc 0, 35 packages `ok`, `internal/controller` 85.8%, **zero skips** — envtest genuinely ran |
+| `make validate`                          | pass                                                                                        |
+
+HALT 1 is cleared by the work, not by a reading of it.

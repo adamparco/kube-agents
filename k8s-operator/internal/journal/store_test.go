@@ -21,10 +21,12 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -261,6 +263,315 @@ func TestSetPhaseKeepsStatusAndLabelInStep(t *testing.T) {
 	}
 	if got.Labels[StatusLabel] != string(agentv1alpha1.PhaseVerified) {
 		t.Fatalf("%s = %q after a second transition", StatusLabel, got.Labels[StatusLabel])
+	}
+}
+
+// `status` is a subresource, so the API server keeps spec and metadata from a Create and DISCARDS
+// the status block. Store.Create has always known that -- it re-writes `status.phase` afterwards --
+// and put back exactly one field of the block it knew had been dropped.
+//
+// Everything else the broker composes at 06 §4.2 step 6 went with it, and what it composes there is
+// `status.timestamps.submitted` and `.classified`: the half of the lifecycle clock that PRECEDES
+// execution, on the write-ahead record, which is the artifact V-BRK-006 is about. A record that
+// becomes durable without them is durable without the evidence it exists to carry. Worse, the
+// caller's copy came back with a nil `status.timestamps`, and the pipeline stamped step 8 straight
+// through it: a panic between "the journal says Executing" and "anything has executed".
+func TestCreateLeavesTheBirthBeatsOnTheServer(t *testing.T) {
+	ctx := context.Background()
+	s, c := newFakeStore(t)
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "developer-team/p/c/team-x")
+	submitted := metav1.NewTime(time.Date(2026, 7, 31, 5, 45, 18, 0, time.UTC))
+	classified := metav1.NewTime(time.Date(2026, 7, 31, 5, 45, 19, 0, time.UTC))
+	ar.Status.Timestamps = &agentv1alpha1.ActionTimestamps{Submitted: &submitted, Classified: &classified}
+
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// On the server, because durability is the property under test -- a birth beat that lives only
+	// in the caller's memory is exactly what the write-ahead rule says must not be relied on.
+	var got agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.Timestamps == nil {
+		t.Fatal("the write-ahead record is durable with no lifecycle clock; the subresource drop took it and Create put back only the phase")
+	}
+	if !got.Status.Timestamps.Submitted.Equal(&submitted) {
+		t.Errorf("submitted = %v, want %v", got.Status.Timestamps.Submitted, submitted)
+	}
+	if !got.Status.Timestamps.Classified.Equal(&classified) {
+		t.Errorf("classified = %v, want %v", got.Status.Timestamps.Classified, classified)
+	}
+	if got.Status.Phase != agentv1alpha1.PhaseExecuting {
+		t.Errorf("phase = %q; the restore must not cost the field it was already putting back", got.Status.Phase)
+	}
+
+	// And in the caller's copy, because the pipeline reads it at step 8 without re-fetching. This is
+	// the assertion that stands where the panic was.
+	if ar.Status.Timestamps == nil || ar.Status.Timestamps.Submitted == nil {
+		t.Fatalf("the caller's copy came back with no clock: %+v", ar.Status.Timestamps)
+	}
+}
+
+// SetPhase re-reads the record and writes the LIVE copy, so for as long as it copied nothing across
+// from the caller, every status field the caller had composed was discarded. The pipeline composes
+// four of them — `status.applied` at step 9, `status.verification` and `status.recovery` at step 11,
+// and the lifecycle clock throughout — and only `phase` and `message` ever reached etcd. A live
+// record from `broker-execute-l2.sh` on 2026-07-31 read back with a phase, a message and nothing
+// else: the audit trail said an action had happened and could not say what it did.
+//
+// `status.timestamps.executionStarted` is also V-BRK-006's L2 evidence, so this was not only a lossy
+// record — it was a check that could not run.
+func TestSetPhaseCarriesTheOutcomeTheBrokerOwns(t *testing.T) {
+	ctx := context.Background()
+	s, c := newFakeStore(t)
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "developer-team/p/c/team-x")
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	started := metav1.NewTime(time.Date(2026, 7, 31, 5, 45, 20, 0, time.UTC))
+	ended := metav1.NewTime(time.Date(2026, 7, 31, 5, 45, 21, 0, time.UTC))
+	ar.Status.Timestamps = &agentv1alpha1.ActionTimestamps{ExecutionStarted: &started, ExecutionEnded: &ended}
+	ar.Status.Applied = []agentv1alpha1.AppliedTarget{{TargetIndex: 0, ResourceVersionAfter: "4711"}}
+	ar.Status.Verification = &agentv1alpha1.ActionVerification{Passed: true}
+	ar.Status.Recovery = &agentv1alpha1.ActionRecovery{Rung: 1}
+
+	if err := s.SetPhase(ctx, ar, agentv1alpha1.PhaseVerified, "executed"); err != nil {
+		t.Fatalf("SetPhase: %v", err)
+	}
+
+	var got agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.Timestamps == nil || got.Status.Timestamps.ExecutionStarted == nil {
+		t.Fatalf("status.timestamps.executionStarted did not survive the write: %+v", got.Status.Timestamps)
+	}
+	if !got.Status.Timestamps.ExecutionStarted.Equal(&started) {
+		t.Errorf("executionStarted = %v, want %v", got.Status.Timestamps.ExecutionStarted, started)
+	}
+	if !got.Status.Timestamps.ExecutionEnded.Equal(&ended) {
+		t.Errorf("executionEnded = %v, want %v", got.Status.Timestamps.ExecutionEnded, ended)
+	}
+	if len(got.Status.Applied) != 1 {
+		t.Errorf("status.applied = %+v, want the one target the caller composed", got.Status.Applied)
+	}
+	if got.Status.Verification == nil || !got.Status.Verification.Passed {
+		t.Errorf("status.verification = %+v", got.Status.Verification)
+	}
+	if got.Status.Recovery == nil || got.Status.Recovery.Rung != 1 {
+		t.Errorf("status.recovery = %+v", got.Status.Recovery)
+	}
+	if got.Status.Phase != agentv1alpha1.PhaseVerified || got.Status.Message != "executed" {
+		t.Errorf("phase/message = %q/%q", got.Status.Phase, got.Status.Message)
+	}
+}
+
+// The nil-guard, which is what makes the merge safe to run on EVERY transition rather than only the
+// terminal one. SetPhase is called for plain lifecycle steps too, and on those the caller's copy is
+// a record it read moments ago and never composed anything onto. An unguarded field-by-field copy
+// would let such a caller erase a clock the server already holds -- the same data loss as no merge
+// at all, arriving through the fix for it.
+func TestSetPhaseDoesNotBlankWhatTheCallerNeverSet(t *testing.T) {
+	ctx := context.Background()
+	s, c := newFakeStore(t)
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "developer-team/p/c/team-x")
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// The server holds a full outcome: the birth beats from the write-ahead Create, plus what an
+	// earlier transition persisted.
+	started := metav1.NewTime(time.Date(2026, 7, 31, 5, 45, 20, 0, time.UTC))
+	var live agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &live); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	live.Status.Timestamps = &agentv1alpha1.ActionTimestamps{ExecutionStarted: &started}
+	live.Status.Applied = []agentv1alpha1.AppliedTarget{{TargetIndex: 0, ResourceVersionAfter: "4711"}}
+	live.Status.Verification = &agentv1alpha1.ActionVerification{Passed: true}
+	if err := c.Status().Update(ctx, &live); err != nil {
+		t.Fatalf("seeding the server's outcome: %v", err)
+	}
+
+	// The caller carries a phase and nothing else -- the shape of every non-terminal SetPhase.
+	ar.Status.Timestamps = nil
+	ar.Status.Applied = nil
+	ar.Status.Verification = nil
+	if err := s.SetPhase(ctx, ar, agentv1alpha1.PhaseVerified, "verified"); err != nil {
+		t.Fatalf("SetPhase: %v", err)
+	}
+
+	var got agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.Timestamps == nil || got.Status.Timestamps.ExecutionStarted == nil {
+		t.Fatalf("status.timestamps was erased by a caller that never set it: %+v", got.Status.Timestamps)
+	}
+	if !got.Status.Timestamps.ExecutionStarted.Equal(&started) {
+		t.Errorf("executionStarted = %v, want the server's %v", got.Status.Timestamps.ExecutionStarted, started)
+	}
+	if len(got.Status.Applied) != 1 {
+		t.Errorf("status.applied was erased: %+v", got.Status.Applied)
+	}
+	if got.Status.Verification == nil || !got.Status.Verification.Passed {
+		t.Errorf("status.verification was erased: %+v", got.Status.Verification)
+	}
+}
+
+// The other half of the same rule, and the one that makes it safe: 06 §4.3 hands `approvals`,
+// `contested` and `undoneBy` to principals that are NOT this broker, and `exported` to the audit
+// exporter. SetPhase reads the record fresh and must leave every one of them exactly as the server
+// has it — a broker that copied its own stale idea of `approvals` back would be silently reversing a
+// human decision, which is the worst thing a wholesale status copy could do.
+func TestSetPhaseNeverWritesAnotherPrincipalsStatus(t *testing.T) {
+	ctx := context.Background()
+	s, c := newFakeStore(t)
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "developer-team/p/c/team-x")
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// The other writers move first, straight against the server, as they would in a cluster.
+	var live agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &live); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	live.Status.Approvals = &agentv1alpha1.ActionApprovals{Required: 2}
+	live.Status.Contested = true
+	live.Status.UndoneBy = "01JZQ8X9K7M4N2P6R8T0V3W5ZZ"
+	if err := c.Status().Update(ctx, &live); err != nil {
+		t.Fatalf("seeding another principal's status: %v", err)
+	}
+
+	// The broker's copy predates all three and disagrees about every one of them.
+	ar.Status.Approvals = nil
+	ar.Status.Contested = false
+	ar.Status.UndoneBy = ""
+	if err := s.SetPhase(ctx, ar, agentv1alpha1.PhaseVerified, "executed"); err != nil {
+		t.Fatalf("SetPhase: %v", err)
+	}
+
+	var got agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.Approvals == nil || got.Status.Approvals.Required != 2 {
+		t.Errorf("status.approvals = %+v; the broker blanked the ChatOps gateway's write", got.Status.Approvals)
+	}
+	if !got.Status.Contested {
+		t.Error("status.contested was cleared by a phase change; only the gateway and the undo controller may clear it")
+	}
+	if got.Status.UndoneBy != "01JZQ8X9K7M4N2P6R8T0V3W5ZZ" {
+		t.Errorf("status.undoneBy = %q; the undo controller's write was overwritten", got.Status.UndoneBy)
+	}
+}
+
+// The broker's grant is the reason this arm exists. 06 §2.2.1 gives broker-operations
+// `actionrecords get list watch create` and `actionrecords/status get update patch`, and withholds
+// `update` on the main resource deliberately -- the broker appends and advances status, it can never
+// rewrite or remove a record. `kube-agents/status` is a LABEL, so keeping it in step is an `update`
+// on the main resource and always will be. Before this arm, that meant every terminal transition the
+// broker took returned a hard error for an action that had already executed and whose authoritative
+// `status.phase` had already landed through the subresource the grant does allow -- surfaced to the
+// caller as an HTTP 500 on a successful action, which is a false negative in the audit trail.
+//
+// Found live: `dev/verify/broker-execute-l2.sh` reached step 11 against
+// `gke-scratch-kube-agents-dev` and failed with exactly this Forbidden.
+func TestSetPhaseSurvivesAnIndexWriteTheGrantForbids(t *testing.T) {
+	ctx := context.Background()
+	forbidden := apierrors.NewForbidden(
+		schema.GroupResource{Group: "kubeagents.x-k8s.io", Resource: "actionrecords"},
+		"ar-01jzq8x9k7m4n2p6r8t0v3w5yz",
+		errors.New(`User "system:serviceaccount:kubeagents-system:platform-p-actor" cannot update resource "actionrecords"`))
+
+	var updates int
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithStatusSubresource(&agentv1alpha1.ActionRecord{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: dropStatusLikeTheApiServer,
+			// Only the MAIN resource is refused. `Status().Update` routes through SubResourceUpdate,
+			// which is left alone -- modelling the grant as it is written, not as a blanket denial,
+			// because a blanket denial would also have caught a bug in the status write and this
+			// test would then not be about the label at all.
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				updates++
+				return forbidden
+			},
+		}).
+		Build()
+	s := NewStore(c, newMemBlob())
+
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "platform/my-project/cluster-a/team-x")
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := s.SetPhase(ctx, ar, agentv1alpha1.PhaseVerified, "executed"); err != nil {
+		t.Fatalf("SetPhase reported failure for an action whose outcome WAS journaled: %v", err)
+	}
+	if updates == 0 {
+		t.Fatal("the label sync was never attempted, so this test proves nothing about tolerating its refusal")
+	}
+
+	var got agentv1alpha1.ActionRecord
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "team-x", Name: ar.Name}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	// The authoritative field landed. That is what makes swallowing the index failure legitimate.
+	if got.Status.Phase != agentv1alpha1.PhaseVerified {
+		t.Fatalf("status.phase = %q, want %q -- the outcome was not journaled at all", got.Status.Phase, agentv1alpha1.PhaseVerified)
+	}
+	if got.Status.Message != "executed" {
+		t.Fatalf("status.message = %q", got.Status.Message)
+	}
+	// The index legitimately lags. `JournalReconciler.repairStatusLabel` closes it, running in the
+	// operator, which does hold `update`.
+	if got.Labels[StatusLabel] == string(agentv1alpha1.PhaseVerified) {
+		t.Fatal("the label was refused by the API server and yet came back updated; the fake is not modelling the grant")
+	}
+	// And the caller's copy must not claim otherwise. Adopting live.Labels on this path would make
+	// an in-memory read of the index disagree with the server -- the exact drift the whole
+	// status/label pair exists to avoid.
+	if ar.Labels[StatusLabel] == string(agentv1alpha1.PhaseVerified) {
+		t.Fatalf("the caller's copy says %s=%q, but that write was refused", StatusLabel, ar.Labels[StatusLabel])
+	}
+	if ar.Status.Phase != agentv1alpha1.PhaseVerified {
+		t.Fatalf("the caller's copy did not adopt the status that DID land: %q", ar.Status.Phase)
+	}
+}
+
+// A Forbidden is the RBAC model working as specified; every other failure is not, and must still
+// reach the caller. Narrowing the tolerance is the difference between "this write is closed to me by
+// design" and "this write is broken", and only the first one is safe to continue past.
+func TestSetPhaseStillFailsOnAnIndexWriteThatIsNotForbidden(t *testing.T) {
+	ctx := context.Background()
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithStatusSubresource(&agentv1alpha1.ActionRecord{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: dropStatusLikeTheApiServer,
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				return apierrors.NewInternalError(errors.New("etcdserver: request timed out"))
+			},
+		}).
+		Build()
+	s := NewStore(c, newMemBlob())
+
+	ar := record("01JZQ8X9K7M4N2P6R8T0V3W5YZ", "team-x", "platform/my-project/cluster-a/team-x")
+	if err := s.Create(ctx, ar); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	err := s.SetPhase(ctx, ar, agentv1alpha1.PhaseVerified, "executed")
+	if err == nil {
+		t.Fatal("SetPhase swallowed a transient index failure; only a Forbidden is a by-design refusal")
+	}
+	if !strings.Contains(err.Error(), StatusLabel) {
+		t.Fatalf("the error does not say which write failed: %v", err)
 	}
 }
 

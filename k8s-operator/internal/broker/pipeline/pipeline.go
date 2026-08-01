@@ -282,6 +282,11 @@ type state struct {
 	at       time.Time
 	caller   classify.Caller
 
+	// classifiedAt is step 4's finishing instant, held here because the record does not exist yet
+	// when it is taken: `buildRecord` runs at step 6. Every other beat of the lifecycle clock is
+	// stamped straight onto `s.record.Status.Timestamps`, because by then there is one.
+	classifiedAt time.Time
+
 	targets  []agentv1alpha1.TargetRef
 	resolved []classify.ResolvedOp
 	snaps    []execute.Snapshot
@@ -698,6 +703,10 @@ func (p *Pipeline) stepClassify(ctx context.Context, s *state) (*broker.Result, 
 				SecurityEvent: true,
 			}
 		}
+		// After the refusal arms, not before: `status.timestamps.classified` is "when the classifier
+		// returned" (06 §4.3), and a submission that ends in `forbidden` never got an answer to
+		// carry forward. The record built for a refusal is a different object on a different path.
+		s.classifiedAt = p.cfg.Now().UTC()
 		return fmt.Sprintf("%s (%s)", cls.Class, strings.Join(cls.PolicySources, "+")), nil
 	})
 }
@@ -898,6 +907,21 @@ func (p *Pipeline) stepExecute(ctx context.Context, s *state) (*broker.Result, e
 		if err != nil {
 			return "", err
 		}
+
+		// V-BRK-006's L2 EVIDENCE IS THIS LINE, and it must be read off the wall clock rather than
+		// off `s.at`. The check compares `metadata.creationTimestamp` -- assigned by the API SERVER
+		// at step 8 -- against `status.timestamps.executionStarted`, and reads any inversion as a
+		// broker that executed before it journaled. `s.at` is the submission instant, frozen before
+		// step 3, so stamping it here would make every record ever written claim it started
+		// executing several steps before the API server had heard of it: a fabricated violation of
+		// the one ordering the write-ahead rule exists to establish.
+		//
+		// Stamped for a dry run too. `execute.Execute` issues real API calls with `client.DryRunAll`
+		// -- a server-side dry run is authorized and admitted before it is discarded -- so a mutating
+		// call WAS issued, which is what the field records. A shadow run that left this nil would
+		// make the write-ahead ordering unobservable on exactly the path Phase 9 runs.
+		s.clock().ExecutionStarted = ptrTime(p.cfg.Now())
+
 		res, execErr := p.cfg.Executor.Execute(ctx, execute.Request{
 			ActionID:      s.actionID,
 			AgentIdentity: agentIdentity(s.id),
@@ -905,6 +929,12 @@ func (p *Pipeline) stepExecute(ctx context.Context, s *state) (*broker.Result, e
 			Snapshots:     s.snaps,
 			DryRunOnly:    s.dryRun(),
 		})
+		// Before the error branches below, for the same reason the Result is: "when the last
+		// mutating call returned" is answerable whether or not the pass succeeded, and it is the
+		// base for `undoWindowExpiresAt`. A partially-applied action is precisely the one whose undo
+		// window a human needs, so it is the one case where losing this would matter most.
+		s.clock().ExecutionEnded = ptrTime(p.cfg.Now())
+
 		// The Result is kept even on error: it carries Mutated, which is the recovery ladder's
 		// only input on whether there is anything to roll back. Discarding it here is the bug
 		// execute.Execute's doc comment warns about.
@@ -975,6 +1005,7 @@ func (p *Pipeline) stepVerify(ctx context.Context, s *state) (*broker.Result, er
 			return "", fmt.Errorf("step 10: verifying action %s: %w", s.actionID, err)
 		}
 		s.verify = res
+		s.clock().Verified = ptrTime(p.cfg.Now())
 
 		d := broker.Decide(broker.BrakeInputs{
 			Stage:      broker.StagePostExecute,
@@ -1092,8 +1123,56 @@ func (p *Pipeline) buildRecord(s *state) *agentv1alpha1.ActionRecord {
 			Undo:      s.plan.Plan,
 			Retention: retention,
 		},
+		// THE LIFECYCLE CLOCK (06 §4.3), opened here so that the two beats that already happened
+		// are durable from the record's very first write -- step 7 and step 8 both Create, and
+		// `Store.Create` sends the whole status block through the subresource.
+		//
+		// Three readers depend on this and every one of them was silently degraded while nothing
+		// wrote it: `budget.go` reads `submitted` to place an action in its window,
+		// `cooldown.go` reads the execution pair, and `JournalReconciler.exportLateness` reads four
+		// of the six to decide how late an export was -- falling back to `creationTimestamp` when
+		// it finds none, which is exactly what it did on every record ever written.
+		//
+		// `approved` is deliberately absent and stays nil here. It is "when the roster was
+		// satisfied", the roster is the ChatOps gateway's business, and 06 §4.3's principals table
+		// gives `approvals` to that SA and not to this one. The broker stamping an approval time is
+		// the broker asserting an approval happened.
+		Status: agentv1alpha1.ActionRecordStatus{
+			Timestamps: &agentv1alpha1.ActionTimestamps{
+				Submitted:  ptrTime(s.at),
+				Classified: ptrTime(s.classifiedAt),
+			},
+		},
 	}
 	return ar
+}
+
+// ptrTime is metav1.NewTime behind a pointer, with the zero instant rendered as nil rather than as
+// the beginning of the epoch. `ActionTimestamps`'s own doc says "nil means the phase was never
+// reached", and a `0001-01-01T00:00:00Z` in an audit record does not mean that -- it means a clock
+// nobody set, wearing the shape of a real answer.
+// clock returns the record's timestamp block, creating it if the record does not have one.
+//
+// Not defensive programming for its own sake: `status` is a SUBRESOURCE, so the API server drops
+// the whole block from the object the broker POSTs at step 8 and hands back a record whose
+// `status.timestamps` is nil. `journal.Store.Create` puts the broker-owned fields back, but the
+// pipeline must not be one refactor of the store away from a nil dereference HERE -- at step 8,
+// after the write-ahead record is durable and before the executor has run. A panic at that point
+// leaves a record in `Executing` that no code path will ever advance, which is strictly worse than
+// the missing timestamp it would be crashing about. Fail closed means refuse, not die.
+func (s *state) clock() *agentv1alpha1.ActionTimestamps {
+	if s.record.Status.Timestamps == nil {
+		s.record.Status.Timestamps = &agentv1alpha1.ActionTimestamps{}
+	}
+	return s.record.Status.Timestamps
+}
+
+func ptrTime(t time.Time) *metav1.Time {
+	if t.IsZero() {
+		return nil
+	}
+	mt := metav1.NewTime(t.UTC())
+	return &mt
 }
 
 // --- conversions -----------------------------------------------------------------------------

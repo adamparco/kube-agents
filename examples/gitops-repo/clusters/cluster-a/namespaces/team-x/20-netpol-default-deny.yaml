@@ -4,7 +4,7 @@
 # `provision_13_apply_network_policies.sh` and applied by it. THIS FILE IS THE SOURCE. Two copies
 # are DERIVED from it and must never be hand-edited: the committed exemplar under
 # examples/gitops-repo/ (checked byte-for-byte by dev/tests/reference-render.py) and the
-# matching propose-developer-team skill asset with the tenant namespace parameterised (checked by
+# matching provision-developer-team skill asset with the tenant namespace parameterised (checked by
 # dev/test_skill_templates.py). Edit this template, then regenerate both.
 #
 # An empty podSelector selects EVERY pod in the namespace; policyTypes [Ingress, Egress] with NO

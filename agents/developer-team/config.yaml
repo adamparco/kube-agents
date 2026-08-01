@@ -43,12 +43,16 @@ mcp_servers:
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
   # NOTE: the cluster-mutating `gke` remote MCP proxy (container.googleapis.com) is intentionally
-  # omitted so the Developer Team Agent is read-only (03 §4, 06 §9). This tier reads ONLY its one
-  # assigned namespace — enforced by RBAC (a namespaced read-only Role, not the persona) and the VAP
-  # backstop, not by this config. This baked config is a fallback; the operator's renderConfigYAML()
-  # is runtime-authoritative and also omits the write proxy. Every change goes through the
-  # submit-suggestion GitOps skill (a reviewed PR), never a direct cluster write. As the leaf tier,
-  # this persona ships NO propose-child cascade skill.
+  # omitted. The agent process holds the reader identity only and has no write verb (03 §4, 06 §9),
+  # and this tier reads ONLY its one assigned namespace — enforced by RBAC (a namespaced read-only
+  # Role, not the persona) and the VAP backstop, not by this config. This baked config is a fallback;
+  # the operator's renderConfigYAML() is runtime-authoritative and also omits the write proxy. The
+  # Developer Team Agent still acts — mutation leaves this process as an Action Envelope submitted to
+  # the Action Broker with the apply-change skill, and the broker (a separate workload holding the
+  # actor identity, unreachable from here) is what resolves scope, classifies risk, gates, plans the
+  # undo and journals the ActionRecord; its templated write surface stops at this namespace. Never a
+  # direct cluster write from here. As the leaf tier, this persona ships NO provision-child skill and
+  # NO delegate skill — work above its ceiling goes one hop up with escalate.
 
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.

@@ -5,18 +5,18 @@ sidebar:
   order: 3
 ---
 
-Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion` and `github-issue-resolver` skills. The GitHub App's private key never leaves GCP KMS.
+Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) GitHub App installation tokens on demand for the GitHub flows that remain in the install: the write-behind IaC mirror the Action Broker commits to after a change, the provisioning bundles the cascade skills render for human review, and the `github-issue-resolver` watchdog. It is **not** on the change path — an agent's mutation goes to its broker, not to a PR. The GitHub App's private key never leaves GCP KMS.
 
 Provisioner: [`provision_10_deploy_github_minter.sh`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/provision_10_deploy_github_minter.sh).
 Full README: [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md).
 
 ## How it works
 
-1. **Request.** The agent calls Minty via HTTP, specifying the target org and repo. The request is authenticated with the agent's Google Service Account OIDC token (via Workload Identity).
+1. **Request.** The caller (agent pod or broker) calls Minty via HTTP, specifying the target org and repo. The request is authenticated with the caller's Google Service Account OIDC token (via Workload Identity).
 2. **Verification.** Minty checks the request against local rules ([`configmap.yaml`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github)). It extracts the `email` claim from the OIDC token and verifies against `assertion.email`.
 3. **KMS signing.** Minty asks GCP KMS to sign a JWT with the GitHub App's private key. The raw key material never touches Minty.
 4. **Token exchange.** Minty exchanges the signed JWT with GitHub for a 1-hour installation access token.
-5. **Delivery.** Minty returns the token to the agent, which uses it for `git push` and PR-open operations.
+5. **Delivery.** Minty returns the token to the caller, which uses it for `git push` and PR-open operations.
 
 ## Setup checklist
 
@@ -76,5 +76,5 @@ A 200 response with a `token` field means the pipeline works end-to-end.
 
 ## Where to go next
 
-- [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — the `submit-suggestion` skill that uses Minty.
+- [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — what the change path actually is, and where Minty fits around it.
 - [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) — full Minty install detail.

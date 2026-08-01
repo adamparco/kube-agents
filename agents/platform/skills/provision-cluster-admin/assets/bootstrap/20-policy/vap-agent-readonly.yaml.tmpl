@@ -1,0 +1,146 @@
+# Bootstrap wave 20 — the agent-read-only ValidatingAdmissionPolicy (VAP). Rendered for @@CLUSTER@@.
+#
+# MATERIALIZED COPY of the canonical policy/vap-agent-readonly.yaml (the exemplar + VAP test fixture).
+# It is copied per cluster — not referenced up-tree — because the pipeline applies bootstrap waves with
+# `kubectl apply -f`/`-k` scoped to the wave dir, and kustomize disallows out-of-tree paths. Keep this
+# in sync with the canonical file whenever the read-only shape changes.
+#
+# This template is the one copy a HUMAN never edits into existence: the platform agent renders it when
+# it proposes a new cluster admin. Everything below the header is byte-identical to the canonical file
+# and `dev/tests/actor-grant-single-sourced.py` asserts that (V-BRK-013, L0) — so a cluster the fleet
+# grows tomorrow gets the same actor allow-list as the one it grew today, rather than whatever this
+# file happened to say when it was last touched.
+#
+# WHY THIS IS A BOOTSTRAP WAVE: the VAP must be ENFORCING before the `agents/` apply lands any agent
+# identity, so a Role/ClusterRole granting an agent SA a write verb or a wrong-scope binding is rejected
+# at apply time even if it was merged past review (03 §4, §11). Requires K8s >= 1.30 (VAP GA).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-agent-readonly
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["roles", "clusterroles"]
+  matchConditions:
+    # Only govern agent RBAC — objects carrying a label the overlay stamps. `kube-agents/role` is
+    # here as well as `kube-agents/tier` because 06 §2.2.1's grant is explicitly "identical across
+    # tiers and not scoped", so it ships as ONE shared ClusterRole carrying no tier at all. Matching
+    # on tier alone would leave that object — the only cluster-scoped actor grant in the system —
+    # ungoverned by the policy whose entire job is to bound actor RBAC.
+    - name: is-agent-rbac
+      expression: >-
+        has(object.metadata.labels) &&
+        ('kube-agents/tier' in object.metadata.labels ||
+         'kube-agents/role' in object.metadata.labels)
+  variables:
+    # Extracted once so validations 1 and 3 cannot drift into disagreeing about who is an actor —
+    # the failure where an object escapes the read-only arm as an actor and the actor arm as a
+    # reader, and is governed by neither.
+    - name: isActor
+      expression: >-
+        'kube-agents/role' in object.metadata.labels &&
+        object.metadata.labels['kube-agents/role'] == 'actor'
+  validations:
+    # 1) Read-only: every rule may grant ONLY read verbs (get/list/watch). This is an ALLOW-LIST, so
+    #    write verbs (create/update/patch/delete/deletecollection/*) AND privilege-escalation verbs
+    #    (impersonate/bind/escalate, CSR approve/sign, use, …) and any future non-read verb are all
+    #    denied. Agent render overlays only ever emit get/list/watch, so this rejects nothing legit.
+    #    (`impersonate` is standalone-exploitable — an agent SA with it could act as system:masters.)
+    #    Skipped for `role: actor`, which validation 3 governs instead — and only for it.
+    - expression: >-
+        variables.isActor ||
+        !has(object.rules) ||
+        object.rules.all(r,
+          !has(r.verbs) ||
+          r.verbs.all(v, v in ['get','list','watch']))
+      message: "agent RBAC may grant only read verbs (get/list/watch) — no write or privilege-escalation verbs (impersonate/bind/escalate/…); agents are read-only (03 §4)"
+      reason: Forbidden
+    # 2) Wrong-scope: the namespace tier (developer-team) must not get a cluster-scoped ClusterRole.
+    #    The `in` guard is required now that the match condition admits objects carrying `role` and
+    #    no `tier`: indexing an absent key is a CEL evaluation ERROR, and under failurePolicy: Fail
+    #    an error denies — which would reject the shared broker-operations ClusterRole for a reason
+    #    that has nothing to do with scope, and report it as a developer-team violation.
+    - expression: >-
+        !(object.kind == 'ClusterRole' &&
+          'kube-agents/tier' in object.metadata.labels &&
+          object.metadata.labels['kube-agents/tier'] == 'developer-team')
+      message: "developer-team is a namespace-scoped tier and may not be granted a ClusterRole (wrong-scope, 03 §4)"
+      reason: Forbidden
+    # 3) The actor allow-list. Read verbs pass; every WRITE verb must be one of 06 §2.2.1's
+    #    broker-operations grant, compiled in as literal (apiGroup, resource, verb) triples.
+    #
+    #    THE LEADING READ DISJUNCT IS THE PHASE-9 RENDER'S PRICE, AND ITS BOUND IS ELSEWHERE. 06
+    #    §2.2 gives each tier a read profile far wider than this grant — 68 to 89 triples against
+    #    its 20 — and appends the grant "verbatim" to it, so the union is what the spec asks a
+    #    cluster to accept. Until P9-T9b-5b-0-ii-b nothing on any install path rendered that read
+    #    half and the disjunct would have widened nothing; three `actor-grant-<tier>` templates now
+    #    do, and without it admission rejects the very objects 06 §2.2 specifies. The reads are
+    #    bounded, just not here: `dev/tests/actor-grant-single-sourced.py` (V-BRK-013, L0) holds the
+    #    UNION of each tier's rendered actor objects to exactly that tier's profile, and 06 §2.2's
+    #    template is the ceiling that profile is filtered out of. P10-T1's `vap-agent-scope` is what
+    #    moves that bound into the cluster.
+    #
+    #    So this validation is the WRITE gate it was always described as, and the write half of 06
+    #    §2.2 stays dark because a tier's write triples are admitted by neither disjunct. `update`
+    #    and `delete` on `actionrecords` are ABSENT: the broker appends to the journal and advances
+    #    `status`, and can never rewrite or remove a record, including its own (06 §2.2.1, §3.3
+    #    rule 4). Every tenant WRITE is absent, so an actor Role that grew a `create deployments`
+    #    rule is denied here even if a human approved the PR. A wildcard VERB is absent too — `*`
+    #    is not a read verb and no triple below ends in `:*` — but a wildcard GROUP or RESOURCE
+    #    carrying only read verbs now passes, which 06 §2.2's platform template requires and which
+    #    is the one thing the disjunct genuinely gave up.
+    #
+    #    THE SOURCE OF TRUTH IS 06 §2.2.1, NOT THIS LIST. `dev/tests/actor-grant-single-sourced.py`
+    #    parses the fenced YAML block in that section and fails if these twenty triples are not
+    #    exactly its expansion, in either direction. Edit the spec; the check will tell you to edit
+    #    this. (V-BRK-013, L0.)
+    - expression: >-
+        !variables.isActor ||
+        !has(object.rules) ||
+        object.rules.all(r,
+          !has(r.nonResourceURLs) &&
+          has(r.apiGroups) && size(r.apiGroups) > 0 &&
+          has(r.resources) && size(r.resources) > 0 &&
+          has(r.verbs) && size(r.verbs) > 0 &&
+          r.apiGroups.all(g,
+            r.resources.all(res,
+              r.verbs.all(v,
+                v in ['get', 'list', 'watch'] ||
+                (g + '/' + res + ':' + v) in [
+                  'authentication.k8s.io/tokenreviews:create',
+                  'kubeagents.x-k8s.io/actionrecords:get',
+                  'kubeagents.x-k8s.io/actionrecords:list',
+                  'kubeagents.x-k8s.io/actionrecords:watch',
+                  'kubeagents.x-k8s.io/actionrecords:create',
+                  'kubeagents.x-k8s.io/actionrecords/status:get',
+                  'kubeagents.x-k8s.io/actionrecords/status:update',
+                  'kubeagents.x-k8s.io/actionrecords/status:patch',
+                  'kubeagents.x-k8s.io/fleetfreezes:get',
+                  'kubeagents.x-k8s.io/fleetfreezes:list',
+                  'kubeagents.x-k8s.io/fleetfreezes:watch',
+                  'kubeagents.x-k8s.io/agents:get',
+                  'kubeagents.x-k8s.io/agents:list',
+                  'kubeagents.x-k8s.io/agents:watch',
+                  'kubeagents.x-k8s.io/changepolicies:get',
+                  'kubeagents.x-k8s.io/changepolicies:list',
+                  'kubeagents.x-k8s.io/changepolicies:watch',
+                  'kubeagents.x-k8s.io/approvalrosters:get',
+                  'kubeagents.x-k8s.io/approvalrosters:list',
+                  'kubeagents.x-k8s.io/approvalrosters:watch'
+                ]))))
+      message: "actor RBAC may grant read verbs (get/list/watch) freely, bounded by its tier's 06 §2.2 template rather than by admission, plus only the write verbs of the 06 §2.2.1 broker-operations grant (tokenreviews:create; actionrecords:create; actionrecords/status update/patch) — no update/delete on actionrecords, no tenant writes, no wildcard verbs, no nonResourceURLs (03 §4.2, 06 §2.2, §2.2.1)"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-agent-readonly
+spec:
+  policyName: kube-agents-agent-readonly
+  validationActions: ["Deny"]
+  # No paramRef / matchResources selector: applies to every namespace and the cluster scope.

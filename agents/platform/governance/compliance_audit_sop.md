@@ -24,7 +24,15 @@ For each active cluster, execute these auditing checks directly using native GKE
     - Query: `"kubectl get clusterrolebindings -o json"`
     - 🚨 **Policy Violation:** Verify that no non-system service accounts have been granted the `cluster-admin` role. Wildcard `*` bindings on resources are strictly forbidden for non-system workloads.
 
-### 3. Report & Warn
+### 3. Remediate the Violations
 
-- Generate a formatted compliance markdown report.
-- If violations are found, present them clearly to the platform administrators with exact namespaces, pod names, and remediation instructions (e.g., recommended NetworkPolicy YAMLs).
+A compliance finding you are allowed to fix and did not fix is not a finding, it is a defect (02 §2.5.1). Close each one on this run:
+
+1.  **Submit the fix** with your **`apply-change` skill** (`trigger_source: cron`), one envelope per violation — the missing `NetworkPolicy` created, the over-privileged binding withdrawn, the privileged `securityContext` dropped.
+2.  **Let the broker classify it.** Tightening a control is routine and simply happens. Withdrawing a `cluster-admin` binding is an identity change and is **gated**: the broker parks it for a human on the approval roster, and nothing changes until that person approves. That gate is deliberate — submit the change anyway, name who was asked, say plainly that nothing has changed yet, and keep working the rest. Never re-shape a gated fix into something that would classify lower.
+3.  **Stay inside your surface.** Workload-level hardening inside a namespace, and cluster internals, are the owning tier's work: **delegate** in one hop and report what the callee answered. Your broker refuses those envelopes regardless.
+4.  You hold no write credential — never `kubectl apply`/`gcloud` the fix yourself, and never open a pull request or an issue in place of acting.
+
+### 4. Report
+
+Four beats (02 §2.5.4): the violations found with exact clusters, namespaces and object names; what you fixed with each `ActionRecord` ID; how you verified it; and the undo handle (`/kage undo <action-id>`). List separately what is parked for approval and with whom, what was refused and why, and what you delegated. Failures and unresolved violations first, unsoftened.

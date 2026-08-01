@@ -4,7 +4,7 @@
 # (06 §2; 03 §4/§11; Phase 2 acceptance b/d/e). The paired expected/agent.yaml asserts the operator:
 #   - resolves the cluster-admin image BY TIER (spec.deployment.image is intentionally OMITTED here, so
 #     the render must fall back to defaultImageForTier(cluster-admin) = cluster-admin-agent:v0.1.0);
-#   - injects AGENT_TIER=cluster-admin (so submit-suggestion branches under cluster-admin-agent/);
+#   - injects AGENT_TIER=cluster-admin, the pod's own statement of its persona / containment level;
 #   - binds the pre-created read-only ServiceAccount cluster-admin-agent (controller references, never mints);
 #   - renders the CLOSED chat allowlist to GOOGLE_CHAT_ALLOWED_USERS and NEVER emits
 #     GOOGLE_CHAT_ALLOW_ALL_USERS, which P8-T1 deleted outright (V-CTR-014).

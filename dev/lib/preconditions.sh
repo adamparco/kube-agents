@@ -580,6 +580,152 @@ p3_pod_of_deploy() {
   return 1
 }
 
+# --- P12 -------------------------------------------------------------------------------------------
+#
+# One L2 suite per cluster at a time.
+#
+# [[LSN-066]]. A suite that DERIVES its subject set from cluster state — reader-scope-l2 enumerating
+# every RoleBinding in a namespace, actor-grant-sweep-l2 enumerating every Agent — measures whatever
+# another suite has just staged as if it were the installed world, and reports a red that points at
+# the wrong artifact. P10's own probe is an instance of the staging: it creates and deletes a
+# `p10-health-*` namespace, which a concurrent namespace-enumerating suite sees.
+#
+# WHY THIS LIVES INSIDE P10 RATHER THAN AT 30 CALL SITES. The lock has to be taken by every suite
+# that reads the cluster, not declared once by the chain runner on everyone else's behalf: each
+# suite is independently runnable and the chain is not the only thing that runs them (binding.md
+# §P10 makes exactly this argument for P10, and `invariants-gate.py`'s L2_SCOPE_FLOOR exists to
+# reject the other shape). The one function all of those scripts already call — on the live path and
+# nowhere else — is p10_assert_control_plane_healthy. It sits after each suite's
+# `--negative-control` dispatch and after its anchored `gke-scratch-*` refusal, and
+# check_l2_scripts_assert_cluster_health already forces every cluster-reading script in the L2
+# closure to call it. Wiring the lock there is one definition site that inherits an existing,
+# ENFORCED roster; wiring it at 30 call sites is 30 chances to forget and a 31st suite that never
+# gets it at all.
+#
+# THE OFFLINE PATHS ARE NOT TOUCHED, and that is the load-bearing property: a suite that blocked for
+# 30 minutes on a lock during an L0 chain run would be a worse outage than the one this prevents.
+# Every suite dispatches and exits its `--negative-control` BEFORE it sources this file — verified,
+# not assumed — so no offline mode can reach this function at all.
+#
+# THE CONTEXT COMES FROM $K, NOT FROM P10's LABEL. The lock serializes access to one CLUSTER, and
+# the only authoritative statement of which cluster a suite is about to touch is the `--context` in
+# the kubectl invocation it is about to run. The label argument happens to be the context at every
+# current call site, but it is a human string; keying on it would let a drifted label lock a cluster
+# nobody is touching while the touched one stays open ([[LSN-018]]).
+#
+# rc 0 = this process may proceed: it holds the lock, or an ancestor process does.
+# rc 2 = could not run: no context could be derived, the library is missing, or a SECOND, different
+#        context was asked for in one process. Never rc 1 — as with P10, an inability to run the
+#        experiment is not a failed property.
+#
+# A lock TIMEOUT does not return here at all: l2_lock_guard exits the calling shell with 1, by its
+# own design ("a suite that could not take the lock must not go on to score the cluster").
+p12_assert_exclusive_l2() {
+  local K="${1:-}" ctx="" dir="" _key="" _lib=""
+
+  # 1. Which cluster is this about to touch? Read it out of the invocation itself.
+  case " $K " in
+    *" --context "*)
+      ctx="${K##* --context }"
+      ctx="${ctx%% *}"
+      ;;
+    *" --context="*)
+      ctx="${K##* --context=}"
+      ctx="${ctx%% *}"
+      ;;
+  esac
+  if [ -z "$ctx" ]; then
+    echo "P12-CANNOT-RUN: no --context in the kubectl invocation '$K', so there is no named cluster" >&2
+    echo "  to lock. A lock keyed on the ambient context serializes suites that share no cluster and" >&2
+    echo "  lets through the two that do ([[LSN-018]]) — refusing is the only answer that is not a" >&2
+    echo "  lock-shaped no-op." >&2
+    return 2
+  fi
+
+  # 2. Held already, by this process tree? Two ways in, so two tests.
+  #
+  #    (a) An ancestor holds it. The L2 scripts run each other as CHILD PROCESSES — verify-phase9
+  #        runs verify-phase8, phase 7 reaches phases 2-6 — and the lock is not re-entrant across
+  #        processes, so an unmemoized child would queue behind its own parent for the full
+  #        KAGE_L2_LOCK_TIMEOUT and then fail the chain. Exported so children inherit it, keyed by
+  #        CONTEXT (not by the $K string P10 memoizes on) because that is what the lock is keyed by.
+  #        A positive only: a process that does not hold it must never inherit a claim that it does.
+  _key="P12_L2_LOCK_$(printf '%s' "$ctx" | tr -c 'A-Za-z0-9' '_')"
+  if [ "${!_key:-}" = "1" ]; then
+    echo "P12 ok: $ctx — exclusive access already held by this run (memoized)"
+    return 0
+  fi
+
+  # BEST EFFORT, AND SAID SO. Taking the lock from inside a subshell installs the release trap on
+  # the SUBSHELL, which then releases at the end of the pipeline and leaves the suite running
+  # unlocked — a lock that is silently not a lock ([[LSN-019]]). BASHPID detects that for free, but
+  # it does not exist before bash 4.0 and the developer hosts here run bash 3.2, so this catches the
+  # mistake on Linux and cannot catch it on macOS. No current caller pipes P10; this exists so that
+  # the first one to try finds out.
+  if [ -n "${BASHPID:-}" ] && [ "$BASHPID" != "$$" ]; then
+    echo "P12-CANNOT-RUN: reached from a subshell (BASHPID $BASHPID != \$\$ $$). The lock's release" >&2
+    echo "  is an EXIT trap, and an EXIT trap installed in a subshell fires when the SUBSHELL ends —" >&2
+    echo "  the suite would then score the cluster holding nothing. Call P10 directly, not through a" >&2
+    echo "  pipe or a command substitution, or take l2_lock_guard yourself in the main shell." >&2
+    return 2
+  fi
+
+  # Loaded HERE and not at the top of this file. l2-lock.sh defines nc_ok/nc_bad/nc_total/
+  # run_negative_control at its top level, and brake-l2.sh and workload-pair-l2.sh define their own
+  # nc_* helpers — sourcing the library when preconditions.sh is sourced would let it replace a
+  # suite's offline control with the lock's. On the live path that collision is unreachable (every
+  # negative control has already run and exited), and `command -v` keeps a suite that took the guard
+  # itself from having its held state reset by a second source.
+  if ! command -v l2_lock_guard >/dev/null 2>&1; then
+    _lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/l2-lock.sh"
+    if [ ! -r "$_lib" ]; then
+      echo "P12-CANNOT-RUN: $_lib is not readable, so the one-suite-per-cluster lock cannot be taken." >&2
+      echo "  Proceeding without it would let a second suite stage fixtures underneath this one's" >&2
+      echo "  derived subject set ([[LSN-066]]), which is a red pointing at the wrong artifact." >&2
+      return 2
+    fi
+    # shellcheck source=dev/lib/l2-lock.sh
+    . "$_lib"
+  fi
+
+  #    (b) THIS process holds it, because the suite took l2_lock_guard itself before calling P10 —
+  #        which is the ordering l2-lock.sh's own header recommends. Asked of the lock rather than
+  #        of a variable, so it is also true for a suite that acquired in some way this function has
+  #        never heard of. Without this test the second acquisition finds a lock whose owner pid is
+  #        alive (it is us), declines to break it as stale, and waits half an hour for itself.
+  dir="$(l2_lock_path "$ctx")"
+  if [ -d "$dir" ] && [ "$(_l2_lock_owner_pid "$dir")" = "$$" ]; then
+    export "$_key=1"
+    echo "P12 ok: $ctx — this process already holds the lock (taken by the suite before P10)"
+    return 0
+  fi
+
+  # 3. A second, DIFFERENT context in one process is refused rather than served. l2-lock.sh tracks
+  #    exactly one held lock per process (_L2_LOCK_HELD_DIR is a scalar), so a second acquire would
+  #    orphan the first — and an orphan whose owner pid is still alive is never stale-broken, so it
+  #    wedges every other suite for the full timeout. The EXIT chain breaks too: the second guard
+  #    captures _l2_lock_exit_handler as its "prior" trap and calls it from itself.
+  if [ -n "${_L2_LOCK_HELD_DIR:-}" ] && [ "$_L2_LOCK_HELD_DIR" != "$dir" ]; then
+    echo "P12-CANNOT-RUN: this process already holds the L2 lock for a DIFFERENT cluster" >&2
+    echo "  ($_L2_LOCK_HELD_DIR) and cannot hold two. Acquiring the second would orphan the first" >&2
+    echo "  until this process dies, and chain the lock's own EXIT handler onto itself. Run the two" >&2
+    echo "  contexts as two processes." >&2
+    return 2
+  fi
+
+  # 4. Take it. l2_lock_guard exits the shell on timeout, so a return from here means held.
+  #
+  #    IT IS NOT ENOUGH ON ITS OWN: a caller that installs its own EXIT trap after this point
+  #    replaces the release. Seventeen suites in dev/verify/ do exactly that, and each of them now
+  #    chains `l2_lock_release` into its own trap. Left unchained the lock survives to be broken as
+  #    stale by the next acquirer, which is a delay rather than a correctness hole — but "BROKE A
+  #    STALE LOCK" printed on every line of the chain is a warning that means nothing (V-MET-014),
+  #    and a reused pid turns it into a half-hour hang and a false red.
+  l2_lock_guard "$ctx"
+  export "$_key=1"
+  return 0
+}
+
 # --- P10 -------------------------------------------------------------------------------------------
 #
 # The cluster can still DO the things an L2 claim needs done, before any L2 claim is believed.
@@ -609,7 +755,17 @@ p3_pod_of_deploy() {
 # a caller that maps this to FAIL reintroduces the exact confusion it exists to remove).
 p10_assert_control_plane_healthy() {
   local K="$1" label="${2:-cluster}" ns="" i sa=""
-  # 0. Memoize per target, for the life of the process tree.
+  # 0a. P12 FIRST, and before the memo below.
+  #
+  # The lock has to be held for everything this function does, not merely for what the suite does
+  # after it: step 2 creates and deletes a namespace on the cluster, which is precisely the kind of
+  # transient state a concurrent suite deriving its subject set would count. It also has to be
+  # re-checked on the memoized path, because P10's memo is keyed on the $K STRING and P12's is keyed
+  # on the CONTEXT — two different keys, and only the second one is what the lock is about.
+  #
+  # Its could-not-run is P10's could-not-run: rc 2, never 1.
+  p12_assert_exclusive_l2 "$K" || return 2
+  # 0b. Memoize per target, for the life of the process tree.
   #
   # The L2 scripts invoke each other: verify-phase7 reaches phases 2-6, and phase 5 reaches 2-4 and
   # chaos-suite, all as CHILD PROCESSES. Unmemoized, one chain would create and delete a probe
@@ -735,4 +891,122 @@ EOT
   echo "P10 ok: $label — API server ready, controller-manager converging, scheduler Ready, no recent restarts${sched_note}"
   export "$_key=1"
   return 0
+}
+
+# --- P11 -------------------------------------------------------------------------------------------
+#
+# The namespace models an INSTALLED agent, not merely an empty namespace with an Agent CR in it.
+#
+# Written on 2026-08-01, after `startup-ordering-l2.sh` (V-RUN-005) spent a session reporting a
+# product defect that did not exist ([[LSN-068]]). The operator's `<agent>-to-broker` policy
+# (`buildAgentToBrokerPolicy` in `pair_netpol.go`) is **Egress-only** and renders exactly one rule —
+# TCP 8443 to the actor pod. In Kubernetes a pod selected by ANY egress policy becomes default-deny
+# for EVERY other egress, DNS included. The operator is right to render only the hop it owns; rule 1
+# of the per-tier allowlist is what carries DNS, and that allowlist is applied by
+# `provision_13_apply_network_policies.sh`, which `dev/cluster/up.sh` does not run. So the moment the
+# controller reconciles an Agent into a namespace no install path ever touched, the pair loses name
+# resolution — with no error anywhere, because a name that does not resolve is a timeout.
+#
+# THE FALSE RED WAS THE CHEAP HALF. The expensive half is that the OTHER arm passed. Arm (a) expects
+# `wait-for-broker` to time out and the pair to converge to observe-and-report; on a namespace with
+# no DNS it gets that timeout for free, and would go on passing if `wait-for-broker` were deleted
+# outright ([[LSN-035]]: a vacuous pass is a failure here). One missing rule produced one red arm and
+# one arm passing for a reason unrelated to its property.
+#
+# AND IT WAS ALREADY WRITTEN DOWN. `dev/lib/broker-driver.sh`'s header, committed phases earlier,
+# states the whole mechanism in a paragraph. A suite written after that paragraph paid the full cost
+# anyway, because a paragraph in one file is not reachable from another ([[LSN-019]]). This function
+# is that paragraph made callable.
+#
+# rc 0 = a policy in this namespace admits DNS to the tier's pods
+# rc 2 = it does not (COULD-NOT-RUN, never rc 1) — an unseeded namespace is not a failed security
+#        property, and a caller that maps this to FAIL re-creates the exact confusion above: it would
+#        report "the broker never became reachable" about a cluster that was never asked.
+#
+# Seeding is deliberately NOT done here. `dev/lib/shipped-render.sh` renders the tier allowlist
+# through the SHIPPED `render_egress_policy` ([[LSN-024]]); a precondition that quietly repaired the
+# environment would make the difference between "installed" and "not installed" invisible to the
+# transcript, which is the difference this whole lesson is about.
+p11_assert_namespace_admits_dns() {
+  local K="$1" ns="${2:-}" tier="${3:-}"
+  local line rest tab name sel rules types examined=0 admitting=""
+  tab="$(printf '\t')"
+
+  if [ -z "$ns" ] || [ -z "$tier" ]; then
+    echo "P11-CANNOT-RUN: p11_assert_namespace_admits_dns needs <kubectl> <namespace> <tier>." >&2
+    echo "  The TIER is required, not optional. Without it this can only ask 'does some policy here" >&2
+    echo "  admit DNS to somebody', and a DNS rule that does not select the agent's pods is exactly" >&2
+    echo "  as useless as no DNS rule at all — while reading, from the outside, like a green." >&2
+    return 2
+  fi
+
+  # One line per policy: name, podSelector.matchLabels as JSON, one [ports] group per egress rule,
+  # and policyTypes. An empty selector renders empty and means "every pod in the namespace"; an
+  # egress rule with no `ports` renders `[]` and admits every port, DNS included.
+  #
+  # SPLIT ON TAB BY HAND. `IFS="$(printf '\t')" read -r name sel rules types` cannot do this job:
+  # TAB is an IFS *whitespace* character, so a run of tabs collapses into one separator and every
+  # field after an empty one shifts left. The live install really does emit
+  # `default-deny-all\t\t\t["Ingress","Egress"]` — empty podSelector, no egress rules — and the
+  # collapsing read binds `sel` to the policyTypes, `rules` and `types` to nothing. The
+  # "an empty podSelector selects every pod in the namespace" branch below is then UNREACHABLE
+  # against real output, which is a false could-not-run (never a false ok — `admits` also goes to
+  # no) but it is a precondition reporting the wrong reason, on the one policy shape most likely to
+  # be the answer.
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line%%${tab}*}"
+    rest="${line#*${tab}}"
+    sel="${rest%%${tab}*}"
+    rest="${rest#*${tab}}"
+    rules="${rest%%${tab}*}"
+    types="${rest#*${tab}}"
+    [ -n "$name" ] || continue
+    examined=$((examined + 1))
+
+    local verdict="" selects=no admits=no
+    if [ -z "$sel" ]; then
+      selects=yes
+    elif printf '%s' "$sel" | grep -q "\"kube-agents/tier\":\"$tier\""; then
+      selects=yes
+    fi
+    # `Egress` must be in policyTypes: an explicitly Ingress-only policy carrying an `egress:` block
+    # admits nothing, and the block reads like it does.
+    if printf '%s' "$types" | grep -q '"Egress"'; then
+      case "$rules" in
+      *'[]'*) admits=yes ;;
+      *'53/UDP'*) admits=yes ;;
+      esac
+    fi
+
+    if [ "$selects" = yes ] && [ "$admits" = yes ]; then
+      verdict="ADMITS DNS to tier=$tier"
+      admitting="$admitting $name"
+    elif [ "$selects" = yes ]; then
+      verdict="selects tier=$tier but admits no port 53"
+    elif [ "$admits" = yes ]; then
+      verdict="admits DNS but not to tier=$tier (selector $sel)"
+    else
+      verdict="neither selects tier=$tier nor admits DNS"
+    fi
+    echo "  P11: $ns/$name — $verdict"
+  done <<EOT
+$($K -n "$ns" get networkpolicies \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.podSelector.matchLabels}{"\t"}{range .spec.egress[*]}[{range .ports[*]}{.port}/{.protocol}{","}{end}]{end}{"\t"}{.spec.policyTypes}{"\n"}{end}' 2>/dev/null)
+EOT
+
+  if [ -n "$admitting" ]; then
+    echo "P11 ok: $ns models an installed agent —${admitting} admits DNS to tier=$tier ($examined policies examined)"
+    return 0
+  fi
+
+  echo "P11-CANNOT-RUN: namespace '$ns' does not model an installed agent ($examined NetworkPolicies" >&2
+  echo "  examined, none admitting port 53 to tier=$tier)." >&2
+  echo "  The operator is about to render <agent>-to-broker, an EGRESS-ONLY policy selecting the" >&2
+  echo "  reader half with exactly one rule. A pod selected by any egress policy is default-deny for" >&2
+  echo "  every other egress, so the pair will silently lose DNS and the transcript will read as a" >&2
+  echo "  broker that never came up. Rule 1 of the per-tier allowlist carries DNS and is applied by" >&2
+  echo "  provision_13_apply_network_policies.sh, which dev/cluster/up.sh does not run ([[LSN-068]])." >&2
+  echo "  Seed it through dev/lib/shipped-render.sh before creating the Agent CR." >&2
+  return 2
 }

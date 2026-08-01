@@ -89,6 +89,18 @@ DOC_ALLOWLIST = (
     # directory will later hold per-run manifests written by whatever produced
     # them, and a prefix here would exempt those sight-unseen.
     "verification/results.csv",
+    # The requirement enumeration (V-MET-009). It is a generated, verbatim mirror of the
+    # normative statements in docs/design/01-08, and 07 §2's acceptance text names the retired
+    # hatch while describing its deletion — the same bytes, already exempt one line above under
+    # `docs/design/`. The exemption follows the content, exactly as it did for results.csv.
+    # An exact file for the same reason given there: `verification/` will hold per-run manifests
+    # written by whatever produced them, and a prefix would exempt those sight-unseen.
+    #
+    # Note this is narrower than it looks. The file's `text:` values are asserted equal to the
+    # spec's own sentences on every L0 run, so the only way to smuggle an emission through this
+    # exemption is to first put it in docs/design/ — where it is already exempt, and where it
+    # would be read.
+    "verification/requirements.yaml",
     "dev/tests/closed-allowlist.py",
 )
 

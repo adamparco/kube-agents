@@ -183,25 +183,28 @@ enforcement role is absorbed by the broker). C7/C8/C13 (customer CI/CD, IaC arti
 are **optional**: the harness asserts the system is fully functional with them absent, which is the
 check that proves they left the critical path.
 
-- **V-CMP-001** — every component ID in 05 §1 has all three probes recorded in the run manifest;
-  a component with `Exists: pass, Wired: fail` reports **fail**, not partial. `L2`
-- **V-CMP-002** — no first-party image referenced by any deployed manifest lacks a published build.
-  This is the check the router failed for two phases. `L0`
-- **V-CMP-003** — no shipped manifest applied by an install path contains a `REPLACE_WITH_*` or
-  `PLACEHOLDER` token. `L0`
-- **V-CMP-004** — every Deployment the design requires has `replicas > 0` in the default install; a
-  component parked at zero is reported as **not wired**. `L2`
-- **V-CMP-005** — the optional components are genuinely optional: a full install with C7/C8/C13
-  absent passes V-CTN, V-BRK, V-REV, V-GAT, V-PRO. `L2`
-- **V-CMP-006** — every MCP server whose script reads a credential from the environment declares
+Levels and due phases for the checks below are **not** repeated here — they live in their §6.15
+catalog rows, which are the single definition site for both.
+
+- `V-CMP-001` — every component ID in 05 §1 has all three probes recorded in the run manifest;
+  a component with `Exists: pass, Wired: fail` reports **fail**, not partial.
+- `V-CMP-002` — no first-party image referenced by any deployed manifest lacks a published build.
+  This is the check the router failed for two phases.
+- `V-CMP-003` — no shipped manifest applied by an install path contains a `REPLACE_WITH_*` or
+  `PLACEHOLDER` token.
+- `V-CMP-004` — every Deployment the design requires has `replicas > 0` in the default install; a
+  component parked at zero is reported as **not wired**.
+- `V-CMP-005` — the optional components are genuinely optional: a full install with C7/C8/C13
+  absent passes V-CTN, V-BRK, V-REV, V-GAT, V-PRO.
+- `V-CMP-006` — every MCP server whose script reads a credential from the environment declares
   that variable in its **own** `env:` block, asserted against the **runtime-authoritative** rendered
   ConfigMap and not the image-baked `config.yaml` (§11.3). A container that holds the secret is not
   the process that needs it: Hermes passes an MCP server only what its config declares, so a server
   with no `env:` block reads an empty value and fails closed at the first call. Reports **fail**,
   never partial — the symptom surfaces as a runtime refusal in a component whose pod is Ready and
   whose unit tests are green. Negative control: strip `API_SERVER_KEY` from a fixture's
-  `platform_control` block and confirm the check goes red. `L0`, `L2`
-- **V-CMP-007** — every identity the broker resolves by name is **created by something the install
+  `platform_control` block and confirm the check goes red.
+- `V-CMP-007` — every identity the broker resolves by name is **created by something the install
   path runs**. V-CMP-001 walks the script graph and stops there; this walks the three links beyond
   it — a template must be rendered by a step that is itself reachable, a ServiceAccount named as an
   RBAC subject or a `roleRef` must be one the install path creates, and every agent tier present in
@@ -214,8 +217,8 @@ check that proves they left the critical path.
   an identity missing them is not denied but **invisible** to the rules written to bound it. Reports
   **fail**, never partial — the symptom is a policy that matches nothing, which reports the same
   green as a policy that passes. Negative control: stop applying one tier's identity and confirm the
-  check goes red while the other two tiers still install. `L0`
-- **V-CMP-008** — the install overlay **renders**, and what it renders is **the install**. Two
+  check goes red while the other two tiers still install.
+- `V-CMP-008` — the install overlay **renders**, and what it renders is **the install**. Two
   properties, separately provable. That it renders is `make render`, a prerequisite of
   `make build` and `make test`; a `kustomize build` of the full overlay must succeed, and the
   absence of that build is how `make deploy` — and therefore
@@ -226,13 +229,13 @@ check that proves they left the critical path.
   `internal/controller/mesh_trust.go` names a `ClusterIssuer` that exists, the CA `Certificate`
   stays in `cert-manager` (the only namespace a ClusterIssuer resolves `ca.secretName` from), and
   that Secret is one a `Certificate` in-tree creates. Every path that pulls the overlay — the two
-  cluster-facing Makefile targets, GitOps bootstrap wave 10, and the `propose-cluster-admin`
+  cluster-facing Makefile targets, GitOps bootstrap wave 10, and the `provision-cluster-admin`
   template — must name `config/install` and not `config/default`, the transformed half that omits
   the CA. Reports **fail**, never partial, and an empty result set is a fail rather than a vacuous
   pass: a `namePrefix` applied to the CA does not error, does not fail to apply, and surfaces only
   as brokers that never become Ready behind agent `Certificate`s that sit `Pending` forever.
   Negative control: nine mutations, one of which reintroduces the original defect verbatim by
-  moving `../mesh-ca` back under `config/default`. `L0` ¬
+  moving `../mesh-ca` back under `config/default`. ¬
 
 ### 5.2 Contract inventory (from [06](06-api-and-data-contracts.md))
 
@@ -258,25 +261,25 @@ contract (06 §2a) and the session-state contract's mem0 backing (06 §6). Absen
 asserts no type, CRD, or code path implements them — a partially-built deferral is the failure this
 row exists to catch.
 
-- **V-CMP-010** — for each contract, a **field-level diff** between the spec's schema block and the
+- `V-CMP-010` — for each contract, a **field-level diff** between the spec's schema block and the
   generated OpenAPI/type: any field in the spec and missing from the code fails; any field in the
   code and absent from the spec is reported for review (it may be a legitimate implementation
-  detail, or an authority field that must not exist). `L0`
-- **V-CMP-011** — the CRD schema contains **none** of the prohibited authority field names
+  detail, or an authority field that must not exist).
+- `V-CMP-011` — the CRD schema contains **none** of the prohibited authority field names
   (`spec.rbac`, `spec.rules`, `spec.riskClass`, `spec.scopeOverride`, `brokerServiceAccountName`,
-  `actorServiceAccountName`) and sets no `x-kubernetes-preserve-unknown-fields` on `spec`. `L0`
+  `actorServiceAccountName`) and sets no `x-kubernetes-preserve-unknown-fields` on `spec`.
 
 ### 5.3 Behaviour inventory
 
-- **V-CMP-020** — each tier's `skills/` set matches its [02](02-agent-personas.md) §2.1 row exactly
-  — no missing skill, no skill belonging to another tier. `L0`
-- **V-CMP-021** — each tier's proactive jobs and SOPs match [04](04-workflow-model.md) §4.1 and its
-  persona's responsibilities; every SOP carries its scope guard. `L0`
-- **V-CMP-022** — every trigger class in 04 §4.1 has a deployed delivery path (not a documented
-  one). `L2`
-- **V-CMP-023** — every operational verb in 06 §2b.1 is implemented on **both** the Slack `/kage`
+- `V-CMP-020` — each tier's `skills/` set matches its [02](02-agent-personas.md) §2.1 row exactly
+  — no missing skill, no skill belonging to another tier.
+- `V-CMP-021` — each tier's proactive jobs and SOPs match [04](04-workflow-model.md) §4.1 and its
+  persona's responsibilities; every SOP carries its scope guard.
+- `V-CMP-022` — every trigger class in 04 §4.1 has a deployed delivery path (not a documented
+  one).
+- `V-CMP-023` — every operational verb in 06 §2b.1 is implemented on **both** the Slack `/kage`
   grammar and `kubectl`/API, and each pair produces an identical `ActionRecord` effect. A verb
-  present on one surface only fails. `L2`
+  present on one surface only fails.
 
 ---
 
@@ -289,30 +292,42 @@ section — this table exists so a harness can enumerate, schedule, and report o
 **Negative controls are mandatory** for every check marked `¬`. A check that only demonstrates the
 happy path is not evidence for a security or safety property.
 
+**Two suites are catalogued where their rationale is, and both are reachable from here.** V-CMP's
+rationale is §5's three inventories, so §6.15 indexes it rather than restating it. V-MET-001…009 sit
+in the §8 table, next to the traceability obligation they police, and V-MET-010/011/012 with them;
+V-MET-013 and V-MET-014 arrived with the coverage audit and sit in §6.14. Every check ID this
+document defines is defined **once**, in exactly one of those places — `dev/tests/spec-ids.py`
+(V-MET-013) fails the build on a second definition site, which is what stops an index from becoming
+a copy that drifts.
+
 ### 6.1 V-CTN — Containment (BLOCKING-ALWAYS)
 
-| ID        | Assertion                                                                                                                    | Source        | Lvl      | Phase |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------- | -------- | ----- |
-| V-CTN-001 | Reader SA reads only within tier scope; `no` in any other namespace/cluster/project ¬                                        | 03 §11        | L2, L3   | 8     |
-| V-CTN-002 | Actor SA writes succeed for templated resources **inside** scope                                                             | 03 §11        | L2       | 10    |
-| V-CTN-003 | Actor SA writes **denied** for every out-of-scope target ¬                                                                   | 03 §11        | L2, L3   | 10    |
-| V-CTN-004 | Reader SA holds **no** write verb on anything, universally ¬                                                                 | 03 §11, 08 §7 | L0, L2   | 8     |
-| V-CTN-005 | Forbidden rule 1 — RBAC/IAM naming any agent identity is rejected ¬                                                          | 03 §3.3       | L2       | 10    |
-| V-CTN-006 | Forbidden rule 2 — `escalate`/`bind`/`impersonate` rejected on any resource ¬                                                | 03 §3.3       | L2       | 10    |
-| V-CTN-007 | Forbidden rule 3 — control-plane objects (controller, broker, VAPs, CRD, own CR) not mutable ¬                               | 03 §3.3       | L2       | 10    |
-| V-CTN-008 | Forbidden rule 4 — `ActionRecord`s, log sinks, audit config, SLI policies not mutable ¬                                      | 03 §3.3       | L2       | 10    |
-| V-CTN-009 | Forbidden rule 5 — cross-scope writes rejected regardless of verb ¬                                                          | 03 §3.3       | L2       | 10    |
-| V-CTN-010 | Forbidden rule 6 — protected namespaces refused except the declared add-on allowlist ¬                                       | 03 §3.3       | L2       | 11    |
-| V-CTN-011 | **Each forbidden rule is rejected twice** — by the broker, and by admission when submitted directly with the actor's token ¬ | 03 §3.3, §4.3 | L2       | 10    |
-| V-CTN-012 | Attenuation: a `Role`/`ClusterRole` exceeding its tier template is denied by `vap-agent-scope` ¬                             | 03 §4.2       | L0, L2   | 8     |
-| V-CTN-013 | Cross-object ceiling: a child whose scope is not a strict subset of its parent's is rejected ¬                               | 03 §4.2       | L2       | 11    |
-| V-CTN-014 | Label↔SA pinning: a pod may bind an actor SA only if its tier/scope/role labels match ¬                                      | 03 §4.3       | L2       | 10    |
-| V-CTN-015 | `(tier, scope)` cardinality: a duplicate `Agent` CR is rejected ¬                                                            | 08 §7         | L2       | 8     |
-| V-CTN-016 | Developer-team placement: `metadata.namespace` must equal `spec.scope.namespace` ¬                                           | 08 §7         | L2       | 8     |
-| V-CTN-017 | The controller mints no RBAC — parse its ClusterRole, do not inspect it by eye ¬                                             | 08 §7         | L0, L2   | 8     |
-| V-CTN-018 | Cloud IAM: every actor GSA binding carries its scope condition; no owner/editor/IAM-admin role ¬                             | 06 §2.3       | L3       | 11    |
-| V-CTN-019 | Cloud negative: a tier's actor GSA cannot read/write another cluster or project ¬                                            | 03 §3.2       | L3       | 11    |
-| V-CTN-020 | Egress default-deny holds while Workload Identity still functions ¬                                                          | 03 §9         | L2\*, L3 | 8     |
+| ID        | Assertion                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Source        | Lvl      | Phase |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | -------- | ----- |
+| V-CTN-001 | Reader SA reads only within tier scope; `no` in any other namespace/cluster/project ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | 03 §11        | L2, L3   | 8     |
+| V-CTN-002 | Actor SA writes succeed for templated resources **inside** scope                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | 03 §11        | L2       | 10    |
+| V-CTN-003 | Actor SA writes **denied** for every out-of-scope target ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | 03 §11        | L2, L3   | 10    |
+| V-CTN-004 | Reader SA holds **no** write verb on anything, universally ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 03 §11, 08 §7 | L0, L2   | 8     |
+| V-CTN-005 | Forbidden rule 1 — RBAC/IAM naming any agent identity is rejected ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | 03 §3.3       | L2       | 10    |
+| V-CTN-006 | Forbidden rule 2 — `escalate`/`bind`/`impersonate` rejected on any resource ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | 03 §3.3       | L2       | 10    |
+| V-CTN-007 | Forbidden rule 3 — control-plane objects (controller, broker, VAPs, CRD, own CR) not mutable ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | 03 §3.3       | L2       | 10    |
+| V-CTN-008 | Forbidden rule 4 — `ActionRecord`s, log sinks, audit config, SLI policies not mutable ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | 03 §3.3       | L2       | 10    |
+| V-CTN-009 | Forbidden rule 5 — cross-scope writes rejected regardless of verb ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | 03 §3.3       | L2       | 10    |
+| V-CTN-010 | Forbidden rule 6 — protected namespaces refused except the declared add-on allowlist ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | 03 §3.3       | L2       | 11    |
+| V-CTN-011 | **Each forbidden rule is rejected twice** — by the broker, and by admission when submitted directly with the actor's token ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 03 §3.3, §4.3 | L2       | 10    |
+| V-CTN-012 | Attenuation: a `Role`/`ClusterRole` exceeding its tier template is denied by `vap-agent-scope` ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | 03 §4.2       | L0, L2   | 8     |
+| V-CTN-013 | Cross-object ceiling: a child whose scope is not a strict subset of its parent's is rejected ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | 03 §4.2       | L2       | 11    |
+| V-CTN-014 | Label↔SA pinning: a pod may bind an actor SA only if its tier/scope/role labels match ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | 03 §4.3       | L2       | 10    |
+| V-CTN-015 | `(tier, scope)` cardinality: a duplicate `Agent` CR is rejected ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 08 §7         | L2       | 8     |
+| V-CTN-016 | Developer-team placement: `metadata.namespace` must equal `spec.scope.namespace` ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | 08 §7         | L2       | 8     |
+| V-CTN-017 | The controller mints no RBAC — parse its ClusterRole, do not inspect it by eye ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | 08 §7         | L0, L2   | 8     |
+| V-CTN-018 | Cloud IAM: every actor GSA binding carries its scope condition; no owner/editor/IAM-admin role ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | 06 §2.3       | L3       | 11    |
+| V-CTN-019 | Cloud negative: a tier's actor GSA cannot read/write another cluster or project ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 03 §3.2       | L3       | 11    |
+| V-CTN-020 | Egress default-deny holds while Workload Identity still functions ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | 03 §9         | L2\*, L3 | 8     |
+| V-CTN-038 | **Authority never precedes machinery.** No agent-identity `Role`/`ClusterRole` anywhere in the tree — `.yaml.template` included, because a verb that appears only after envsubst is still granted — carries a verb outside `get`/`list`/`watch` while the broker, risk classifier, `ActionRecord` journal or undo path is missing or has no test beside it; `*` is a write verb; the finding names the file, the verb and **every** absent item. Ordering, not prohibition: the same verb passes once all four exist, so Phase 10 satisfies this row rather than deleting it. An empty agent-RBAC corpus is `VACUOUS`, not green ¬                                                                                                                                                                                                                                                                                                                                                            | 07 §5         | L0       | 9     |
+| V-CTN-039 | **The developer-team tier has no cloud actor identity.** 06 §2.3's Cloud IAM table gives the developer-team actor **none in v1**, and nothing in the tree may quietly supply one: no ServiceAccount labelled `kube-agents/role: actor` carries an `iam.gke.io/gcp-service-account` annotation, no GSA identifier anywhere classifies as (developer-team, actor), and the tier's cloud roles stay inside a read-only allow-list. This mechanizes a deliberate omission that has so far been held by a comment in `agent-identity.yaml.template` — binding a cloud-write credential to the actor now would hand it months of authority ahead of the controls meant to bound it. The tier's **Kubernetes** actor grant must still exist, so "no cloud actor" stays distinguishable from "no actor at all": every other row in this suite asserts what a principal cannot do, and this one asserts that a principal does not exist, which is the shape that gets greener when you delete things ¬ | 06 §2.3       | L0       | 9     |
+| V-CTN-040 | **No write to an `Agent` CR whose identity is an ancestor of the writer's.** Walking `parentRef` to the root is an unbounded cross-object traversal, so 03 §4.3 assigns it to the controller's validating webhook rather than to `vap-agent-scope` — in-tree CEL cannot read a second object. V-CTN-007 covers the writer's own CR and V-CTN-025 the brake field on a **child's**; nothing walks upward, and upward is the direction that lets a leaf edit the CR that bounds it. The webhook is `failurePolicy: Fail`, so the check must also show the rule is not silently open when the webhook is unavailable ¬                                                                                                                                                                                                                                                                                                                                                                           | 03 §4.3       | L2       | 10    |
+| V-CTN-041 | **Actor writes stay inside the live tier template.** Deciding "inside" against a template versioned per deployment requires reading the template object, which is why 03 §4.3 places this on the controller webhook. Both existing template checks assert the **inlined-literal** form compiled into `vap-agent-scope` — 03 §4.2's whole point, and a different property: the inlined copy proves the policy matches the template it was generated from, never that either matches the template the cluster is actually running ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 03 §4.3       | L2       | 10    |
 
 \* L2 requires a dataplane on P4's known-enforcing allow-list. A cluster accepts a NetworkPolicy
 whether or not anything enforces it, so on an unrecognised dataplane the result is `deferred`, never
@@ -350,6 +365,7 @@ row from a standing liability into evidence.
 | V-REV-008 | Undo retention honours the class-based TTL; a record is not GC'd before export confirms                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | 06 §4.3   | L2, L4 | 14    |
 | V-REV-010 | A `recreate` downgrade is decided from **live cluster state**, not from the payload and not from a partial scan: an object with an inbound owner reference downgrades to `none` naming the referrer, an object with none keeps `recreate`, a reference that resolves by **name** downgrades nothing, and an index that could not enumerate every kind in the target's scope refuses rather than reporting "nothing points at it" ¬                                                                                                                                            | 06 §4.3.1 | L1, L2 | 9     |
 | V-REV-011 | A rollback **replays the pre-state or refuses**, and never replays a body that is not the pre-state: a restore whose target's live uid does not match the plan's pin refuses, a `recreate` uses a create so a name taken since the action refuses rather than merging, a body that does not address its own step's target refuses, an out-of-band body whose digest does not match the plan refuses, a Secret body holding digest placeholders refuses **naming the keys**, and the first failing step stops the replay and reports how many steps had already been applied ¬ | 06 §4.3.1 | L1, L2 | 9     |
+| V-REV-012 | The **settle windows are the published ones**: every row of 04 §5.1's window table resolves to a per-kind entry in the broker's `settleWindows` with the same duration, cell for cell; the RBAC and custom-resource rows resolve to the code's own two constants; nothing in the map is unpublished; and the ceiling constant equals the stated 30 minutes with no row above it ¬                                                                                                                                                                                             | 04 §5.1   | L0     | 9     |
 
 V-REV-009 is in the [extended catalog](#614-extended-catalog-from-the-requirement-coverage-audit),
 which is where the requirement-coverage audit allocated it. IDs are never renumbered, so the gap
@@ -373,21 +389,22 @@ CH1–CH9 as defined in [05](05-system-architecture.md) §8. `V-ISO-00n` ≡ `CH
 
 ### 6.5 V-GAT — Classification, gating, approval
 
-| ID        | Assertion                                                                                          | Source  | Lvl    | Phase |
-| --------- | -------------------------------------------------------------------------------------------------- | ------- | ------ | ----- |
-| V-GAT-001 | Classifier golden corpus passes in full (§7.1)                                                     | 03 §5.2 | L1     | 9     |
-| V-GAT-002 | The wired-in classifier is the same one the corpus tests — an L2 spot-check per class              | 03 §5   | L2     | 9     |
-| V-GAT-003 | A representative gated action per tier parks as `PendingApproval` and does not execute ¬           | 04 §9   | L2     | 10    |
-| V-GAT-004 | Forbidden actions are rejected with **no approval path offered anywhere** ¬                        | 03 §5.1 | L2     | 10    |
-| V-GAT-005 | Approval cannot be laundered: self, sibling, parent-for-child, and non-roster approvals refused ¬  | 04 §2.3 | L1, L2 | 10    |
-| V-GAT-006 | Approval is not a bypass — a stale snapshot re-gates rather than executing ¬                       | 04 §3.1 | L2     | 10    |
-| V-GAT-007 | An unapproved action expires at its TTL and never executes afterwards ¬                            | 04 §3.1 | L2     | 10    |
-| V-GAT-008 | Parked work does not block: the agent demonstrably continues other work                            | 04 §3.1 | L2     | 10    |
-| V-GAT-009 | `ChangePolicy` can tighten and **provably cannot loosen**, including the floor and forbidden set ¬ | 03 §5.3 | L1, L2 | 9     |
-| V-GAT-010 | Asymmetry: tightening a control classifies routine/elevated; loosening the same control gates ¬    | 03 §5.2 | L1     | 9     |
-| V-GAT-011 | Blast-radius cap: over per-action cap ⇒ gated; over hard cap ⇒ abort ¬                             | 04 §4.2 | L1, L2 | 10    |
-| V-GAT-012 | An object marked `kube-agents/change-policy: gated` is always gated ¬                              | 03 §5.2 | L2     | 10    |
-| V-GAT-013 | Approval is recorded by an authenticated human on the record — a model claim is not accepted ¬     | 04 §2.3 | L2     | 10    |
+| ID        | Assertion                                                                                                                                                                                                                                                                                                                                          | Source  | Lvl    | Phase |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- | ------ | ----- |
+| V-GAT-001 | Classifier golden corpus passes in full (§7.1)                                                                                                                                                                                                                                                                                                     | 03 §5.2 | L1     | 9     |
+| V-GAT-002 | The wired-in classifier is the same one the corpus tests — an L2 spot-check per class                                                                                                                                                                                                                                                              | 03 §5   | L2     | 9     |
+| V-GAT-003 | A representative gated action per tier parks as `PendingApproval` and does not execute ¬                                                                                                                                                                                                                                                           | 04 §9   | L2     | 10    |
+| V-GAT-004 | Forbidden actions are rejected with **no approval path offered anywhere** ¬                                                                                                                                                                                                                                                                        | 03 §5.1 | L2     | 10    |
+| V-GAT-005 | Approval cannot be laundered: self, sibling, parent-for-child, and non-roster approvals refused ¬                                                                                                                                                                                                                                                  | 04 §2.3 | L1, L2 | 10    |
+| V-GAT-006 | Approval is not a bypass — a stale snapshot re-gates rather than executing ¬                                                                                                                                                                                                                                                                       | 04 §3.1 | L2     | 10    |
+| V-GAT-007 | An unapproved action expires at its TTL and never executes afterwards ¬                                                                                                                                                                                                                                                                            | 04 §3.1 | L2     | 10    |
+| V-GAT-008 | Parked work does not block: the agent demonstrably continues other work                                                                                                                                                                                                                                                                            | 04 §3.1 | L2     | 10    |
+| V-GAT-009 | `ChangePolicy` can tighten and **provably cannot loosen**, including the floor and forbidden set ¬                                                                                                                                                                                                                                                 | 03 §5.3 | L1, L2 | 9     |
+| V-GAT-010 | Asymmetry: tightening a control classifies routine/elevated; loosening the same control gates ¬                                                                                                                                                                                                                                                    | 03 §5.2 | L1     | 9     |
+| V-GAT-011 | Blast-radius cap: over per-action cap ⇒ gated; over hard cap ⇒ abort ¬                                                                                                                                                                                                                                                                             | 04 §4.2 | L1, L2 | 10    |
+| V-GAT-012 | An object marked `kube-agents/change-policy: gated` is always gated ¬                                                                                                                                                                                                                                                                              | 03 §5.2 | L2     | 10    |
+| V-GAT-013 | Approval is recorded by an authenticated human on the record — a model claim is not accepted ¬                                                                                                                                                                                                                                                     | 04 §2.3 | L2     | 10    |
+| V-GAT-024 | The secret-egress digest set is exactly the specified formula — `sha256(ns‖0x1f‖v)` and `sha256(v)` over the raw, base64 and URL-encoded forms — and a digest **cannot leave the classifier**: the map is unexported, `*DigestSet`'s exported surface is `{Lookup, Len}`, `SecretHit` carries only provenance, and the package imports no logger ¬ | 06 §4.2 | L1     | 9     |
 
 ### 6.6 V-PRO — Proactivity and its bounds
 
@@ -484,6 +501,7 @@ eight rows from the write's own return value would satisfy V-PRO-013's letter ex
 | V-CTR-008 | Mesh request/response schema conformance                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | 06 §7                  | L1     | 12    |
 | V-CTR-009 | MCP tools are envelope builders: **no tool calls a mutating API directly** — proven statically ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | 06 §9                  | L0     | 10    |
 | V-CTR-010 | OKF entries validate; an observation records an action taken                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 06 §5                  | L0     | 13    |
+| V-CTR-021 | **The two path dialects are never interchangeable, at all three places one could be accepted for the other.** A `when.fieldPaths` entry beginning with `/` is refused at `ChangePolicy` admission with the message 06 §4.2 specifies — `expected a dotted field path, not a JSON Pointer` — reported against the offending **index** and exactly once, not stacked with the rule-level restatement; `ValidateChangeRule` refuses it a second time, for objects that never met the webhook; and a Pointer that reached the matcher regardless matches **nothing** rather than being helpfully normalised. The mistake is otherwise silent — `/spec/replicas` is a well-formed dotted path whose single segment is literally named `/spec/replicas`, so the rule parses, admits, stores, lists and never fires ¬                                                                                                                                                                                                                                           | 06 §4.2                | L1     | 9     |
 | V-CTR-019 | **06 §1.2 V-11 is enforced, not merely written down**: every `Agent.spec.integration.*.allowedUsers` entry must match `^(slack\|googlechat):\S+$` with a platform-native immutable user ID — a bare ID, an `@handle`, a display name and an email are each refused with the offending field path in the message, at both enforcement points 06 §1.2 names (the CRD CEL pattern and the validating webhook), and neither point may be the only one ¬                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 06 §1.2                | L2     | 10    |
 | V-CTR-020 | **The agent's instructions for writing describe the write path that exists**: the `apply-change` skill (02 §2.2) is present and byte-identical in all three tiers, and every tool it tells the agent to call, and every parameter it promises that tool takes, are **read out of the MCP server's `@mcp.tool()` functions by AST** rather than restated — a skill naming a tool the server does not register sends the agent to a dead call whose only symptom is an agent explaining in prose that it cannot act. The four things 02 §2.2 says the agent cannot influence (tier, scope, risk class, approval) are **absent from that signature**, because the persona's claim is only true while the parameter is missing; `require_approval` exists and is the one direction the caller may push. The body contains no mutating shell-out and no proposal path — no `kubectl apply/delete/patch/scale`, no `gcloud`, no `git` branch/commit/push, no `gh pr` — and names none of the six brake verbs V-CTR-011 forbids anywhere in the agent surface ¬ | 02 §2.2, 06 §9, 07 §2  | L0     | 9     |
 
@@ -503,14 +521,15 @@ name a permissive accountant" to the empty set.
 
 ### 6.10 V-OBS — SLIs, audit, attribution
 
-| ID        | Assertion                                                                                      | Source | Lvl    | Phase |
-| --------- | ---------------------------------------------------------------------------------------------- | ------ | ------ | ----- |
-| V-OBS-001 | SLI 1 cross-scope escapes: alert exists, reads zero, and **fires when deliberately tripped** ¬ | 01 §7  | L3     | 14    |
-| V-OBS-002 | SLI 2 unjournaled mutations: exists, zero, fires ¬                                             | 01 §7  | L3     | 14    |
-| V-OBS-003 | SLI 3 self-escalations: exists, zero, fires ¬                                                  | 01 §7  | L3     | 14    |
-| V-OBS-004 | SLI 4 undo health: coverage and undo success rate reported                                     | 01 §7  | L3     | 14    |
-| V-OBS-005 | Attribution chain intact: chat → envelope → `ActionRecord` → audit log, one trace ID           | 06 §8  | L2, L3 | 10    |
-| V-OBS-006 | Proactivity metrics exist: MTTR, share auto-resolved, actions/day, flap and revert counters    | 01 §7  | L3, L4 | 14    |
+| ID        | Assertion                                                                                                                                                                                                                | Source  | Lvl    | Phase |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- | ------ | ----- |
+| V-OBS-001 | SLI 1 cross-scope escapes: alert exists, reads zero, and **fires when deliberately tripped** ¬                                                                                                                           | 01 §7   | L3     | 14    |
+| V-OBS-002 | SLI 2 unjournaled mutations: exists, zero, fires ¬                                                                                                                                                                       | 01 §7   | L3     | 14    |
+| V-OBS-003 | SLI 3 self-escalations: exists, zero, fires ¬                                                                                                                                                                            | 01 §7   | L3     | 14    |
+| V-OBS-004 | SLI 4 undo health: coverage and undo success rate reported                                                                                                                                                               | 01 §7   | L3     | 14    |
+| V-OBS-005 | Attribution chain intact: chat → envelope → `ActionRecord` → audit log, one trace ID                                                                                                                                     | 06 §8   | L2, L3 | 10    |
+| V-OBS-006 | Proactivity metrics exist: MTTR, share auto-resolved, actions/day, flap and revert counters                                                                                                                              | 01 §7   | L3, L4 | 14    |
+| V-OBS-008 | A journaled snapshot carries no `managedFields` and no Secret material anywhere in its bytes — a Secret's pre-state is a per-key digest — and the rollback replayer recognises that redaction and refuses to replay it ¬ | 05 §1.2 | L1     | 9     |
 
 ### 6.11 V-ADV — Adversarial (BLOCKING-ALWAYS)
 
@@ -652,6 +671,40 @@ runnable until the named ambiguity is resolved.
 | V-BRK-026 | **The broker's own identity is resolved live, and "fleet-wide" is never a stand-in for "unknown"**: the `Agent` a `ChangePolicy`'s `agentSelector` is evaluated against is re-read on **every** poll of `policy.Source`, not pinned at construction — `spec.tier` is immutable but `spec.scope` is not, and the operator renders only `scope.Of(agent).Leaf()` into the broker Deployment, so editing a **non-leaf** level (a cluster-admin's `projectId`) changes no rendered argument, triggers no rollout, and would strand a pinned identity for the life of the pod. Because a ChangePolicy can only tighten, a binding LOST is the loosening direction, so all three loss paths are refused: a nil `Identity` is rejected at construction, an **ill-formed** own scope is refused and **discarded** (a hole in the inner scope is matched by too little, the mirror of the ill-formed policy scope that matches too much), and an **unreadable** Agent CR is **retained** and aged out on `MaxPolicyStaleness` rather than collapsed to the zero Agent. Negative control: the **zero scope is a legal identity** — a platform Agent may carry no `spec.scope` — so it classifies and binds exactly the policies that narrow nothing, which is what stops the other three from being satisfied by "refuse anything not fully narrowed" ¬                                                                                                                                                                                                                                                              | 03 §4.1, 06 §1.2                 | L1         | 9     |
 | V-BRK-027 | **The broker that ships is the broker that was tested**: the `kage-broker` binary hands `broker.NewServer` a pipeline built by `pipeline.New`, and **every** seam of `pipeline.Config` is either populated by that binary or named on a two-sided allowlist with a written reason. Enumerated by reflection over the struct, not by a hand-written assertion per field, so a seam added to `pipeline.Config` tomorrow fails this check until someone wires it or writes down why not. The allowlist **requires** its entries to be zero rather than merely permitting it, so an entry that becomes wired fails and the allowlist shrinks; an entry naming a field that no longer exists fails too, since a renamed field leaves the entry silently excusing nothing. Startup order is asserted where it is load-bearing — the brake is refreshed before the policy source, whose identity closure reads the brake's cache — as is the fact that a failed first read stops the process and leaves **no** poller running behind it. Because `run` dials a kubeconfig and a TLS keypair and is not callable from a test, the last link is closed by **parsing** the binary's own sources: the `Pipeline` field of the `broker.Config` literal must be an identifier assigned from `pipeline.New`, `broker.UnavailablePipeline` must not appear, and exactly one such literal must have been inspected. Negative control: an incomplete `brokerDeps` must refuse **by name** and return a zero `Config` — a half-built config is the one a caller might pass on to `pipeline.New` anyway. Closes [[LSN-007]] ¬ | 03 §4.1, 06 §4.1                 | L1         | 9     |
 
+### 6.15 V-CMP — Completeness (rationale in §5)
+
+The completeness suite's rationale is §5's three inventories, and this table is its index — the
+assertion in brief, the §5 subsection that owns the argument, the level, and the phase by which it
+must be green. The rows carry no rationale of their own on purpose: §5 is a single definition site,
+and a paraphrase here would be a second one.
+
+**The due phase is when the check's population is complete, not when its subject first exists.**
+V-CMP entered the ratchet at phase 8 (§10), and a suite name in §10 contributes the members §6 dates
+at or before the phase. Four of these rows are dated late for one reason, stated so it can be argued
+with: their population is the **whole** of 05 §1 or 06, and the last members of it — the mesh
+contract, the observability pipeline, the ChatOps verb surface — do not exist until phases 12, 14
+and 15. A completeness check cannot be green over a population that is still being built, and dating
+it early would buy a permanent red rather than a real obligation.
+
+| ID        | Assertion                                                                                                                                                         | Source        | Lvl    | Phase |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | ------ | ----- |
+| V-CMP-001 | All three probes — Exists, Wired, Exercised — recorded in the run manifest for **every** 05 §1 component; `Exists: pass, Wired: fail` reports **fail**            | this doc §5.1 | L2     | 14    |
+| V-CMP-002 | No first-party image referenced by a deployed manifest lacks a published build                                                                                    | this doc §5.1 | L0     | 8     |
+| V-CMP-003 | No manifest an install path applies carries a `REPLACE_WITH_*` or `PLACEHOLDER` token                                                                             | this doc §5.1 | L0     | 8     |
+| V-CMP-004 | Every Deployment the design requires has `replicas > 0` in the default install; parked at zero is **not wired**                                                   | this doc §5.1 | L2     | 14    |
+| V-CMP-005 | The optional components are genuinely optional — a full install with C7/C8/C13 absent passes V-CTN, V-BRK, V-REV, V-GAT, V-PRO                                    | this doc §5.1 | L2     | 13    |
+| V-CMP-006 | Every MCP server reading a credential from the environment declares it in its **own** `env:` block, asserted against the runtime-authoritative rendered ConfigMap | this doc §5.1 | L0, L2 | 9     |
+| V-CMP-007 | Every identity the broker resolves by name is created by something the install path runs, and the Go and shell derivations of the actor SA name agree             | this doc §5.1 | L0     | 9     |
+| V-CMP-008 | The install overlay renders, and what it renders **is** the install — no transforming kustomization reaches `config/mesh-ca` ¬                                    | this doc §5.1 | L0     | 9     |
+| V-CMP-010 | Field-level diff, per contract, between 06's schema block and the generated OpenAPI/type                                                                          | this doc §5.2 | L0     | 12    |
+| V-CMP-011 | The CRD schema holds none of the prohibited authority field names and sets no `x-kubernetes-preserve-unknown-fields` on `spec`                                    | this doc §5.2 | L0     | 8     |
+| V-CMP-020 | Each tier's `skills/` set matches its 02 §2.1 row exactly — nothing missing, nothing borrowed from another tier                                                   | this doc §5.3 | L0     | 8     |
+| V-CMP-021 | Each tier's proactive jobs and SOPs match 04 §4.1 and its persona's responsibilities; every SOP carries its scope guard                                           | this doc §5.3 | L0     | 13    |
+| V-CMP-022 | Every trigger class in 04 §4.1 has a **deployed** delivery path, not a documented one                                                                             | this doc §5.3 | L2     | 13    |
+| V-CMP-023 | Every operational verb in 06 §2b.1 is implemented on **both** the Slack `/kage` grammar and `kubectl`/API, with an identical `ActionRecord` effect                | this doc §5.3 | L2     | 15    |
+
+V-CMP-024 is in §6.14, where the coverage audit that found it put it.
+
 ---
 
 ## 7. Fixtures and golden corpora
@@ -732,8 +785,16 @@ The mapping is a generated artifact, not prose:
   result) on every full run.
 
 The meta suite is self-referential: its `Source` is a section of **this** document, because what it
-verifies is this document's own machinery. Every other suite sources a spec — a check whose Source
-cell is empty has no stated rationale anywhere, which `dev/tests/spec-ids.py` now rejects.
+verifies is this document's own machinery. So is V-CMP's, for the same reason one level down — §5's
+inventories are what "complete" means here, and they are derived from 05 and 06 rather than restated
+by them. Every other suite sources a spec, and a check whose Source cell resolves to nothing has no
+stated rationale anywhere, which `dev/tests/spec-ids.py` rejects.
+
+This table is the V-MET catalog. It carries **no phase column**, and that is the correct reading
+rather than an omission: the meta checks police the machinery every phase is graded by, so each is
+required at every phase that names the suite — which, since V-MET entered the ratchet at phase 8, is
+every phase from 8 on. The two exceptions are V-MET-013 and V-MET-014, dated to phase 9 in §6.14
+because they arrived with the coverage audit rather than with the document.
 
 | ID        | Meta-check                                                                                                                                                                                              | Source        | Lvl |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | --- |
@@ -746,6 +807,9 @@ cell is empty has no stated rationale anywhere, which `dev/tests/spec-ids.py` no
 | V-MET-005 | Classifier rules and corpus cases stay in sync (§7.1) ¬                                                                                                                                                 | this doc §7.1 | L0  |
 | V-MET-006 | Every deferred check names a blocker, an owner, and a promotion condition; none is recorded as passing ¬                                                                                                | this doc §9.6 | L0  |
 | V-MET-007 | Every BLOCKING-ALWAYS check ran in the last full run — a suite that silently skipped is a failure ¬                                                                                                     | this doc §9.5 | L0  |
+| V-MET-010 | Every check ID specs 01–08 cite is defined in §6, and every ID §6 defines traces to a spec section that exists ¬                                                                                        | this doc §14  | L0  |
+| V-MET-011 | Every bullet of every spec Verification section resolves to ≥1 check ID through the curated `verification/traceability.yaml`, asserted in **both** directions ¬                                         | this doc §14  | L0  |
+| V-MET-012 | §5.1 lists every 05 §1 component and §5.2 every 06 contract — the inventories cannot silently shrink ¬                                                                                                  | this doc §14  | L0  |
 
 ### 8.1 The coverage baseline, and why it is a ratchet
 
@@ -846,6 +910,25 @@ audit-log query. **A `pass` with no evidence reference is treated as `skipped`.*
 - A retired check keeps its ID, gains `status: RETIRED`, and names its replacement ID.
 - **A BLOCKING-ALWAYS check may not be deferred.** If it cannot run, the build is not verifiable —
   which is itself the finding.
+- **What "the check" means when a check has more than one level.** The bullet above is about the
+  **check**, not about each of its levels independently. A BLOCKING-ALWAYS check that is green at
+  one of its declared levels and unrunnable at another may record the **unrunnable level** as
+  `deferred`, with a blocker, an owner and a promotion condition; the check itself is verified and
+  the build is not blind. A check that is green at **no** level may not be deferred at all — its
+  verdict is `finding` or `fail`, and it blocks. This paragraph relaxes nothing: it states the
+  reading `check_deferrals_name_blockers` in `dev/tests/invariants-gate.py` has enforced all along
+  (it clears a BLOCKING-ALWAYS deferral only on the green-somewhere clause), and it closes the case
+  the prose left open by naming the verdict for green-nowhere. **The executable rule is
+  authoritative**; if it and this paragraph ever disagree, the paragraph is the bug.
+- **Which verdict, when the level was never attempted.** `deferred` is for a level blocked by
+  something **outside** the current unit's reach — an unbuilt fixture cluster, an unprovisioned
+  target, a spec tightening that has not landed. An arm nobody has written yet is **not** a
+  blocker: "the check does not exist" describes unstarted work, and filing it as `deferred` is
+  §11.8's deferred-read-as-done wearing the right label. That case is a `finding`, naming what
+  would claim the level. This was written on 2026-08-01 after two rows one day apart took opposite
+  readings of the same situation — one filing an unclaimed level as a `finding` and arguing a
+  deferral would be the wrong verdict, the other filing an unwritten arm as `deferred` with the
+  closing phase as its own owner.
 
 ### 9.7 Flake policy
 
@@ -1043,31 +1126,36 @@ than absorbed, because an unowned requirement is exactly what §12.2 existed to 
 
 ## 14. Verification of this document
 
-- **V-MET-010** — every check ID referenced anywhere in specs 01–08 exists in §6 of this document,
-  and every §6 ID is referenced by or traceable to a spec section. `L0` — **implemented**:
+Levels and due phases are in the §8 catalog rows, with the other nine V-MET checks; §14 owns the
+argument and nothing else.
+
+- `V-MET-010` — every check ID referenced anywhere in specs 01–08 exists in §6 of this document,
+  and every §6 ID is referenced by or traceable to a spec section. **Implemented**:
   `dev/tests/spec-ids.py`, in `dev/L0-CHAIN.txt`. A check's source is read from its
   `Source` cell, or from its section preamble where the table has no such column; the target must
   resolve to a real heading (or, for `05 C15`, a real component).
-- **V-MET-011** — every bullet in every spec Verification section (02 §10, 03 §11, 04 §9, 05 §8,
-  06 §10, 08 §7) resolves to at least one §6 check ID in the generated
-  `verification/traceability.yaml`; an unmapped bullet fails the lint. The mapping is **generated,
-  not inline** — the specs stay readable prose and the harness owns the correspondence, so the two
-  cannot drift without the lint noticing. `L0` — **not implemented; scheduled as P8-T10, and it
-  gates the Phase 8 milestone.** It was written here as a deferral first, and the ledger's V-MET-006
-  lint refused the row: V-MET is BLOCKING-ALWAYS and such a check may not be deferred (§9.6). The
-  refusal is right, and the reason is worth keeping. A deferral names an **external** blocker; the
-  blocker here was "the generator has not been written", which is unwritten work wearing a
-  deferral's label — the reward hack SELF-IMPROVEMENT §4 names. The work is real and bounded: 176
-  bullets across the six Verification sections, each needing at least one check ID, and it is
-  **curated, not fuzzy-matched** — a mapping produced by text similarity would assert coverage
-  nobody established, which is V-MET-014 with extra steps.
-- **V-MET-012** — §5.1 of this document lists every component ID from
+- `V-MET-011` — every bullet in every spec Verification section (02 §10, 03 §11, 04 §9, 05 §8,
+  06 §10, 08 §7) resolves to at least one §6 check ID in the curated
+  `verification/traceability.yaml`; an unmapped bullet fails the lint, and so does a matrix key that
+  no longer names a real bullet. The mapping is **a separate artifact, not inline** — the specs stay
+  readable prose and the harness owns the correspondence, so the two cannot drift without the lint
+  noticing. **Implemented**: same script, as P8-T10, and it gated the Phase 8 milestone. It was
+  written here as a deferral first, and the ledger's V-MET-006 lint refused the row: V-MET is
+  BLOCKING-ALWAYS and such a check may not be deferred (§9.6). The refusal is right, and the reason
+  is worth keeping. A deferral names an **external** blocker; the blocker here was "the generator has
+  not been written", which is unwritten work wearing a deferral's label — the reward hack
+  SELF-IMPROVEMENT §4 names. What eventually landed is not a generator at all: 177 bullets mapped by
+  hand, because **curated, not fuzzy-matched** was the whole point — a mapping produced by text
+  similarity would assert coverage nobody established, which is V-MET-014 with extra steps.
+- `V-MET-012` — §5.1 of this document lists every component ID from
   [05](05-system-architecture.md) §1, and §5.2 lists every contract defined in
-  [06](06-api-and-data-contracts.md). `L0` — **implemented**: same script. Its first run found
+  [06](06-api-and-data-contracts.md). **Implemented**: same script. Its first run found
   `C-JR` and `C-AD` — both **New (v1, load-bearing)** in 05 §1 — absent from §5.1 entirely, and five
   06 contracts missing from §5.2. Neither gap was visible while §14 was prose.
 
 These three keep this document from drifting away from the set it verifies — the same failure mode
 as §11.7, applied to the verification layer itself. All three were unimplemented for as long as they
-existed, which is §11.7 again: the lint that polices vacuous checks was itself one. Two are now
-implemented and the third is scheduled with a phase gate rather than an excuse.
+existed, which is §11.7 again: the lint that polices vacuous checks was itself one. **All three now
+run on the L0 chain**, and each has already caught real drift — 010 the renumbered sources, 011 a
+duplicate ID pair and an imperfect transcript recovery, 012 two load-bearing components missing from
+the inventory that decides what "complete" means.

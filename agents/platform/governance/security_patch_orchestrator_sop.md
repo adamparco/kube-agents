@@ -21,16 +21,18 @@ For each active GKE cluster retrieved directly using native GKE monitoring and r
 - Compare the active GKE version against the **Latest Stable Security Patch** returned by the server configuration.
 - Identify if the active GKE version contains any known high-severity GKE CVEs (Common Vulnerabilities and Exposures).
 
-### 3. Coordinate Staggered Zero-Downtime Upgrades
+### 3. Drive the Staggered Zero-Downtime Rollout
 
-If an emergency security patch upgrade is required:
+If a security patch upgrade is required, you carry it out — the staggering below is the safety
+property, and it is preserved exactly:
 
-1.  **Propose Dev-First Upgrade (GitOps PR):**
-    - Do **NOT** apply the version patch directly to the cluster.
-    - Utilize your **`submit-suggestion` skill** to update the GKE version inside the cluster manifest in git, and **submit a GitHub Pull Request (PR)** for the development/staging cluster (e.g., `mercury-03`).
-    - Inform the SRE team that the Dev upgrade PR is ready for manual review and merge.
-2.  **Propose Prod Promotion (GitOps PR):**
-    - Once the Dev upgrade is merged, provisioned, and monitored healthy for 30 minutes, repeat the process.
-    - Utilize the **`submit-suggestion` skill** to submit a Pull Request (PR) proposing the version upgrade for the production cluster (e.g., `mercury-04`).
-3.  **Log Release Rollout Progress:**
-    - Document the PR links and the staggered rollout timeline in the cron output.
+1.  **Dev/staging first:**
+    - Submit the version change for the development/staging cluster (e.g. `mercury-03`) with your **`apply-change` skill**, `trigger_source: cron`. Run `plan_action` first if you want the classification and blast radius before you commit.
+    - The Action Broker resolves scope, classifies, snapshots, plans the undo, executes and journals an `ActionRecord`. Never `gcloud container clusters upgrade` it yourself; the identity in your pod cannot, by design.
+2.  **Soak, and verify before you promote:**
+    - Wait until the upgraded cluster has been provisioned and **healthy for 30 minutes** — control plane and node versions reported at the target, no new crash-looping or unschedulable workloads. This wait is a real precondition, not a formality; do not promote on an unverified dev upgrade.
+3.  **Then production — and expect the gate:**
+    - Submit the production cluster's version change (e.g. `mercury-04`) the same way. A production control-plane upgrade is **gated**: the broker parks it for a human on the approval roster, and nothing changes until that person approves. That human step is retained deliberately — it exists because the change is high-blast-radius, not because you cannot act.
+    - Submit it anyway, name who was asked, say plainly that nothing has changed yet, and **do not idle waiting for the approval** — carry on with the rest of the sweep. Never re-shape a gated upgrade into something that would classify lower.
+4.  **Report:**
+    - Four beats (02 §2.5.4) per cluster: what you noticed, what you did with its `ActionRecord` ID (or what is parked and with whom), how you verified it, and the undo handle (`/kage undo <action-id>`). State the current position in the staggered rollout and which clusters remain exposed.

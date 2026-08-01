@@ -215,7 +215,12 @@ fi
 echo; echo "== L2-4: V-CTR-014 — no rendered Deployment carries *_ALLOW_ALL_USERS =="
 
 cleanup() { $K -n "$NS" delete agent "$PROBE" --ignore-not-found --wait=false >/dev/null 2>&1 || true; }
-trap cleanup EXIT
+# P12 ([[LSN-066]]): this trap is installed AFTER p10_assert_control_plane_healthy, whose
+# p12_assert_exclusive_l2 took the one-suite-per-cluster lock and put `_l2_lock_exit_handler` on
+# EXIT. Replacing that trap here would leak the lock to the next acquirer's stale break, so the
+# release is chained in. It cannot change this script's exit status: bash runs the EXIT trap with
+# the pending status and only an explicit `exit` inside the trap overrides it.
+trap 'cleanup; l2_lock_release' EXIT
 
 if render googlechat "$(printf '%b' '      allowedUsers:\n        - ""\n        - "users/1234567890"\n        - "   "')" \
      | $K apply -f - >/dev/null 2>&1; then

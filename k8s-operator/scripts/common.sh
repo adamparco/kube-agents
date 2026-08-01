@@ -683,11 +683,42 @@ render_apiserver_block() {
 #      from the kubeconfig, and for any cluster reached through a bastion or a
 #      forwarded endpoint where the address the kubeconfig names is not the address
 #      the pods reach.
-#   2. The live cluster: the `kubernetes` Service ClusterIP, plus the host out of the
-#      current context's `server:` URL. Both become /32s. This is the ordinary GKE
-#      case and it needs no configuration at all — which matters, because a knob that
-#      must be filled in for the broker to work is a knob that will not be filled in.
+#   2. The live cluster: the `kubernetes` Service's ENDPOINT addresses, its ClusterIP,
+#      and the host out of the current context's `server:` URL. All become /32s. This
+#      is the ordinary GKE case and it needs no configuration at all — which matters,
+#      because a knob that must be filled in for the broker to work is a knob that will
+#      not be filled in.
 #   3. Nothing. Return 1.
+#
+# THE ENDPOINT ADDRESS IS THE ONE THAT ACTUALLY MATCHES, AND IT WAS MISSING UNTIL
+# 2026-08-01. This function shipped reading the ClusterIP and the kubeconfig host, on
+# the argument above that one of the two must be what the dataplane sees. On GKE
+# neither is. A pod dials the ClusterIP (34.118.224.1), the dataplane DNATs it in eBPF
+# BEFORE egress policy is evaluated, and the packet the policy scores carries the
+# control-plane's node-network address — `endpoints/kubernetes` in `default`, which is
+# a third address this function never read: 10.150.0.9 on the scratch cluster,
+# 10.150.0.2 on the live one, and neither cluster's kubeconfig names it (they name
+# 35.221.35.254 and 34.145.154.119, the public endpoints). The rendered rule 9 was
+# therefore two /32s that no packet ever carries.
+#
+# It presents exactly as the header of render_apiserver_block warns and worse. The
+# broker's startSources() reads the brake BEFORE the listener opens, so the pod never
+# binds :8443 at all: `kubectl logs` is EMPTY, the readiness and liveness probes both
+# report `connection refused`, and the kubelet restarts it on a loop. Nothing anywhere
+# says "network". Measured on 2026-08-01 by adding a single /32 for the endpoint
+# address to the same namespace — the broker went 1/1 within one probe period
+# ([[LSN-069]]).
+#
+# ALL THREE FORMS ARE STILL EMITTED, endpoint first. The ClusterIP and the kubeconfig
+# host stay because the original argument for them stands — where the dataplane
+# evaluates egress relative to DNAT is not something this script can know — and three
+# /32s on 443 is a narrow price for not having to be right about it. Adding the one
+# that matches is the fix; removing the two that did not would be a second guess.
+#
+# EndpointSlice is read first and `endpoints` is the fallback: v1 Endpoints is
+# deprecated from 1.33 and prints a warning to stderr on every read, which is noise in
+# an install log and, on a cluster that has dropped the compatibility shim, no answer
+# at all.
 #
 # A hostname in the `server:` URL is DELIBERATELY NOT RESOLVED here. NetworkPolicy
 # takes addresses, resolving one at install time pins whatever the DNS answer was that
@@ -695,7 +726,7 @@ render_apiserver_block() {
 # rotation is worse than one that was never written. Set KUBE_APISERVER_CIDR instead.
 resolve_apiserver_cidrs() {
   local override="${KUBE_APISERVER_CIDR:-}"
-  local out="" clusterip server host
+  local out="" clusterip server host endpoints ep
 
   if [ -n "$(printf '%s' "${override}" | tr -d '[:space:]')" ]; then
     printf '%s\n' "${override}"
@@ -715,24 +746,37 @@ resolve_apiserver_cidrs() {
     esac
   }
 
-  clusterip="$(kubectl get service kubernetes -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")"
-  if _ipv4 "${clusterip}"; then
-    out="${clusterip}/32"
+  # _append <candidate> — a /32 for a dotted quad, deduplicated. Order is preserved, so
+  # rule 9 reads endpoint-first and a human comparing it against `endpoints/kubernetes`
+  # sees the match on the first line.
+  _append() {
+    case ",${out}," in
+      *",$1/32,"*) return 0 ;;
+    esac
+    _ipv4 "$1" || return 0
+    if [ -n "${out}" ]; then out="${out},$1/32"; else out="$1/32"; fi
+  }
+
+  endpoints="$(kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes \
+    -o jsonpath='{.items[*].endpoints[*].addresses[*]}' 2>/dev/null || echo "")"
+  if [ -z "$(printf '%s' "${endpoints}" | tr -d '[:space:]')" ]; then
+    endpoints="$(kubectl get endpoints kubernetes -n default \
+      -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || echo "")"
   fi
+  for ep in ${endpoints}; do
+    _append "${ep}"
+  done
+
+  clusterip="$(kubectl get service kubernetes -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")"
+  _append "${clusterip}"
 
   server="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")"
   host="${server#*://}"
   host="${host%%:*}"
   host="${host%%/*}"
-  if _ipv4 "${host}"; then
-    if [ -n "${out}" ]; then
-      out="${out},${host}/32"
-    else
-      out="${host}/32"
-    fi
-  fi
+  _append "${host}"
 
-  unset -f _ipv4
+  unset -f _ipv4 _append
 
   [ -z "${out}" ] && return 1
   printf '%s\n' "${out}"
@@ -1126,13 +1170,13 @@ actor_service_account_name() { # actor_service_account_name <tier> <scope-leaf>
   printf '%s-%s-actor\n' "$1" "$2"
 }
 
-# render_broker_operations_grant <namespace>
+# render_broker_operations_grant
 #
-# The shared, tier-neutral grant. Rendered once per namespace that hosts an agent, because the
-# namespaced half must exist in each of them; the ClusterRole half is identical every time and
-# `kubectl apply` makes the repeats no-ops.
-render_broker_operations_grant() { # render_broker_operations_grant <namespace>
-  local namespace="$1"
+# The shared, tier-neutral grant — the cluster-scoped half of 06 §2.2.1 and nothing else. It takes no
+# arguments and substitutes nothing: the namespaced half retired into the per-tier grant in
+# P9-T9b-5b-0-ii-b (see broker-operations-grant.yaml.template), and what is left is one ClusterRole
+# that is identical on every install. `kubectl apply` makes the repeat per tier a no-op.
+render_broker_operations_grant() { # render_broker_operations_grant
   local template="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/broker-operations-grant.yaml.template"
 
   if [ ! -f "${template}" ]; then
@@ -1140,10 +1184,47 @@ render_broker_operations_grant() { # render_broker_operations_grant <namespace>
     exit 1
   fi
 
-  local rendered
+  cat "${template}"
+}
+
+# render_actor_grant <tier> <namespace> <scope-leaf>
+#
+# The PER-TIER half of the actor's authority: the read half of 06 §2.2's template for this tier,
+# joined with 06 §2.2.1's grant, in objects stamped `kube-agents/tier`. Rendered alongside the
+# tier-neutral grant above, not instead of it — see actor-grant-developer-team.yaml.template for why
+# a namespace-scoped tier still needs a cluster-scoped object that belongs to no tier.
+#
+# THE THREE FILENAMES ARE LITERAL, and that is not laziness. `dev/tests/identity-has-install-path.py`
+# (V-CMP-007) property 1 asserts every `*.yaml.template` beside this file is NAMED by text the
+# install path executes; a path built as "actor-grant-${tier}.yaml.template" names none of them, and
+# all three would read as templates nothing renders — LSN-007's shape, reported by the check written
+# for it. The `*)` arm is a hard error rather than a fallback: a fourth tier must arrive with its own
+# template, and failing closed here is a provisioning error a human reads, not an agent identity
+# quietly missing its tenant authority.
+render_actor_grant() { # render_actor_grant <tier> <namespace> <scope-leaf>
+  local tier="$1" namespace="$2" leaf="$3" base
+  case "${tier}" in
+    developer-team) base="actor-grant-developer-team.yaml.template" ;;
+    cluster-admin) base="actor-grant-cluster-admin.yaml.template" ;;
+    platform) base="actor-grant-platform.yaml.template" ;;
+    *)
+      print_error "No actor grant template for tier '${tier}'. 06 §2.2 defines one per tier; add it beside common.sh."
+      exit 1
+      ;;
+  esac
+
+  local template="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/${base}"
+  if [ ! -f "${template}" ]; then
+    print_error "Actor grant template not found: ${template}"
+    exit 1
+  fi
+
+  local actor_ksa rendered
+  actor_ksa="$(actor_service_account_name "${tier}" "${leaf}")"
   rendered="$(
     AGENT_NAMESPACE="${namespace}" \
-      envsubst '${AGENT_NAMESPACE}' \
+      AGENT_ACTOR_KSA="${actor_ksa}" \
+      envsubst '${AGENT_NAMESPACE} ${AGENT_ACTOR_KSA}' \
       <"${template}"
   )"
   printf '%s\n' "${rendered}"
@@ -1191,33 +1272,43 @@ render_agent_identity() { # render_agent_identity <tier> <namespace> <reader-ksa
 
 # apply_agent_identity <tier> <namespace> <reader-ksa> <scope-leaf> [reader-gsa-email]
 #
-# Grant first, then the identity that binds to it. The order matters on a fresh cluster: a
+# Grants first, then the identity that binds to them. The order matters on a fresh cluster: a
 # RoleBinding whose roleRef names a Role that does not exist yet is accepted by the API server and
 # then grants nothing until the Role appears, so the failure is a silent authorization denial rather
-# than an apply error. Applying the grant first removes the window entirely.
+# than an apply error. Applying the grants first removes the window entirely. (The reverse edge does
+# not exist: RBAC resolves a binding's SUBJECT at request time, so a binding may name a
+# ServiceAccount the next apply creates.)
+#
+# Two grants, not one. The tier-neutral pair is 06 §2.2.1 and is the same object for the whole fleet;
+# the per-tier grant is the read half of 06 §2.2's template for THIS tier, stamped with the tier so
+# that admission and V-BRK-013 can both reason about it. Neither subsumes the other — see
+# actor-grant-developer-team.yaml.template.
 #
 # No opt-out flag, unlike the quota and the service aliases. Those degrade an install; skipping this
 # one produces a broker that cannot authenticate its own caller, and an "off" switch for it would
 # only ever be used by someone who had not read this paragraph.
 apply_agent_identity() { # apply_agent_identity <tier> <namespace> <reader-ksa> <scope-leaf> [gsa-email]
   local tier="$1" namespace="$2" reader_ksa="$3" leaf="$4" gsa_email="${5:-}"
-  local grant identity actor_ksa
+  local grant actor_grant identity actor_ksa
 
   actor_ksa="$(actor_service_account_name "${tier}" "${leaf}")"
-  grant="$(render_broker_operations_grant "${namespace}")" || return 1
+  grant="$(render_broker_operations_grant)" || return 1
+  actor_grant="$(render_actor_grant "${tier}" "${namespace}" "${leaf}")" || return 1
   identity="$(render_agent_identity "${tier}" "${namespace}" "${reader_ksa}" "${leaf}" "${gsa_email}")" || return 1
 
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
-    print_info "[dry-run] would apply the broker-operations grant and the ${tier} reader/actor identity in ${namespace}"
+    print_info "[dry-run] would apply the broker-operations grant, the ${tier} actor grant, and the ${tier} reader/actor identity in ${namespace}"
     printf '%s\n' "${grant}" | kubectl apply --dry-run=server -f - >/dev/null || return 1
+    printf '%s\n' "${actor_grant}" | kubectl apply --dry-run=server -f - >/dev/null || return 1
     printf '%s\n' "${identity}" | kubectl apply --dry-run=server -f - >/dev/null || return 1
     print_success "Identity manifests validate against the API server"
     return 0
   fi
 
   printf '%s\n' "${grant}" | kubectl apply -f - || return 1
+  printf '%s\n' "${actor_grant}" | kubectl apply -f - || return 1
   printf '%s\n' "${identity}" | kubectl apply -f - || return 1
-  print_success "Identity applied in ${namespace}: reader '${reader_ksa}', actor '${actor_ksa}' bound to the 06 §2.2.1 grant."
+  print_success "Identity applied in ${namespace}: reader '${reader_ksa}', actor '${actor_ksa}' bound to the 06 §2.2.1 grant and the ${tier} read profile of 06 §2.2."
 }
 
 # delete_agent_identity <tier> <namespace> <reader-ksa> <scope-leaf>
@@ -1225,14 +1316,24 @@ apply_agent_identity() { # apply_agent_identity <tier> <namespace> <reader-ksa> 
 # The teardown half. The namespaced objects would go with the namespace for a tenant tier, but the
 # control namespace outlives every tier that lives in it and the ClusterRoleBinding is cluster-scoped
 # in every case — an undeleted binding survives into the next provision holding a subject name that
-# a later install may reuse. The shared ClusterRole and Role are NOT deleted here: they are fleet
-# objects, and removing them while another tier still binds to them would brick that tier's broker.
+# a later install may reuse. The shared ClusterRole is NOT deleted here: it is a fleet object, and
+# removing it while another tier still binds to it would brick that tier's broker.
+#
+# The per-tier grant IS deleted, all four objects of it, and the two cluster-scoped ones are why this
+# matters more than it did before. A tier ClusterRole left behind holds the read half of 06 §2.2 for
+# a tier that is no longer installed, and its ClusterRoleBinding names `<tier>-<leaf>-actor` — a name
+# the next install of the same tier and scope will recreate. Every name here is `${actor_ksa}`, which
+# is a pure function of tier and leaf, so a teardown that misses one hands the authority to whatever
+# is provisioned next under the same name.
 delete_agent_identity() { # delete_agent_identity <tier> <namespace> <reader-ksa> <scope-leaf>
   local tier="$1" namespace="$2" reader_ksa="$3" leaf="$4" actor_ksa
   actor_ksa="$(actor_service_account_name "${tier}" "${leaf}")"
 
   kubectl delete clusterrolebinding "${reader_ksa}-broker-operations" --ignore-not-found=true || true
-  kubectl delete rolebinding "${reader_ksa}-broker-operations" -n "${namespace}" --ignore-not-found=true || true
+  kubectl delete clusterrolebinding "${actor_ksa}" --ignore-not-found=true || true
+  kubectl delete clusterrole "${actor_ksa}" --ignore-not-found=true || true
+  kubectl delete rolebinding "${actor_ksa}" -n "${namespace}" --ignore-not-found=true || true
+  kubectl delete role "${actor_ksa}" -n "${namespace}" --ignore-not-found=true || true
   kubectl delete serviceaccount "${actor_ksa}" -n "${namespace}" --ignore-not-found=true || true
   kubectl delete serviceaccount "${reader_ksa}" -n "${namespace}" --ignore-not-found=true || true
 }

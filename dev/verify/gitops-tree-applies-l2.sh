@@ -125,7 +125,12 @@ done
 
 seeded=() # entries are "<namespace>/<name>"
 seed_cleanup() { unseed_parent_agents "$K" "${seeded[@]:-}"; }
-trap seed_cleanup EXIT INT TERM
+# P12 ([[LSN-066]]): this trap is installed AFTER p10_assert_control_plane_healthy, whose
+# p12_assert_exclusive_l2 took the one-suite-per-cluster lock and put `_l2_lock_exit_handler` on
+# EXIT. Replacing that trap here would leak the lock to the next acquirer's stale break, so the
+# release is chained in. It cannot change this script's exit status: bash runs the EXIT trap with
+# the pending status and only an explicit `exit` inside the trap overrides it.
+trap 'seed_cleanup; l2_lock_release' EXIT INT TERM
 
 for pf in "${PARENT_FILES[@]:-}"; do
   [ -n "$pf" ] || continue

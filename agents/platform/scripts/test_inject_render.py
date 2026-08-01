@@ -152,15 +152,22 @@ class TestBuildAgentQuery(unittest.TestCase):
                 "• *Warning Message:* insufficient cpu\n\n"
             )
         )
-        # Shared tail still present.
-        self.assertIn("*Proposed Fixes (GitOps):*", q)
-        self.assertIn("Do not execute any write mutations", q)
+        # Shared tail still present, and it tells the agent to remediate rather than propose.
+        self.assertIn("**Diagnose, then fix it.**", q)
+        self.assertIn("submit an Action Envelope with trigger_source 'watch'", q)
+        self.assertIn("• *Undo:* `/kage undo <action-id>`", q)
+        self.assertIn("You never run kubectl apply/patch/delete/scale", q)
+        # The superseded GitOps-proposal path must not come back.
+        for gone in ("Proposed Fixes (GitOps)", "Pull Request", "apply Option A"):
+            self.assertNotIn(gone, q)
 
     def test_alert_query_not_k8s_framed(self):
         q = sk._build_agent_query("k8s-evt-1", {"kind": "alert", "summary": "SLO burn", "policy": "p1"})
         self.assertIn("Investigate the following monitoring alert", q)
         self.assertNotIn("Analyze the following Kubernetes event warning", q)
-        self.assertIn("*Proposed Fixes (GitOps):*", q)  # shared tail
+        self.assertIn("**Diagnose, then fix it.**", q)  # shared tail
+        # An alert-triggered envelope is trigger_source 'alert', never 'chat' — nobody asked.
+        self.assertIn("submit an Action Envelope with trigger_source 'alert'", q)
 
     def test_github_query_not_k8s_framed(self):
         q = sk._build_agent_query("k8s-evt-2", {"kind": "github", "action": "opened", "repo": "acme/infra"})
@@ -169,8 +176,11 @@ class TestBuildAgentQuery(unittest.TestCase):
 
     def test_escalation_query_rederives_scope(self):
         q = sk._build_agent_query("k8s-evt-3", {"kind": "escalation", "from": "cluster-admin", "scope": "kube-system"})
-        self.assertIn("Re-derive the affected scope yourself", q)
-        self.assertIn("never contact the lower tier directly", q)
+        # The callee re-authorizes in its own scope and never inherits the caller's (invariant 5).
+        self.assertIn("Re-authorize this yourself", q)
+        self.assertIn("untrusted input", q)
+        self.assertIn("resolve the work in YOUR scope", q)
+        self.assertIn("submit an Action Envelope with trigger_source 'escalation'", q)
 
 
 if __name__ == "__main__":

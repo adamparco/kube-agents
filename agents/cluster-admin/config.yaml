@@ -43,9 +43,13 @@ mcp_servers:
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
   # NOTE: the cluster-mutating `gke` remote MCP proxy (container.googleapis.com) is intentionally
-  # omitted so the Platform Agent is read-only (03 §4, 06 §9). This baked config is a fallback; the
-  # operator's renderConfigYAML() is runtime-authoritative and also omits it. Provisioning goes
-  # through the submit-suggestion GitOps skill, never a direct cluster write.
+  # omitted. The agent process holds the reader identity only and has no write verb on this cluster
+  # (03 §4, 06 §9); this baked config is a fallback, and the operator's renderConfigYAML() is
+  # runtime-authoritative and also omits it. The Cluster Admin Agent still acts — mutation leaves this
+  # process as an Action Envelope submitted to the Action Broker with the apply-change skill, and the
+  # broker (a separate workload holding the actor identity, unreachable from here) is what resolves
+  # scope, classifies risk, gates, plans the undo and journals the ActionRecord. Provisioning a child
+  # agent goes the same way, via provision-developer-team. Never a direct cluster write from here.
 
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.

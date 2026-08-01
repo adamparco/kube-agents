@@ -76,9 +76,11 @@ Pick one at least:
 
 Or configure Vertex AI credentials (Gemini or Claude via Vertex) at the LiteLLM layer — see [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) for a template.
 
-## GitOps repo (for `submit-suggestion`)
+## GitOps repo (for the Minty-backed GitHub flows)
 
-The declarative workflow needs a GitHub repo to file PRs against.
+Optional, and not on the change path — an agent's mutation goes to its Action Broker, not to a pull
+request. A GitHub repo is what the write-behind IaC mirror commits to, what the cascade skills render
+their provisioning bundles into for human review, and what `github-issue-resolver` works against.
 
 - A GitHub repo you own or can install a GitHub App on.
 - A GitHub App with `contents:write` and `pull_requests:write` permissions, installed on that repo.

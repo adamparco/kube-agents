@@ -16,6 +16,15 @@ limitations under the License.
 
 package brake_test
 
+// V-CTR-017 (L1, 09 §6.9): the brake's production input source tells the truth about what it
+// could not read -- TestObserveGathersAllFourInputs and TestOneFailedReadDoesNotBlindTheOthers
+// are the two halves, each of the four reads failing in isolation without blinding the rest.
+//
+// V-CTR-018 (L1, 09 §6.9): row 7 is asked about the ACTION and cannot be switched off -- see the
+// nil-Accountant argument at TestNewSourceRefusesEveryUnusableWiring.
+//
+// Both are registered in verification/implementations.yaml.
+
 import (
 	"context"
 	"errors"

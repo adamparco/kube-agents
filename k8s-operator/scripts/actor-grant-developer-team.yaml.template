@@ -1,0 +1,121 @@
+# developer-team ACTOR tenant grant — the READ half of 06 §2.2's developer-team template, joined
+# with 06 §2.2.1's broker-operations grant. THE INSTALL-PATH COPY.
+#
+# Rendered by `render_actor_grant developer-team <namespace> <leaf>` in common.sh and applied by the
+# step that installs the tier, before the identity that binds to it.
+#
+# ── WHY A ROLE AND NEVER A CLUSTERROLE ─────────────────────────────────────────────────────────
+# 06 §2.2 spells this tier's template `kind: Role` in its one namespace, and `vap-agent-readonly`
+# validation 2 enforces it from the other side: a ClusterRole labelled `kube-agents/tier:
+# developer-team` is denied at admission as a wrong-scope grant (03 §4). So this file has one Role
+# and no cluster-scoped object at all — and that is also why the tier-neutral
+# `kubeagents-broker-operations` ClusterRole in broker-operations-grant.yaml.template SURVIVES this
+# unit rather than being retired with its namespaced twin. Three of §2.2.1's ten cluster-scoped
+# triples (`tokenreviews`, `fleetfreezes`, `changepolicies`) address cluster-scoped kinds that a
+# namespaced Role cannot grant, and 06 §2.2.1 says losing the `fleetfreezes` read does not fail safe
+# — it bricks the tier (06 §4.4). A namespace-scoped tier therefore needs a cluster-scoped object it
+# does not own, and the only one that is admissible is one wearing no tier label at all.
+#
+# They are still written out below, inert, because 06 §2.2.1 appends the grant "verbatim to every
+# actor Role/ClusterRole" and V-BRK-013 property 4 holds the union of this tier's objects to exactly
+# that. An inert rule grants nothing; a missing one would make the spec and the tree disagree about
+# what the tier is owed, which is the drift the check exists to refuse.
+#
+# ── WHAT IS ABSENT, AND WHY THE ABSENCE IS THE POINT ───────────────────────────────────────────
+# Every WRITE verb of 06 §2.2. Phase 9 renders the read half only: `create`, `update`, `patch`,
+# `delete` and the `pods/eviction` rule are specified, unrendered, and — while the three copies of
+# `vap-agent-readonly` carry the read disjunct and nothing wider — inadmissible. The write half
+# arrives with `vap-agent-scope` in P10-T1, in the same unit that widens the policy to the per-tier
+# allow-list 03 §4.2 requires. `DARK_PROFILE` in dev/tests/actor-grant-single-sourced.py is the
+# switch, and it is one switch for both halves on purpose: flipping either alone turns V-BRK-013 red.
+#
+# The `deployments/scale` rule keeps `get` and loses `update`/`patch`, which is what "the READ verbs
+# of the template" means applied rule by rule rather than rule-wise: a rule is not dropped because it
+# holds a write verb, it is narrowed to the read verbs it holds.
+#
+# ── NO `kube-agents/scope` LABEL ───────────────────────────────────────────────────────────────
+# 06 §2's identity table lists one; it is deliberately absent here for the reason recorded at length
+# in examples/gitops-repo/policy/rbac-overlay/platform.yaml — the label's value is
+# `agentlabels.RenderScope`, not the scope leaf in the SA name, and writing it by hand would create a
+# second definition site for a value that already has one in Go.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ${AGENT_ACTOR_KSA}
+  namespace: ${AGENT_NAMESPACE}
+  labels:
+    kube-agents/tier: developer-team
+    kube-agents/role: actor
+rules:
+  # ── The READ half of 06 §2.2, developer-team ──────────────────────────────────────────────────
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "secrets", "serviceaccounts", "persistentvolumeclaims", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log", "pods/status", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  # `get` only. The template grants get/update/patch here; the two writes are the write half.
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale", "replicasets/scale"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes", "grpcroutes"]
+    verbs: ["get", "list", "watch"]
+  # ── 06 §2.2.1, appended verbatim ──────────────────────────────────────────────────────────────
+  # The first three rules are inert in a namespaced Role — see the header. They are here because the
+  # spec appends the grant to every actor Role, not to every actor ClusterRole.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["fleetfreezes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["changepolicies"]
+    verbs: ["get", "list", "watch"]
+  # These four are the effective half, and the only two verbs in the whole grant that change stored
+  # state (`create actionrecords`, the status update) are bound in this namespace and nowhere else.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["actionrecords/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["agents"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["approvalrosters"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ${AGENT_ACTOR_KSA}
+  namespace: ${AGENT_NAMESPACE}
+  labels:
+    kube-agents/tier: developer-team
+    kube-agents/role: actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ${AGENT_ACTOR_KSA}
+subjects:
+  - kind: ServiceAccount
+    name: ${AGENT_ACTOR_KSA}
+    namespace: ${AGENT_NAMESPACE}

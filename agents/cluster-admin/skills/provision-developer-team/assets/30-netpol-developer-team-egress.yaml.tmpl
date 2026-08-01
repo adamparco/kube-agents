@@ -1,0 +1,108 @@
+# netpol-agent-egress.yaml.template
+#
+# The per-tier DEFAULT-DENY egress NetworkPolicy for an agent pod (03 §9/§10), rendered by
+# `provision_13_apply_network_policies.sh` and applied by it. THIS FILE IS THE SOURCE. Two sets of
+# copies are DERIVED from it and must never be hand-edited: the committed exemplars under
+# examples/gitops-repo/ (checked byte-for-byte by dev/tests/reference-render.py) and, where one
+# exists, the matching provision-developer-team skill asset with the tenant namespace parameterised
+# (checked by dev/test_skill_templates.py). Edit this template, then regenerate both.
+#
+# SHAPE = PURE ALLOWLIST. `policyTypes: [Egress]` plus a podSelector makes egress default-deny for the
+# selected pods; only what is listed is reachable. There is deliberately NO 0.0.0.0/0 rule: a broad
+# allow-with-exceptions would make "arbitrary hosts are unreachable" false, and every destination
+# below had to be argued for individually.
+#
+# WHAT IS *NOT* HERE, AND WHY THAT IS THE POINT. The cloud metadata server is absent from the base
+# allowlist, so raw node credentials are unreachable by omission rather than by a deny rule that a
+# later edit could reorder away. When Workload Identity genuinely needs the metadata server, the
+# install path appends the NARROW, PORT-BOUND block below (WORKLOAD_IDENTITY_METADATA_BLOCK) — never
+# a whole-host allow. See common.sh:render_wi_metadata_block for the exact IP↔port pairings, which
+# are dataplane-specific and are the single easiest thing in this file to get wrong.
+#
+# LIMITATION (hostname precision): NetworkPolicy is L3/L4 and cannot express hostnames, so GitHub is
+# allowlisted by published IP CIDRs, which drift. Refresh them from https://api.github.com/meta. The
+# hostname-precise L7 egress proxy remains deferred hardening (08 §5).
+#
+# THE ONE RULE THAT IS NOT IN THIS FILE AND MUST STILL BE THERE: the kube-apiserver. It is rule 9,
+# appended by common.sh:render_apiserver_block, and it is absent from the base render for a reason
+# that does not apply to any other destination here — every other address in this allowlist is
+# published and stable (Google's restricted VIP, GitHub's four blocks, GKE's two metadata pairings),
+# and the API server's is not. It is per-cluster, and on a public GKE endpoint it is a bare IP with
+# no range anyone publishes, so the committed exemplars cannot pin it without stating a fiction
+# about somebody's cluster. `provision_13` resolves it at apply time and REFUSES TO APPLY WITHOUT IT
+# unless KUBE_APISERVER_EGRESS_ENABLED=false is set deliberately — because the failure mode of a
+# missing API-server rule is a broker that authenticates nobody, reported as an auth bug.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: developer-team-egress
+  namespace: @@NAMESPACE@@
+  labels:
+    kube-agents/tier: developer-team
+    app.kubernetes.io/managed-by: gitops
+spec:
+  podSelector:
+    matchLabels:
+      kube-agents/tier: developer-team
+  policyTypes:
+    - Egress
+  egress:
+    # 1) DNS — cluster resolution. Without this, every name-based egress fails before it starts,
+    #    including the ExternalName CNAME chain rule 2 depends on.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # 2) The cluster's shared agent services in kubeagents-system — Inference (LiteLLM, :80, the
+    #    ONLY inference path, per-tier virtual key) and the GitHub/Workload-Identity token broker
+    #    (github-token-minter, :8080, short-lived scoped tokens; the agent holds no long-lived write
+    #    credential). The controller renders both hostnames into the POD'S OWN namespace, so a
+    #    developer-team agent reaches them through the ExternalName aliases in its namespace; this
+    #    rule is what admits that hop. It is one-way into the cluster's control namespace and never
+    #    toward another tenant.
+    #
+    #    Default-deny applies to same-namespace traffic too, so the platform and cluster-admin tiers
+    #    need this rule just as much as a developer-team agent does — their pods happen to already be
+    #    in kubeagents-system, which does not exempt them.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 8080
+    # 3) Google cloud APIs via Private Google Access (restricted.googleapis.com). Stable, well-known
+    #    range — reads only (the agent's cloud GSA is viewer-only; the write path is a GitOps PR).
+    #    This ALSO carries the eventingress Pub/Sub SUBSCRIBE leg (04 §4): pubsub.googleapis.com
+    #    resolves to the same restricted VIP, so draining PRE-CREATED subscriptions needs no new
+    #    CIDR or port. Subscribe-only — eventingress never creates a topic/subscription or publishes.
+    - to:
+        - ipBlock:
+            cidr: 199.36.153.8/30
+      ports:
+        - protocol: TCP
+          port: 443
+    # 4) GitHub — the agent pushes suggestion/provisioning branches and opens PRs with a Minty-minted
+    #    token. GitHub's four published, stable IPv4 blocks (api + git + web, api.github.com/meta).
+    #    The per-region /32s in that feed are deliberately omitted: they churn weekly and an
+    #    allowlist nobody refreshes is an allowlist that silently breaks.
+    - to:
+        - ipBlock:
+            cidr: 192.30.252.0/22
+        - ipBlock:
+            cidr: 185.199.108.0/22
+        - ipBlock:
+            cidr: 140.82.112.0/20
+        - ipBlock:
+            cidr: 143.55.64.0/20
+      ports:
+        - protocol: TCP
+          port: 443
+@@EGRESS_OPTIONAL_BLOCKS@@

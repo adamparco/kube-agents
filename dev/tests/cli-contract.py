@@ -72,6 +72,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gitcorpus import repo_files  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
+SELF = Path(__file__).resolve()
 
 # Directories whose text is a historical record, not an instruction to a machine.
 EXCLUDED_DIRS = ("docs/build/",)
@@ -87,6 +88,11 @@ FLAG = re.compile(r"(?<![\w-])--([A-Za-z0-9][A-Za-z0-9-]*)")
 TERMINATORS = ("|", ";", "&&", "||", ">", "`", "\n")
 
 HELP_TIMEOUT = 30
+
+# Non-vacuity floor on the SUBJECT. 18 distinct CLI basenames on 2026-08-01 (27 files; the
+# per-tier copies of `submit_suggestion.py` and friends union under one basename). Set at two
+# thirds so ordinary churn does not trip it and a collapse does.
+MIN_CLIS = 12
 
 # argparse prints a subparser's choices as `{poll,claim,transition}` in the positional section.
 # Their flags are not in the top-level help, and a caller writes `resolver.py claim --issue 7`.
@@ -154,6 +160,37 @@ def _flags_from_source(cli: Path) -> tuple[set[str], list[str]]:
     return flags, notes
 
 
+def builds_a_parser(text: str) -> tuple[bool, str | None]:
+    """Does this module construct an `ArgumentParser`? Answered by AST, never by substring.
+
+    B-011's property, applied to the corpus gate rather than to a control mode: a string that
+    mentions a construct is not the construct. `dev/tests/negative-controls-name-their-rule.py`
+    carries a set of synthetic Python fixtures as string literals -- among them one whose whole
+    point is to be an argparse dispatch -- and a `"ArgumentParser" in text` test therefore admitted
+    it as a CLI. It is not one: it accepts `--negative-control` through a plain `sys.argv` check and
+    has no `--help`, so `_flags_from_help` ran it, got its ordinary PASS output back with rc 0, read
+    zero flags out of it, and reported `dev/L0-CHAIN.txt:283` as passing a flag the CLI does not
+    accept. A false finding against a line that works.
+
+    A `Call` inside a string constant is not in the tree at all, so this is the whole fix. The
+    second element is a reason string when the answer had to fall back to the substring test, which
+    happens only for a file that will not parse -- excluding it silently would shrink the corpus
+    invisibly, which is the failure [[LSN-038]] names.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError) as exc:
+        return "ArgumentParser" in text, f"unparsable, fell back to a substring test: {exc}"
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+        if name == "ArgumentParser":
+            return True, None
+    return False, None
+
+
 def discover_clis(repo: Path, tracked: list[str]) -> dict[str, dict]:
     """basename -> {path, flags, mode, notes}. Basename, because that is how callers name them."""
     clis: dict[str, dict] = {}
@@ -161,11 +198,18 @@ def discover_clis(repo: Path, tracked: list[str]) -> dict[str, dict]:
         if not rel.endswith(".py"):
             continue
         path = repo / rel
+        # This checker is itself an argparse CLI in the tracked tree. Probing it would run
+        # `cli-contract.py --help`, which scans again and probes itself again -- unbounded
+        # recursive spawn, each generation orphaning the next to init. Read its flags from
+        # source instead of executing it.
+        if path.resolve() == SELF:
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        if "ArgumentParser" not in text:
+        is_cli, fallback_note = builds_a_parser(text)
+        if not is_cli:
             continue
         flags = _flags_from_help(path)
         if flags is not None:
@@ -173,6 +217,8 @@ def discover_clis(repo: Path, tracked: list[str]) -> dict[str, dict]:
         else:
             mode = "source"
             flags, notes = _flags_from_source(path)
+        if fallback_note:
+            notes = [*notes, fallback_note]
         name = path.name
         if name in clis:
             # Three identical `submit_suggestion.py` copies exist, one per tier. A caller names a
@@ -248,6 +294,12 @@ def caller_files(repo: Path, tracked: list[str], cli_paths: set[str]) -> list[st
     for rel in tracked:
         if rel in cli_paths:
             continue
+        # Not a caller either. This file's docstring spells out example invocations
+        # (`resolver.py claim --report x`) to explain what the check does not cover; parsing
+        # them as real calls turns its own prose into findings. It was skipped here for free
+        # while it was in cli_paths -- keep that now that discovery excludes it.
+        if (repo / rel).resolve() == SELF:
+            continue
         if any(rel.startswith(d) for d in EXCLUDED_DIRS):
             continue
         if rel.endswith(CALLER_SUFFIXES) or Path(rel).name in CALLER_NAMES:
@@ -268,6 +320,17 @@ def run(repo: Path) -> tuple[list[str], list[str], int]:
     clis = discover_clis(repo, tracked)
     if not clis:
         raise SystemExit("could not run: no argparse CLI found in the tracked tree")
+    # A floor above zero, because the interesting collapse is partial. On 2026-08-01 the corpus
+    # gate moved from a substring test to an AST one and correctly lost two members; a gate that
+    # only refuses an EMPTY corpus would have said nothing had that change lost twenty. The floor
+    # sits on the subject, not on the findings -- a tree with no contract violations is supposed to
+    # report none, and is byte-identical to a scanner that stopped discovering CLIs.
+    if len(clis) < MIN_CLIS:
+        raise SystemExit(
+            f"VACUOUS: {len(clis)} CLI(s) discovered, floor is {MIN_CLIS}. Either the corpus gate "
+            f"in `builds_a_parser` stopped recognising a parser shape this tree uses, or a lot of "
+            f"CLIs left the tree. Neither is something this check may pass through quietly."
+        )
 
     cli_paths = {p for c in clis.values() for p in c["paths"]}
     names = set(clis)
@@ -361,6 +424,18 @@ def self_test() -> int:
 
 
 def main() -> int:
+    # This script takes no flags, so it never built a parser -- which meant `--help` fell
+    # through to a full scan rather than printing and exiting. Anything probing this tree
+    # with `--help` (including this checker) would start a recursive spawn. Answer it here.
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(
+            "usage: cli-contract.py [--help] [--self-test]\n\n"
+            "Checks that every flag a caller passes to a repo CLI is one that CLI defines.\n"
+            "Takes no other arguments; scans the tracked tree from the repo root.\n\n"
+            "  --help       show this message and exit\n"
+            "  --self-test  run the built-in controls instead of the scan\n"
+        )
+        return 0
     if "--self-test" in sys.argv:
         return self_test()
     findings, notes, scanned = run(REPO)

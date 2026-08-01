@@ -1,6 +1,6 @@
 ---
 name: read-knowledge
-description: Retrieve Operational Knowledge Framework (OKF) entries — runbooks, escalations, blueprints, observations — from the GitOps repo's knowledge/ tree via a strictly read-only, sparse checkout. This is how agents share context without ever calling each other.
+description: Retrieve Operational Knowledge Framework (OKF) entries — runbooks, escalations, blueprints, observations — from the GitOps repo's knowledge/ tree via a strictly read-only, sparse checkout. This is the shared knowledge layer, not a channel for talking to another agent.
 ---
 
 # read-knowledge — read-only OKF retrieval
@@ -9,16 +9,17 @@ This skill lets you look up shared operational knowledge — a **runbook** for a
 **escalation** a lower tier raised, a **cluster-blueprint**, a **tenancy-model**, a prior
 **observation** — from the GitOps repository's `knowledge/` tree (OKF, 06 §5).
 
-It is the **read half of indirect coordination**: agents never call each other directly (invariant 3).
-Instead, one agent leaves knowledge here (via `submit-suggestion` / `raise-escalation`) and another
-picks it up with this skill on its next sweep.
+OKF is the **knowledge** layer and only that: durable, curated context one agent records and another
+reads later. It is **not** a coordination channel. Cross-tier requests are direct, synchronous mesh
+calls (02 §2.3); nothing is left here for a parent to discover by polling.
 
 ## When to Use
 
 - **Before acting on an incident:** check for an existing `runbook` (`--type runbook`) that matches the
   symptom instead of re-deriving a fix.
-- **On a proactive/heartbeat sweep:** a parent tier lists open `escalation` entries
-  (`--type escalation`) raised by its children, then triages them.
+- **When something is waiting on a human:** list the `escalation` entries (`--type escalation`) —
+  which now hold only requests a human must resolve (a budget approval, a vendor ticket, a decision
+  outside every agent's scope, 06 §5), never a request to another agent.
 - **When onboarding a change:** read the relevant `cluster-blueprint` / `tenancy-model` for the target.
 
 ## Read-only by construction
@@ -30,10 +31,11 @@ This skill **cannot** write. Two properties are enforced by the helper script, n
    trees, and asserts they are absent after checkout. A read can therefore never turn into a deployable
    working tree or accumulate into a commit.
 2. **Hard-refuses writes.** Every git call is gated to a read-only allowlist; any `push` / `commit` /
-   write intent exits non-zero **before** touching the repo. To propose a change, use
-   `submit-suggestion` (or `raise-escalation`) — never this skill.
+   write intent exits non-zero **before** touching the repo. To change something, use
+   `apply-change` — never this skill.
 
-It uses a **contents:read**-scoped token (`GITHUB_READ_TOKEN`), not the `submit-suggestion` write token.
+It uses a **contents:read**-scoped token (`GITHUB_READ_TOKEN`). There is no write credential in this
+pod to reach for (02 §2.2).
 
 The frontmatter parser is the **same shared module** `dev/okf-validate.py` uses, so what you read
 is exactly what CI validates — no schema drift.
@@ -67,5 +69,5 @@ Flags:
 ## After Reading
 
 Act on what you read within your own scope. If an entry (e.g. an `escalation`) implies a change,
-**re-derive the scope from your own CR** — do not trust a `to:` field — and propose the change via
-`submit-suggestion`. Never mutate anything directly.
+**re-derive the scope from your own CR** — do not trust a `to:` field — and submit the change with
+`apply-change`. Never mutate anything directly.

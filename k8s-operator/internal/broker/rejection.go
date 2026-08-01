@@ -57,7 +57,15 @@ const (
 // client wired is a compile-time visible configuration rather than a nil dereference on the
 // refusal path -- which is the path least likely to be exercised before production.
 type RejectionJournal interface {
-	Reject(ctx context.Context, id *Identity, body []byte, ref *Refusal) error
+	// Reject records the refusal and returns the action id of the record it wrote.
+	//
+	// The id is returned rather than kept private because 06 §4.4 row 3's auto-pause has to name a
+	// record: the broker cannot pause an agent directly (see internal/broker/escalate), so it writes
+	// the request onto `status.escalation` of an ActionRecord, and on a refusal the only record that
+	// exists is this one. An empty id means no ActionRecord was written -- whether because of an
+	// error or because this implementation does not write one -- and a caller must treat it exactly
+	// as it treats an error for escalation purposes: there is nothing to hang the escalation on.
+	Reject(ctx context.Context, id *Identity, body []byte, ref *Refusal) (string, error)
 }
 
 // StoreRejectionJournal is the production implementation, backed by the journal Store.
@@ -81,9 +89,9 @@ type StoreRejectionJournal struct {
 // NOT happen: a journal failure does not upgrade the refusal into a 500. The caller is already
 // being refused; turning a journaling problem into a different refusal would tell them something
 // untrue about their request, and the refusal itself is unaffected.
-func (j *StoreRejectionJournal) Reject(ctx context.Context, id *Identity, body []byte, ref *Refusal) error {
+func (j *StoreRejectionJournal) Reject(ctx context.Context, id *Identity, body []byte, ref *Refusal) (string, error) {
 	if j.Store == nil {
-		return fmt.Errorf("broker: no journal store configured; the refusal %q was not recorded", ref.Reason)
+		return "", fmt.Errorf("broker: no journal store configured; the refusal %q was not recorded", ref.Reason)
 	}
 	now := time.Now
 	if j.Now != nil {
@@ -93,7 +101,7 @@ func (j *StoreRejectionJournal) Reject(ctx context.Context, id *Identity, body [
 
 	actionID, err := journal.NewULID(at)
 	if err != nil {
-		return fmt.Errorf("broker: mint action id for refusal %q: %w", ref.Reason, err)
+		return "", fmt.Errorf("broker: mint action id for refusal %q: %w", ref.Reason, err)
 	}
 
 	identity := "unauthenticated"
@@ -157,7 +165,10 @@ func (j *StoreRejectionJournal) Reject(ctx context.Context, id *Identity, body [
 	// reconciler; the label below is what makes the record findable as a refusal immediately,
 	// before that first reconcile.
 	ar.Status.Phase = agentv1alpha1.PhaseRejected
-	return j.Store.Create(ctx, ar)
+	if err := j.Store.Create(ctx, ar); err != nil {
+		return "", err
+	}
+	return actionID, nil
 }
 
 // refusedTarget is the sentinel that satisfies the CRD's `targets` MinItems=1 for a record that
@@ -287,11 +298,16 @@ type LogRejectionJournal struct {
 }
 
 // Reject appends a one-line summary.
-func (j *LogRejectionJournal) Reject(_ context.Context, id *Identity, _ []byte, ref *Refusal) error {
+//
+// It returns an empty action id, and truthfully: a log line is not an ActionRecord, so there is no
+// object for an escalation to be recorded on. A broker wired this way refuses exactly as it always
+// did and logs that the auto-pause had nowhere to go, which is the honest behaviour for a journal
+// that is not durable in the first place.
+func (j *LogRejectionJournal) Reject(_ context.Context, id *Identity, _ []byte, ref *Refusal) (string, error) {
 	who := "unauthenticated"
 	if id != nil {
 		who = id.Username
 	}
 	j.Records = append(j.Records, who+" "+ref.Reason+" "+ref.Detail)
-	return nil
+	return "", nil
 }
