@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import importlib.util
 import json
 import re
 import subprocess
@@ -40,6 +41,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gitcorpus import read_repo_files, repo_files  # noqa: E402
+
+# B-011: "does this script have a `--negative-control` mode?" is answered by ONE recogniser, the
+# one in the check whose whole subject is negative controls. Asking it with `FLAG in text` -- which
+# is what this file did until 2026-08-01 -- makes a comment, a usage string or an error message
+# indistinguishable from a dispatch arm, so documenting the flag in prose becomes a finding and the
+# only way to clear it is to stop mentioning it. `handles()` parses instead: Python through the AST,
+# shell through a quote-aware lex, and it returns `None` when the file will not parse so a syntax
+# error is a finding rather than a silent exclusion ([[LSN-038]]).
+#
+# The import goes through `importlib` because the module's filename is hyphenated, which is the
+# repo's convention for a check script and is not a legal identifier. Loading it by path keeps the
+# convention and keeps the recogniser at one definition site; copying `handles()` here would restore
+# exactly the two-implementations-of-one-question state B-011 was filed about.
+_ncntr_spec = importlib.util.spec_from_file_location(
+    "negative_controls_name_their_rule",
+    Path(__file__).resolve().parent / "negative-controls-name-their-rule.py",
+)
+_ncntr = importlib.util.module_from_spec(_ncntr_spec)
+_ncntr_spec.loader.exec_module(_ncntr)
+_dispatches_a_control = _ncntr.handles
 
 REPO = Path(__file__).resolve().parents[2]
 LESSONS = REPO / ".claude/harness/LESSONS.md"
@@ -3183,7 +3204,19 @@ def check_negative_controls_exercise_the_statement_under_test() -> list[str]:
                 f'tr \'[:upper:]\' \'[:lower:]\')\"` (LSN-060).'
             )
 
-        if "--negative-control" not in text:
+        # B-011: by HANDLER, not by substring. `None` means the file would not lex, which is a
+        # finding of its own -- a suite that cannot be parsed is a suite whose control mode nobody
+        # can see, and silently skipping it is how the corpus shrinks without anyone noticing.
+        dispatches = _dispatches_a_control(path, text)
+        if dispatches is None:
+            failures.append(
+                f"{rel} could not be lexed to decide whether it dispatches a "
+                f"`--negative-control` mode, so it was neither checked nor excluded. Fix the "
+                f"script or the recogniser in `negative-controls-name-their-rule.py`; do not "
+                f"leave it unclassified (LSN-038)."
+            )
+            continue
+        if not dispatches:
             continue
         saw_control = True
         if marker not in text:
