@@ -1133,98 +1133,14 @@ class PhaseGateRunsItsOwnRatchet(unittest.TestCase):
         self.assertTrue(any("no verify-phase*.sh at all" in p for p in problems), problems)
 
 
-class PhaseGatePublishesTheCoverageRemainder(unittest.TestCase):
-    """V-MET-002 is BLOCKING-ALWAYS, is off the L0 chain, and section K is the only place it runs.
-
-    Every control below leaves a `verify-phase9.sh` that still runs, still has sections A-J, and
-    still reports a coherent verdict -- which is the point. A BLOCKING-ALWAYS check that runs
-    nowhere does not announce itself; the phase gate goes green faster and looks the same.
-    """
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(dir=gate.REPO / "dev")
-        self.addCleanup(self._tmp.cleanup)
-        self._saved: dict[str, object] = {}
-        self._dir = pathlib.Path(self._tmp.name) / "verify"
-        self._dir.mkdir()
-        self._real = gate.REPO / "dev" / "verify" / "verify-phase9.sh"
-
-    def tearDown(self):
-        for name, value in self._saved.items():
-            setattr(gate, name, value)
-
-    def repoint(self, name: str, value) -> None:
-        self._saved.setdefault(name, getattr(gate, name))
-        setattr(gate, name, value)
-
-    def stage(self, *replacements: tuple[str, str]) -> None:
-        text = self._real.read_text(encoding="utf-8")
-        for find, replace in replacements:
-            self.assertIn(find, text, f"stale needle: {find!r}")
-            text = text.replace(find, replace)
-        (self._dir / "verify-phase9.sh").write_text(text, encoding="utf-8")
-        self.repoint("VERIFY_DIR", self._dir)
-
-    def test_green_on_the_tree_as_it_stands(self):
-        self.assertEqual([], gate.check_phase_gate_publishes_the_coverage_remainder())
-
-    def test_a_gate_with_no_coverage_arm_fails(self):
-        self.stage(("python3 dev/tests/load-bearing-coverage-is-full.py", "true #"))
-        problems = gate.check_phase_gate_publishes_the_coverage_remainder()
-        self.assertTrue(any("never invokes" in p for p in problems), problems)
-
-    def test_a_commented_out_coverage_arm_does_not_count(self):
-        self.stage(
-            (
-                "if python3 dev/tests/load-bearing-coverage-is-full.py",
-                "# if python3 dev/tests/load-bearing-coverage-is-full.py\nif true;",
-            )
-        )
-        problems = gate.check_phase_gate_publishes_the_coverage_remainder()
-        self.assertTrue(any("never invokes" in p for p in problems), problems)
-
-    def test_the_control_arm_alone_does_not_satisfy_the_obligation(self):
-        # The one that would actually happen. `--negative-control` is green today and green after
-        # the catalog closes, so swapping the live arm for it turns section K into a permanent pass
-        # that asserts nothing about coverage -- and the diff is one flag.
-        self.stage(
-            (
-                "if python3 dev/tests/load-bearing-coverage-is-full.py >",
-                "if python3 dev/tests/load-bearing-coverage-is-full.py --negative-control >",
-            )
-        )
-        problems = gate.check_phase_gate_publishes_the_coverage_remainder()
-        self.assertTrue(any("never invokes" in p for p in problems), problems)
-
-    def test_an_arm_whose_red_never_reaches_the_exit_code_fails(self):
-        text = self._real.read_text(encoding="utf-8")
-        start = text.index("# ==== K.")
-        end = text.index('echo\necho "====', start)
-        section = text[start:end]
-        (self._dir / "verify-phase9.sh").write_text(
-            text[:start] + section.replace("bad ", "echo ") + text[end:], encoding="utf-8"
-        )
-        self.repoint("VERIFY_DIR", self._dir)
-        problems = gate.check_phase_gate_publishes_the_coverage_remainder()
-        self.assertTrue(any("is a comment" in p for p in problems), problems)
-
-    def test_deleting_the_runner_fails(self):
-        self.repoint("COVERAGE_RUNNER", pathlib.Path(self._tmp.name) / "gone.py")
-        problems = gate.check_phase_gate_publishes_the_coverage_remainder()
-        self.assertTrue(any("does not exist" in p for p in problems), problems)
-
-    def test_an_empty_corpus_is_a_failure_and_not_a_green(self):
-        self.repoint("VERIFY_DIR", self._dir)  # empty
-        problems = gate.check_phase_gate_publishes_the_coverage_remainder()
-        self.assertTrue(any("no verify-phase*.sh at all" in p for p in problems), problems)
-
-    def test_a_wholly_grandfathered_corpus_is_a_failure_and_not_a_green(self):
-        # The corpus can also empty out one phase at a time. A tree whose only gate is exempt walks
-        # every loop iteration and appends nothing, which is byte-identical to a pass.
-        (self._dir / "verify-phase8.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
-        self.repoint("VERIFY_DIR", self._dir)
-        problems = gate.check_phase_gate_publishes_the_coverage_remainder()
-        self.assertTrue(any("evaluated nothing" in p for p in problems), problems)
+# RETIRED 2026-07-31 with the arm it tested: `PhaseGatePublishesTheCoverageRemainder`, eight
+# controls over `check_phase_gate_publishes_the_coverage_remainder`. That arm asserted that
+# `verify-phase<N>.sh` runs V-MET-002, because V-MET-002 was BLOCKING-ALWAYS and off the L0 chain,
+# making section K the only place it ran. The load-bearing remainder reached zero on 2026-07-31, the
+# live arm moved onto `dev/L0-CHAIN.txt`, and the chain file became the artifact that answers "does
+# it run". Retired in the same commit that moved the line, as the arm's own docstring required, so
+# neither ever covered it alone. `dev/assertion-baseline.json` is wound down by the same commit --
+# a ratchet that falls silently is [[LSN-056]], and one that falls for a recorded reason is not.
 
 
 def _load_phase_ratchet():

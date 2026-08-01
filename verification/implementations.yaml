@@ -284,6 +284,10 @@
   runs: "python3 dev/tests/check-ids-have-implementations.py"
   asserts_in: "dev/tests/check-ids-have-implementations.py"
 
+"V-MET-002":
+  runs: "python3 dev/tests/load-bearing-coverage-is-full.py"
+  asserts_in: "dev/tests/load-bearing-coverage-is-full.py"
+
 "V-MET-003":
   runs: "python3 dev/tests/invariants-gate.py"
   asserts_in: "dev/tests/invariants-gate.py"

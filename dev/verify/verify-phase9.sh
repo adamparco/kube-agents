@@ -628,12 +628,17 @@ else
 fi
 
 # ==== K. V-MET-002 — full coverage of the load-bearing suites =======================================
-# The one BLOCKING-ALWAYS L0 check with no line on dev/L0-CHAIN.txt, for the reason written out
-# beside its control there: it is red by construction until the 09 §6 catalog grows the rows that
-# assert the published remainder, and a required PR check that stays red for a phase reddens every
-# unrelated commit. This is where it runs instead. Section J above already reports V-MET-002 as
-# "not green" from the results file; this section is what says WHICH sixteen obligations, by ID and
-# in their own words, so the worklist is legible without opening three artifacts.
+# Until 2026-07-31 this was the ONLY place V-MET-002 ran: red by construction until the 09 §6
+# catalog grew the rows asserting the published remainder, and a required PR check that stays red
+# for a phase reddens every unrelated commit. The remainder is now zero, the live arm is a line on
+# dev/L0-CHAIN.txt, and `invariants-gate.py`'s arm that protected this section retired in the same
+# commit that moved the line.
+#
+# The section STAYS, and not out of sentiment. Section J above reports V-MET-002 as green or not
+# from the results file; this section is what says WHICH obligations are uncovered, by ID and in
+# their own words, so a red is legible without opening three artifacts. That was worth having when
+# the number was sixteen and it will be worth having the next time it is not zero -- 09 §8.1's
+# draw-down does not end at Phase 9, it ends at every phase that adds an owned section.
 echo; echo "== K. V-MET-002 — every load-bearing-owned requirement maps to >=1 check (09 §8) =="
 if python3 dev/tests/load-bearing-coverage-is-full.py >/tmp/p9-vmet002.log 2>&1; then
   pass "$(tail -1 /tmp/p9-vmet002.log)"

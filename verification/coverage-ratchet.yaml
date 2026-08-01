@@ -134,7 +134,7 @@ ownership_sections:
     section: "4.3"
     space: "requirements"
     enumerated: 20
-    checks: "V-CTN-011 V-CTN-014 V-CTN-026 V-CTN-032"
+    checks: "V-CTN-011 V-CTN-014 V-CTN-026 V-CTN-032 V-CTN-040 V-CTN-041"
   - suite: "V-BRK"
     document: "03"
     section: "4.4"
@@ -248,7 +248,7 @@ ownership_sections:
     section: "2.3"
     space: "requirements"
     enumerated: 7
-    checks: "V-CTN-018"
+    checks: "V-CTN-018 V-CTN-039"
   - suite: "V-BRK"
     document: "06"
     section: "4.1"
@@ -1208,6 +1208,3 @@ digests:
   - ffc5c266b673730f
 
 load_bearing_uncovered:
-  - "R-03.4.3-8"
-  - "R-03.4.3-9"
-  - "R-06.2.3-6"

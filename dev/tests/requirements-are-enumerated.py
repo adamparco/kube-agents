@@ -404,25 +404,33 @@ def dump_requirements(entries: dict[str, dict]) -> str:
 # section states the numbers precisely so that they are falsifiable, and a check that never reads
 # 5m/10m/90s/30s/15s/20m/2m cannot fail when a constant drifts from the table.
 #
-# Published gaps -- three requirements deliberately left unmapped, because no catalog row
-# asserts them. One in 06:
-#   R-06.2.3-6   "developer-team actor: none in v1". Nothing asserts the ABSENCE of a
-#                developer-team actor GSA; every containment check asserts what a principal
-#                cannot do, not that a principal does not exist.
-# R-06.4.2-30 is NOT one of them, and was wrongly filed as one until 2026-07-31: it is a row of the
-# same code-floor rule table as `secret-write` and `blast-radius-cap`, `RuleSecretMaterialEgress` is
-# a member of `classify.AllFloorRuleIDs`, and the corpus carries nine cases for it -- so V-MET-005
+# Published gaps -- NONE remain as of 2026-07-31. The list stays here because the three that closed
+# last closed in two different ways, and the difference is the part worth keeping.
+#   R-06.2.3-6   "developer-team actor: none in v1" -> V-CTN-039. Nothing asserted the ABSENCE of a
+#                developer-team actor GSA; every containment check asserts what a principal cannot
+#                do, not that a principal does not exist. The machinery for it did exist -- an
+#                unannotated ServiceAccount and a VIEWER-ONLY role array -- held in place by a
+#                comment in `agent-identity.yaml.template` and by nothing else. V-CTN-039 is L0 and
+#                green today.
+#   R-03.4.3-8   no write to an `Agent` CR whose identity is an ANCESTOR of the writer's ->
+#                V-CTN-040. V-CTN-007 covers the writer's OWN CR and V-CTN-025 the brake field on a
+#                child's; nothing walks `parentRef` upward on a write.
+#   R-03.4.3-9   actor writes stay inside the LIVE tier template -> V-CTN-041. Both existing
+#                template checks (V-CTN-012, V-CTR-004) are the inlined-literal form, which is the
+#                point of 03 section 4.2 -- the live-object form needs the webhook, not the VAP.
+# The last two map to catalog rows dated PHASE 10, and that is a real closure rather than a
+# bookkeeping one. Coverage asks whether an honest check owns the obligation, not whether that check
+# is green yet -- `load-bearing-coverage-is-full.py` says so in its own docstring, and the draw-down
+# in 09 section 8.1 is built on the distinction. What is NOT allowed is the reverse: closing an
+# obligation with the nearest-looking existing row. V-CTN-012 was sitting right there for R-03.4.3-9
+# and taking it would have been wrong, because the inlined-literal property is a different property.
+# R-06.4.2-30 was never one of these gaps, and was wrongly filed as one until 2026-07-31: it is a row
+# of the same code-floor rule table as `secret-write` and `blast-radius-cap`, `RuleSecretMaterialEgress`
+# is a member of `classify.AllFloorRuleIDs`, and the corpus carries nine cases for it -- so V-MET-005
 # and V-GAT-001 reach it by exactly the argument that maps every one of its siblings, and singling
 # it out was a curation error, not a stricter reading.
-# And two elsewhere:
-#   R-03.4.3-8   no write to an `Agent` CR whose identity is an ANCESTOR of the writer's.
-#                V-CTN-007 covers the writer's OWN CR and V-CTN-025 the brake field on a child's;
-#                nothing walks `parentRef` upward on a write.
-#   R-03.4.3-9   actor writes stay inside the LIVE tier template. Both template checks
-#                (V-CTN-012, V-CTR-004) are the inlined-literal form, which is the point of 03
-#                section 4.2 -- the live-object form is a deferred capability with no check.
 #
-# Five of the eight closed on 2026-07-31, and every one of them closed as a CATALOG row over
+# All eight closed on 2026-07-31, and five of them closed as a CATALOG row over
 # machinery that had been in the tree for units -- unmapped only because no check ID claimed it.
 # That is the shape of most of what is left, and it is worth naming: an obligation with no `checks:`
 # entry is not evidence that the property is unbuilt, and reading it that way is how a build

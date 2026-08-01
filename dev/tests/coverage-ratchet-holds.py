@@ -896,8 +896,22 @@ def negative_control() -> int:
             "the partition is wrong: ownership.load_bearing",
         ),
         (
-            "V-MET-002's worklist is truncated",
-            _mutate(base, 0, lambda t: "\n".join(t.splitlines()[:-30]) + "\n"),
+            # Was "the worklist is truncated" -- `t.splitlines()[:-30]`, a positional chop of the
+            # file's tail, which worked only while the worklist WAS the tail. It emptied on
+            # 2026-07-31 when the draw-down closed, and the chop started landing thirty lines into
+            # the arrival-baseline digests instead: the row went MISS, reporting the check as having
+            # let a defect through when what happened is that the defect was aimed at nothing. Same
+            # shape as the floor mutation below, same lesson ([[LSN-063]]), one file apart.
+            #
+            # Re-aimed rather than deleted, and aimed the other way: with the computed set empty,
+            # the two artifacts can only disagree by the FILE publishing an ID the computation does
+            # not, so injecting one tests the same conjunct in the only direction now observable.
+            # It also survives the worklist coming back -- a bogus ID disagrees at any length,
+            # where a positional chop only works at one.
+            "V-MET-002's worklist disagrees with the computed remainder",
+            _mutate(base, 0, lambda t: t.replace(
+                "\nload_bearing_uncovered:", '\nload_bearing_uncovered:\n  - "R-01.1-1"', 1
+            )),
             "is not V-MET-002's worklist",
         ),
         (

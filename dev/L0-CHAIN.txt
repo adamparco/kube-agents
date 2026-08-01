@@ -464,30 +464,38 @@ python3 dev/tests/coverage-ratchet-holds.py
 python3 dev/tests/coverage-ratchet-holds.py --negative-control
 
 # --- V-MET-002: full coverage of the load-bearing suites ------------------------------------------
-# THE LIVE ARM IS NOT ON THIS CHAIN, and that is deliberate — the same call, for the same reason, as
-# `phase-ratchet-is-asserted.py --phase 9` above. It is RED today by construction: eight remaining
-# obligations owned by V-CTN / V-BRK / V-REV / V-ISO / V-ADV have no catalog row that asserts them,
-# and closing them is a change to the 09 §6 catalog, not a curation change. This chain is a required
-# PR check, so an arm that stays red until that work lands would redden every unrelated commit and
-# destroy the per-commit attribution CHECKPOINT exists to produce ([[LSN-055]]). It runs in
-# `dev/verify/verify-phase9.sh` section K, where its redness IS the worklist and is published by ID,
-# and `invariants-gate.py` (`check_phase_gate_publishes_the_coverage_remainder`) is what stops that
-# section being deleted.
+# THE LIVE ARM IS ON THIS CHAIN AS OF 2026-07-31, and the date is the whole story. For four phases it
+# was deliberately absent, because it was RED by construction: obligations owned by
+# V-CTN / V-BRK / V-REV / V-ISO / V-ADV had no catalog row that asserted them, closing them meant
+# changing the 09 §6 catalog rather than curating a mapping, and this chain is a required PR check —
+# an arm that stays red until far-off work lands reddens every unrelated commit and destroys the
+# per-commit attribution CHECKPOINT exists to produce ([[LSN-055]]). It ran instead in
+# `dev/verify/verify-phase9.sh` section K, where its redness WAS the worklist, published by ID.
 #
-# 09 §8.1 dates the zero: the load-bearing suites "must reach zero uncovered before Phase 10 grants
-# the first write credential". So this is not a deferral and not a backlog item — it is the last of
-# the draw-down, it is scheduled inside Phase 9, and a red V-MET-002 at the milestone is a halt
-# (09 §9.6). What it is NOT is a reason to weaken the gate: the spec's own answer to "a gate that
-# always fails is a gate someone disables" was to demand full coverage here anyway and to ratchet
-# everywhere else.
+# All 420 owned obligations now map. The draw-down finished inside Phase 9, on the date 09 §8.1 set
+# for it: the load-bearing suites "must reach zero uncovered before Phase 10 grants the first write
+# credential". So the arm comes home. The interesting part is what that took — the last three closed
+# as CATALOG rows (V-CTN-039/040/041), two of them dated phase 10, because coverage asks whether an
+# honest check OWNS the obligation and not whether that check is green yet. The temptation each time
+# was the nearest-looking existing row; V-CTN-012 was sitting right there for the live-tier-template
+# obligation and taking it would have been wrong, because the inlined-literal property is a
+# different property. A gate that always failed was never the reason to weaken it, and the spec's
+# own answer to "a gate that always fails is a gate someone disables" was to demand full coverage
+# here anyway and to ratchet everywhere else.
 #
-# What IS chain-eligible is the control, whose BASE CASE is the future tree — the remainder closed
-# by synthesis — in which this arm must go GREEN ([[LSN-053]]). Eight mutations on top of it, each
-# naming the finding ITS property produces ([[LSN-035]]): an owned obligation losing its last check,
-# one mapped to an ID with no catalog row, V-ISO's prose source deleted so a BLOCKING-ALWAYS suite
-# owns zero sections, traceability.yaml's 05§8 bullets deleted so it owns one section and zero
-# obligations, a Source cell blanked, the enumerator returning almost nothing, the enumeration
-# artifact truncated, and the catalog itself unparseable.
+# Moving the arm here RETIRES `invariants-gate.py`'s `check_phase_gate_publishes_the_coverage_remainder`,
+# in the same commit, because that invariant existed only to stop section K being deleted while it
+# was the sole runner. Same commit is not tidiness: split either way and the arm is uncovered for one
+# commit — the chain line absent while the invariant is gone, or two runners disagreeing about who
+# owns the failure.
+python3 dev/tests/load-bearing-coverage-is-full.py
+# The control's BASE CASE is now simply the tree ([[LSN-053]] is satisfied by arrival rather than by
+# synthesis — the future tree it used to synthesise is the one we are standing in). Eight mutations
+# on top of it, each naming the finding ITS property produces ([[LSN-035]]): an owned obligation
+# losing its last check, one mapped to an ID with no catalog row, V-ISO's prose source deleted so a
+# BLOCKING-ALWAYS suite owns zero sections, traceability.yaml's 05§8 bullets deleted so it owns one
+# section and zero obligations, a Source cell blanked, the enumerator returning almost nothing, the
+# enumeration artifact truncated, and the catalog itself unparseable.
 python3 dev/tests/load-bearing-coverage-is-full.py --negative-control
 
 # --- V-REV-012: the settle windows are the published ones (P9-T11g-2b-ii-2c-ii-a) -----------------
