@@ -562,6 +562,26 @@ bash dev/verify/reader-scope-l2.sh gke-scratch-kube-agents-dev
 # until it lands, this line proves the renderer and not the cluster.
 bash dev/verify/tier-egress-render-l2.sh gke-scratch-kube-agents-dev
 
+# --- V-CMP-006 at L2: the resolved environment of every MCP server, read inside the pod ----------
+# 09 §6 dates V-CMP-006 `L0, L2` at phase 9. The L0 arm (`dev/test_mcp_env_declared.py`) has been
+# green since phase 8 and reads two artifacts that stand in for the runtime: the rendered-ConfigMap
+# golden and the scripts in the TREE. Both are inputs. This arm reads the three things decided after
+# them and that no static check can reach — that the bytes the agent process opens at its Hermes
+# config path are the ConfigMap the operator rendered for THIS CR and not the copy baked into the
+# image at the same path ([[LSN-003]]); that the scripts the IMAGE shipped, not the tree's, declare
+# what they read; and that the credential a declaration PROMISES actually arrives at the process
+# Hermes spawned. `env: {API_SERVER_KEY: ${API_SERVER_KEY}}` is satisfied on paper by a container
+# that never sets `API_SERVER_KEY`, and the symptom is a runtime refusal in a pod that is Ready with
+# every unit test green — which is why 09 §5.1 says this row reports **fail**, never partial.
+#
+# WHAT THIS LINE DOES NOT YET PROVE. It has never been executed against a cluster. Its 15/15
+# `--negative-control` runs with no cluster at all, synthesising the observation directory, and is
+# on `dev/L0-CHAIN.txt`; that establishes the arm rejects each defect it targets, not that the live
+# install is clean. `verification/results.csv` therefore still carries V-CMP-006 at L2 as
+# **deferred**, with this file named as its promotion condition and "exits 0" still unmet. The row
+# is promoted by a green run, not by this line existing.
+bash dev/verify/mcp-env-resolves-l2.sh gke-scratch-kube-agents-dev
+
 # --- Phase 9's gate ------------------------------------------------------------------------------
 # verify-phase9.sh is the phase's single verdict: Accept (a)-(e) bound to the lines above plus the
 # two suites P9-T9b-5 still owes, the L0 chain run as a file, and the whole prior ratchet through the

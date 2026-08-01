@@ -760,3 +760,11 @@ python3 dev/tests/controller-mints-no-rbac.py
 # rather than the roles: the generated ClusterRole emptied, so every scan below it has nothing to
 # scan, and the self-test probe swapped for a harmless role, which blinds property 1.
 python3 dev/tests/controller-mints-no-rbac.py --negative-control
+# V-CMP-006's L2 arm is the only check in this file that reaches for a cluster, so only its ¬ runs
+# here. `--negative-control` takes no `--context` and touches no kubeconfig: it synthesises the
+# observation directory the live mode would have collected — config text, in-image script inventory,
+# resolved process environments, the running-server census — and replays each arm against a world it
+# has deliberately broken. 15 rows over the five assertion groups. The live arm is on
+# `dev/L2-CHAIN.txt` and has not been run; a green ¬ says the arm rejects what it targets, never that
+# the install is clean, and `verification/results.csv` still carries V-CMP-006 at L2 as deferred.
+bash dev/verify/mcp-env-resolves-l2.sh --negative-control

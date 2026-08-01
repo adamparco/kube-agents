@@ -1851,7 +1851,12 @@ CM_DATA_KEY = re.compile(r'"([A-Za-z0-9._-]+\.(?:ya?ml|json|toml))":\s*\w')
 # green; a floor that did not move with it would let the line be deleted without anything going red.
 # Raised 30 -> 31 on 2026-08-01 (improvement pass 07): tier-egress-render-l2.sh, the [[LSN-068]]
 # item 3 and [[LSN-069]] mechanization. Both floors move together a ninth time.
-L2_CHAIN_FLOOR = 31
+# Raised 31 -> 32 on 2026-08-01 (P13-T5's checkpoint): mcp-env-resolves-l2.sh, V-CMP-006's L2 arm.
+# The line is on the chain and has NEVER been run against a cluster — results.csv still carries the
+# row as deferred. The floor still moves now, in the commit that adds the line, because what it
+# guards is the line's presence and not the row's verdict: an arm that is deleted before its first
+# live run leaves no red anywhere, and that is the exact silence this ratchet exists to break.
+L2_CHAIN_FLOOR = 32
 # How many scripts the TRANSITIVE scope held when it was widened (2026-07-25, P8-T8). A separate
 # ratchet from the one above because the two guard different things: L2_CHAIN_FLOOR notices a line
 # leaving L2-CHAIN.txt, this one notices a claim-making script leaving the closure — including one
@@ -1884,7 +1889,9 @@ L2_CHAIN_FLOOR = 31
 # move together an eighth time.
 # Raised 38 -> 39 on 2026-08-01 (improvement pass 07): tier-egress-render-l2.sh, named on an L2
 # chain line. A ninth time together.
-L2_SCOPE_FLOOR = 39
+# Raised 39 -> 40 on 2026-08-01 (P13-T5's checkpoint): mcp-env-resolves-l2.sh, named on an L2 chain
+# line. A tenth time together.
+L2_SCOPE_FLOOR = 40
 # A script whose output is read as a verdict defines both of these. Derived rather than listed,
 # because a curated roster of "the L2 scripts" is a roster someone must remember to extend, and the
 # gap this widening closed existed for five phases precisely because nobody did. Both are required:
