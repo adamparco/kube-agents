@@ -374,7 +374,11 @@ class SlackRelay:
         response = self._client(team_id).api_call(
             method, **self._decode_argument(arguments)
         )
-        return dict(response)
+        # WebClient.api_call returns a SlackResponse, which defines __iter__ but
+        # no keys(), so dict() takes it for a sequence of pairs and dies on the
+        # first key. The payload lives on .data; fall back to the response itself
+        # so a plain mapping still works.
+        return dict(getattr(response, "data", response))
 
     def download(self, team_id: str, url: str) -> bytes:
         def is_slack_url(value: str) -> bool:
