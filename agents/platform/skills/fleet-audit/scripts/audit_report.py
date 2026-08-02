@@ -27,6 +27,7 @@ test_audit_report.py; the thin shell below them owns all subprocess execution.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 # The shared scripts dir holds github_token_refresh (see docker-entrypoint.sh:
 # executable scripts are shared across profiles, not copied per-profile). The
@@ -47,11 +49,11 @@ sys.path.append("/opt/data/scripts")
 # Constants
 # --------------------------------------------------------------------------- #
 
-# The audit streams allowed to own a PR. An id not listed here is rejected
-# before any git/gh call: a typo must not silently open a sixth PR stream.
+# The audit streams allowed to own a ledger. An id not listed here is rejected
+# before any git/gh call: a typo must not silently open a sixth ledger stream.
 # The human names mirror the `name` of the matching watchdog in
-# agents/platform/cron/jobs.json — keep the two in step so the PR title and the
-# cron catalogue name the same thing.
+# agents/platform/cron/jobs.json — keep the two in step so the issue title and
+# the cron catalogue name the same thing.
 AUDITS: dict[str, str] = {
     "compliance-audit": "Security & RBAC Posture Audit",
     "security-patch-orchestrator": "Upgrade & Patch Readiness Audit",
@@ -79,7 +81,26 @@ RECOMMENDATION_FIELDS: tuple[tuple[str, str], ...] = (
 
 PROTECTED_BRANCHES = {"main", "master", "production"}
 BASE_BRANCH = "main"
-SCRATCH_DIR = "/opt/data/scratch"
+
+# Both directories must live on the PVC. `gh` and `git` are not binaries in the
+# agent container: /opt/credential-proxy/bin/{gh,git} POST argv and cwd to a
+# sidecar that runs the real tool in *its* filesystem. Only /opt/data is shared
+# between the two containers — /tmp is a per-container emptyDir — so a body file
+# written to the default temp dir names a path the sidecar cannot open, and a
+# checkout outside the workspace root is rejected by the sidecar outright.
+#
+# Overridable so the suite can point them at a temp directory. Off-cluster
+# /opt/data does not exist and is not creatable, and a harness that can only be
+# exercised where it is deployed is a harness whose failure paths are never
+# tested — which is how the clone that never happened survived this long.
+SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
+GITOPS_WORKSPACE = os.environ.get("FLEET_AUDIT_GITOPS_ROOT") or "/opt/data/gitops"
+
+# Applied to a pull request the harness itself closed as stale. It is the
+# discriminator that keeps a *human's* close final while letting the audit
+# re-propose a fix it withdrew on its own: strip the label and the close becomes
+# a veto. Requested in the `gh pr list` projection, so it costs no extra call.
+STALE_CLOSED_LABEL = "audit:stale-closed"
 
 # Wildcard stagers that must never reach `git add` — an audit stages named
 # remediation files only, never the whole working tree.
@@ -91,22 +112,33 @@ FORBIDDEN_ADD_PATHSPECS = {".", "-A", "--all", "-a", "*", ":/", "./", ":"}
 # wrong files.
 GLOB_METACHARACTERS = "*?[]"
 
-# A finding id becomes a component of the remediation branch
-# `platform-agent/fix-<audit-id>-<finding-id>`, so it must survive
-# `git check-ref-format`: no ':', no whitespace, no '..' run, no '.lock' suffix.
-FINDING_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?$")
+# A finding id becomes a component of the remediation branch, so it must
+# survive `git check-ref-format`: no ':', no whitespace, no '..' run, no
+# '.lock' suffix. `\Z` rather than `$` on purpose — Python's `$` also matches
+# immediately before a trailing newline, so `"abc\n"` would pass the pattern
+# and put a control character into a git ref. This is the exact expression the
+# five SOPs and SKILL.md quote to the model; keep the seven copies in step.
+# The optional tail makes a one-character id legal. Nothing about a single
+# letter is unsafe in a ref name, and the SOP fixtures use them.
+FINDING_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?\Z")
 
 # The hidden block that makes the run-over-run delta computable without keeping
-# any state outside the report itself. Anchored to line boundaries so an opener
-# pasted inside a fenced evidence excerpt cannot start a match that swallows the
-# real block further down the body.
+# any state outside the report itself.
+#
+# Every character class here is single-line (`[ \t]`, `[^\n]`) and the flags are
+# `re.M` alone. An earlier version combined `re.M` with `re.S`, which let the
+# lazy `.*?` cross newlines: an unterminated `<!-- audit-findings: [` pasted
+# from a cluster excerpt — exactly the text the SOPs mandate pasting verbatim —
+# started a match that ran past the real block at the bottom of the body and
+# consumed it, so every finding read as new forever and no stale pull request
+# was ever closed.
 DELTA_RE = re.compile(
-    r"^[ \t]*<!--\s*audit-findings:\s*(\[.*?\])\s*-->[ \t]*$", re.M | re.S
+    r"^[ \t]*<!--[ \t]*audit-findings:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
 # Per-finding marker on each heading, so a *resolved* finding can still be named
 # by title when it no longer exists in the current findings.json.
 FINDING_MARKER_RE = re.compile(
-    r"^####\s+(.*?)\s*<!--\s*finding:\s*(\S+?)\s*-->\s*$", re.M
+    r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
 )
 
 # Idempotency markers. Design §3.1 deliberately never mutates a `/remediate`
@@ -114,23 +146,46 @@ FINDING_MARKER_RE = re.compile(
 # "act exactly once" is carried instead by hidden markers in the bodies this
 # harness already owns, the same technique the delta block uses.
 PERSISTS_MARKER_RE = re.compile(
-    r"^[ \t]*<!--\s*audit-persists:\s*(\S+?)\s*-->[ \t]*$", re.M
+    r"^[ \t]*<!--[ \t]*audit-persists:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
 )
 REFUSED_MARKER_RE = re.compile(
-    r"^[ \t]*<!--\s*audit-refused:\s*(\S+?)\s*-->[ \t]*$", re.M
+    r"^[ \t]*<!--[ \t]*audit-refused:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
+)
+# Answered exactly once, which is what stops a `/remediate` becoming a standing
+# order that force-pushes over a reviewer's fixup commits every morning.
+ACKED_MARKER_RE = re.compile(
+    r"^[ \t]*<!--[ \t]*audit-acked:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
+)
+# Written into the closing comment of a pull request the *harness* closed, so
+# the audit trail says who closed it. The machine-readable half of the same
+# fact is the `audit:stale-closed` label — see STALE_CLOSED_LABEL.
+STALE_CLOSED_MARKER_RE = re.compile(
+    r"^[ \t]*<!--[ \t]*audit-stale-closed:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
 )
 
-# `/remediate <finding-id>` / `/remediate all`, at the start of a line.
-REMEDIATE_RE = re.compile(r"^[ \t]*/remediate[ \t]+(\S+)[ \t]*$", re.M)
-# Fenced code blocks are stripped before command matching, so a `/remediate`
-# quoted inside an evidence excerpt never fires.
-FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*$", re.M | re.S)
+# `/remediate <finding-id>` / `/remediate all`, at the start of a line. The
+# argument is captured loosely — anything up to end of line — so that a
+# malformed request like `/remediate f-1 please` is *answered* with a refusal
+# rather than silently matching nothing and leaving the requester waiting.
+REMEDIATE_RE = re.compile(r"^[ \t]*/remediate\b[ \t]*(.*?)[ \t]*$", re.M)
+# A fence opener. Fenced code blocks are stripped before command matching, so a
+# `/remediate` quoted inside an evidence excerpt never fires; strip_fenced_blocks
+# scans line by line rather than with one regex, because the regex form missed
+# both an unterminated fence and a block closed by a longer run of backticks.
+FENCE_OPEN_RE = re.compile(r"(`{3,}|~{3,})")
 
 MAX_EXCERPT_LINES = 40
 MAX_EXCERPT_CHARS = 2000
 # The SOPs mandate pasting the evidence command verbatim, which makes it the
 # dominant per-finding term; trim_excerpt guards the wrong field on its own.
 MAX_COMMAND_CHARS = 2000
+# The free-text schema fields. Without these a schema-valid document can render
+# one finding larger than the whole body budget, and since at least one finding
+# always renders that overflows the body and publishes nothing at all.
+MAX_TITLE_CHARS = 300
+MAX_TEXT_CHARS = 1500
+MAX_NOTE_CHARS = 2000
+MAX_CELL_CHARS = 120
 
 # GitHub rejects an issue or pull-request body over 65,536 characters with a
 # 422. Issue bodies carry the identical limit, so this budget is the difference
@@ -139,6 +194,11 @@ MAX_BODY_CHARS = 65_536
 BODY_BUDGET = 60_000
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
+
+# `gh pr list` takes a limit, not a cursor. A full page means the oldest
+# remediation branches fell off the end, and a branch that reads as "no pull
+# request exists" is one the harness will force-push over. Detect it and stop.
+MAX_PR_PAGE = 1000
 
 # Auto-promotion ceiling per `finish` run (design §3.1). An explicit
 # `/remediate` bypasses it: a human asked for that one by name.
@@ -167,6 +227,139 @@ def log(msg: str) -> None:
         file=sys.stderr,
         flush=True,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Pure helpers — text hygiene
+# --------------------------------------------------------------------------- #
+
+
+def normalise_newlines(text: str | None) -> str:
+    """Fold CRLF and lone CR to LF before any line-anchored regex sees the text.
+
+    Every marker pattern in this file ends `[ \\t]*$`, and `\\r` is neither a
+    space nor a tab. GitHub's web comment box submits CRLF, so without this a
+    `/remediate` typed in a browser is ignored, a body a human edited loses its
+    delta block, and both comment-once guards fail open and comment again. This
+    is the most reachable defect class in the harness: it fires on ordinary
+    browser use, not on hostile input.
+    """
+    if not text:
+        return ""
+    return str(text).replace("\r\n", "\n").replace("\r", "\n")
+
+
+REDACTED = "[redacted by audit_report.py]"
+
+# Field names whose value is a credential often enough that publishing it to a
+# GitHub issue is never worth the convenience. Matched as a YAML/JSON key with a
+# value on the same line, so `kubectl get secret -o jsonpath='{.data.token}'`
+# in an evidence *command* is untouched — there is no value after the colon.
+_SECRET_KEY_RE = re.compile(
+    r"""(?ix)
+    ^(?P<lead>[\s"'\-]*"?)
+    (?P<key>password|passwd|token|secret|api[_-]?key|access[_-]?key
+        |auth|authorization|credentials?
+        |private[_-]?key|privatekey|clientkey|clientcertificate
+        |client-key-data|client-certificate-data|cluster-?ca-?certificate
+        |access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key)
+    (?P<sep>"?\s*[:=]\s*)
+    (?P<value>\S.*?)
+    (?P<trail>\s*,?)$
+    """,
+    re.M,
+)
+
+# Token shapes that identify themselves. Redacted anywhere they appear, because
+# a bearer token in the middle of a log line is still a bearer token.
+_TOKEN_SHAPE_RE = re.compile(
+    r"(?:gh[pousr]_[A-Za-z0-9]{16,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|ya29\.[A-Za-z0-9._\-]{20,}"
+    r"|AIza[A-Za-z0-9_\-]{30,}"
+    r"|xox[baprs]-[A-Za-z0-9\-]{10,}"
+    r"|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})"
+)
+
+# The body between a PEM header and its footer, header and footer preserved so
+# the reader can still see *what* was redacted.
+_PEM_RE = re.compile(
+    r"(-----BEGIN [A-Z0-9 ]*-----)(.*?)(-----END [A-Z0-9 ]*-----)", re.S
+)
+
+_BEARER_RE = re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._\-+/=]{12,})")
+
+# The opener of a Kubernetes Secret payload. Everything indented under it is a
+# credential by definition, whatever the individual keys are called.
+_SECRET_BLOCK_RE = re.compile(r"^(\s*)(data|stringData)\s*:\s*$")
+_INDENTED_PAIR_RE = re.compile(r"^(\s*)([\w.\-/]+)\s*:\s*(\S.*)$")
+
+
+def _redact_secret_blocks(text: str) -> str:
+    """Blank every value indented under a `data:` / `stringData:` key.
+
+    A Secret's payload is credential material regardless of what the individual
+    keys are named, so the key-name heuristic below cannot see it. Indentation
+    is the only structure available in an excerpt, which is why this is a line
+    scan rather than a YAML parse — the excerpt is a fragment, not a document.
+    """
+    out: list[str] = []
+    block_indent: int | None = None
+    for line in text.split("\n"):
+        opener = _SECRET_BLOCK_RE.match(line)
+        if opener:
+            block_indent = len(opener.group(1))
+            out.append(line)
+            continue
+        if block_indent is not None:
+            pair = _INDENTED_PAIR_RE.match(line)
+            if pair and len(pair.group(1)) > block_indent:
+                out.append(f"{pair.group(1)}{pair.group(2)}: {REDACTED}")
+                continue
+            if line.strip() and (len(line) - len(line.lstrip())) <= block_indent:
+                block_indent = None
+        out.append(line)
+    return "\n".join(out)
+
+
+def redact_secrets(text: str | None) -> str:
+    """Strip high-confidence credential shapes out of model-authored text.
+
+    The five governance SOPs tell the model never to paste a Secret's `data:`,
+    a token, or a private key into evidence, and promise this backstop for when
+    it does anyway. It is deliberately conservative: it fires on a *named* field,
+    a self-identifying token prefix, or a PEM header — never on bare base64,
+    because audit evidence legitimately contains base64 and long opaque
+    identifiers, and over-redaction destroys the artifact's whole purpose.
+
+    A backstop, not a licence. Anything that reaches here has already been
+    written into a file on disk.
+    """
+    if not text:
+        return ""
+    out = _PEM_RE.sub(rf"\1\n{REDACTED}\n\3", str(text))
+    out = _redact_secret_blocks(out)
+    out = _SECRET_KEY_RE.sub(
+        lambda m: f"{m.group('lead')}{m.group('key')}{m.group('sep')}{REDACTED}{m.group('trail')}",
+        out,
+    )
+    out = _BEARER_RE.sub(rf"\1 {REDACTED}", out)
+    return _TOKEN_SHAPE_RE.sub(REDACTED, out)
+
+
+def clip_text(text: str | None, limit: int) -> str:
+    """Redact, then clip a free-text schema field to `limit` characters.
+
+    Every free-text field is capped, not only the evidence: `title`, `impact`,
+    the three `recommendation` sub-fields and `remediation.note` were uncapped,
+    and since `select_rendered_findings` guarantees at least one finding always
+    renders, a single oversized field could push the body past GitHub's limit
+    and publish nothing at all.
+    """
+    value = redact_secrets(text).strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + " …(truncated)"
 
 
 # --------------------------------------------------------------------------- #
@@ -217,14 +410,27 @@ def _require_str(value: object, where: str, *, allow_empty: bool = True) -> str:
 
 
 def _require_repo_relative(path: str, where: str) -> str:
-    """A remediation path is staged with `git add` — keep it inside the repo."""
+    """A remediation path is staged with `git add` — keep it inside the repo.
+
+    Returns the **normalised** path. Normalising here rather than at each call
+    site is what makes `remediation_groups` correct: `a/b.yaml` and `./a/b.yaml`
+    name one file, and a grouper that compares raw strings puts them in two
+    groups, opens two pull requests against the same file, and the second one
+    conflicts. Every downstream consumer — grouping, the branch digest, the
+    `git add` pathspec, the existence check — sees the same spelling.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise ValidationError(f"{where}: required, must be a non-empty path")
+    if "\x00" in path:
+        raise ValidationError(f"{where}: must not contain a NUL byte")
     if "\\" in path or path.startswith("/") or PurePosixPath(path).is_absolute():
         raise ValidationError(
             f"{where}: must be a POSIX path relative to the repository root, got {path!r}"
         )
-    if ".." in PurePosixPath(path).parts:
+    if path.startswith(":"):
         raise ValidationError(
-            f"{where}: must not escape the repository root ('..' segment), got {path!r}"
+            f"{where}: must not begin with ':' — git reads a leading colon as a "
+            f"pathspec magic prefix, not a filename; got {path!r}"
         )
     found = [char for char in GLOB_METACHARACTERS if char in path]
     if found:
@@ -232,26 +438,50 @@ def _require_repo_relative(path: str, where: str) -> str:
             f"{where}: must name one literal file, not a glob "
             f"(contains {', '.join(repr(c) for c in found)}), got {path!r}"
         )
-    if path.startswith(":"):
+
+    # Drop the no-op segments git itself would drop, then judge what remains.
+    # Checking `..` before this would pass `a/./../../etc`, whose *parts* start
+    # with a legitimate-looking `a`.
+    parts = [p for p in PurePosixPath(path).parts if p not in ("", ".")]
+    if ".." in parts:
         raise ValidationError(
-            f"{where}: must not begin with ':' — git reads a leading colon as a "
-            f"pathspec magic prefix, not a filename; got {path!r}"
+            f"{where}: must not escape the repository root ('..' segment), got {path!r}"
         )
-    return path
+    if not parts:
+        raise ValidationError(
+            f"{where}: must name a file inside the repository, got {path!r}"
+        )
+    if parts[0] == ".git":
+        raise ValidationError(
+            f"{where}: must not write inside '.git' — that is the repository's "
+            f"own state, not a manifest; got {path!r}"
+        )
+    if path.endswith("/"):
+        raise ValidationError(
+            f"{where}: must name one file, not a directory, got {path!r}"
+        )
+    return "/".join(parts)
 
 
 def validate_finding_id(fid: str, where: str) -> str:
-    """A finding id is a git ref component, not just a delta key.
+    """A finding id is a join key and an operator types it, so its charset is narrow.
 
-    Design §2 names the remediation branch
-    `platform-agent/fix-<audit-id>-<finding-id>`, so an unconstrained id yields
-    a branch `git check-ref-format` rejects — not merely a churning delta.
+    The remediation branch is
+    `platform-agent/fix-<audit-id>-<slug>-<digest>`, where the slug is derived
+    from a manifest path — so an id no longer reaches the ref name directly.
+    The constraint stays anyway, for two reasons that outlive the naming
+    scheme: the id is the join key of the hidden delta block and of the
+    `audit-persists:<id>` marker, both of which are line-anchored regexes that
+    a whitespace-bearing or case-varying id would quietly break; and it is
+    interpolated into `/remediate <id>`, which an operator types by hand.
     """
     if not FINDING_ID_RE.match(fid):
         raise ValidationError(
             f"{where}: {fid!r} is not a usable id. Use 1-100 characters matching "
-            "[a-z0-9._-], starting and ending alphanumeric — the id becomes part "
-            "of a git branch name, so ':', whitespace and uppercase are refused"
+            "[a-z0-9._-], starting and ending alphanumeric — the id is the join key "
+            "of the delta block and the audit-persists marker, both line-anchored, "
+            "and an operator types it in '/remediate <id>', so ':', whitespace and "
+            "uppercase are refused"
         )
     if ".." in fid:
         raise ValidationError(
@@ -436,7 +666,13 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 path, f"findings[{i}].remediation.path", allow_empty=False
             )
             assert isinstance(path, str)
-            _require_repo_relative(path, f"findings[{i}].remediation.path")
+            # Write the normalised spelling back. Grouping, the branch digest
+            # and the `git add` pathspec all key on this string; if `a/b.yaml`
+            # and `./a/b.yaml` survive as two spellings they become two groups,
+            # two pull requests against one file, and a conflict on the second.
+            remediation["path"] = _require_repo_relative(
+                path, f"findings[{i}].remediation.path"
+            )
         elif path:
             raise ValidationError(
                 f"findings[{i}].remediation.path: only permitted when kind == "
@@ -477,6 +713,29 @@ def manifest_paths(findings: list[dict]) -> list[str]:
             if path:
                 paths.add(str(path))
     return sorted(paths)
+
+
+def coverage_gaps(data: dict) -> list[str]:
+    """Why this run cannot speak for the whole fleet, if it cannot.
+
+    Two different gaps, one consequence. A cluster in `scope.skipped` was never
+    read; a cluster carrying `limitations` was read but not fully checked.
+    Either way a finding's *absence* proves nothing, so the run must not treat
+    "absent from this document" as "fixed" — not in the delta it announces, not
+    in the remediation pull requests it closes, and not by retiring the ledger
+    and declaring the stream clean.
+    """
+    scope = data.get("scope") or {}
+    gaps: list[str] = []
+    for entry in scope.get("skipped") or []:
+        cluster = str(entry.get("cluster", "")).strip() or "(unnamed)"
+        gaps.append(f"{cluster}: not audited — {entry.get('reason', 'no reason given')}")
+    for cluster in scope.get("clusters") or []:
+        limitation = str(cluster.get("limitations", "")).strip()
+        if limitation:
+            name = str(cluster.get("name", "")).strip() or "(unnamed)"
+            gaps.append(f"{name}: partially audited — {limitation}")
+    return gaps
 
 
 def build_git_add_command(paths: list[str]) -> list[str]:
@@ -529,7 +788,8 @@ def delta_block(ids: list[str]) -> str:
 
 
 def parse_delta_block(body: str | None) -> list[str]:
-    """Read the finding ids out of a previous PR body ([] when absent/unparseable)."""
+    """Read the finding ids out of a previous issue body ([] when absent/unparseable)."""
+    body = normalise_newlines(body)
     if not body:
         return []
     matches = DELTA_RE.findall(body)
@@ -545,7 +805,8 @@ def parse_delta_block(body: str | None) -> list[str]:
 
 
 def parse_finding_titles(body: str | None) -> dict[str, str]:
-    """Recover {finding id: title} from a previous PR body, to name resolved findings."""
+    """Recover {finding id: title} from a previous issue body, to name resolved findings."""
+    body = normalise_newlines(body)
     if not body:
         return {}
     return {fid: title.strip() for title, fid in FINDING_MARKER_RE.findall(body)}
@@ -618,17 +879,34 @@ def remediation_groups(findings: list[dict]) -> list[list[dict]]:
     return groups
 
 
+def _branch_slug(text: str) -> str:
+    """A short, legible, ref-safe fragment — decoration, never the join key."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:24].strip("-")
+
+
 def group_branch_for(audit_id: str, group: list[dict]) -> str:
-    """Name a remediation branch after the lowest-sorted finding in its group.
+    """Name a remediation branch after the *files* the group stages.
 
     The branch name is the only durable link between a finding and its pull
     request — one `gh pr list --json headRefName` reconstructs the whole mapping
-    with no state kept anywhere else.
+    with no state kept anywhere else. That makes its stability load-bearing.
+
+    Keying it on the lowest finding id looked reasonable and was not: finding
+    ids are regenerated from scratch every run, so the day a group's lowest id
+    resolves, the survivors rename their branch, the open pull request is
+    orphaned, and a duplicate opens against the same file. The path set is the
+    thing that actually identifies the work — it is what makes the group a
+    group — and it is stable across id churn. A leading slug from the first
+    path keeps the name readable in the GitHub UI; the digest is what joins.
     """
-    ids = sorted(str(f.get("id", "")) for f in group if f.get("id"))
-    if not ids:
+    paths = group_paths(group)
+    if not paths:
         raise ValueError("cannot name a remediation branch for an empty group")
-    return f"platform-agent/fix-{audit_id}-{ids[0]}"
+    digest = hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest()[:10]
+    slug = _branch_slug(PurePosixPath(paths[0]).stem)
+    suffix = f"{slug}-{digest}" if slug else digest
+    return f"platform-agent/fix-{audit_id}-{suffix}"
 
 
 def group_paths(group: list[dict]) -> list[str]:
@@ -645,18 +923,64 @@ def group_paths(group: list[dict]) -> list[str]:
 
 
 def strip_fenced_blocks(text: str) -> str:
-    """Drop fenced code blocks so a `/remediate` quoted in evidence never fires."""
-    return FENCE_RE.sub("", text or "")
+    """Drop fenced code blocks so a `/remediate` quoted in evidence never fires.
+
+    A non-greedy ```…``` regex is the obvious implementation and it is wrong in
+    the direction that matters. Given three fences it pairs the first with the
+    second and leaves the third dangling, so text between fence 2 and fence 3 —
+    text that is *inside* a code block to every Markdown renderer, and to the
+    human who wrote it — survives stripping and its `/remediate` fires. Quoting
+    a command to discuss it is the single most likely thing to be written in
+    one of these issues.
+
+    So: CommonMark's actual rule. A fence opens on a run of three or more
+    backticks or tildes; it closes on a run of the same character, at least as
+    long, with nothing else on the line. An unterminated fence runs to the end.
+    """
+    if not text:
+        return ""
+    out: list[str] = []
+    fence_char = ""
+    fence_len = 0
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if fence_char:
+            if (
+                stripped
+                and set(stripped) == {fence_char}
+                and len(stripped) >= fence_len
+            ):
+                fence_char = ""
+                fence_len = 0
+            continue
+        match = FENCE_OPEN_RE.match(stripped)
+        if match:
+            fence_char = match.group(1)[0]
+            fence_len = len(match.group(1))
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+class RemediateRequests(NamedTuple):
+    """Everything the ledger's comments asked for, and who asked."""
+
+    targets: list[str]
+    refusals: list[dict]
+    accepted_by_comment: dict[str, list[str]]
 
 
 def parse_remediate_commands(
     comments: list[dict], findings: list[dict]
-) -> tuple[list[str], list[dict]]:
+) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
-    Returns (authorized finding ids, refusals). A refusal is one entry per
-    comment, not per bad target, because the reply is posted once per comment
-    and marked with that comment's node id.
+    A refusal is one entry per comment, not per bad target, because the reply is
+    posted once per comment and marked with that comment's node id.
+
+    `accepted_by_comment` exists so a request that *worked* gets an answer too.
+    A command that silently succeeds is indistinguishable from one that was
+    never read — the requester waits, sees nothing, and comments again.
     """
     by_id = {str(f.get("id", "")): f for f in findings}
     promotable = {
@@ -667,9 +991,10 @@ def parse_remediate_commands(
 
     targets: set[str] = set()
     refusals: list[dict] = []
+    accepted_by_comment: dict[str, list[str]] = {}
 
     for comment in comments or []:
-        body = strip_fenced_blocks(str(comment.get("body", "")))
+        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
         matches = REMEDIATE_RE.findall(body)
         if not matches:
             continue
@@ -693,10 +1018,12 @@ def parse_remediate_commands(
             )
             continue
 
+        accepted: list[str] = []
         for raw in matches:
             target = raw.strip().strip("`")
             if target == "all":
                 targets |= promotable
+                accepted.extend(sorted(promotable))
                 continue
             if target not in by_id:
                 reasons.append(
@@ -713,13 +1040,19 @@ def parse_remediate_commands(
                 )
                 continue
             targets.add(target)
+            accepted.append(target)
 
+        if accepted:
+            accepted_by_comment.setdefault(node_id, [])
+            for target in accepted:
+                if target not in accepted_by_comment[node_id]:
+                    accepted_by_comment[node_id].append(target)
         if reasons:
             refusals.append(
                 {"comment_id": node_id, "author": author, "reasons": reasons}
             )
 
-    return sorted(targets), refusals
+    return RemediateRequests(sorted(targets), refusals, accepted_by_comment)
 
 
 def pending_remediate_targets(comments: list[dict]) -> list[str]:
@@ -736,7 +1069,7 @@ def pending_remediate_targets(comments: list[dict]) -> list[str]:
         association = str(comment.get("authorAssociation", "") or "").upper()
         if association not in WRITE_ASSOCIATIONS:
             continue
-        body = strip_fenced_blocks(str(comment.get("body", "")))
+        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
         for raw in REMEDIATE_RE.findall(body):
             target = raw.strip().strip("`")
             if target and target != "all":
@@ -786,18 +1119,75 @@ def derive_finding_state(reproduces: bool, pr: dict | None) -> str:
     return STATE_RESOLVED_MERGED if merged else STATE_RESOLVED
 
 
+def pr_labels(pr: dict | None) -> set[str]:
+    """The label names on a `gh pr list --json labels` record."""
+    labels = (pr or {}).get("labels") or []
+    names: set[str] = set()
+    for label in labels:
+        if isinstance(label, dict):
+            name = label.get("name")
+        else:
+            name = label
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
+def pr_is_merged(pr: dict | None) -> bool:
+    if not pr:
+        return False
+    return str(pr.get("state", "")).upper() == "MERGED" or bool(pr.get("mergedAt"))
+
+
+def pr_closed_by_harness(pr: dict | None) -> bool:
+    """True when *this harness* closed the pull request, not a human.
+
+    The distinction is the whole of the close-semantics decision. When a finding
+    stops reproducing the harness closes its pull request as stale and labels it
+    `audit:stale-closed`; if the finding comes back, re-opening a fix is exactly
+    right. When a *human* closes one, that is a considered rejection of the
+    proposed fix and the harness must never overrule it by opening the same
+    pull request again tomorrow morning, and the morning after that.
+
+    The escape hatch for a human who changes their mind is `/remediate <id>` —
+    an explicit request, from someone with write access, on the record.
+    """
+    if not pr or pr_is_merged(pr):
+        return False
+    if str(pr.get("state", "")).upper() != "CLOSED":
+        return False
+    return STALE_CLOSED_LABEL in pr_labels(pr)
+
+
+class PromotionPlan(NamedTuple):
+    """What `finish` will do about remediation pull requests this run."""
+
+    promote: list[str]
+    withheld: list[str]
+    already_open: list[str]
+
+
 def promotion_candidates(
     findings: list[dict],
     pr_by_finding: dict[str, dict | None],
     requested: list[str] | None = None,
     cap: int = AUTO_PROMOTION_CAP,
-) -> tuple[list[str], list[str]]:
-    """Split findings into (promote now, withheld for an explicit request).
+) -> PromotionPlan:
+    """Decide which findings become pull requests this run.
 
-    Auto-promotion is deliberately narrow — `critical`, `manifest`, and no pull
-    request on its branch in any state — and capped, so one bad night cannot
-    bury the repository in generated pull requests. An explicit `/remediate`
-    bypasses the cap: a human asked for that one by name.
+    Auto-promotion is deliberately narrow — `critical`, `manifest`, and no
+    live pull request on its branch — and capped, so one bad night cannot bury
+    the repository in generated pull requests. An explicit `/remediate` bypasses
+    the cap: a human asked for that one by name.
+
+    Two states are *not* "no pull request", and conflating them is how this goes
+    wrong in opposite directions. A pull request the harness closed as stale is
+    re-promotable — otherwise a finding that flaps can never be fixed again
+    after its first quiet day. A pull request a human closed is not, and neither
+    is one they merged: re-opening either overrules a person, daily, forever.
+
+    `already_open` is neither promoted nor withheld — the work exists. It is
+    reported so an explicit request gets an answer instead of silence.
 
     The cap counts findings, and a group of findings sharing a path collapses to
     one pull request, so the number of PRs opened is at most `cap`.
@@ -805,11 +1195,19 @@ def promotion_candidates(
     by_id = {str(f.get("id", "")): f for f in findings}
     requested_set = {fid for fid in (requested or []) if fid in by_id}
 
-    promote = [
-        fid
-        for fid in sorted(requested_set)
-        if (by_id[fid].get("remediation") or {}).get("kind") == "manifest"
-    ]
+    promote: list[str] = []
+    already_open: list[str] = []
+
+    for fid in sorted(requested_set):
+        if (by_id[fid].get("remediation") or {}).get("kind") != "manifest":
+            continue
+        pr = pr_by_finding.get(fid)
+        if pr and str(pr.get("state", "")).upper() == "OPEN":
+            # Force-pushing over a live pull request would discard whatever a
+            # reviewer pushed onto it. The ledger already links it.
+            already_open.append(fid)
+            continue
+        promote.append(fid)
 
     auto: list[str] = []
     for finding in sort_findings(findings):
@@ -820,12 +1218,13 @@ def promotion_candidates(
             continue
         if (finding.get("remediation") or {}).get("kind") != "manifest":
             continue
-        if pr_by_finding.get(fid) is not None:
+        pr = pr_by_finding.get(fid)
+        if pr is not None and not pr_closed_by_harness(pr):
             continue
         auto.append(fid)
 
     promote.extend(auto[:cap])
-    return promote, auto[cap:]
+    return PromotionPlan(promote, auto[cap:], already_open)
 
 
 # --------------------------------------------------------------------------- #
@@ -841,6 +1240,14 @@ def refused_marker(comment_id: str) -> str:
     return f"<!-- audit-refused:{comment_id} -->"
 
 
+def acked_marker(comment_id: str) -> str:
+    return f"<!-- audit-acked:{comment_id} -->"
+
+
+def stale_closed_marker(pr_number: int | str) -> str:
+    return f"<!-- audit-stale-closed:{pr_number} -->"
+
+
 def has_marker(text: str | None, pattern: re.Pattern[str], value: str) -> bool:
     """True when `text` already carries this marker.
 
@@ -848,9 +1255,15 @@ def has_marker(text: str | None, pattern: re.Pattern[str], value: str) -> bool:
     writer can re-issue one after closing a pull request. "Act exactly once"
     therefore lives in the bodies the harness owns, not in the command.
     """
+    text = normalise_newlines(text)
     if not text:
         return False
-    return value in {match for match in pattern.findall(text)}
+    return value in set(pattern.findall(text))
+
+
+def any_marker(texts: list[str | None], pattern: re.Pattern[str], value: str) -> bool:
+    """True when any of `texts` carries this marker (a body plus its comments)."""
+    return any(has_marker(text, pattern, value) for text in texts)
 
 
 # --------------------------------------------------------------------------- #
@@ -859,14 +1272,37 @@ def has_marker(text: str | None, pattern: re.Pattern[str], value: str) -> bool:
 
 
 def _cell(text: str) -> str:
-    """Make a value safe inside a Markdown table cell."""
-    return str(text).replace("|", "\\|").replace("\n", " ").strip()
+    """Make a value safe, and short, inside a Markdown table cell.
+
+    A cell is a summary line — a title that runs to two thousand characters
+    turns the findings table into an unreadable wall and spends budget the
+    detail section needs. Clipped here rather than at validation so an
+    over-long title costs its own legibility and nothing else.
+    """
+    value = redact_secrets(text).replace("|", "\\|").replace("\n", " ").strip()
+    if len(value) > MAX_CELL_CHARS:
+        value = value[: MAX_CELL_CHARS - 1].rstrip() + "…"
+    return value
 
 
-def _fence(text: str) -> str:
-    """A backtick fence long enough to wrap text that itself contains fences."""
+def _fence_for(text: str) -> str:
+    """A backtick run longer than any inside `text`, so the block cannot break out."""
     longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
     return "`" * max(3, longest + 1)
+
+
+def _code_block(text: str, lang: str = "", *, placeholder: str = "") -> list[str]:
+    """Render a complete fenced block — opener, body, closer.
+
+    Returning the whole block rather than just the delimiter is the point.
+    `_fence()` returned a bare run of backticks, and two callers used that
+    return value as though it were the rendered block, emitting a stray ```
+    into a comment and dropping the command it was supposed to be showing.
+    A helper whose result is unusable on its own invites exactly that.
+    """
+    body = text if text.strip() else placeholder
+    fence = _fence_for(body)
+    return [f"{fence}{lang}", body, fence]
 
 
 def _clip_comment(text: str) -> str:
@@ -882,8 +1318,8 @@ def _clip_comment(text: str) -> str:
 
 
 def trim_excerpt(excerpt: str) -> str:
-    """Clip evidence output so one noisy finding cannot blow the PR body limit."""
-    text = (excerpt or "").strip("\n").rstrip()
+    """Redact, then clip evidence output so one noisy finding cannot blow the body limit."""
+    text = redact_secrets(normalise_newlines(excerpt)).strip("\n").rstrip()
     if not text:
         return ""
     lines = text.splitlines()
@@ -908,7 +1344,7 @@ def trim_command(command: str) -> str:
     that grows without bound. A truncated command is still a usable pointer;
     an unpublishable body is not.
     """
-    text = (command or "").strip()
+    text = redact_secrets(normalise_newlines(command)).strip()
     if len(text) <= MAX_COMMAND_CHARS:
         return text
     return (
@@ -936,14 +1372,19 @@ def render_finding(
     finding: dict, *, state: str | None = None, pr_url: str | None = None
 ) -> list[str]:
     fid = str(finding.get("id", ""))
-    title = str(finding.get("title", "")).strip()
+    # Every free-text field is clipped, not only the evidence. The body budget
+    # guarantees at least one finding always renders, so a single uncapped
+    # field on that one finding could push the description past GitHub's limit
+    # and publish nothing at all — the noisiest possible failure for the least
+    # important reason.
+    title = clip_text(finding.get("title", ""), MAX_TITLE_CHARS)
     namespace = str(finding.get("namespace", "")).strip()
     where = f"`{finding.get('cluster', '')}`"
     where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
 
     lines = [f"#### {title} <!-- finding:{fid} -->", ""]
     lines.append(f"- **Where:** {where} — `{finding.get('object', '')}`")
-    lines.append(f"- **Impact:** {finding.get('impact', '')}")
+    lines.append(f"- **Impact:** {clip_text(finding.get('impact', ''), MAX_TEXT_CHARS)}")
     if state:
         label = STATE_LABELS.get(state, state)
         suffix = f" — {pr_url}" if pr_url else ""
@@ -960,36 +1401,43 @@ def render_finding(
     command = trim_command(str(evidence.get("command", "")))
     lines.append("Evidence — reproduce with:")
     lines.append("")
-    fence = _fence(command)
-    lines += [f"{fence}bash", command, fence]
+    lines += _code_block(command, "bash", placeholder="# (no command supplied)")
 
     excerpt = trim_excerpt(str(evidence.get("excerpt", "")))
     if excerpt:
         lines.append("")
-        fence = _fence(excerpt)
-        lines += [f"{fence}text", excerpt, fence]
+        lines += _code_block(excerpt, "text")
 
     recommendation = finding.get("recommendation") or {}
     lines.append("")
-    lines.append(f"- **Recommendation:** {recommendation.get('action', '')}")
-    lines.append(f"- **Why this fix:** {recommendation.get('rationale', '')}")
-    lines.append(f"- **Risk on apply:** {recommendation.get('risk', '')}")
+    lines.append(
+        f"- **Recommendation:** {clip_text(recommendation.get('action', ''), MAX_TEXT_CHARS)}"
+    )
+    lines.append(
+        f"- **Why this fix:** {clip_text(recommendation.get('rationale', ''), MAX_TEXT_CHARS)}"
+    )
+    lines.append(
+        f"- **Risk on apply:** {clip_text(recommendation.get('risk', ''), MAX_TEXT_CHARS)}"
+    )
 
     remediation = finding.get("remediation") or {}
     kind = remediation.get("kind")
-    note = str(remediation.get("note", "")).strip()
     lines.append("")
     if kind == "manifest":
         path = str(remediation.get("path", ""))
+        note = clip_text(remediation.get("note", ""), MAX_NOTE_CHARS)
         suffix = f" — {note}" if note else ""
         lines.append(f"- **Remediation (manifest):** [`{path}`]({path}){suffix}")
     elif kind == "gcloud":
         lines.append("- **Remediation (gcloud):**")
         lines.append("")
-        command_note = trim_command(note)
-        fence = _fence(command_note)
-        lines += [f"{fence}bash", command_note or "# (no command supplied)", fence]
+        lines += _code_block(
+            trim_command(str(remediation.get("note", ""))),
+            "bash",
+            placeholder="# (no command supplied)",
+        )
     else:
+        note = clip_text(remediation.get("note", ""), MAX_NOTE_CHARS)
         lines.append(f"- **Remediation (manual):** {note or '_none supplied_'}")
     return lines
 
@@ -1236,8 +1684,28 @@ def _render_withheld(withheld: list[str], findings: list[dict]) -> list[str]:
     ]
     for fid in withheld:
         finding = by_id.get(fid) or {}
-        out.append(f"- `{fid}` — {finding.get('title', '')}")
+        out.append(f"- `{fid}` — {_cell(finding.get('title', ''))}")
     return out
+
+
+class RenderedIssue(NamedTuple):
+    """A ledger body together with what it actually managed to say.
+
+    `rendered_ids` is the reason this is not just a string. The delta the next
+    run computes, and the delta comment this run posts, must both be taken
+    against the ids the body *rendered* — never against the full finding set.
+    Get that wrong and a finding dropped for space is announced as resolved:
+    the harness claims a fix that never happened, on a critical, in writing.
+    """
+
+    body: str
+    rendered_ids: list[str]
+    omitted: list[dict]
+
+    @property
+    def partial(self) -> bool:
+        """True when the body could not carry every finding."""
+        return bool(self.omitted)
 
 
 def render_issue_body(
@@ -1248,7 +1716,7 @@ def render_issue_body(
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
     withheld: list[str] | None = None,
-) -> str:
+) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
 
     Everything but the findings renders and is measured first; whatever is left
@@ -1301,7 +1769,7 @@ def render_issue_body(
             "this is a harness bug, not a findings error — report it rather than "
             "trimming the audit"
         )
-    return body
+    return RenderedIssue(body, rendered_ids, omitted)
 
 
 def render_delta_comment(
@@ -1311,9 +1779,11 @@ def render_delta_comment(
     findings: list[dict],
     previous_titles: dict[str, str],
     generated_at: datetime,
+    *,
+    omitted: int = 0,
 ) -> str | None:
     """The delta comment, or None when nothing changed (silence beats noise)."""
-    if not new_ids and not resolved_ids:
+    if not new_ids and not resolved_ids and not omitted:
         return None
 
     by_id = {str(f.get("id", "")): f for f in findings}
@@ -1326,7 +1796,7 @@ def render_delta_comment(
         for fid in new_ids[:MAX_DELTA_ROWS]:
             finding = by_id.get(fid, {})
             severity = str(finding.get("severity", "unknown"))
-            title = str(finding.get("title", fid))
+            title = _cell(finding.get("title", fid))
             out.append(f"- **{severity}** — {title} (`{fid}`)")
         if len(new_ids) > MAX_DELTA_ROWS:
             out.append(f"- _…and {len(new_ids) - MAX_DELTA_ROWS} more_")
@@ -1336,7 +1806,7 @@ def render_delta_comment(
         out.append(f"**{len(resolved_ids)} resolved**")
         out.append("")
         for fid in resolved_ids[:MAX_DELTA_ROWS]:
-            title = previous_titles.get(fid) or fid
+            title = _cell(previous_titles.get(fid) or fid)
             out.append(f"- {title} (`{fid}`)")
         if len(resolved_ids) > MAX_DELTA_ROWS:
             out.append(f"- _…and {len(resolved_ids) - MAX_DELTA_ROWS} more_")
@@ -1345,6 +1815,17 @@ def render_delta_comment(
     out.append(
         "The ledger description has been rewritten to the current state of the fleet."
     )
+    if omitted:
+        # Said here because the delta is computed against what the body could
+        # carry. Without this line, "0 resolved" on a partial body reads as a
+        # complete picture of a fleet the description only half describes.
+        out += [
+            "",
+            f"**Coverage of this description is partial:** {omitted} further "
+            "finding(s) did not fit GitHub's body limit and are not listed above "
+            "or below. They are still counted in the title. Resolve some findings, "
+            "or narrow the audit's scope, to see them.",
+        ]
     # Capping the body made this path reachable: previously the body failed
     # first at ~67 findings, so a delta this large could never be produced.
     return _clip_comment("\n".join(out))
@@ -1353,38 +1834,56 @@ def render_delta_comment(
 def render_clean_comment(
     audit_id: str, data: dict, generated_at: datetime
 ) -> str:
-    """Comment posted when an audit that previously had findings comes back clean."""
+    """Comment posted when an audit that previously had findings comes back clean.
+
+    Two comments, really, because a clean run has two very different endings and
+    saying the wrong one is worse than saying nothing. Over complete coverage the
+    ledger closes and the comment is an all-clear. Over a coverage gap the ledger
+    stays open (see `handle_finish`), so the comment must not announce a closure
+    that is not happening — a reader who takes "closed as completed" at face
+    value on a still-open issue learns to distrust every other line the harness
+    writes.
+    """
     scope = data.get("scope") or {}
     clusters = list(scope.get("clusters") or [])
-    skipped = list(scope.get("skipped") or [])
+    gaps = coverage_gaps(data)
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     shown = clusters[:MAX_SCOPE_ROWS]
     names = ", ".join(f"`{c.get('name', '')}`" for c in shown)
     if len(clusters) > len(shown):
         names += f", and {len(clusters) - len(shown)} more"
 
-    out = [
-        f"### `{audit_id}` is now clean — closing",
-        "",
-        f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
-        f"{len(clusters)} audited cluster(s): {names}.",
-        "",
-        "Every finding previously reported here is gone, so this ledger is being "
-        "closed as completed. The next run that finds anything opens a fresh one.",
-    ]
-    if skipped:
-        out += [
+    if gaps:
+        out = [
+            f"### `{audit_id}` found nothing — but did not see the whole fleet",
             "",
-            f"**Caveat:** {len(skipped)} cluster(s) were skipped this run and are not "
-            "covered by this all-clear:",
+            f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
+            f"{len(clusters)} audited cluster(s): {names}.",
+            "",
+            "**This is not an all-clear, and the ledger stays open.** A finding's "
+            "absence only means it was fixed if the audit actually looked, so "
+            "nothing has been reported as resolved and no remediation pull request "
+            "has been closed. The ledger closes on the next run that reads the "
+            "whole fleet and still finds nothing.",
+            "",
+            f"Not covered by this run ({len(gaps)}):",
             "",
         ]
-        out += [
-            f"- `{_cell(entry.get('cluster', ''))}` — {_cell(entry.get('reason', ''))}"
-            for entry in skipped[:MAX_SCOPE_ROWS]
+    else:
+        out = [
+            f"### `{audit_id}` is now clean — closing",
+            "",
+            f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
+            f"{len(clusters)} audited cluster(s): {names}.",
+            "",
+            "Every finding previously reported here is gone, so this ledger is being "
+            "closed as completed. The next run that finds anything opens a fresh one.",
         ]
-        if len(skipped) > MAX_SCOPE_ROWS:
-            out.append(f"- _…and {len(skipped) - MAX_SCOPE_ROWS} more_")
+
+    if gaps:
+        out += [f"- {_cell(gap)}" for gap in gaps[:MAX_SCOPE_ROWS]]
+        if len(gaps) > MAX_SCOPE_ROWS:
+            out.append(f"- _…and {len(gaps) - MAX_SCOPE_ROWS} more_")
     return _clip_comment("\n".join(out))
 
 
@@ -1412,19 +1911,13 @@ def _select_pr_by_head(prs: list[dict], branch: str) -> dict | None:
     return matches[-1]
 
 
-def pr_is_merged(pr: dict | None) -> bool:
-    if not pr:
-        return False
-    return str(pr.get("state", "")).upper() == "MERGED" or bool(pr.get("mergedAt"))
-
-
 def remediation_pr_title(audit_id: str, group: list[dict]) -> str:
     """One subject for the whole group, named after what it fixes."""
     ordered = sort_findings(group)
     head = ordered[0]
     extra = len(ordered) - 1
     suffix = f" (+{extra} more)" if extra else ""
-    return f"fix({audit_id}): {head.get('title', '')}{suffix}"
+    return f"fix({audit_id}): {_cell(head.get('title', ''))}{suffix}"
 
 
 def group_commit_subject(audit_id: str, group: list[dict]) -> str:
@@ -1495,33 +1988,45 @@ def render_remediation_pr_body(
 
 
 def render_stale_close_comment(
-    audit_id: str, findings: list[dict], generated_at: datetime
+    audit_id: str,
+    findings: list[dict],
+    generated_at: datetime,
+    *,
+    pr_number: int | str = 0,
+    reason: str = "",
 ) -> str:
     """Why a remediation pull request is being closed unmerged."""
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     out = [
-        f"Closing unmerged: as of {stamp} the `{audit_id}` audit no longer "
-        "reproduces the finding(s) this pull request was opened for. Something "
-        "else fixed them, or the objects are gone.",
+        reason
+        or (
+            f"Closing unmerged: as of {stamp} the `{audit_id}` audit no longer "
+            "reproduces the finding(s) this pull request was opened for. Something "
+            "else fixed them, or the objects are gone."
+        ),
         "",
     ]
     for finding in sort_findings(findings):
-        out += [f"**`{finding.get('id', '')}` — {finding.get('title', '')}**", ""]
+        out += [
+            f"**`{finding.get('id', '')}` — {_cell(finding.get('title', ''))}**",
+            "",
+        ]
         # A resolved finding is absent from the current document, so its command
         # is only known when a previous body recorded it. Say nothing rather
         # than print an empty code fence.
         command = trim_command(str((finding.get("evidence") or {}).get("command", "")))
         if command:
-            out += [
-                "The command below no longer shows the deviation:",
-                "",
-                _fence(command),
-                "",
-            ]
-    out.append(
-        "The branch is left in place. If the finding comes back, the audit "
-        "opens a fresh pull request on it; nothing here is lost."
-    )
+            out += ["The command below no longer shows the deviation:", ""]
+            out += _code_block(command, "bash")
+            out.append("")
+    out += [
+        "The branch is left in place, and this pull request is labelled "
+        f"`{STALE_CLOSED_LABEL}`. If the finding comes back the audit reopens a "
+        "fresh pull request on the same branch — a close made *here*, by the "
+        "harness, is not read as a rejection of the fix.",
+        "",
+        stale_closed_marker(pr_number),
+    ]
     return "\n".join(out)
 
 
@@ -1531,25 +2036,29 @@ def render_persists_comment(
     """Said once, on a merged pull request whose finding still reproduces."""
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     evidence = finding.get("evidence") or {}
-    return "\n".join(
-        [
-            f"This fix merged, but as of {stamp} the `{audit_id}` audit still "
-            f"reproduces `{finding.get('id', '')}` — {finding.get('title', '')}.",
-            "",
-            "Either the remediation was incomplete, or something outside this "
-            "repository reverted it. This pull request is **not** reopened: it "
-            "merged, and reopening it would misrepresent history. The finding "
-            "stays on the ledger, flagged, until it stops reproducing.",
-            "",
-            "Current evidence:",
-            "",
-            _fence(trim_command(str(evidence.get("command", "")))),
-            "",
-            _fence(trim_excerpt(str(evidence.get("excerpt", "")))),
-            "",
-            persists_marker(str(finding.get("id", ""))),
-        ]
+    out = [
+        f"This fix merged, but as of {stamp} the `{audit_id}` audit still "
+        f"reproduces `{finding.get('id', '')}` — {_cell(finding.get('title', ''))}.",
+        "",
+        "Either the remediation was incomplete, or something outside this "
+        "repository reverted it. This pull request is **not** reopened: it "
+        "merged, and reopening it would misrepresent history. The finding "
+        "stays on the ledger, flagged, until it stops reproducing.",
+        "",
+        "Current evidence:",
+        "",
+    ]
+    out += _code_block(
+        trim_command(str(evidence.get("command", ""))),
+        "bash",
+        placeholder="# (no command supplied)",
     )
+    excerpt = trim_excerpt(str(evidence.get("excerpt", "")))
+    if excerpt:
+        out.append("")
+        out += _code_block(excerpt, "text")
+    out += ["", persists_marker(str(finding.get("id", "")))]
+    return "\n".join(out)
 
 
 def render_refusal_comment(refusal: dict, generated_at: datetime) -> str:
@@ -1565,48 +2074,175 @@ def render_refusal_comment(refusal: dict, generated_at: datetime) -> str:
     return "\n".join(out)
 
 
+def render_ack_comment(
+    comment_id: str,
+    accepted: list[str],
+    outcomes: dict[str, str],
+    generated_at: datetime,
+) -> str:
+    """Said once per `/remediate` the harness *did* act on.
+
+    Silence is not an acceptable answer to a command. A requester who sees
+    nothing cannot tell "the audit has not run yet" from "the audit ignored
+    me", so they comment again, and the ledger fills with duplicate requests
+    for work that is already done.
+    """
+    stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
+    out = [f"That `/remediate` was processed on {stamp}:", ""]
+    for fid in accepted:
+        out.append(f"- `{fid}` — {outcomes.get(fid, 'no pull request was opened')}")
+    out += ["", acked_marker(comment_id)]
+    return "\n".join(out)
+
+
 # --------------------------------------------------------------------------- #
 # I/O shell — every subprocess call funnels through run_cmd
 # --------------------------------------------------------------------------- #
 
 
+# The clone every `git` and `gh` call runs inside, once `ensure_workspace` has
+# established it. Module-level rather than threaded through forty call sites,
+# but *never* implicit at the boundary: `run_cmd` still takes an explicit `cwd`
+# and only falls back to this.
+_WORKSPACE: Path | None = None
+
+
+def workspace() -> Path | None:
+    return _WORKSPACE
+
+
+def set_workspace(path: Path | None) -> None:
+    global _WORKSPACE
+    _WORKSPACE = path
+
+
 def run_cmd(
-    cmd: list[str], *, check: bool = True, capture: bool = True
+    cmd: list[str],
+    *,
+    check: bool = True,
+    capture: bool = True,
+    cwd: str | Path | None = None,
 ) -> subprocess.CompletedProcess:
-    log("$ " + " ".join(cmd))
+    """Run one subprocess, always from a known directory.
+
+    `cwd` is not a convenience. `gh` and `git` are not binaries in this
+    container: `/opt/credential-proxy/bin/{gh,git}` are shims that POST their
+    argv **and `os.getcwd()`** to a sidecar, which runs the real tool in its own
+    filesystem at that path and rejects anything outside the workspace root. A
+    call made from whatever directory the agent happened to be in is not merely
+    untidy — it is a call the sidecar refuses, or worse, one that lands in the
+    wrong clone.
+    """
+    target = Path(cwd) if cwd is not None else _WORKSPACE
+    where = f" (in {target})" if target is not None else ""
+    log("$ " + " ".join(cmd) + where)
     try:
-        return subprocess.run(cmd, check=check, text=True, capture_output=capture)
+        result = subprocess.run(
+            cmd,
+            check=check,
+            text=True,
+            capture_output=capture,
+            cwd=str(target) if target is not None else None,
+        )
     except subprocess.CalledProcessError as exc:
-        if check:
-            log(f"FAILED ({exc.returncode}): {' '.join(cmd)}")
-            if exc.stderr:
-                log(exc.stderr.strip())
-            raise
-        return exc
+        log(f"FAILED ({exc.returncode}): {' '.join(cmd)}")
+        if exc.stderr:
+            log(exc.stderr.strip())
+        raise
+    # `check=False` callers used to fail in silence: the logging lived in the
+    # except arm, which a non-raising call never reaches, so a `gh` outage on
+    # the comment path left no trace anywhere in the run's output.
+    if result.returncode != 0:
+        log(f"FAILED ({result.returncode}): {' '.join(cmd)}")
+        if capture and result.stderr:
+            log(result.stderr.strip())
+    return result
 
 
-def git(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
-    return run_cmd(["git"] + args, check=check)
+def git(
+    args: list[str], *, check: bool = True, cwd: str | Path | None = None
+) -> subprocess.CompletedProcess:
+    return run_cmd(["git"] + args, check=check, cwd=cwd)
 
 
-def gh(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
-    return run_cmd(["gh"] + args, check=check)
+def gh(
+    args: list[str], *, check: bool = True, cwd: str | Path | None = None
+) -> subprocess.CompletedProcess:
+    return run_cmd(["gh"] + args, check=check, cwd=cwd)
 
 
-def refresh_credentials() -> None:
-    """Mint the short-lived repo-scoped GitHub App token into gh + the git credential store."""
+def refresh_credentials(repo: str | None = None) -> None:
+    """Mint the short-lived repo-scoped GitHub App token into gh + the git credential store.
+
+    `repo` is passed explicitly because the fallback is not usable here:
+    `refresh_git_credentials()` with no argument re-derives the repository by
+    running `git config --get remote.origin.url` in the *current* directory, and
+    on this path there is no clone in the current directory yet — establishing
+    one is what the token is for.
+    """
     from github_token_refresh import refresh_git_credentials
 
-    refresh_git_credentials()
+    refresh_git_credentials(repo)
+
+
+SETTINGS_PATH = os.environ.get("FLEET_AUDIT_SETTINGS") or "/opt/data/SETTINGS.md"
+
+# "- **Git Repo:** https://github.com/owner/repo.git". The operator writes this
+# line into SETTINGS.md from the PlatformAgent CR (see
+# k8s-operator/internal/controller/platformagent_manifests.go), and writes the
+# literal `None` when the CR leaves it unset.
+SETTINGS_REPO_RE = re.compile(r"^\s*[-*]?\s*\**Git Repo:\**\s*(\S+)\s*$", re.M)
+
+
+def repo_from_settings(path: str | None = None) -> str | None:
+    """The target repository as `owner/name`, from SETTINGS.md, or None.
+
+    This is the only repo source that works before the clone exists, which is
+    why it is tried first. `github-issue-resolver/scripts/resolver.py` reads the
+    same line; the two skills now agree by construction rather than by
+    coincidence.
+    """
+    try:
+        text = Path(path or SETTINGS_PATH).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = SETTINGS_REPO_RE.search(text)
+    if not match:
+        return None
+    url = match.group(1).strip().strip("/")
+    if url.lower() in {"none", "null", ""}:
+        return None
+    url = re.sub(r"^https?://(www\.)?github\.com/", "", url)
+    url = re.sub(r"^git@github\.com:", "", url)
+    url = re.sub(r"\.git$", "", url)
+    parts = [p for p in url.split("/") if p]
+    if len(parts) < 2:
+        return None
+    return f"{parts[-2]}/{parts[-1]}"
 
 
 def resolve_repo() -> str:
+    """Resolve the GitOps repository as `owner/name`, without needing a clone.
+
+    Order matters. The git remote used to be the only source, and it cannot
+    work on this path: the audit crons start in the agent's profile directory,
+    which is not a working tree, so `git config --get remote.origin.url`
+    returned nothing and the run died before it could clone anything. SETTINGS.md
+    is written by the operator at provisioning time and is present from the
+    first second of the pod's life.
+    """
+    repo = repo_from_settings()
+    if repo:
+        return repo
+
     from github_token_refresh import get_current_git_repo
 
     repo = get_current_git_repo()
     if not repo or "/" not in repo:
         raise RuntimeError(
-            "Could not resolve the target repository as owner/name from the git remote"
+            f"Could not resolve the target repository as owner/name: no usable "
+            f"'Git Repo:' line in {SETTINGS_PATH} and no origin remote in "
+            f"{Path.cwd()}"
         )
     return repo
 
@@ -1677,12 +2313,20 @@ class GitHubLookupError(RuntimeError):
 
 
 def find_existing_issue(repo: str, audit_id: str) -> tuple[int | None, str | None]:
-    """The audit's single open ledger issue, if any. Lowest number wins.
+    """The audit's single open ledger issue, if any. Highest number wins.
 
     Raises rather than reporting "none" when the lookup itself fails. The old
     code returned (None, None) on a non-zero exit, which made a `gh` outage
     indistinguishable from an empty result: the run would open a duplicate
     ledger, or on a clean run report CLEAN having closed nothing.
+
+    Highest, not lowest, because the choice has to *converge*. Duplicates only
+    exist because a run created one — and that run created the higher number,
+    wrote this stream's current state into it, and linked it from every
+    remediation pull request it opened. Preferring the lower one abandons that
+    work on the very next run, then the run after that creates another, and the
+    audit alternates between two ledgers indefinitely. Preferring the higher one
+    settles on the ledger everything already points at.
     """
     res = gh(
         [
@@ -1715,13 +2359,16 @@ def find_existing_issue(repo: str, audit_id: str) -> tuple[int | None, str | Non
     if not isinstance(issues, list) or not issues:
         return None, None
     issues.sort(key=lambda p: int(p.get("number", 0)))
+    chosen = issues[-1]
     if len(issues) > 1:
+        others = ", ".join(f"#{i.get('number')}" for i in issues[:-1])
         log(
             f"WARNING: {len(issues)} open issues carry label audit:{audit_id}; "
-            f"updating #{issues[0].get('number')} and leaving the rest alone. "
-            "Close the duplicates."
+            f"updating #{chosen.get('number')} and leaving {others} alone. "
+            "Close the duplicates by hand — this harness will not close an issue "
+            "it cannot prove it opened."
         )
-    return int(issues[0]["number"]), issues[0].get("url")
+    return int(chosen["number"]), chosen.get("url")
 
 
 def fetch_issue_body(repo: str, number: int) -> str | None:
@@ -1771,8 +2418,26 @@ def fetch_issue_comments(repo: str, number: int) -> list[dict]:
 
 
 def _write_temp(text: str, suffix: str = ".md") -> str:
+    """Write a body to a file `gh` can actually open.
+
+    Not `/tmp`. `gh` is not a binary in this container — the shim POSTs argv to
+    a sidecar which runs the real `gh` **in its own filesystem**, and `/tmp` is
+    a per-container emptyDir. A `--body-file /tmp/…` path therefore names a file
+    that exists in the agent container and does not exist in the one running the
+    command, so every issue create, every issue edit and every comment fails
+    with "no such file". The shared PersistentVolumeClaim at /opt/data is the
+    only filesystem both containers can see.
+
+    Falls back to the system temp directory when the PVC is absent, so the unit
+    tests and a local `--dry-run` still work off-cluster.
+    """
+    directory: str | None = SCRATCH_DIR
+    try:
+        Path(SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        directory = None
     handle = tempfile.NamedTemporaryFile(
-        "w", suffix=suffix, delete=False, encoding="utf-8"
+        "w", suffix=suffix, delete=False, encoding="utf-8", dir=directory
     )
     with handle:
         handle.write(text)
@@ -1857,6 +2522,11 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
     `--state all` on purpose: a merged pull request whose finding still
     reproduces is a state the report has to be able to show, and a closed one
     is what stops the harness re-opening a fix a human rejected.
+
+    `labels` is in the projection because the close-semantics rule needs it —
+    `audit:stale-closed` is what tells a close the harness made from a close a
+    human made, and asking for it here costs nothing over the request already
+    being sent.
     """
     res = gh(
         [
@@ -1871,9 +2541,9 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
             "--state",
             "all",
             "--json",
-            "number,headRefName,state,mergedAt,url,body",
+            "number,headRefName,state,mergedAt,url,body,labels",
             "--limit",
-            "200",
+            str(MAX_PR_PAGE),
         ],
         check=False,
     )
@@ -1888,7 +2558,20 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
         raise GitHubLookupError(
             f"gh pr list returned output that is not JSON: {exc}"
         ) from exc
-    return [p for p in prs if isinstance(p, dict)]
+    prs = [p for p in prs if isinstance(p, dict)]
+    if len(prs) >= MAX_PR_PAGE:
+        # A silently truncated page is the worst possible answer here: the
+        # missing pull requests read as "no pull request", so the harness
+        # re-opens fixes that already exist and re-closes ones already closed.
+        # Refuse instead — a stream with a thousand remediation pull requests
+        # needs a human, not another cron run.
+        raise GitHubLookupError(
+            f"audit:{audit_id} has at least {MAX_PR_PAGE} remediation pull "
+            "requests, so this listing is truncated and the finding-to-PR "
+            "mapping cannot be trusted. Merge or close the backlog before the "
+            "audit runs again."
+        )
+    return prs
 
 
 def reconcile_remediation_prs(
@@ -1948,15 +2631,27 @@ def open_remediation_pr(
         target.write_bytes(snapshot[path])
 
     git(build_git_add_command(paths)[1:])
-    res = git(["commit", "-m", group_commit_subject(audit_id, group)], check=False)
-    if res.returncode != 0:
-        # Nothing to commit means main already carries this exact fix. Opening
-        # an empty pull request would be the rolling-PR mistake all over again.
+
+    # Ask git what is staged instead of inferring it from the commit's exit
+    # code. `git commit` exits non-zero for "nothing to commit" *and* for a
+    # missing committer identity, a failed hook, an unwritable object store and
+    # a corrupt index — and the old code read every one of them as "already
+    # fixed on main", logged a reassuring line, and returned success having
+    # opened nothing. A real failure has to be loud.
+    staged = git(["diff", "--cached", "--quiet"], check=False)
+    if staged.returncode == 0:
         log(
             f"{branch}: the remediation is already present on {BASE_BRANCH}; "
             "no pull request opened."
         )
         return None
+    if staged.returncode != 1:
+        raise RuntimeError(
+            f"{branch}: `git diff --cached --quiet` exited {staged.returncode}; "
+            "the index could not be read, so it is not safe to say whether this "
+            "remediation is already applied"
+        )
+    git(["commit", "-m", group_commit_subject(audit_id, group)])
     git(["push", "-f", "origin", branch])
 
     body_file = _write_temp(
@@ -2023,19 +2718,47 @@ def close_stale_remediation_prs(
     previous_titles: dict[str, str],
     resolved_findings: dict[str, dict],
     generated_at: datetime,
+    *,
+    live_branches: set[str] | None = None,
 ) -> list[str]:
-    """Close every open remediation PR whose findings have all stopped reproducing.
+    """Close every open remediation PR the current findings no longer justify.
 
-    The pull request says which findings it was opened for, in the same hidden
-    block the ledger uses, so this needs no stored state. The branch is never
-    deleted: if the finding returns, the audit pushes to it again.
+    Two reasons a pull request is stale, and the second one is why this cannot
+    just read the hidden block. A pull request is stale when every finding it
+    covers has stopped reproducing — and also when its branch is no longer any
+    group's branch, which happens whenever a group splits or merges because its
+    file set changed. The second rule subsumes the first for grouped findings
+    and catches the orphans the first rule cannot see.
+
+    The branch is never deleted: if the finding returns, the audit pushes to it
+    again. The `audit:stale-closed` label is applied *before* the close, so a
+    later run can tell this close from a human's rejection even if the process
+    dies between the two calls.
     """
     closed: list[str] = []
     for pr in prs:
         if str(pr.get("state", "")).upper() != "OPEN":
             continue
+        number = int(pr.get("number", 0))
+        head = str(pr.get("headRefName", ""))
         covered = parse_delta_block(str(pr.get("body", "")))
-        if not covered or any(fid in current_ids for fid in covered):
+
+        orphaned = bool(live_branches) and not any(
+            head == branch or head.endswith(f":{branch}") for branch in live_branches
+        )
+        if not orphaned:
+            if not covered or any(fid in current_ids for fid in covered):
+                continue
+
+        # Idempotent on the marker, not on the state: a close that succeeded
+        # while its comment failed must not be re-commented tomorrow, and a
+        # comment that landed while the close failed must not be repeated
+        # either. Both cases leave the marker, which is the whole point of it.
+        if has_marker(str(pr.get("body", "")), STALE_CLOSED_MARKER_RE, str(number)) or any(
+            has_marker(str(c.get("body", "")), STALE_CLOSED_MARKER_RE, str(number))
+            for c in fetch_pr_comments(repo, number)
+        ):
+            log(f"PR #{number} was already closed as stale; not repeating it.")
             continue
 
         findings = [
@@ -2043,15 +2766,37 @@ def close_stale_remediation_prs(
             or {"id": fid, "title": previous_titles.get(fid, ""), "evidence": {}}
             for fid in covered
         ]
-        number = int(pr.get("number", 0))
+        reason = ""
+        if orphaned:
+            reason = (
+                f"Closing unmerged: the `{audit_id}` audit no longer groups its "
+                f"findings onto `{head}`. The set of files this fix would touch "
+                "has changed, so the work now lives on a different branch — "
+                "this pull request would conflict with it."
+            )
+
+        # Label first. If the process dies between these two calls, a labelled
+        # open pull request is recoverable; an unlabelled closed one reads as a
+        # human rejection forever.
+        gh(
+            ["pr", "edit", str(number), "-R", repo, "--add-label", STALE_CLOSED_LABEL],
+            check=False,
+        )
         post_pr_comment(
             repo,
             number,
-            render_stale_close_comment(audit_id, findings, generated_at),
+            render_stale_close_comment(
+                audit_id, findings, generated_at, pr_number=number, reason=reason
+            ),
             what="stale-close comment",
         )
         # Never --delete-branch: a returning finding pushes to this branch again.
-        gh(["pr", "close", str(number), "-R", repo], check=False)
+        res = gh(["pr", "close", str(number), "-R", repo], check=False)
+        if res.returncode != 0:
+            # Reporting a close that did not happen is how a run's own summary
+            # stops describing the repository.
+            log(f"WARNING: could not close PR #{number}; it stays open.")
+            continue
         closed.append(str(pr.get("url") or number))
     return closed
 
@@ -2128,6 +2873,29 @@ def reply_to_refusals(
         )
 
 
+def ack_remediate_requests(
+    repo: str,
+    issue_number: int,
+    accepted_by_comment: dict[str, list[str]],
+    outcomes: dict[str, str],
+    existing_comments: list[dict],
+    generated_at: datetime,
+) -> None:
+    """Answer each acted-on `/remediate` exactly once, on the same guard as refusals."""
+    answered = "\n".join(str(c.get("body", "")) for c in existing_comments)
+    for comment_id, accepted in accepted_by_comment.items():
+        if not accepted:
+            continue
+        if comment_id and has_marker(answered, ACKED_MARKER_RE, comment_id):
+            continue
+        post_comment(
+            repo,
+            issue_number,
+            render_ack_comment(comment_id, accepted, outcomes, generated_at),
+            what="/remediate acknowledgement",
+        )
+
+
 def load_findings(path: str, audit_id: str) -> dict:
     findings_file = Path(path)
     if not findings_file.is_file():
@@ -2139,19 +2907,41 @@ def load_findings(path: str, audit_id: str) -> dict:
     return validate_findings(data, audit_id)
 
 
-def assert_remediation_files_exist(findings: list[dict], root: Path) -> None:
-    """A manifest remediation must already be written to disk before finish."""
-    for i, finding in enumerate(findings):
+def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
+    """Downgrade manifest findings whose file was never written, and report them.
+
+    This used to raise, which is the wrong shape of failure by a wide margin.
+    A manifest path the model promised and did not write is a defect in one
+    *finding*; aborting the run over it suppresses the entire stream, so a
+    fleet with nine critical findings publishes nothing at all because the
+    tenth finding's author forgot a file. The audit's job is to report what it
+    saw. A fix it cannot supply degrades to `manual` — the finding, its
+    evidence and its recommendation all survive — and the omission is stated
+    in the ledger rather than swallowed.
+
+    Returns the ids that were degraded, for the caller to log.
+    """
+    degraded: list[str] = []
+    for finding in findings:
         remediation = finding.get("remediation") or {}
         if remediation.get("kind") != "manifest":
             continue
         path = str(remediation.get("path", ""))
-        if not (root / path).is_file():
-            raise ValidationError(
-                f"findings[{i}].remediation.path: {path!r} does not exist under the "
-                f"repository root ({root}); write the remediation file before calling "
-                "finish, or use remediation kind 'gcloud'/'manual'"
-            )
+        if (root / path).is_file():
+            continue
+        fid = str(finding.get("id", ""))
+        note = str(remediation.get("note", "")).strip()
+        remediation["kind"] = "manual"
+        remediation["path"] = ""
+        remediation["note"] = (
+            f"{note} " if note else ""
+        ) + (
+            f"_(The audit named `{path}` as the fix but did not write it, so no "
+            "pull request can be opened for this finding. Apply the "
+            "recommendation above by hand, or re-run the audit.)_"
+        )
+        degraded.append(fid)
+    return degraded
 
 
 # --------------------------------------------------------------------------- #
@@ -2159,11 +2949,55 @@ def assert_remediation_files_exist(findings: list[dict], root: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def ensure_workspace(repo: str, *, reset: bool = False) -> Path:
+    """Establish (and enter) the clone every git and gh call runs inside.
+
+    Lazy and idempotent: the first audit of the day clones, the other four
+    fetch. Nothing in the pod does this at startup, and nothing should — a
+    clone baked into the image is stale before the first cron fires.
+
+    `reset` scrubs the working tree, and only `start` may ask for it. Between
+    `start` and `finish` the agent writes its remediation manifests into this
+    tree; they are untracked until a remediation branch stages them, so a reset
+    on the way into `finish` would delete every fix the audit just wrote and
+    then report each one as a file the model forgot to produce.
+    """
+    import gitops_workspace
+
+    with gitops_workspace.workspace_lock(GITOPS_WORKSPACE):
+        target = gitops_workspace.ensure_workspace(
+            repo,
+            _workspace_runner,
+            root=GITOPS_WORKSPACE,
+            base_branch=BASE_BRANCH,
+            reset=reset,
+        )
+        gitops_workspace.configure_identity(target, _workspace_runner)
+    set_workspace(target)
+    return target
+
+
+def _workspace_runner(
+    cmd: list[str], *, cwd: str | Path | None = None, check: bool = True
+) -> subprocess.CompletedProcess:
+    """Adapter so gitops_workspace runs through this module's logged runner.
+
+    Named rather than a lambda so the test harness, which patches `run_cmd`,
+    covers the clone path like every other subprocess in the skill.
+    """
+    return run_cmd(cmd, cwd=cwd, check=check)
+
+
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
 
-    refresh_credentials()
+    # Resolve first, then mint: the token is repo-scoped, and the repository
+    # cannot be read off a clone that does not exist yet.
     repo = resolve_repo()
+    refresh_credentials(repo)
+    # The one place a scrub is correct: the audit has not written anything yet,
+    # so whatever is in the tree is debris from a run that did not finish.
+    root = ensure_workspace(repo, reset=True)
     ensure_labels(repo, audit_id)
 
     # No branch is created or reset here. The report branch is gone: the ledger
@@ -2189,6 +3023,11 @@ def handle_start(args: argparse.Namespace) -> None:
             {
                 "issue": existing_issue,
                 "repo": repo,
+                # Where the GitOps clone actually is. The agent does not start
+                # in a working tree and cannot guess this: a `remediation.path`
+                # is resolved against this directory, so a manifest written
+                # anywhere else is a file the harness will never find.
+                "workspace": str(root),
                 "findings_path": findings_path,
                 "pending_remediation_requests": pending,
             }
@@ -2198,28 +3037,53 @@ def handle_start(args: argparse.Namespace) -> None:
 
 def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
     findings = list(data["findings"])
-    paths = manifest_paths(findings)
 
     log("DRY RUN: validated findings; nothing will be committed, pushed, or published.")
     root = repo_root_best_effort()
-    for path in paths:
-        if not (root / path).is_file():
-            log(
-                f"WARNING: remediation path {path!r} not found under {root} "
-                "(this is a hard error outside --dry-run)"
-            )
+
+    # The same degradation the real run applies, so a dry run shows the body
+    # that would actually be published rather than an optimistic one. Every
+    # step below therefore sees the post-degradation findings, exactly as
+    # `handle_finish` does.
+    degraded = degrade_missing_remediations(findings, root)
+    for fid in degraded:
+        log(
+            f"WARNING: {fid}'s remediation file is not on disk under {root}; "
+            "it degrades to a manual remediation and opens no pull request."
+        )
+    paths = manifest_paths(findings)
+
+    gaps = coverage_gaps(data)
+    for gap in gaps:
+        log(f"COVERAGE GAP: {gap}")
 
     if not findings:
-        log("STATUS: CLEAN — 0 findings; the open ledger (if any) would be closed.")
+        if gaps:
+            log(
+                "STATUS: CLEAN but coverage is partial — the ledger would be "
+                "refreshed and left OPEN, not closed."
+            )
+        else:
+            log("STATUS: CLEAN — 0 findings; the open ledger (if any) would be closed.")
         print(render_clean_comment(audit_id, data, now))
         return
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
-    promote, withheld = promotion_candidates(findings, {})
-    groups = remediation_groups([f for f in findings if str(f.get("id", "")) in promote])
+    plan = promotion_candidates(findings, {})
+
+    # Groups over the whole finding set, filtered to those holding a promoted
+    # id — identical to `_open_promoted_prs`. Grouping the promoted subset in
+    # isolation reported a different branch name than the run would use, and a
+    # dry run whose branch names are wrong is worse than no dry run.
+    promoted = set(plan.promote)
+    groups = [
+        group
+        for group in remediation_groups(findings)
+        if any(str(f.get("id", "")) in promoted for f in group)
+    ]
 
     log(f"TITLE: {issue_title(audit_id, findings)}")
-    # "declared", not "on disk": the loop above warns about the ones missing.
+    # "declared", not "on disk": degradation above already removed the missing ones.
     log(f"MANIFESTS DECLARED: {', '.join(paths) if paths else '(none)'}")
     log(
         "WOULD OPEN: "
@@ -2229,17 +3093,21 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
             else "(no remediation pull requests)"
         )
     )
-    if withheld:
-        log(f"WITHHELD BY THE CAP: {', '.join(withheld)}")
-    print(
-        render_issue_body(
-            data,
-            generated_at=now,
-            audit_id=audit_id,
-            states=states,
-            withheld=withheld,
-        )
+    if plan.withheld:
+        log(f"WITHHELD BY THE CAP: {', '.join(plan.withheld)}")
+    rendered = render_issue_body(
+        data,
+        generated_at=now,
+        audit_id=audit_id,
+        states=states,
+        withheld=plan.withheld,
     )
+    if rendered.partial:
+        log(
+            f"WARNING: {len(rendered.omitted)} finding(s) do not fit GitHub's body "
+            "limit and would be omitted from the description."
+        )
+    print(rendered.body)
 
 
 def _open_promoted_prs(
@@ -2313,6 +3181,40 @@ def _open_promoted_prs(
     return opened
 
 
+def _remediation_outcomes(
+    requests: RemediateRequests,
+    plan: PromotionPlan,
+    pr_by_finding: dict[str, dict | None],
+    opened: list[str],
+) -> dict[str, str]:
+    """One sentence per accepted `/remediate` target, for the acknowledgement.
+
+    Pure: `pr_by_finding` is expected to be the mapping *after* this run's pull
+    requests were opened, so a freshly opened request is named by its URL
+    rather than reported as missing.
+    """
+    just_opened = set(opened)
+    outcomes: dict[str, str] = {}
+    for fid in requests.targets:
+        pr = pr_by_finding.get(fid) or {}
+        url = str(pr.get("url") or "")
+        if url and url in just_opened:
+            outcomes[fid] = f"pull request opened — {url}"
+        elif fid in plan.already_open:
+            outcomes[fid] = (
+                f"a pull request is already open — {url or 'see the table above'}; "
+                "it was left untouched rather than force-pushed over"
+            )
+        elif url:
+            outcomes[fid] = f"pull request refreshed — {url}"
+        else:
+            outcomes[fid] = (
+                "no pull request was opened; the harness could not publish it "
+                "this run and will retry on the next audit"
+            )
+    return outcomes
+
+
 def handle_remediate(args: argparse.Namespace) -> None:
     """Open remediation pull requests for findings named on the command line.
 
@@ -2365,12 +3267,32 @@ def handle_remediate(args: argparse.Namespace) -> None:
             )
         return
 
-    refresh_credentials()
     repo = resolve_repo()
+    refresh_credentials(repo)
+    root = ensure_workspace(repo)
     ensure_labels(repo, audit_id)
 
-    root = repo_root()
-    assert_remediation_files_exist(findings, root)
+    # A named finding whose manifest was never written cannot become a pull
+    # request, so it is refused — but only it. `/remediate all` expands to
+    # every id in the document, and failing the whole batch over one unwritten
+    # file would answer a request for thirty fixes with zero, which is both
+    # the least useful outcome and the hardest to act on. Refuse by name,
+    # proceed with the rest, and let the operator see exactly which is which.
+    degraded = set(degrade_missing_remediations(findings, root))
+    refused = [fid for fid in args.finding if fid in degraded]
+    requested = [fid for fid in args.finding if fid not in degraded]
+    for fid in refused:
+        log(
+            f"REFUSED {fid}: its remediation file is not on disk under {root}. "
+            "Write the manifest, then ask again."
+        )
+    if refused and not requested:
+        # Nothing survives, so there is no partial success to report and an
+        # exit 0 with an empty list would read as "done".
+        raise ValidationError(
+            f"--finding: the remediation file for {', '.join(refused)} is not on "
+            f"disk under {root}; write it before calling remediate"
+        )
 
     issue_number = args.issue
     if issue_number is None:
@@ -2379,17 +3301,37 @@ def handle_remediate(args: argparse.Namespace) -> None:
     pr_by_finding, _ = reconcile_remediation_prs(
         audit_id, findings, list_remediation_prs(repo, audit_id)
     )
+    # Routed through the same gate as every other promotion, so an explicit
+    # request cannot force-push over a pull request someone is reviewing.
+    plan = promotion_candidates(
+        findings, pr_by_finding, requested, cap=AUTO_PROMOTION_CAP
+    )
+    for fid in plan.already_open:
+        pr = pr_by_finding.get(fid) or {}
+        log(
+            f"{fid} already has an open remediation pull request "
+            f"({pr.get('url') or '#' + str(pr.get('number', '?'))}); not replacing it."
+        )
     opened = _open_promoted_prs(
         repo,
         audit_id,
         findings,
-        list(args.finding),
+        plan.promote,
         pr_by_finding,
         root=root,
         issue_number=issue_number,
         generated_at=now,
     )
-    print(json.dumps({"status": "REMEDIATED", "prs_opened": opened}))
+    print(
+        json.dumps(
+            {
+                "status": "REMEDIATED",
+                "prs_opened": opened,
+                "already_open": plan.already_open,
+                "refused": refused,
+            }
+        )
+    )
 
 
 def handle_finish(args: argparse.Namespace) -> None:
@@ -2402,9 +3344,26 @@ def handle_finish(args: argparse.Namespace) -> None:
         _handle_finish_dry_run(audit_id, data, now)
         return
 
-    refresh_credentials()
     repo = resolve_repo()
+    refresh_credentials(repo)
+    root = ensure_workspace(repo)
     ensure_labels(repo, audit_id)
+
+    # A fix the audit promised but did not write degrades that one finding to
+    # `manual`; it never suppresses the report.
+    for fid in degrade_missing_remediations(findings, root):
+        log(
+            f"WARNING: {fid}'s remediation file is missing under {root}; the "
+            "finding is published with a manual remediation instead."
+        )
+
+    # "Absent from this document" only means "fixed" if the audit actually
+    # looked. When it could not, resolution is unknowable — so nothing is
+    # announced as resolved, no remediation pull request is retired, and the
+    # ledger is not closed.
+    gaps = coverage_gaps(data)
+    for gap in gaps:
+        log(f"COVERAGE GAP: {gap}")
 
     existing_issue, existing_url = find_existing_issue(repo, audit_id)
     previous_body = fetch_issue_body(repo, existing_issue) if existing_issue else ""
@@ -2420,10 +3379,29 @@ def handle_finish(args: argparse.Namespace) -> None:
 
     # --- Clean run: retire the stream's ledger and every fix it was waiting on. ---
     if not findings:
-        prs_closed = close_stale_remediation_prs(
-            repo, audit_id, remediation_prs, set(), previous_titles, {}, now
+        prs_closed = (
+            []
+            if gaps
+            else close_stale_remediation_prs(
+                repo, audit_id, remediation_prs, set(), previous_titles, {}, now
+            )
         )
-        if existing_issue:
+        if existing_issue and gaps:
+            # Zero findings over incomplete coverage is not an all-clear. The
+            # ledger stays open and says why, so the stream self-heals the day
+            # the unreadable clusters come back.
+            post_comment(
+                repo,
+                existing_issue,
+                render_clean_comment(audit_id, data, now),
+                what="partial all-clear comment",
+            )
+            log(
+                f"Audit {audit_id} found nothing, but {len(gaps)} coverage gap(s) "
+                f"mean it cannot speak for the fleet; issue #{existing_issue} stays "
+                "open and no remediation pull request was closed."
+            )
+        elif existing_issue:
             post_comment(
                 repo,
                 existing_issue,
@@ -2452,18 +3430,17 @@ def handle_finish(args: argparse.Namespace) -> None:
                     "status": "CLEAN",
                     "issue_url": existing_url,
                     "new": 0,
-                    "resolved": len(previous_ids),
+                    "resolved": 0 if gaps else len(previous_ids),
                     "prs_opened": [],
                     "prs_closed": prs_closed,
+                    "partial": bool(gaps),
+                    "coverage_gaps": gaps,
                 }
             )
         )
         return
 
     # --- Findings: publish the ledger, then propose fixes separately. ---
-    root = repo_root()
-    assert_remediation_files_exist(findings, root)
-
     # Every finding in the document reproduces by definition — the resolved ones
     # are the ids that are absent from it.
     pr_by_finding, pr_urls = reconcile_remediation_prs(
@@ -2477,20 +3454,27 @@ def handle_finish(args: argparse.Namespace) -> None:
     }
 
     ledger_comments = fetch_issue_comments(repo, existing_issue) if existing_issue else []
-    requested, refusals = parse_remediate_commands(ledger_comments, findings)
-    promote, withheld = promotion_candidates(findings, pr_by_finding, requested)
+    requests = parse_remediate_commands(ledger_comments, findings)
+    plan = promotion_candidates(findings, pr_by_finding, requests.targets)
+    for fid in plan.already_open:
+        log(f"{fid} already has an open remediation pull request; not replacing it.")
 
     title = issue_title(audit_id, findings)
-    body_file = _write_temp(
-        render_issue_body(
-            data,
-            generated_at=now,
-            audit_id=audit_id,
-            states=states,
-            pr_urls=pr_urls,
-            withheld=withheld,
-        )
+    rendered = render_issue_body(
+        data,
+        generated_at=now,
+        audit_id=audit_id,
+        states=states,
+        pr_urls=pr_urls,
+        withheld=plan.withheld,
     )
+    if rendered.partial:
+        log(
+            f"WARNING: {len(rendered.omitted)} finding(s) did not fit GitHub's body "
+            "limit and are omitted from the description; the title counts are still "
+            "the true totals."
+        )
+    body_file = _write_temp(rendered.body)
     try:
         if existing_issue is None:
             res = gh(
@@ -2538,30 +3522,50 @@ def handle_finish(args: argparse.Namespace) -> None:
 
     if number is not None:
         apply_severity_label(repo, number, findings)
-        reply_to_refusals(repo, number, refusals, ledger_comments, now)
+        reply_to_refusals(repo, number, requests.refusals, ledger_comments, now)
 
     # A merged fix whose finding still reproduces is said once, on the pull
     # request, and the pull request is never reopened.
     comment_on_merged_but_persisting(repo, audit_id, findings, pr_by_finding, now)
 
-    prs_closed = close_stale_remediation_prs(
-        repo, audit_id, remediation_prs, set(current_ids), previous_titles, {}, now
-    )
+    # Retiring a pull request means asserting its finding no longer reproduces.
+    # Over incomplete coverage that assertion is unfounded, so nothing is
+    # closed and every open fix survives to the next complete run.
+    if gaps:
+        prs_closed = []
+        log(
+            "Coverage is partial, so no remediation pull request was closed as "
+            "stale; a fix cannot be retired on evidence the audit never gathered."
+        )
+    else:
+        prs_closed = close_stale_remediation_prs(
+            repo,
+            audit_id,
+            remediation_prs,
+            set(current_ids),
+            previous_titles,
+            {},
+            now,
+            live_branches={
+                group_branch_for(audit_id, group)
+                for group in remediation_groups(findings)
+            },
+        )
 
     prs_opened = _open_promoted_prs(
         repo,
         audit_id,
         findings,
-        promote,
+        plan.promote,
         pr_by_finding,
         root=root,
         issue_number=number,
         generated_at=now,
     )
 
-    # The ledger was written before those pull requests existed, so it does not
-    # yet link them. One extra edit is cheaper than making a reader wait a day.
-    if prs_opened and number is not None:
+    if prs_opened:
+        # The ledger was written before those pull requests existed, so it does
+        # not yet link them, and neither would the acknowledgement below.
         refreshed = list_remediation_prs(repo, audit_id)
         pr_by_finding, pr_urls = reconcile_remediation_prs(
             audit_id, findings, refreshed
@@ -2572,23 +3576,38 @@ def handle_finish(args: argparse.Namespace) -> None:
             )
             for f in findings
         }
-        relink = _write_temp(
-            render_issue_body(
-                data,
-                generated_at=now,
-                audit_id=audit_id,
-                states=states,
-                pr_urls=pr_urls,
-                withheld=withheld,
+        # One extra edit is cheaper than making a reader wait a day.
+        if number is not None:
+            relink = _write_temp(
+                render_issue_body(
+                    data,
+                    generated_at=now,
+                    audit_id=audit_id,
+                    states=states,
+                    pr_urls=pr_urls,
+                    withheld=plan.withheld,
+                ).body
             )
+            try:
+                gh(
+                    ["issue", "edit", str(number), "-R", repo, "--body-file", relink],
+                    check=False,
+                )
+            finally:
+                _unlink(relink)
+
+    # A command that succeeds silently is indistinguishable from one that was
+    # never read, so every accepted `/remediate` gets an answer naming what it
+    # produced — once, on the requesting comment's node id.
+    if number is not None and requests.accepted_by_comment:
+        ack_remediate_requests(
+            repo,
+            number,
+            requests.accepted_by_comment,
+            _remediation_outcomes(requests, plan, pr_by_finding, prs_opened),
+            ledger_comments,
+            now,
         )
-        try:
-            gh(
-                ["issue", "edit", str(number), "-R", repo, "--body-file", relink],
-                check=False,
-            )
-        finally:
-            _unlink(relink)
 
     if status == "UPDATED" and number is not None:
         if not delta_known:
@@ -2598,7 +3617,16 @@ def handle_finish(args: argparse.Namespace) -> None:
             )
         else:
             comment = render_delta_comment(
-                audit_id, new_ids, resolved_ids, findings, previous_titles, now
+                audit_id,
+                new_ids,
+                # Absence is only evidence of a fix when the audit looked. Over
+                # a coverage gap it means "not checked", so nothing is announced
+                # as resolved.
+                [] if gaps else resolved_ids,
+                findings,
+                previous_titles,
+                now,
+                omitted=len(rendered.omitted),
             )
             if comment:
                 post_comment(repo, number, comment, what="delta comment")
@@ -2611,9 +3639,31 @@ def handle_finish(args: argparse.Namespace) -> None:
                 "status": status,
                 "issue_url": issue_url,
                 "new": len(new_ids) if delta_known else 0,
-                "resolved": len(resolved_ids) if delta_known else 0,
+                "resolved": (
+                    0 if (gaps or not delta_known) else len(resolved_ids)
+                ),
                 "prs_opened": prs_opened,
                 "prs_closed": prs_closed,
+                # Coverage, and only coverage: `partial` is true iff
+                # `coverage_gaps` is non-empty, on this branch and on the CLEAN
+                # one alike. It used to also be set by `rendered.partial` —
+                # findings dropped for the body budget — which made
+                # `partial: true, coverage_gaps: []` reachable and left the
+                # agent with a flag it was told to explain and nothing to
+                # explain it with.
+                #
+                # The two are not the same kind of incomplete. A coverage gap
+                # means the audit did not *look*, which is why it suppresses
+                # the resolved count and the stale-closes above: absence of a
+                # finding is not evidence of a fix. Truncation means it looked,
+                # found everything, and could not *print* it all — the counts
+                # in the title are still true, the delta block still lists
+                # exactly what the body rendered, and resolution accounting is
+                # unaffected. It is presentational, and it is already surfaced
+                # where a reader will meet it: a line in the body itself and a
+                # WARNING in the run log.
+                "partial": bool(gaps),
+                "coverage_gaps": gaps,
             }
         )
     )
