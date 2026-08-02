@@ -207,10 +207,10 @@ class CommandExecutorTest(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def executor(self, timeout_seconds=5):
+    def executor(self, timeout_seconds=5, max_output_bytes=1024):
         return CommandExecutor(
             timeout_seconds=timeout_seconds,
-            max_output_bytes=1024,
+            max_output_bytes=max_output_bytes,
             state_dir=self.temp_dir.name,
         )
 
@@ -263,6 +263,37 @@ class CommandExecutorTest(unittest.TestCase):
         stub.chmod(0o755)
         executor.executables["gcloud"] = str(stub)
         return executor
+
+    def fake_git(self, executor):
+        """Swap in a git that reports the environment it was handed.
+
+        The stub has to be called `git`: the executor decides whether a command
+        gets a commit identity from the executable's own name, so a `fake-git`
+        would test nothing. Hence the directory rather than a suffixed filename.
+        """
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "git"
+        stub.write_text("#!/bin/bash\nenv\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor.executables["git"] = str(stub)
+        return executor
+
+    def dumped_environment(self, result):
+        """Parse an `env` dump, insisting it arrived whole.
+
+        A truncated dump would make every `assertNotIn` below pass for the wrong
+        reason, so the size check is part of reading it.
+        """
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertFalse(result.truncated, "environment dump was truncated")
+        return dict(
+            line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+        )
+
+    def git_environment(self, executor, argv=("git", "commit", "-m", "fleet audit")):
+        """The environment a proxied git subprocess actually receives."""
+        return self.dumped_environment(self.fake_git(executor).execute(list(argv)))
 
     def test_rejects_unsupported_executable(self):
         with self.assertRaisesRegex(ValueError, "not supported"):
@@ -486,6 +517,74 @@ class CommandExecutorTest(unittest.TestCase):
                 os.environ["SLACK_BOT_TOKEN"] = previous
         self.assertNotIn("SLACK_BOT_TOKEN", executor.environment)
         self.assertEqual(str(Path(self.temp_dir.name) / "home"), executor.environment["HOME"])
+
+    def test_git_commands_carry_a_commit_identity(self):
+        # The remediation Pull Request path commits through the proxy, and the
+        # commit runs here, in the sidecar. With no identity `git commit` exits
+        # 128 before it writes anything, so all four variables have to be set.
+        environment = self.git_environment(self.executor(max_output_bytes=1 << 16))
+        self.assertEqual("kube-agents platform agent", environment["GIT_AUTHOR_NAME"])
+        self.assertEqual("kube-agents platform agent", environment["GIT_COMMITTER_NAME"])
+        self.assertEqual("platform-agent@kube-agents.invalid", environment["GIT_AUTHOR_EMAIL"])
+        self.assertEqual("platform-agent@kube-agents.invalid", environment["GIT_COMMITTER_EMAIL"])
+
+    def test_commit_identity_honours_the_operator_override(self):
+        import os
+
+        overrides = {
+            "CREDENTIAL_PROXY_GIT_AUTHOR_NAME": "fleet-bot",
+            "CREDENTIAL_PROXY_GIT_AUTHOR_EMAIL": "fleet-bot@example.invalid",
+        }
+        previous = {name: os.environ.get(name) for name in overrides}
+        os.environ.update(overrides)
+        try:
+            executor = self.executor(max_output_bytes=1 << 16)
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    del os.environ[name]
+                else:
+                    os.environ[name] = value
+        environment = self.git_environment(executor)
+        self.assertEqual("fleet-bot", environment["GIT_AUTHOR_NAME"])
+        self.assertEqual("fleet-bot", environment["GIT_COMMITTER_NAME"])
+        self.assertEqual("fleet-bot@example.invalid", environment["GIT_AUTHOR_EMAIL"])
+        self.assertEqual("fleet-bot@example.invalid", environment["GIT_COMMITTER_EMAIL"])
+
+    def test_commit_identity_reaches_no_other_executable(self):
+        # Scoped to git on purpose: nothing else needs it, and a variable that is
+        # not there cannot be read by a command that had no business seeing it.
+        executor = self.executor(max_output_bytes=1 << 16)
+        environment = self.dumped_environment(
+            executor.execute_internal(["/bin/bash", "-c", "env"])
+        )
+        for name in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+            self.assertNotIn(name, environment)
+
+    def test_commit_identity_forwards_no_token(self):
+        # The identity is the only thing git gains. Its credentials still come
+        # from the sidecar's own store, so no bearer token may ride along.
+        import os
+
+        tokens = {
+            "GITHUB_TOKEN": "must-not-be-forwarded-github",
+            "GH_TOKEN": "must-not-be-forwarded-gh",
+            "SLACK_BOT_TOKEN": "must-not-be-forwarded-slack",
+        }
+        previous = {name: os.environ.get(name) for name in tokens}
+        os.environ.update(tokens)
+        try:
+            executor = self.executor(max_output_bytes=1 << 16)
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    del os.environ[name]
+                else:
+                    os.environ[name] = value
+        environment = self.git_environment(executor)
+        for name, value in tokens.items():
+            self.assertNotIn(name, environment)
+            self.assertNotIn(value, environment.values())
 
     def test_bootstrap_prepares_profile_for_later_commands(self):
         import os

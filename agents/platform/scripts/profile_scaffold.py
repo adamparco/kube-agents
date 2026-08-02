@@ -115,11 +115,21 @@ def main() -> None:
     ap.add_argument("--template", required=True, help="Baked template dir to overlay onto the profile home.")
     ap.add_argument("--description", default="", help="Profile description (surfaced in discovery).")
     ap.add_argument("--plugins", default="", help="Optional shared plugins dir to overlay for observability.")
+    ap.add_argument(
+        "--items",
+        default="",
+        help="Space-separated template entries (files or dirs) to overlay; default overlays the whole template.",
+    )
     args = ap.parse_args()
 
     hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
     home = ensure_profile(args.name, args.description, hermes_home)
-    overlay_template(home, Path(args.template), Path(args.plugins) if args.plugins else None)
+    overlay_template(
+        home,
+        Path(args.template),
+        Path(args.plugins) if args.plugins else None,
+        tuple(args.items.split()) or None,
+    )
     print(str(home))
 
 

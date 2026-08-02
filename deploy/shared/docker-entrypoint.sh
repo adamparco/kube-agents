@@ -88,10 +88,27 @@ fi
 # name and description in profiles/<name>/profile.yaml, a separate file that no
 # template ships, so it is never overwritten here. Per-profile runtime state
 # (USER.md, memory/, sessions/) is likewise left untouched.
-if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
-    for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
-        [ -f "$PLATFORM_TEMPLATE/$f" ] && cp -f "$PLATFORM_TEMPLATE/$f" "$TARGET_DIR/profiles/platform/$f" 2>/dev/null || true
-    done
+#
+# The sync goes through profile_scaffold.py --items rather than a `cp -f` loop
+# because the list is no longer files-only: cron/, skills/, and governance/ carry
+# the machinery CAPABILITIES.md advertises. `[ -f ]` is false for a directory, so
+# naming them in a shell loop would be a silent no-op — an upgraded install would
+# take the new CAPABILITIES.md and none of what it describes. --items copies each
+# entry with copytree(dirs_exist_ok=True), which handles both. The profile already
+# exists here, so the scaffold's `hermes profile create` is a no-op and only the
+# overlay runs; --plugins is deliberately omitted (step 2.5 owns that).
+#
+# Known limit: the overlay adds and overwrites, it never prunes. A skill or SOP
+# dropped from the image stays on the PVC until an operator removes it by hand.
+# That is the deliberate trade — this path must not start silently deleting from
+# a user's volume — not an oversight.
+if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ] && [ -f "$TARGET_DIR/scripts/profile_scaffold.py" ]; then
+    HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$TARGET_DIR/scripts/profile_scaffold.py" \
+        --name platform \
+        --template "$PLATFORM_TEMPLATE" \
+        --items "config.yaml SOUL.md AGENTS.md CAPABILITIES.md cron skills governance" \
+        >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then

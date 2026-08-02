@@ -564,6 +564,16 @@ def read_current_context(text: str) -> str | None:
     return context.strip() or None
 
 
+# Identity stamped on commits the proxy makes on the agent's behalf. `git commit`
+# exits 128 — "Please tell me who you are" — with no identity configured, and the
+# commit runs here rather than in the agent container, so a .gitconfig over there
+# would never be read. The address uses the reserved `.invalid` TLD (RFC 2606) so
+# an automated commit can never be attributed to a real mailbox that happens to
+# exist. Both are overridable per deployment.
+DEFAULT_GIT_AUTHOR_NAME = "kube-agents platform agent"
+DEFAULT_GIT_AUTHOR_EMAIL = "platform-agent@kube-agents.invalid"
+
+
 class CommandExecutor:
     ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")
 
@@ -641,6 +651,24 @@ class CommandExecutor:
         ):
             if name in os.environ:
                 self.environment[name] = os.environ[name]
+        # Applied per invocation in `_execute`, and only to git, rather than
+        # written once to ~/.gitconfig: the identity then stays scoped to the
+        # proxied commands that need it and leaves no ambient state in the
+        # sidecar's home for anything else to pick up. An operator who sets the
+        # override to an empty string means "unset", not "commit with no name",
+        # so an empty value falls back rather than reinstating the exit 128.
+        author_name = (
+            os.getenv("CREDENTIAL_PROXY_GIT_AUTHOR_NAME", "").strip() or DEFAULT_GIT_AUTHOR_NAME
+        )
+        author_email = (
+            os.getenv("CREDENTIAL_PROXY_GIT_AUTHOR_EMAIL", "").strip() or DEFAULT_GIT_AUTHOR_EMAIL
+        )
+        self.git_identity = {
+            "GIT_AUTHOR_NAME": author_name,
+            "GIT_AUTHOR_EMAIL": author_email,
+            "GIT_COMMITTER_NAME": author_name,
+            "GIT_COMMITTER_EMAIL": author_email,
+        }
 
     def bootstrap(self, command: str) -> None:
         """Prepare the trusted shell profile without interpreting later commands."""
@@ -919,6 +947,8 @@ class CommandExecutor:
                 raise ValueError("working directory is outside the shared workspace")
             command_cwd = requested_cwd
         command_environment = self.environment.copy()
+        if argv and Path(argv[0]).name == "git":
+            command_environment.update(self.git_identity)
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
         process = subprocess.Popen(
