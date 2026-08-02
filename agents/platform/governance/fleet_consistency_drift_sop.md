@@ -1,6 +1,6 @@
 # SOP: Fleet Consistency Drift Audit (Weekly Governance)
 
-**Purpose:** Find the cluster that does not match its peers. For each configuration facet, compute what the majority of comparable clusters do, then report the outliers — answering "eleven of my twelve clusters have Workload Identity on; which one doesn't, and why didn't I know?"
+**Purpose:** Find the cluster that does not match its peers. For each configuration facet, compute what the majority of comparable clusters do, then report the outliers — answering "eleven of my twelve clusters have Binary Authorization on; which one doesn't, and why didn't I know?"
 
 **Data sources:** The baseline is **derived from the live fleet and nowhere else.** `gcloud container clusters list/describe --format=json`, `gcloud container node-pools list/describe --format=json`, read-only `kubectl`, the `gke` MCP server, and the platform MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`). There is no Platform Master Blueprint, no standards document, no CMDB, no Terraform state, no Config Sync repo, no BigQuery, no Prometheus. If you find yourself wanting an "expected value" from outside the fleet, you have left this SOP.
 
@@ -14,9 +14,9 @@
 ./skills/fleet-audit/scripts/audit_report.py start --audit fleet-consistency-drift
 ```
 
-Returns `{"issue":…, "repo":…, "findings_path":"/opt/data/scratch/findings_fleet-consistency-drift.json", "pending_remediation_requests":[…]}`. Use the returned `findings_path` verbatim. `issue` is this stream's open ledger issue, or `null` when it has none; `finish` opens or rewrites it either way. There is no audit branch and no report branch: do not create branches, commit, push, or call `gh` yourself — the helper owns every git and GitHub operation and renders the ledger issue body. You never hand-write it.
+Returns `{"issue":…, "repo":…, "workspace":"/opt/data/gitops/<owner>__<name>", "findings_path":"/opt/data/scratch/findings_fleet-consistency-drift.json", "pending_remediation_requests":[…]}`. Use the returned `findings_path` verbatim. `workspace` is the GitOps clone `start` made — the pod has no checkout of its own — and any `remediation.path` you emit in §5 is resolved against it. `issue` is this stream's open ledger issue, or `null` when it has none; `finish` opens or rewrites it either way. There is no audit branch and no report branch: do not create branches, commit, push, or call `gh` yourself — the helper owns every git and GitHub operation and renders the ledger issue body. You never hand-write it.
 
-`pending_remediation_requests` names findings a repo writer asked for by commenting `/remediate <finding-id>` on the ledger; write the manifest for each during inspection. Only `manifest` remediations are promotable and this audit emits almost none (§5), so the list is normally empty — the helper refuses a request naming a `gcloud` or `manual` finding with a comment of its own. Never invent a manifest to satisfy one.
+`pending_remediation_requests` names findings a repo writer asked for by commenting `/remediate <finding-id>` on the ledger; write the manifest for each during inspection. Only `manifest` remediations are promotable and this audit emits almost none (§5), so the list is normally empty — the helper refuses a request naming a `gcloud` or `manual` finding with a comment of its own. Every request gets exactly one reply, whichever way it goes: an acknowledgement naming each target and its outcome, or a single refusal with the reason (no write access, an id absent from the current document, a non-`manifest` target), written once behind a hidden marker rather than repeated each run. Never invent a manifest to satisfy one.
 
 ### 1. Enumerate the target fleet
 
@@ -51,7 +51,7 @@ For each cohort `C` (size ≥ 3) and each facet `F`:
 4. Every member whose token differs from `t*` is an outlier and yields one finding.
 5. **Confidence to severity.** Start at the facet's base severity and walk down the ladder `critical > major > minor`: `r < 0.90` → one step; `r < 0.80` → one further step (cumulative); `k >= 3` → one step (three-plus divergent clusters is an undeclared cohort, not an outlier); the outlier's or the baseline's cohort membership rests on an **inferred** environment → one step. If the result falls below `minor`, **drop the finding.** A base-`major` facet at `r = 0.71` therefore disappears while a base-`critical` facet at `r = 0.71` survives as `minor`. That is intended: a weak majority only earns an admin's attention when the stake is high.
 6. **Split-cluster guard.** If one cluster is an outlier on **6 or more** facets it is not drifting, it is a different kind of cluster. Suppress its individual facet findings and emit one `major` finding `fcd-uncohorted-<cluster-slug>` naming them, so the admin fixes the cohort labelling instead of twelve symptoms.
-7. **Ids must be stable across runs:** `fcd-<facet-slug>-<project>-<location>-<name>`, where `<facet-slug>` is the slug backticked in the facet's §4 heading — a section covering several facets backticks one slug per facet, in the order its **Read** bullet lists them. Lowercase, collapse non-alphanumerics to `-`, trim any leading or trailing `-`, truncate to 100 characters. The result must match `^[a-z0-9][a-z0-9._-]{0,98}[a-z0-9]$`, with no `..` segment and no `.lock` suffix: the id becomes a git branch component (`platform-agent/fix-fleet-consistency-drift-<finding-id>`), so a colon, a space, a `*`, a `..`, or a `.lock` ending is rejected outright. Never put counts, ratios, dates, or severities in an id — the harness's new/resolved delta depends on the same drift keeping the same id between runs.
+7. **Ids must be stable across runs:** `fcd-<facet-slug>-<project>-<location>-<name>`, where `<facet-slug>` is the slug backticked in the facet's §4 heading — a section covering several facets backticks one slug per facet, in the order its **Read** bullet lists them. Lowercase, collapse non-alphanumerics to `-`, trim any leading or trailing `-`, truncate to 100 characters. The result must match `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$`, with no `..` segment and no `.lock` suffix: the id is the join key of the ledger's hidden delta block and of the `audit-persists:<id>` marker — both line-anchored regexes — and an operator types it by hand in `/remediate <id>`, so a colon, a space, a `*`, a `..`, or a `.lock` ending is rejected outright. Never put counts, ratios, dates, or severities in an id — the harness's new/resolved delta depends on the same drift keeping the same id between runs.
 8. **Every finding shows its work.** `evidence.excerpt` opens with these four labelled lines — the harness clips excerpts at 40 lines / 2000 characters, so they go first and the raw JSON fragment follows. Without them the audit reads as an oracle and gets ignored:
 
 ```
@@ -72,19 +72,15 @@ consensus: <r to 2dp> -> severity <sev> (base <base>, <downgrades applied or "no
 
 #### 4.1 Release channel (`release-channel`)
 
-- **Read:** `.releaseChannel.channel` → `RAPID`/`REGULAR`/`STABLE`; absent, `{}`, or `UNSPECIFIED` → `NONE`.
-- **Do NOT flag:** a `NONE` cluster pinned to a specific `currentMasterVersion` for a documented dependency — check `.resourceLabels` for a pin/freeze marker the fleet uses elsewhere first.
-- **Severity:** base `major` for `NONE` against a channelled majority; base `minor` for a mismatch between two real channels.
+- **Read:** `.releaseChannel.channel` → `RAPID`/`REGULAR`/`STABLE`. A cluster reading absent, `{}`, or `UNSPECIFIED` is **not enrolled**; drop it from the vote as `UNREADABLE` and emit nothing for it — enrolment is owned by the Upgrade & Patch Readiness audit (`security-patch-orchestrator` check 3.4), which flags it absolutely and does not need a majority to be right. This facet compares only clusters that are on a real channel, and reports the one sitting on a different real channel from its cohort.
+- **Do NOT flag:** an unenrolled cluster, per the read rule above; a cluster pinned to a specific `currentMasterVersion` for a documented dependency — check `.resourceLabels` for a pin/freeze marker the fleet uses elsewhere first.
+- **Severity:** base `minor` — a mismatch between two real channels is a rollout-cadence difference, not an absent control.
 - **Impact:** the outlier receives security patches on a different schedule than every peer.
-- **Remediation:** `gcloud` — `gcloud container clusters update <name> --location <loc> --project <proj> --release-channel=<t*>` (`# leaving NONE for a channel is one-way`).
+- **Remediation:** `gcloud` — `gcloud container clusters update <name> --location <loc> --project <proj> --release-channel=<t*>` (`# changing channel can move the cluster's version; downgrading a channel is not always permitted`).
 
-#### 4.2 Workload Identity (`workload-identity`)
+#### 4.2 Workload Identity — owned by the Security & RBAC Posture Audit
 
-- **Read:** `.workloadIdentityConfig.workloadPool` → non-empty string `ON`, absent or empty `OFF`. Compare on/off only; the pool string embeds the project id and legitimately differs.
-- **Do NOT flag:** nothing beyond §4.0 — no cluster has a good reason to be the only one in its cohort on node service-account credentials.
-- **Severity:** base `critical`.
-- **Impact:** the outlier's pods reach Google APIs with node-level credentials, so every pod on a node inherits that node's IAM.
-- **Remediation:** `gcloud` — `gcloud container clusters update … --workload-pool=<proj>.svc.id.goog` (`# node pools must then be updated or recreated to expose the metadata server`).
+**Not compared here. Emit no finding for it, and give it no facet slug.** Workload Identity being off is a defect against an absolute standard, not against a cohort, and the Security & RBAC Posture Audit (`compliance-audit` check 2.8) already reports it that way on every cluster in the fleet. A majority vote is strictly weaker: a cohort that has Workload Identity off everywhere produces no drift finding at all, and every cluster in it is still wrong. Reporting it in both places would put one cluster's single misconfiguration in two ledgers with two remediation notes.
 
 #### 4.3 Shielded Nodes, secure boot, integrity monitoring (`shielded-nodes`, `secure-boot`, `integrity-monitoring`)
 
@@ -142,13 +138,9 @@ consensus: <r to 2dp> -> severity <sev> (base <base>, <downgrades applied or "no
 - **Impact:** the outlier emits different flow telemetry and enforces network policy through a different engine than its cohort.
 - **Remediation:** intra-node visibility is `gcloud` — `gcloud container clusters update … --enable-intra-node-visibility`. Dataplane V2 cannot be enabled on an existing cluster, so that one is `manual`: cluster recreation and workload migration.
 
-#### 4.10 Maintenance window (`maintenance-window`)
+#### 4.10 Maintenance window — owned by the Upgrade & Patch Readiness Audit
 
-- **Read:** `.maintenancePolicy.window.dailyMaintenanceWindow` and `.recurringWindow` → `DAILY`, `RECURRING`, or `NONE`. **Presence and kind only.** Start times are deliberately excluded: a window at 02:00 local in `us-east4` is a business-hours window in `asia-northeast1`, so comparing UTC start times across a multi-region cohort manufactures findings. The narrowing is the point.
-- **Do NOT flag:** `DAILY` against `RECURRING` — only `NONE` against a configured majority is a finding.
-- **Severity:** base `minor`.
-- **Impact:** GKE can upgrade the outlier at any hour while its peers are protected.
-- **Remediation:** `gcloud` — `gcloud container clusters update … --maintenance-window-start=… --maintenance-window-end=… --maintenance-window-recurrence=…`, times left to the cluster's owner.
+**Not compared here. Emit no finding for it, and give it no facet slug.** The only divergence this facet could ever report is a cluster with **no** window against a configured majority — `DAILY` against `RECURRING` is not drift, and start times are incomparable across regions, since a window at 02:00 local in `us-east4` is a business-hours window in `asia-northeast1`. "No maintenance window" is exactly what the Upgrade & Patch Readiness audit (`security-patch-orchestrator` check 3.7) reports, absolutely and on every cluster. Nothing is left for a majority vote to add.
 
 #### 4.11 Resource label key set (`label-keys`)
 
@@ -178,8 +170,8 @@ consensus: <r to 2dp> -> severity <sev> (base <base>, <downgrades applied or "no
 ### 5. Generate remediation artifacts
 
 - These are control-plane settings, so `kind` is almost always `gcloud` or `manual`. For `gcloud` the harness renders `remediation.note` **inside a bash code block**, so the note must be shell-pasteable: the command, with any caveat as a `#` comment. For `manual` the note is prose — say plainly that the change needs pool or cluster recreation rather than emitting a command that would fail.
-- `remediation.path` is **only permitted when `kind == "manifest"`**; a path on a `gcloud` or `manual` remediation is a hard validation failure. Use `manifest` only when the fix is a genuine in-cluster object, write the file to `remediations/fleet-consistency-drift/<file>.yaml` in the working tree **before** `finish`, and give that repo-relative path — the harness stages exactly those files and errors if one is missing, absolute, containing `..`, carrying a glob metacharacter (`* ? [ ]`), or starting with `:`.
-- **Only a `manifest` finding can become a pull request.** A `critical` manifest finding opens a narrow remediation PR automatically, branched from `main` and linked to the ledger with `Part of #<issue>` — capped at five per run, with the withheld ones named in the ledger as awaiting `/remediate`. Every other manifest finding waits for a repo writer to comment `/remediate <finding-id>`, and findings whose `remediation.path` values overlap are promoted together in one PR. Since this audit is `gcloud` and `manual` almost throughout, nearly every drift finding lives and dies as prose in the ledger issue. That is the intended outcome: a control-plane flag is a command to run, not a file to merge.
+- `remediation.path` is **only permitted when `kind == "manifest"`**; a path on a `gcloud` or `manual` remediation is a hard validation failure. Use `manifest` only when the fix is a genuine in-cluster object. When that object does not exist yet, write it complete to `remediations/fleet-consistency-drift/<file>.yaml`. When it already exists, write the object's **complete** desired manifest over its existing declaration in the GitOps repo (`grep -rl "name: <object>" --include='*.yaml' <workspace>`) and give that file's path — never a patch fragment, which is not valid `kubectl apply` input, and never a second file for an object the repo already declares, which is a duplicate resource id to Config Sync and Argo. If the object exists and you cannot find its declaration, the finding is `kind: manual` with the change described in `recommendation.action`. Either way write the file into the §0 `workspace` **before** `finish` and give its path relative to that clone's root — the harness stages exactly those files and errors on a path that is absolute, contains `..`, carries a glob metacharacter (`* ? [ ]`), or starts with `:`. A path pointing at no file is the one case it forgives: that finding degrades to `kind: manual`, keeping its evidence and recommendation and stating in the ledger that the fix was named but never written, and the report publishes regardless.
+- **Only a `manifest` finding can become a pull request.** A `critical` manifest finding opens a narrow remediation PR automatically, branched from `main` and linked to the ledger with `Part of #<issue>` — capped at five per run, with the withheld ones named in the ledger as awaiting `/remediate`, and only when its branch has no **live** pull request on it (a stale close by the harness carries `audit:stale-closed` and reopens the door; a human's close and a merge do not). Every other manifest finding waits for a repo writer to comment `/remediate <finding-id>`, and findings whose `remediation.path` values overlap are promoted together in one PR. Since this audit is `gcloud` and `manual` almost throughout, nearly every drift finding lives and dies as prose in the ledger issue. That is the intended outcome: a control-plane flag is a command to run, not a file to merge.
 - Never copy cluster-scoped values from a peer (CIDRs, KMS key names, label values, autoscaling limits). Leave a named placeholder and say what the human supplies.
 - Mark disruptive remediations in the note: anything that recreates node pools, restarts networking add-ons, or is one-way.
 
@@ -204,13 +196,13 @@ Write the document to the `findings_path` from §0, with `"audit": "fleet-consis
 - `rationale` — why this fix and not the obvious alternative. Name the alternative you considered and say why you rejected it.
 - `risk` — what breaks on apply, and the read-only check to run first. Control-plane flags are fleet-visible switches: say which workloads notice.
 
-Worked example, for a 4.2 Workload Identity outlier:
+Worked example, for a 4.4 network-policy outlier:
 
 ```json
 "recommendation": {
-  "action": "Enable Workload Identity on stg-eu-west with its own project's pool, then update or recreate each node pool so the GKE metadata server is exposed.",
-  "rationale": "Every other cluster in the (standard, staging) cohort already runs it, so this is the cohort's own baseline rather than an imported standard; tightening the node service account instead would narrow the blast radius but still leave every pod on a node sharing one identity, which is exactly the exposure being reported.",
-  "risk": "Pods that authenticate today through the node service account lose access the moment their pool is recreated. List the KSAs in each namespace and the GCP APIs they call before scheduling the pool update."
+  "action": "Enable network policy enforcement on stg-eu-west with gcloud container clusters update stg-eu-west --location europe-west1 --project acme-stg --enable-network-policy.",
+  "rationale": "Every other cluster in the (standard, staging) cohort enforces pod-to-pod policy, so this is the cohort's own baseline rather than an imported standard; migrating the cluster to Dataplane V2 instead would give the same control natively and with better performance, but that cannot be done in place and would mean recreating the cluster to close a gap a single flag closes.",
+  "risk": "Enabling enforcement restarts the cluster's networking add-ons, and any namespace that already carries a NetworkPolicy starts enforcing it the moment the engine comes up. List what exists first with kubectl --context stg-eu-west get netpol -A."
 }
 ```
 
@@ -221,8 +213,12 @@ Worked example, for a 4.2 Workload Identity outlier:
   --findings-file /opt/data/scratch/findings_fleet-consistency-drift.json
 ```
 
-- `CLEAN` → the ledger issue is closed as completed and any remediation PR still open for this stream closes with it. Your final response is exactly `[SILENT]`. Nothing else, no summary, no preamble.
-- `UPDATED` with `new: 0` **and** `resolved: 0` → the fleet drifted no further and healed nothing. Also exactly `[SILENT]`.
+- One JSON line comes back: `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, and `coverage_gaps`. Read `partial` before deciding whether to say anything at all.
+- `partial: true` means the run could not compare the whole fleet — a cluster in `scope.skipped`, or one read but not compared and so carrying a `limitations` string (§1.4, §2.4, §3.1) — and `coverage_gaps` puts each gap in a sentence. On a drift audit that cuts deep, because the majority is what defines normal and a missing peer changes the majority. So the harness declines to infer: `resolved` comes back `0` with no resolved-delta, no remediation PR is closed as stale, and the ledger stays open even with an empty findings array — `status` is still `CLEAN`, the issue simply survives with a comment naming the gaps. The flag tracks coverage and nothing else, so it is `true` exactly when `coverage_gaps` is non-empty; a body too long to hold every finding is a rendering limit, not a gap in what was compared, and says so in the body itself.
+- `CLEAN` with `resolved: 0` **and** `partial: false` → the ledger issue is closed as completed and any remediation PR still open for this stream closes with it. Your final response is exactly `[SILENT]`. Nothing else, no summary, no preamble.
+- `CLEAN` with `resolved: > 0` → the fleet converged. Report the issue URL and how many drifts closed with it: a fleet that came back into line is worth a sentence, and it is the only good news this audit has to give.
+- `CLEAN` with `partial: true` → nothing diverged among the clusters you could compare, and the ledger stayed open because that is not the whole fleet. Not silent: one line with the result, the `coverage_gaps`, and the issue URL.
+- `UPDATED` with `new: 0` **and** `resolved: 0` **and** `partial: false` → the fleet drifted no further and healed nothing. Also exactly `[SILENT]` — and only with all three; incomplete coverage is itself news.
 - `OPENED`, or `UPDATED` with a non-zero `new` or `resolved` → one line naming the audit, the `new` and `resolved` counts, the ledger issue URL, and anything in `prs_opened` / `prs_closed`.
 - A schema violation exits 2 and publishes nothing; exit 1 is a fatal error and exit 0 is a publish. Fix the document and re-run `finish`. Never work around a validation error by deleting the finding that triggered it.
 

@@ -12,13 +12,14 @@
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit
-# -> {"issue": <int|null>, "repo":"org/repo", "findings_path":"/opt/data/scratch/findings_compliance-audit.json",
+# -> {"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/org__repo",
+#     "findings_path":"/opt/data/scratch/findings_compliance-audit.json",
 #     "pending_remediation_requests":["<finding-id>", ...]}
 ```
 
 `findings_path` is the only file you write findings to. `issue` is the stream's open ledger issue, or `null` when the stream has none. `pending_remediation_requests` is the set of finding ids a repo writer asked for with a `/remediate` comment on the ledger — write a `kind: manifest` file for every one of them during §2 and §3, whether or not this SOP would have promoted it on its own.
 
-`start` leaves you in the GitOps repo working tree; every path in §3 is relative to it. There is no report branch, and `start` creates none. Do not run `git`, `gh`, or `submit-suggestion` anywhere in this SOP — `audit_report.py` owns the write path and renders the ledger issue and every remediation PR. **Never hand-write an issue body or a PR body.**
+`workspace` is the GitOps clone. You do **not** start in a checkout: `start` clones the repository to that directory itself, and every `remediation.path` in §3 is resolved against it — a manifest written anywhere else is a file the harness never sees. There is no report branch, and `start` creates none. Do not run `git`, `gh`, or `submit-suggestion` anywhere in this SOP — `audit_report.py` owns the write path and renders the ledger issue and every remediation PR. **Never hand-write an issue body or a PR body.**
 
 ### 1. Enumerate the target fleet
 
@@ -75,7 +76,7 @@ id = "<check-slug>.<cluster>.<namespace-or-_>.<kind>-<name>"    lowercased, [^a-
 
 e.g. `privileged-container.prod-usc1.payments.deployment-api`. One finding per (check, workload): three privileged containers in one Deployment is **one** finding listing all three in `evidence.excerpt`.
 
-The result must match `^[a-z0-9][a-z0-9._-]{0,98}[a-z0-9]$`, contain no `..` segment, and not end in `.lock`. The id becomes a git branch component (`platform-agent/fix-compliance-audit-<finding-id>`), so a colon, a space, a `*`, a `..` or a `.lock` suffix is rejected outright. Cap at 100 characters by trimming the object name from the right, then strip any leading or trailing `.` or `-`; never drop the leading slug, and never substitute a hash.
+The result must match `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$`, contain no `..` segment, and not end in `.lock`. The id is the join key of the ledger's hidden delta block and of the `audit-persists:<id>` marker — both line-anchored regexes — and an operator types it by hand in `/remediate <id>`, so a colon, a space, a `*`, a `..`, or a `.lock` suffix is rejected outright. Cap at 100 characters by trimming the object name from the right, then strip any leading or trailing `.` or `-`; never drop the leading slug, and never substitute a hash.
 
 **Evidence.** `evidence.command` is mandatory and must be the literal command run, with `$WL`/`$SYS`/`$PRE` expanded so a human can paste it unchanged. **A finding you cannot reproduce is dropped, not softened** — there is no "possible" severity.
 
@@ -179,7 +180,7 @@ kubectl get netpol -A -o json | jq -r '.items[]
 - **Do NOT flag:** universal suppressions; namespaces with zero workloads (`kubectl get pods -n <ns> --no-headers | wc -l` is `0`) — no exposure, pure churn; namespaces already covered by a cluster-wide policy under Dataplane V2 (`kubectl get ccnp -o name`).
 - **Severity:** `major` for zero policies — unrestricted lateral movement, though the namespace boundary and RBAC still hold. `minor` for allow-all-only: the team engaged with NetworkPolicy and the fix is a one-line edit.
 - **Impact:** "Every pod in this namespace accepts traffic from every pod in the cluster; a compromise anywhere reaches these workloads unimpeded."
-- **Remediation:** `kind: manifest`, path `remediations/compliance-audit/<cluster>/<namespace>-default-deny.yaml`. Generate a `NetworkPolicy` `default-deny-ingress` (`podSelector: {}`, `policyTypes: [Ingress]`, no `ingress` rules) plus an `allow-dns-egress` policy permitting UDP/TCP 53 to `kube-system`. `remediation.note` must say it is deliberately ingress-only and the team adds per-service allow rules before merge.
+- **Remediation:** `kind: manifest`, path `remediations/compliance-audit/<cluster>/<namespace>-default-deny.yaml`. Generate **exactly one** `NetworkPolicy`, `default-deny-ingress` (`podSelector: {}`, `policyTypes: [Ingress]`, no `ingress` rules), and nothing else. `remediation.note` says the policy is ingress-only and that the team adds per-service allow rules before merge. **Never add a second policy that lists `Egress` in `policyTypes`** — including an "allow DNS" companion. Any policy naming `Egress` makes every pod it selects egress-isolated, so pairing one with the default-deny does not soften it: it default-denies all outbound traffic for those pods and permits only what that policy allows. Egress isolation is a separate, deliberate, breaking change, and this audit does not make it.
 
 #### 2.7 Default ServiceAccount token automounting (`default-sa-automount`)
 
@@ -195,7 +196,7 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 - **Do NOT flag:** universal suppressions; workloads using a dedicated named ServiceAccount — a mounted token there is intentional, and whether its RBAC is right is 2.4/2.5's job; namespaces whose `default` SA already sets `automountServiceAccountToken: false`.
 - **Severity:** `major` — the mounted token is a live API credential handed to a workload that by definition did not ask for one, and it is the standard first move after a container compromise.
 - **Impact:** "Workload mounts an API-server credential it does not use, handing an attacker an authenticated foothold for free."
-- **Remediation:** `kind: manifest`, path `remediations/compliance-audit/<cluster>/<namespace>-default-sa-automount.yaml` — the namespace's `default` ServiceAccount with `automountServiceAccountToken: false`. One file fixes every workload in that namespace, so emit it once per namespace and point all of that namespace's findings at the same path.
+- **Remediation:** the namespace's `default` ServiceAccount with `automountServiceAccountToken: false`. That ServiceAccount already exists in the cluster, so §3's rule applies: `kind: manifest` only when the repo already declares it — rewrite that declaration complete — and `kind: manual` otherwise. One file fixes every workload in that namespace, so emit it once per namespace and point all of that namespace's findings at the same path.
 
 #### 2.8 Workload Identity not enabled on the cluster (`workload-identity-off`)
 
@@ -209,6 +210,7 @@ gcloud container clusters describe "$C" --location="$L" --project="$PROJECT" \
 - **Severity:** `critical` — without it every pod authenticates to Google Cloud as the node service account, so all workloads on a node share one identity and pod-level IAM is impossible.
 - **Impact:** "All pods on this cluster share the node service account's Google Cloud permissions; there is no per-workload IAM boundary."
 - **Remediation:** `kind: gcloud` — `gcloud container clusters update <C> --location=<L> --project=<PROJECT> --workload-pool=<PROJECT>.svc.id.goog`. Note that node pools must then move to `GKE_METADATA` (2.9) and that this recreates nodes.
+- **Ownership.** This check owns the Workload Identity verdict for the whole fleet; the Fleet Consistency Drift audit defers its `workload-identity` facet here (its §4.2) rather than reporting the same cluster in a second ledger. An absolute check is strictly stronger than a majority vote — a fleet that has Workload Identity off everywhere produces no drift finding at all, and still every cluster is wrong.
 
 #### 2.9 Node pool exposes the legacy GCE metadata endpoint (`legacy-metadata`)
 
@@ -241,25 +243,33 @@ gcloud container clusters describe "$C" --location="$L" --project="$PROJECT" \
 ```bash
 $WL | jq -r --arg sys "$SYS" "$PRE"'
  | . as $o | [((.spec.containers//[])+(.spec.initContainers//[]))[]
-     | select(((.securityContext.runAsNonRoot // $o.spec.securityContext.runAsNonRoot)!=true)
-           or ((.securityContext.runAsUser // $o.spec.securityContext.runAsUser)==0)
-           or ((((.securityContext.seccompProfile.type // $o.spec.securityContext.seccompProfile.type)//"")|test("^(RuntimeDefault|Localhost)$"))|not))
+     | . as $c
+     | (if (($c.securityContext//{})|has("runAsNonRoot")) then $c.securityContext.runAsNonRoot
+        elif (($o.spec.securityContext//{})|has("runAsNonRoot")) then $o.spec.securityContext.runAsNonRoot
+        else null end) as $nonroot
+     | select(($nonroot!=true)
+           or (($c.securityContext.runAsUser // $o.spec.securityContext.runAsUser)==0)
+           or (((($c.securityContext.seccompProfile.type // $o.spec.securityContext.seccompProfile.type)//"")|test("^(RuntimeDefault|Localhost)$"))|not))
      | .name] as $bad
  | select(($bad|length)>0) | "\(.kind)/\(.ns)/\(.name): \($bad|join(","))"'
 ```
 
-- **Flag when:** a container neither inherits nor sets `runAsNonRoot: true`, or explicitly sets `runAsUser: 0`, or has no `seccompProfile.type` of `RuntimeDefault`/`Localhost`.
+**Resolve `runAsNonRoot` with `has()`, never with `//`.** `//` is jq's _alternative_ operator: it fires on `false` exactly as it fires on `null`, so `(.securityContext.runAsNonRoot // $o.spec.securityContext.runAsNonRoot)` turns a container that explicitly sets `runAsNonRoot: false` over a compliant pod-level `true` into `true` — the check silently passes the one input it exists to catch. The `has()` ladder above distinguishes absent from false. `runAsUser` and `seccompProfile.type` keep `//` safely: neither `0` nor a string is falsy in jq, so the alternative fires only on a genuinely absent field.
+
+- **Flag when:** a container neither inherits nor sets `runAsNonRoot: true` — **including a container that explicitly sets `runAsNonRoot: false` over a compliant pod-level default** — or explicitly sets `runAsUser: 0`, or has no `seccompProfile.type` of `RuntimeDefault`/`Localhost`.
 - **Do NOT flag:** universal suppressions; any workload already reported by 2.1 — the privileged finding subsumes this one, never emit both; namespaces labelled `pod-security.kubernetes.io/enforce=restricted`, where admission already guarantees it.
 - **Severity:** `minor` — these are defence-in-depth defaults rather than live escalation paths, and the fix is mechanical. Rating them `major` would drown the critical findings, which is how an audit becomes noise.
 - **Impact:** "Containers run as root and/or without a seccomp filter, so a runtime escape has an unfiltered syscall surface and immediate root in the namespace it reaches."
-- **Remediation:** `kind: manifest`, path `remediations/compliance-audit/<cluster>/<namespace>-<workload>-securitycontext.yaml` — a strategic-merge patch setting `spec.template.spec.securityContext` to `{runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}` and each container's `securityContext` to `{allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}`. `remediation.note` states the UID is a placeholder the image owner must confirm.
+- **Remediation:** the workload already exists, so §3's rule applies. When the repo declares it, `kind: manifest` at that declaration's own path, rewritten as the workload's **complete** desired manifest with `spec.template.spec.securityContext` set to `{runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}` and each container's `securityContext` to `{allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}`, everything else carried over unchanged. `remediation.note` states the UID is a placeholder the image owner must confirm. When you cannot find a declaration, `kind: manual` with the same change spelled out in `recommendation.action`.
 
 ### 3. Generate remediation artifacts
 
-- Write every `kind: manifest` file into the repo working tree **before** calling `finish`. The helper checks that each `remediation.path` exists; a missing file hard-fails the run. This includes every finding named in `pending_remediation_requests` from §0 — a `/remediate` request with no manifest on disk cannot be promoted.
-- `remediation.path` is repo-root relative, always under `remediations/compliance-audit/<cluster>/`, and must match the file you wrote exactly. No `..`, no glob metacharacter (`*`, `?`, `[`, `]`), no leading `:` — the helper rejects all of them.
-- One file per remediation. Two findings share a path only where 2.7 says so (the per-namespace `default` ServiceAccount patch).
-- **Findings that share a path share a Pull Request.** The promotion unit is the group of findings whose `remediation.path` values intersect, unioned transitively. 2.7 is the one case in this SOP that produces a group: every finding in a namespace points at that namespace's single `default-sa-automount.yaml`, so all of them are one group, on one branch, in one PR. Every other check here is one finding, one path, one PR.
+- Write every `kind: manifest` file into the `workspace` clone §0 named, **before** calling `finish`. A path with no file behind it no longer kills the run: that one finding degrades to `kind: manual`, keeps its evidence and recommendation, and says in the ledger that the audit named the fix but never wrote it — the report still publishes. Treat a degrade as a defect in your own work, not a fallback: it converts a fix a reviewer could have merged into one a human now writes by hand. This includes every finding named in `pending_remediation_requests` from §0 — a `/remediate` request with no manifest on disk cannot be promoted.
+- **Where the file goes depends on whether the object already exists.** A remediation that _creates_ an object the cluster does not have — 2.6's NetworkPolicy — is written as a complete, appliable object under `remediations/compliance-audit/<cluster>/`. A remediation that _changes an object that already exists_ — 2.7's `default` ServiceAccount, 2.11's workload — goes to that object's **existing declaration in the GitOps repo**: locate it (`grep -rl "name: <object>" --include='*.yaml' .`), name that file as `remediation.path`, and rewrite it as the object's complete desired manifest. Never write a patch fragment: a file carrying `metadata.name` and a partial `spec` is not valid `kubectl apply` input, and a second file under `remediations/` claiming an object the repo already declares is a duplicate resource id that both Config Sync and Argo reject.
+- **An object that already exists and has no declaration you can find is `kind: manual`.** Describe the change in `recommendation.action`, write no file, and omit `remediation.path`. Never invent a new path for it.
+- `remediation.path` is relative to the repository root — which is `workspace`, not the directory you happen to be in — and must match the file you wrote exactly. No `..`, no glob metacharacter (`*`, `?`, `[`, `]`), no leading `:` — the helper rejects all of them.
+- One file per remediation. Two findings share a path only where 2.7 says so (the per-namespace `default` ServiceAccount).
+- **Findings that share a path share a Pull Request.** The promotion unit is the group of findings whose `remediation.path` values intersect, unioned transitively. 2.7 is the one case in this SOP that produces a group: every finding in a namespace points at that namespace's single `default` ServiceAccount declaration, so all of them are one group, on one branch, in one PR. Every other check here is one finding, one path, one PR.
 - Manifests are proposals. Never `kubectl apply` them and never embed a live `resourceVersion`.
 - For `kind: gcloud` and `kind: manual`, write no file and **omit `remediation.path` entirely** — the helper rejects a path on a non-manifest remediation. Put the full command or ordered human steps in `remediation.note`, with real cluster, location, project, and object names substituted — no angle-bracket placeholders except the human-supplied CIDR in 2.10. Neither kind is ever promotable to a PR; a `/remediate` request naming one is refused.
 - A `kind: gcloud` `note` is rendered into the ledger issue **inside a bash fence**, so it must be shell-pasteable: commands on their own lines, and caveats (2.8 and 2.9 both recreate nodes; 2.10 needs a human-supplied CIDR) as `#` comment lines above the command they guard. Prose in a `gcloud` note renders as broken shell. A `kind: manual` note is rendered as prose and should read as prose.
@@ -301,15 +311,19 @@ Three `rationale`/`risk` pairs in this SOP are check-specific and must not be wr
 ./skills/fleet-audit/scripts/audit_report.py finish --audit compliance-audit \
   --findings-file /opt/data/scratch/findings_compliance-audit.json
 # -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
-#     "prs_opened":[...],"prs_closed":[...]}
+#     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[]}
 ```
 
-`finish` owns publication end to end. Tier 1 is one ledger issue for this stream, rewritten in place every run and labelled `agent:audit`, `audit:compliance-audit`, `severity:<highest>`; a clean run closes it as completed. Tier 2 is a narrow remediation PR per remediation group, branched `platform-agent/fix-compliance-audit-<lowest-sorted-finding-id>` off `main`, linked with `Part of #<issue>` and additionally labelled `audit:remediation`. A PR opens automatically only for a finding that is `critical` **and** `manifest` **and** has no PR on its branch in any state, capped at five per run, with any withheld findings named in the ledger. Everything else waits for a repo writer to comment `/remediate <finding-id>` or `/remediate all`, which arrives as `pending_remediation_requests` on the next run's `start`.
+`finish` owns publication end to end. Tier 1 is one ledger issue for this stream, rewritten in place every run and labelled `agent:audit`, `audit:compliance-audit`, `severity:<highest>`; a clean run closes it as completed. Tier 2 is a narrow remediation PR per remediation group, branched `platform-agent/fix-compliance-audit-<slug>-<digest>` off `main` — the digest is taken over the group's sorted remediation paths, so the branch is keyed on the files the fix touches and stays put across runs even though the finding ids are re-derived every morning — linked with `Part of #<issue>` and additionally labelled `audit:remediation`. A PR opens automatically only for a finding that is `critical` **and** `manifest` **and** has no **live** pull request on its branch: one the harness closed itself carries `audit:stale-closed` and may be promoted again, while one a human closed and one that merged may not, because re-opening either would overrule a person every morning. Capped at five per run, with any withheld findings named in the ledger. Everything else waits for a repo writer to comment `/remediate <finding-id>` or `/remediate all`. A comment naming ids arrives as `pending_remediation_requests` on the next run's `start`, so you know which manifests to write while inspecting; `all` does not, because it names no particular file — it is expanded at `finish` against that run's manifest findings. Every such comment gets exactly one answer on the ledger — an acknowledgement naming each target and what became of it, or a single refusal saying why (the commenter has no write access, an id is not in the current document, or the target is not a `manifest`) — so a standing request is answered once, not re-answered every run.
+
+**Partial coverage.** `partial` is `true` when this run cannot speak for the whole fleet: anything in `scope.skipped`, or any cluster carrying a `limitations` string, and `coverage_gaps` names each one in a readable sentence. It constrains what the run is allowed to conclude, because a finding absent from a cluster you never read is not a finding that was fixed. So a partial run reports `resolved: 0` and posts no resolved-delta, closes no remediation PR as stale, and leaves the ledger open even with zero findings — `status` is still `CLEAN`, but the issue survives with a comment naming the gaps. Note the reach of this on a fleet with Autopilot clusters: the `limitations` string §1 records for them makes every run partial, which is intended — checks 2.1–2.3 and 2.9 never ran there, so the run is in no position to announce one of their findings fixed. The flag means coverage and only coverage — it is `true` if and only if `coverage_gaps` is non-empty. §4's body budget dropping findings from the description does not raise it: those findings were seen, the title's counts include them, and the body names what it dropped.
 
 **No finding this SOP produces meets the auto-promotion bar.** Every `manifest` check here is `major` or `minor` (2.6, 2.7, 2.11) and every `critical` check is `gcloud` or `manual`, so every remediation PR from this stream is human-requested. That is deliberate: the fixes worth shipping unattended are the ones a reviewer can merge without a conversation, and none of these are. Never inflate a severity to force a PR open.
 
-- `status == "CLEAN"` → the ledger issue closes as completed and your final response is exactly `[SILENT]`. No preamble, no "no issues found". A clean fleet is a silent fleet.
-- `status == "UPDATED"` with `new: 0` **and** `resolved: 0` → also exactly `[SILENT]`. Nothing moved; the ledger already says everything you would.
+- `status == "CLEAN"` with `resolved: 0` **and** `partial: false` → the ledger issue closes as completed and your final response is exactly `[SILENT]`. No preamble, no "no issues found". A clean fleet is a silent fleet.
+- `status == "CLEAN"` with `resolved: > 0` → the fleet was carrying findings and is not any more. Report it: the issue URL, and how many findings closed with it. This is the one piece of good news the audit produces, and swallowing it while reporting every failure teaches the operator that the audit only ever brings problems.
+- `status == "CLEAN"` with `partial: true` → not silent. The ledger stayed open because the run could not see the whole fleet: one line reporting the clean result and `coverage_gaps`, then stop.
+- `status == "UPDATED"` with `new: 0` **and** `resolved: 0` **and** `partial: false` → also exactly `[SILENT]`. Nothing moved; the ledger already says everything you would. All three conditions must hold — a run that found nothing new but skipped a cluster still has something to report.
 - `status == "OPENED"`, or `"UPDATED"` with a non-zero `new` or `resolved` → one line, then stop: `Security & RBAC posture audit: <new> new, <resolved> resolved across <count(scope.clusters)> clusters — <issue_url>`
 - Exit 2 means the validator rejected the document and nothing was published: fix the findings file and re-run `finish`. Exit 1 is fatal. Exit 0 published. Do not work around the validator, and never open the issue or a PR by hand.
 - A finding that still reproduces after its remediation PR merged renders in the ledger with a `⚠ fix merged, still reproduces` warning and the merged PR gets one comment. The audit never reopens it, and neither do you — re-verify the finding and let the next run carry it.

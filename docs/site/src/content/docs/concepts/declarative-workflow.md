@@ -50,19 +50,25 @@ Each audit stream owns exactly one **GitHub issue**, rewritten in place on every
 
 A run that finds nothing **closes the issue as completed**, and closes any remediation PRs still open for the stream. That is the point of the shape: a closed issue reads as _done_.
 
+Unless the run could not see the whole fleet. A cluster that was skipped, or one that was read but where some checks could not run, makes the run **partial** — and a finding's absence from a cluster nobody looked at is not evidence it was fixed. Over a partial run the ledger stays open with a comment naming the gaps, nothing is announced as resolved, and no remediation PR is retired.
+
 ### Tier 2 — remediation pull requests
 
-A finding whose remediation is a manifest can be promoted into its own pull request on `platform-agent/fix-<audit-id>-<finding-id>`, based on `main`, carrying only that finding's manifest and linked back to the ledger with `Part of #<issue>`. It takes the ledger's labels plus `audit:remediation`. Findings whose `remediation.path` values overlap share a single PR, since separate branches touching the same file would conflict on merge.
+A finding whose remediation is a manifest can be promoted into its own pull request on `platform-agent/fix-<audit-id>-<slug>-<digest>`, based on `main`, carrying only that finding's manifest and linked back to the ledger with `Part of #<issue>`. It takes the ledger's labels plus `audit:remediation`. Findings whose `remediation.path` values overlap share a single PR, since separate branches touching the same file would conflict on merge.
+
+The branch name is the only join key between a finding and its PR — nothing is stored outside GitHub — so the digest is taken over the group's sorted set of remediation **paths**, not over its finding ids. Ids are regenerated on every run; the files a fix touches are what actually persists.
 
 Promotion is hybrid:
 
-- **Automatic** when the finding is `critical`, its remediation is a `manifest`, and no PR yet exists on its branch — capped at five auto-promotions per run, with any withheld findings named in the ledger as awaiting an explicit request.
+- **Automatic** when the finding is `critical`, its remediation is a `manifest`, and there is no _live_ pull request on its branch — capped at five auto-promotions per run, with any withheld findings named in the ledger as awaiting an explicit request.
 - **On request** otherwise. Someone with write access on the repo comments `/remediate <finding-id>` — or `/remediate all` — on the ledger issue, and the next run opens the PRs and replies with the links. Only `manifest` findings are promotable: naming a `gcloud` or `manual` finding gets one reply explaining that its fix is a command to run, not a file to merge. A command from an author without write access gets one reply and nothing else.
 
-Each finding's state is recomputed every run, never stored, and the ledger renders exactly one of `open`, `pr-open`, `pr-merged-persists`, `resolved (fix merged)`, `resolved (no PR)`, or `refused`. Two of those states act on the PR side, and the second is one the old PR-as-report model had no way to express:
+Each finding's state is recomputed every run from two facts — whether it still reproduces, and what its remediation PR is doing — and never stored. The ledger renders exactly one of `open`, `fix proposed`, `⚠ fix merged, still reproduces`, `resolved (fix merged)`, `resolved`, or `fix refused`. Two of those act on the PR side, and the second is one the old PR-as-report model had no way to express:
 
 - A remediation PR whose finding no longer reproduces is **closed automatically**, with a comment naming the command that no longer reproduces. The branch is deliberately **not** deleted, so any human fixup pushed to it survives and the PR can be reopened.
 - A finding that still reproduces after its PR merged is rendered with a **"fix merged, still reproduces"** warning and the merged PR gets one comment. It is never reopened.
+
+`fix refused` means the fix PR is closed and the finding is still there — and the harness has to distinguish who closed it. Its own stale-closes carry the `audit:stale-closed` label, so when such a finding comes back the fix is proposed again. A PR a **human** closed is a considered rejection and is final: re-proposing it would overrule a person every morning. The escape hatch is `/remediate <finding-id>`, which is on the record and from someone with write access.
 
 ### What the script owns
 

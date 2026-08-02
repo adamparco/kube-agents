@@ -1,11 +1,10 @@
 # Fleet Audit — Issue Ledger and Remediation Pull Requests
 
-> **STATUS — design of record; implemented on `feat/platform-admin-cron-audits`.** The behaviour
-> described here is the behaviour that branch ships: a GitHub **issue** per audit stream plus narrow,
-> per-finding remediation PRs linked back to it. It replaces the model in which each audit stream
-> owned one continuously-rewritten Pull Request.
+> **STATUS — design of record; implemented.** The behaviour described here is the behaviour the
+> harness ships: a GitHub **issue** per audit stream plus narrow, per-finding remediation PRs linked
+> back to it. It replaces the model in which each audit stream owned one continuously-rewritten Pull
+> Request.
 
-**Status:** Implemented on `feat/platform-admin-cron-audits`
 **Scope:** How the five autonomous audit watchdogs publish findings and propose fixes.
 **Supersedes:** the PR-as-report model introduced in `424a345`.
 
@@ -55,26 +54,48 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   remediation state and, where one exists, its remediation PR.
 - A clean run closes the issue **as completed** and closes any remediation PRs still open for that
   stream.
-- `[SILENT]` semantics are unchanged: a clean run says nothing in chat, and an `UPDATED` run is
-  `[SILENT]` **only when `new: 0` and `resolved: 0`**. If either counter is non-zero the agent
-  reports the ledger issue URL and a one-line summary. A run that resolved five findings and found
-  nothing new is _news_ — it is the audit reporting that the fleet got better.
+- `[SILENT]` has one rule, and it is a conjunction of three: `new == 0` **and** `resolved == 0`
+  **and** `partial == false`. If either counter is non-zero the agent reports the ledger issue URL
+  and a one-line summary — a run that resolved five findings and found nothing new is _news_, the
+  audit reporting that the fleet got better. And a run that could not read the whole fleet is never
+  silent even when both counters are zero, because "I found nothing" and "I could not look" are
+  different statements and only one of them is reassuring (§7, Partial coverage).
 
 ### Tier 2 — remediation pull requests
 
 Narrow PRs, each proposing the fix for one finding (or one group of findings whose manifest paths
 collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
 
-- Branch: `platform-agent/fix-<audit-id>-<finding-id>`. **The branch name is the source of truth
-  for the finding↔PR link.** It survives anyone editing the issue body, and a single
-  `gh pr list --label audit:<audit-id> --state all --json number,headRefName,state,mergedAt`
-  reconstructs the whole mapping in one API call. No body marker is needed and none is added.
-- **The finding id is therefore a git ref component, and the validator constrains it to
-  `^[a-z0-9][a-z0-9._-]{0,98}[a-z0-9]$`, with no `..` segment and no `.lock` suffix.** An
-  unconstrained id does not merely churn the delta, it produces an _unusable branch name_: verified
-  with `git check-ref-format`, an id containing `:`, a space, `..`, or `*`, or one ending `.lock`, is
-  rejected by git outright. The SOPs already build ids deterministically from lowercased slugs; the
-  rule makes that a hard gate rather than a convention.
+- Branch: `platform-agent/fix-<audit-id>-<slug>-<digest>`, where the digest is the first ten hex
+  characters of a SHA-256 over the group's **sorted set of remediation paths** and the slug is a
+  readable fragment of the first path's stem. **The branch name is the source of truth for the
+  finding↔PR link.** It survives anyone editing the issue body, and a single
+  `gh pr list --label audit:<audit-id> --label audit:remediation --state all
+--json number,headRefName,state,mergedAt,url,body,labels` reconstructs the whole mapping in one
+  API call. No body marker is needed and none is added. `labels` is load-bearing rather than
+  incidental: §3.3's harness-close-versus-human-close discriminator reads `audit:stale-closed` off
+  it, so dropping the field from the projection would silently make every close look final.
+- **The branch is keyed on the files, not on the finding ids.** An earlier draft of this section
+  named the branch after the lowest-sorted member id, which does not survive contact with the way
+  the model actually works: ids are regenerated from scratch every run, so the day an SOP heading is
+  reworded — or the day one finding in a two-finding group is fixed and the survivor becomes the new
+  lowest id — the branch name changes, the `headRefName` lookup misses, and the harness opens a
+  second pull request proposing a fix that is already sitting in review. The set of paths a fix
+  touches is the stable thing, so that is what the name is derived from.
+- **The finding id is still constrained**, to `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with no `..`
+  segment and no `.lock` suffix — even though the path digest took it out of the branch name. The
+  original justification was that it was a git ref component; that is no longer true, and a rule
+  whose stated reason has evaporated is a rule someone deletes. Two live reasons replace it. The id
+  is the **join key** of the ledger's hidden delta block and of the `audit-persists:<id>` marker,
+  both matched by line-anchored regexes that whitespace or a stray newline would silently break —
+  and a silent break here means the delta reports every finding as new. And it is **typed by a
+  human** in `/remediate <id>`, which rules out case variation and shell metacharacters. The git
+  constraints are kept as a superset rather than relaxed: they cost nothing, the SOP-generated
+  shapes already satisfy them, and a future change that puts an id back in a ref then finds the
+  gate already in place. The
+  SOPs already build ids deterministically from lowercased slugs; the rule makes that a hard gate
+  rather than a convention, and `hack/check-docs-terminology.sh` now extracts the pattern from
+  `FINDING_ID_RE` and fails the build if any document quotes a different one.
 - Body carries only that finding: evidence, impact, the recommendation, and the diff.
 - Labels: `agent:audit`, `audit:<audit-id>`, `audit:remediation`, `severity:<highest>`.
 
@@ -88,11 +109,19 @@ A remediation PR opens automatically **iff** the finding satisfies all of:
 
 1. `severity == "critical"`, and
 2. `remediation.kind == "manifest"`, and
-3. no PR already exists on its branch in any state.
+3. there is no **live** pull request on its branch.
 
 Every other finding stays prose in the ledger until a human asks for it. Rationale: the highest-risk
 findings that have a mergeable diff should arrive ready to merge; the long tail must not turn five
-streams into a notification firehose.
+streams into a notification firehose. At most five auto-promotions per run (§13 Q4); the surplus is
+named in the ledger.
+
+"Live" rather than "in any state" is condition 3's whole point, and the distinction is between two
+kinds of closed PR. One the harness closed itself as stale carries the `audit:stale-closed` label,
+and if the finding comes back, re-proposing the fix is exactly right. One a **human** closed is a
+considered rejection, and re-opening it every morning would be the harness overruling a person on a
+schedule. A merged PR is likewise not re-promoted — that finding is `pr-merged-persists` (§4), which
+is a different problem and gets a different treatment.
 
 **The human trigger is an issue comment command:** `/remediate <finding-id>`, or `/remediate all` to
 promote every eligible finding in the stream. On its next run the audit parses the ledger issue's
@@ -114,16 +143,23 @@ re-issue `/remediate` and have it take effect. For a **promoted** finding this n
 the finding already has a branch and a PR discoverable by name, so re-reading the same command on a
 later run is a no-op by construction.
 
-The two actions §4 requires to happen _exactly once_ — the comment on a `pr-merged-persists` PR and
-the reply to a refused `/remediate` — have no such natural key, so each gets a **hidden marker in a
-body**, the same technique the delta block already uses:
+The actions that must happen _exactly once_ have no such natural key, so each gets a **hidden marker
+in a body**, the same technique the delta block already uses:
 
 - `<!-- audit-persists:<finding-id> -->` in the merged remediation PR's body. Present means the
   persistence comment has already been posted for that finding; absent means post it.
 - `<!-- audit-refused:<comment-node-id> -->` in the ledger issue body. Present means that specific
-  `/remediate` comment has already been refused; absent means reply and record it. Keying on the
-  comment node id, not the finding id, is what lets a later `/remediate` for the same finding be
-  refused again.
+  `/remediate` comment has already been refused; absent means reply and record it.
+- `<!-- audit-acked:<comment-node-id> -->`, likewise, for a `/remediate` that was **accepted**. A
+  request that is honoured needs answering exactly as much as one that is refused — the requester is
+  owed the PR links — and a standing comment on a long-lived ledger would otherwise be re-answered
+  every morning for as long as the issue is open.
+- `<!-- audit-stale-closed:<pr-number> -->` records that the harness, not a human, closed that PR.
+  It backs the `audit:stale-closed` label of §3.3 in a place a label edit cannot reach.
+
+Keying the `/remediate` markers on the **comment node id**, not the finding id, is what lets a later
+`/remediate` for the same finding be answered again: the second comment is a different comment, and
+a person asking twice is asking twice.
 
 Idempotency lives in bodies the renderer owns, never in the command comment a human wrote.
 
@@ -152,17 +188,22 @@ required `recommendation` object:
   reviewer's argument is worth more than the forty-fifth minor finding, so the field stays required
   and the renderer learns to truncate.
 
-### 3.3 Stale remediation PRs are always auto-closed
+### 3.3 Stale remediation PRs are auto-closed — over complete coverage
 
-When a run no longer reproduces a finding that has an open remediation PR, the PR is closed with a
-generated comment naming the date, the exact command that no longer reproduces, and its output.
+When a **complete** run no longer reproduces a finding that has an open remediation PR, the PR is
+closed with a generated comment naming the date, the exact command that no longer reproduces, and
+its output. Over a partial run nothing is closed (§7.3): retiring a fix asserts that its finding is
+gone, and an audit that could not read the cluster has no standing to assert it.
 
-Accepted risk: this can close a PR a human was mid-review on. Mitigations, both required:
+Accepted risk: this can close a PR a human was mid-review on. Mitigations, all three required:
 
 - The closing comment states plainly that the PR may be reopened, and that the audit will re-open a
   fresh one if the finding returns.
 - **The branch is not deleted on close.** Branches are cheap and any human fixup pushed to the branch
   survives. A branch is reset only when the same finding is promoted again.
+- **The close is labelled `audit:stale-closed`.** Without a marker, next month's run cannot tell its
+  own close from a maintainer's rejection, and it must treat those oppositely (§3.1). The label is
+  the harness signing its own work; removing it makes the close permanent.
 
 ### 3.4 Replace the PR-report path outright
 
@@ -182,14 +223,27 @@ is no fleet state left over from the model it replaces.
 
 The ledger renders each finding in exactly one state. Transitions are computed per run, never stored.
 
-| State                | Condition                                                                                  | Ledger renders                                      | Action taken                                   |
-| -------------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------- | ---------------------------------------------- |
-| `open`               | reproduces; no PR on its branch                                                            | finding + recommendation                            | none (or auto-promote if critical + manifest)  |
-| `pr-open`            | reproduces; branch has an open PR                                                          | finding + link to PR                                | refresh the PR body if the evidence changed    |
-| `pr-merged-persists` | reproduces; branch PR is merged                                                            | finding + **⚠ fix merged, still reproduces** + link | comment once on the merged PR; never reopen it |
-| `resolved`           | no longer reproduces; branch has an open PR                                                | removed from the table; named in the delta comment  | close the PR (§3.3), keep the branch           |
-| `resolved`           | no longer reproduces; no open PR                                                           | removed from the table; named in the delta comment  | none                                           |
-| `refused`            | `/remediate` named a non-`manifest` finding, or came from a commenter without write access | unchanged                                           | one-time reply comment explaining why          |
+| State                | Condition                                            | Rendered as                      | Action taken                                            |
+| -------------------- | ---------------------------------------------------- | -------------------------------- | ------------------------------------------------------- |
+| `open`               | reproduces; no PR on its branch                      | `open`                           | none, unless it qualifies for auto-promotion            |
+| `pr-open`            | reproduces; branch has an open PR                    | `fix proposed` + link            | **nothing** — the PR is left exactly as it is           |
+| `pr-merged-persists` | reproduces; branch PR is merged                      | `⚠ fix merged, still reproduces` | comment once on the merged PR; never reopen it          |
+| `refused`            | reproduces; branch PR is closed and was never merged | `fix refused` + link             | none — the close stands until someone says `/remediate` |
+| `resolved`           | no longer reproduces; PR open or absent              | dropped; named in the delta      | close any open PR (§3.3), keep the branch               |
+| `resolved-merged`    | no longer reproduces; branch PR is merged            | dropped; delta records the fix   | none — the ledger records that the merged fix is why    |
+
+Two rows are easy to misread, and both were wrong in an earlier draft:
+
+- **`pr-open` is not refreshed.** The draft said "refresh the PR body if the evidence changed",
+  which would have the harness force-push over a reviewer's own commits every morning. An open
+  remediation PR is left alone; the ledger links it, and the diff is whatever a human last made it.
+- **`refused` is a human decision, not a rejected command.** It is what a finding looks like when
+  someone closed its fix without merging — a considered "no" the harness must not overrule by
+  re-proposing the same fix tomorrow. (A refused `/remediate` is a _reply_, not a finding state;
+  there is no finding to put in a state, which is why the draft's condition for this row did not
+  correspond to anything the renderer could compute.) The discriminator is the `audit:stale-closed`
+  label: a close the harness performed is re-openable, a close a human performed is final, and the
+  escape hatch either way is `/remediate <id>` from someone with write access.
 
 `pr-merged-persists` is the state the current design cannot express and is a primary reason for the
 change. It must be visually distinct in the ledger.
@@ -206,10 +260,11 @@ practice groups are almost always singletons.
 
 - Group key: the sorted tuple of manifest paths, unioned transitively across findings that share any
   path.
-- Branch name for a multi-finding group: `platform-agent/fix-<audit-id>-<lowest-sorted-finding-id>`,
-  with every member finding named in the PR body and each linking back to the same PR from the
-  ledger. The group's branch is named after a member id, so the charset rule of §2 is what makes the
-  name legal; sorting is over the validated ids, byte-wise.
+- Branch name for a group: `platform-agent/fix-<audit-id>-<slug>-<digest>` over that same sorted
+  path tuple (§2), with every member finding named in the PR body and each linking back to the same
+  PR from the ledger. Deriving the name from the group key rather than from a member id is what
+  makes it stable across runs: the key is the set of files, and the group survives its members being
+  renumbered or partially fixed.
 - Promoting any member of a group promotes the whole group. The reply comment says so.
 
 ## 6. Script surface
@@ -218,13 +273,14 @@ practice groups are almost always singletons.
 
 ### `start --audit <id>`
 
-Unchanged in spirit. Refreshes credentials, resolves the repo, ensures labels, locates the stream's
-open ledger issue, returns the scratch path for `findings.json`. Emits:
+Resolves the repo, refreshes credentials, establishes the GitOps clone, ensures labels, locates the
+stream's open ledger issue, and returns the scratch path for `findings.json`. Emits:
 
 ```json
 {
   "issue": 128,
   "repo": "acme/fleet",
+  "workspace": "/opt/data/gitops/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
   "pending_remediation_requests": ["netpol-missing-payments"]
 }
@@ -233,7 +289,22 @@ open ledger issue, returns the scratch path for `findings.json`. Emits:
 `pending_remediation_requests` is the parsed set of `/remediate` targets from the issue's comments,
 surfaced early so the agent knows which findings need a manifest written during inspection.
 
-Note the removed behaviour: `start` no longer resets a report branch. There is no report branch.
+`workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
+directory, which is not a working tree — so there is nothing to `git add` into and nothing for
+`git config --get remote.origin.url` to answer. The harness therefore clones lazily on the way in,
+and **every `remediation.path` is resolved against this directory**. A manifest written anywhere
+else is a file the harness will never find.
+
+That also fixes an ordering problem worth recording: the GitHub App token is repo-scoped, so it
+cannot be minted before the repo is known, and the repo used to be derived from the clone the token
+was needed to create. The repo now comes from the `Git Repo:` line of `/opt/data/SETTINGS.md`, which
+the operator writes at provisioning time and which is present from the pod's first second, with the
+git remote kept only as a fallback. This resolves §13 Q1 in passing: `github-issue-resolver` already
+read that same line, so the two skills now agree by construction rather than by coincidence.
+
+`start` is also the **only** subcommand that scrubs the working tree — see the note under
+`remediate`. Note the removed behaviour: it no longer resets a report branch. There is no report
+branch.
 
 ### `finish --audit <id> --findings-file <path> [--dry-run]`
 
@@ -241,24 +312,30 @@ Note the removed behaviour: `start` no longer resets a report branch. There is n
    §2, and the scope rules of §7.2).
 2. Reconcile: one `gh pr list` call builds the finding→PR state map from head branch names.
 3. Compute the delta against the ledger issue's `<!-- audit-findings -->` marker.
-4. Clean run → close the ledger issue as completed, close every open remediation PR for the stream,
-   print `CLEAN`.
-5. Otherwise → render and create-or-edit the ledger issue, apply the severity label, post the delta
+4. Compute coverage gaps (§7.3). A gap does not stop the run; it narrows what the run may conclude.
+5. Clean run → close the ledger issue as completed, close every open remediation PR for the stream,
+   print `CLEAN`. **Unless the run is partial**, in which case the status is still `CLEAN` but the
+   issue stays open with a comment naming the gaps and no PR is retired.
+6. Otherwise → render and create-or-edit the ledger issue, apply the severity label, post the delta
    comment when the delta is non-empty.
-6. Auto-promote every eligible critical manifest finding (§3.1) — at most five per run, the surplus
+7. Auto-promote every eligible critical manifest finding (§3.1) — at most five per run, the surplus
    named in the ledger as awaiting `/remediate` (§13 Q4) — and every authorised `/remediate` target,
    which is uncapped, by invoking the same code path as `remediate`.
-7. Close stale PRs (§3.3); comment once on `pr-merged-persists` PRs; reply once to each refused
-   command. Both "once" guards read the hidden markers of §3.1.
+8. Close stale PRs (§3.3), unless partial; comment once on `pr-merged-persists` PRs; answer every
+   `/remediate` exactly once, with an acknowledgement or a refusal. Each "once" guard reads the
+   hidden markers of §3.1.
 
-Exit contract:
+Exit contract — eight keys, always all eight:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[]}`
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"]}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"]}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[]}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"]}`
 
 `--dry-run` renders the issue body and every PR body it _would_ open to stdout with zero git or gh
-side effects.
+side effects. It applies the **same** grouping, promotion, budget, and coverage-gap degradation as a
+real run, so a dry run that looks right is evidence the real one will be — a dry run that took a
+shorter path through the code would be worth very little.
 
 ### `remediate --audit <id> --findings-file <path> --finding <id>...`
 
@@ -266,7 +343,26 @@ The promotion primitive, callable directly and reused internally by `finish`. Fo
 the branch onto `main`, stage only the group's manifest paths (the existing wildcard-pathspec refusal
 is retained), commit with a generated Conventional Commit subject, push, and create or edit the PR.
 
-Manifest files must already exist on disk — a missing path stays a hard error.
+Manifest files must already exist under the workspace, but **a missing one is no longer a hard
+error**. That finding degrades to `kind: manual`, keeps its evidence and recommendation, says in the
+ledger that a fix was named but not written, and the report publishes. Killing a nine-critical
+security report because one of the nine manifests was not written is the wrong shape of failure: it
+throws away eight findings to punish one.
+
+`remediate` degrades the same way, for the same reason at a smaller scale. A named target whose file
+is missing is refused **by name** — logged, and returned in the `refused` key of its exit JSON so
+the acknowledgement comment can say so — while the rest of the batch opens. This matters because
+`/remediate all` expands to every manifest-remediation id in the document: refusing the batch would answer a request for
+thirty fixes with zero, and leave the operator to work out which one was to blame. Only the case
+where _every_ named target is refused is an error, since there is then no partial success to report
+and an exit 0 with an empty list would read as "done".
+
+Neither `finish` nor `remediate` scrubs the working tree, and that is load-bearing rather than
+incidental. The agent writes its remediation manifests into the clone _between_ `start` and
+`finish`, and they are untracked until a remediation branch stages them — so a `git clean -fd` on
+the way into `finish` would delete every fix the audit just produced and then report each one as a
+file the model forgot to write. Only `start` may reset, because at `start` there is nothing yet to
+lose and anything present is debris from a run that did not finish.
 
 ## 7. Rendering
 
@@ -330,22 +426,65 @@ The validator enforces both halves: the two lists must be disjoint, and a findin
 names a skipped entry is rejected. The rendered scope table carries a `limitations` column only when
 at least one cluster has one, so the common case stays two columns wide.
 
+### 7.3 Partial coverage
+
+`coverage_gaps(data)` folds the two representations of "did not look" — every `scope.skipped` entry
+and every cluster `limitations` note — into one list of human-readable strings, and a run with a
+non-empty list is **partial**.
+
+The reason this needs a name is that the whole ledger rests on one inference: _a finding that was in
+yesterday's document and is not in today's has been fixed._ That inference is sound only over a
+fleet the audit actually read. Absence of evidence from a cluster nobody could reach is not evidence
+of absence, and acting on it does real damage — it announces fixes that did not happen, and it
+closes the pull request that was going to make them happen.
+
+So over a partial run the harness withholds exactly the conclusions that depend on complete
+coverage, and nothing else:
+
+- `resolved` is reported as `0` and no resolved-delta is posted. Findings that genuinely were fixed
+  are simply reported the next time the fleet is fully readable.
+- No remediation PR is stale-closed. Every open fix survives to the next complete run.
+- Zero findings does not close the ledger. `status` is still `CLEAN` — the audit found nothing, and
+  saying otherwise would be its own lie — but the issue stays open and gains a comment naming the
+  gaps, so the stream self-heals the day the unreadable clusters come back.
+- The run is never `[SILENT]` (§2). "I found nothing" and "I could not look" must not arrive in chat
+  as the same silence.
+
+What a gap does **not** do is suppress the report. Findings from the clusters that _were_ read are
+published normally, and new fixes are still proposed for them. A partial audit is a partial audit,
+not a failed one.
+
+`partial` is `true` if and only if `coverage_gaps` is non-empty, on both `finish` branches. The
+tempting generalisation — also raising it when the body budget (§7) dropped findings from the
+description — was implemented and then removed, because the two are not the same kind of incomplete
+and the flag has one job. A coverage gap means the audit did not look, which is precisely why it
+suppresses the resolved count. Truncation means it looked, found everything, counted it all in the
+title, and could not print the tail; resolution accounting is untouched, because the delta block
+already carries only the ids the body rendered (§2). Folding them together produced
+`partial: true` with an empty `coverage_gaps` — a flag five SOPs instruct the agent to explain to a
+human, with nothing to explain it with. Truncation is surfaced where it belongs: a line in the body
+naming the count it dropped, and a `WARNING` in the run log.
+
 ## 8. Labels
 
-`ensure_labels` gains one entry; the rest are unchanged.
+`ensure_labels` gains two entries; the rest are unchanged.
 
-| Label               | Applies to  | Purpose                                      |
-| ------------------- | ----------- | -------------------------------------------- |
-| `agent:audit`       | issue + PRs | Everything this skill owns                   |
-| `audit:<audit-id>`  | issue + PRs | Stream identity; how the ledger is found     |
-| `audit:remediation` | PRs only    | Distinguishes a fix PR from the ledger issue |
-| `severity:*`        | issue + PRs | Highest live severity, mutually exclusive    |
+| Label                | Applies to  | Purpose                                      |
+| -------------------- | ----------- | -------------------------------------------- |
+| `agent:audit`        | issue + PRs | Everything this skill owns                   |
+| `audit:<audit-id>`   | issue + PRs | Stream identity; how the ledger is found     |
+| `audit:remediation`  | PRs only    | Distinguishes a fix PR from the ledger issue |
+| `audit:stale-closed` | PRs only    | The harness closed this, not a human (§3.3)  |
+| `severity:*`         | issue + PRs | Highest live severity, mutually exclusive    |
 
 ## 9. Red lines (carried forward, plus new)
 
 Unchanged: read-only against clusters; never `git add .` or `-A`; never force-push a protected
-branch; never hand-write a body, title, commit message, or timestamp; a `manifest` path must exist on
-disk before publishing.
+branch; never hand-write a body, title, commit message, or timestamp.
+
+Amended: a `manifest` path **should** exist under the workspace before publishing, and the agent is
+still told to write it — but a missing one degrades that finding to `manual` rather than killing the
+run (§6, `remediate`).
 
 New:
 
@@ -355,6 +494,16 @@ New:
 - **Never reopen a merged remediation PR.** A persisting finding gets a comment and a ledger state,
   not a resurrection.
 - **Never delete a remediation branch on close.**
+- **Never report a cluster the audit could not read as clean.** An unreadable cluster goes in
+  `scope.skipped`, a cluster read with a check missing gets a `limitations` note, and either way the
+  run is partial (§7.3). Reporting an all-clear for a cluster nobody looked at is the one failure
+  mode that makes the whole ledger untrustworthy.
+- **Never put a credential in `evidence.excerpt`.** No Secret `data:` or `stringData:` block, no
+  token, no password, no private key. The SOPs say this to the model; `audit_report.py` also
+  enforces it on the way out, replacing a `data:` block, a secret-named field, a self-identifying
+  token prefix, a PEM header, or an `Authorization:` value with `[redacted by audit_report.py]`. The
+  backstop exists because the ledger is a public artefact and one leaked excerpt cannot be recalled;
+  it is a backstop and not a licence, since it cannot recognise bare base64.
 
 ## 10. Work breakdown
 
@@ -418,7 +567,8 @@ docs/site/src/content/docs/install/prerequisites.md              (§13 Q2 — :8
 
 ## 12. Testing
 
-The existing module is 60 tests over 980 lines; most pure-helper coverage ports unchanged. New cases:
+The module this design started from was 60 tests over 980 lines; most pure-helper coverage ported
+unchanged. As shipped it is **274**. New cases:
 
 - `recommendation` validation: each sub-field missing, empty, wrong type.
 - Finding-id charset: an id containing `:`, a space, `..`, or `*`, one ending `.lock`, one starting
@@ -448,6 +598,14 @@ The existing module is 60 tests over 980 lines; most pure-helper coverage ports 
 - 5 critical plus 300 minor findings keeps all 5 criticals.
 - 10 findings render untruncated, with no "omitted" notice and no trimmed command.
 - The clean-run comment stays under the limit with 900 skipped clusters.
+- A truncated body reports `partial: false` with empty `coverage_gaps`, and warns in the log —
+  truncation is not a coverage gap (§7.3).
+- `partial == bool(coverage_gaps)` over both `finish` branches and all three ways a gap arises: clean
+  and complete, clean over a `skipped` entry, findings over a `skipped` entry, findings over a
+  cluster carrying only a `limitations` note.
+- The clean-run comment announces a close only when coverage is complete. Over a gap it says the
+  ledger stays open, and it treats a `limitations` note as a gap — the earlier version rendered
+  `scope.skipped` alone and posted "closed as completed" onto an issue that stayed open.
 
 **Failure-path cases.** The existing suite has **zero** of these: its mock command recorder returns
 exit 0 unconditionally, so not one test exercises a failing `gh` or `git` call. That is not a gap in
@@ -461,6 +619,25 @@ closed nothing. So:
 - A failing `gh pr list` must not be read as "no PR on this branch" and must not re-promote.
 - A clean run that cannot reach GitHub does not print `CLEAN`.
 
+**Coverage-gap cases** (§7.3): a `scope.skipped` entry and a cluster `limitations` note each set
+`partial`; a partial clean run leaves the ledger open, posts the gap comment, closes no PR, and
+reports `resolved: 0`; a complete clean run does all four of the opposite things.
+
+**Workspace cases.** Two of these run **real git** against a real bare origin rather than the
+recorded runner, because the defect they cover is invisible to a mock: `ensure_workspace` executes
+`git clean -fd`, and a mock happily records the command without deleting anything. The tests assert
+that an untracked manifest written between `start` and `finish` survives the reattach, that
+`reset=True` does remove it, and that `finish` issues neither `git clean` nor `git reset --hard`.
+This is worth the cost of a real repository in the suite: the bug it guards against silently emptied
+Tier 2 — every manifest the audit wrote would have been deleted moments before the harness looked
+for it, and every finding would have been published as "the fix was named but never written".
+
+**Repo-resolution cases** (§13 Q1): the `Git Repo:` line parsed from `https://`, `git@`, and bare
+`owner/name` forms; the literal `None` the operator writes for an unset CR field; a missing
+`SETTINGS.md` falling back to the git remote; SETTINGS winning when both are present; and an error
+that names both sources when neither works. Plus ordering: the repo is resolved before the token is
+minted, the token is minted for the resolved repo, and both happen before the clone.
+
 Plus the existing gates: `make docs-generate`, `make docs-check`, `make validate`, `prettier`,
 `astro build`, and a Docker build to prove in-image script paths.
 
@@ -471,12 +648,16 @@ directory's `origin`, which is the GitOps repo — correct for the PRs, but a pl
 audit issues in an ops/tracking repo instead. If they must differ, `start` needs an explicit
 issue-repo argument and the App token needs scope on both.
 
-_Resolved: the GitOps repo, via the existing `resolve_repo()`._ No new argument, no second token
-scope, no second place to look. One divergence surfaced while implementing and is recorded here
-rather than fixed: `audit_report.py`'s `resolve_repo()` derives the repo from the working directory's
-`origin` remote, while `github-issue-resolver/scripts/resolver.py`'s `get_target_repo()` derives it from the
-`Git Repo:` line of `/opt/data/SETTINGS.md`. The same repository in practice, two sources of truth
-for it. Noted, not unified — out of scope for this change.
+_Resolved: the GitOps repo._ No new argument, no second token scope, no second place to look.
+
+The divergence this question surfaced — `audit_report.py` deriving the repo from the working
+directory's `origin` remote while `github-issue-resolver/scripts/resolver.py` derives it from the
+`Git Repo:` line of `/opt/data/SETTINGS.md` — was first recorded as cosmetic and deferred. It was
+not cosmetic. Reading the remote requires a working tree, the audit cron does not start in one, and
+the clone that would create one needs a repo-scoped token that cannot be minted until the repo is
+known. The old resolution was circular and would have failed on the first real run. `resolve_repo()`
+now reads `SETTINGS.md` first and falls back to the remote, so the two skills agree by construction
+and the repo is knowable before anything has been cloned (§6, `start`).
 
 **Q2. Does the App token already carry `issues: write`?** `github-issue-resolver/scripts/resolver.py`
 creates labels, comments, and closes issues with the same token, so issue write is established — but

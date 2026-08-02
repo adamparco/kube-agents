@@ -45,9 +45,11 @@ fails if the two drift apart. Do not restate a title anywhere else.
 ## The two-command lifecycle
 
 Run both commands from your normal working directory — the same one `submit-suggestion` assumes,
-where `./skills/...` resolves and `git` already addresses the GitOps repository. The script resolves
-the target repository from that directory's `origin` remote and performs every git operation there.
-Do not `cd` elsewhere between `start` and `finish`.
+where `./skills/...` resolves. **You are not in a git checkout, and you do not need to be.** The
+audit crons start in the profile directory; the harness clones the GitOps repository itself, into
+`/opt/data/gitops/<owner>__<name>` on the shared volume, and runs every git and gh call inside it.
+The repository comes from the `Git Repo:` line of `/opt/data/SETTINGS.md`, which the operator writes
+at provisioning time and which is readable before any clone exists.
 
 ### Step 1 — `start`
 
@@ -57,20 +59,27 @@ Before inspecting anything, claim the workspace:
 ./skills/fleet-audit/scripts/audit_report.py start --audit <audit-id>
 ```
 
-This refreshes GitHub credentials, resolves the target repository, ensures the audit's labels exist,
-locates the stream's open ledger issue, and clears any findings document a crashed run left behind.
-It creates **no branch** — there is no report branch. It prints exactly one JSON line:
+This resolves the target repository, mints a repo-scoped GitHub token, clones or refreshes the
+GitOps workspace and leaves it on a clean `main`, ensures the audit's labels exist, locates the
+stream's open ledger issue, and clears any findings document a crashed run left behind. It creates
+**no branch** — there is no report branch. It prints exactly one JSON line:
 
 ```json
 {
   "issue": 128,
   "repo": "acme/fleet",
+  "workspace": "/opt/data/gitops/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
   "pending_remediation_requests": ["netpol-missing-payments"]
 }
 ```
 
 Write your findings to the `findings_path` it gives you. Do not pick your own path.
+
+`workspace` is the clone. **Every `remediation.path` is resolved against it**, so a manifest written
+anywhere else is a file the harness will never find — the finding degrades to a manual one and no
+pull request opens. `start` scrubs that directory before handing it to you; `finish` does not, which
+is what lets the files you write in between survive.
 
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
 parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
@@ -82,10 +91,11 @@ Enumerate the clusters in scope and inspect them **read-only** (`kubectl get/des
 `gcloud ... describe/list`). For every deviation you intend to report, capture the exact command you
 ran and the output that proves it.
 
-If a remediation is a declarative file, write that file into the repository working tree now and
-name its repo-relative path in the finding. The harness puts it on a branch of its own.
+If a remediation is a declarative file, write that file **under the `workspace` directory `start`
+reported** and name its repo-relative path in the finding. The harness puts it on a branch of its
+own.
 
-**Do not leave unrelated uncommitted work in the tree during an audit.** Opening a remediation pull
+**Do not leave unrelated uncommitted work in that tree during an audit.** Opening a remediation pull
 request requires switching branches, and the harness forces the switch. It snapshots and restores
 every path you declared, and returns you to the branch you started on — but a file it was never told
 about is not covered by that guarantee.
@@ -99,22 +109,45 @@ about is not covered by that guarantee.
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line:
+JSON line with eight fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
+`partial`, and `coverage_gaps`:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[]}` —
-  the stream had no open ledger.
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"]}` —
-  the existing ledger was rewritten.
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"]}` —
-  zero findings; the ledger closed as completed and its open fixes closed with it.
+- `{"status":"OPENED","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[]}`
+  — the stream had no open ledger.
+- `{"status":"UPDATED","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[]}`
+  — the existing ledger was rewritten.
+- `{"status":"CLEAN","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[]}`
+  — zero findings; the ledger closed as completed and its open fixes closed with it.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
-to stdout with **zero** git or gh side effects. Use it whenever you are unsure your document is well
-formed.
+to stdout with **zero** git or gh side effects. It applies the same grouping and the same
+degradation as the real run, so the branch names it names are the branch names it would create. Use
+it whenever you are unsure your document is well formed.
 
 Exit 0 means published. **Exit 2 means the validator rejected the document and nothing was
 published** — fix the document and re-run; never delete the finding that tripped it. Exit 1 is
 fatal.
+
+### Partial coverage
+
+`partial` is `true` exactly when the run could not speak for the whole fleet: any entry in
+`scope.skipped`, or any cluster carrying a `limitations` note. `coverage_gaps` says which, and why —
+so `partial` is `true` if and only if `coverage_gaps` is non-empty, and you can report from either.
+
+It does not mean "the description was truncated." A ledger too long for GitHub's body limit says so
+in its own body and still carries true totals in its title; the audit saw everything, so nothing
+about what the run may conclude changes. Coverage is the only thing `partial` tracks.
+
+A gap changes what the run is _allowed to conclude_, because a finding's absence from an unread
+cluster is not evidence that it was fixed. Over a partial run the harness:
+
+- reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
+- closes **no** remediation pull request as stale, so a fix survives to the next complete run;
+- does **not** close the ledger, even with zero findings — `status` is still `CLEAN`, but the issue
+  stays open and gains a comment naming the gaps. The stream self-heals the day the fleet is fully
+  readable again.
+
+A partial run is never `[SILENT]`. Report the issue URL and say which clusters were not covered.
 
 ## The findings document
 
@@ -171,12 +204,14 @@ field, and publishes nothing:
 - `audit` must equal the `--audit` argument. An audit may only write to its own ledger.
 - `scope.clusters` must be **non-empty**. An audit that enumerated nothing is a failure, not a clean
   run — if you could not list the fleet, say so loudly instead of reporting zero findings.
-- `id` is a stable slug, unique within the file, matching `^[a-z0-9][a-z0-9._-]{0,98}[a-z0-9]$` with
+- `id` is a stable slug, unique within the file, matching `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with
   no `..` run and no `.lock` suffix. Two rules ride on this. **Stability is what makes the delta
   work**: the same underlying problem must produce the same id on every run, or it will churn as
   "resolved" then "new" forever — derive it from the cluster/namespace/object, never from a
-  timestamp, counter, or run id. And the id becomes a **git branch name component**, which is why
-  the charset is narrow. Keep ids short: a 100-character id is legal, and unreadable.
+  timestamp, counter, or run id. **The charset is narrow** because the id is the join key of the
+  ledger's hidden delta block and of the `audit-persists:<id>` marker — both line-anchored regexes a
+  space or a newline would break — and because an operator types it by hand in `/remediate <id>`.
+  Keep ids short: a 100-character id is legal, and unreadable.
 - `severity` is one of `critical`, `major`, `minor`.
 - `namespace` may be empty for cluster-scoped objects.
 - `evidence.command` is **required and non-empty**.
@@ -224,6 +259,14 @@ Corollaries:
 - **Never paste a Secret's `data:`, a token, a password, or a private key into an excerpt.** Report
   that the Secret exists and what is wrong with it; the command in `evidence.command` is how a
   reviewer sees the rest, under their own credentials.
+
+  The harness redacts high-confidence credential shapes as a backstop — a `data:`/`stringData:`
+  block, a field named like a secret, a self-identifying token prefix, a PEM header, an
+  `Authorization:` value — replacing them with `[redacted by audit_report.py]`. It is deliberately
+  conservative and **does not** touch bare base64, because legitimate audit output is full of it.
+  Treat the backstop as a seatbelt, not a licence: it will not catch a credential that looks like
+  ordinary output.
+
 - Report what the command showed, not what you infer it implies. Inference belongs in `impact`.
 - One finding per object. Do not roll up "12 namespaces lack NetworkPolicies" into one finding — each
   gets its own stable id so each can resolve independently.
@@ -233,13 +276,25 @@ Corollaries:
 Every finding renders in exactly one state, computed fresh each run from whether it still reproduces
 and what pull request sits on its branch. Nothing is stored between runs.
 
-| State                | Meaning                                               | What the harness does                                                |
-| -------------------- | ----------------------------------------------------- | -------------------------------------------------------------------- |
-| `open`               | Reproduces; no pull request                           | Nothing, unless it qualifies for auto-promotion                      |
-| `pr-open`            | Reproduces; a fix is open on its branch               | Refreshes that pull request                                          |
-| `pr-merged-persists` | Reproduces; the fix **merged anyway**                 | Comments once on the merged PR; never reopens it                     |
-| `resolved`           | Stopped reproducing                                   | Drops it from the ledger, names it in the delta, closes any open fix |
-| `refused`            | A `/remediate` named it but the harness would not act | Replies once, saying why                                             |
+| State                | Rendered as                      | Meaning                                     | What the harness does                                                |
+| -------------------- | -------------------------------- | ------------------------------------------- | -------------------------------------------------------------------- |
+| `open`               | `open`                           | Reproduces; no pull request                 | Nothing, unless it qualifies for auto-promotion                      |
+| `pr-open`            | `fix proposed`                   | Reproduces; a fix is open on its branch     | **Nothing.** The pull request is left alone                          |
+| `pr-merged-persists` | `⚠ fix merged, still reproduces` | Reproduces; the fix **merged anyway**       | Comments once on the merged PR; never reopens it                     |
+| `refused`            | `fix refused`                    | Reproduces; a **human closed** the fix      | Nothing. The close stands until someone says `/remediate`            |
+| `resolved`           | `resolved`                       | Stopped reproducing                         | Drops it from the ledger, names it in the delta, closes any open fix |
+| `resolved-merged`    | `resolved (fix merged)`          | Stopped reproducing, and its fix was merged | The same, and the ledger records that the fix is why                 |
+
+Two of these are easy to misread:
+
+- **`pr-open` is not refreshed.** An open pull request is left exactly as it is, because a reviewer
+  may have pushed onto it and a nightly force-push would silently discard their work. The ledger
+  links it; the diff is whatever a human last made it.
+- **`refused` is a human decision, not a rejected command.** It means someone closed the remediation
+  pull request without merging it. That is a considered "no", and the harness never overrules it by
+  re-opening the same fix tomorrow morning. A pull request the _harness_ closed as stale carries the
+  `audit:stale-closed` label and is re-openable; strip that label and the close becomes permanent.
+  The escape hatch either way is `/remediate <id>` from someone with write access.
 
 `pr-merged-persists` is the state worth reading twice: a fix merged and the deviation is still
 there. Either the remediation was incomplete or something outside this repository reverted it.
@@ -249,19 +304,57 @@ there. Either the remediation was incomplete or something outside this repositor
 A pull request is opened for a finding only when its remediation is a `manifest` — there is nothing
 to put in a diff otherwise. Two paths lead there:
 
-- **Auto-promotion.** A finding that is `critical`, is a `manifest`, and has no pull request on its
-  branch in any state is promoted automatically by `finish` — **at most five per run**. The surplus
-  is named in the ledger as awaiting `/remediate`, so nothing is silently dropped.
+- **Auto-promotion.** A finding that is `critical`, is a `manifest`, and has no live pull request on
+  its branch is promoted automatically by `finish` — **at most five per run**. The surplus is named
+  in the ledger as awaiting `/remediate`, so nothing is silently dropped. "Live" excludes a pull
+  request the harness itself closed as stale (that one is re-openable) and includes one a human
+  closed or merged (those are not).
 - **`/remediate <finding-id>`**, or `/remediate all`, commented on the ledger by someone with write
-  access to the repository. This path is uncapped: a human asked for that one by name. A request
-  from a commenter without write access, or naming a non-`manifest` finding, gets one reply
-  explaining why and no pull request.
+  access to the repository. This path is uncapped: a human asked for that one by name.
+
+Every `/remediate` gets exactly one answer, and the answer is never silence:
+
+- Accepted — one acknowledgement comment on the ledger naming each target and what happened to it:
+  the pull request URL, or "already open" and left untouched, or that publishing failed and the next
+  run will retry.
+- Refused — one reply saying why, for a commenter without write access, a `/remediate` naming a
+  finding that is not in the current document, or one naming a non-`manifest` finding.
+
+Both are guarded by a hidden marker carrying the triggering comment's node id, so a standing
+`/remediate` in the thread is answered once rather than every morning forever.
+
+Run the requested targets through the subcommand, which takes `--finding` once per id:
+
+```bash
+./skills/fleet-audit/scripts/audit_report.py remediate --audit <audit-id> \
+  --findings-file <findings_path> --finding <id> [--finding <id> …] [--issue <n>]
+```
+
+It prints one JSON line — `status`, `prs_opened`, `already_open`, and `refused`:
+
+- `{"status":"REMEDIATED","prs_opened":["…"],"already_open":["cluster-old"],"refused":["ns-quota"]}`
+
+`refused` names the targets whose remediation file is not on disk in the clone: the audit promised a
+manifest and never wrote it, so there is nothing to put in a diff. The other targets still open —
+`/remediate all` expands to every **manifest-remediation** id in the document, and failing the batch over one unwritten file
+would answer a request for many fixes with none. Say which were refused when you acknowledge the
+command.
+
+Exit 2 means nothing was published, for one of three reasons — read the message before reporting
+which: a named id is not in the document at all, a named target is not a `manifest`, or every named
+target was refused for a missing file. The first two are fixed by dropping the bad id and asking
+again; only the third is about writing manifests.
 
 **Findings whose remediation paths intersect share one pull request.** They have to: separate
-branches touching the same file conflict on merge. The group's branch is
-`platform-agent/fix-<audit-id>-<lowest-finding-id>`, and promoting any member promotes the whole
-group — the pull request names every member. That is why several findings can point at one shared
-manifest and still produce one clean diff.
+branches touching the same file conflict on merge. Promoting any member promotes the whole group —
+the pull request names every member. That is why several findings can point at one shared manifest
+and still produce one clean diff.
+
+The group's branch is `platform-agent/fix-<audit-id>-<slug>-<digest>`, where the digest is over the
+group's **sorted path set** and the slug is a readable fragment of the first path. It is keyed on
+the files, not on a finding id, and that is load-bearing: ids are regenerated every run, so a branch
+named after one of them gets renamed the day that finding resolves — orphaning the open pull request
+and opening a duplicate against the same file.
 
 The branch name is the only join key. There is no state file: `finish` reconstructs the entire
 finding-to-pull-request mapping from one `gh pr list` call.
@@ -280,15 +373,29 @@ you must not work around:
 ## The clean run
 
 If the audit finds nothing, still call `finish` with `"findings": []` and a populated
-`scope.clusters`. The harness comments the date and the clusters covered, closes the ledger issue
-**as completed**, and closes every remediation pull request still open for the stream.
+`scope.clusters`. With complete coverage the harness comments the date and the clusters covered,
+closes the ledger issue **as completed**, and closes every remediation pull request still open for
+the stream.
 
-Then your final response **MUST be exactly `[SILENT]`**. A clean audit is not news; the closed issue
-is the record. Say nothing in chat.
+A clean run is usually not news, and the closed issue is the record — but "clean" alone does not
+decide it. Read the `finish` JSON and apply the full rule:
 
-`UPDATED` with `new: 0` **and** `resolved: 0` is also exactly `[SILENT]` — nothing moved since the
-last run, and the ledger already says everything you would. If **either** counter is non-zero,
-report the issue URL and a one-line summary.
+> **`[SILENT]` iff `new == 0` and `resolved == 0` and `partial == false`.**
+
+If any of the three fails, report the issue URL and a one-line summary. Two clean runs are _not_
+silent, and both matter:
+
+- **`resolved > 0`** — the fleet was carrying findings yesterday and is not today. Something got
+  fixed, and that is the best thing this audit ever gets to say. Reporting `partial` failures while
+  swallowing this one would leave the operator hearing only bad news.
+- **`partial: true`** — the ledger stayed open because the fleet was not fully read. "I found
+  nothing" and "I could not look" must not arrive as the same silence.
+
+There is one case where the harness reports `new: 0, resolved: 0` without knowing it: if the
+previous ledger body could not be read, the delta is unknowable, so it announces nothing rather than
+declaring every live finding new. The run logs
+`Previous ledger body was unreadable; skipping the delta comment` to stderr and the ledger is still
+rewritten correctly. Treat it as `[SILENT]` — the issue carries the truth either way.
 
 ## Red lines
 
@@ -307,5 +414,11 @@ report the issue URL and a one-line summary.
 - **Never force-push a protected branch.** `main`, `master`, and `production` are refused.
 - **Never hand-write a body, title, commit message, or timestamp.** They are generated so that the
   diff between two runs is meaningful.
-- **A `manifest` remediation path must exist on disk** when `finish` runs. Write the file first. A
-  missing path is a hard error, not a warning.
+- **Write every `manifest` remediation file before calling `finish`**, under the `workspace`
+  directory. A path that is not on disk does not fail the run — that one finding degrades to
+  `manual`, keeps its evidence and recommendation, and says in the ledger that the fix was named but
+  not written. The report still publishes. Do not rely on this: a degraded finding is a fix a human
+  now has to apply by hand.
+- **Never report a cluster you could not read as clean.** Put it in `scope.skipped`, or name what
+  did not run in that cluster's `limitations`. Both make the run `partial`, which is the mechanism
+  that stops the harness from closing fixes and retiring the ledger on evidence it never gathered.
