@@ -13,6 +13,7 @@ commands that do touch the network are driven through a single recorded seam
 import contextlib
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,16 @@ import gitops_workspace  # noqa: E402
 
 AUDIT = "compliance-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
+
+# What GitHub enforces on an issue body, a comment and a pull request body,
+# written out here rather than imported. The harness's `MAX_BODY_CHARS` is only
+# the harness's *belief* about that number, and a size test asserting a body
+# fits under the harness's own belief passes just as happily when the belief is
+# wrong: raise the constant to 200,000 and every budget test below stays green
+# while every publish 422s — which is the whole failure the budget exists to
+# prevent. The real number is not ours to change, so it is a literal, and the
+# constant is checked against it once (`test_the_budget_matches_github`).
+GITHUB_BODY_LIMIT = 65_536
 
 
 def render_body(doc, **kwargs):
@@ -138,6 +149,11 @@ class Recorder:
     def __init__(self, replies=None, failures=None):
         self.calls: list[list[str]] = []
         self.cwds: list[str | None] = []
+        # Body-file contents, one entry per call, None when the call had no
+        # `--body-file`. Captured here because the harness unlinks each temp
+        # file the moment `gh` returns — read it later and there is nothing to
+        # read. See `bodies_for` for why the seam has to exist at all.
+        self.bodies: list[str | None] = []
         self.replies = replies or {}
         self.failures = failures or {}
         # `git diff --cached --quiet` is the harness's commit classifier: rc 0
@@ -149,6 +165,7 @@ class Recorder:
     def __call__(self, cmd, *, check=True, capture=True, cwd=None):
         self.calls.append(list(cmd))
         self.cwds.append(None if cwd is None else str(cwd))
+        self.bodies.append(self._read_body_file(cmd))
         joined = " ".join(cmd)
         for key, code in self.failures.items():
             if key in joined:
@@ -177,6 +194,49 @@ class Recorder:
             return
         destination = Path(cmd[-1])
         (destination / ".git").mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _read_body_file(cmd):
+        """The contents of this call's body file, or None if it has none.
+
+        Both spellings: `gh issue/pr create|edit` takes `--body-file`, while
+        `gh issue/pr comment` takes `-F`. Recognising only one silently returns
+        None for the other, which reads as "nothing was published" — the exact
+        blind spot this seam exists to close.
+        """
+        cmd = list(cmd)
+        flag = next((f for f in ("--body-file", "-F") if f in cmd), None)
+        if flag is None:
+            return None
+        index = cmd.index(flag) + 1
+        if index >= len(cmd):
+            return None
+        try:
+            return Path(cmd[index]).read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def bodies_for(self, *path):
+        """What `gh <path...>` actually published, in order.
+
+        The one seam the suite was missing. Every other assertion checks either
+        the *arguments* handed to `gh` or the *return value* of a renderer, and
+        nothing checked the wire between them: `_write_temp` could write an
+        empty string — blanking every issue, comment and pull request the
+        feature exists to produce — and the whole suite stayed green. Anything
+        asserting that something was *published* has to come through here.
+
+        Calls with no `--body-file` contribute nothing, so `gh issue edit` for a
+        label and `gh issue edit` for a report do not have to be told apart by
+        the caller; the length of this list is the number of bodies that
+        reached GitHub.
+        """
+        wanted = ["gh", *path]
+        return [
+            body
+            for call, body in zip(self.calls, self.bodies)
+            if call[: len(wanted)] == wanted and body is not None
+        ]
 
     def matching(self, *fragments):
         return [
@@ -482,6 +542,87 @@ class TestDeltaBlock(unittest.TestCase):
         new, resolved = audit_report.compute_delta(["a", "b"], ["b", "c"])
         self.assertEqual(new, ["c"])
         self.assertEqual(resolved, ["a"])
+
+    def test_a_truncated_finding_is_not_announced_as_new_every_run(self):
+        # The block records what the body *rendered*, so `new` has to be
+        # measured against the same set. Against the full finding list, every
+        # finding the budget dropped reads as new every morning, forever.
+        new, _ = audit_report.compute_delta(
+            previous_ids=["a", "b"],
+            rendered_ids=["a", "b"],
+            all_current_ids=["a", "b", "truncated"],
+        )
+        self.assertEqual(new, [])
+
+    def test_a_truncated_finding_is_not_announced_as_resolved(self):
+        # It still reproduces; it just did not fit. Calling it resolved claims
+        # a fix that never happened, on a finding nobody can see.
+        _, resolved = audit_report.compute_delta(
+            previous_ids=["a", "b"],
+            rendered_ids=["a"],
+            all_current_ids=["a", "b"],
+        )
+        self.assertEqual(resolved, [])
+
+    def test_a_genuinely_absent_finding_is_still_resolved_when_truncation_happens(self):
+        _, resolved = audit_report.compute_delta(
+            previous_ids=["a", "b", "gone"],
+            rendered_ids=["a"],
+            all_current_ids=["a", "b"],
+        )
+        self.assertEqual(resolved, ["gone"])
+
+    def test_a_finding_that_becomes_renderable_is_announced_then(self):
+        new, resolved = audit_report.compute_delta(
+            previous_ids=["a"],
+            rendered_ids=["a", "b"],
+            all_current_ids=["a", "b"],
+        )
+        self.assertEqual(new, ["b"])
+        self.assertEqual(resolved, [])
+
+
+class TestDeltaCommentOrdering(BaseTestCase):
+    """The delta comment is the notification that says "look now"."""
+
+    def findings_at(self, spec):
+        return [
+            make_finding(fid=fid, severity=severity, title=f"{fid} title")
+            for fid, severity in spec
+        ]
+
+    def test_a_new_critical_survives_the_row_cap(self):
+        # Alphabetical order decides what a reader sees by the first letter of
+        # an id; on a bad night that keeps fifty minors and drops the criticals.
+        cap = audit_report.MAX_DELTA_ROWS
+        spec = [(f"a-minor-{i:03d}", "minor") for i in range(cap + 10)]
+        spec.append(("z-critical", "critical"))
+        findings = self.findings_at(spec)
+        comment = audit_report.render_delta_comment(
+            AUDIT, sorted(f["id"] for f in findings), [], findings, {}, NOW
+        )
+        self.assertIn("z-critical", comment)
+        self.assertIn(f"**{len(spec)} new**", comment)
+        self.assertIn("lower severity first to be cut", comment)
+
+    def test_rows_are_severity_ordered(self):
+        findings = self.findings_at(
+            [("a", "minor"), ("b", "critical"), ("c", "major")]
+        )
+        comment = audit_report.render_delta_comment(
+            AUDIT, ["a", "b", "c"], [], findings, {}, NOW
+        )
+        self.assertLess(comment.index("`b`"), comment.index("`c`"))
+        self.assertLess(comment.index("`c`"), comment.index("`a`"))
+
+    def test_an_id_with_no_finding_behind_it_does_not_stop_the_notification(self):
+        findings = self.findings_at([("b", "critical")])
+        comment = audit_report.render_delta_comment(
+            AUDIT, ["ghost", "b"], [], findings, {}, NOW
+        )
+        self.assertIn("`b`", comment)
+        self.assertIn("`ghost`", comment)
+        self.assertLess(comment.index("`b`"), comment.index("`ghost`"))
 
     def test_delta_across_two_rendered_runs(self):
         run_one = render_body(
@@ -1026,6 +1167,110 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
 
 
+class TestPublishedBodies(HarnessTestCase):
+    """What reaches GitHub, read back off the `--body-file` the harness wrote.
+
+    Every other end-to-end test asserts that `gh` was called with the right
+    flags, and every rendering test asserts that a renderer returns the right
+    string. Neither connects the two. Replacing `_write_temp`'s payload with an
+    empty string — blanking the ledger, every comment and every pull request —
+    left the whole suite green, so the feature's actual output was untested.
+    These tests are the wire, and they belong to the artifacts rather than to
+    the code paths, so a rewrite of the publish path cannot quietly drop them.
+    """
+
+    def test_the_created_ledger_carries_the_report(self):
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        bodies = self.harness.bodies_for("issue", "create")
+        self.assertEqual(len(bodies), 1)
+        self.assertIn("## Findings", bodies[0])
+        self.assertIn("Namespace has no NetworkPolicy", bodies[0])
+        self.assertIn("kubectl get networkpolicy -n payments", bodies[0])
+        # The hidden block is the only state the next run has. If it is not in
+        # the published document, every finding reads as new forever.
+        self.assertIn('<!-- audit-findings: ["no-network-policy"] -->', bodies[0])
+
+    def test_the_refreshed_ledger_and_its_delta_carry_their_own_text(self):
+        previous_body = render_body(
+            make_doc(findings=[make_finding(fid="a", title="Alpha finding")]),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        self.assertEqual(self.run_finish(doc), 0)
+
+        edits = self.harness.bodies_for("issue", "edit")
+        self.assertEqual(len(edits), 1)
+        self.assertIn("Bravo finding", edits[0])
+        self.assertNotIn("Alpha finding", edits[0])
+
+        comments = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(len(comments), 1)
+        self.assertIn("`b`", comments[0])
+        self.assertIn("`a`", comments[0])
+
+    def test_the_clean_comment_is_published_not_just_rendered(self):
+        previous_body = render_body(
+            make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+        }
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+
+        comments = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(len(comments), 1)
+        self.assertIn("is now clean", comments[0])
+
+    def test_the_promoted_pull_request_carries_its_own_body(self):
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        bodies = self.harness.bodies_for("pr", "create")
+        self.assertEqual(len(bodies), 1)
+        self.assertIn("## Files", bodies[0])
+        self.assertIn("clusters/prod-us-east/payments-netpol.yaml", bodies[0])
+        self.assertIn("Part of #42", bodies[0])
+        # Same self-describing block as the ledger: the next run keys the pull
+        # request back to its findings by reading it.
+        self.assertIn('<!-- audit-findings: ["no-network-policy"] -->', bodies[0])
+
+    def test_no_published_body_is_ever_empty(self):
+        # The blanket form of the above, so an artifact added later is covered
+        # by default rather than by somebody remembering to add a test.
+        previous_body = render_body(
+            make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        published = [b for b in self.harness.bodies if b is not None]
+        self.assertTrue(published, "the run published nothing at all")
+        for index, body in enumerate(published):
+            with self.subTest(body=index):
+                self.assertTrue(body.strip())
+
+
 class TestFinishClean(HarnessTestCase):
     def test_clean_run_closes_the_open_ledger_as_completed(self):
         previous_body = render_body(
@@ -1264,6 +1509,10 @@ class TestStart(HarnessTestCase):
                 "agent:audit",
                 "audit:compliance-audit",
                 "audit:remediation",
+                # Load-bearing, not decorative: the close path refuses to close
+                # without it, because an unlabelled close reads as a human's
+                # rejection and retires the finding for good.
+                "audit:stale-closed",
                 "severity:critical",
                 "severity:major",
                 "severity:minor",
@@ -1316,6 +1565,57 @@ class TestDryRun(BaseTestCase):
         )
         self.assertIn("is now clean", self.out)
 
+    def test_dry_run_renders_every_pr_body_it_would_open(self):
+        # The pull request is the artifact a person is asked to merge. Printing
+        # the ledger alone left the reviewable half visible only in production.
+        self.patch_attr("run_cmd", Recorder())
+        self.patch_attr("repo_root_best_effort", lambda: self.tmp_path)
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        rc = self.run_finish(make_doc(), argv_extra=("--dry-run",))
+        self.assertEqual(rc, 0)
+        self.assertIn(audit_report.DRY_RUN_PR_SEPARATOR, self.out)
+
+        ledger, _, pr = self.out.partition(audit_report.DRY_RUN_PR_SEPARATOR)
+        self.assertIn("## Findings", ledger)
+        self.assertIn("## Files", pr)
+        self.assertIn("clusters/prod-us-east/payments-netpol.yaml", pr)
+        self.assertIn("branch: platform-agent/fix-", pr)
+        self.assertIn("title: ", pr)
+        # No `gh` call on this path, so the ledger number is genuinely unknown;
+        # the run says so rather than letting the gap read as a rendering bug.
+        self.assertNotIn("Part of #", pr)
+        self.assertIn("the 'Part of #N' link is omitted", self.err)
+
+    def test_dry_run_prints_no_pr_body_for_a_manifest_that_is_not_on_disk(self):
+        # Degradation runs first, so the dry run must show the same nothing the
+        # real run would open — not a pull request for a file that isn't there.
+        self.patch_attr("run_cmd", Recorder())
+        self.patch_attr("repo_root_best_effort", lambda: self.tmp_path)
+
+        rc = self.run_finish(make_doc(), argv_extra=("--dry-run",))
+        self.assertEqual(rc, 0)
+        self.assertNotIn(audit_report.DRY_RUN_PR_SEPARATOR, self.out)
+        self.assertIn("no remediation pull requests", self.err)
+
+    def test_dry_run_pr_bodies_match_the_branches_it_says_it_would_open(self):
+        # `WOULD OPEN` and the bodies are computed from the same group list, so
+        # a dry run cannot name one branch and render another's contents.
+        self.patch_attr("run_cmd", Recorder())
+        self.patch_attr("repo_root_best_effort", lambda: self.tmp_path)
+        for path in ("a.yaml", "b.yaml"):
+            self.touch(path)
+        doc = make_doc(
+            findings=[manifest_finding("f-a", "a.yaml"), manifest_finding("f-b", "b.yaml")]
+        )
+
+        self.assertEqual(self.run_finish(doc, argv_extra=("--dry-run",)), 0)
+        line = re.search(r"WOULD OPEN: (.+)$", self.err, re.M).group(1)
+        announced = [name.strip() for name in line.split(",")]
+        rendered = re.findall(r"^branch: (\S+)$", self.out, re.M)
+        self.assertEqual(len(rendered), 2)
+        self.assertEqual(sorted(announced), sorted(rendered))
+
 
 # --------------------------------------------------------------------------- #
 # Size budget — the difference between a stream that publishes and one that 422s
@@ -1350,14 +1650,30 @@ class TestRenderBudget(BaseTestCase):
     def render(self, doc):
         return render_body(doc, generated_at=NOW)
 
+    def test_the_budget_matches_github(self):
+        # The one place the two numbers are allowed to meet. Every other size
+        # test measures against the literal, so this is what fails — loudly,
+        # and on its own — if somebody widens the constant to make a body fit.
+        self.assertEqual(audit_report.MAX_BODY_CHARS, GITHUB_BODY_LIMIT)
+        # And the working budget has to leave real headroom underneath it: the
+        # footer, the delta block and the truncation notice are all appended
+        # after selection, so a budget equal to the limit overflows by exactly
+        # the amount the selection loop could not see.
+        self.assertLess(audit_report.BODY_BUDGET, GITHUB_BODY_LIMIT)
+
     def test_body_stays_under_the_github_limit_at_250_findings(self):
         body = self.render(make_doc(findings=bulk_findings(250)))
-        self.assertLess(len(body), audit_report.MAX_BODY_CHARS)
+        self.assertLess(len(body), GITHUB_BODY_LIMIT)
 
     def test_ten_findings_render_untruncated(self):
         findings = bulk_findings(10)
         body = self.render(make_doc(findings=findings))
-        self.assertNotIn("further findings omitted", body)
+        # The renderer says "further finding(s) are omitted". Asserting on
+        # "further findings omitted" — the phrasing this test used to check —
+        # matched nothing the renderer can emit, so it stayed green on a body
+        # that *was* truncated. Assert on the same regex the truncation test
+        # uses, inverted, so the two cannot drift apart again.
+        self.assertNotRegex(body, r"\d+ further finding\(s\) are omitted")
         for finding in findings:
             self.assertIn(finding["id"], body)
 
@@ -1398,7 +1714,7 @@ class TestRenderBudget(BaseTestCase):
         body = self.render(make_doc(findings=findings))
         for i in range(5):
             self.assertIn(f"crit-{i:04d}", body)
-        self.assertLess(len(body), audit_report.MAX_BODY_CHARS)
+        self.assertLess(len(body), GITHUB_BODY_LIMIT)
 
     def test_scope_only_body_cannot_overflow(self):
         # Zero findings, an enormous fleet: this overflowed at 148,627 chars
@@ -1415,7 +1731,7 @@ class TestRenderBudget(BaseTestCase):
             ],
         )
         body = self.render(doc)
-        self.assertLess(len(body), audit_report.MAX_BODY_CHARS)
+        self.assertLess(len(body), GITHUB_BODY_LIMIT)
         self.assertIn("more", body)
 
     def test_clean_comment_stays_under_the_limit_at_900_skipped(self):
@@ -1430,7 +1746,7 @@ class TestRenderBudget(BaseTestCase):
             ],
         )
         comment = audit_report.render_clean_comment(AUDIT, doc, NOW)
-        self.assertLess(len(comment), audit_report.MAX_BODY_CHARS)
+        self.assertLess(len(comment), GITHUB_BODY_LIMIT)
 
     def test_delta_comment_stays_under_the_limit(self):
         # Newly reachable: capping the body means N is no longer pinned under
@@ -1444,7 +1760,7 @@ class TestRenderBudget(BaseTestCase):
             {f["id"]: f["title"] for f in findings},
             NOW,
         )
-        self.assertLess(len(comment), audit_report.MAX_BODY_CHARS)
+        self.assertLess(len(comment), GITHUB_BODY_LIMIT)
 
     def test_long_command_is_trimmed(self):
         finding = make_finding(command="kubectl get pods " + "x" * 5000)
@@ -1733,13 +2049,32 @@ class TestRemediationGroups(BaseTestCase):
 # --------------------------------------------------------------------------- #
 
 
+ALL_STATES = (
+    audit_report.STATE_OPEN,
+    audit_report.STATE_PR_OPEN,
+    audit_report.STATE_PR_MERGED_PERSISTS,
+    audit_report.STATE_RESOLVED_MERGED,
+    audit_report.STATE_RESOLVED,
+    audit_report.STATE_REFUSED,
+    audit_report.STATE_WITHDRAWN,
+)
+
+
+def stale_closed_pr(**extra):
+    """A pull request the *harness* closed, not a person."""
+    return {"state": "CLOSED", "labels": [{"name": audit_report.STALE_CLOSED_LABEL}], **extra}
+
+
 class TestFindingState(BaseTestCase):
-    def test_all_six_states(self):
+    def test_all_seven_states(self):
         cases = [
             (True, None, audit_report.STATE_OPEN),
             (True, {"state": "OPEN"}, audit_report.STATE_PR_OPEN),
             (True, {"state": "MERGED"}, audit_report.STATE_PR_MERGED_PERSISTS),
             (True, {"state": "CLOSED"}, audit_report.STATE_REFUSED),
+            # The discriminator between the last two is the label, and nothing
+            # else: same state, same absence of a merge, opposite meanings.
+            (True, stale_closed_pr(), audit_report.STATE_WITHDRAWN),
             (False, None, audit_report.STATE_RESOLVED),
             (False, {"state": "MERGED"}, audit_report.STATE_RESOLVED_MERGED),
         ]
@@ -1754,15 +2089,19 @@ class TestFindingState(BaseTestCase):
         )
 
     def test_every_state_has_a_label(self):
-        for state in (
-            audit_report.STATE_OPEN,
-            audit_report.STATE_PR_OPEN,
-            audit_report.STATE_PR_MERGED_PERSISTS,
-            audit_report.STATE_RESOLVED_MERGED,
-            audit_report.STATE_RESOLVED,
-            audit_report.STATE_REFUSED,
-        ):
+        for state in ALL_STATES:
             self.assertIn(state, audit_report.STATE_LABELS)
+        # No state may be added to the module without being enumerated here —
+        # `withdrawn` was, and went untested in every case below for a release.
+        self.assertEqual(set(ALL_STATES), set(audit_report.STATE_LABELS))
+
+    def test_withdrawn_and_refused_do_not_share_a_label(self):
+        # Rendering a harness withdrawal as `fix refused` tells the reader a
+        # person declined the fix when no person was involved.
+        self.assertNotEqual(
+            audit_report.STATE_LABELS[audit_report.STATE_WITHDRAWN],
+            audit_report.STATE_LABELS[audit_report.STATE_REFUSED],
+        )
 
 
 class TestPromotion(BaseTestCase):
@@ -1781,12 +2120,35 @@ class TestPromotion(BaseTestCase):
         self.assertEqual(plan.withheld, [])
 
     def test_a_finding_with_an_existing_pr_is_not_promoted_again(self):
-        findings = [manifest_finding("crit", "a.yaml")]
+        # Every PR state, because "already has a PR" is not one condition. Only
+        # a close the *harness* made is re-promotable; the doc calls that row
+        # `withdrawn`, and testing one state left the other three unguarded.
+        for label, pr_state, expect_promoted in [
+            ("open", {"state": "OPEN"}, False),
+            ("merged", {"state": "MERGED"}, False),
+            ("closed by a person", {"state": "CLOSED"}, False),
+            ("withdrawn by the harness", stale_closed_pr(), True),
+        ]:
+            with self.subTest(pr=label):
+                plan = audit_report.promotion_candidates(
+                    [manifest_finding("crit", "a.yaml")], {"crit": pr_state}
+                )
+                self.assertEqual(plan.promote, ["crit"] if expect_promoted else [])
+                self.assertEqual(plan.withheld, [])
+
+    def test_a_request_reopens_a_withdrawn_fix_without_an_age_test(self):
+        # A `withdrawn` pull request is treated as no pull request at all, so
+        # the after-the-close age test that guards a human's `refused` close
+        # must not apply — a finding that flaps would otherwise be fixable
+        # exactly once, and never again after its first quiet day.
         plan = audit_report.promotion_candidates(
-            findings, {"crit": {"state": "CLOSED"}}
+            [manifest_finding("crit", "a.yaml")],
+            {"crit": stale_closed_pr(closedAt="2026-07-01T00:00:00Z")},
+            requested=["crit"],
+            requested_at={},
         )
-        self.assertEqual(plan.promote, [])
-        self.assertEqual(plan.withheld, [])
+        self.assertEqual(plan.promote, ["crit"])
+        self.assertEqual(plan.superseded, [])
 
     def test_auto_promotion_is_capped_and_names_the_withheld(self):
         findings = [
@@ -1803,14 +2165,45 @@ class TestPromotion(BaseTestCase):
             manifest_finding(f"c-{i:02d}", f"{i}.yaml", severity="critical")
             for i in range(9)
         ] + [manifest_finding("asked", "asked.yaml", severity="minor")]
-        plan = audit_report.promotion_candidates(
-            findings, {}, requested=["asked", "c-08"]
-        )
-        self.assertIn("asked", plan.promote)
-        self.assertIn("c-08", plan.promote)
-        # The two requested are uncapped; the auto path still yields cap-many.
-        self.assertEqual(len(plan.promote), 2 + audit_report.AUTO_PROMOTION_CAP)
-        self.assertNotIn("c-08", plan.withheld)
+        # Six requested — comfortably past the cap of five, so a request that
+        # was merely being counted against it would show here.
+        asked = ["asked", "c-08", "c-07", "c-06", "c-05", "c-04"]
+        plan = audit_report.promotion_candidates(findings, {}, requested=asked)
+        for fid in asked:
+            self.assertIn(fid, plan.promote)
+        # The six requested are uncapped, and the auto path still sweeps what
+        # is left — here the four criticals nobody named, under the cap of five.
+        self.assertEqual(len(plan.promote), len(asked) + 4)
+        self.assertEqual(set(asked) & set(plan.withheld), set())
+
+    def test_a_wrong_id_refusal_names_the_ids_that_would_have_worked(self):
+        # Without the hint the requester's only recourse is to re-read the
+        # ledger, on a daily cron: two round trips, two days, for a typo.
+        findings = [manifest_finding("real-one", "a.yaml")]
+        comment = {
+            "id": "IC_1",
+            "body": "/remediate rael-one",
+            "authorAssociation": "MEMBER",
+            "author": {"login": "operator"},
+        }
+        requests = audit_report.parse_remediate_commands([comment], findings)
+        reason = requests.refusals[0]["reasons"][0]
+        self.assertIn("`real-one`", reason)
+
+    def test_a_non_manifest_refusal_names_the_ids_that_would_have_worked(self):
+        findings = [
+            make_finding(fid="g", remediation={"kind": "gcloud", "note": "g"}),
+            manifest_finding("real-one", "a.yaml"),
+        ]
+        comment = {
+            "id": "IC_1",
+            "body": "/remediate g",
+            "authorAssociation": "MEMBER",
+            "author": {"login": "operator"},
+        }
+        requests = audit_report.parse_remediate_commands([comment], findings)
+        reason = requests.refusals[0]["reasons"][0]
+        self.assertIn("`real-one`", reason)
 
     def test_a_requested_non_manifest_finding_is_not_promoted(self):
         findings = [
@@ -1825,12 +2218,19 @@ class TestPromotion(BaseTestCase):
 # --------------------------------------------------------------------------- #
 
 
-def comment(body, association="MEMBER", login="dev", node_id="IC_1"):
+def comment(
+    body,
+    association="MEMBER",
+    login="dev",
+    node_id="IC_1",
+    created_at="2026-07-01T00:00:00Z",
+):
     return {
         "id": node_id,
         "body": body,
         "author": {"login": login},
         "authorAssociation": association,
+        "createdAt": created_at,
     }
 
 
@@ -1846,12 +2246,12 @@ class TestRemediateCommands(BaseTestCase):
         return audit_report.parse_remediate_commands(comments, self.findings)
 
     def test_an_authorized_request_is_accepted(self):
-        targets, refusals, _ = self.parse([comment("/remediate netpol-missing")])
+        targets, refusals, _, _ = self.parse([comment("/remediate netpol-missing")])
         self.assertEqual(targets, ["netpol-missing"])
         self.assertEqual(refusals, [])
 
     def test_a_commenter_without_write_access_is_refused_once(self):
-        targets, refusals, _ = self.parse(
+        targets, refusals, _, _ = self.parse(
             [comment("/remediate netpol-missing", association="NONE", login="drive-by")]
         )
         self.assertEqual(targets, [])
@@ -1860,38 +2260,149 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(refusals[0]["comment_id"], "IC_1")
 
     def test_a_non_manifest_target_is_refused(self):
-        targets, refusals, _ = self.parse([comment("/remediate cluster-old")])
+        targets, refusals, _, _ = self.parse([comment("/remediate cluster-old")])
         self.assertEqual(targets, [])
         self.assertEqual(len(refusals), 1)
         self.assertIn("gcloud", refusals[0]["reasons"][0])
 
     def test_an_unknown_target_is_refused(self):
-        _, refusals, _ = self.parse([comment("/remediate no-such-finding")])
+        _, refusals, _, _ = self.parse([comment("/remediate no-such-finding")])
         self.assertIn("not a finding", refusals[0]["reasons"][0])
 
     def test_a_fenced_command_never_fires(self):
         body = "Here is how you would ask:\n\n```\n/remediate netpol-missing\n```\n"
-        targets, refusals, _ = self.parse([comment(body)])
+        targets, refusals, _, _ = self.parse([comment(body)])
         self.assertEqual(targets, [])
         self.assertEqual(refusals, [])
 
     def test_remediate_all_expands_to_promotable_targets_only(self):
-        targets, refusals, _ = self.parse([comment("/remediate all")])
+        targets, refusals, _, _ = self.parse([comment("/remediate all")])
         self.assertEqual(targets, ["netpol-missing"])
         self.assertEqual(refusals, [])
 
     def test_a_command_must_start_the_line(self):
-        targets, _, _ = self.parse([comment("maybe we should /remediate netpol-missing")])
+        targets, _, _, _ = self.parse([comment("maybe we should /remediate netpol-missing")])
         self.assertEqual(targets, [])
+
+    def test_a_mid_sentence_command_is_answered_not_ignored(self):
+        # Silence here is indistinguishable from an audit that has not run yet,
+        # so the requester waits a day and asks again the same wrong way.
+        targets, refusals, _, _ = self.parse(
+            [comment("maybe we should /remediate netpol-missing")]
+        )
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("start of its own line", refusals[0]["reasons"][0])
+        self.assertIn("`netpol-missing`", refusals[0]["reasons"][0])
+
+    def test_a_mid_sentence_command_from_a_stranger_is_left_alone(self):
+        # It would have been refused for write access anyway, and correcting a
+        # stranger's syntax on a request they cannot make is pure noise.
+        targets, refusals, _, _ = self.parse(
+            [
+                comment(
+                    "maybe we should /remediate netpol-missing",
+                    association="NONE",
+                    login="drive-by",
+                )
+            ]
+        )
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_the_command_quoted_in_a_code_span_is_not_an_attempt(self):
+        # Documenting the syntax must not trip the syntax check. This is also
+        # what stops the harness answering its own replies, which backtick
+        # every `/remediate` they mention.
+        targets, refusals, _, _ = self.parse(
+            [comment("You can ask for it with `/remediate <finding-id>` when it lands.")]
+        )
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_the_harness_own_reply_does_not_provoke_another_reply(self):
+        # The refusal comment is read back off the issue on the next run. If it
+        # read as a request, every run would answer the previous run's answer.
+        own = audit_report.render_refusal_comment(
+            {
+                "comment_id": "IC_1",
+                "author": "someone",
+                "reasons": ["`/remediate` on its own does not say what to fix."],
+            },
+            datetime(2026, 7, 30, 9, 0, tzinfo=timezone.utc),
+        )
+        targets, refusals, _, _ = self.parse([comment(own, node_id="IC_2")])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_bare_command_names_the_ids_that_would_work(self):
+        targets, refusals, _, _ = self.parse([comment("/remediate")])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        reason = refusals[0]["reasons"][0]
+        # Not the old "`` is not a finding in the current report", which told a
+        # requester holding a correct id that their id was wrong.
+        self.assertNotIn("not a finding", reason)
+        self.assertIn("does not say what to fix", reason)
+        self.assertIn("`netpol-missing`", reason)
+
+    def test_a_bare_command_is_not_read_as_all(self):
+        # `netpol-missing` is promotable; an empty target must not promote it.
+        targets, _, accepted, _ = self.parse([comment("/remediate")])
+        self.assertEqual(targets, [])
+        self.assertEqual(accepted, {})
+
+    def test_a_bare_command_with_nothing_promotable_says_so(self):
+        requests = audit_report.parse_remediate_commands(
+            [comment("/remediate")],
+            [make_finding(fid="cluster-old", remediation={"kind": "gcloud", "note": "g"})],
+        )
+        self.assertIn("nothing to promote", requests.refusals[0]["reasons"][0])
+
+    def test_no_comment_this_harness_writes_reads_as_a_request(self):
+        # Everything below is posted onto the ledger and read back by the next
+        # run. One un-backticked `/remediate` in any of them and the harness
+        # answers itself forever, once per run, on a cron.
+        findings = [manifest_finding("netpol-missing", "a.yaml")]
+        written = {
+            "delta": audit_report.render_delta_comment(
+                AUDIT, ["netpol-missing"], ["gone"], findings, {"gone": "t"}, NOW
+            ),
+            "clean": audit_report.render_clean_comment(AUDIT, make_doc(findings=[]), NOW),
+            "refusal": audit_report.render_refusal_comment(
+                {"comment_id": "IC_1", "author": "a", "reasons": ["nope"]}, NOW
+            ),
+            "ack": audit_report.render_ack_comment(
+                "IC_1", ["netpol-missing"], {"netpol-missing": "opened #4"}, NOW
+            ),
+            "persists": audit_report.render_persists_comment(AUDIT, findings[0], NOW),
+            "stale": audit_report.render_stale_close_comment(
+                AUDIT, findings, NOW, pr_number=4
+            ),
+        }
+        for name, body in written.items():
+            with self.subTest(comment=name):
+                requests = audit_report.parse_remediate_commands(
+                    [comment(body, node_id=f"IC_{name}")], findings
+                )
+                self.assertEqual(requests.targets, [])
+                self.assertEqual(requests.refusals, [])
+
+    def test_the_id_list_in_a_refusal_is_capped(self):
+        findings = [manifest_finding(f"f-{n:03d}", f"{n}.yaml") for n in range(25)]
+        requests = audit_report.parse_remediate_commands([comment("/remediate")], findings)
+        reason = requests.refusals[0]["reasons"][0]
+        self.assertEqual(reason.count("`f-"), audit_report.MAX_HINT_IDS)
+        self.assertIn(f"and {25 - audit_report.MAX_HINT_IDS} more", reason)
 
     def test_one_refusal_per_comment_not_per_bad_target(self):
         body = "/remediate cluster-old\n/remediate no-such-finding\n"
-        _, refusals, _ = self.parse([comment(body)])
+        _, refusals, _, _ = self.parse([comment(body)])
         self.assertEqual(len(refusals), 1)
         self.assertEqual(len(refusals[0]["reasons"]), 2)
 
     def test_targets_are_deduplicated_and_sorted(self):
-        targets, _, _ = self.parse(
+        targets, _, _, _ = self.parse(
             [
                 comment("/remediate netpol-missing", node_id="IC_1"),
                 comment("/remediate netpol-missing", node_id="IC_2"),
@@ -2133,7 +2644,15 @@ class TestRemediationPrBody(BaseTestCase):
         )
 
 
-class TestStaleClose(HarnessTestCase):
+class TestStaleCloseEligibility(HarnessTestCase):
+    """Which open pull requests a stale sweep may touch at all.
+
+    Named apart from `TestStaleCloseLabelling` below on purpose: the two shared
+    a class name, so Python rebound it before unittest collected and these four
+    cases never ran — the suite reported them as passing by never executing
+    them. Any new stale-close class needs its own name.
+    """
+
     def close(self, prs, current_ids):
         return audit_report.close_stale_remediation_prs(
             "acme/fleet", AUDIT, prs, current_ids, {"a": "Old title"}, {}, NOW
@@ -2310,6 +2829,26 @@ class TestAutoPromotionInFinish(HarnessTestCase):
             ["git", "checkout", "--force", "feature-branch"], self.harness.calls
         )
 
+    def test_dry_run_looks_for_manifests_in_the_clone_not_the_cwd(self):
+        # The pod's working directory is the agent profile — the SOPs tell the
+        # model it is not in a checkout at all. Resolving remediation paths
+        # there degraded every manifest to `manual` and printed no pull request
+        # body, so a dry run answered "nothing would happen" for a document
+        # whose files were all present, in the right place.
+        def not_a_checkout():
+            raise RuntimeError("Not inside a git working tree")
+
+        self.patch_attr("repo_root", not_a_checkout)
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        self.assertEqual(self.run_finish(make_doc(), ["--dry-run"]), 0)
+
+        self.assertNotIn("degrades to a manual remediation", self.err)
+        self.assertIn(f"platform-agent/fix-{AUDIT}", self.err)
+        self.assertIn("## Files", self.out)
+        self.assertEqual(self.harness.gh_calls("issue"), [])
+        self.assertEqual(self.harness.gh_calls("pr"), [])
+
     def test_a_failed_pr_create_does_not_fail_the_run(self):
         # The ledger is already published; the finding shows as having no PR
         # and the next run retries. Losing the report costs more.
@@ -2318,6 +2857,116 @@ class TestAutoPromotionInFinish(HarnessTestCase):
         self.assertEqual(self.run_finish(make_doc()), 0)
         self.assertEqual(self.stdout_json()["prs_opened"], [])
         self.assertIn("could not publish the fix", self.err)
+
+
+class TestRemediateOnACleanRun(HarnessTestCase):
+    """A command standing on a ledger the morning the fleet comes back clean.
+
+    The clean branch returned before any comment was read, so the request got
+    nothing — and then the issue closed, taking with it the thread the
+    requester would have re-asked on. "Never silence" cannot have as its one
+    exception the morning the issue disappears.
+    """
+
+    def comment(self, body="/remediate a", cid="IC_1", assoc="MEMBER"):
+        return {
+            "id": cid,
+            "body": body,
+            "createdAt": "2026-07-01T00:00:00Z",
+            "authorAssociation": assoc,
+            "author": {"login": "operator"},
+        }
+
+    def replies(self, comments):
+        return {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": "prior"}),
+            "--json comments": json.dumps({"comments": comments}),
+        }
+
+    def issue_comments(self):
+        return self.harness.gh_calls("issue", "comment")
+
+    def test_a_standing_request_is_answered_before_the_ledger_closes(self):
+        self.harness.replies = self.replies([self.comment()])
+
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+
+        bodies = self.harness.bodies_for("issue", "comment")
+        answer = [b for b in bodies if audit_report.acked_marker("IC_1") in b]
+        self.assertEqual(len(answer), 1, bodies)
+        self.assertIn("no longer reproduces", answer[0])
+        self.assertIn("closing as completed", answer[0])
+        self.assertTrue(self.harness.gh_calls("issue", "close"))
+
+    def test_the_answer_is_said_once_when_the_ledger_stays_open(self):
+        # Over a coverage gap the issue survives, so the marker is what stops a
+        # second answer tomorrow morning, and the morning after.
+        prior = self.comment(
+            body=f"answered\n{audit_report.acked_marker('IC_1')}\n", cid="IC_2"
+        )
+        self.harness.replies = self.replies([self.comment(), prior])
+        doc = make_doc(findings=[])
+        doc["scope"]["skipped"] = [{"cluster": "prod-eu", "reason": "unreachable"}]
+
+        self.assertEqual(self.run_finish(doc), 0)
+
+        bodies = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(
+            [b for b in bodies if audit_report.acked_marker("IC_1") in b], []
+        )
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+
+    def test_a_gap_answer_does_not_promise_a_closure_that_is_not_happening(self):
+        self.harness.replies = self.replies([self.comment()])
+        doc = make_doc(findings=[])
+        doc["scope"]["skipped"] = [{"cluster": "prod-eu", "reason": "unreachable"}]
+
+        self.assertEqual(self.run_finish(doc), 0)
+
+        bodies = self.harness.bodies_for("issue", "comment")
+        answer = [b for b in bodies if audit_report.acked_marker("IC_1") in b][0]
+        self.assertIn("stays open", answer)
+        self.assertNotIn("closing as completed", answer)
+
+    def test_a_comment_with_no_command_is_left_alone(self):
+        self.harness.replies = self.replies(
+            [self.comment(body="looks good to me, thanks")]
+        )
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        bodies = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(
+            [b for b in bodies if audit_report.acked_marker("IC_1") in b], []
+        )
+
+
+class TestUnansweredRemediateComments(unittest.TestCase):
+    def comment(self, body, cid="IC_1"):
+        return {"id": cid, "body": body, "author": {"login": "operator"}}
+
+    def test_a_quoted_command_is_not_a_command(self):
+        fenced = self.comment("```\n/remediate a\n```")
+        self.assertEqual(audit_report.unanswered_remediate_comments([fenced]), [])
+
+    def test_a_mention_still_earns_an_answer_when_nothing_can_be_opened(self):
+        # Unlike the findings path, authorization is not consulted: nothing is
+        # acted on for anybody, so "it no longer reproduces" is the true answer
+        # for a writer and a non-writer alike.
+        mention = self.comment("could you /remediate a please")
+        got = audit_report.unanswered_remediate_comments([mention])
+        self.assertEqual([r["comment_id"] for r in got], ["IC_1"])
+        self.assertEqual(got[0]["targets"], [])
+
+    def test_either_marker_counts_as_already_answered(self):
+        for marker in (audit_report.acked_marker, audit_report.refused_marker):
+            with self.subTest(marker=marker.__name__):
+                thread = [
+                    self.comment("/remediate a"),
+                    self.comment(marker("IC_1"), cid="IC_2"),
+                ]
+                self.assertEqual(
+                    audit_report.unanswered_remediate_comments(thread), []
+                )
 
 
 class TestRemediateSubcommand(HarnessTestCase):
@@ -2434,7 +3083,11 @@ class TestRemediateSubcommand(HarnessTestCase):
         )
         self.harness.replies = {"issue list": self.issue_list()}
         self.assertEqual(self.run_remediate(doc, ["unwritten"]), 2)
-        self.assertIn("not on disk", self.err)
+        # "not a readable file inside", not "not on disk": a path that exists
+        # but resolves outside the clone lands in exactly this refusal, and
+        # telling that operator their file is missing sends them to look for a
+        # file that is right there.
+        self.assertIn("not a readable file inside", self.err)
         self.assertEqual(self.harness.gh_calls("pr", "create"), [])
 
     def test_an_uncapped_request_beats_the_auto_promotion_cap(self):
@@ -2461,6 +3114,68 @@ class TestRemediateSubcommand(HarnessTestCase):
         )
         self.assertEqual(rc, 0)
         self.assertEqual(len(self.harness.gh_calls("pr", "create")), 7)
+
+    def test_only_the_named_findings_become_pull_requests(self):
+        # `remediate` is a person naming ids. The cron's auto-promotion sweep
+        # used to ride along on it, so naming one id opened six pull requests —
+        # and in the repository the five nobody asked for are indistinguishable
+        # from the one they did.
+        findings = []
+        for i in range(6):
+            findings.append(
+                make_finding(
+                    fid=f"crit-{i}",
+                    title=f"Crit {i}",
+                    remediation={
+                        "kind": "manifest",
+                        "path": f"clusters/prod-us-east/f{i}.yaml",
+                        "note": "n",
+                    },
+                )
+            )
+            self.touch(f"clusters/prod-us-east/f{i}.yaml")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+
+        rc = self.run_remediate(make_doc(findings=findings), ["crit-3"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        # Branch names key on the group's paths, not the id, so the staged file
+        # is what proves which finding was acted on.
+        staged = " ".join(" ".join(c) for c in self.git_add_calls(self.harness))
+        self.assertIn("clusters/prod-us-east/f3.yaml", staged)
+        for other in ("f0", "f1", "f2", "f4", "f5"):
+            self.assertNotIn(
+                f"clusters/prod-us-east/{other}.yaml",
+                staged,
+                f"{other} was never named and must not be staged",
+            )
+
+    def test_dry_run_previews_the_body_even_when_the_manifest_is_unwritten(self):
+        # The warning is the point, not suppression: an operator drafting a
+        # document before writing its manifests still needs to see what the
+        # pull request would say.
+        doc = make_doc(
+            findings=[
+                make_finding(
+                    fid="unwritten",
+                    remediation={
+                        "kind": "manifest",
+                        "path": "clusters/prod-us-east/unwritten.yaml",
+                        "note": "n",
+                    },
+                )
+            ]
+        )
+        self.assertEqual(self.run_remediate(doc, ["unwritten"], ["--dry-run"]), 0)
+        self.assertIn("WOULD REFUSE unwritten", self.err)
+        self.assertIn("## Files", self.out)
+        # Warned about, never rewritten: a dry run that mutated the document it
+        # is previewing would show a body the real run never produces.
+        self.assertNotIn("did not write it", self.out)
 
 
 # --------------------------------------------------------------------------- #
@@ -2664,7 +3379,33 @@ class TestClipText(unittest.TestCase):
             ]
         )
         body = render_body(doc, generated_at=NOW)
-        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
+        self.assertLessEqual(len(body), GITHUB_BODY_LIMIT)
+
+    def test_the_identifiers_are_capped_too(self):
+        # cluster/namespace/object were the last fields interpolated raw, and
+        # the selection loop renders the first finding whatever it costs — so
+        # one of these overflowed the body and published *nothing*, every run,
+        # for as long as the finding reproduced.
+        huge = "z" * 40_000
+        doc = make_doc(
+            findings=[make_finding(cluster=huge, namespace=huge, obj=huge)]
+        )
+        body = render_body(doc, generated_at=NOW)
+        self.assertLessEqual(len(body), GITHUB_BODY_LIMIT)
+        self.assertIn("…(truncated)", body)
+
+    def test_an_identifier_cannot_break_out_of_its_code_span(self):
+        # A backtick closes the span and a newline ends it; what follows is
+        # rendered as Markdown in the reader's browser.
+        doc = make_doc(
+            findings=[
+                make_finding(obj="Pod/x` <script>alert(1)</script> `y", cluster="a\nb")
+            ]
+        )
+        body = render_body(doc, generated_at=NOW)
+        self.assertNotIn("Pod/x`", body)
+        self.assertIn("Pod/x' <script>", body)
+        self.assertIn("`a b`", body)
 
 
 class TestNewlineNormalisation(unittest.TestCase):
@@ -2728,6 +3469,29 @@ class TestFenceScanning(unittest.TestCase):
     def test_a_backtick_fence_is_not_closed_by_tildes(self):
         self.assertNotIn("/remediate x", self.strip("```\n~~~\n/remediate x\n```"))
 
+    def test_a_four_space_indented_run_does_not_close_a_block(self):
+        # CommonMark and GitHub both render this as literal text *inside* the
+        # block. Reading it as a closer ends the block early and exposes the
+        # command the author quoted to talk about.
+        out = self.strip("```\n    ```\n/remediate x\n```")
+        self.assertNotIn("/remediate x", out)
+
+    def test_a_four_space_indented_run_does_not_open_a_block(self):
+        # The mirror image: treating it as an opener swallows every real
+        # command after it, so the channel silently stops working.
+        out = self.strip("    ```\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_three_spaces_of_indent_is_still_a_fence(self):
+        self.assertNotIn("/remediate x", self.strip("   ```\n/remediate x\n   ```"))
+
+    def test_a_tab_indented_run_is_not_a_fence(self):
+        # A tab advances to the next four-column stop, so it is indented code.
+        self.assertIn("/remediate real", self.strip("\t```\n/remediate real"))
+
+    def test_a_closer_may_carry_trailing_whitespace(self):
+        self.assertIn("/remediate real", self.strip("```\nx\n``` \n/remediate real"))
+
 
 class TestPathContainment(unittest.TestCase):
     def test_a_normalised_path_is_returned_not_just_accepted(self):
@@ -2763,10 +3527,106 @@ class TestPathContainment(unittest.TestCase):
             "",
             ".",
             "..",
+            # `.git` on any part, in any case. `sub/.git/config` rewrites where
+            # a submodule points; `.GIT` is the same file on the
+            # case-insensitive filesystems this is checked out on.
+            ".GIT/config",
+            ".Git/config",
+            "sub/.git/config",
+            "sub/.GIT/hooks/pre-commit",
         ):
             with self.subTest(path=path):
                 with self.assertRaises(audit_report.ValidationError):
                     audit_report._require_repo_relative(path, "where")
+
+
+class TestFilesystemContainment(unittest.TestCase):
+    """The string check is not containment; this is.
+
+    Every path here passes `_require_repo_relative` — no `..`, relative, no
+    glob — and still reads or writes outside the repository on a real
+    filesystem. The exploit is executed rather than argued.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "repo"
+        (self.root / "manifests").mkdir(parents=True)
+        self.outside = Path(self.tmp.name) / "outside"
+        self.outside.mkdir()
+        (self.outside / "secret.yaml").write_text("token: hunter2\n")
+
+    def link(self, name="vendor", target=None):
+        (self.root / "manifests" / name).symlink_to(
+            target or self.outside, target_is_directory=True
+        )
+
+    def test_the_string_check_alone_lets_the_exploit_through(self):
+        # Not a hypothetical: this asserts the gap the filesystem check exists
+        # to close. `_require_repo_relative` accepts it, and the naive
+        # `(root / path)` an earlier version used reads the file outside.
+        self.link()
+        path = "manifests/vendor/secret.yaml"
+        self.assertEqual(audit_report._require_repo_relative(path, "where"), path)
+        self.assertEqual(
+            (self.root / path).read_text(), "token: hunter2\n"
+        )
+
+    def test_a_symlinked_directory_component_is_refused(self):
+        self.link()
+        with self.assertRaises(audit_report.ContainmentError) as caught:
+            audit_report.resolve_inside_repo(
+                self.root, "manifests/vendor/secret.yaml", "where"
+            )
+        self.assertIn("symbolic link", str(caught.exception))
+
+    def test_a_symlinked_file_is_refused(self):
+        (self.root / "manifests" / "x.yaml").symlink_to(self.outside / "secret.yaml")
+        with self.assertRaises(audit_report.ContainmentError):
+            audit_report.resolve_inside_repo(self.root, "manifests/x.yaml", "where")
+
+    def test_a_link_that_resolves_back_inside_is_still_refused(self):
+        # It is contained today and stops being contained the moment somebody
+        # retargets the link. Writing *through* a link is never intended here.
+        (self.root / "real").mkdir()
+        self.link(target=self.root / "real")
+        with self.assertRaises(audit_report.ContainmentError):
+            audit_report.resolve_inside_repo(
+                self.root, "manifests/vendor/x.yaml", "where"
+            )
+
+    def test_a_real_path_resolves_and_is_absolute(self):
+        (self.root / "manifests" / "x.yaml").write_text("kind: Namespace\n")
+        resolved = audit_report.resolve_inside_repo(
+            self.root, "./manifests//x.yaml", "where"
+        )
+        self.assertTrue(resolved.is_absolute())
+        self.assertEqual(resolved.read_text(), "kind: Namespace\n")
+
+    def test_a_path_that_does_not_exist_yet_is_allowed(self):
+        # The remediation write creates it after a fresh checkout.
+        resolved = audit_report.resolve_inside_repo(
+            self.root, "manifests/new/x.yaml", "where"
+        )
+        self.assertEqual(resolved, self.root.resolve() / "manifests/new/x.yaml")
+
+    def test_the_snapshot_refuses_to_read_through_a_link(self):
+        self.link()
+        with self.assertRaises(audit_report.ContainmentError):
+            audit_report.snapshot_paths(self.root, ["manifests/vendor/secret.yaml"])
+
+    def test_an_escaping_remediation_degrades_instead_of_publishing(self):
+        self.link()
+        findings = [manifest_finding("leak", "manifests/vendor/secret.yaml")]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            degraded = audit_report.degrade_missing_remediations(findings, self.root)
+        self.assertEqual(degraded, ["leak"])
+        self.assertEqual(findings[0]["remediation"]["kind"], "manual")
+        self.assertEqual(findings[0]["remediation"]["path"], "")
+        self.assertIn("does not resolve to a real file", findings[0]["remediation"]["note"])
+        self.assertIn("SECURITY", err.getvalue())
 
 
 # --------------------------------------------------------------------------- #
@@ -2967,7 +3827,146 @@ class TestCloseSemantics(unittest.TestCase):
         self.assertEqual(plan.already_open, ["crit"])
 
 
-class TestStaleClose(HarnessTestCase):
+class TestStaleRemediateRequests(BaseTestCase):
+    """A `/remediate` is an override, not a standing order.
+
+    Ledger comments are never edited away, so an old command re-reads as fresh
+    on every cron run. Without an age it would re-open a pull request a person
+    closed, every morning, forever — the exact loop `pr_closed_by_harness`
+    exists to prevent, re-entered through the escape hatch.
+    """
+
+    def human_closed(self, closed_at="2026-07-15T00:00:00Z"):
+        return {"state": "CLOSED", "labels": [], "closedAt": closed_at, "number": 8}
+
+    def plan_for(self, asked_at, closed_at="2026-07-15T00:00:00Z"):
+        findings = [manifest_finding("crit", "a.yaml")]
+        return audit_report.promotion_candidates(
+            findings,
+            {"crit": self.human_closed(closed_at)},
+            requested=["crit"],
+            requested_at={"crit": asked_at} if asked_at is not None else None,
+        )
+
+    def test_a_request_older_than_the_close_is_superseded(self):
+        plan = self.plan_for("2026-07-01T00:00:00Z")
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.superseded, ["crit"])
+
+    def test_a_request_newer_than_the_close_overrules_it(self):
+        # The escape hatch has to actually open: a human who changed their mind
+        # asks again, and asking again is the whole mechanism.
+        plan = self.plan_for("2026-07-20T00:00:00Z")
+        self.assertEqual(plan.promote, ["crit"])
+        self.assertEqual(plan.superseded, [])
+
+    def test_a_request_at_the_same_instant_as_the_close_loses(self):
+        # Equal timestamps cannot distinguish cause from effect, and the
+        # cheaper mistake is the one a second `/remediate` fixes.
+        self.assertEqual(self.plan_for("2026-07-15T00:00:00Z").superseded, ["crit"])
+
+    def test_an_unknown_request_time_never_overrules_a_close(self):
+        for asked_at in (None, "", "not-a-date"):
+            with self.subTest(asked_at=asked_at):
+                self.assertEqual(self.plan_for(asked_at).superseded, ["crit"])
+
+    def test_an_unknown_close_time_still_blocks_a_stale_request(self):
+        # A missing `closedAt` is a gh schema change, not evidence the close
+        # never happened. Treating it as "no close" force-pushes over a human.
+        plan = self.plan_for("2026-07-20T00:00:00Z", closed_at="")
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.superseded, ["crit"])
+
+    def test_a_harness_close_is_re_promotable_regardless_of_request_age(self):
+        findings = [manifest_finding("crit", "a.yaml")]
+        plan = audit_report.promotion_candidates(
+            findings,
+            {
+                "crit": {
+                    "state": "CLOSED",
+                    "labels": [{"name": audit_report.STALE_CLOSED_LABEL}],
+                    "closedAt": "2026-07-15T00:00:00Z",
+                }
+            },
+            requested=["crit"],
+            requested_at={"crit": "2026-07-01T00:00:00Z"},
+        )
+        self.assertEqual(plan.promote, ["crit"])
+        self.assertEqual(plan.superseded, [])
+
+    def test_the_newest_request_for_a_finding_is_the_one_that_counts(self):
+        findings = [manifest_finding("crit", "a.yaml")]
+        parsed = audit_report.parse_remediate_commands(
+            [
+                comment("/remediate crit", node_id="IC_1", created_at="2026-07-01T00:00:00Z"),
+                comment("/remediate crit", node_id="IC_2", created_at="2026-07-20T00:00:00Z"),
+            ],
+            findings,
+        )
+        self.assertEqual(parsed.requested_at, {"crit": "2026-07-20T00:00:00Z"})
+        plan = audit_report.promotion_candidates(
+            findings,
+            {"crit": self.human_closed()},
+            requested=parsed.targets,
+            requested_at=parsed.requested_at,
+        )
+        self.assertEqual(plan.promote, ["crit"])
+
+    def test_remediate_all_carries_the_comment_time_to_every_target(self):
+        findings = [
+            manifest_finding("a", "a.yaml"),
+            manifest_finding("b", "b.yaml"),
+        ]
+        parsed = audit_report.parse_remediate_commands(
+            [comment("/remediate all", created_at="2026-07-20T00:00:00Z")], findings
+        )
+        self.assertEqual(
+            parsed.requested_at,
+            {"a": "2026-07-20T00:00:00Z", "b": "2026-07-20T00:00:00Z"},
+        )
+
+
+class TestGhTimestamps(BaseTestCase):
+    def test_a_z_suffix_parses_as_utc(self):
+        parsed = audit_report.parse_gh_timestamp("2026-07-20T09:14:22Z")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.utcoffset().total_seconds(), 0)
+
+    def test_an_offset_is_honoured_not_dropped(self):
+        # 09:00+02:00 is 07:00Z — earlier than 08:00Z, which a naive string
+        # compare gets backwards.
+        self.assertTrue(
+            audit_report.newer_timestamp(
+                "2026-07-20T09:00:00+02:00", "2026-07-20T08:00:00Z"
+            )
+        )
+
+    def test_garbage_is_none_not_an_exception(self):
+        for value in (None, "", "   ", "yesterday", "2026-13-45T99:99:99Z"):
+            with self.subTest(value=value):
+                self.assertIsNone(audit_report.parse_gh_timestamp(value))
+
+    def test_an_unparseable_candidate_never_wins(self):
+        self.assertFalse(audit_report.newer_timestamp(None, "yesterday"))
+        self.assertFalse(audit_report.newer_timestamp("2026-07-01T00:00:00Z", ""))
+
+    def test_anything_parseable_beats_an_unknown_current(self):
+        self.assertTrue(audit_report.newer_timestamp(None, "2026-07-01T00:00:00Z"))
+
+    def test_strictly_after_refuses_an_unknown_on_either_side(self):
+        # The asymmetry with newer_timestamp is the point: "unknown" must not
+        # read as "infinitely old" when the question is whether to overrule a
+        # person.
+        known = "2026-07-01T00:00:00Z"
+        self.assertFalse(audit_report.timestamp_strictly_after(known, None))
+        self.assertFalse(audit_report.timestamp_strictly_after(None, known))
+        self.assertFalse(audit_report.timestamp_strictly_after(known, known))
+        self.assertTrue(
+            audit_report.timestamp_strictly_after("2026-07-02T00:00:00Z", known)
+        )
+
+
+class TestStaleCloseLabelling(HarnessTestCase):
     def close_it(self, prs, current_ids=(), live_branches=None):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -3008,7 +4007,12 @@ class TestStaleClose(HarnessTestCase):
         self.assertEqual(self.close_it([self.stale_pr()]), [])
         self.assertIn("could not close PR #8", self.err)
 
-    def test_a_pull_request_already_closed_as_stale_is_not_re_commented(self):
+    def test_an_announced_pull_request_is_closed_again_but_not_re_commented(self):
+        # The marker records that the announcement happened, not that the pull
+        # request shut. Every PR reaching this function is OPEN — so a marker
+        # here means an earlier run commented and then failed to close, and
+        # short-circuiting on it leaves the pull request open forever while the
+        # ledger and the run summary both claim it closed.
         marked = pr(
             8,
             "platform-agent/fix-x-old",
@@ -3016,8 +4020,12 @@ class TestStaleClose(HarnessTestCase):
             + "\n"
             + audit_report.stale_closed_marker(8),
         )
-        self.assertEqual(self.close_it([marked]), [])
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertEqual(
+            self.close_it([marked]), ["https://github.com/acme/fleet/pull/8"]
+        )
+        self.assertEqual(len(self.harness.gh_calls("pr", "close")), 1)
+        self.assertEqual(self.harness.gh_calls("pr", "comment"), [])
+        self.assertIn("retrying the close", self.err)
 
     def test_a_live_finding_keeps_its_pull_request_open(self):
         self.assertEqual(self.close_it([self.stale_pr()], current_ids={"gone"}), [])
@@ -3221,7 +4229,7 @@ class TestRenderedIssue(unittest.TestCase):
     def test_a_truncated_render_says_which_ids_it_dropped(self):
         rendered = audit_report.render_issue_body(self.flood(400), generated_at=NOW)
         self.assertTrue(rendered.partial)
-        self.assertLessEqual(len(rendered.body), audit_report.MAX_BODY_CHARS)
+        self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
         self.assertEqual(
             len(rendered.rendered_ids) + len(rendered.omitted), 400
         )
