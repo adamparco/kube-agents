@@ -8,13 +8,22 @@ import json
 import logging
 import os
 import sys
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 LOGGER = logging.getLogger("slack-relay-patch")
 DEFAULT_MAX_FILE_BYTES = 20 * 1024 * 1024
+DEFAULT_RELAY_READY_TIMEOUT = 120.0
+RELAY_READY_POLL_SECONDS = 2.0
+# credential_proxy binds its port before the Slack relay finishes
+# authenticating — relay setup runs on a background thread so a Slack outage
+# cannot wedge the whole proxy — and answers 503 "Slack relay disabled" until
+# then. That is a readiness signal, unlike every other status it can return.
+RELAY_NOT_READY_STATUS = 503
 
 
 def read_upload(path: Path, max_file_bytes: int) -> bytes:
@@ -28,6 +37,46 @@ def read_upload(path: Path, max_file_bytes: int) -> bytes:
     return content
 
 
+def wait_for_relay(
+    send: Callable[[], dict[str, Any]],
+    *,
+    timeout: float,
+    poll: float = RELAY_READY_POLL_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Call ``send``, retrying while the relay is still coming up.
+
+    The agent container starts before the credential-proxy sidecar, so the
+    first connect can beat the relay by the better part of a minute. Letting
+    that surface is fatal rather than merely slow: the real bot token lives in
+    the relay, so when the gateway retries it finds no bot credential on the
+    queued config and drops Slack from the retry queue for the life of the pod.
+    Absorb the startup race here, where the relay is the thing being waited on.
+
+    Coming up has two stages, and both have to be waited out — the socket
+    refuses connections until the proxy binds it, then the proxy answers
+    ``RELAY_NOT_READY_STATUS`` until Slack authentication completes.
+    """
+    deadline = monotonic() + timeout
+    while True:
+        try:
+            return send()
+        except urllib.error.HTTPError as error:
+            if error.code != RELAY_NOT_READY_STATUS:
+                # The relay answered; a real error is not a readiness problem.
+                raise
+            if monotonic() >= deadline:
+                raise
+            reason = "has no authenticated workspace yet"
+        except (urllib.error.URLError, OSError):
+            if monotonic() >= deadline:
+                raise
+            reason = "is not accepting connections yet"
+        LOGGER.warning("Slack relay %s; retrying", reason)
+        sleep(poll)
+
+
 def install() -> None:
     relay_url = os.getenv("SLACK_RELAY_URL", "").rstrip("/")
     if not relay_url:
@@ -39,6 +88,15 @@ def install() -> None:
     except ValueError:
         LOGGER.warning("Invalid Slack relay file limit; using the default")
         max_file_bytes = DEFAULT_MAX_FILE_BYTES
+    try:
+        relay_ready_timeout = float(
+            os.getenv(
+                "SLACK_RELAY_READY_TIMEOUT_SECONDS", str(DEFAULT_RELAY_READY_TIMEOUT)
+            )
+        )
+    except ValueError:
+        LOGGER.warning("Invalid Slack relay readiness timeout; using the default")
+        relay_ready_timeout = DEFAULT_RELAY_READY_TIMEOUT
 
     def request(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -125,6 +183,8 @@ def install() -> None:
         if getattr(adapter_class, "_credential_proxy_relay_patched", False):
             return
 
+        from slack_sdk.web.async_slack_response import AsyncSlackResponse
+
         module = sys.modules[adapter_class.__module__]
         real_async_app = module.AsyncApp
         real_async_client = module.AsyncWebClient
@@ -134,10 +194,16 @@ def install() -> None:
         class RemoteSlackClient(real_async_client):
             """Slack SDK client whose generic API calls execute in the proxy."""
 
-            def __init__(self, token: str | None = None, **_kwargs: Any) -> None:
+            def __init__(
+                self, token: str | None = None, team_id: str = "", **_kwargs: Any
+            ) -> None:
                 placeholder = token or "relay:"
                 super().__init__(token=placeholder)
-                self.team_id = (
+                # Prefer the team Bolt resolved from the inbound event. Across
+                # several workspaces the token is a comma-joined list, so
+                # splitting it yields every team at once rather than the one
+                # this request belongs to.
+                self.team_id = team_id or (
                     placeholder.split(":", 1)[1]
                     if placeholder.startswith("relay:")
                     else ""
@@ -164,25 +230,36 @@ def install() -> None:
                     "headers": json_value(headers) if headers else None,
                     "auth": json_value(auth) if auth else None,
                 }
+                supplied = {
+                    key: value
+                    for key, value in arguments.items()
+                    if value is not None
+                }
                 response = await asyncio.to_thread(
                     request,
                     "/v1/chat/slack/api",
                     {
                         "teamId": self.team_id,
                         "method": api_method,
-                        "arguments": {
-                            key: value
-                            for key, value in arguments.items()
-                            if value is not None
-                        },
+                        "arguments": supplied,
                     },
                 )
-                return response.get("response") or {}
-
-        def remote_client_factory(
-            token: str | None = None, **kwargs: Any
-        ) -> RemoteSlackClient:
-            return RemoteSlackClient(token=token, **kwargs)
+                # Hand back the SDK's own response type rather than the bare
+                # payload. Everything downstream is written against the real
+                # client: Bolt's authorization middleware reads .headers off
+                # this to pick up x-oauth-scopes, and a plain dict makes it
+                # die with "'dict' object has no attribute 'headers'" before
+                # any listener runs. The relay does not forward Slack's
+                # response headers, so scope introspection sees none.
+                return AsyncSlackResponse(
+                    client=self,
+                    http_verb=http_verb,
+                    api_url=api_method,
+                    req_args=supplied,
+                    data=response.get("response") or {},
+                    headers={},
+                    status_code=200,
+                ).validate()
 
         def remote_app_factory(
             *_args: Any, token: str | None = None, **kwargs: Any
@@ -194,12 +271,25 @@ def install() -> None:
                 **kwargs,
             )
 
-        module.AsyncWebClient = remote_client_factory
+        module.AsyncWebClient = RemoteSlackClient
         module.AsyncApp = remote_app_factory
+
+        # Bolt does not reuse the client the app was built with. _init_context
+        # constructs a fresh one per request from the AsyncWebClient bound in
+        # its own module, so rebinding only the adapter's name leaves every
+        # request talking to slack.com directly with the "relay:" placeholder
+        # for a token — which fails authorization and silently drops the
+        # message. Rebind the name Bolt actually reads. It has to stay a class,
+        # not a factory: AsyncApp isinstance-checks the client it is handed.
+        from slack_bolt.app import async_app as bolt_async_app
+
+        bolt_async_app.AsyncWebClient = RemoteSlackClient
 
         async def connect(self: Any, *, is_reconnect: bool = False) -> bool:
             bootstrap = await asyncio.to_thread(
-                request, "/v1/chat/slack/bootstrap", {}
+                wait_for_relay,
+                lambda: request("/v1/chat/slack/bootstrap", {}),
+                timeout=relay_ready_timeout,
             )
             workspaces = bootstrap.get("workspaces") or []
             if not workspaces:

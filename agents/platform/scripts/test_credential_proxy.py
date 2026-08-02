@@ -1,4 +1,7 @@
+import asyncio
+import io
 import json
+import os
 import queue
 import socket
 import subprocess
@@ -25,7 +28,8 @@ from credential_proxy import (
     parse_gke_context,
     read_current_context,
 )
-from slack_relay_patch import read_upload
+import slack_relay_patch
+from slack_relay_patch import read_upload, wait_for_relay
 
 
 class AgentAPIProxyTest(unittest.TestCase):
@@ -779,12 +783,29 @@ class GoogleChatRelayTest(unittest.TestCase):
         self.assertEqual(arguments, result["arguments"])
 
 
+class FakeSlackResponse:
+    """Stand-in for slack_sdk's SlackResponse.
+
+    The real object carries its payload on ``.data`` and defines ``__iter__``
+    without ``keys()``, so ``dict(response)`` raises rather than returning the
+    payload. A fake that is a plain mapping cannot catch that regression.
+    """
+
+    def __init__(self, data):
+        self.data = data
+
+    def __iter__(self):
+        return iter(self.data)
+
+
 class SlackRelayTest(unittest.TestCase):
     class FakeClient:
         token = "xoxb-not-returned"
 
         def api_call(self, method, **arguments):
-            return {"ok": True, "method": method, "arguments": arguments}
+            return FakeSlackResponse(
+                {"ok": True, "method": method, "arguments": arguments}
+            )
 
     def relay(self):
         relay = SlackRelay.__new__(SlackRelay)
@@ -911,6 +932,272 @@ class SlackRelayTest(unittest.TestCase):
             path = Path(directory) / "upload"
             path.write_bytes(b"1234")
             self.assertEqual(b"1234", read_upload(path, 4))
+
+
+class RelayReadinessTest(unittest.TestCase):
+    """The agent container starts before the credential-proxy sidecar.
+
+    A connection error out of the bootstrap call is not recoverable further up:
+    the gateway's reconnect path finds no bot credential on the queued config
+    (the token lives in the relay) and drops Slack until the pod restarts.
+    """
+
+    def clock(self):
+        """A monotonic clock that only advances when the caller sleeps."""
+        now = [0.0]
+        return now, lambda: now[0], lambda seconds: now.__setitem__(0, now[0] + seconds)
+
+    def test_bootstrap_retries_until_the_relay_binds_its_port(self):
+        attempts = []
+
+        def send():
+            attempts.append(None)
+            if len(attempts) < 4:
+                raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+            return {"workspaces": [{"teamId": "T1"}]}
+
+        _, monotonic, sleep = self.clock()
+        with self.assertLogs("slack-relay-patch", level="WARNING"):
+            result = wait_for_relay(
+                send, timeout=120.0, poll=2.0, monotonic=monotonic, sleep=sleep
+            )
+
+        self.assertEqual({"workspaces": [{"teamId": "T1"}]}, result)
+        self.assertEqual(4, len(attempts))
+
+    def test_bootstrap_gives_up_once_the_deadline_passes(self):
+        def send():
+            raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+
+        _, monotonic, sleep = self.clock()
+        with self.assertLogs("slack-relay-patch", level="WARNING"):
+            with self.assertRaises(urllib.error.URLError):
+                wait_for_relay(
+                    send, timeout=10.0, poll=2.0, monotonic=monotonic, sleep=sleep
+                )
+
+    def http_error(self, status):
+        return urllib.error.HTTPError(
+            "http://127.0.0.1:8765/v1/chat/slack/bootstrap",
+            status,
+            "boom",
+            {},  # type: ignore[arg-type]
+            None,
+        )
+
+    def test_bootstrap_retries_while_the_relay_reports_no_workspace(self):
+        """The proxy binds its port before Slack auth finishes, answering 503."""
+        attempts = []
+
+        def send():
+            attempts.append(None)
+            if len(attempts) < 3:
+                raise self.http_error(503)
+            return {"workspaces": [{"teamId": "T1"}]}
+
+        _, monotonic, sleep = self.clock()
+        with self.assertLogs("slack-relay-patch", level="WARNING"):
+            result = wait_for_relay(
+                send, timeout=120.0, poll=2.0, monotonic=monotonic, sleep=sleep
+            )
+
+        self.assertEqual({"workspaces": [{"teamId": "T1"}]}, result)
+        self.assertEqual(3, len(attempts))
+
+    def test_bootstrap_waits_out_both_startup_stages_in_turn(self):
+        """Connection refused until the port binds, then 503 until auth lands."""
+        attempts = []
+
+        def send():
+            attempts.append(None)
+            if len(attempts) <= 2:
+                raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+            if len(attempts) <= 4:
+                raise self.http_error(503)
+            return {"workspaces": [{"teamId": "T1"}]}
+
+        _, monotonic, sleep = self.clock()
+        with self.assertLogs("slack-relay-patch", level="WARNING") as logs:
+            result = wait_for_relay(
+                send, timeout=120.0, poll=2.0, monotonic=monotonic, sleep=sleep
+            )
+
+        self.assertEqual({"workspaces": [{"teamId": "T1"}]}, result)
+        self.assertEqual(5, len(attempts))
+        self.assertEqual(2, sum("not accepting connections" in m for m in logs.output))
+        self.assertEqual(2, sum("no authenticated workspace" in m for m in logs.output))
+
+    def test_a_relay_error_response_is_not_retried(self):
+        attempts = []
+
+        def send():
+            attempts.append(None)
+            raise self.http_error(500)
+
+        _, monotonic, sleep = self.clock()
+        with self.assertRaises(urllib.error.HTTPError):
+            wait_for_relay(
+                send, timeout=120.0, poll=2.0, monotonic=monotonic, sleep=sleep
+            )
+
+        self.assertEqual(1, len(attempts))
+
+    def test_a_relay_stuck_at_503_eventually_gives_up(self):
+        def send():
+            raise self.http_error(503)
+
+        _, monotonic, sleep = self.clock()
+        with self.assertLogs("slack-relay-patch", level="WARNING"):
+            with self.assertRaises(urllib.error.HTTPError):
+                wait_for_relay(
+                    send, timeout=10.0, poll=2.0, monotonic=monotonic, sleep=sleep
+                )
+
+
+class BoltClientPatchTest(unittest.TestCase):
+    """Every Slack client Bolt builds has to route through the relay.
+
+    Bolt does not reuse the client its app was constructed with: ``_init_context``
+    builds a fresh one per request from the ``AsyncWebClient`` bound in its own
+    module. Patch only the adapter's name and each request talks to slack.com
+    directly holding the ``relay:`` placeholder, fails authorization, and drops
+    the user's message with no reply.
+    """
+
+    class FakeAsyncWebClient:
+        def __init__(self, token=None, **kwargs):
+            self.token = token
+            self.kwargs = kwargs
+
+    class FakeAsyncApp:
+        def __init__(self, client=None, **kwargs):
+            self.client = client
+            self.kwargs = kwargs
+
+    class FakeAsyncSlackResponse:
+        """Mirrors the SDK response Bolt expects: .headers, .data, .validate()."""
+
+        def __init__(self, *, client, http_verb, api_url, req_args, data, headers, status_code):
+            self.client = client
+            self.http_verb = http_verb
+            self.api_url = api_url
+            self.req_args = req_args
+            self.data = data
+            self.headers = headers
+            self.status_code = status_code
+
+        def get(self, key, default=None):
+            return self.data.get(key, default)
+
+        def validate(self):
+            if not self.data.get("ok", False):
+                raise AssertionError("slack api error")
+            return self
+
+    def install_against_fakes(self):
+        """Run install() over stand-ins and hand back the patched modules."""
+        adapter_module = types.ModuleType("gateway.platforms.slack_adapter")
+        adapter_module.AsyncWebClient = self.FakeAsyncWebClient
+        adapter_module.AsyncApp = self.FakeAsyncApp
+
+        class SlackAdapter:
+            async def connect(self, *, is_reconnect=False):
+                return True
+
+            async def disconnect(self):
+                return None
+
+        SlackAdapter.__module__ = adapter_module.__name__
+        adapter_module.SlackAdapter = SlackAdapter
+
+        bolt_module = types.ModuleType("slack_bolt.app.async_app")
+        bolt_module.AsyncWebClient = self.FakeAsyncWebClient
+
+        class PlatformRegistry:
+            def create_adapter(self, name, config):
+                return SlackAdapter()
+
+        registry_module = types.ModuleType("gateway.platform_registry")
+        registry_module.PlatformRegistry = PlatformRegistry
+
+        response_module = types.ModuleType("slack_sdk.web.async_slack_response")
+        response_module.AsyncSlackResponse = self.FakeAsyncSlackResponse
+
+        modules = {
+            "gateway": types.ModuleType("gateway"),
+            "gateway.platform_registry": registry_module,
+            adapter_module.__name__: adapter_module,
+            "slack_bolt": types.ModuleType("slack_bolt"),
+            "slack_bolt.app": types.ModuleType("slack_bolt.app"),
+            "slack_bolt.app.async_app": bolt_module,
+            "slack_sdk": types.ModuleType("slack_sdk"),
+            "slack_sdk.web": types.ModuleType("slack_sdk.web"),
+            "slack_sdk.web.async_slack_response": response_module,
+        }
+        with mock.patch.dict(sys.modules, modules):
+            with mock.patch.dict(
+                os.environ, {"SLACK_RELAY_URL": "http://127.0.0.1:8765"}
+            ):
+                slack_relay_patch.install()
+            # Creating the adapter is what triggers the class-level patching.
+            PlatformRegistry().create_adapter("slack", object())
+        return adapter_module, bolt_module
+
+    def test_bolt_per_request_client_is_rebound_to_the_relay_client(self):
+        adapter_module, bolt_module = self.install_against_fakes()
+
+        self.assertIsNot(bolt_module.AsyncWebClient, self.FakeAsyncWebClient)
+        self.assertIs(bolt_module.AsyncWebClient, adapter_module.AsyncWebClient)
+        self.assertTrue(issubclass(bolt_module.AsyncWebClient, self.FakeAsyncWebClient))
+
+    def test_the_rebound_client_is_a_class_so_bolt_can_isinstance_it(self):
+        """AsyncApp raises BoltError unless the client passes isinstance."""
+        _, bolt_module = self.install_against_fakes()
+
+        self.assertIsInstance(bolt_module.AsyncWebClient, type)
+        client = bolt_module.AsyncWebClient(token="relay:T1")
+        self.assertIsInstance(client, bolt_module.AsyncWebClient)
+
+    def test_the_team_bolt_resolved_wins_over_the_joined_token(self):
+        """Bolt passes team_id per request; the token lists every workspace."""
+        _, bolt_module = self.install_against_fakes()
+
+        client = bolt_module.AsyncWebClient(
+            token="relay:T1,relay:T2", team_id="T2", base_url="https://slack.com/api/"
+        )
+        self.assertEqual("T2", client.team_id)
+
+    def test_a_single_workspace_token_still_yields_its_team(self):
+        _, bolt_module = self.install_against_fakes()
+
+        self.assertEqual("T1", bolt_module.AsyncWebClient(token="relay:T1").team_id)
+
+    def relayed_call(self, client, method, payload):
+        """Drive one api_call with the relay's HTTP response stubbed out."""
+        body = json.dumps({"response": payload}).encode("utf-8")
+        with mock.patch.object(slack_relay_patch.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = io.BytesIO(body)
+            return asyncio.run(client.api_call(method))
+
+    def test_api_call_returns_a_response_object_not_a_bare_dict(self):
+        """Bolt reads .headers off this; a dict raises AttributeError."""
+        _, bolt_module = self.install_against_fakes()
+        client = bolt_module.AsyncWebClient(token="relay:T1")
+
+        payload = {"ok": True, "user_id": "U1", "team_id": "T1", "bot_id": "B1"}
+        result = self.relayed_call(client, "auth.test", payload)
+
+        self.assertNotIsInstance(result, dict)
+        self.assertEqual({}, result.headers)
+        self.assertEqual(payload, result.data)
+        self.assertEqual("U1", result.get("user_id"))
+
+    def test_a_failed_slack_call_raises_the_way_the_real_client_does(self):
+        _, bolt_module = self.install_against_fakes()
+        client = bolt_module.AsyncWebClient(token="relay:T1")
+
+        with self.assertRaises(AssertionError):
+            self.relayed_call(client, "auth.test", {"ok": False, "error": "nope"})
 
 
 if __name__ == "__main__":
