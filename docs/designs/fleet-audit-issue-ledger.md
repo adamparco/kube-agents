@@ -59,7 +59,7 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   and a one-line summary — a run that resolved five findings and found nothing new is _news_, the
   audit reporting that the fleet got better. And a run that could not read the whole fleet is never
   silent even when both counters are zero, because "I found nothing" and "I could not look" are
-  different statements and only one of them is reassuring (§7, Partial coverage).
+  different statements and only one of them is reassuring (§7.4).
 
 ### Tier 2 — remediation pull requests
 
@@ -71,10 +71,12 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   readable fragment of the first path's stem. **The branch name is the source of truth for the
   finding↔PR link.** It survives anyone editing the issue body, and a single
   `gh pr list --label audit:<audit-id> --label audit:remediation --state all
---json number,headRefName,state,mergedAt,url,body,labels` reconstructs the whole mapping in one
-  API call. No body marker is needed and none is added. `labels` is load-bearing rather than
-  incidental: §3.3's harness-close-versus-human-close discriminator reads `audit:stale-closed` off
-  it, so dropping the field from the projection would silently make every close look final.
+--json number,headRefName,state,mergedAt,closedAt,url,body,labels` reconstructs the whole mapping in
+  one API call. No body marker is needed and none is added. Two of those fields are load-bearing
+  rather than incidental. `labels` carries §3.3's harness-close-versus-human-close discriminator,
+  `audit:stale-closed`, so dropping it from the projection would silently make every close look
+  final. `closedAt` is what §3.1's superseded rule compares a `/remediate` timestamp against;
+  without it every stale command wins by default, which is the failure that rule exists to prevent.
 - **The branch is keyed on the files, not on the finding ids.** An earlier draft of this section
   named the branch after the lowest-sorted member id, which does not survive contact with the way
   the model actually works: ids are regenerated from scratch every run, so the day an SOP heading is
@@ -143,25 +145,45 @@ re-issue `/remediate` and have it take effect. For a **promoted** finding this n
 the finding already has a branch and a PR discoverable by name, so re-reading the same command on a
 later run is a no-op by construction.
 
-The actions that must happen _exactly once_ have no such natural key, so each gets a **hidden marker
-in a body**, the same technique the delta block already uses:
+_But a command that is never marked processed is a command that is read again every morning_, and
+that turns the escape hatch of §4 into a way around the close button. A `/remediate` posted in March
+would re-open, in April, the pull request a human closed in April — and again in May, and every
+morning after, which is the exact loop the harness/human close split exists to prevent, re-entered
+through the door left open for changing one's mind. So an explicit request overrules a human close
+only when the request was written **strictly after** it. An older one is not honoured and not
+silently dropped: it is reported as `superseded`, naming the close that answered it and the fact
+that a fresh `/remediate` would be honoured. Unknown timestamps on either side lose the comparison,
+because the two failures are not symmetric — an unrequestable finding costs one more comment, an
+uncloseable pull request costs the reader's belief that the close button does anything.
 
-- `<!-- audit-persists:<finding-id> -->` in the merged remediation PR's body. Present means the
-  persistence comment has already been posted for that finding; absent means post it.
-- `<!-- audit-refused:<comment-node-id> -->` in the ledger issue body. Present means that specific
-  `/remediate` comment has already been refused; absent means reply and record it.
-- `<!-- audit-acked:<comment-node-id> -->`, likewise, for a `/remediate` that was **accepted**. A
-  request that is honoured needs answering exactly as much as one that is refused — the requester is
-  owed the PR links — and a standing comment on a long-lived ledger would otherwise be re-answered
-  every morning for as long as the issue is open.
-- `<!-- audit-stale-closed:<pr-number> -->` records that the harness, not a human, closed that PR.
-  It backs the `audit:stale-closed` label of §3.3 in a place a label edit cannot reach.
+The actions that must happen _exactly once_ have no such natural key, so each gets a **hidden
+marker**, the same technique the delta block already uses. Every one of them is written into the
+comment the harness posts to do the thing, never into a body:
+
+- `<!-- audit-persists:<finding-id> -->` in the persistence comment on the merged remediation PR.
+  Present means that comment has already been posted for that finding; absent means post it.
+- `<!-- audit-refused:<comment-node-id> -->` in the refusal reply on the ledger. Present means that
+  specific `/remediate` comment has already been refused; absent means reply and record it.
+- `<!-- audit-acked:<comment-node-id> -->`, likewise, in the acknowledgement of a `/remediate` that
+  was **accepted**. A request that is honoured needs answering exactly as much as one that is
+  refused — the requester is owed the PR links — and a standing comment on a long-lived ledger would
+  otherwise be re-answered every morning for as long as the issue is open.
+- `<!-- audit-stale-closed:<pr-number> -->` in the stale-close comment. It records that the comment
+  was posted, and nothing more; the harness-versus-human discriminator of §3.3 is the
+  `audit:stale-closed` **label**, which is the thing the state derivation actually reads.
+
+**The marker goes in a comment, not in the body it is about, and that is the load-bearing half.**
+The ledger body is regenerated from scratch on every run, so a marker written there is erased by the
+next morning's edit and the "exactly once" guarantee lasts one day. A comment is append-only: the
+harness can add to the thread but never rewrites what is already in it, including its own earlier
+replies. So the readers scan the comment thread, and — for a pull request, where a human might have
+pasted one — the body as well, before concluding an action is still owed.
 
 Keying the `/remediate` markers on the **comment node id**, not the finding id, is what lets a later
 `/remediate` for the same finding be answered again: the second comment is a different comment, and
 a person asking twice is asking twice.
 
-Idempotency lives in bodies the renderer owns, never in the command comment a human wrote.
+Idempotency lives in comments the harness itself wrote, never in the command comment a human wrote.
 
 ### 3.2 A first-class `recommendation` field
 
@@ -191,19 +213,45 @@ required `recommendation` object:
 ### 3.3 Stale remediation PRs are auto-closed — over complete coverage
 
 When a **complete** run no longer reproduces a finding that has an open remediation PR, the PR is
-closed with a generated comment naming the date, the exact command that no longer reproduces, and
-its output. Over a partial run nothing is closed (§7.3): retiring a fix asserts that its finding is
-gone, and an audit that could not read the cluster has no standing to assert it.
+closed with a generated comment naming the date and each finding it was opened for. Over a partial
+run nothing is closed (§7.4): retiring a fix asserts that its finding is gone, and an audit that
+could not read the cluster has no standing to assert it.
+
+The comment does **not** print the command that no longer reproduces, or its output, and an earlier
+draft of this section promising both was wrong about what is knowable at that moment. A resolved
+finding is by definition absent from the current document, so its evidence is not in hand; the only
+place it survives is the previous ledger body, and recovering it would mean parsing rendered
+Markdown back into fields. The renderer emits the command only on the rare path where a caller
+supplies the finding — and says nothing rather than print an empty code fence.
 
 Accepted risk: this can close a PR a human was mid-review on. Mitigations, all three required:
 
-- The closing comment states plainly that the PR may be reopened, and that the audit will re-open a
-  fresh one if the finding returns.
+- The closing comment states plainly that the PR may be reopened, and says **exactly** what happens
+  if the finding returns: a `critical` manifest finding is re-proposed automatically on this same
+  branch, at most five per run, and anything else is listed on the ledger as awaiting
+  `/remediate <finding-id>`. The comment is not allowed to promise a fresh pull request to every
+  reader, because auto-promotion does not open one for every reader — and the findings it silently
+  would not re-propose are precisely the low-severity ones nobody is watching for.
 - **The branch is not deleted on close.** Branches are cheap and any human fixup pushed to the branch
   survives. A branch is reset only when the same finding is promoted again.
 - **The close is labelled `audit:stale-closed`.** Without a marker, next month's run cannot tell its
   own close from a maintainer's rejection, and it must treat those oppositely (§3.1). The label is
   the harness signing its own work; removing it makes the close permanent.
+
+Two orderings inside that sequence are load-bearing, and both are the kind of thing that only shows
+up when a `gh` call fails:
+
+- **Label first, and refuse to close without the label.** An _unlabelled_ close is worse than no
+  close at all — it is indistinguishable from a human rejection, so the finding is retired
+  permanently and never re-proposed. A labelled pull request that is still open costs one line of
+  log noise and is finished on the next run. So a failed label edit skips the close entirely.
+- **Announce at most once; close as many times as it takes.** The `audit-stale-closed` marker
+  records that the comment was posted, not that the close succeeded. Every pull request reaching
+  this step is open, so a marker already on the record means an earlier run commented and _then_
+  failed to close; treating it as proof of the close leaves the PR open forever while the ledger and
+  the run summary both report it closed. The retry re-issues the close without repeating the
+  comment. For the same reason a close whose `gh` call fails is never added to `prs_closed` — a run
+  summary that describes work that did not happen is worse than one that admits it.
 
 ### 3.4 Replace the PR-report path outright
 
@@ -223,16 +271,25 @@ is no fleet state left over from the model it replaces.
 
 The ledger renders each finding in exactly one state. Transitions are computed per run, never stored.
 
-| State                | Condition                                            | Rendered as                      | Action taken                                            |
-| -------------------- | ---------------------------------------------------- | -------------------------------- | ------------------------------------------------------- |
-| `open`               | reproduces; no PR on its branch                      | `open`                           | none, unless it qualifies for auto-promotion            |
-| `pr-open`            | reproduces; branch has an open PR                    | `fix proposed` + link            | **nothing** — the PR is left exactly as it is           |
-| `pr-merged-persists` | reproduces; branch PR is merged                      | `⚠ fix merged, still reproduces` | comment once on the merged PR; never reopen it          |
-| `refused`            | reproduces; branch PR is closed and was never merged | `fix refused` + link             | none — the close stands until someone says `/remediate` |
-| `resolved`           | no longer reproduces; PR open or absent              | dropped; named in the delta      | close any open PR (§3.3), keep the branch               |
-| `resolved-merged`    | no longer reproduces; branch PR is merged            | dropped; delta records the fix   | none — the ledger records that the merged fix is why    |
+| State                | Condition                                             | Rendered as                           | Action taken                                            |
+| -------------------- | ----------------------------------------------------- | ------------------------------------- | ------------------------------------------------------- |
+| `open`               | reproduces; no PR on its branch                       | `open`                                | none, unless it qualifies for auto-promotion            |
+| `pr-open`            | reproduces; branch has an open PR                     | `fix proposed` + link                 | **nothing** — the PR is left exactly as it is           |
+| `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`      | comment once on the merged PR; never reopen it          |
+| `refused`            | reproduces; branch PR closed unmerged by a **person** | `fix refused` + link                  | none — the close stands until someone says `/remediate` |
+| `withdrawn`          | reproduces; branch PR closed unmerged by the harness  | `fix withdrawn, awaiting re-proposal` | eligible for promotion again, exactly as if it had none |
+| `resolved`           | no longer reproduces; PR open or absent               | not rendered — see below              | close any open PR (§3.3), keep the branch               |
+| `resolved-merged`    | no longer reproduces; branch PR is merged             | not rendered — see below              | none; a merged fix that worked is the expected ending   |
 
-Two rows are easy to misread, and both were wrong in an earlier draft:
+**The last two rows have no rendering, and the "Rendered as" column cannot be made to give them
+one.** A finding that no longer reproduces is absent from the run's document, so there is no row in
+the findings table to carry a state — `derive_finding_state` is only ever called with
+`reproduces=True` in production, and the two resolved labels never reach a reader. What the reader
+sees instead is the delta comment, which names the resolution by id and by the title recovered from
+the previous body. The distinction between the two states survives only in the code, where it
+decides whether a pull request is closed as stale or left alone because it already merged.
+
+Three of the rendered rows are easy to misread, and two of them were wrong in an earlier draft:
 
 - **`pr-open` is not refreshed.** The draft said "refresh the PR body if the evidence changed",
   which would have the harness force-push over a reviewer's own commits every morning. An open
@@ -241,16 +298,28 @@ Two rows are easy to misread, and both were wrong in an earlier draft:
   someone closed its fix without merging — a considered "no" the harness must not overrule by
   re-proposing the same fix tomorrow. (A refused `/remediate` is a _reply_, not a finding state;
   there is no finding to put in a state, which is why the draft's condition for this row did not
-  correspond to anything the renderer could compute.) The discriminator is the `audit:stale-closed`
-  label: a close the harness performed is re-openable, a close a human performed is final, and the
-  escape hatch either way is `/remediate <id>` from someone with write access.
+  correspond to anything the renderer could compute.)
+- **`withdrawn` is the other half of that row**, and splitting the two is not cosmetic. A closed
+  unmerged pull request is two different events: one the harness closed itself under §3.3 because
+  the finding had stopped reproducing, and one a person closed because they did not want the fix.
+  The discriminator is the `audit:stale-closed` label the harness applies as it closes. Rendering
+  the first as `fix refused` states that a person declined a fix when no person was involved, and
+  the reader who believes it leaves alone the one case the harness is waiting to re-propose — a
+  flapping finding would be fixable exactly once, and never again after its first quiet day. So a
+  `withdrawn` finding is treated as having no pull request at all: auto-promotion picks it up on the
+  usual terms (`critical`, `manifest`, under the cap), and `/remediate` reaches it without the
+  after-the-close age test a `refused` finding imposes.
+  A `refused` one is reachable only by `/remediate <id>` from someone with write access, and only by
+  a command written _after_ the close — an older one is reported as `superseded` rather than
+  honoured, because a comment nobody can edit away would otherwise re-open a human's close every
+  morning forever.
 
 `pr-merged-persists` is the state the current design cannot express and is a primary reason for the
 change. It must be visually distinct in the ledger.
 
 The two "once" obligations in the last column — the comment on a merged PR and the reply to a
-refused command — are enforced by the hidden `audit-persists` / `audit-refused` markers of §3.1, not
-by mutating anything a human wrote.
+refused command — are enforced by the hidden `audit-persists` / `audit-refused` markers of §3.1,
+carried in the harness's own comments, not by mutating anything a human wrote.
 
 ## 5. Grouping
 
@@ -312,10 +381,20 @@ branch.
    §2, and the scope rules of §7.2).
 2. Reconcile: one `gh pr list` call builds the finding→PR state map from head branch names.
 3. Compute the delta against the ledger issue's `<!-- audit-findings -->` marker.
-4. Compute coverage gaps (§7.3). A gap does not stop the run; it narrows what the run may conclude.
-5. Clean run → close the ledger issue as completed, close every open remediation PR for the stream,
-   print `CLEAN`. **Unless the run is partial**, in which case the status is still `CLEAN` but the
-   issue stays open with a comment naming the gaps and no PR is retired.
+4. Compute coverage gaps (§7.4). A gap does not stop the run; it narrows what the run may conclude.
+5. Clean run → answer every unanswered `/remediate` on the ledger, then close the ledger issue as
+   completed, close every open remediation PR for the stream, print `CLEAN`. **Unless the run is
+   partial**, in which case the status is still `CLEAN` but the issue stays open with a comment
+   naming the gaps and no PR is retired.
+
+   The answers come **before** the close, and that ordering is the whole of the rule. "Every
+   `/remediate` gets exactly one answer" cannot have the clean run as its exception: this is the one
+   morning the issue disappears, taking with it the thread the requester would have re-asked on, so
+   it is the one morning silence costs the most. The answer says the finding no longer reproduces,
+   and whether the ledger is closing or staying open on partial coverage. Authorization is not
+   consulted — nothing is being acted on for anybody, and the answer is equally true and equally
+   useful to a commenter without write access.
+
 6. Otherwise → render and create-or-edit the ledger issue, apply the severity label, post the delta
    comment when the delta is non-empty.
 7. Auto-promote every eligible critical manifest finding (§3.1) — at most five per run, the surplus
@@ -325,6 +404,25 @@ branch.
    `/remediate` exactly once, with an acknowledgement or a refusal. Each "once" guard reads the
    hidden markers of §3.1.
 
+The acknowledgement names a per-target outcome rather than a count, because "3 requests processed"
+is indistinguishable from "3 requests silently dropped": opened with its URL, refreshed, already
+open and deliberately not force-pushed over, `superseded` by a human close written after the request
+(§3.1), or not published this run and queued for a retry. A **refusal** is likewise never silence.
+Naming a `gcloud` or `manual` finding, naming an id that is not in the document, lacking write
+access, writing `/remediate` mid-sentence where the line-anchored parser will not honour it, or
+writing it with no target at all each get exactly one reply.
+
+Four of those five replies carry the ids that would have worked — capped at ten, then "and N more",
+since a refusal is help and not a second copy of the report. **The write-access refusal deliberately
+carries neither the id list nor the syntax.** Every other refusal is a correction to someone who may
+retry and succeed; that one is a "no" to someone who cannot, and handing them a menu of fixes they
+are not permitted to request reads as an invitation rather than an answer. It says what the rule is
+and stops. The one deliberate silence is a mid-sentence mention from someone without write access:
+their correctly-typed command would have been refused anyway, and two replies to one comment that
+was probably never a command is a bot picking an argument. A `/remediate` the harness itself renders
+into a comment is always inside a code span, and inline code is stripped before the mention search
+runs — otherwise the ledger reads its own replies back on the next run and answers itself forever.
+
 Exit contract — eight keys, always all eight:
 
 - `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[]}`
@@ -333,9 +431,19 @@ Exit contract — eight keys, always all eight:
 - `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"]}`
 
 `--dry-run` renders the issue body and every PR body it _would_ open to stdout with zero git or gh
-side effects. It applies the **same** grouping, promotion, budget, and coverage-gap degradation as a
-real run, so a dry run that looks right is evidence the real one will be — a dry run that took a
-shorter path through the code would be worth very little.
+**side effects**: nothing is cloned, staged, committed, pushed, created, edited, commented, or
+closed. It is not "zero subprocesses" and must not be described as such — resolving the repository
+can fall back to reading `git config --get remote.origin.url`, and locating the clone to resolve
+`remediation.path` against is a filesystem read. Those are the same read-only lookups a real run
+performs before it does anything, which is the point: it applies the **same** grouping, promotion,
+budget, and coverage-gap degradation as a real run, against the **same** workspace clone, so a dry
+run that looks right is evidence the real one will be. A dry run that took a shorter path through
+the code — or resolved paths against the current directory instead of the clone — would be worth
+very little, because "the manifest is missing" is exactly the answer it exists to give early.
+
+One asymmetry with the real run is deliberate: a dry run **warns** about a `remediation.path` that
+is missing or fails containment, and does not rewrite the finding to `manual` the way `finish` does.
+Degrading a document it is only previewing would show the reader a body the real run never produces.
 
 ### `remediate --audit <id> --findings-file <path> --finding <id>...`
 
@@ -343,15 +451,27 @@ The promotion primitive, callable directly and reused internally by `finish`. Fo
 the branch onto `main`, stage only the group's manifest paths (the existing wildcard-pathspec refusal
 is retained), commit with a generated Conventional Commit subject, push, and create or edit the PR.
 
+**It promotes what was named and nothing else.** The auto-promotion sweep of §3.1 belongs to
+`finish`, where the whole fleet is being reported on anyway, and does not ride along on this
+subcommand. Sharing one code path between the two is right; sharing the sweep is not — it would
+make `remediate --finding one-id` open up to six pull requests, five of them for findings the
+operator never mentioned and cannot tell apart from the one they did, on the command whose entire
+purpose is to act on a specific request.
+
 Manifest files must already exist under the workspace, but **a missing one is no longer a hard
 error**. That finding degrades to `kind: manual`, keeps its evidence and recommendation, says in the
 ledger that a fix was named but not written, and the report publishes. Killing a nine-critical
 security report because one of the nine manifests was not written is the wrong shape of failure: it
 throws away eight findings to punish one.
 
-`remediate` degrades the same way, for the same reason at a smaller scale. A named target whose file
-is missing is refused **by name** — logged, and returned in the `refused` key of its exit JSON so
-the acknowledgement comment can say so — while the rest of the batch opens. This matters because
+`remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
+is not a readable file inside the clone is refused **by name** — logged, and returned in the
+`refused` key of its exit JSON so the acknowledgement comment can say so — while the rest of the
+batch opens. "Not a readable file inside the clone" covers two different failures and the message
+must not collapse them into "not on disk": either nothing was written at that path, or the path does
+not resolve inside the repository at all (§9), and only the second is a security event. A
+`SECURITY:` line in the log distinguishes them; telling an operator to write a file they already
+wrote sends them looking in the wrong place. This matters because
 `/remediate all` expands to every manifest-remediation id in the document: refusing the batch would answer a request for
 thirty fixes with zero, and leave the operator to work out which one was to blame. Only the case
 where _every_ named target is refused is an error, since there is then no partial success to report
@@ -372,11 +492,11 @@ lose and anything present is debris from a run that did not finish.
 | Ledger issue body    | Scope, findings table with state column, then per-finding detail: evidence, impact, recommendation, remediation, PR link. Hidden `<!-- audit-findings -->` marker last, listing the ids the body rendered. |
 | Scope                | Clusters covered with their optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2.                                                     |
 | Size budget          | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                        |
-| Delta comment        | New / resolved / newly-merged-but-persisting, by title. Reuses `render_delta_comment` with a fourth section.                                                                                               |
-| Clean-close comment  | Date, clusters covered, PRs closed. Reuses `render_clean_comment`.                                                                                                                                         |
+| Delta comment        | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything. Reuses `render_delta_comment`.                                                    |
+| Clean-close comment  | Date and the clusters covered, then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                           |
 | Remediation PR title | `fix(<audit-id>): <finding title>`                                                                                                                                                                         |
 | Remediation PR body  | `Part of #<issue>`, the single finding's evidence, impact, **Why this fix** (the recommendation), and the risk note. For a group, one section per member.                                                  |
-| Stale-close comment  | Date, the command that no longer reproduces, its output, and the reopen note.                                                                                                                              |
+| Stale-close comment  | Date, each finding the pull request was opened for, the `audit:stale-closed` label, and an accurate reopen note. Not the evidence — see §3.3.                                                              |
 
 ### 7.1 Size budget
 
@@ -387,6 +507,13 @@ headroom for the trailing marker and for anything a later section appends.
 - **Per-finding trims.** Excerpts already trim to 40 lines / 2,000 characters. **Commands now trim
   to 2,000 characters too.** The SOPs mandate pasting the confirm command verbatim into
   `evidence.command`, which makes it the dominant per-finding term, and it was previously unbounded.
+  So do the remaining free-text fields — title 300, impact and each `recommendation` sub-field
+  1,500, `remediation.note` 2,000 — and `cluster`, `namespace` and `object` at 320, which clears
+  `Kind/name` at its longest (a namespace is a 63-character DNS label, a resource name a
+  253-character DNS subdomain, a GKE cluster name 40) while still capping a hostile value. Every one
+  of these matters for the same reason: the selection loop renders the **first** finding whatever it
+  costs, so a single oversized field on a single finding overflows the body and publishes nothing at
+  all, every morning, for as long as that finding reproduces.
 - **Table caps.** The scope and skipped tables cap at 60 rows each, with a trailing "…and N more"
   row. Without the cap a body with _zero findings_ overflows: 1,200 clusters plus 1,200 skipped
   entries renders 148,627 characters of pure scope.
@@ -402,8 +529,28 @@ headroom for the trailing marker and for anything a later section appends.
   absent from the previous marker, or present in it and absent from the body, and report a finding
   that is very much still reproducing as _resolved_. The marker is itself a size term and was
   unbounded: 1,250 finding ids render 80,526 characters of marker alone, over the limit before a
-  single word of prose, and `obtainability_audit_sop.md:67` permits exactly that many findings in
-  one run.
+  single word of prose. That figure came from an earlier reading of the obtainability SOP's
+  roll-up rule; that SOP now caps a check at 25 findings per cluster
+  ([obtainability_audit_sop.md:78](../../agents/platform/governance/obtainability_audit_sop.md)),
+  so no single documented rule licenses a run that large today. Bounding the marker is still right:
+  the cap is per check per cluster, five streams run against a fleet of unknown size, and a size
+  term that grows with the fleet and is invisible in the rendered body is the worst kind to leave
+  unbounded.
+- **The two halves of the delta are measured against different sets**, because "appeared" and "was
+  fixed" are different claims and truncation breaks them apart. `new` is _rendered minus previous_:
+  the previous marker records what the last body rendered, so comparing it to anything wider
+  announces every budget-dropped finding as new, every morning, forever. `resolved` is _previous
+  minus **every** current finding, rendered or not_: a finding cut for space still reproduces, and
+  calling it resolved puts a fix that never happened in writing, on the one finding nobody can see
+  to contradict it. One yardstick for both halves is wrong in one direction or the other whichever
+  one is chosen.
+- **The delta comment is capped and ordered by severity.** Both of its lists cap at 50 rows, and the
+  `new` list is sorted severity-first before the cap applies — an alphabetical cut decides what a
+  reader sees by the first letter of a finding id, which is how a critical ends up under "…and 40
+  more". The overflow line says the remainder is lower severity, so the reader knows the cut was not
+  arbitrary. The same 50-row cap governs the **findings state index** at the top of the body — the
+  one-row-per-finding table of id, severity, cluster, and state. There is no delta table in the
+  body; the index needs no separate ordering rule because the body is already severity-first.
 - The clean-close comment is measured against the same budget, for the same reason: a clean run on a
   fleet with 900 skipped clusters must still be postable.
 
@@ -426,7 +573,32 @@ The validator enforces both halves: the two lists must be disjoint, and a findin
 names a skipped entry is rejected. The rendered scope table carries a `limitations` column only when
 at least one cluster has one, so the common case stays two columns wide.
 
-### 7.3 Partial coverage
+### 7.3 Untrusted text in a rendered body
+
+Every string the renderer interpolates arrives from a model-authored document describing a cluster
+nobody controls, so all of it is untrusted input to a Markdown renderer that will happily obey it.
+
+- **Fences are computed, never literal.** A block's delimiter is a run of backticks one longer than
+  the longest run inside its own content, so an excerpt containing ` ``` ` cannot break out of the
+  block that is quoting it. The helper returns the **whole** block — opener, body, closer — because
+  the earlier version returned a bare delimiter and two callers emitted a stray ` ``` ` into a
+  comment while dropping the command they meant to show.
+- **Fence detection follows CommonMark, including the indentation bound.** `strip_fenced_blocks`
+  exists so a `/remediate` quoted inside evidence never fires, and quoting the command to discuss it
+  is the single most likely thing anyone writes in one of these issues. A non-greedy ` ```…``` `
+  regex pairs the first fence with the second and leaves the third dangling, so text every renderer
+  puts _inside_ a block survives stripping. The rule is: open on a run of three or more backticks or
+  tildes indented at most three spaces, close on a run of the same character at least as long,
+  likewise indented at most three, nothing else on the line, unterminated fences run to the end.
+  Dropping the indentation bound — stripping each line before comparing — makes four-space
+  ` ``` `, which CommonMark and GitHub both render as literal text, read as a closer.
+- **Table cells escape `|` and flatten newlines**; identifiers additionally replace a backtick,
+  because one backtick closes the inline code span they sit in and the rest of the value renders as
+  live Markdown.
+- **Redaction runs before every clip**, not after, so a secret cannot survive by being past the
+  truncation point (§9).
+
+### 7.4 Partial coverage
 
 `coverage_gaps(data)` folds the two representations of "did not look" — every `scope.skipped` entry
 and every cluster `limitations` note — into one list of human-readable strings, and a run with a
@@ -455,7 +627,7 @@ published normally, and new fixes are still proposed for them. A partial audit i
 not a failed one.
 
 `partial` is `true` if and only if `coverage_gaps` is non-empty, on both `finish` branches. The
-tempting generalisation — also raising it when the body budget (§7) dropped findings from the
+tempting generalisation — also raising it when the body budget (§7.1) dropped findings from the
 description — was implemented and then removed, because the two are not the same kind of incomplete
 and the flag has one job. A coverage gap means the audit did not look, which is precisely why it
 suppresses the resolved count. Truncation means it looked, found everything, counted it all in the
@@ -494,9 +666,22 @@ New:
 - **Never reopen a merged remediation PR.** A persisting finding gets a comment and a ledger state,
   not a resurrection.
 - **Never delete a remediation branch on close.**
+- **Never touch a file outside the checkout.** `remediation.path` is validated as a string during
+  `finish` — repo-relative, no `..`, no glob metacharacter, no leading `:` — but a string check is
+  all that can run at validation time, because the harness does not yet know where the clone is. On
+  a real filesystem an unimpeachable relative path escapes the moment a directory component is a
+  symlink: `manifests/vendor/x.yaml` is beyond reproach until `manifests/vendor` points at `/etc`,
+  and then the existence check passes, the snapshot reads `/etc/x.yaml`, and its contents are
+  committed to a public pull request. So every path is re-resolved against the checkout root before
+  it is read or staged, under two independent tests — **no component may be a symlink**, and the
+  fully resolved path must sit under the fully resolved root. Either alone has a hole: the walk
+  misses a root reached through a link, and the resolve-and-compare accepts a link whose target is
+  inside the repo today and moves tomorrow. Nothing is read from a path that fails either test: the
+  finding degrades to `manual` under §6's missing-manifest rule, the run logs a `SECURITY:` line
+  naming the path, and no pull request can open for it while the path stays uncontained.
 - **Never report a cluster the audit could not read as clean.** An unreadable cluster goes in
   `scope.skipped`, a cluster read with a check missing gets a `limitations` note, and either way the
-  run is partial (§7.3). Reporting an all-clear for a cluster nobody looked at is the one failure
+  run is partial (§7.4). Reporting an all-clear for a cluster nobody looked at is the one failure
   mode that makes the whole ledger untrustworthy.
 - **Never put a credential in `evidence.excerpt`.** No Secret `data:` or `stringData:` block, no
   token, no password, no private key. The SOPs say this to the model; `audit_report.py` also
@@ -546,7 +731,7 @@ agents/platform/skills/fleet-audit/scripts/audit_pr.py      → audit_report.py
 agents/platform/skills/fleet-audit/scripts/test_audit_pr.py → test_audit_report.py
 docs/README.md
 docs/site/src/content/docs/concepts/autonomous-watchdogs.md
-docs/site/src/content/docs/concepts/declarative-workflow.md   (:63 — stale App permissions)
+docs/site/src/content/docs/concepts/declarative-workflow.md   (stale App permissions)
 docs/site/src/content/docs/concepts/governance-sops.md
 docs/site/src/content/docs/overview/architecture.mdx
 docs/site/src/content/docs/overview/proactive-autonomy.md
@@ -561,14 +746,14 @@ Four more are prerequisites of the ledger rather than references to the PR path:
 ```
 agents/platform/skills/github-issue-resolver/SKILL.md            (§13 Q3 — red line gains `agent:audit`)
 agents/platform/skills/github-issue-resolver/scripts/resolver.py (§13 Q3 — poll query gains `-label:agent:audit`)
-docs/site/src/content/docs/deploy/token-minter.md                (§13 Q2 — :26, :61, stale App permissions)
-docs/site/src/content/docs/install/prerequisites.md              (§13 Q2 — :89, stale App permissions)
+docs/site/src/content/docs/deploy/token-minter.md                (§13 Q2 — stale App permissions, two places)
+docs/site/src/content/docs/install/prerequisites.md              (§13 Q2 — stale App permissions)
 ```
 
 ## 12. Testing
 
 The module this design started from was 60 tests over 980 lines; most pure-helper coverage ported
-unchanged. As shipped it is **274**. New cases:
+unchanged. As shipped it is **346**. New cases:
 
 - `recommendation` validation: each sub-field missing, empty, wrong type.
 - Finding-id charset: an id containing `:`, a space, `..`, or `*`, one ending `.lock`, one starting
@@ -584,14 +769,60 @@ unchanged. As shipped it is **274**. New cases:
 - Command parsing: `/remediate <id>`, `/remediate all`, unknown id, non-manifest id, the command
   appearing inside a fenced code block (must not match), and a command from an `authorAssociation`
   of `NONE` or `CONTRIBUTOR` (refused, replied to once).
-- State derivation across all six rows of the §4 table, including `pr-merged-persists`.
+- State derivation across all **seven** rows of the §4 table, including `pr-merged-persists` and
+  `withdrawn`; that every state has a distinct label, asserted as a set equality against
+  `STATE_LABELS` so a new state cannot be added without one; and that `withdrawn` and `refused` do
+  not share a label, since rendering them alike is the specific mistake §4 exists to prevent.
 - Idempotency markers: a merged PR already carrying `audit-persists` gets no second comment; a ledger
   already carrying `audit-refused` for a comment node id does not re-refuse it; a different node id
   for the same finding does.
 - Clean run closes the issue and every open remediation PR.
-- `--dry-run` performs zero git and zero gh calls (assert on the mocked runner).
+- `--dry-run` issues no command through the harness runner at all (assert the recorder is empty),
+  prints every pull request body it would open, separated from the ledger body by a machine-findable
+  line so a size check can measure each one against the limit rather than the concatenation, and
+  resolves `remediation.path` against the workspace clone rather than the process's working
+  directory — the one where a dry run run from the wrong place would have reported every manifest as
+  written when none were, or as missing when all were.
 
-**Size-cap cases** (§7.1), asserting on rendered length rather than on shape:
+**Publication cases.** The suite's one structural blind spot: every other assertion checked either
+the _arguments_ handed to `gh` or the _return value_ of a renderer, and nothing checked the wire
+between them. Replacing the temp-file writer's payload with an empty string — blanking the ledger,
+every comment and every pull request — left the whole suite green. The recorder now reads each
+call's `--body-file` (or `-F`) at call time, before the harness unlinks it, and:
+
+- the created ledger carries the findings section and the hidden `audit-findings` block;
+- a refreshed ledger carries this run's findings and not the last run's;
+- the delta comment names both the new and the resolved id;
+- the clean comment is published, not merely rendered;
+- a promoted pull request carries its file list, its `Part of #N` link, and its own hidden block;
+- and, as a blanket rule, no body published by any run is empty.
+
+**Command-syntax cases.** Both ways of getting `/remediate` wrong used to produce exactly the
+observable behaviour of an audit that had not run yet, so the requester waited and asked again the
+same wrong way. A mid-sentence mention and a bare `/remediate` are each answered once, with the
+syntax and the promotable ids; a mistyped id and a non-`manifest` target likewise name the ids that
+would have worked; a mention inside a code span is not an attempt; a mention from an author without
+write access is left alone; and no comment the harness itself writes reads as a request — which is
+what keeps it from answering its own replies on every run.
+
+**Answered-anyway cases.** The two ways a request can be dropped without anybody noticing, because
+in both the harness is doing something else at the time:
+
+- A **clean run** answers every unanswered `/remediate` before it closes the ledger — asserted on
+  the published comment bodies, not on the render, since the bug being guarded against is a comment
+  that is composed and then never posted. Covered: a request answered on a closing run, one answered
+  on a partial run that keeps the ledger open, one already carrying an `audit-acked` or
+  `audit-refused` marker that is not answered twice, and a `/remediate` inside a code fence that is
+  not answered at all.
+- The `remediate` subcommand opens pull requests for **only** the ids it was given, asserted on the
+  paths staged rather than on branch names — branch names are derived from the group's path set, so
+  an assertion keyed on a finding id would fail for the wrong reason and be "fixed" by weakening it.
+
+**Size-cap cases** (§7.1), asserting on rendered length rather than on shape. Every one of them
+measures against the literal 65,536 GitHub enforces, never against `MAX_BODY_CHARS`: a test that
+asserts a body fits under the harness's own belief about the limit passes just as happily when the
+belief is wrong, so raising the constant to 200,000 would keep them all green while every publish
+422s. One test — and only one — asserts the constant equals the literal.
 
 - A run of 250 findings renders a body at or under the limit.
 - The hidden delta block contains exactly the ids the body rendered — no more, no fewer.
@@ -599,7 +830,7 @@ unchanged. As shipped it is **274**. New cases:
 - 10 findings render untruncated, with no "omitted" notice and no trimmed command.
 - The clean-run comment stays under the limit with 900 skipped clusters.
 - A truncated body reports `partial: false` with empty `coverage_gaps`, and warns in the log —
-  truncation is not a coverage gap (§7.3).
+  truncation is not a coverage gap (§7.4).
 - `partial == bool(coverage_gaps)` over both `finish` branches and all three ways a gap arises: clean
   and complete, clean over a `skipped` entry, findings over a `skipped` entry, findings over a
   cluster carrying only a `limitations` note.
@@ -607,27 +838,30 @@ unchanged. As shipped it is **274**. New cases:
   ledger stays open, and it treats a `limitations` note as a gap — the earlier version rendered
   `scope.skipped` alone and posted "closed as completed" onto an issue that stayed open.
 
-**Failure-path cases.** The existing suite has **zero** of these: its mock command recorder returns
-exit 0 unconditionally, so not one test exercises a failing `gh` or `git` call. That is not a gap in
-coverage of unlikely code, it hides a live defect — `find_existing_issue` and `find_existing_pr`
-return `(None, None)` on transport failure, which makes a GitHub outage indistinguishable from "no
-issue exists". The run then opens a **duplicate ledger**, or, on a clean run, prints `CLEAN` having
-closed nothing. So:
+**Failure-path cases.** The suite this one grew from had **zero** of these: its mock command recorder
+returned exit 0 unconditionally, so not one test exercised a failing `gh` or `git` call. That was not
+a gap in coverage of unlikely code, it hid a live defect — `find_existing_issue` and
+`find_existing_pr` returned `(None, None)` on transport failure, which makes a GitHub outage
+indistinguishable from "no issue exists". The run then opens a **duplicate ledger**, or, on a clean
+run, prints `CLEAN` having closed nothing. So:
 
 - The recorder gains fault injection: a per-command exit code, stderr, and payload.
 - A failing `gh issue list` must not be read as "no ledger exists".
 - A failing `gh pr list` must not be read as "no PR on this branch" and must not re-promote.
 - A clean run that cannot reach GitHub does not print `CLEAN`.
 
-**Coverage-gap cases** (§7.3): a `scope.skipped` entry and a cluster `limitations` note each set
+**Coverage-gap cases** (§7.4): a `scope.skipped` entry and a cluster `limitations` note each set
 `partial`; a partial clean run leaves the ledger open, posts the gap comment, closes no PR, and
 reports `resolved: 0`; a complete clean run does all four of the opposite things.
 
-**Workspace cases.** Two of these run **real git** against a real bare origin rather than the
-recorded runner, because the defect they cover is invisible to a mock: `ensure_workspace` executes
-`git clean -fd`, and a mock happily records the command without deleting anything. The tests assert
-that an untracked manifest written between `start` and `finish` survives the reattach, that
-`reset=True` does remove it, and that `finish` issues neither `git clean` nor `git reset --hard`.
+**Workspace cases.** Exactly **one** of these runs real git against a real bare origin rather than
+the recorded runner, and it is the one whose defect is invisible to a mock: `ensure_workspace`
+executes `git clean -fd`, and a mock happily records the command without deleting anything, so the
+untracked manifest the fixture wrote is still on disk and the assertion passes on code that would
+wipe the tree in production. That test asserts an untracked manifest written between `start` and
+`finish` survives the reattach. Its two companions — that `reset=True` does remove it, and that
+`finish` issues neither `git clean` nor `git reset --hard` — are assertions about which commands
+were issued, which the recorder answers correctly and more cheaply.
 This is worth the cost of a real repository in the suite: the bug it guards against silently emptied
 Tier 2 — every manifest the audit wrote would have been deleted moments before the harness looked
 for it, and every finding would have been published as "the fix was named but never written".
@@ -637,6 +871,15 @@ for it, and every finding would have been published as "the fix was named but ne
 `SETTINGS.md` falling back to the git remote; SETTINGS winning when both are present; and an error
 that names both sources when neither works. Plus ordering: the repo is resolved before the token is
 minted, the token is minted for the resolved repo, and both happen before the clone.
+
+**One hazard the suite has to defend against itself.** Two test classes were both named
+`TestStaleClose`. Python rebinds the name at import, long before `unittest` collects anything, so the
+first class simply ceased to exist and its four tests never ran — while the suite reported them as
+passing, because a test that does not exist cannot fail. Nothing in `unittest`, and nothing in the
+count printed at the end of a run, distinguishes "four tests passed" from "four tests were shadowed
+away". The classes are now `TestStaleCloseEligibility` and `TestStaleCloseLabelling`, and the
+docstring on each says why: any new stale-close class needs its own name. A duplicate class name is
+the one test defect that hides itself.
 
 Plus the existing gates: `make docs-generate`, `make docs-check`, `make validate`, `prettier`,
 `astro build`, and a Docker build to prove in-image script paths.
@@ -669,9 +912,9 @@ _Resolved: already granted._ The design guessed; source settles it.
 the App's permissions. Nothing to add.
 
 The published documentation, however, was **stale in four places**, each listing only `contents` and
-`pull_requests`: `docs/site/src/content/docs/deploy/token-minter.md:26` and `:61`,
-`docs/site/src/content/docs/install/prerequisites.md:89`, and
-`docs/site/src/content/docs/concepts/declarative-workflow.md:63`. An operator who followed them
+`pull_requests`: two in `docs/site/src/content/docs/deploy/token-minter.md` (the App-creation step
+and the scope description), one in `docs/site/src/content/docs/install/prerequisites.md`, and one in
+`docs/site/src/content/docs/concepts/declarative-workflow.md`. An operator who followed them
 created a GitHub App without issue permission, which makes Minty's scope request unsatisfiable and
 fails the ledger at runtime with a 403 — a class of failure the operator cannot debug from the
 documentation that caused it. Corrected as part of this change.
@@ -705,3 +948,40 @@ _Resolved: honour the command only from an author whose `authorAssociation` is `
 `COLLABORATOR`._ Anyone else gets a single reply saying the command requires write access, recorded
 by the `audit-refused` marker of §3.1 so they are not told twice. `gh issue view --json comments`
 exposes `authorAssociation` on each comment, so this costs no extra API call.
+
+## 14. Accepted risks
+
+Two findings from the adversarial review of this feature were deliberately not fixed. They are
+recorded here rather than dropped, because an unrecorded decision not to act is indistinguishable
+from not having noticed.
+
+**Mutation coverage is not measured, and the suite is not known to be strong.** A 71-mutation corpus
+run against the suite as it stood at 167 tests left 40 mutants alive — a 56% survival rate. Notable
+survivors: inverting the severity label on a finding, closing the pull requests whose findings still
+reproduce rather than the resolved ones, and dropping the withheld-findings notice from the ledger.
+The single largest cause was the missing publication seam — no test opened a `--body-file` and read
+it — which is fixed (`Recorder.bodies_for`, `TestPublishedBodies`), and re-running the blanking
+mutation now fails eight tests where it previously failed none. The rest of the corpus has not been
+re-run, and no mutation gate is wired into CI.
+
+_Why it is accepted:_ a mutation harness is a testing-infrastructure project of its own, it needs a
+tool the container does not have and cannot fetch (there is no network in the build), and its output
+is a backlog of individually cheap test cases rather than a defect. The three named survivors are
+each now covered by a direct test. _What it costs:_ the suite's true strength remains an estimate.
+_What would change it:_ if a defect ships that a mutation would plainly have caught, wire the gate
+in before fixing the defect.
+
+**A dead cron is indistinguishable from a healthy fleet.** A clean stream with no pre-existing
+ledger publishes no artifact at all and reports `[SILENT]`. That is byte-for-byte the same
+observable state as a cron that never fired, a pod that crash-looped, or a CronJob somebody
+suspended. Silence means "nothing to say" and "nothing said anything" at once, and only the first is
+good news.
+
+_Why it is accepted:_ every fix crosses a boundary this design deliberately holds. A heartbeat issue
+per stream reintroduces exactly the always-open, always-noisy artifact §1 exists to remove; a
+liveness check needs state outside GitHub, and §2's whole premise is that the branch name is the
+only join key; a metrics export needs a monitoring stack this repository does not own. _What it
+costs:_ a stream that stops running is invisible until somebody notices the absence, and nobody
+notices absence. _What would change it:_ the right home for this is CronJob-level alerting in the
+operator — `PlatformAgent` already reconciles the schedule and knows the expected cadence, so it can
+see a missed run without the audit publishing anything. Track it there, not here.
