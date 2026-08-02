@@ -1,0 +1,50 @@
+name: Python Unit Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, feat/platform-admin-cron-audits]
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    name: Python Unit Tests
+    runs-on: ubuntu-latest
+
+    env:
+      # platform_mcp_server writes its per-thread kubeconfigs under $HERMES_HOME,
+      # which defaults to the in-container path /opt/data. A runner cannot create
+      # that, so point it at the workspace instead.
+      HERMES_HOME: ${{ github.workspace }}/.hermes-home
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # The suite itself is stdlib unittest; these are only the third-party
+      # imports the modules under test pull in. The runtime image gets them
+      # transitively from hermes-agent (deploy/docker/Dockerfile), which is far
+      # too heavy to install for a unit-test run. mcp is held below 2.0 because
+      # agent_common_server imports mcp.server.fastmcp, which 2.x moved.
+      - name: Install the third-party imports the modules under test need
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install fastapi "mcp<2" python-dotenv pyyaml
+
+      # Two runs rather than one: unittest discovery only recurses into
+      # importable packages, and neither scripts directory is one, so a single
+      # run rooted above them finds zero tests. Each also has to be its own
+      # top-level dir — the tests import their subjects by bare module name.
+      - name: Platform Agent scripts
+        run: python3 -m unittest discover -s agents/platform/scripts -p 'test_*.py' -t agents/platform/scripts
+
+      - name: Fleet audit scripts
+        run: python3 -m unittest discover -s agents/platform/skills/fleet-audit/scripts -p 'test_*.py' -t agents/platform/skills/fleet-audit/scripts
