@@ -352,6 +352,18 @@ field, and publishes nothing:
 - `remediation.kind` is `manifest`, `gcloud`, or `manual`. `path` is required for `manifest`
   (repo-relative, no `..`, no absolute paths, no glob metacharacters) and forbidden for the other
   two. For `gcloud`, put the exact command in `note` — it is rendered as a runnable block.
+- **A `path` is discovered, never invented.** Editing an object means writing over its existing
+  declaration. Creating one means writing beside a sibling already applied to the same cluster and
+  namespace — grep the clone for `namespace: <namespace>`, then **open the hits and confirm one
+  declares an object you observed on the target cluster** before writing beside it. A `grep` for a
+  name is kind-blind and matches label lines and shared prefixes, so a hit is not a declaration
+  until you have read it. **The parent directory must already exist in the clone**; if no sibling
+  can be confirmed, or the hits straddle two directories you cannot tell apart, the finding is
+  `kind: manual` with no path. The harness cannot check this for
+  you: it validates the shape of a path, not whether anything reconciles it, and it will create
+  missing parents and commit the file happily. A manifest in a directory the deploying tool does not
+  apply merges clean, closes the finding for exactly one run, and changes nothing on the cluster —
+  then returns next run as `pr-merged-persists`, where neither documented explanation fits.
 
 ### Scope, skipped, and limitations
 
