@@ -4181,7 +4181,14 @@ def handle_start(args: argparse.Namespace) -> None:
                     "command you issued for it. A check you did not run is left "
                     "out and makes the run partial; naming one you did not run "
                     "is the single entry in the document that turns a partial "
-                    "audit into a false all-clear."
+                    "audit into a false all-clear. A check this cluster's shape "
+                    "rules out goes in the optional "
+                    "scope.clusters[].checks_not_applicable as {check, reason}, "
+                    "where the reason names the property of the cluster that "
+                    "forbids it — those leave the coverage denominator instead "
+                    "of counting as missing, and are published with their "
+                    "reasons. A check you could have run and did not is not one "
+                    "of those; it is a limitations note and a real gap."
                 ),
             }
         )

@@ -1666,6 +1666,13 @@ class TestStart(HarnessTestCase):
         # What must hold is that it states the shape and the consequence.
         self.assertIn("checks_run", contract)
         self.assertIn("command", contract)
+        # And that it names the other half of the coverage story. `start` is
+        # the only place the worker is told this before it writes the document;
+        # a contract that mentions only `checks_run` sends every inapplicable
+        # check into `limitations`, which is where the permanently-partial
+        # Autopilot fleet came from.
+        self.assertIn("checks_not_applicable", contract)
+        self.assertIn("reason", contract)
 
     def test_start_hands_over_the_roster(self):
         """Coverage must not depend on how far into the SOP the worker read.
