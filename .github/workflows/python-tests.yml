@@ -49,5 +49,8 @@ jobs:
       - name: Fleet audit scripts
         run: python3 -m unittest discover -s agents/platform/skills/fleet-audit/scripts -p 'test_*.py' -t agents/platform/skills/fleet-audit/scripts
 
+      - name: Chat Agent legacy_slash_commands plugin
+        run: python3 -m unittest discover -s agents/chat/defaults/plugins/legacy_slash_commands -p 'test_*.py' -t agents/chat/defaults/plugins/legacy_slash_commands
+
       - name: Image patches
         run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches

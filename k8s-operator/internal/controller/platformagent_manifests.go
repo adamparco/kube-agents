@@ -302,8 +302,12 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Web.Backend = "ddgs"
 	// Enable incident_context plugin by default to parse and rewrite GChat/Slack threaded incident replies.
 	// bootstrap_onboarding rides on the default profile because it hooks pre_llm_call on the first
-	// human turn — chat ingress lands here, not on the platform specialist.
-	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context", "bootstrap_onboarding"}
+	// human turn — chat ingress lands here, not on the platform specialist. legacy_slash_commands
+	// rides here for the same reason: it hooks pre_gateway_dispatch on inbound chat messages so a
+	// typed "/hermes sethome" reaches the gateway command dispatcher instead of drawing an
+	// unknown-command reply. Keep this list in sync with agents/chat/config.yaml — this copy is
+	// authoritative on the deployed default profile.
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context", "bootstrap_onboarding", "legacy_slash_commands"}
 	cfg.Display.Platforms = map[string]map[string]any{}
 	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
 	// multiuser_memory provider replaces it and keys each user's notes off the

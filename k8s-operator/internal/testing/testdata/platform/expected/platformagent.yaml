@@ -237,6 +237,7 @@ data:
       - tool_call_audit
       - incident_context
       - bootstrap_onboarding
+      - legacy_slash_commands
     terminal:
       backend: local
       cwd: /opt/data
