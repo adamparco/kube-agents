@@ -1262,6 +1262,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "resolved": 0,
                 "prs_opened": [],
                 "prs_closed": [],
+                "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
             },
@@ -1319,6 +1320,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "resolved": 1,
                 "prs_opened": [],
                 "prs_closed": [],
+                "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
             },
@@ -1541,6 +1543,7 @@ class TestFinishClean(HarnessTestCase):
                 "resolved": 2,
                 "prs_opened": [],
                 "prs_closed": [],
+                "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
             },
@@ -1571,6 +1574,7 @@ class TestFinishClean(HarnessTestCase):
                 "resolved": 0,
                 "prs_opened": [],
                 "prs_closed": [],
+                "silent_ok": True,
                 "partial": False,
                 "coverage_gaps": [],
             },
@@ -3976,7 +3980,7 @@ class TestCoverageGaps(unittest.TestCase):
         )
         self.assertEqual(len(gaps), 1)
         self.assertIn("prod-us-east", gaps[0])
-        self.assertIn("9 of 11 checks did not run", gaps[0])
+        self.assertIn("9 of 11 applicable checks did not run", gaps[0])
         self.assertIn("netpol-missing", gaps[0])
 
     def test_a_cluster_reports_one_gap_line_not_two(self):
@@ -3999,7 +4003,7 @@ class TestCoverageGaps(unittest.TestCase):
             )
         )
         self.assertEqual(len(gaps), 1)
-        self.assertIn("1 of 11 checks did not run", gaps[0])
+        self.assertIn("1 of 11 applicable checks did not run", gaps[0])
         self.assertIn("Autopilot", gaps[0])
 
 
@@ -5161,6 +5165,264 @@ class TestCredentialOrdering(HarnessTestCase):
         )
         self.assertLess(self.order.index("refresh"), 2)
         self.assertGreaterEqual(clone, 0)
+
+
+def na(check, reason="Autopilot — Google manages the node pools here."):
+    """One `checks_not_applicable` entry, long enough to satisfy the validator."""
+    return {"check": check, "reason": reason}
+
+
+class TestNotApplicableChecks(unittest.TestCase):
+    """A check that cannot apply is not a check nobody ran.
+
+    Before this distinction existed the two were one state. An Autopilot
+    cluster has no node pools, so the node-pool checks could never run against
+    it and it sat at `6/10 ⚠` on every run forever. Permanent partiality is not
+    a warning, it is a broken stream: `resolved` is pinned at 0, no stale
+    remediation pull request ever closes, and the ledger cannot retire however
+    healthy the fleet gets. Two of the three clusters on the fleet that
+    surfaced this were Autopilot.
+
+    The risk the tests below guard is the mirror image: `checks_not_applicable`
+    is the only field that can *shrink* the denominator, so it is the obvious
+    place to hide a check that simply was not performed.
+    """
+
+    def doc(self, na_entries, ran_checks=None, **kwargs):
+        roster = list(audit_report.audit_checks(AUDIT))
+        excused = {e["check"] for e in na_entries}
+        if ran_checks is None:
+            ran_checks = [c for c in roster if c not in excused]
+        cluster = {
+            "name": "prod-autopilot",
+            "location": "us-central1",
+            "project": "acme-prod",
+            "checks_run": [ran(c, "prod-autopilot") for c in ran_checks],
+            "checks_not_applicable": na_entries,
+        }
+        cluster.update(kwargs)
+        return make_doc(clusters=[cluster])
+
+    def test_an_inapplicable_check_is_not_a_coverage_gap(self):
+        doc = self.doc([na("privileged-container")])
+        audit_report.validate_findings(doc, AUDIT)
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+
+    def test_an_unrun_check_is_still_a_gap_beside_an_inapplicable_one(self):
+        """Excusing one check does not excuse the one next to it."""
+        roster = list(audit_report.audit_checks(AUDIT))
+        doc = self.doc(
+            [na(roster[0])],
+            ran_checks=[c for c in roster if c not in (roster[0], roster[1])],
+        )
+        audit_report.validate_findings(doc, AUDIT)
+        gaps = audit_report.coverage_gaps(doc)
+        self.assertEqual(len(gaps), 1)
+        self.assertIn(roster[1], gaps[0])
+        self.assertNotIn(roster[0], gaps[0])
+
+    def test_the_gap_line_counts_against_applicable_checks_only(self):
+        """"1 of 10 applicable" — not "2 of 11", which would double-count."""
+        roster = list(audit_report.audit_checks(AUDIT))
+        doc = self.doc(
+            [na(roster[0])],
+            ran_checks=[c for c in roster if c not in (roster[0], roster[1])],
+        )
+        gaps = audit_report.coverage_gaps(doc)
+        self.assertIn(f"1 of {len(roster) - 1} applicable checks did not run", gaps[0])
+
+    def test_a_fully_excused_and_fully_run_cluster_is_not_partial(self):
+        """The whole point: an Autopilot cluster can be complete."""
+        doc = self.doc([na(c) for c in list(audit_report.audit_checks(AUDIT))[:4]])
+        audit_report.validate_findings(doc, AUDIT)
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+
+    def test_a_limitations_note_still_goes_partial(self):
+        """`limitations` means impaired. Inapplicability has its own field now."""
+        doc = self.doc(
+            [na("privileged-container")],
+            limitations="Autopilot: node-level checks do not apply.",
+        )
+        gaps = audit_report.coverage_gaps(doc)
+        self.assertEqual(len(gaps), 1)
+
+    def test_a_check_cannot_be_both_run_and_inapplicable(self):
+        roster = list(audit_report.audit_checks(AUDIT))
+        doc = self.doc([na(roster[0])], ran_checks=roster)
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("also in this cluster's checks_run", str(ctx.exception))
+
+    def test_an_unknown_slug_is_rejected(self):
+        doc = self.doc([na("not-a-real-check")])
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("not a check in", str(ctx.exception))
+
+    def test_the_unknown_slug_rejection_does_not_print_the_roster(self):
+        """Same answer-key problem as `checks_run`, same rule."""
+        doc = self.doc([na("not-a-real-check")])
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.validate_findings(doc, AUDIT)
+        message = str(ctx.exception)
+        for check in audit_report.audit_checks(AUDIT):
+            self.assertNotIn(check, message)
+        self.assertIn(audit_report.audit_sop(AUDIT), message)
+
+    def test_a_duplicate_is_rejected(self):
+        doc = self.doc([na("privileged-container"), na("privileged-container")])
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("duplicate check", str(ctx.exception))
+
+    def test_an_abbreviation_is_not_a_reason(self):
+        for excuse in ("n/a", "N/A", "-", "skip", "not applicable"):
+            with self.subTest(excuse=excuse):
+                doc = self.doc([na("privileged-container", excuse)])
+                with self.assertRaises(audit_report.ValidationError) as ctx:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertIn("does not say why", str(ctx.exception))
+
+    def test_a_missing_reason_is_rejected(self):
+        doc = self.doc([{"check": "privileged-container"}])
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.validate_findings(doc, AUDIT)
+
+    def test_a_bare_slug_is_rejected(self):
+        doc = self.doc([])
+        doc["scope"]["clusters"][0]["checks_not_applicable"] = ["privileged-container"]
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("expected an object", str(ctx.exception))
+
+    def test_the_field_is_optional(self):
+        doc = make_doc()
+        doc["scope"]["clusters"][0].pop("checks_not_applicable", None)
+        audit_report.validate_findings(doc, AUDIT)
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+
+    def test_the_scope_table_shows_the_denominator_and_the_na_count(self):
+        roster = list(audit_report.audit_checks(AUDIT))
+        doc = self.doc([na(roster[0]), na(roster[1])])
+        body = render_body(doc, generated_at=NOW)
+        self.assertIn(f"| {len(roster) - 2}/{len(roster) - 2} (2 n/a) |", body)
+        self.assertNotIn("⚠", body.split("## Findings")[0])
+
+    def test_the_reason_is_published_where_a_reader_can_judge_it(self):
+        doc = self.doc([na("privileged-container", "Autopilot blocks privileged pods.")])
+        body = render_body(doc, generated_at=NOW)
+        self.assertIn("Not applicable (1)", body)
+        self.assertIn("Autopilot blocks privileged pods.", body)
+
+    def test_no_na_section_when_nothing_is_excused(self):
+        body = render_body(make_doc(), generated_at=NOW)
+        self.assertNotIn("Not applicable", body)
+
+
+class TestSilentVerdict(HarnessTestCase):
+    """`silent_ok` is computed, not re-derived by the model.
+
+    The rule used to be four clauses of prose evaluated against the model's own
+    reading of this JSON. On 2026-08-03 a run with `partial: true` evaluated it
+    to `[SILENT]`, suppressed its own delivery, and the operator who had asked
+    for the run got a kanban summary that named no issue. The harness holds
+    every input; it should hold the verdict.
+    """
+
+    def finish_json(self, doc, **replies):
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": render_body(doc, generated_at=NOW)}),
+            **replies,
+        }
+        self.run_finish(doc)
+        return self.stdout_json()
+
+    def test_an_unchanged_complete_clean_run_is_silent(self):
+        doc = make_doc(findings=[])
+        out = self.finish_json(doc)
+        self.assertTrue(out["silent_ok"])
+
+    def test_a_partial_run_is_never_silent(self):
+        """The exact shape that went silent on 2026-08-03."""
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {
+                    "name": "prod-autopilot",
+                    "location": "us-central1",
+                    "project": "acme-prod",
+                    "checks_run": ["privileged-container"],
+                }
+            ],
+        )
+        out = self.finish_json(doc)
+        self.assertTrue(out["partial"])
+        self.assertFalse(out["silent_ok"])
+
+    def test_new_findings_are_never_silent(self):
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps(
+                {"body": render_body(make_doc(findings=[]), generated_at=NOW)}
+            ),
+        }
+        self.run_finish(make_doc(findings=[make_finding(fid="a")]))
+        out = self.stdout_json()
+        self.assertEqual(out["new"], 1)
+        self.assertFalse(out["silent_ok"])
+
+    def test_the_verdict_agrees_with_the_fields_beside_it(self):
+        """Whatever else changes, `silent_ok` stays a function of the JSON."""
+        for findings in ([], [make_finding(fid="a")]):
+            with self.subTest(findings=len(findings)):
+                out = self.finish_json(make_doc(findings=findings))
+                self.assertEqual(
+                    out["silent_ok"],
+                    not (
+                        out["new"]
+                        or out["resolved"]
+                        or out["partial"]
+                        or out["prs_opened"]
+                        or out["prs_closed"]
+                    ),
+                )
+
+
+class TestDispatchAndHandover(unittest.TestCase):
+    """The ledger URL has to survive the hop from worker to requester.
+
+    A dispatched run's transcript goes to a log file nothing downstream reads.
+    What the requester sees is the kanban card, so the URL has to be on the
+    card — and on 2026-08-03 it was not: the card's summary said "the existing
+    ledger issue" with no number, and that sentence was the Slack message.
+    """
+
+    def read(self, relative):
+        agent_dir = Path(__file__).resolve().parents[4] / "platform"
+        path = agent_dir / relative
+        if not path.is_file():
+            self.skipTest(f"{relative} not present")
+        return path.read_text(encoding="utf-8")
+
+    def test_the_dispatch_rule_requires_reporting_the_result(self):
+        text = self.read("AGENTS.md")
+        bullet = next(
+            line for line in text.splitlines() if "cronjob(action='run'" in line
+        )
+        self.assertIn("kanban_complete", bullet)
+        self.assertIn("[SILENT]", bullet)
+
+    def test_the_worker_protocol_requires_the_url_in_the_summary(self):
+        section = self.read("SOUL.md").split("## 1.")[0]
+        self.assertIn("URL", section)
+
+    def test_every_sop_says_an_on_demand_run_is_never_silent(self):
+        for audit_id in audit_report.AUDITS:
+            with self.subTest(audit=audit_id):
+                text = self.read(f"governance/{audit_report.audit_sop(audit_id)}")
+                self.assertIn("silent_ok", text)
+                self.assertIn("on-demand", text.lower())
 
 
 if __name__ == "__main__":

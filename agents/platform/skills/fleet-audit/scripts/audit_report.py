@@ -576,6 +576,33 @@ def checks_ran(cluster: object) -> list[str]:
     return out
 
 
+def checks_na(cluster: object) -> list[str]:
+    """The check slugs a `scope.clusters` entry declares inapplicable.
+
+    A check that *cannot* apply to a cluster is not a check that failed to run,
+    and the difference decides whether the stream can ever close. Node-pool
+    checks against an Autopilot cluster are the standing example: Google owns
+    the node pools, so there is nothing there to inspect and never will be.
+    Counted as gaps they made every Autopilot cluster permanently `⚠`, which
+    pinned `resolved` at 0, stopped every stale remediation pull request from
+    closing, and left a ledger that could not retire no matter how healthy the
+    fleet got.
+
+    Tolerant of a half-built document for the same reason as `checks_ran`: the
+    renderers run on dry-run data that has not been through validation.
+    """
+    out: list[str] = []
+    entries = (
+        (cluster.get("checks_not_applicable") or []) if isinstance(cluster, dict) else []
+    )
+    for entry in entries:
+        if isinstance(entry, dict):
+            slug = str(entry.get("check", "")).strip()
+            if slug:
+                out.append(slug)
+    return out
+
+
 def findings_path_for(audit_id: str) -> str:
     return f"{SCRATCH_DIR}/findings_{audit_id}.json"
 
@@ -697,6 +724,37 @@ def validate_check_command(value: object, where: str, check: str) -> str:
             "the cloud API. A check is only 'run' if something was queried."
         )
     return command
+
+
+# Long enough that "n/a", "N/A", "-" and "skip" cannot satisfy it. Declaring a
+# check inapplicable removes it from the denominator, so it is the one field in
+# the document that can *shrink* the fleet the run is measured against — it has
+# to cost a sentence.
+MIN_NA_REASON_CHARS = 16
+
+
+def validate_na_reason(value: object, where: str, check: str) -> str:
+    """Why a check cannot apply to a cluster, as opposed to did not run there.
+
+    `checks_not_applicable` is the only way to leave a check out of a cluster
+    without going partial, so it is also the obvious way to launder a check that
+    simply was not performed. Two things make that harder: the reason must be a
+    real sentence, and it is published in the ledger next to the check it
+    excuses, where the same reader who can re-run a command can read "Autopilot
+    — Google manages node pools" and judge it.
+    """
+    reason = _require_str(value, where, allow_empty=False)
+    text = reason.strip()
+    if len(text) < MIN_NA_REASON_CHARS:
+        raise ValidationError(
+            f"{where}: {text!r} does not say why check {check!r} cannot apply "
+            "here. A check left out of the denominator needs a reason a reader "
+            "can judge — what about this cluster makes the check meaningless "
+            "(managed node pools, no such resource kind, feature not enabled) — "
+            "not an abbreviation. A check that simply did not run belongs "
+            "nowhere in this list: leave it out and let the run go partial."
+        )
+    return reason
 
 
 def _require_repo_relative(path: str, where: str) -> str:
@@ -871,8 +929,10 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "claims the cluster was read and nothing was checked on it. That is "
                 "an audit that did not run, not a clean cluster. Name the checks you "
                 "ran, or — if nothing could run there — say why in that cluster's "
-                "limitations, or move it to scope.skipped with a reason. "
-                f"{_sop_pointer(audit_id)}"
+                "limitations, or move it to scope.skipped with a reason. A check "
+                "that cannot apply to this cluster goes in checks_not_applicable "
+                f"with its reason, but a cluster where nothing applies still owes "
+                f"a limitations note. {_sop_pointer(audit_id)}"
             )
         seen_checks: set[str] = set()
         for j, entry in enumerate(checks_run):
@@ -903,6 +963,52 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 raise ValidationError(f"{where}.check: duplicate check {name!r}")
             seen_checks.add(name)
             validate_check_command(entry.get("command"), f"{where}.command", name)
+
+        # Checks that cannot apply here, each with the reason it cannot. These
+        # come *out* of the denominator rather than counting against coverage:
+        # an Autopilot cluster has no node pools to inspect, so a node-pool
+        # check that "did not run" there did not fail to run — there was
+        # nothing to run it against. Treating the two as one thing is what left
+        # every Autopilot cluster at `6/10 ⚠` forever, and a permanently
+        # partial stream can never close its ledger, never report a finding as
+        # resolved, and never close a stale remediation pull request.
+        na_entries = cluster.get("checks_not_applicable")
+        if na_entries is not None:
+            if not isinstance(na_entries, list):
+                raise ValidationError(
+                    f"scope.clusters[{i}].checks_not_applicable: must be a list of "
+                    "{check, reason} objects, or omitted when every check applies"
+                )
+            seen_na: set[str] = set()
+            for j, entry in enumerate(na_entries):
+                where = f"scope.clusters[{i}].checks_not_applicable[{j}]"
+                if not isinstance(entry, dict):
+                    raise ValidationError(
+                        f"{where}: expected an object with 'check' and 'reason'"
+                    )
+                _require_str(entry.get("check"), f"{where}.check", allow_empty=False)
+                name = str(entry["check"])
+                if name not in roster_set:
+                    # No roster here either, for the reason given above: this
+                    # rejection is reachable from an empty document too, and an
+                    # error that enumerates the valid slugs is an answer key
+                    # whichever field asked for it.
+                    raise ValidationError(
+                        f"{where}.check: {name!r} is not a check in the {audit_id} "
+                        "SOP, so it cannot be inapplicable to anything. Name checks "
+                        "by the backticked slug in their `####` heading. "
+                        f"{_sop_pointer(audit_id)}"
+                    )
+                if name in seen_checks:
+                    raise ValidationError(
+                        f"{where}.check: {name!r} is also in this cluster's "
+                        "checks_run. A check either ran or could not apply — "
+                        "claiming both makes the coverage count meaningless."
+                    )
+                if name in seen_na:
+                    raise ValidationError(f"{where}.check: duplicate check {name!r}")
+                seen_na.add(name)
+                validate_na_reason(entry.get("reason"), f"{where}.reason", name)
 
     skipped = scope.get("skipped", [])
     if not isinstance(skipped, list):
@@ -1093,6 +1199,11 @@ def coverage_gaps(data: dict) -> list[str]:
     evaluates two of eleven checks and writes no `limitations` reads exactly like
     a complete run; measured against the SOP's own roster it reads as what it is,
     and the ledger stays open naming the nine checks nobody performed.
+
+    A check the cluster declared inapplicable is not measured at all — it leaves
+    the roster for that cluster rather than counting as unread. Without that,
+    "this check cannot exist here" and "nobody looked" were the same state, and
+    two Autopilot clusters were enough to keep a stream partial in perpetuity.
     """
     scope = data.get("scope") or {}
     roster = audit_checks(str(data.get("audit") or ""))
@@ -1103,7 +1214,9 @@ def coverage_gaps(data: dict) -> list[str]:
     for cluster in scope.get("clusters") or []:
         limitation = str(cluster.get("limitations", "")).strip()
         ran = set(checks_ran(cluster))
-        missing = [check for check in roster if check not in ran]
+        na = set(checks_na(cluster))
+        applicable = [check for check in roster if check not in na]
+        missing = [check for check in applicable if check not in ran]
         if not limitation and not missing:
             continue
         name = str(cluster.get("name", "")).strip() or "(unnamed)"
@@ -1112,7 +1225,7 @@ def coverage_gaps(data: dict) -> list[str]:
         reasons: list[str] = []
         if missing:
             reasons.append(
-                f"{len(missing)} of {len(roster)} checks did not run "
+                f"{len(missing)} of {len(applicable)} applicable checks did not run "
                 f"({', '.join(missing)})"
             )
         if limitation:
@@ -2284,9 +2397,16 @@ def _render_scope(
         )
         if roster:
             ran = set(checks_ran(cluster))
+            na = set(checks_na(cluster)) & set(roster)
+            # The denominator is what *could* have run here, so the ⚠ means
+            # "unread", not "inapplicable". The n/a count stays visible beside
+            # it: a cluster excusing itself from half the roster is something a
+            # reader should see, even when its coverage is technically complete.
+            applicable = len(roster) - len(na)
             complete = len(ran & set(roster))
-            flag = "" if complete == len(roster) else " ⚠"
-            row += f"| {complete}/{len(roster)}{flag} "
+            flag = "" if complete >= applicable else " ⚠"
+            note = f" ({len(na)} n/a)" if na else ""
+            row += f"| {complete}/{applicable}{note}{flag} "
         if show_limitations:
             row += f"| {_cell(cluster.get('limitations', '')) or '—'} "
         out.append(row + "|")
@@ -2488,6 +2608,7 @@ def _render_check_evidence(
     if not audit_checks(audit_id):
         return []
     rows: list[tuple[str, str, str]] = []
+    na_rows: list[tuple[str, str, str]] = []
     for cluster in clusters:
         name = str(cluster.get("name", "")).strip() or "(unnamed)"
         for entry in cluster.get("checks_run") or []:
@@ -2497,7 +2618,14 @@ def _render_check_evidence(
             command = str(entry.get("command", "")).strip()
             if check and command:
                 rows.append((name, check, command))
-    if not rows:
+        for entry in cluster.get("checks_not_applicable") or []:
+            if not isinstance(entry, dict):
+                continue
+            check = str(entry.get("check", "")).strip()
+            reason = str(entry.get("reason", "")).strip()
+            if check and reason:
+                na_rows.append((name, check, reason))
+    if not rows and not na_rows:
         return []
 
     out = [
@@ -2514,6 +2642,23 @@ def _render_check_evidence(
     ]
     for name, check, command in rows:
         out.append(f"| `{_cell(name)}` | `{_cell(check)}` | `{_cell(command)}` |")
+    if na_rows:
+        # Published for the same reason the commands are. A check declared
+        # inapplicable leaves the coverage denominator, so this is the one claim
+        # in the document that can make a partial run look complete — it belongs
+        # where a reader can weigh the excuse against the cluster.
+        out += [
+            "",
+            f"**Not applicable ({len(na_rows)})** — checks excluded from the "
+            "coverage count above, and why. These did not run because there was "
+            "nothing to run them against; a check that could have run and did "
+            "not is a gap, and is reported as one.",
+            "",
+            "| Cluster | Check | Why it cannot apply |",
+            "| ------- | ----- | ------------------- |",
+        ]
+        for name, check, reason in na_rows:
+            out.append(f"| `{_cell(name)}` | `{_cell(check)}` | {_cell(reason)} |")
     out.append("")
     out.append("</details>")
     return out if len("\n".join(out)) <= budget else []
@@ -4563,15 +4708,22 @@ def handle_finish(args: argparse.Namespace) -> None:
             )
         else:
             log(f"Audit {audit_id} is clean and has no open ledger; nothing to do.")
+        clean_resolved = 0 if gaps else len(previous_ids)
         print(
             json.dumps(
                 {
                     "status": "CLEAN",
                     "issue_url": existing_url,
                     "new": 0,
-                    "resolved": 0 if gaps else len(previous_ids),
+                    "resolved": clean_resolved,
                     "prs_opened": [],
                     "prs_closed": prs_closed,
+                    # Same rule as the findings branch below — see the long note
+                    # there. A clean run is the *usual* silent one, but not
+                    # unconditionally: `resolved > 0` is the fleet getting
+                    # better and is the best news this audit ever delivers, and
+                    # a gap means it could not look rather than found nothing.
+                    "silent_ok": not (clean_resolved or gaps or prs_closed),
                     "partial": bool(gaps),
                     "coverage_gaps": gaps,
                 }
@@ -4793,17 +4945,43 @@ def handle_finish(args: argparse.Namespace) -> None:
             else:
                 log("No new or resolved findings; body refreshed without a comment.")
 
+    reported_new = len(new_ids) if delta_known else 0
+    reported_resolved = 0 if (gaps or not delta_known) else len(resolved_ids)
     print(
         json.dumps(
             {
                 "status": status,
                 "issue_url": issue_url,
-                "new": len(new_ids) if delta_known else 0,
-                "resolved": (
-                    0 if (gaps or not delta_known) else len(resolved_ids)
-                ),
+                "new": reported_new,
+                "resolved": reported_resolved,
                 "prs_opened": prs_opened,
                 "prs_closed": prs_closed,
+                # The `[SILENT]` verdict, computed rather than re-derived.
+                #
+                # The rule was four clauses of prose the model had to evaluate
+                # against its own reading of this JSON, and on 2026-08-03 a run
+                # with `partial: true` evaluated it to `[SILENT]` and suppressed
+                # its own delivery — the ledger had been rewritten, two clusters
+                # were short of coverage, and the operator who asked for the run
+                # got a summary with no issue in it. The harness already holds
+                # all four numbers; asking the model to recombine them was
+                # asking it to reproduce a computation for no benefit.
+                #
+                # A run that opened or closed a pull request is never silent
+                # either, even at `new == 0`: a `/remediate` answered on an
+                # otherwise-unchanged ledger moves something a human asked for.
+                #
+                # This is the *scheduled* verdict. An operator who asked for a
+                # run off-schedule is waiting for an answer, and gets one
+                # regardless of what this says — see the dispatch rule in the
+                # Platform Agent's AGENTS.md.
+                "silent_ok": not (
+                    reported_new
+                    or reported_resolved
+                    or gaps
+                    or prs_opened
+                    or prs_closed
+                ),
                 # Coverage, and only coverage: `partial` is true iff
                 # `coverage_gaps` is non-empty, on this branch and on the CLEAN
                 # one alike. It used to also be set by `rendered.partial` —

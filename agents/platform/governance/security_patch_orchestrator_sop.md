@@ -38,14 +38,54 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
 
    `check` is the backticked slug from the §3 heading that defines it — `master-behind`, `no-maintenance-window`, and so on — never the section number and never prose. (`start` prints the full roster of ten; the SOP still says what each check _is_.) `command` is the literal invocation you issued on that cluster for that check, with its `--location`/`--project` or `--context`. It must name one of `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`; `echo`, `cat`, `python3 -c`, and a call back into `audit_report.py` are all rejected.
 
-   The validator rejects an unknown slug, a duplicate, a missing or unusable command, the field being absent, and an empty list unless that cluster's `limitations` says why nothing ran: a cluster you could read but ran nothing against is not a clean cluster, it is an audit that did not happen. Anything short of all ten makes the run **partial** exactly as a `limitations` note does, so the ledger stays open and nothing is announced as resolved. Append the entry when its check completes, not when you intend to run it, and paste the command rather than reconstructing it — every one is published verbatim in the ledger under _How this run checked the fleet_.
+   The validator rejects an unknown slug, a duplicate, a missing or unusable command, the field being absent, and an empty list unless that cluster's `limitations` says why nothing ran: a cluster you could read but ran nothing against is not a clean cluster, it is an audit that did not happen. Anything short of the checks that apply to that cluster makes the run **partial** exactly as a `limitations` note does, so the ledger stays open and nothing is announced as resolved. Append the entry when its check completes, not when you intend to run it, and paste the command rather than reconstructing it — every one is published verbatim in the ledger under _How this run checked the fleet_.
+
+   **A check the cluster's shape rules out is not a gap — declare it.** Alongside `checks_run`, a cluster may carry `checks_not_applicable` as a list of `{check, reason}`:
+
+   ```json
+   {
+     "check": "pool-skew",
+     "reason": "GKE Autopilot: Google manages the node pools, there are none to skew."
+   }
+   ```
+
+   Same slugs as `checks_run`, and the `reason` must say why the check _cannot_ apply here — "N/A" and "not applicable" are rejected; name the property of the cluster that rules it out. Those checks leave the denominator instead of counting as missing, so an Autopilot cluster reads as complete at six of six rather than forever-incomplete at six of ten. This matters more here than anywhere: on a fleet that is mostly Autopilot, without it every run is partial forever, `resolved` is pinned at `0`, the ledger can never close, and no stale remediation PR is ever cleaned up. Use it only for checks the cluster's shape rules out. A check you could have run and did not is a `limitations` note and a real gap, and the validator rejects a slug in both lists, a duplicate, an unknown slug, and a reason under sixteen characters.
 
 4. **One question decides the scope list.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; if some checks did not run there, name them in that cluster's `limitations`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator rejects a document whose two lists overlap, and any finding whose `cluster` names a `scope.skipped` entry.
 5. Record every cluster you could **not** read in `scope.skipped` with a specific reason. Skip, do not flag:
    - `status` is `PROVISIONING`, `STOPPING`, or `ERROR` — the object is mid-flight or broken; version data is meaningless.
    - `enableKubernetesAlpha: true` — alpha clusters cannot be upgraded and auto-expire by design.
    - A project that errors on list (permission, API disabled). Record it as `{"cluster": "<project>/*", "reason": "…"}`.
-6. Record every cluster you **could** read but could not fully check in `scope.clusters`, with the gap in its `limitations`. Autopilot (`autopilot.enabled: true`) is the standard case and is **never** skipped: Google manages those node pools, so record `{"name": "<name>", "location": "<loc>", "project": "<p>", "limitations": "Autopilot — node-pool checks 3.2/3.5/3.6/3.9 not applicable; cluster-scoped checks executed"}` and still run 3.1, 3.3, 3.4, 3.7, 3.8, 3.10. Skipping it would suppress every cluster-scoped finding you did prove there.
+6. Record every cluster you **could** read but could not fully check in `scope.clusters`, with the gap in its `limitations`. Autopilot (`autopilot.enabled: true`) is the standard case and is **never** skipped: Google manages those node pools, so run 3.1, 3.3, 3.4, 3.7, 3.8, 3.10 there and declare the four node-pool checks inapplicable rather than missing —
+
+   ```json
+   {
+     "name": "<name>",
+     "location": "<loc>",
+     "project": "<p>",
+     "checks_run": [{ "check": "master-behind", "command": "…" }],
+     "checks_not_applicable": [
+       {
+         "check": "pool-skew",
+         "reason": "GKE Autopilot: Google manages the node pools; no user-managed pool to skew."
+       },
+       {
+         "check": "no-autoupgrade",
+         "reason": "GKE Autopilot: node auto-upgrade is enforced by Google and not configurable."
+       },
+       {
+         "check": "no-autorepair",
+         "reason": "GKE Autopilot: node auto-repair is enforced by Google and not configurable."
+       },
+       {
+         "check": "stale-image-type",
+         "reason": "GKE Autopilot: Google selects the node image; the operator cannot choose one."
+       }
+     ]
+   }
+   ```
+
+   — which leaves the cluster fully covered at six of six instead of dragging every run into partial coverage. Do not also name those four in `limitations`; that is the field for a check that could have run here and did not. Skipping the cluster outright would suppress every cluster-scoped finding you did prove there.
 
 ### 2. Establish the version baseline
 
@@ -184,7 +224,7 @@ For `kind: manifest`, **edit the Config Connector declaration the grep above fou
 
 Write the document to the `findings_path` from step 0 with `audit: "security-patch-orchestrator"` (it must match `--audit` exactly), the populated `scope.clusters`/`scope.skipped`, and the findings array — `[]` for a clean audit. Every finding needs a non-empty `id`, `severity`, `title`, `cluster`, `object`, `impact`, `evidence.command`, `recommendation`, and `remediation.kind`; `namespace` is `""` here. Before writing, self-check: ids unique within the file and free of versions or dates; every `evidence.command` a literal command you actually ran; `remediation.path` set for and only for `kind: "manifest"`, and present on disk; `scope.clusters` non-empty, every entry carrying a `checks_run` list of `{check, command}` objects naming the §3 checks that actually ran on that cluster and the commands that ran them — never the full ten because the SOP lists ten — every entry's `limitations` non-empty where present, and every `scope.skipped` entry carrying both `cluster` and `reason`, with the two lists disjoint and no finding naming a skipped cluster. A schema violation publishes nothing — `finish` exits 2 and the ledger is untouched — so validate here rather than discover it there.
 
-Read your `checks_run` lists once more before you write. Padding one to ten because §3 lists ten checks is the one entry in this document that converts a partial audit back into a false all-clear — the harness cannot see the check you skipped, so it takes the list at its word. The `command` on each entry is what makes that padding falsifiable rather than free: it is published verbatim, so an invented command is a false statement in a public issue. An honest eight-of-ten costs you nothing but an open ledger.
+Read your `checks_run` lists once more before you write. Padding one to ten because §3 lists ten checks is the one entry in this document that converts a partial audit back into a false all-clear — the harness cannot see the check you skipped, so it takes the list at its word. The `command` on each entry is what makes that padding falsifiable rather than free: it is published verbatim, so an invented command is a false statement in a public issue. `checks_not_applicable` is the same lie wearing a different field: it removes checks from the denominator, so a slug parked there because you ran out of turns is a coverage gap the ledger will never show. It is published too — every exclusion and its reason render under _Not applicable_, where a reviewer who knows the cluster can call it. An honest six-of-ten costs you nothing but an open ledger, and an honest six-of-six on an Autopilot cluster closes it.
 
 **`recommendation` is required on every finding.** Three sub-fields, all non-empty strings, no exceptions. Almost nothing in this audit is promotable, and that is precisely why: a `gcloud` finding a human runs by hand needs the argument for the fix more than a mergeable diff does, and the reasoning is only cheap while the evidence is in front of you.
 
@@ -211,14 +251,20 @@ Worked example, for a 3.5 finding on node pool `batch-a`:
   --findings-file /opt/data/scratch/findings_security-patch-orchestrator.json
 ```
 
-One JSON line comes back with `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, and `coverage_gaps`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
+One JSON line comes back with `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
 
-**`partial` is the coverage flag.** It is `true` when any cluster landed in `scope.skipped` or any audited cluster carries a `limitations` note, and `coverage_gaps` lists those gaps as readable sentences. An upgrade audit that could not reach a cluster has no idea whether that cluster's node pools are still behind, so the harness will not let the run act as if it does: `resolved` is forced to `0` with no resolved-delta posted, no remediation PR is closed as stale, and even a findings-free run keeps the ledger open — `status: "CLEAN"`, but the issue stays and gains a comment naming the gaps. It is a coverage flag and nothing more: `true` if and only if `coverage_gaps` is non-empty. The step 5 size budget does not raise it, because a description that could not carry every finding still counted them all in the title and names in the body what it dropped.
+**`partial` is the coverage flag.** It is `true` when any cluster landed in `scope.skipped` or any audited cluster carries a `limitations` note, and `coverage_gaps` lists those gaps as readable sentences. An upgrade audit that could not reach a cluster has no idea whether that cluster's node pools are still behind, so the harness will not let the run act as if it does: `resolved` is forced to `0` with no resolved-delta posted, no remediation PR is closed as stale, and even a findings-free run keeps the ledger open — `status: "CLEAN"`, but the issue stays and gains a comment naming the gaps. A check declared in `checks_not_applicable` is not a gap and does not raise the flag: it left the denominator, so an Autopilot cluster that ran everything that _can_ apply to it is a fully covered cluster. It is a coverage flag and nothing more: `true` if and only if `coverage_gaps` is non-empty. The step 5 size budget does not raise it, because a description that could not carry every finding still counted them all in the title and names in the body what it dropped.
 
-- `status: "CLEAN"` with `resolved: 0` **and** `partial: false` → the helper comments, closes the ledger issue **as completed**, and closes every open remediation PR for this stream; your final response is **exactly** `[SILENT]`. Nothing else, no preamble.
+**`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
+
+- On a **scheduled** run, `silent_ok: true` → your final response is **exactly** `[SILENT]`. Otherwise report, and every report carries `issue_url` in full.
+- **An on-demand run is never silent.** If a person dispatched this job — from a kanban card, from chat, from `cronjob(action='run')` — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
+
+What to report in each case:
+
+- `silent_ok: true` → `[SILENT]` on a scheduled run, nothing else and no preamble. On `CLEAN` the helper commented, closed the ledger issue **as completed**, and closed every open remediation PR for this stream; on `UPDATED` the ledger was rewritten but nothing moved. Dispatched on demand, say which of those happened in one line and give the issue URL.
 - `status: "CLEAN"` with `resolved: > 0` → the fleet is fully patched and no longer behind its channel. Report the issue URL and how many findings closed with it. On a patch audit this is the sentence someone has been waiting for, and silence would bury it.
-- `status: "CLEAN"` with `partial: true` → nothing reproduced, but the ledger and its PRs stay open on incomplete coverage. This is **not** silent: one line reporting the clean result and the `coverage_gaps`, then the issue URL.
-- `status: "UPDATED"` with `new: 0` **and** `resolved: 0` **and** `partial: false` → the ledger was rewritten but nothing moved. Also **exactly** `[SILENT]`. Any one of the three failing means you report.
+- `status: "CLEAN"` with `partial: true` → nothing reproduced, but the ledger and its PRs stay open on incomplete coverage. One line reporting the clean result and the `coverage_gaps`, then the issue URL.
 - Any other outcome → one line, then the issue URL. For example: `Upgrade & patch readiness: 3 new findings (1 critical), 2 resolved, across 11 clusters — <issue_url>`. Name any remediation PRs opened or closed in the same line.
 
 ## Red Lines

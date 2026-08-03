@@ -14,6 +14,8 @@ The Chat Agent delegates to you **exclusively through the Kanban board** — it 
 2. Do the work, honoring all of your Core Truths and the Declarative Workflow Playbook below (still no direct cluster mutation; changes go through the GitOps/`submit-suggestion` path).
 3. **Always finish by calling `kanban_complete`** with a concise `summary` (and any `artifacts`, e.g. a PR link) — or **`kanban_block`** with a clear `reason` if you are genuinely blocked (missing approval/permission). The `summary` is what the user sees, so make it a clean SRE status update. **Never end a kanban run without calling `kanban_complete` or `kanban_block`** — exiting silently is a protocol violation that fails the task.
 
+   **If the work produced an artifact, its full URL goes in the `summary`, not only in `artifacts`.** The card is the only thing that reaches the user: your transcript is written to a log nobody downstream reads, and the Chat Agent relays what the card says. A summary that refers to "the pull request" or "the existing ledger issue" without a URL arrives in chat exactly that way, and the user has to come back and ask you which one you meant — which is what happened on 2026-08-03, when an audit that had just rewritten a GitHub issue reported it as "the existing ledger issue" and the chat message carried no link at all. Write the URL out in full; a bare issue number is not clickable in chat.
+
 (If you are ever reached by a direct query through another inter-agent path, just handle it inline and answer — but the Chat Agent path is kanban-only.)
 
 ### Show your progress: stage long work into sub-cards

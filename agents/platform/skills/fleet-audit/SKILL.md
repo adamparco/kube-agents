@@ -149,14 +149,14 @@ about is not covered by that guarantee.
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line with eight fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
-`partial`, and `coverage_gaps`:
+JSON line with nine fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
+`partial`, `coverage_gaps`, and `silent_ok`:
 
-- `{"status":"OPENED","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[]}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
   — the stream had no open ledger.
-- `{"status":"UPDATED","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[]}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
   — the existing ledger was rewritten.
-- `{"status":"CLEAN","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
@@ -175,8 +175,14 @@ JSON, or `--audit` is not one of the five ids above. Exit 1 is fatal and means s
 
 `partial` is `true` exactly when the run could not speak for the whole fleet: any entry in
 `scope.skipped`, any cluster carrying a `limitations` note, or any cluster whose `checks_run` is
-short of its SOP's roster. `coverage_gaps` says which, and why — so `partial` is `true` if and only
-if `coverage_gaps` is non-empty, and you can report from either.
+short of the checks that _apply_ to it. `coverage_gaps` says which, and why — so `partial` is `true`
+if and only if `coverage_gaps` is non-empty, and you can report from either.
+
+A check the cluster's shape rules out is not a gap. Declaring it in that cluster's
+`checks_not_applicable` (below) takes it out of the denominator, so a cluster that ran everything
+that _can_ apply to it is a fully covered cluster. Without that, a fleet of Autopilot clusters is
+permanently partial: the ledger never closes, `resolved` is pinned at `0`, and no stale remediation
+pull request is ever cleaned up.
 
 It does not mean "the description was truncated." A ledger too long for GitHub's body limit says so
 in its own body and still carries true totals in its title; the audit saw everything, so nothing
@@ -191,7 +197,8 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
   stays open and gains a comment naming the gaps. The stream self-heals the day the fleet is fully
   readable again.
 
-A partial run is never `[SILENT]`. Report the issue URL and say which clusters were not covered.
+A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it. Report the issue URL
+and say which clusters were not covered. See [The clean run](#the-clean-run) for the full rule.
 
 ## The findings document
 
@@ -233,7 +240,17 @@ A partial run is never `[SILENT]`. Report the issue URL and say which clusters w
             "command": "gcloud container clusters describe prod-autopilot --location us-central1 --project acme-prod --format='value(workloadIdentityConfig.workloadPool)'"
           }
         ],
-        "limitations": "Autopilot: node-level checks 2.1-2.3 and 2.9 do not apply."
+        "checks_not_applicable": [
+          {
+            "check": "legacy-metadata",
+            "reason": "GKE Autopilot: no user-managed node pools to carry a metadata setting."
+          },
+          {
+            "check": "hostpath-mount",
+            "reason": "GKE Autopilot: hostPath volumes are rejected by the admission webhook."
+          }
+        ],
+        "limitations": "RBAC denied `list clusterrolebindings`; check 2.4 did not run."
       }
     ],
     "skipped": [{ "cluster": "dr-west", "reason": "control plane unreachable" }]
@@ -288,6 +305,21 @@ field, and publishes nothing:
   not happen, and without this field the harness cannot tell the two apart. See
   [Scope, skipped, and limitations](#scope-skipped-and-limitations).
 
+- `checks_not_applicable` is **optional**, and says which checks the cluster's shape rules out.
+  Each entry is an object with two required fields:
+  - **`check`** — the same slugs `checks_run` uses. An unknown slug, a duplicate, or a slug that
+    also appears in this cluster's `checks_run` is rejected: a check either ran or could not.
+  - **`reason`** — why the check _cannot_ apply here, naming the property of the cluster that rules
+    it out ("GKE Autopilot: no user-managed node pools to carry a metadata setting"). Anything
+    under sixteen characters is rejected, which is enough to stop "N/A" and "n/a — autopilot".
+
+  These checks leave the coverage denominator instead of counting as missing, so a cluster that ran
+  everything that _can_ apply to it is fully covered. That is the difference between a fleet whose
+  ledger can close and one that is permanently partial. Use it only for a check the cluster's shape
+  forbids — a check you could have run and did not is a `limitations` note and a real gap. Every
+  entry is published in the ledger under _Not applicable_, with its reason, where a reviewer who
+  knows the cluster can call an excuse for what it is.
+
 - `id` is a stable slug, unique within the file, matching `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with
   no `..` run and no `.lock` suffix. Two rules ride on this. **Stability is what makes the delta
   work**: the same underlying problem must produce the same id on every run, or it will churn as
@@ -309,8 +341,9 @@ field, and publishes nothing:
 
 **A cluster appears in exactly one scope list.** Ask one question:
 
-> Could you read it? **Yes** → `scope.clusters`; if some checks did not run or do not apply there,
-> name them in that cluster's `limitations`. **No** → `scope.skipped`, with a reason.
+> Could you read it? **Yes** → `scope.clusters`; name any check that did not run there in that
+> cluster's `limitations`, and any check that _cannot_ run there in its `checks_not_applicable`.
+> **No** → `scope.skipped`, with a reason.
 
 Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator enforces
 both halves. This matters because the alternative produces **false all-clears**: put an Autopilot
@@ -323,21 +356,25 @@ on a cluster you did audit gets suppressed along with it.
 **`checks_run` is not optional, and it is what the scope table counts.** Every cluster carries the
 list of checks that ran against it; the table renders it as `7/11`, marked `⚠` where it falls short,
 on every run whether or not anything was missed — a column that only appears on bad days is a column
-nobody reads on good ones. A shortfall is a coverage gap in its own right: it makes the run
-`partial` exactly as an unreadable cluster does, is named in `coverage_gaps`, and so the ledger will
-not close on it. That is the point. A run that skipped eight of eleven checks and found nothing has
-not found nothing; it has not looked, and before this field existed it published as `CLEAN` and
-closed the ledger.
+nobody reads on good ones. A cluster with declared inapplicable checks renders as `7/7 (4 n/a)`,
+counted against what applies rather than against the full roster. A shortfall of what _does_ apply
+is a coverage gap in its own right: it makes the run `partial` exactly as an unreadable cluster
+does, is named in `coverage_gaps`, and so the ledger will not close on it. That is the point. A run
+that skipped eight of eleven checks and found nothing has not found nothing; it has not looked, and
+before this field existed it published as `CLEAN` and closed the ledger.
 
-Which means the one way to defeat all of this is to claim a check you did not run. The harness runs
-as a subprocess of you; it cannot see your tool calls, so it cannot verify a claim — an inflated
-`checks_run` converts a partial audit straight back into a false all-clear. The `command` field is
-what makes that expensive and, more importantly, **falsifiable**: every command you name is
-published in the ledger under _How this run checked the fleet_, where a reviewer or the next run can
-re-run it. Record the entry as its check completes and paste the command you actually issued. Never
-add entries in advance, never round the list up to the roster because the SOP happens to define that
-many, and never write a command you did not run — a fabricated one is a lie with your name on it in
-a public issue, which is a worse outcome for you than an honest `7/11`.
+Which means the two ways to defeat all of this are to claim a check you did not run, or to park one
+in `checks_not_applicable` that you simply did not get to. The harness runs as a subprocess of you;
+it cannot see your tool calls, so it cannot verify either claim — an inflated `checks_run` converts
+a partial audit straight back into a false all-clear, and a padded `checks_not_applicable` does the
+same by shrinking the denominator until the shortfall disappears. Publication is what makes both
+expensive and, more importantly, **falsifiable**: every command you name is published under _How
+this run checked the fleet_, and every exclusion with its reason under _Not applicable_, where a
+reviewer or the next run can re-run the one and contest the other. Record each entry as its check
+completes and paste the command you actually issued. Never add entries in advance, never round the
+list up to the roster because the SOP happens to define that many, never write a command you did not
+run, and never write a `reason` that does not name a property of the cluster — a fabricated one is a
+lie with your name on it in a public issue, which is a worse outcome for you than an honest `7/11`.
 
 An honest shortfall costs you nothing. It marks the run `partial`, keeps the ledger open, and gets
 picked up next run. That is the system working.
@@ -555,12 +592,25 @@ notice: four streams did exactly that on 2026-08-03, and the only reason it surf
 happened to have a ledger open from the day before.
 
 A clean run is usually not news, and the closed issue is the record — but "clean" alone does not
-decide it. Read the `finish` JSON and apply the full rule:
+decide it. **`finish` decides it, and returns the answer as `silent_ok`.** Read the flag; do not
+reassemble it from `status`, `new`, `resolved`, and `partial` yourself. That arithmetic has more
+clauses than it looks like it has, and re-deriving it is how a run talks itself into silence it has
+not earned — on 2026-08-03 a run with two partially-covered clusters answered `[SILENT]` and its
+ledger URL never reached the operator who had asked for it.
 
-> **`[SILENT]` iff `new == 0` and `resolved == 0` and `partial == false`.**
+> **`silent_ok` is `true` only when the run moved nothing an operator needs to hear about:** nothing
+> new, nothing resolved, no coverage gap, and no remediation pull request opened or closed.
 
-If any of the three fails, report the issue URL and a one-line summary. Two clean runs are _not_
-silent, and both matter:
+Two rules follow, and they are the whole rule:
+
+- On a **scheduled** run, `silent_ok: true` → the final response is exactly `[SILENT]`. Otherwise
+  report, and every report carries `issue_url` in full.
+- **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
+  channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
+  kanban card, from chat, or from `cronjob(action='run')`, they are waiting on the answer and
+  `[SILENT]` throws it away. Report the outcome and the ledger URL whatever the flag says.
+
+Two clean runs come back `silent_ok: false`, and both matter:
 
 - **`resolved > 0`** — the fleet was carrying findings yesterday and is not today. Something got
   fixed, and that is the best thing this audit ever gets to say. Reporting `partial` failures while
@@ -570,9 +620,10 @@ silent, and both matter:
 
 There is one case where the harness reports `new: 0, resolved: 0` without knowing it: if the
 previous ledger body could not be read, the delta is unknowable, so it announces nothing rather than
-declaring every live finding new. The run logs
+declaring every live finding new. `silent_ok` follows the counts it can defend and comes back `true`
+on an otherwise quiet run. The run logs
 `Previous ledger body was unreadable; skipping the delta comment` to stderr and the ledger is still
-rewritten correctly. Treat it as `[SILENT]` — the issue carries the truth either way.
+rewritten correctly — the issue carries the truth either way.
 
 ## Red lines
 

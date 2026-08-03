@@ -54,12 +54,14 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   remediation state and, where one exists, its remediation PR.
 - A clean run closes the issue **as completed** and closes any remediation PRs still open for that
   stream.
-- `[SILENT]` has one rule, and it is a conjunction of three: `new == 0` **and** `resolved == 0`
-  **and** `partial == false`. If either counter is non-zero the agent reports the ledger issue URL
-  and a one-line summary — a run that resolved five findings and found nothing new is _news_, the
-  audit reporting that the fleet got better. And a run that could not read the whole fleet is never
-  silent even when both counters are zero, because "I found nothing" and "I could not look" are
-  different statements and only one of them is reassuring (§7.4).
+- `[SILENT]` has one rule and `finish` computes it, returning the answer as `silent_ok` (§7.5). It
+  is true only when the run moved nothing an operator needs to hear about: `new == 0`,
+  `resolved == 0`, no coverage gap, and no remediation PR opened or closed. If any of those fails
+  the agent reports the ledger issue URL and a one-line summary — a run that resolved five findings
+  and found nothing new is _news_, the audit reporting that the fleet got better. And a run that
+  could not read the whole fleet is never silent even when both counters are zero, because "I found
+  nothing" and "I could not look" are different statements and only one of them is reassuring
+  (§7.4). `silent_ok` is the _scheduled_ verdict; an operator-dispatched run reports regardless.
 
 ### Tier 2 — remediation pull requests
 
@@ -425,12 +427,13 @@ was probably never a command is a bot picking an argument. A `/remediate` the ha
 into a comment is always inside a code span, and inline code is stripped before the mention search
 runs — otherwise the ledger reads its own replies back on the next run and answers itself forever.
 
-Exit contract — eight keys, always all eight:
+Exit contract — nine keys, always all nine:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[]}`
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[]}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[]}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"]}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false}`
+- `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true}`
 
 `--dry-run` renders the issue body and every PR body it _would_ open to stdout with zero git or gh
 **side effects**: nothing is cloned, staged, committed, pushed, created, edited, commented, or
@@ -488,17 +491,17 @@ lose and anything present is debris from a run that did not finish.
 
 ## 7. Rendering
 
-| Artifact             | Contents                                                                                                                                                                                                   |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Ledger issue title   | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against `cron/jobs.json` by test.                                                          |
-| Ledger issue body    | Scope, findings table with state column, then per-finding detail: evidence, impact, recommendation, remediation, PR link. Hidden `<!-- audit-findings -->` marker last, listing the ids the body rendered. |
-| Scope                | Clusters covered with their `n/total` checks-run count and optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2.                      |
-| Size budget          | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                        |
-| Delta comment        | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything. Reuses `render_delta_comment`.                                                    |
-| Clean-close comment  | Date and the clusters covered, then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                           |
-| Remediation PR title | `fix(<audit-id>): <finding title>`                                                                                                                                                                         |
-| Remediation PR body  | `Part of #<issue>`, the single finding's evidence, impact, **Why this fix** (the recommendation), and the risk note. For a group, one section per member.                                                  |
-| Stale-close comment  | Date, each finding the pull request was opened for, the `audit:stale-closed` label, and an accurate reopen note. Not the evidence — see §3.3.                                                              |
+| Artifact             | Contents                                                                                                                                                                                                                                                |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ledger issue title   | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against `cron/jobs.json` by test.                                                                                                       |
+| Ledger issue body    | Scope, findings table with state column, then per-finding detail: evidence, impact, recommendation, remediation, PR link. Hidden `<!-- audit-findings -->` marker last, listing the ids the body rendered.                                              |
+| Scope                | Clusters covered with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. |
+| Size budget          | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                     |
+| Delta comment        | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything. Reuses `render_delta_comment`.                                                                                                 |
+| Clean-close comment  | Date and the clusters covered, then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                                                                        |
+| Remediation PR title | `fix(<audit-id>): <finding title>`                                                                                                                                                                                                                      |
+| Remediation PR body  | `Part of #<issue>`, the single finding's evidence, impact, **Why this fix** (the recommendation), and the risk note. For a group, one section per member.                                                                                               |
+| Stale-close comment  | Date, each finding the pull request was opened for, the `audit:stale-closed` label, and an accurate reopen note. Not the evidence — see §3.3.                                                                                                           |
 
 ### 7.1 Size budget
 
@@ -607,6 +610,38 @@ Unlike `limitations`, the `Checks` column renders on **every** run as `n/total`,
 it falls short. A column that appears only when something went wrong is a column nobody learns to
 read on the days it matters.
 
+#### "Did not run" and "cannot run" are different claims
+
+`checks_run` collapsed them, and the collapse had a cost that only shows on a real fleet. Four of
+this stream's ten upgrade checks read a node pool, and an Autopilot cluster has none to read. The
+SOP's answer was a `limitations` note — which is a coverage gap, so those clusters rendered `6/10 ⚠`
+on every run, forever. `partial` was therefore `true` on every run, forever, and everything keyed to
+`partial` followed: `resolved` pinned at `0`, the ledger unable to close, no stale remediation PR
+ever retired. On the fleet this was found on, two of three clusters are Autopilot. The audit was
+permanently unable to report good news about the majority of the fleet it audits, and the flag that
+was supposed to mean "I could not look here" had come to mean "there is nothing here to look at" —
+which is the opposite claim, published in the same column.
+
+So `scope.clusters[]` gains an optional `checks_not_applicable`: a list of `{check, reason}` using
+the same slugs as `checks_run`. Those checks leave the denominator rather than counting as missing,
+so `6/10 ⚠` becomes `6/6 (4 n/a)`. `coverage_gaps` computes `applicable = roster - not_applicable`
+and reports a shortfall against that, which is what lets a fully-covered Autopilot fleet close its
+ledger.
+
+The `reason` is required and must be at least sixteen characters. That is a deliberately crude
+proxy: it cannot tell a real reason from a padded one, but it does stop `"N/A"`, `"n/a"`, and
+`"autopilot"`, which is the whole distance between a field that documents a decision and a field
+that launders one. The validator also rejects a slug that appears in both lists, since a check
+either ran or could not, and an unknown or duplicated slug — the same rules `checks_run` gets, and
+with the same discipline about not naming the roster in the message.
+
+The new field is a second way to inflate coverage, and the design treats it the way it treats the
+first: not by verifying it, which is impossible from a subprocess, but by publishing it. Every
+exclusion and its reason render in the ledger under _Not applicable_, alongside the commands table,
+where a reviewer who knows the cluster can contest one. Padding `checks_not_applicable` is the same
+lie as padding `checks_run`, told by shrinking the denominator instead of inflating the numerator,
+and it is exposed the same way.
+
 #### The guard's first failure, and what it cost
 
 `checks_run` shipped as a bare list of slugs, and the validator was helpful about rejecting one:
@@ -681,11 +716,13 @@ nobody controls, so all of it is untrusted input to a Markdown renderer that wil
 ### 7.4 Partial coverage
 
 `coverage_gaps(data)` folds the three representations of "did not look" — every `scope.skipped`
-entry, every cluster `limitations` note, and every cluster whose `checks_run` falls short of its
-stream's roster — into one list of human-readable strings, and a run with a non-empty list is
-**partial**. A cluster contributes at most one line however many of the three apply to it, so a
+entry, every cluster `limitations` note, and every cluster whose `checks_run` falls short of the
+checks that _apply_ to it — into one list of human-readable strings, and a run with a non-empty list
+is **partial**. A cluster contributes at most one line however many of the three apply to it, so a
 partly-checked cluster that also carries a limitation reads as one sentence with two reasons rather
-than as two separate gaps.
+than as two separate gaps. The denominator is the stream's roster minus that cluster's
+`checks_not_applicable`, which is what keeps a check the cluster's shape forbids from reading as a
+check nobody ran.
 
 Routing the roster shortfall through `coverage_gaps` rather than gating it separately is the whole
 economy of the change. Everything below already keys off `partial`, so an incomplete run inherits
@@ -707,8 +744,8 @@ coverage, and nothing else:
 - Zero findings does not close the ledger. `status` is still `CLEAN` — the audit found nothing, and
   saying otherwise would be its own lie — but the issue stays open and gains a comment naming the
   gaps, so the stream self-heals the day the unreadable clusters come back.
-- The run is never `[SILENT]` (§2). "I found nothing" and "I could not look" must not arrive in chat
-  as the same silence.
+- The run is never `[SILENT]`: `finish` returns `silent_ok: false` (§7.5). "I found nothing" and "I
+  could not look" must not arrive in chat as the same silence.
 
 What a gap does **not** do is suppress the report. Findings from the clusters that _were_ read are
 published normally, and new fixes are still proposed for them. A partial audit is a partial audit,
@@ -724,6 +761,36 @@ already carries only the ids the body rendered (§2). Folding them together prod
 `partial: true` with an empty `coverage_gaps` — a flag five SOPs instruct the agent to explain to a
 human, with nothing to explain it with. Truncation is surfaced where it belongs: a line in the body
 naming the count it dropped, and a `WARNING` in the run log.
+
+### 7.5 `silent_ok`, and who is listening
+
+The silence rule was correct and the agent still got it wrong, which is the interesting part. Stated
+in full it is a four-clause conjunction over four fields on two `finish` branches, and the SOPs
+stated it four different ways because each one had a different set of cases worth spelling out. On
+2026-08-03 a dispatched `security-patch-orchestrator` run rewrote its ledger over a fleet where two
+of three clusters were `6/10 ⚠`, concluded `[SILENT]`, and suppressed its own delivery. The operator
+who had asked for it got a card that said "successfully updated the existing ledger issue" and no
+URL. An earlier run of the same job, the same morning, had got the same rule right. A rule an agent
+applies correctly most of the time is a rule the harness should be applying.
+
+So `finish` computes it and returns `silent_ok` on both branches. It is `true` only when the run
+moved nothing an operator needs to hear about — nothing new, nothing resolved, no coverage gap, no
+remediation PR opened or closed — and it is computed from the numbers `finish` is about to _report_,
+not the ones it privately knows. A partial run reports `resolved: 0`; an unreadable previous body
+makes the delta unknowable and reports `new: 0`. `silent_ok` follows what was published, so the flag
+and the report can never disagree. The PR counters are in the conjunction because opening a fix is
+news even on a run that found nothing new: the ids were already in the ledger, so `new` is zero,
+while a pull request now exists that did not before.
+
+`silent_ok` is the **scheduled** verdict. It answers "would a channel want this?", and it has no way
+to know a person is waiting: `finish` sees a findings document, not the provenance of the run. So
+the second half of the rule lives with the agent and cannot be moved into the harness — **an
+on-demand run is never silent.** A run dispatched from a kanban card, from chat, or from
+`cronjob(action='run')` reports its outcome and its ledger URL whatever `silent_ok` says. Two places
+say so: every SOP's close section, and the Platform Agent's `AGENTS.md`, which additionally requires
+the dispatching session to read `cron/output/<job-id>/<timestamp>.md` and relay the URL on the card
+when the dispatched run answers `[SILENT]` — because the card summary is what reaches Slack, and the
+worker's own transcript reaches nothing.
 
 ## 8. Labels
 
@@ -772,9 +839,10 @@ New:
   run is partial (§7.4). Reporting an all-clear for a cluster nobody looked at is the one failure
   mode that makes the whole ledger untrustworthy.
 - **Never report a cluster the audit did not check as clean.** `checks_run` records what actually
-  ran, per cluster, and anything short of the roster is a gap (§7.2). Naming a check that did not run
-  is the one way left to defeat every protection above, which is why each SOP says so where the field
-  is written.
+  ran, per cluster, and anything short of the checks that apply to it is a gap (§7.2). Naming a check
+  that did not run, or parking one in `checks_not_applicable` that the cluster's shape does not
+  actually forbid, are the two ways left to defeat every protection above, which is why each SOP says
+  so where the fields are written.
 - **Never put a credential in `evidence.excerpt`.** No Secret `data:` or `stringData:` block, no
   token, no password, no private key. The SOPs say this to the model; `audit_report.py` also
   enforces it on the way out, replacing a `data:` block, a secret-named field, a self-identifying
@@ -807,11 +875,12 @@ GitHub App permission lines of §13 Q2. There is no legacy reconciliation step (
 
 ## 11. Files touched
 
-Twenty-one existing files reference the audit PR path today:
+Twenty-two existing files reference the audit PR path today:
 
 ```
 agents/platform/CAPABILITIES.md
-agents/platform/SOUL.md                                     (§3.2 — GitOps write paths)
+agents/platform/AGENTS.md                                   (cron dispatch and handover)
+agents/platform/SOUL.md                                     (§3.2 — GitOps write paths; §0 — card summaries)
 agents/platform/cron/jobs.json
 agents/platform/governance/compliance_audit_sop.md
 agents/platform/governance/fleet_consistency_drift_sop.md
@@ -861,7 +930,14 @@ unchanged. As shipped it is **346**. New cases:
   roster in `AUDITS` matches the slugs its SOP's `####` headings declare.
 - **No rejection names a roster slug**, on any of the five paths that reject the field. This is the
   test that would have caught the 2026-08-03 answer-key inversion, and it is written as the negative
-  of the test it replaces.
+  of the test it replaces. The `checks_not_applicable` rejections are held to the same rule.
+- `checks_not_applicable`: absent is accepted; a non-list, a bare slug in place of an entry object,
+  an unknown slug, a duplicate, and a slug that also appears in that cluster's `checks_run` are each
+  rejected; a `reason` that is absent, empty, or under sixteen characters is rejected, with `"N/A"`
+  and `"not applicable"` named as the cases the length bound exists to stop. A declared check leaves
+  the coverage denominator: a cluster running every applicable check is not a gap and does not set
+  `partial`, the scope table renders `n/applicable (m n/a)`, and the exclusions render with their
+  reasons in the evidence section.
 - `command`: absent, empty, shorter than eight characters, over `MAX_COMMAND_CHARS`, a call back into
   `audit_report.py`, an `echo`/`cat`/`printf`/`python3 -c`/`true`, and prose naming no inspection
   binary are each rejected; a real invocation is accepted; one command backing three checks is
@@ -942,8 +1018,8 @@ belief is wrong, so raising the constant to 200,000 would keep them all green wh
   truncation is not a coverage gap (§7.4).
 - `partial == bool(coverage_gaps)` over both `finish` branches and every way a gap arises: clean and
   complete, clean over a `skipped` entry, findings over a `skipped` entry, findings over a cluster
-  carrying only a `limitations` note, and a cluster whose `checks_run` is short of the roster with no
-  limitation at all. A cluster that is both short and limited yields one gap line, not two.
+  carrying only a `limitations` note, and a cluster whose `checks_run` is short of its applicable
+  checks with no limitation at all. A cluster that is both short and limited yields one gap line, not two.
 - The clean-run comment announces a close only when coverage is complete. Over a gap it says the
   ledger stays open, and it treats a `limitations` note as a gap — the earlier version rendered
   `scope.skipped` alone and posted "closed as completed" onto an issue that stayed open.
@@ -961,9 +1037,18 @@ run, prints `CLEAN` having closed nothing. So:
 - A clean run that cannot reach GitHub does not print `CLEAN`.
 
 **Coverage-gap cases** (§7.4): a `scope.skipped` entry, a cluster `limitations` note, and a
-`checks_run` short of the roster each set `partial`; a partial clean run leaves the ledger open,
-posts the gap comment, closes no PR, and reports `resolved: 0`; a complete clean run does all four
-of the opposite things.
+`checks_run` short of the applicable checks each set `partial`, while a shortfall fully accounted
+for by `checks_not_applicable` does not; a partial clean run leaves the ledger open, posts the gap
+comment, closes no PR, and reports `resolved: 0`; a complete clean run does all four of the opposite
+things.
+
+**Silence cases** (§7.5): `silent_ok` is `true` on a quiet clean run and a quiet `UPDATED` run, and
+`false` whenever the run reported a new finding, a resolved finding, a coverage gap, or a
+remediation PR opened or closed — asserted on both `finish` branches, since each prints its own
+JSON. Three prose tests pin the handover the flag cannot cover on its own: the `AGENTS.md` cron
+bullet names both `kanban_complete` and `[SILENT]`, `SOUL.md` requires the artifact URL in the card
+summary before its first numbered section, and every one of the five SOPs contains both `silent_ok`
+and "on-demand".
 
 **Workspace cases.** Exactly **one** of these runs real git against a real bare origin rather than
 the recorded runner, and it is the one whose defect is invisible to a mock: `ensure_workspace`
