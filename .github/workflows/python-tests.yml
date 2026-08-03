@@ -48,3 +48,6 @@ jobs:
 
       - name: Fleet audit scripts
         run: python3 -m unittest discover -s agents/platform/skills/fleet-audit/scripts -p 'test_*.py' -t agents/platform/skills/fleet-audit/scripts
+
+      - name: Image patches
+        run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches

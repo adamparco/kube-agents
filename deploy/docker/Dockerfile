@@ -61,6 +61,17 @@ RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed
 # Hotfix: Allow explicit target routing for google_chat spaces/threads in send_message_tool
 RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/tools/send_message_tool.py'); c = p.read_text(); t = 'def _parse_target_ref(platform_name: str, target_ref: str):\n    \"\"\"Parse a tool target into chat_id/thread_id and whether it is explicit.\"\"\"'; r = t + '\n    if platform_name == \"google_chat\":\n        parts = target_ref.split(\":\", 1)\n        if len(parts) == 2 and parts[0].startswith(\"spaces/\"):\n            return parts[0].strip(), parts[1].strip(), True\n        elif target_ref.startswith(\"spaces/\"):\n            return target_ref.strip(), None, True'; p.write_text(c.replace(t, r)) if t in c else exit(1)"
 
+# Hotfix: stop the kanban notifier from severing URLs in a card's completion line.
+# Upstream hard-slices the handoff at a fixed width, which turned a published
+# ledger link into ".../is" in chat. Swap both slices for a whitespace-boundary
+# clip that also stops discarding every line after the first. See the module
+# docstring in deploy/docker/patches/kanban_handoff_clip.py.
+COPY deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gateway/kanban_handoff_clip.py
+RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/gateway/kanban_watchers.py'); c = p.read_text(); t1 = 'h = lines[0][:200] if lines else payload_summary[:200]'; t2 = 'r = lines[0][:160] if lines else task.result[:160]'; exit(1) if (t1 not in c or t2 not in c) else None; c = c.replace(t1, 'h = _clip_handoff(payload_summary)').replace(t2, 'r = _clip_handoff(task.result)'); p.write_text(c + '\n\n# kube-agents patch: see gateway/kanban_handoff_clip.py\nfrom gateway.kanban_handoff_clip import clip_handoff as _clip_handoff\n')" && \
+    grep -q "h = _clip_handoff(payload_summary)" /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q "r = _clip_handoff(task.result)" /opt/hermes/gateway/kanban_watchers.py && \
+    /opt/hermes/.venv/bin/python3 -c "import ast, pathlib; ast.parse(pathlib.Path('/opt/hermes/gateway/kanban_watchers.py').read_text())"
+
 
 # 3. Clone and build mcp-remote proxy. Git is a build-only dependency here;
 # the sandbox runtime exposes only the credential-proxy Git wrapper.

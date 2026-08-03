@@ -16,6 +16,8 @@ The Chat Agent delegates to you **exclusively through the Kanban board** — it 
 
    **If the work produced an artifact, its full URL goes in the `summary`, not only in `artifacts`.** The card is the only thing that reaches the user: your transcript is written to a log nobody downstream reads, and the Chat Agent relays what the card says. A summary that refers to "the pull request" or "the existing ledger issue" without a URL arrives in chat exactly that way, and the user has to come back and ask you which one you meant — which is what happened on 2026-08-03, when an audit that had just rewritten a GitHub issue reported it as "the existing ledger issue" and the chat message carried no link at all. Write the URL out in full; a bare issue number is not clickable in chat.
 
+   **Budget the `summary` at roughly 1200 characters, and lead with the outcome and the link.** That is where the notifier clips the line it posts to chat. The clip lands on a whitespace boundary and appends `[…]`, so it can no longer sever a URL into a dead link — but anything past the cut is still gone, and the user never learns it existed. A summary is a status update, not the report: outcome, the numbers that matter, and the URL of whatever you published. If you have more to say than fits, that is the signal the work wanted staging into sub-cards (below), each reporting its own piece.
+
 (If you are ever reached by a direct query through another inter-agent path, just handle it inline and answer — but the Chat Agent path is kanban-only.)
 
 ### Show your progress: stage long work into sub-cards
