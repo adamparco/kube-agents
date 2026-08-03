@@ -71,11 +71,21 @@ class AuditSpec(NamedTuple):
     `test_check_rosters_match_the_sops` re-derives `checks` from the SOP
     headings, so a check added to an SOP without being added here fails CI
     rather than becoming a check no run is ever required to perform.
+
+    `derived` names slugs a finding may cite but no cluster is ever asked to
+    run. They are the streams' meta-findings — a conclusion drawn *across*
+    facets rather than a check performed against one — so they belong in the
+    set a `finding.check` is validated against but not in the coverage
+    denominator, where they would read as a check nobody performed and hold the
+    ledger open forever. `fleet-consistency-drift`'s split-cluster guard is the
+    standing example: it fires when a cluster is an outlier on six or more
+    facets, which is not something you can run against a cluster in isolation.
     """
 
     title: str
     sop: str
     checks: tuple[str, ...]
+    derived: tuple[str, ...] = ()
 
 
 # The audit streams allowed to own a ledger. An id not listed here is rejected
@@ -129,7 +139,8 @@ AUDITS: dict[str, AuditSpec] = {
             "hpa-cannot-scale",
             "rigid-scheduling",
             "no-spread",
-            "probes",
+            "probes-readiness",
+            "probes-liveness",
             "single-replica",
         ),
     ),
@@ -173,6 +184,11 @@ AUDITS: dict[str, AuditSpec] = {
             "image-type",
             "database-encryption",
         ),
+        # §3 step 6's split-cluster guard: a cluster that is an outlier on six
+        # or more facets is a different kind of cluster, not a drifting one, so
+        # its individual facet findings are suppressed in favour of one finding
+        # telling the admin to fix the cohort labelling.
+        derived=("uncohorted",),
     ),
 }
 
@@ -247,6 +263,23 @@ GLOB_METACHARACTERS = "*?[]"
 # letter is unsafe, and the SOP fixtures use them.
 FINDING_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?\Z")
 
+# The id is *derived*, never model-written — see `derive_finding_id` for what
+# went wrong when it was prose. These three describe the derived shape.
+#
+# `<check>.<cluster>.<namespace>.<object>`, one grammar for all five streams.
+# The per-SOP `wra-`/`spo-` prefixes it replaces carried no information the
+# ledger did not already have: an id never leaves the stream that minted it.
+ID_SEGMENTS = 4
+# Stands in for an absent namespace, and for a value that sanitises to nothing.
+# `_` and not `-`: it has to be a character `_id_segment` can never emit, or a
+# cluster-scoped finding and one in a namespace named after its object would
+# collide. This is also the spelling the live ledgers already carry, so
+# derivation lands on them byte-identical and the first run after it reports no
+# spurious delta.
+ID_EMPTY_SEGMENT = "_"
+# Kept in step with FINDING_ID_RE's own 100-character ceiling.
+MAX_FINDING_ID = 100
+
 # The hidden block that makes the run-over-run delta computable without keeping
 # any state outside the report itself.
 #
@@ -259,6 +292,27 @@ FINDING_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?\Z")
 # was ever closed.
 DELTA_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
+)
+# Which identity scheme minted the ids in the block above it. Bump this
+# whenever `derive_finding_id` would spell an existing finding differently.
+#
+# The delta is a set difference over strings, so it cannot tell a renamed
+# finding from a fixed one — it reports the rename as a resolution, which is
+# the harness stating in writing that somebody fixed something nobody touched.
+# Guarding that on the *shape* of the old ids was the first attempt and it is
+# not sound: the schemes that shipped happened to be distinguishable, but the
+# next change need not be, and the very first one was not. On 2026-08-03 the
+# compliance ledger carried `…clusterrolebinding-argocd-application-controller`
+# for a check that judges the ClusterRole; correcting the object to the role
+# leaves an id of exactly the current shape and would have read as a fix.
+#
+# A stamp needs no cleverness: a previous body whose stamp is missing or
+# different was written by a scheme this one cannot join against, whatever the
+# ids look like. `resolved` is withheld for the single run it takes to rewrite
+# the block, then the stamp matches and the guard lifts by itself.
+ID_SCHEME = 1
+ID_SCHEME_RE = re.compile(
+    r"^[ \t]*<!--[ \t]*audit-id-scheme:[ \t]*(\d+)[ \t]*-->[ \t]*$", re.M
 )
 # Per-finding marker on each heading, so a *resolved* finding can still be named
 # by title when it no longer exists in the current findings.json.
@@ -547,9 +601,19 @@ def audit_name(audit_id: str) -> str:
 
 
 def audit_checks(audit_id: str) -> tuple[str, ...]:
-    """The check roster the stream's SOP defines, in SOP order."""
+    """The check roster the stream's SOP defines, in SOP order.
+
+    Coverage is measured against this and this alone — see `AuditSpec.derived`
+    for why the meta-findings stay out of it.
+    """
     spec = AUDITS.get(audit_id)
     return spec.checks if spec else ()
+
+
+def audit_finding_checks(audit_id: str) -> frozenset[str]:
+    """Every slug a `finding.check` may cite: the roster plus the derived ones."""
+    spec = AUDITS.get(audit_id)
+    return frozenset(spec.checks + spec.derived) if spec else frozenset()
 
 
 def audit_sop(audit_id: str) -> str:
@@ -849,6 +913,112 @@ def validate_finding_id(fid: str, where: str) -> str:
     return fid
 
 
+def _id_segment(value: str) -> str:
+    """One interpolated value, reduced to the id charset minus the separator.
+
+    `.` is squeezed out along with everything else outside `[a-z0-9-]`, so a
+    value can never manufacture a segment boundary. That is what makes
+    `ID_SEGMENTS` a structural invariant rather than a hope: an object named
+    `widgets.example.com` used to split a four-segment id into six, and no
+    amount of counting dots could tell that apart from a legacy scheme.
+    Squeezing runs of `-` keeps `Cluster//foo` and `Cluster/foo` from being two
+    findings. An empty result becomes the same sentinel an absent value gets —
+    every segment is non-empty, so `..` cannot occur and the `git
+    check-ref-format` half of `validate_finding_id` is unreachable by
+    construction.
+    """
+    out = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+    return out or ID_EMPTY_SEGMENT
+
+
+def derive_finding_id(finding: dict) -> str:
+    """The finding's identity, computed from its own fields. Never model-written.
+
+    A join key that an LLM re-derives from prose every morning is not a key. It
+    was written five different ways by five SOPs, and on 2026-08-03 a single
+    stream spelled the same nine problems three different ways in three
+    consecutive runs: `.-.` and `._.` for the empty namespace (the SOP gave `_`
+    as the sentinel and, on the next line, a sanitiser mapping `_` to `-`), the
+    namespace segment present or absent entirely, and one finding attributed to
+    a `ClusterRole` in one run and its `ClusterRoleBinding` in the next. Every
+    variant satisfied `FINDING_ID_RE`, so nothing downstream could object.
+    `compute_delta` joins on this string; a renamed key is indistinguishable
+    from a fixed problem, so the 16:34 run announced four unfixed criticals —
+    three internet-reachable control planes among them — as resolved, in
+    writing, on a security ledger, while the same body listed them as open.
+
+    Identity is `(check, cluster, namespace, object)`: what was looked for,
+    where, and at what. Nothing else may enter — no severity (it is re-judged),
+    no title (it is prose), no count, no timestamp. The four fields are already
+    validated and already the natural key; the SOP's own "one finding per
+    (check, workload)" rule is exactly this tuple, and deriving the id is what
+    finally enforces it instead of asking for it.
+    """
+    namespace = str(finding.get("namespace", "") or "")
+    return ".".join(
+        (
+            _id_segment(str(finding.get("check", "") or "")),
+            _id_segment(str(finding.get("cluster", "") or "")),
+            _id_segment(namespace) if namespace.strip() else ID_EMPTY_SEGMENT,
+            _id_segment(str(finding.get("object", "") or "")),
+        )
+    )
+
+
+def _shorten_id(fid: str) -> str:
+    """Bring a derived id under `MAX_FINDING_ID`, deterministically.
+
+    Takes a character at a time off whichever segment is currently *longest*,
+    never the leading check slug. Trimming right-to-left instead — which is
+    what the SOPs used to ask for — spends the whole budget on the object, the
+    single most distinguishing component: a 63-character namespace would eat
+    the allowance and leave `…deployment-api` and `…deployment-web` both
+    truncated to `d`, which is a collision, which is two findings sharing one
+    row in the ledger. Longest-first keeps the segments near-equal, so identity
+    degrades evenly instead of falling off one end.
+
+    No hash, deliberately: an operator types this id into `/remediate`, and the
+    same object has to derive the same id next week. Ties go to the rightmost
+    segment, and no segment is ever emptied, which is what keeps `..` out.
+    """
+    if len(fid) <= MAX_FINDING_ID:
+        return fid
+    # Exactly `ID_SEGMENTS` of them, guaranteed by `_id_segment` squeezing the
+    # separator out of every interpolated value. Index 0 is the check slug and
+    # is out of range on purpose.
+    parts = fid.split(".")
+    while len(".".join(parts)) > MAX_FINDING_ID:
+        longest = max(
+            range(1, ID_SEGMENTS), key=lambda i: (len(parts[i]), i), default=None
+        )
+        if longest is None or len(parts[longest]) <= 1:
+            break
+        parts[longest] = parts[longest][:-1].rstrip("-") or ID_EMPTY_SEGMENT
+    return ".".join(parts)[:MAX_FINDING_ID].rstrip(".-")
+
+
+def parse_id_scheme(body: str | None) -> int:
+    """Which identity scheme wrote this body's delta block. 0 when unstamped.
+
+    0 is the honest answer for every ledger written before the stamp existed,
+    and it is also what an unparseable or hand-edited stamp collapses to — in
+    both cases the correct behaviour is the same, so they need not be told
+    apart. Zero can never equal `ID_SCHEME`, so an unstamped body is always
+    treated as unjoinable, which is the safe direction: the cost is one run of
+    withheld `resolved`, and the alternative is announcing a fix nobody made.
+    """
+    body = normalise_newlines(body)
+    if not body:
+        return 0
+    matches = ID_SCHEME_RE.findall(body)
+    if not matches:
+        return 0
+    try:
+        return int(matches[-1])
+    except (TypeError, ValueError):  # pragma: no cover - the regex is \d+
+        return 0
+
+
 def validate_findings(data: object, audit_id: str) -> dict:
     """Validate a findings document. Raises ValidationError naming index + field."""
     validate_audit_id(audit_id)
@@ -879,6 +1049,10 @@ def validate_findings(data: object, audit_id: str) -> dict:
         )
     roster = audit_checks(audit_id)
     roster_set = set(roster)
+    # Wider than `roster_set` by the stream's meta-findings. `checks_run` and
+    # `checks_not_applicable` keep validating against the roster: a run cannot
+    # claim to have performed, or excused itself from, a check that is not one.
+    finding_check_set = audit_finding_checks(audit_id)
     audited_names: set[str] = set()
     for i, cluster in enumerate(clusters):
         if not isinstance(cluster, dict):
@@ -887,7 +1061,26 @@ def validate_findings(data: object, audit_id: str) -> dict:
             _require_str(
                 cluster.get(field), f"scope.clusters[{i}].{field}", allow_empty=False
             )
-        audited_names.add(str(cluster["name"]))
+        # A finding names its cluster by bare name, and so does every lookup
+        # that resolves one back to this table. Two same-named clusters in two
+        # projects make that name ambiguous, and the ambiguity is already
+        # load-bearing today: `coverage_gaps` and the scope table resolve by
+        # name, and the derived finding id has `cluster` as its second segment,
+        # so a collision merges two clusters' findings into one identity. The
+        # SPO SOP used to paper over this by putting the project in the id
+        # string it hand-wrote, which made the id more unique than the data
+        # behind it. Refuse the document instead: a fleet audit that cannot say
+        # which `prod` it means should not publish a ledger about `prod`.
+        name = str(cluster["name"])
+        if name in audited_names:
+            raise ValidationError(
+                f"scope.clusters[{i}].name: duplicate cluster {name!r}. Findings "
+                "reference a cluster by bare name, so two clusters sharing one "
+                "name cannot be told apart — their findings would merge into a "
+                "single identity and the ledger would under-report. Audit the "
+                "projects in separate runs."
+            )
+        audited_names.add(name)
         # Optional, but non-empty when present: "I read this cluster fine, but
         # some checks did not run or do not apply" is a different claim from
         # "I could not read this cluster", and conflating the two produces
@@ -1050,16 +1243,21 @@ def validate_findings(data: object, audit_id: str) -> dict:
         if not isinstance(finding, dict):
             raise ValidationError(f"findings[{i}]: expected an object")
 
-        fid = finding.get("id")
-        _require_str(fid, f"findings[{i}].id", allow_empty=False)
-        assert isinstance(fid, str)
-        validate_finding_id(fid, f"findings[{i}].id")
-        if fid in seen_ids:
+        # Which check produced this. Was implicit in the id's first segment,
+        # which meant it was only ever as reliable as the id — and the id was
+        # prose. Named explicitly it is checkable against the roster, and it
+        # becomes the first component of the derived identity below.
+        _require_str(finding.get("check"), f"findings[{i}].check", allow_empty=False)
+        check = str(finding["check"])
+        if check not in finding_check_set:
+            # No roster in the message, for the same reason `checks_run` gives
+            # none: a rejection that enumerates the valid slugs is an answer
+            # key for a run that inspected nothing.
             raise ValidationError(
-                f"findings[{i}].id: duplicate id {fid!r} (first seen at "
-                f"findings[{seen_ids[fid]}]); ids must be unique within the file"
+                f"findings[{i}].check: {check!r} is not a check in the {audit_id} "
+                "SOP. Name checks by the backticked slug in their `####` heading, "
+                f"not by section number or prose. {_sop_pointer(audit_id)}"
             )
-        seen_ids[fid] = i
 
         severity = finding.get("severity")
         if severity not in SEVERITIES:
@@ -1082,6 +1280,49 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # namespace may legitimately be empty for cluster-scoped objects.
         _require_str(finding.get("namespace", ""), f"findings[{i}].namespace")
         _require_str(finding.get("object"), f"findings[{i}].object", allow_empty=False)
+        # `///` is a non-empty string and an empty name. Caught here, against
+        # the field the worker wrote, rather than four lines down against a
+        # derived string it has never seen.
+        for field in ("cluster", "object"):
+            if _id_segment(str(finding[field])) == ID_EMPTY_SEGMENT:
+                raise ValidationError(
+                    f"findings[{i}].{field}: {finding[field]!r} has no letter or "
+                    "digit in it, so it names nothing and cannot carry the "
+                    "finding's identity"
+                )
+
+        # Identity, computed now that its four components are validated. Any
+        # `id` the document arrived with is discarded rather than rejected: a
+        # worker running against a cached SOP would otherwise fail the whole
+        # document, and `exit 2` on an audit publishes nothing at all.
+        fid = _shorten_id(derive_finding_id(finding))
+        try:
+            validate_finding_id(fid, f"findings[{i}] (derived id)")
+        except ValidationError as exc:
+            # Unreachable for any object named `Kind/name`, but the operator
+            # must never be sent to fix a string they did not write: say which
+            # fields produced it.
+            raise ValidationError(
+                f"{exc} — the id is derived from check={check!r}, "
+                f"cluster={finding['cluster']!r}, "
+                f"namespace={finding.get('namespace') or ''!r}, "
+                f"object={finding['object']!r}; change one of those"
+            ) from None
+        if fid in seen_ids:
+            first = seen_ids[fid]
+            raise ValidationError(
+                f"findings[{i}]: same identity as findings[{first}] — check "
+                f"{check!r} against {finding['object']!r} in "
+                f"{finding['cluster']!r}/{finding.get('namespace') or '(cluster)'} "
+                f"derives the id {fid!r} twice. One finding per (check, object): "
+                "three privileged containers in one Deployment are one finding "
+                "listing all three in evidence.excerpt, not three findings. If "
+                "these really are different problems, they are against different "
+                "objects — say which in `object`."
+            )
+        seen_ids[fid] = i
+        finding["id"] = fid
+
         _require_str(finding.get("impact"), f"findings[{i}].impact", allow_empty=False)
 
         evidence = finding.get("evidence")
@@ -1343,9 +1584,19 @@ def coverage_issue_title(audit_id: str, gaps: list[str]) -> str:
 
 
 def delta_block(ids: list[str]) -> str:
-    """The hidden, machine-read block that carries this run's finding ids."""
+    """The hidden, machine-read block that carries this run's finding ids.
+
+    Two lines, always emitted together: the ids, and the `ID_SCHEME` that
+    minted them. Together rather than separately because a block without its
+    stamp is a block the next run has to distrust, and every artifact that
+    carries one — the ledger, each remediation pull request — is joined
+    against later.
+    """
     payload = json.dumps(sorted(set(ids)), separators=(",", ":"))
-    return f"<!-- audit-findings: {payload} -->"
+    return (
+        f"<!-- audit-findings: {payload} -->\n"
+        f"<!-- audit-id-scheme: {ID_SCHEME} -->"
+    )
 
 
 def parse_delta_block(body: str | None) -> list[str]:
@@ -3873,12 +4124,20 @@ def close_stale_remediation_prs(
         number = int(pr.get("number", 0))
         head = str(pr.get("headRefName", ""))
         covered = parse_delta_block(str(pr.get("body", "")))
+        # A body written under a different identity scheme names its findings
+        # by ids this run cannot join against, so "none of them still
+        # reproduce" is unknowable rather than true — and acting on it closes
+        # an open fix with a comment saying the problem went away. The
+        # branch-orphan rule below joins on manifest paths rather than ids and
+        # is unaffected. Self-clearing: a pull request whose findings do still
+        # reproduce has its body rewritten by this run's promotion pass.
+        joinable = parse_id_scheme(str(pr.get("body", ""))) == ID_SCHEME
 
         orphaned = bool(live_branches) and not any(
             head == branch or head.endswith(f":{branch}") for branch in live_branches
         )
         if not orphaned:
-            if not covered or any(fid in current_ids for fid in covered):
+            if not covered or not joinable or any(fid in current_ids for fid in covered):
                 continue
 
         # Announce at most once; close as many times as it takes. Every pull
@@ -4674,6 +4933,22 @@ def handle_finish(args: argparse.Namespace) -> None:
     delta_known = previous_body is not None
     previous_ids = parse_delta_block(previous_body or "")
     previous_titles = parse_finding_titles(previous_body or "")
+    # A block written under a different identity scheme cannot be joined
+    # against this one: the same finding is spelled differently on the two
+    # sides, so every id on the left looks fixed and every id on the right
+    # looks new. `new` is merely noisy that way and is left alone; `resolved`
+    # is a claim that somebody fixed something, so it is withheld for the one
+    # run it takes for the block to be rewritten. Self-clearing, and it costs a
+    # single run of silence on a question nothing can answer.
+    previous_scheme = parse_id_scheme(previous_body)
+    stale_scheme = bool(previous_ids) and previous_scheme != ID_SCHEME
+    if stale_scheme:
+        log(
+            f"Previous ledger's {len(previous_ids)} finding id(s) were written "
+            f"under identity scheme {previous_scheme} and this run uses "
+            f"{ID_SCHEME}; withholding 'resolved' this run rather than reporting "
+            "a rename as a fix."
+        )
     # Every finding in the document, rendered or not. The stale-close pass
     # below reads this set and must keep reading it: a finding the body budget
     # dropped still reproduces, and retiring its pull request on that basis
@@ -4785,6 +5060,11 @@ def handle_finish(args: argparse.Namespace) -> None:
             )
         else:
             log(f"Audit {audit_id} is clean and has no open ledger; nothing to do.")
+        # No `stale_scheme` guard here on purpose. This branch is not a join —
+        # the run produced no findings at all, so everything the ledger knew
+        # about is gone whatever it was called. The coverage guard still
+        # applies, because "nothing found" over an unchecked fleet is not the
+        # same as "nothing there".
         clean_resolved = 0 if gaps else len(previous_ids)
         print(
             json.dumps(
@@ -5008,10 +5288,11 @@ def handle_finish(args: argparse.Namespace) -> None:
             comment = render_delta_comment(
                 audit_id,
                 new_ids,
-                # Absence is only evidence of a fix when the audit looked. Over
-                # a coverage gap it means "not checked", so nothing is announced
-                # as resolved.
-                [] if gaps else resolved_ids,
+                # Absence is only evidence of a fix when the audit looked, and
+                # only when the two sides are comparable. Over a coverage gap
+                # absence means "not checked"; across a scheme change it means
+                # "spelled differently". Neither is a fix.
+                [] if (gaps or stale_scheme) else resolved_ids,
                 findings,
                 previous_titles,
                 now,
@@ -5023,7 +5304,9 @@ def handle_finish(args: argparse.Namespace) -> None:
                 log("No new or resolved findings; body refreshed without a comment.")
 
     reported_new = len(new_ids) if delta_known else 0
-    reported_resolved = 0 if (gaps or not delta_known) else len(resolved_ids)
+    reported_resolved = (
+        0 if (gaps or stale_scheme or not delta_known) else len(resolved_ids)
+    )
     print(
         json.dumps(
             {

@@ -320,14 +320,30 @@ field, and publishes nothing:
   entry is published in the ledger under _Not applicable_, with its reason, where a reviewer who
   knows the cluster can call an excuse for what it is.
 
-- `id` is a stable slug, unique within the file, matching `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with
-  no `..` run and no `.lock` suffix. Two rules ride on this. **Stability is what makes the delta
-  work**: the same underlying problem must produce the same id on every run, or it will churn as
-  "resolved" then "new" forever — derive it from the cluster/namespace/object, never from a
-  timestamp, counter, or run id. **The charset is narrow** because the id is the join key of the
-  ledger's hidden delta block and of the `audit-persists:<id>` marker — both line-anchored regexes a
-  space or a newline would break — and because an operator types it by hand in `/remediate <id>`.
-  Keep ids short: a 100-character id is legal, and unreadable.
+- `check` is **required**, and is the backticked slug in the heading of the SOP check that produced
+  the finding. Anything outside that SOP's roster is rejected.
+- **Do not write an `id`.** The harness derives it as `<check>.<cluster>.<namespace>.<object>` — one
+  grammar for all five streams — lowercasing each part, replacing every run of non-alphanumerics
+  with `-`, and substituting `_` for an absent namespace. Any `id` in the document is discarded.
+
+  This used to be the model's job, specified in prose, and it was the wrong job to give it. A join
+  key re-derived by inference is not a key: on 2026-08-03 one stream spelled the same nine findings
+  three different ways in three consecutive runs, and because `compute_delta` joins on this string,
+  the third run announced four unfixed criticals — three internet-reachable control planes among
+  them — as **resolved**, on a ledger whose whole purpose is to say what is still broken. Derivation
+  is what makes "the same problem keeps the same id" a property of the code rather than a request.
+
+  What you still control is `check`, `cluster`, `namespace` and `object`, because identity is those
+  four. Name the durable object the check judged — the owning controller, never the pod, whose name
+  carries a random suffix — and never put a timestamp, counter, version, or run id in it. Two
+  findings agreeing on all four are the same finding, and the document is refused rather than
+  silently collapsed.
+
+  The derived id still has to satisfy `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with no `..` run and
+  no `.lock` suffix, and is shortened to fit: the id is the join key of the ledger's hidden delta
+  block and of the `audit-persists:<id>` marker — both line-anchored regexes a space or a newline
+  would break — and an operator types it by hand in `/remediate <id>`.
+
 - `severity` is one of `critical`, `major`, `minor`.
 - `namespace` may be empty for cluster-scoped objects.
 - `evidence.command` is **required and non-empty**.
