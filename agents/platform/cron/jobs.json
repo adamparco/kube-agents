@@ -8,7 +8,7 @@
         "expr": "20 6 * * *",
         "display": "20 6 * * *"
       },
-      "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home and execute it exactly, using the fleet-audit skill to open and close the audit run. Reply with exactly [SILENT] when the fleet is clean.",
+      "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 348 lines of it, before you run anything. Its eleven checks are section 2, lines 56-270, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "enabled": true,
       "deliver": "all"
@@ -21,7 +21,7 @@
         "expr": "50 6 * * *",
         "display": "50 6 * * *"
       },
-      "prompt": "Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your profile home and execute it exactly, using the fleet-audit skill to open and close the audit run. Reply with exactly [SILENT] when the fleet is clean.",
+      "prompt": "Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your profile home — all 238 lines of it, before you run anything. Its ten checks are section 3, lines 61-179, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "enabled": true,
       "deliver": "all"
@@ -34,7 +34,7 @@
         "expr": "20 7 * * 1",
         "display": "20 7 * * 1"
       },
-      "prompt": "Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrator_sop.md' in your profile home and execute it exactly, using the fleet-audit skill to open and close the audit run. This audit is read-only: never upgrade a cluster. Reply with exactly [SILENT] when the fleet is clean.",
+      "prompt": "Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrator_sop.md' in your profile home — all 221 lines of it, before you run anything. Its ten checks are section 3, lines 59-163, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. This audit is read-only: never upgrade a cluster.",
       "skills": ["fleet-audit"],
       "enabled": true,
       "deliver": "all"
@@ -47,7 +47,7 @@
         "expr": "50 7 * * 1",
         "display": "50 7 * * 1"
       },
-      "prompt": "Run the weekly fleet waste audit. Read the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your profile home and execute it exactly, using the fleet-audit skill to open and close the audit run. Report findings in resource units only — you have no pricing data. Reply with exactly [SILENT] when the fleet is clean.",
+      "prompt": "Run the weekly fleet waste audit. Read the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your profile home — all 221 lines of it, before you run anything. Its ten checks are section 3, lines 57-161, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. Report findings in resource units only — you have no pricing data.",
       "skills": ["fleet-audit"],
       "enabled": true,
       "deliver": "all"
@@ -60,7 +60,7 @@
         "expr": "20 8 * * 1",
         "display": "20 8 * * 1"
       },
-      "prompt": "Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' in your profile home and execute it exactly, using the fleet-audit skill to open and close the audit run. The baseline is derived from the live fleet itself — never from an external blueprint. Reply with exactly [SILENT] when the fleet is clean.",
+      "prompt": "Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' in your profile home — all 239 lines of it, before you run anything. Its nineteen facets are section 4, lines 68-173, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. The baseline is derived from the live fleet itself — never from an external blueprint.",
       "skills": ["fleet-audit"],
       "enabled": true,
       "deliver": "all"

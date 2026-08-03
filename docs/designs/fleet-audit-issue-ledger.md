@@ -492,7 +492,7 @@ lose and anything present is debris from a run that did not finish.
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Ledger issue title   | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against `cron/jobs.json` by test.                                                          |
 | Ledger issue body    | Scope, findings table with state column, then per-finding detail: evidence, impact, recommendation, remediation, PR link. Hidden `<!-- audit-findings -->` marker last, listing the ids the body rendered. |
-| Scope                | Clusters covered with their optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2.                                                     |
+| Scope                | Clusters covered with their `n/total` checks-run count and optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2.                      |
 | Size budget          | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                        |
 | Delta comment        | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything. Reuses `render_delta_comment`.                                                    |
 | Clean-close comment  | Date and the clusters covered, then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                           |
@@ -575,6 +575,37 @@ The validator enforces both halves: the two lists must be disjoint, and a findin
 names a skipped entry is rejected. The rendered scope table carries a `limitations` column only when
 at least one cluster has one, so the common case stays two columns wide.
 
+`limitations` closed the false all-clear that came from mis-filing a cluster. It did not close the
+one that comes from not checking it, because it is optional and an audit that ran nothing has no
+particular reason to volunteer that it ran nothing. A document naming three clusters, carrying no
+`limitations`, and reporting `findings: []` validated, published as `CLEAN`, and closed the ledger —
+and it was byte-for-byte indistinguishable from a complete run over a healthy fleet. It happened:
+four of five streams finished in about fourteen seconds each having issued no inspection command at
+all, because the SOP's checks sit past the point a partial read of the file stops.
+
+So `scope.clusters[]` also gains a **mandatory** `checks_run`, the list of checks that actually ran
+against that cluster, named by the backticked slug in the SOP heading that defines them. `AUDITS`
+carries the roster per stream as an `AuditSpec`, which makes three things enforceable that were not:
+an unknown or duplicated slug is rejected; an absent field is rejected outright; and an empty list is
+rejected unless that cluster's `limitations` says why nothing ran. The last of those is a
+concession, not an oversight — a drift cohort below the comparability floor legitimately compares
+nothing on a cluster it read perfectly well, and a hard non-empty rule would force the agent to
+invent a slug to get published. An explained zero is still a coverage gap, so it stays partial and
+the ledger stays open; only the false all-clear is foreclosed.
+
+The roster lives in code and the checks live in prose, so the two will drift. A test re-derives each
+roster from its SOP's `####` headings and fails on any difference: a check added to an SOP but not to
+`AUDITS` is a check no run is ever obliged to perform, which is the same silent hole one level up.
+
+Unlike `limitations`, the `Checks` column renders on **every** run as `n/total`, suffixed `⚠` where
+it falls short. A column that appears only when something went wrong is a column nobody learns to
+read on the days it matters.
+
+One residual risk is worth naming because the design cannot remove it: the harness never observes
+the commands the agent issued, only the list it hands over. An inflated `checks_run` converts a
+partial audit straight back into a false all-clear. Every SOP therefore says so at the point of
+writing the field, in those words.
+
 ### 7.3 Untrusted text in a rendered body
 
 Every string the renderer interpolates arrives from a model-authored document describing a cluster
@@ -602,9 +633,17 @@ nobody controls, so all of it is untrusted input to a Markdown renderer that wil
 
 ### 7.4 Partial coverage
 
-`coverage_gaps(data)` folds the two representations of "did not look" — every `scope.skipped` entry
-and every cluster `limitations` note — into one list of human-readable strings, and a run with a
-non-empty list is **partial**.
+`coverage_gaps(data)` folds the three representations of "did not look" — every `scope.skipped`
+entry, every cluster `limitations` note, and every cluster whose `checks_run` falls short of its
+stream's roster — into one list of human-readable strings, and a run with a non-empty list is
+**partial**. A cluster contributes at most one line however many of the three apply to it, so a
+partly-checked cluster that also carries a limitation reads as one sentence with two reasons rather
+than as two separate gaps.
+
+Routing the roster shortfall through `coverage_gaps` rather than gating it separately is the whole
+economy of the change. Everything below already keys off `partial`, so an incomplete run inherits
+the full set of withheld conclusions — no resolved claims, no stale-closes, no ledger closure, not
+`[SILENT]` — without a second mechanism to keep in step with the first.
 
 The reason this needs a name is that the whole ledger rests on one inference: _a finding that was in
 yesterday's document and is not in today's has been fixed._ That inference is sound only over a
@@ -685,6 +724,10 @@ New:
   `scope.skipped`, a cluster read with a check missing gets a `limitations` note, and either way the
   run is partial (§7.4). Reporting an all-clear for a cluster nobody looked at is the one failure
   mode that makes the whole ledger untrustworthy.
+- **Never report a cluster the audit did not check as clean.** `checks_run` records what actually
+  ran, per cluster, and anything short of the roster is a gap (§7.2). Naming a check that did not run
+  is the one way left to defeat every protection above, which is why each SOP says so where the field
+  is written.
 - **Never put a credential in `evidence.excerpt`.** No Secret `data:` or `stringData:` block, no
   token, no password, no private key. The SOPs say this to the model; `audit_report.py` also
   enforces it on the way out, replacing a `data:` block, a secret-named field, a self-identifying
@@ -764,6 +807,11 @@ unchanged. As shipped it is **346**. New cases:
 - Scope: `clusters` and `skipped` must be disjoint; a finding naming a skipped cluster is rejected; a
   cluster with `limitations` is accepted and renders the extra column, and the column is absent when
   no cluster carries one.
+- `checks_run`: absent is rejected; a non-list is rejected; an unknown slug and a duplicate are each
+  rejected and the message names the roster; empty is rejected without a `limitations` string and
+  accepted with one; the full roster validates and is complete coverage, a subset validates and is
+  not; the rejection fires for every stream against its own roster; and the roster in `AUDITS`
+  matches the slugs its SOP's `####` headings declare.
 - Grouping: disjoint paths, two findings one path, transitive union across three findings.
 - Promotion eligibility: critical+manifest auto; critical+gcloud not; major+manifest only on request;
   already-has-PR is a no-op in every state; the sixth eligible critical in a run is withheld and
@@ -833,9 +881,10 @@ belief is wrong, so raising the constant to 200,000 would keep them all green wh
 - The clean-run comment stays under the limit with 900 skipped clusters.
 - A truncated body reports `partial: false` with empty `coverage_gaps`, and warns in the log —
   truncation is not a coverage gap (§7.4).
-- `partial == bool(coverage_gaps)` over both `finish` branches and all three ways a gap arises: clean
-  and complete, clean over a `skipped` entry, findings over a `skipped` entry, findings over a
-  cluster carrying only a `limitations` note.
+- `partial == bool(coverage_gaps)` over both `finish` branches and every way a gap arises: clean and
+  complete, clean over a `skipped` entry, findings over a `skipped` entry, findings over a cluster
+  carrying only a `limitations` note, and a cluster whose `checks_run` is short of the roster with no
+  limitation at all. A cluster that is both short and limited yields one gap line, not two.
 - The clean-run comment announces a close only when coverage is complete. Over a gap it says the
   ledger stays open, and it treats a `limitations` note as a gap — the earlier version rendered
   `scope.skipped` alone and posted "closed as completed" onto an issue that stayed open.
@@ -852,9 +901,10 @@ run, prints `CLEAN` having closed nothing. So:
 - A failing `gh pr list` must not be read as "no PR on this branch" and must not re-promote.
 - A clean run that cannot reach GitHub does not print `CLEAN`.
 
-**Coverage-gap cases** (§7.4): a `scope.skipped` entry and a cluster `limitations` note each set
-`partial`; a partial clean run leaves the ledger open, posts the gap comment, closes no PR, and
-reports `resolved: 0`; a complete clean run does all four of the opposite things.
+**Coverage-gap cases** (§7.4): a `scope.skipped` entry, a cluster `limitations` note, and a
+`checks_run` short of the roster each set `partial`; a partial clean run leaves the ledger open,
+posts the gap comment, closes no PR, and reports `resolved: 0`; a complete clean run does all four
+of the opposite things.
 
 **Workspace cases.** Exactly **one** of these runs real git against a real bare origin rather than
 the recorded runner, and it is the one whose defect is invisible to a mock: `ensure_workspace`

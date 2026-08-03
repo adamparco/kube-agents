@@ -37,6 +37,17 @@ import gitops_workspace  # noqa: E402
 AUDIT = "compliance-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
 
+# Which SOP owns each stream's check roster. Spelled out rather than derived
+# from the audit id so that renaming a file breaks this mapping loudly instead
+# of silently skipping the roster-drift check for that stream.
+SOP_FILENAMES = {
+    "compliance-audit": "compliance_audit_sop.md",
+    "security-patch-orchestrator": "security_patch_orchestrator_sop.md",
+    "obtainability-audit": "obtainability_audit_sop.md",
+    "fleet-wide-cost-analysis": "fleet_wide_cost_analysis_sop.md",
+    "fleet-consistency-drift": "fleet_consistency_drift_sop.md",
+}
+
 # What GitHub enforces on an issue body, a comment and a pull request body,
 # written out here rather than imported. The harness's `MAX_BODY_CHARS` is only
 # the harness's *belief* about that number, and a size test asserting a body
@@ -110,23 +121,35 @@ def make_finding(
 
 
 def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
+    if clusters is None:
+        clusters = [
+            {
+                "name": "prod-us-east",
+                "location": "us-east1",
+                "project": "acme-prod",
+            },
+            {
+                "name": "stage-eu",
+                "location": "europe-west1",
+                "project": "acme-stage",
+            },
+        ]
+    # Every cluster ran the full roster unless the test says otherwise. The
+    # fixture fills `checks_run` in rather than each call site doing it, because
+    # a default of "no checks ran" would turn every unrelated test in this file
+    # into a coverage test — and would make a *partial* run the baseline the
+    # renderer, the delta and the ledger-closing tests are all written against.
+    full = list(audit_report.audit_checks(audit))
+    clusters = [
+        cluster
+        if not isinstance(cluster, dict) or "checks_run" in cluster
+        else {**cluster, "checks_run": full}
+        for cluster in clusters
+    ]
     return {
         "audit": audit,
         "scope": {
-            "clusters": clusters
-            if clusters is not None
-            else [
-                {
-                    "name": "prod-us-east",
-                    "location": "us-east1",
-                    "project": "acme-prod",
-                },
-                {
-                    "name": "stage-eu",
-                    "location": "europe-west1",
-                    "project": "acme-stage",
-                },
-            ],
+            "clusters": clusters,
             "skipped": skipped if skipped is not None else [],
         },
         "findings": findings if findings is not None else [make_finding()],
@@ -807,14 +830,149 @@ class TestAuditCatalogue(unittest.TestCase):
             self.skipTest(f"{jobs_file} not present")
         jobs = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
         names = {job["id"]: job["name"] for job in jobs}
-        for audit_id, human in audit_report.AUDITS.items():
+        for audit_id, spec in audit_report.AUDITS.items():
             if audit_id in names:
                 with self.subTest(audit=audit_id):
                     self.assertEqual(
-                        human,
+                        spec.title,
                         names[audit_id],
-                        f"audit_report.AUDITS[{audit_id!r}] is {human!r} but "
-                        f"cron/jobs.json calls it {names[audit_id]!r}",
+                        f"audit_report.AUDITS[{audit_id!r}].title is "
+                        f"{spec.title!r} but cron/jobs.json calls it "
+                        f"{names[audit_id]!r}",
+                    )
+
+    def test_check_rosters_match_the_sops(self):
+        """The roster is the SOP's check list, or it is a lie the validator tells.
+
+        `checks_run` is only worth requiring if the set it is checked against is
+        the set the SOP actually defines. Re-derive it from the headings rather
+        than trusting the copy in `AUDITS`: a check added to an SOP but not here
+        is a check no run is ever obliged to perform, which is precisely the
+        silent-coverage-hole this field exists to close.
+        """
+        sop_dir = Path(__file__).resolve().parents[4] / "platform" / "governance"
+        if not sop_dir.is_dir():  # not shipped alongside the skill at runtime
+            self.skipTest(f"{sop_dir} not present")
+        # The slugs are the backticked tokens in the trailing parenthesis of a
+        # `####` check heading. Anchoring on the trailing group and not on every
+        # backtick in the line is load-bearing: "2.4 `cluster-admin` bound to
+        # non-system subjects (`cluster-admin-binding`)" names one check, not
+        # two, and a heading with no trailing group ("4.2 Workload Identity —
+        # owned by the Security & RBAC Posture Audit") names none.
+        trailing = re.compile(r"\((((?:`[^`]+`)(?:,\s*)?)+)\)\s*$")
+        token = re.compile(r"`([^`]+)`")
+        for audit_id, spec in audit_report.AUDITS.items():
+            sop = sop_dir / SOP_FILENAMES[audit_id]
+            with self.subTest(audit=audit_id):
+                self.assertTrue(sop.is_file(), f"{sop} is missing")
+                found: list[str] = []
+                for line in sop.read_text(encoding="utf-8").splitlines():
+                    if not line.startswith("#### "):
+                        continue
+                    match = trailing.search(line)
+                    if match:
+                        found.extend(token.findall(match.group(1)))
+                self.assertEqual(
+                    list(spec.checks),
+                    found,
+                    f"audit_report.AUDITS[{audit_id!r}].checks has drifted from "
+                    f"{sop.name}. The SOP defines {found}",
+                )
+
+    def test_cron_prompts_cite_the_real_sop_geography(self):
+        """A stale line number is worse than no line number.
+
+        Each audit prompt tells the worker how long its SOP is and where the
+        checks live, because a read that stops early lands in the preamble and
+        produces a confident all-clear over an audit that never ran. That only
+        helps while the numbers are true: a citation that has drifted teaches
+        the worker it has read enough when it has not. Re-derive both from the
+        file so that editing an SOP without re-measuring fails here rather than
+        at 06:20 in production.
+        """
+        root = Path(__file__).resolve().parents[4] / "platform"
+        jobs_file = root / "cron" / "jobs.json"
+        sop_dir = root / "governance"
+        if not jobs_file.is_file() or not sop_dir.is_dir():
+            self.skipTest("cron catalogue and governance SOPs not present")
+        jobs = {
+            job["id"]: job["prompt"]
+            for job in json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
+        }
+        total = re.compile(r"all (\d+) lines of it")
+        span = re.compile(r"are section (\d+), lines (\d+)-(\d+)")
+        for audit_id in audit_report.AUDITS:
+            prompt = jobs.get(audit_id)
+            if prompt is None:
+                continue
+            body = (sop_dir / SOP_FILENAMES[audit_id]).read_text(encoding="utf-8")
+            lines = body.splitlines()
+            with self.subTest(audit=audit_id):
+                claimed = total.search(prompt)
+                self.assertIsNotNone(
+                    claimed, f"{audit_id} prompt no longer states the SOP length"
+                )
+                self.assertEqual(
+                    len(lines),
+                    int(claimed.group(1)),
+                    f"{audit_id} prompt claims {claimed.group(1)} lines but "
+                    f"{SOP_FILENAMES[audit_id]} has {len(lines)}",
+                )
+                cited = span.search(prompt)
+                self.assertIsNotNone(
+                    cited, f"{audit_id} prompt no longer locates the checks"
+                )
+                section, first, last = cited.groups()
+                # Sections are `### <n>. Title`; the section ends where the next
+                # one begins, so the checks span up to the line before it.
+                starts = [
+                    n
+                    for n, line in enumerate(lines, start=1)
+                    if line.startswith("### ")
+                ]
+                heading = f"### {section}. "
+                where = [n for n in starts if lines[n - 1].startswith(heading)]
+                self.assertEqual(
+                    1,
+                    len(where),
+                    f"{SOP_FILENAMES[audit_id]} has {len(where)} sections "
+                    f"headed {heading!r}; the {audit_id} prompt cites one",
+                )
+                after = [n for n in starts if n > where[0]]
+                self.assertEqual(
+                    (where[0], (after[0] - 1) if after else len(lines)),
+                    (int(first), int(last)),
+                    f"{audit_id} prompt cites lines {first}-{last} for section "
+                    f"{section} of {SOP_FILENAMES[audit_id]}, which has moved",
+                )
+
+    def test_no_audit_prompt_restates_the_silence_rule(self):
+        """`[SILENT]` is the SOP's to define, and the prompt's to stay out of.
+
+        Every audit SOP closes with the full rule: silent iff nothing is new,
+        nothing resolved, and coverage is complete. A prompt that adds "reply
+        with exactly [SILENT] when the fleet is clean" restates it with the two
+        qualifiers dropped, and does so before the run starts — telling the
+        worker what its answer looks like while it still decides what to check.
+        """
+        jobs_file = (
+            Path(__file__).resolve().parents[4] / "platform" / "cron" / "jobs.json"
+        )
+        if not jobs_file.is_file():
+            self.skipTest(f"{jobs_file} not present")
+        jobs = {
+            job["id"]: job["prompt"]
+            for job in json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
+        }
+        for audit_id in audit_report.AUDITS:
+            if audit_id in jobs:
+                with self.subTest(audit=audit_id):
+                    self.assertNotIn(
+                        "SILENT",
+                        jobs[audit_id],
+                        f"the {audit_id} cron prompt has picked the silence rule "
+                        "back up; it belongs in the SOP's closing section, where "
+                        "it is stated in full",
                     )
 
 
@@ -3694,6 +3852,191 @@ class TestCoverageGaps(unittest.TestCase):
 
     def test_a_complete_run_has_no_gaps(self):
         self.assertEqual(audit_report.coverage_gaps(make_doc()), [])
+
+    def test_an_unrun_check_is_a_gap_even_with_no_limitations(self):
+        """The gap prose cannot catch a run that never admits to one."""
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                clusters=[
+                    {
+                        "name": "prod-us-east",
+                        "location": "us-east1",
+                        "project": "acme-prod",
+                        "checks_run": ["privileged-container", "host-namespace"],
+                    }
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("prod-us-east", gaps[0])
+        self.assertIn("9 of 11 checks did not run", gaps[0])
+        self.assertIn("netpol-missing", gaps[0])
+
+    def test_a_cluster_reports_one_gap_line_not_two(self):
+        """A cluster with both an unrun check and a limitation is one cluster."""
+        gaps = audit_report.coverage_gaps(
+            make_doc(
+                clusters=[
+                    {
+                        "name": "prod-autopilot",
+                        "location": "us-central1",
+                        "project": "acme-prod",
+                        "limitations": "Autopilot: 2.1-2.3 are admission-enforced.",
+                        "checks_run": [
+                            check
+                            for check in audit_report.audit_checks(AUDIT)
+                            if check != "privileged-container"
+                        ],
+                    }
+                ]
+            )
+        )
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("1 of 11 checks did not run", gaps[0])
+        self.assertIn("Autopilot", gaps[0])
+
+
+class TestChecksRun(unittest.TestCase):
+    """The field that tells an audit that ran from one that merely finished.
+
+    Every test here is a regression on one incident: five audit streams
+    reported a clean fleet after four of them ran zero inspection commands. The
+    documents they published were valid — populated scope, empty findings — and
+    the harness had no way to know the difference.
+    """
+
+    def _cluster(self, **extra):
+        base = {
+            "name": "prod-us-east",
+            "location": "us-east1",
+            "project": "acme-prod",
+        }
+        base.update(extra)
+        return base
+
+    def _omitting_checks_run(self, **doc_kwargs):
+        """A document from before this field existed — the field simply absent.
+
+        `make_doc` back-fills a full roster so unrelated tests are not coverage
+        tests, so the omission has to be made deliberately here.
+        """
+        doc = make_doc(clusters=[self._cluster()], **doc_kwargs)
+        del doc["scope"]["clusters"][0]["checks_run"]
+        return doc
+
+    def test_an_audit_that_ran_nothing_is_rejected(self):
+        """The t_751ffb70 document: clusters enumerated, no checks, no findings."""
+        doc = self._omitting_checks_run(findings=[])
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        message = str(exc.exception)
+        self.assertIn("scope.clusters[0].checks_run", message)
+        self.assertIn("audit that did not run", message)
+
+    def test_an_unexplained_empty_checks_run_is_rejected(self):
+        doc = make_doc(clusters=[self._cluster(checks_run=[])])
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("scope.clusters[0].checks_run", str(exc.exception))
+
+    def test_an_explained_empty_checks_run_is_allowed_but_partial(self):
+        """Drift's "read it, compared nothing" state — honest, and never clean.
+
+        The refusal is aimed at the silent zero. A zero that says why is still a
+        coverage gap, so the ledger cannot close on it either way.
+        """
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                self._cluster(
+                    checks_run=[],
+                    limitations="cohort below the size floor; no facet compared.",
+                )
+            ],
+        )
+        self.assertEqual(audit_report.validate_findings(doc, AUDIT), doc)
+        self.assertTrue(audit_report.coverage_gaps(doc))
+
+    def test_checks_run_of_the_wrong_type_is_rejected(self):
+        doc = make_doc(clusters=[self._cluster(checks_run="privileged-container")])
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("must be a list", str(exc.exception))
+
+    def test_the_rejection_names_the_checks_it_expected(self):
+        """A rejection that does not say what to run teaches the model nothing."""
+        doc = self._omitting_checks_run()
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        for check in audit_report.audit_checks(AUDIT):
+            self.assertIn(check, str(exc.exception))
+
+    def test_a_check_outside_the_roster_is_rejected(self):
+        doc = make_doc(
+            clusters=[self._cluster(checks_run=["privileged-container", "2.4"])]
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("scope.clusters[0].checks_run[1]", str(exc.exception))
+        self.assertIn("'2.4'", str(exc.exception))
+
+    def test_a_duplicate_check_is_rejected(self):
+        doc = make_doc(
+            clusters=[
+                self._cluster(
+                    checks_run=["privileged-container", "privileged-container"]
+                )
+            ]
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("duplicate check", str(exc.exception))
+
+    def test_a_full_roster_validates(self):
+        doc = make_doc(
+            clusters=[self._cluster(checks_run=list(audit_report.audit_checks(AUDIT)))]
+        )
+        self.assertEqual(audit_report.validate_findings(doc, AUDIT), doc)
+
+    def test_a_partial_roster_validates_but_is_not_complete_coverage(self):
+        """A half-run audit publishes — it just may not call the fleet clean."""
+        doc = make_doc(
+            findings=[],
+            clusters=[self._cluster(checks_run=["privileged-container"])],
+        )
+        self.assertEqual(audit_report.validate_findings(doc, AUDIT), doc)
+        self.assertTrue(audit_report.coverage_gaps(doc))
+
+    def test_the_scope_table_records_how_much_of_the_roster_ran(self):
+        body = render_body(
+            make_doc(findings=[], clusters=[self._cluster()]), generated_at=NOW
+        )
+        self.assertIn("| Checks |", body)
+        self.assertIn("11/11", body)
+        self.assertNotIn("⚠", body)
+
+    def test_an_incomplete_cluster_is_flagged_in_the_scope_table(self):
+        body = render_body(
+            make_doc(
+                findings=[],
+                clusters=[self._cluster(checks_run=["privileged-container"])],
+            ),
+            generated_at=NOW,
+        )
+        self.assertIn("1/11 ⚠", body)
+
+    def test_every_stream_requires_its_own_roster(self):
+        """A compliance check named by the cost audit is still a typo."""
+        for audit_id in audit_report.AUDITS:
+            with self.subTest(audit=audit_id):
+                doc = make_doc(
+                    audit=audit_id,
+                    clusters=[self._cluster(checks_run=["privileged-container"])],
+                )
+                if audit_id == AUDIT:
+                    continue
+                with self.assertRaises(audit_report.ValidationError):
+                    audit_report.validate_findings(doc, audit_id)
 
 
 class TestPartialCoverageGating(HarnessTestCase):

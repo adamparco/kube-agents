@@ -92,7 +92,9 @@ still reproducing at `finish`, its pull request opens immediately instead of a w
 
 Enumerate the clusters in scope and inspect them **read-only** (`kubectl get/describe`,
 `gcloud ... describe/list`). For every deviation you intend to report, capture the exact command you
-ran and the output that proves it.
+ran and the output that proves it. Keep a per-cluster tally of which of your SOP's checks you have
+actually run as you go — `finish` requires it as `checks_run`, and reconstructing it afterwards from
+memory is how a check that never ran gets recorded as one that did.
 
 If a remediation is a declarative file, write that file **under the `workspace` directory `start`
 reported** and name its repo-relative path in the finding. The harness puts it on a branch of its
@@ -137,8 +139,9 @@ JSON, or `--audit` is not one of the five ids above. Exit 1 is fatal and means s
 ### Partial coverage
 
 `partial` is `true` exactly when the run could not speak for the whole fleet: any entry in
-`scope.skipped`, or any cluster carrying a `limitations` note. `coverage_gaps` says which, and why —
-so `partial` is `true` if and only if `coverage_gaps` is non-empty, and you can report from either.
+`scope.skipped`, any cluster carrying a `limitations` note, or any cluster whose `checks_run` is
+short of its SOP's roster. `coverage_gaps` says which, and why — so `partial` is `true` if and only
+if `coverage_gaps` is non-empty, and you can report from either.
 
 It does not mean "the description was truncated." A ledger too long for GitHub's body limit says so
 in its own body and still carries true totals in its title; the audit saw everything, so nothing
@@ -165,13 +168,35 @@ A partial run is never `[SILENT]`. Report the issue URL and say which clusters w
       {
         "name": "prod-us-east",
         "location": "us-east1",
-        "project": "acme-prod"
+        "project": "acme-prod",
+        "checks_run": [
+          "privileged-container",
+          "host-namespace",
+          "hostpath-mount",
+          "cluster-admin-binding",
+          "wildcard-rbac",
+          "netpol-missing",
+          "default-sa-automount",
+          "workload-identity-off",
+          "legacy-metadata",
+          "public-control-plane",
+          "podsecurity-gaps"
+        ]
       },
       {
         "name": "prod-autopilot",
         "location": "us-central1",
         "project": "acme-prod",
-        "limitations": "Autopilot: node-level checks 2.6 and 2.7 do not apply."
+        "checks_run": [
+          "cluster-admin-binding",
+          "wildcard-rbac",
+          "netpol-missing",
+          "default-sa-automount",
+          "workload-identity-off",
+          "public-control-plane",
+          "podsecurity-gaps"
+        ],
+        "limitations": "Autopilot: node-level checks 2.1-2.3 and 2.9 do not apply."
       }
     ],
     "skipped": [{ "cluster": "dr-west", "reason": "control plane unreachable" }]
@@ -210,6 +235,12 @@ field, and publishes nothing:
 - `audit` must equal the `--audit` argument. An audit may only write to its own ledger.
 - `scope.clusters` must be **non-empty**. An audit that enumerated nothing is a failure, not a clean
   run — if you could not list the fleet, say so loudly instead of reporting zero findings.
+- `checks_run` is **required on every cluster**: the list of checks that actually ran against it,
+  named by the backticked slug in the SOP heading that defines them (`netpol-missing`, not "2.6" and
+  not prose). An unknown slug, a duplicate, or a missing field is rejected, and so is an empty list
+  unless that cluster's `limitations` says why nothing ran. Enumerating a cluster and checking
+  nothing on it is not a clean cluster — it is an audit that did not happen, and without this field
+  the harness cannot tell the two apart. See [Scope, skipped, and limitations](#scope-skipped-and-limitations).
 - `id` is a stable slug, unique within the file, matching `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with
   no `..` run and no `.lock` suffix. Two rules ride on this. **Stability is what makes the delta
   work**: the same underlying problem must produce the same id on every run, or it will churn as
@@ -241,6 +272,21 @@ on a cluster you did audit gets suppressed along with it.
 
 `limitations` is optional, and non-empty when present. The rendered scope table grows a
 `limitations` column only when at least one cluster carries one.
+
+**`checks_run` is not optional, and it is what the scope table counts.** Every cluster carries the
+list of checks that ran against it; the table renders it as `7/11`, marked `⚠` where it falls short,
+on every run whether or not anything was missed — a column that only appears on bad days is a column
+nobody reads on good ones. A shortfall is a coverage gap in its own right: it makes the run
+`partial` exactly as an unreadable cluster does, is named in `coverage_gaps`, and so the ledger will
+not close on it. That is the point. A run that skipped eight of eleven checks and found nothing has
+not found nothing; it has not looked, and before this field existed it published as `CLEAN` and
+closed the ledger.
+
+Which means the one way to defeat all of this is to write a slug for a check you did not run. The
+harness cannot see the commands you issued, only the list you hand it, so an inflated `checks_run`
+converts a partial audit straight back into a false all-clear. Add each slug as its check completes,
+never in advance, and never round the list up to the roster because the SOP happens to define that
+many.
 
 ### `recommendation`
 
@@ -496,3 +542,6 @@ rewritten correctly. Treat it as `[SILENT]` — the issue carries the truth eith
 - **Never report a cluster you could not read as clean.** Put it in `scope.skipped`, or name what
   did not run in that cluster's `limitations`. Both make the run `partial`, which is the mechanism
   that stops the harness from closing fixes and retiring the ledger on evidence it never gathered.
+- **Never name a check in `checks_run` that you did not run.** It is the only claim in the document
+  the harness has to take on trust, and padding it turns every protection above back off: the run
+  stops being `partial`, the ledger closes, and a fleet nobody looked at publishes as clean.

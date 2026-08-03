@@ -56,7 +56,7 @@ Each job in `jobs.json` follows this schema:
     "expr": "20 6 * * *",
     "display": "20 6 * * *"
   },
-  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home and execute it exactly, using the fleet-audit skill to open and close the audit run. Reply with exactly [SILENT] when the fleet is clean.",
+  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 348 lines of it, before you run anything. Its eleven checks are section 2, lines 56-270, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
   "skills": ["fleet-audit"],
   "enabled": true,
   "deliver": "all"
@@ -65,7 +65,7 @@ Each job in `jobs.json` follows this schema:
 
 - **`id`** — stable identifier, referenced in observability and disable/enable ops. It outlives renames: `obtainability-audit` is now the Workload Reliability Audit, but the id stays put.
 - **`schedule.expr`** — standard 5-field cron in the pod's local time zone (UTC unless the pod's TZ is overridden).
-- **`prompt`** — verbatim message sent to the agent when the schedule fires. Governance jobs point at an SOP **relative to the profile home** (`governance/<sop>.md`), which is where `profile_scaffold.py` overlays the baked `/opt/platform-template/governance/` directory. An absolute `/opt/defaults/governance/...` path does not resolve — nothing is mounted there.
+- **`prompt`** — verbatim message sent to the agent when the schedule fires. Governance jobs point at an SOP **relative to the profile home** (`governance/<sop>.md`), which is where `profile_scaffold.py` overlays the baked `/opt/platform-template/governance/` directory. An absolute `/opt/defaults/governance/...` path does not resolve — nothing is mounted there. The five audit prompts also state how long their SOP is and which section holds the checks, because a read that stops early lands in the preamble and the run reports a clean fleet it never inspected; a test in `audit_report.py`'s suite re-derives both numbers from the file so a stale citation fails there rather than at 06:20. What the prompts deliberately do **not** restate is the `[SILENT]` rule — each SOP's closing section states it in full, qualifiers included, and a shorter version in the prompt would both lose the qualifiers and tell the run what its answer looks like before it decides what to check.
 - **`skills`** — optional array of skill names to preload. The five audits preload `fleet-audit`; `github-issue-resolver` preloads its namesake skill.
 - **`enabled`** — set to `false` to disable a job without deleting its entry.
 - **`deliver`** (optional) — controls chat delivery. `"all"` means every run reports back. It is set on all six enabled jobs, which is safe because each returns `[SILENT]` when it has nothing to say.

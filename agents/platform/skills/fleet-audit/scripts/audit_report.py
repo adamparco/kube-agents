@@ -52,17 +52,118 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 # Constants
 # --------------------------------------------------------------------------- #
 
+class AuditSpec(NamedTuple):
+    """What a stream is called, and every check its SOP defines.
+
+    `checks` is the roster: the backticked slug in each `####` check heading of
+    the stream's SOP, in SOP order. It exists so the harness can tell an audit
+    that *ran* from one that merely *finished*. Without it, "I evaluated eleven
+    checks against three clusters and found nothing" and "I read the first page
+    of the SOP, enumerated the fleet, and stopped" produce byte-identical
+    documents — both a populated `scope.clusters` and an empty `findings`, both
+    published as a confident all-clear. That is not hypothetical: it is how five
+    streams reported a clean fleet on a fleet that was not.
+
+    `test_check_rosters_match_the_sops` re-derives this from the SOP headings,
+    so a check added to an SOP without being added here fails CI rather than
+    becoming a check no run is ever required to perform.
+    """
+
+    title: str
+    checks: tuple[str, ...]
+
+
 # The audit streams allowed to own a ledger. An id not listed here is rejected
 # before any git/gh call: a typo must not silently open a sixth ledger stream.
 # The human names mirror the `name` of the matching watchdog in
 # agents/platform/cron/jobs.json — keep the two in step so the issue title and
 # the cron catalogue name the same thing.
-AUDITS: dict[str, str] = {
-    "compliance-audit": "Security & RBAC Posture Audit",
-    "security-patch-orchestrator": "Upgrade & Patch Readiness Audit",
-    "obtainability-audit": "Workload Reliability Audit",
-    "fleet-wide-cost-analysis": "Fleet Waste Audit",
-    "fleet-consistency-drift": "Fleet Consistency Drift Audit",
+AUDITS: dict[str, AuditSpec] = {
+    "compliance-audit": AuditSpec(
+        "Security & RBAC Posture Audit",
+        (
+            "privileged-container",
+            "host-namespace",
+            "hostpath-mount",
+            "cluster-admin-binding",
+            "wildcard-rbac",
+            "netpol-missing",
+            "default-sa-automount",
+            "workload-identity-off",
+            "legacy-metadata",
+            "public-control-plane",
+            "podsecurity-gaps",
+        ),
+    ),
+    "security-patch-orchestrator": AuditSpec(
+        "Upgrade & Patch Readiness Audit",
+        (
+            "master-behind",
+            "pool-skew",
+            "fleet-spread",
+            "no-channel",
+            "no-autoupgrade",
+            "no-autorepair",
+            "no-maintenance-window",
+            "blocking-exclusion",
+            "stale-image-type",
+            "no-notifications",
+        ),
+    ),
+    "obtainability-audit": AuditSpec(
+        "Workload Reliability Audit",
+        (
+            "no-requests",
+            "no-memory-limit",
+            "no-pdb",
+            "blocking-pdb",
+            "no-hpa",
+            "hpa-cannot-scale",
+            "rigid-scheduling",
+            "no-spread",
+            "probes",
+            "single-replica",
+        ),
+    ),
+    "fleet-wide-cost-analysis": AuditSpec(
+        "Fleet Waste Audit",
+        (
+            "overrequest",
+            "orphan-pv",
+            "unconsumed-pvc",
+            "unattached-disk",
+            "idle-address",
+            "orphan-lb",
+            "idle-nodepool",
+            "scaledown-blocked",
+            "terminal-pods",
+            "idle-namespace",
+        ),
+    ),
+    "fleet-consistency-drift": AuditSpec(
+        "Fleet Consistency Drift Audit",
+        (
+            "release-channel",
+            "shielded-nodes",
+            "secure-boot",
+            "integrity-monitoring",
+            "network-policy",
+            "private-nodes",
+            "private-endpoint",
+            "authorized-networks",
+            "logging-components",
+            "monitoring-components",
+            "managed-prometheus",
+            "binary-authorization",
+            "node-autoprovisioning",
+            "pool-autoscaling",
+            "intra-node-visibility",
+            "datapath-provider",
+            "label-keys",
+            "image-type",
+            "database-encryption",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")
@@ -432,7 +533,13 @@ def validate_audit_id(audit_id: str) -> str:
 
 
 def audit_name(audit_id: str) -> str:
-    return AUDITS[audit_id]
+    return AUDITS[audit_id].title
+
+
+def audit_checks(audit_id: str) -> tuple[str, ...]:
+    """The check roster the stream's SOP defines, in SOP order."""
+    spec = AUDITS.get(audit_id)
+    return spec.checks if spec else ()
 
 
 def findings_path_for(audit_id: str) -> str:
@@ -584,6 +691,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
             "scope.clusters: must be a non-empty list — an audit that enumerated "
             "no clusters is a failure, not a clean run"
         )
+    roster = audit_checks(audit_id)
+    roster_set = set(roster)
     audited_names: set[str] = set()
     for i, cluster in enumerate(clusters):
         if not isinstance(cluster, dict):
@@ -603,6 +712,54 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 f"scope.clusters[{i}].limitations",
                 allow_empty=False,
             )
+
+        # Which checks actually ran here. This is the field that makes an empty
+        # `findings` list mean something: without it, a run that evaluated every
+        # check and a run that evaluated none are the same document, and the
+        # harness publishes both as an all-clear.
+        #
+        # Absent is always a rejection. Empty is a rejection *unless* the cluster
+        # also explains itself in `limitations` — the consistency-drift audit has
+        # a real "I read it and compared nothing" state (a cohort below the size
+        # floor, a cluster under 24 hours old), and forcing a fabricated slug to
+        # satisfy the schema would corrupt the very record this field exists to
+        # keep. An explained zero is safe because it is still a coverage gap: the
+        # run goes partial, so the ledger cannot close and nothing is announced
+        # as resolved. What is refused is the *silent* zero, which is what
+        # published five clean reports on a fleet that was not.
+        checks_run = cluster.get("checks_run")
+        cluster_label = str(cluster.get("name", "")) or "this cluster"
+        if not isinstance(checks_run, list):
+            raise ValidationError(
+                f"scope.clusters[{i}].checks_run: required, must be a list naming "
+                "the checks this run actually executed against "
+                f"{cluster_label}. Zero checks on a cluster you could read is not "
+                "a clean result — it is an audit that did not run. The "
+                f"{audit_id} checks are: {', '.join(roster)}"
+            )
+        if not checks_run and not str(cluster.get("limitations", "")).strip():
+            raise ValidationError(
+                f"scope.clusters[{i}].checks_run: empty for {cluster_label}, which "
+                "claims the cluster was read and nothing was checked on it. That is "
+                "an audit that did not run, not a clean cluster. Name the checks you "
+                "ran, or — if nothing could run there — say why in that cluster's "
+                "limitations, or move it to scope.skipped with a reason. The "
+                f"{audit_id} checks are: {', '.join(roster)}"
+            )
+        seen_checks: set[str] = set()
+        for j, slug in enumerate(checks_run):
+            where = f"scope.clusters[{i}].checks_run[{j}]"
+            _require_str(slug, where, allow_empty=False)
+            name = str(slug)
+            if name not in roster_set:
+                raise ValidationError(
+                    f"{where}: {name!r} is not a check in the {audit_id} SOP. "
+                    "Name checks by the backticked slug in their heading, not by "
+                    f"section number or prose. Known checks: {', '.join(roster)}"
+                )
+            if name in seen_checks:
+                raise ValidationError(f"{where}: duplicate check {name!r}")
+            seen_checks.add(name)
 
     skipped = scope.get("skipped", [])
     if not isinstance(skipped, list):
@@ -780,23 +937,44 @@ def manifest_paths(findings: list[dict]) -> list[str]:
 def coverage_gaps(data: dict) -> list[str]:
     """Why this run cannot speak for the whole fleet, if it cannot.
 
-    Two different gaps, one consequence. A cluster in `scope.skipped` was never
-    read; a cluster carrying `limitations` was read but not fully checked.
-    Either way a finding's *absence* proves nothing, so the run must not treat
-    "absent from this document" as "fixed" — not in the delta it announces, not
-    in the remediation pull requests it closes, and not by retiring the ledger
-    and declaring the stream clean.
+    Three different gaps, one consequence. A cluster in `scope.skipped` was
+    never read; a cluster carrying `limitations` was read but not fully checked;
+    a cluster whose `checks_run` omits part of its SOP's roster was not fully
+    checked whether or not it admitted so in prose. Either way a finding's
+    *absence* proves nothing, so the run must not treat "absent from this
+    document" as "fixed" — not in the delta it announces, not in the remediation
+    pull requests it closes, and not by retiring the ledger and declaring the
+    stream clean.
+
+    The roster half is the one that catches the failure prose cannot. A run that
+    evaluates two of eleven checks and writes no `limitations` reads exactly like
+    a complete run; measured against the SOP's own roster it reads as what it is,
+    and the ledger stays open naming the nine checks nobody performed.
     """
     scope = data.get("scope") or {}
+    roster = audit_checks(str(data.get("audit") or ""))
     gaps: list[str] = []
     for entry in scope.get("skipped") or []:
         cluster = str(entry.get("cluster", "")).strip() or "(unnamed)"
         gaps.append(f"{cluster}: not audited — {entry.get('reason', 'no reason given')}")
     for cluster in scope.get("clusters") or []:
         limitation = str(cluster.get("limitations", "")).strip()
+        ran = {str(c) for c in (cluster.get("checks_run") or [])}
+        missing = [check for check in roster if check not in ran]
+        if not limitation and not missing:
+            continue
+        name = str(cluster.get("name", "")).strip() or "(unnamed)"
+        # One line per cluster, not one per gap: the same cluster explaining
+        # itself twice reads as two broken clusters in the ledger comment.
+        reasons: list[str] = []
+        if missing:
+            reasons.append(
+                f"{len(missing)} of {len(roster)} checks did not run "
+                f"({', '.join(missing)})"
+            )
         if limitation:
-            name = str(cluster.get("name", "")).strip() or "(unnamed)"
-            gaps.append(f"{name}: partially audited — {limitation}")
+            reasons.append(limitation)
+        gaps.append(f"{name}: partially audited — {'; '.join(reasons)}")
     return gaps
 
 
@@ -1912,41 +2090,52 @@ def _render_header(audit_id: str) -> list[str]:
 
 
 def _render_scope(
-    clusters: list[dict], skipped: list[dict], generated_at: datetime
+    clusters: list[dict],
+    skipped: list[dict],
+    generated_at: datetime,
+    audit_id: str = "",
 ) -> list[str]:
     """The scope tables, row-capped.
 
     A body with *zero* findings overflows without this cap: 1,200 audited plus
     1,200 skipped clusters render over 148,000 characters of table.
+
+    The `Checks` column is what makes an empty findings list readable. "Audited
+    3 clusters, 0 findings" is the same sentence whether eleven checks ran or
+    none did; "2/11" is not, and unlike the delta comment it stays in the body
+    for as long as the ledger is open.
     """
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     show_limitations = any(str(c.get("limitations", "")).strip() for c in clusters)
+    roster = audit_checks(audit_id)
 
     out = ["", "## Scope", "", f"Audited {len(clusters)} cluster(s) on {stamp}."]
+    header = "| Cluster | Location | Project |"
+    rule = "| ------- | -------- | ------- |"
+    if roster:
+        header += " Checks |"
+        rule += " ------ |"
     if show_limitations:
-        out += [
-            "",
-            "| Cluster | Location | Project | Limitations |",
-            "| ------- | -------- | ------- | ----------- |",
-        ]
-    else:
-        out += [
-            "",
-            "| Cluster | Location | Project |",
-            "| ------- | -------- | ------- |",
-        ]
+        header += " Limitations |"
+        rule += " ----------- |"
+    out += ["", header, rule]
     for cluster in clusters[:MAX_SCOPE_ROWS]:
         row = (
             f"| `{_cell(cluster.get('name', ''))}` "
             f"| {_cell(cluster.get('location', ''))} "
             f"| `{_cell(cluster.get('project', ''))}` "
         )
+        if roster:
+            ran = {str(c) for c in (cluster.get("checks_run") or [])}
+            complete = len(ran & set(roster))
+            flag = "" if complete == len(roster) else " ⚠"
+            row += f"| {complete}/{len(roster)}{flag} "
         if show_limitations:
             row += f"| {_cell(cluster.get('limitations', '')) or '—'} "
         out.append(row + "|")
     if len(clusters) > MAX_SCOPE_ROWS:
         remaining = len(clusters) - MAX_SCOPE_ROWS
-        columns = 4 if show_limitations else 3
+        columns = 3 + bool(roster) + bool(show_limitations)
         out.append(f"| _…and {remaining} more_ " + "|  " * (columns - 1) + "|")
 
     if skipped:
@@ -2130,7 +2319,7 @@ def render_issue_body(
     pr_urls = pr_urls or {}
 
     fixed: list[str] = _render_header(audit_id)
-    fixed += _render_scope(clusters, skipped, generated_at)
+    fixed += _render_scope(clusters, skipped, generated_at, audit_id)
     withheld_section = _render_withheld(list(withheld or []), findings)
 
     # Measure the footer with an empty delta block: each finding is separately

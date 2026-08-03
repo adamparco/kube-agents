@@ -37,7 +37,9 @@ gcloud container clusters get-credentials "$C" --location="$L" --project="$PROJE
 kubectl auth can-i list pods --all-namespaces
 ```
 
-Every cluster you actually query goes in `scope.clusters` as `{name, location, project}`. `scope.clusters` must be non-empty — if enumeration returns nothing or every cluster fails, do **not** emit an empty-scope file; stop and report the enumeration failure.
+Every cluster you actually query goes in `scope.clusters` as `{name, location, project, checks_run}`. `scope.clusters` must be non-empty — if enumeration returns nothing or every cluster fails, do **not** emit an empty-scope file; stop and report the enumeration failure.
+
+**`checks_run` is mandatory on every cluster, and it is the record of what you actually did.** List the backticked slug of each §2 check you ran against that cluster — `privileged-container`, `netpol-missing`, and so on — not the section number and not prose. The validator rejects a slug that is not one of the eleven, rejects the field being absent, and rejects an empty list unless that cluster's `limitations` says why nothing ran: a cluster you could reach but ran nothing against is not a clean cluster, it is an audit that did not happen, and it must never publish as an all-clear. Anything short of all eleven makes the run **partial**, exactly as a `limitations` note does — the ledger stays open, nothing is announced as resolved, and no remediation PR is closed. Add the slug when the check runs, not when you plan to run it.
 
 **The one-question scope rule.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; if some checks did not run there, name them in that cluster's `limitations`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding.
 
@@ -280,7 +282,9 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 
 ### 4. Emit findings.json
 
-Write the whole document to `findings_path` in one shot, with `audit: "compliance-audit"`, `scope.clusters` listing every cluster you queried — each carrying the `limitations` string §1 recorded for it, where there is one — and `scope.skipped` listing only the clusters you could not read. Self-check before writing:
+Write the whole document to `findings_path` in one shot, with `audit: "compliance-audit"`, `scope.clusters` listing every cluster you queried — each carrying the `checks_run` list §1 required and the `limitations` string §1 recorded for it, where there is one — and `scope.skipped` listing only the clusters you could not read. Self-check before writing:
+
+- Every cluster carries a non-empty `checks_run` naming the §2 checks that actually ran there, by slug. Never write the full eleven because the SOP lists eleven — write the ones you ran. An inflated `checks_run` is the one entry in this document that converts a partial audit back into a false all-clear, which is the exact failure the field exists to prevent.
 
 - Every finding has a non-empty `evidence.command` that is the literal command run. Drop anything else.
 - `id`s are unique in the file, re-derived by the §2 rule from the check's slug, and match the §2 charset — never copied from a previous run.
