@@ -23,7 +23,9 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
 - `pending_remediation_requests` lists finding ids a repo writer asked for with a `/remediate` comment on the ledger. Write a manifest for each one while you inspect (Step 4), or the promotion fails for want of a file. Each comment is answered once and only once — an acknowledgement listing every target and its outcome, or a single refusal with the reason (no write access, an id absent from the current document, a target that is not a `manifest`, or a command not written at the start of its own line and so never parsed as one) — with a hidden marker keeping yesterday's request from being answered again today.
 - `start` creates and resets no branch. There is no report branch.
 
-The helper owns every `git`/`gh` operation and renders the ledger issue body and every remediation PR body — **never hand-write an issue or PR body, never run `git commit`, `git push`, `gh issue create`, or `gh pr create` yourself.**
+The helper owns every `git`/`gh` operation and renders the ledger issue body and every remediation PR body — **never hand-write an issue or PR body, never run `git commit`, `git push`, `gh issue create`, `gh pr create`, or `gh issue comment` yourself.**
+
+**Never comment on the ledger yourself.** `/remediate` is a human reviewer's instruction to this harness, not a step in the audit: an agent that posts it — including when someone asks for a fix in chat — is authorizing its own pull request. `finish` ignores a `/remediate` from a machine account, so posting one achieves nothing but noise on the issue.
 
 ### 1. Enumerate the target fleet
 

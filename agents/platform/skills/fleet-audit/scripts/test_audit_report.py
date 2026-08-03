@@ -493,7 +493,16 @@ class TestRenderBody(unittest.TestCase):
     def test_body_explains_how_to_ask_for_a_remediation_pr(self):
         body = render_body(make_doc(), generated_at=NOW)
         self.assertIn("`/remediate <finding-id>`", body)
-        self.assertIn("write access", body)
+        self.assertIn("collaborator on this repository", body)
+
+    def test_body_tells_an_agent_reader_not_to_post_the_command(self):
+        # The audit agent reads this body, and on issue #29 it took the
+        # "comment `/remediate all`" line as an instruction to itself and
+        # followed it under its own App credentials. The affordance has to stay
+        # for human reviewers, so the body says who it is talking to.
+        body = render_body(make_doc(), generated_at=NOW)
+        self.assertIn("addressed to human reviewers", body)
+        self.assertIn("must never post that command itself", body)
 
     def test_body_names_no_staged_files(self):
         # The ledger is an issue: it has no diff, so it must never claim one.
@@ -3148,7 +3157,13 @@ class TestRemediateCommands(BaseTestCase):
         )
         self.assertEqual(targets, [])
         self.assertEqual(len(refusals), 1)
-        self.assertIn("write access", refusals[0]["reasons"][0])
+        reason = refusals[0]["reasons"][0]
+        self.assertIn("not recorded as a collaborator", reason)
+        self.assertIn("`authorAssociation: NONE`", reason)
+        # The refusal reports the association it read, not a permission it
+        # never queried. The old wording claimed the commenter "does not have
+        # write access", which was untrue of the App that tripped this path.
+        self.assertNotIn("does not have write access", reason)
         self.assertEqual(refusals[0]["comment_id"], "IC_1")
 
     def test_a_non_manifest_target_is_refused(self):
@@ -3301,6 +3316,110 @@ class TestRemediateCommands(BaseTestCase):
             ]
         )
         self.assertEqual(targets, ["netpol-missing"])
+
+
+class TestAMachineCannotAuthorizeItself(BaseTestCase):
+    """`/remediate` from a bot account, which is what happened on issue #29.
+
+    The audit agent read the ledger it had just written, took the header's
+    "comment `/remediate all`" as an instruction to itself, and posted it three
+    times under the App credentials it uses to open and merge pull requests.
+    The only thing between that and a self-authorized pull request was
+    `authorAssociation: NONE` — a field that happens to be empty for App
+    comments, not a decision anybody made.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.findings = [manifest_finding("netpol-missing", "a.yaml")]
+
+    def parse(self, comments):
+        return audit_report.parse_remediate_commands(comments, self.findings)
+
+    def bot(self, body="/remediate all", **kw):
+        kw.setdefault("login", "kube-agents-minty[bot]")
+        kw.setdefault("association", "NONE")
+        return comment(body, **kw)
+
+    def test_a_bot_login_is_recognised_as_a_machine(self):
+        self.assertTrue(audit_report.is_machine_author(self.bot()))
+
+    def test_a_typed_actor_is_recognised_even_without_the_suffix(self):
+        # The GraphQL struct `fetch_issue_comments` returns strips `[bot]` from
+        # the login, so the suffix alone is not a complete test.
+        for author in (
+            {"login": "minty", "__typename": "Bot"},
+            {"login": "minty", "is_bot": True},
+        ):
+            with self.subTest(author=author):
+                self.assertTrue(
+                    audit_report.is_machine_author(
+                        {"author": author, "authorAssociation": "NONE"}
+                    )
+                )
+
+    def test_the_harness_reading_its_own_comment_is_a_machine(self):
+        self.assertTrue(
+            audit_report.is_machine_author(
+                {
+                    "author": {"login": "minty"},
+                    "authorAssociation": "NONE",
+                    "viewerDidAuthor": True,
+                }
+            )
+        )
+
+    def test_an_operator_running_the_audit_under_their_own_token_is_not(self):
+        # `viewerDidAuthor` is true for a human who runs this audit with their
+        # own credentials. Their `/remediate` has to keep working, which is why
+        # the self-authored signal is paired with the missing association.
+        human = {
+            "author": {"login": "adamparco"},
+            "authorAssociation": "OWNER",
+            "viewerDidAuthor": True,
+        }
+        self.assertFalse(audit_report.is_machine_author(human))
+
+    def test_a_person_without_standing_is_not_mistaken_for_a_machine(self):
+        stranger = comment("/remediate all", association="NONE", login="drive-by")
+        self.assertFalse(audit_report.is_machine_author(stranger))
+
+    def test_a_bots_command_opens_nothing(self):
+        targets, _, accepted, _ = self.parse([self.bot()])
+        self.assertEqual(targets, [])
+        self.assertEqual(accepted, {})
+
+    def test_a_bots_command_is_ignored_in_silence(self):
+        # Refusing it would post a comment addressed to the bot that wrote it,
+        # which is one more comment for that bot to read tomorrow. Issue #29
+        # carries three such refusals, each talking to nobody.
+        _, refusals, _, _ = self.parse([self.bot()])
+        self.assertEqual(refusals, [])
+
+    def test_a_bot_is_not_answered_on_a_clean_run_either(self):
+        got = audit_report.unanswered_remediate_comments([self.bot()])
+        self.assertEqual(got, [])
+
+    def test_a_bot_contributes_no_pending_targets_at_start(self):
+        # Belt and braces: a bot user added as a collaborator would clear the
+        # association check that stopped the App.
+        collaborator_bot = self.bot("/remediate netpol-missing", association="MEMBER")
+        self.assertEqual(
+            audit_report.pending_remediate_targets([collaborator_bot]), []
+        )
+
+    def test_a_collaborator_bot_is_still_refused_promotion(self):
+        collaborator_bot = self.bot("/remediate netpol-missing", association="MEMBER")
+        targets, refusals, _, _ = self.parse([collaborator_bot])
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_person_is_unaffected_by_the_gate(self):
+        targets, refusals, _, _ = self.parse(
+            [comment("/remediate netpol-missing", association="MEMBER")]
+        )
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
 
 
 class TestMarkers(BaseTestCase):

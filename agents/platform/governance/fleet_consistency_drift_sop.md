@@ -256,6 +256,7 @@ Worked example, for a 4.4 network-policy outlier:
 - **No external baseline.** No blueprint, standards document, CMDB, Terraform state, Config Sync repo, BigQuery, or Prometheus. If the fleet cannot tell you what normal looks like, there is no finding.
 - **No delegation.** Do not create kanban cards for Cluster Agents; this audit reads the control plane itself and completes in one session.
 - **No hand-written git or GitHub work.** `audit_report.py` owns the ledger issue, every remediation branch, commit, push, and pull request, and every body, label, and timestamp. Never call `gh issue create` or `gh pr create`; this stream has exactly one ledger issue and never a second.
+- **Never comment on the ledger yourself.** `/remediate` is a human reviewer's instruction to this harness, not a step in the audit: an agent that posts it — including when someone asks for a fix in chat — is authorizing its own pull request. `finish` ignores a `/remediate` from a machine account, so posting one achieves nothing but noise on the issue.
 - **No unreproducible findings.** If you cannot produce the literal command that shows the value, the finding does not exist.
 - **No invented field paths, label keys, or standards.** Confirm every path against real `--format=json` output and derive every expectation from the majority.
 - **No findings below the floor.** Fewer than three comparable clusters, or a consensus under two-thirds, means silence — an audit that calls a two-cluster disagreement "drift" gets switched off within a week, and then it protects nothing.
