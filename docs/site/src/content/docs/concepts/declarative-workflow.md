@@ -47,7 +47,7 @@ What it publishes has two tiers: a durable report that is always there, and — 
 
 ### Tier 1 — the ledger issue
 
-Each audit stream owns exactly one **GitHub issue**, rewritten in place on every run and labelled `agent:audit`, `audit:<audit-id>`, and `severity:<highest severity present>`. Its title is generated (`[audit] <human name> — <n> findings (<c> critical)`), and its body carries the scope table, a findings table with a state column, and per-finding detail: evidence, impact, recommendation, remediation, and a link to that finding's remediation PR where one exists.
+Each audit stream owns exactly one **GitHub issue**, rewritten in place on every run and labelled `agent:audit`, `audit:<audit-id>`, and `severity:<highest severity present>`. Its title is generated (`[audit] <human name> — <n> findings (<c> critical)`), and its body carries the scope table, a findings table with a state column whose every row links to the finding it names, and per-finding detail: evidence, impact, the finding's own id, recommendation, remediation, and a link to that finding's remediation PR where one exists.
 
 A run that finds nothing **closes the issue as completed**, and closes any remediation PRs still open for the stream. That is the point of the shape: a closed issue reads as _done_.
 

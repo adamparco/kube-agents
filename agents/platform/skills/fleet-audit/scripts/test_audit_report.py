@@ -2092,6 +2092,129 @@ class TestRenderBudget(BaseTestCase):
 
 
 # --------------------------------------------------------------------------- #
+# The index ↔ detail link
+# --------------------------------------------------------------------------- #
+
+
+class TestFindingAnchors(BaseTestCase):
+    """The index is for acting on findings, so a row has to reach its detail.
+
+    Before this, the id column was inert text and the detail block named its id
+    only inside an HTML comment — invisible in the rendered issue. A reader who
+    had just finished a detail block and wanted to comment `/remediate <id>`
+    had to scroll back to the table and match the row by cluster and severity.
+    """
+
+    ANCHOR_RE = re.compile(r'<a id="([^"]+)"></a>')
+    HREF_RE = re.compile(r"\]\(#([^)]+)\)")
+
+    def body(self, findings, **kwargs):
+        states = {str(f["id"]): audit_report.STATE_OPEN for f in findings}
+        states.update(kwargs.pop("states", {}))
+        return render_body(
+            make_doc(findings=findings),
+            generated_at=NOW,
+            states=states,
+            **kwargs,
+        )
+
+    def test_every_index_row_reaches_an_anchor_that_exists(self):
+        findings = [
+            make_finding(fid="a-crit", severity="critical"),
+            make_finding(fid="b-major", severity="major"),
+        ]
+        body = self.body(findings)
+        hrefs = set(self.HREF_RE.findall(body))
+        anchors = set(self.ANCHOR_RE.findall(body))
+        # Every id is reachable, and no href points at a target that is not
+        # in the body — a dangling fragment silently does nothing on GitHub.
+        for finding in findings:
+            self.assertIn(audit_report._anchor_id(finding["id"]), anchors)
+        self.assertEqual(hrefs - anchors, set())
+
+    def test_the_detail_block_names_its_own_id_visibly(self):
+        # Visibly: not in the HTML comment, which renders to nothing. This is
+        # the string an operator retypes after `/remediate`.
+        rendered = "\n".join(audit_report.render_finding(make_finding(fid="f-1")))
+        without_comments = re.sub(r"<!--.*?-->", "", rendered, flags=re.S)
+        self.assertIn("`f-1`", without_comments)
+
+    def test_the_anchor_does_not_break_title_recovery(self):
+        """FINDING_MARKER_RE runs to end of line.
+
+        Putting the anchor on the heading instead of above it would stop the
+        regex matching, and the failure would surface a run later as a resolved
+        finding the delta comment could not name.
+        """
+        findings = [make_finding(fid="f-1", title="A real title")]
+        titles = audit_report.parse_finding_titles(self.body(findings))
+        self.assertEqual(titles, {"f-1": "A real title"})
+
+    def test_a_recovered_title_carries_no_markup(self):
+        title = audit_report.parse_finding_titles(
+            self.body([make_finding(fid="f-1", title="A real title")])
+        )["f-1"]
+        self.assertNotIn("<a", title)
+        self.assertNotIn("href", title)
+
+
+class TestIndexOverhead(BaseTestCase):
+    """The index is reserved out of the budget, not charged to a finding.
+
+    It replaced a flat per-row allowance of 160 characters that a real id had
+    already outgrown: ids run to 100 characters and the state cell can carry a
+    full pull request URL. Under-reserving spends budget the findings were
+    promised, and the body only fails once it crosses GitHub's hard limit.
+    """
+
+    def rendered_table(self, body):
+        """The contiguous index block only.
+
+        Stopping at the first non-row line matters: the check-evidence appendix
+        further down the body is also a Markdown table, and sweeping its rows in
+        would measure this reservation against text it does not cover.
+        """
+        lines = body.splitlines()
+        start = lines.index("| Finding | Severity | Cluster | State |")
+        rows = []
+        for line in lines[start:]:
+            if not line.startswith("|"):
+                break
+            rows.append(line)
+        return "\n".join(rows)
+
+    def test_the_reservation_covers_what_the_table_actually_costs(self):
+        # Worst realistic row: a 100-character id (the charset ceiling) and a
+        # state cell carrying a pull request URL.
+        fid = "f" + "-long" * 19 + "-end"
+        self.assertLessEqual(len(fid), 100)
+        findings = [
+            make_finding(fid=f"{fid[:95]}-{i:03d}", severity="critical")
+            for i in range(10)
+        ]
+        states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
+        urls = {
+            f["id"]: "https://github.com/an-org/a-repository/pull/12345"
+            for f in findings
+        }
+        body = render_body(
+            make_doc(findings=findings),
+            generated_at=NOW,
+            states=states,
+            pr_urls=urls,
+        )
+        reserved = audit_report.index_overhead(findings, states, urls)
+        self.assertGreaterEqual(reserved, len(self.rendered_table(body)))
+
+    def test_the_reservation_bounds_a_table_that_hits_the_row_cap(self):
+        findings = bulk_findings(audit_report.MAX_DELTA_ROWS + 20)
+        states = {f["id"]: audit_report.STATE_OPEN for f in findings}
+        reserved = audit_report.index_overhead(findings, states, {})
+        body = render_body(make_doc(findings=findings), generated_at=NOW, states=states)
+        self.assertGreaterEqual(reserved, len(self.rendered_table(body)))
+
+
+# --------------------------------------------------------------------------- #
 # Schema — recommendation, limitations, and the finding-id charset
 # --------------------------------------------------------------------------- #
 

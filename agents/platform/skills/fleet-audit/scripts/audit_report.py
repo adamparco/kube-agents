@@ -2210,6 +2210,67 @@ def _finding_sort_key(finding: dict) -> tuple:
     )
 
 
+def _anchor_id(fid: str) -> str:
+    """The in-page anchor for a finding's detail block.
+
+    GitHub prefixes every id in user content with `user-content-`; emitting the
+    prefix ourselves is what makes the href we write match the id that survives
+    sanitisation. `FINDING_ID_RE` already confines an id to `[a-z0-9._-]`, so
+    there is nothing here to escape for either an attribute or a fragment.
+    """
+    return f"user-content-finding-{fid}"
+
+
+def _index_row(finding: dict, state: str, pr_url: str | None) -> str:
+    """One row of the findings index.
+
+    Shared with `index_overhead` rather than duplicated, because that estimate
+    is what reserves this table's space out of the body budget: a row that
+    renders wider than it was measured spends budget the findings were
+    promised, and the two drifting apart is not visible until a body crosses
+    GitHub's limit and publishes nothing.
+    """
+    fid = str(finding.get("id", ""))
+    label = STATE_LABELS.get(state, state)
+    # The id is the string an operator retypes after `/remediate`, so the cell
+    # keeps it verbatim and spends its link on reaching the detail block.
+    # Verbatim holds because MAX_CELL_CHARS (120) is above the 100-character
+    # ceiling FINDING_ID_RE puts on an id — `_cell` can never clip one to an
+    # ellipsis that would then be uncopyable.
+    cell = f"[`{_cell(fid)}`](#{_anchor_id(fid)})"
+    return (
+        f"| {cell} | {_cell(str(finding.get('severity', '')))} "
+        f"| `{_cell(_ident(str(finding.get('cluster', ''))))}` "
+        f"| {label}{f' ({pr_url})' if pr_url else ''} |"
+    )
+
+
+def index_overhead(
+    findings: list[dict],
+    states: dict[str, str],
+    pr_urls: dict[str, str],
+) -> int:
+    """What the findings index will cost, measured rather than guessed.
+
+    The index is not charged to any single finding, so it has to be reserved up
+    front — but the reservation cannot know the final selection, since selection
+    is what the reservation is an input to. It does not need to: the rendered
+    set is always a prefix of the sorted order, so the first `MAX_DELTA_ROWS`
+    sorted findings bound the table whatever the budget later admits.
+
+    This replaced a flat per-row allowance that a real finding id had already
+    outgrown — ids run to 100 characters and a state cell carries a full pull
+    request URL, so the table could quietly cost twice what was set aside.
+    """
+    measured = 0
+    for finding in sort_findings(findings)[:MAX_DELTA_ROWS]:
+        fid = str(finding.get("id", ""))
+        row = _index_row(finding, states.get(fid, STATE_OPEN), pr_urls.get(fid))
+        measured += len(row) + 1  # + the newline joining it to the next row
+    # Header, separator, the blank line above, and the overflow line below.
+    return measured + 200
+
+
 def render_finding(
     finding: dict, *, state: str | None = None, pr_url: str | None = None
 ) -> list[str]:
@@ -2226,9 +2287,23 @@ def render_finding(
     where = f"`{cluster}`"
     where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
 
-    lines = [f"#### {title} <!-- finding:{fid} -->", ""]
+    # The anchor is a line of its own *above* the heading rather than markup
+    # appended to it. FINDING_MARKER_RE matches the heading through to end of
+    # line, so anything after the comment stops it matching — and that regex is
+    # how a resolved finding's title is recovered from the previous body once
+    # the finding is gone from findings.json.
+    lines = [
+        f'<a id="{_anchor_id(fid)}"></a>',
+        "",
+        f"#### {title} <!-- finding:{fid} -->",
+        "",
+    ]
     lines.append(f"- **Where:** {where} — `{obj}`")
     lines.append(f"- **Impact:** {clip_text(finding.get('impact', ''), MAX_TEXT_CHARS)}")
+    # The id is repeated here, not left to the index alone: it is the string
+    # `/remediate` takes, and the decision to ask for a fix is made at the
+    # bottom of this block, well out of sight of the row that names it.
+    lines.append(f"- **Finding id:** `{fid}`")
     if state:
         label = STATE_LABELS.get(state, state)
         suffix = f" — {pr_url}" if pr_url else ""
@@ -2487,13 +2562,8 @@ def _render_findings(
         ]
         for finding in rendered[:MAX_DELTA_ROWS]:
             fid = str(finding.get("id", ""))
-            state = states.get(fid, STATE_OPEN)
-            label = STATE_LABELS.get(state, state)
-            url = pr_urls.get(fid)
             out.append(
-                f"| `{_cell(fid)}` | {_cell(str(finding.get('severity', '')))} "
-                f"| `{_cell(_ident(str(finding.get('cluster', ''))))}` "
-                f"| {label}{f' ({url})' if url else ''} |"
+                _index_row(finding, states.get(fid, STATE_OPEN), pr_urls.get(fid))
             )
         if len(rendered) > MAX_DELTA_ROWS:
             out.append(
@@ -2701,7 +2771,7 @@ def render_issue_body(
     if states:
         # The state index is one row per rendered finding, capped, and is not
         # part of any single finding's charged cost.
-        overhead += MAX_DELTA_ROWS * 160 + 200
+        overhead += index_overhead(findings, states, pr_urls)
 
     findings_lines, omitted = _render_findings(
         findings,
