@@ -17,10 +17,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import credential_proxy
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
     AgentAPIProxyHandler,
     CommandExecutor,
+    CredentialProxyHandler,
     GoogleChatRelay,
     Policy,
     SlackRelay,
@@ -200,6 +202,278 @@ class PolicyTest(unittest.TestCase):
 
     def test_allows_supported_command(self):
         self.assertIsNone(self.policy.blocked_by(["kubectl", "get", "pods"]))
+
+
+class GitLeaseGateTest(unittest.TestCase):
+    """The floor under the shared PersistentVolumeClaim.
+
+    Containment to the workspace keeps agents off the sidecar's filesystem; it
+    says nothing about keeping them off each other. `submit-suggestion` ran
+    `checkout -b` and `push -f` inside a clone a fleet audit was midway through,
+    because the clone was a single directory every agent shared. Skills now take
+    a lease and get a private tree under it, and this is what stops a skill that
+    does not from mutating one anyway.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def executor(self, **environment):
+        with mock.patch.dict(os.environ, environment):
+            return CommandExecutor(
+                timeout_seconds=5, max_output_bytes=1024, state_dir=self.temp_dir.name
+            )
+
+    def leased(self, executor, lease="compliance-audit", repo="acme__fleet"):
+        """A workspace laid out the way `gitops_workspace` lays one out."""
+        holder = executor.workspace_dir / "gitops" / lease
+        workspace = holder / repo
+        workspace.mkdir(parents=True, exist_ok=True)
+        (holder / ".lease").write_text(
+            json.dumps({"lease": lease, "owner": "fleet-audit"}), encoding="utf-8"
+        )
+        return workspace
+
+    def test_a_mutating_verb_inside_a_lease_is_allowed(self):
+        executor = self.executor()
+        workspace = self.leased(executor)
+        for argv in (
+            ["git", "commit", "-m", "remediate netpol"],
+            ["git", "add", "clusters/prod/netpol.yaml"],
+            ["git", "checkout", "-B", "fleet-audit/compliance", "origin/main"],
+            ["git", "push", "--force-with-lease", "origin", "fleet-audit/compliance"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(executor.git_lease_violation(argv, str(workspace)))
+
+    def test_a_subdirectory_of_the_lease_is_still_inside_it(self):
+        # The agent `cd`s into the manifests it is editing.
+        executor = self.executor()
+        workspace = self.leased(executor)
+        nested = workspace / "clusters" / "prod"
+        nested.mkdir(parents=True)
+        self.assertIsNone(
+            executor.git_lease_violation(["git", "commit", "-m", "x"], str(nested))
+        )
+
+    def test_a_mutating_verb_outside_every_lease_is_refused(self):
+        # The incident, reduced: an agent that skipped the workspace step and
+        # ran git wherever its shell happened to be.
+        executor = self.executor()
+        self.leased(executor)
+        violation = executor.git_lease_violation(
+            ["git", "commit", "--allow-empty", "-m", "x"], str(executor.workspace_dir)
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn(".lease", violation)
+        self.assertIn("submit_suggestion.py prepare", violation)
+
+    def test_the_legacy_shared_clone_is_no_longer_writable(self):
+        # `/opt/data/gitops/<owner>__<name>` — the flat directory every agent
+        # used to share. It survives an upgrade on disk; it must not survive as
+        # a place to commit.
+        executor = self.executor()
+        legacy = executor.workspace_dir / "gitops" / "acme__fleet"
+        (legacy / ".git").mkdir(parents=True)
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "commit", "-m", "x"], str(legacy))
+        )
+
+    def test_read_verbs_are_untouched(self):
+        # A denylist, not a read-only allowlist: an unfamiliar read verb failing
+        # closed would be a worse outcome than the race this closes.
+        executor = self.executor()
+        unleased = str(executor.workspace_dir)
+        for argv in (
+            ["git", "status"],
+            ["git", "diff", "--stat"],
+            ["git", "log", "-1"],
+            ["git", "show", "HEAD"],
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", "fetch", "--prune", "origin"],
+            ["git", "config", "user.name", "platform-agent"],
+            ["git", "ls-files"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(executor.git_lease_violation(argv, unleased))
+
+    def test_clone_is_allowed_at_the_lease_root(self):
+        # `ensure_workspace` runs it one directory above a tree that does not
+        # exist yet, so there is nothing there to damage — and the `.lease` is
+        # written first, so the directory is leased even then.
+        executor = self.executor()
+        holder = executor.workspace_dir / "gitops" / "t_card"
+        holder.mkdir(parents=True)
+        self.assertIsNone(
+            executor.git_lease_violation(
+                ["git", "clone", "--quiet", "https://github.com/acme/fleet", "x"],
+                str(holder),
+            )
+        )
+
+    def test_a_dash_c_redirect_out_of_the_lease_is_refused(self):
+        # git applies `-C` before running the subcommand, so a check that only
+        # read `cwd` would be checking a directory the command never touches.
+        executor = self.executor()
+        workspace = self.leased(executor)
+        escape = executor.workspace_dir / "profiles"
+        escape.mkdir(parents=True, exist_ok=True)
+        for argv in (
+            ["git", "-C", "../../profiles", "commit", "-m", "x"],
+            ["git", "-C", str(escape), "checkout", "main"],
+            ["git", "-C=../..", "reset", "--hard"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(
+                    executor.git_lease_violation(argv, str(workspace))
+                )
+
+    def test_a_dash_c_redirect_into_a_lease_is_allowed(self):
+        executor = self.executor()
+        workspace = self.leased(executor)
+        self.assertIsNone(
+            executor.git_lease_violation(
+                ["git", "-C", str(workspace), "commit", "-m", "x"],
+                str(executor.workspace_dir),
+            )
+        )
+
+    def test_a_global_flag_does_not_hide_the_subcommand(self):
+        # `audit_report.py` issues `git --literal-pathspecs add …`.
+        executor = self.executor()
+        self.assertIsNotNone(
+            executor.git_lease_violation(
+                ["git", "--literal-pathspecs", "add", "manifest.yaml"],
+                str(executor.workspace_dir),
+            )
+        )
+
+    def test_a_flag_value_is_not_mistaken_for_a_verb(self):
+        # `-c` consumes the next argument; reading it as the subcommand would
+        # make the gate skip a real `commit`.
+        executor = self.executor()
+        self.assertIsNotNone(
+            executor.git_lease_violation(
+                ["git", "-c", "commit.gpgsign=false", "commit", "-m", "x"],
+                str(executor.workspace_dir),
+            )
+        )
+
+    def test_a_directory_outside_the_workspace_says_so(self):
+        executor = self.executor()
+        violation = executor.git_lease_violation(["git", "commit", "-m", "x"], "/etc")
+        self.assertIn("outside the shared workspace", violation)
+
+    def test_no_working_directory_at_all_is_refused(self):
+        # The pre-lease `submit_suggestion.py` sent none, and the sidecar's
+        # default is the workspace root, which holds no lease.
+        executor = self.executor()
+        self.assertIsNotNone(
+            executor.git_lease_violation(["git", "push", "-f", "origin", "x"], None)
+        )
+
+    def test_other_executables_are_not_this_gates_business(self):
+        executor = self.executor()
+        for argv in (
+            ["gh", "pr", "create", "--title", "t"],
+            ["kubectl", "apply", "-f", "manifest.yaml"],
+            ["gcloud", "container", "clusters", "list"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(
+                    executor.git_lease_violation(argv, str(executor.workspace_dir))
+                )
+
+    def test_the_gate_can_be_switched_off(self):
+        # The rollback an operator reaches for when a skill that has not been
+        # migrated needs to keep working without a new image.
+        for value in ("0", "false", "no", "off", "OFF"):
+            with self.subTest(value=value):
+                executor = self.executor(CREDENTIAL_PROXY_REQUIRE_GIT_LEASE=value)
+                self.assertIsNone(
+                    executor.git_lease_violation(
+                        ["git", "commit", "-m", "x"], str(executor.workspace_dir)
+                    )
+                )
+
+    def test_the_gate_is_on_by_default(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CREDENTIAL_PROXY_REQUIRE_GIT_LEASE", None)
+            self.assertTrue(self.executor().require_git_lease)
+
+    def test_the_marker_name_matches_the_one_gitops_workspace_writes(self):
+        # Two constants in two modules that must not drift: renaming one alone
+        # locks every skill out of git.
+        import gitops_workspace
+
+        self.assertEqual(credential_proxy.GIT_LEASE_MARKER, gitops_workspace.LEASE_FILENAME)
+
+
+class GitLeaseGateWiringTest(unittest.TestCase):
+    """The gate as the agent meets it — over HTTP, through /v1/exec."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(
+            json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8"
+        )
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+        )
+        CredentialProxyHandler.max_request_bytes = 65536
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post(self, payload):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_an_unleased_commit_comes_back_as_a_policy_block(self):
+        # The shim renders `SECURITY_POLICY_BLOCKED` as a refusal the agent can
+        # read and act on, rather than an unexplained proxy failure.
+        workspace = CredentialProxyHandler.executor.workspace_dir
+        status, body = self.post(
+            {"argv": ["git", "commit", "-m", "x"], "cwd": str(workspace)}
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("blocked", body["status"])
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual("git.workspace.lease", body["rule"])
+        self.assertIn("audit_report.py start", body["message"])
+
+    def test_a_leased_commit_reaches_the_executor(self):
+        workspace = (
+            CredentialProxyHandler.executor.workspace_dir / "gitops" / "t_card"
+        )
+        (workspace / "acme__fleet").mkdir(parents=True)
+        (workspace / ".lease").write_text('{"lease": "t_card"}', encoding="utf-8")
+        status, body = self.post(
+            {
+                "argv": ["git", "status", "--porcelain"],
+                "cwd": str(workspace / "acme__fleet"),
+            }
+        )
+        # git runs and fails on "not a repository" — what matters is that the
+        # gate let it through rather than answering 403 itself.
+        self.assertEqual(200, status)
+        self.assertEqual("completed", body["status"])
 
 
 class CommandExecutorTest(unittest.TestCase):

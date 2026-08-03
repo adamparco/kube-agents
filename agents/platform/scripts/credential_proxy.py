@@ -577,6 +577,65 @@ def read_current_context(text: str) -> str | None:
 DEFAULT_GIT_AUTHOR_NAME = "kube-agents platform agent"
 DEFAULT_GIT_AUTHOR_EMAIL = "platform-agent@kube-agents.invalid"
 
+# The marker `gitops_workspace` drops in a leased workspace. The two names must
+# agree: renaming one without the other locks every skill out of git.
+GIT_LEASE_MARKER = ".lease"
+
+# git subcommands that write a working tree or a remote ref. Anything here is
+# refused unless it runs inside a leased workspace, because the pod runs many
+# agents against one shared volume and these are the verbs with which one agent
+# destroys another's work — the incident that prompted the rule was
+# `submit-suggestion` running `checkout -b` and `push -f` inside the clone a
+# fleet audit was midway through.
+#
+# A denylist rather than a read-only allowlist, deliberately. The set of verbs
+# that can mutate a tree is closed and well known; the set of read verbs is not,
+# and a new one silently failing closed would be a worse outcome than the race
+# this closes. `clone` is absent on purpose: it runs at the lease root, one
+# directory above the tree it is about to create, and it cannot damage a tree
+# that does not exist yet. `fetch`, `config`, `remote` and every read verb are
+# likewise untouched.
+GIT_MUTATING_SUBCOMMANDS = frozenset(
+    {
+        "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean",
+        "commit", "merge", "mv", "push", "rebase", "reset", "restore", "revert",
+        "rm", "stash", "switch", "tag", "update-ref", "worktree",
+    }
+)
+
+# git's own global options, split by whether they consume the next argument.
+# Needed to find the subcommand in `git --literal-pathspecs add …` (which
+# audit_report issues) without mistaking a flag for a verb.
+_GIT_GLOBAL_WITH_VALUE = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
+)
+
+
+def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
+    """The subcommand in `argv`, plus every directory its `-C` flags select.
+
+    `-C` is returned rather than ignored because git applies it cumulatively
+    before running the subcommand: `git -C /elsewhere commit` executes nowhere
+    near the working directory the caller reported, so a containment check that
+    only looked at `cwd` would be checking the wrong path.
+    """
+    directories: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if not token.startswith("-"):
+            return token, directories
+        name, sep, inline = token.partition("=")
+        if name == "-C":
+            if sep:
+                directories.append(inline)
+            elif index + 1 < len(argv):
+                directories.append(argv[index + 1])
+        if name in _GIT_GLOBAL_WITH_VALUE and not sep:
+            index += 1
+        index += 1
+    return None, directories
+
 
 class CommandExecutor:
     ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")
@@ -591,6 +650,12 @@ class CommandExecutor:
         self.workspace_dir = Path(
             os.getenv("CREDENTIAL_PROXY_WORKSPACE_ROOT", str(self.state_dir / "workspace"))
         ).resolve()
+        # On by default; the escape hatch exists so an operator can unblock a
+        # skill that has not been migrated to leases yet without shipping a new
+        # image. See `git_lease_violation`.
+        self.require_git_lease = os.getenv(
+            "CREDENTIAL_PROXY_REQUIRE_GIT_LEASE", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
         self.tmp_dir = self.state_dir / "tmp"
         self.config_dir = self.home_dir / ".config"
         self.cache_dir = self.home_dir / ".cache"
@@ -750,6 +815,63 @@ class CommandExecutor:
 
     def _within_workspace(self, candidate: Path) -> bool:
         return candidate == self.workspace_dir or self.workspace_dir in candidate.parents
+
+    def _lease_holder(self, candidate: Path) -> Path | None:
+        """The nearest ancestor of `candidate` that holds a lease marker."""
+        for directory in (candidate, *candidate.parents):
+            if not self._within_workspace(directory):
+                break
+            try:
+                if (directory / GIT_LEASE_MARKER).is_file():
+                    return directory
+            except OSError:
+                break
+        return None
+
+    def git_lease_violation(self, argv: list[str], cwd: str | None) -> str | None:
+        """Why this git command may not run here, or None if it may.
+
+        The pod runs many agents against one PersistentVolumeClaim. Containment
+        to `/opt/data` keeps them off the sidecar's filesystem but says nothing
+        about keeping them off *each other*, and the shared clone that used to
+        sit at the workspace root was a directory every agent wrote in at once.
+        Skills now take a lease and get a private clone under it; this is the
+        floor that stops a skill which does not from mutating a tree anyway.
+
+        It is a floor and not an ownership check. The client sends argv and a
+        working directory — never a caller identity — so the proxy can tell that
+        a push is happening inside *some* lease but not whose. Ownership is
+        checked by the skill (`gitops_workspace.assert_lease_owner`), which is
+        the only layer that knows which lease it holds.
+        """
+        if not self.require_git_lease:
+            return None
+        if not argv or Path(argv[0]).name != "git":
+            return None
+        subcommand, redirects = _git_plan(argv)
+        if subcommand not in GIT_MUTATING_SUBCOMMANDS:
+            return None
+
+        candidate = Path(cwd).resolve() if cwd else self.workspace_dir
+        # `-C` is applied the way git applies it: each one relative to the last.
+        for redirect in redirects:
+            candidate = (candidate / redirect).resolve()
+
+        if not self._within_workspace(candidate):
+            return (
+                f"`git {subcommand}` would run in {candidate}, outside the shared "
+                "workspace."
+            )
+        if self._lease_holder(candidate) is None:
+            return (
+                f"`git {subcommand}` is only allowed inside a leased GitOps "
+                f"workspace, and {candidate} is not one (no {GIT_LEASE_MARKER} in "
+                "it or any directory above it). Other agents share this volume: "
+                "run the skill's workspace step — `audit_report.py start` for a "
+                "fleet audit, `submit_suggestion.py prepare` for a suggestion — "
+                "and work in the directory it prints."
+            )
+        return None
 
     def _workspace_kubeconfig(self, kubeconfig: str) -> Path:
         """Hold a caller-supplied kubeconfig path to the shared workspace.
@@ -1111,6 +1233,24 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": rule.rule_id,
                     "message": rule.message,
+                },
+            )
+            return
+
+        # Not a policy rule: the policy matches on argv alone, and this refusal
+        # turns on the working directory as well.
+        violation = self.executor.git_lease_violation(argv, cwd)
+        if violation is not None:
+            LOGGER.warning(
+                "git lease refused request_id=%s cwd=%s", request_id, cwd
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": "git.workspace.lease",
+                    "message": violation,
                 },
             )
             return

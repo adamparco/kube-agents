@@ -39,11 +39,14 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
-# The shared scripts dir holds github_token_refresh (see docker-entrypoint.sh:
-# executable scripts are shared across profiles, not copied per-profile). The
-# import itself is lazy so `--dry-run` works on a dev machine with no sandbox.
+# The shared scripts dir holds github_token_refresh and gitops_workspace (see
+# docker-entrypoint.sh: executable scripts are shared across profiles, not
+# copied per-profile). The import itself is lazy so `--dry-run` works on a dev
+# machine with no sandbox. The third entry is the same directory in a source
+# checkout, where nothing has been staged into /opt.
 sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
+sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -2654,64 +2657,24 @@ def refresh_credentials(repo: str | None = None) -> None:
 
 SETTINGS_PATH = os.environ.get("FLEET_AUDIT_SETTINGS") or "/opt/data/SETTINGS.md"
 
-# "- **Git Repo:** https://github.com/owner/repo.git". The operator writes this
-# line into SETTINGS.md from the PlatformAgent CR (see
-# k8s-operator/internal/controller/platformagent_manifests.go), and writes the
-# literal `None` when the CR leaves it unset.
-SETTINGS_REPO_RE = re.compile(r"^\s*[-*]?\s*\**Git Repo:\**\s*(\S+)\s*$", re.M)
 
-
+# Both of these live in `gitops_workspace` now, because `submit-suggestion`
+# needs the same answer and a third copy of the SETTINGS.md parser is how the
+# skills start disagreeing about which repository they are writing to. They stay
+# named here so this module's own callers — and its tests, which patch
+# SETTINGS_PATH — do not have to care where the implementation moved.
 def repo_from_settings(path: str | None = None) -> str | None:
-    """The target repository as `owner/name`, from SETTINGS.md, or None.
+    """The target repository as `owner/name`, from SETTINGS.md, or None."""
+    import gitops_workspace
 
-    This is the only repo source that works before the clone exists, which is
-    why it is tried first. `github-issue-resolver/scripts/resolver.py` reads the
-    same line; the two skills now agree by construction rather than by
-    coincidence.
-    """
-    try:
-        text = Path(path or SETTINGS_PATH).read_text(encoding="utf-8")
-    except OSError:
-        return None
-    match = SETTINGS_REPO_RE.search(text)
-    if not match:
-        return None
-    url = match.group(1).strip().strip("/")
-    if url.lower() in {"none", "null", ""}:
-        return None
-    url = re.sub(r"^https?://(www\.)?github\.com/", "", url)
-    url = re.sub(r"^git@github\.com:", "", url)
-    url = re.sub(r"\.git$", "", url)
-    parts = [p for p in url.split("/") if p]
-    if len(parts) < 2:
-        return None
-    return f"{parts[-2]}/{parts[-1]}"
+    return gitops_workspace.repo_from_settings(path or SETTINGS_PATH)
 
 
 def resolve_repo() -> str:
-    """Resolve the GitOps repository as `owner/name`, without needing a clone.
+    """Resolve the GitOps repository as `owner/name`, without needing a clone."""
+    import gitops_workspace
 
-    Order matters. The git remote used to be the only source, and it cannot
-    work on this path: the audit crons start in the agent's profile directory,
-    which is not a working tree, so `git config --get remote.origin.url`
-    returned nothing and the run died before it could clone anything. SETTINGS.md
-    is written by the operator at provisioning time and is present from the
-    first second of the pod's life.
-    """
-    repo = repo_from_settings()
-    if repo:
-        return repo
-
-    from github_token_refresh import get_current_git_repo
-
-    repo = get_current_git_repo()
-    if not repo or "/" not in repo:
-        raise RuntimeError(
-            f"Could not resolve the target repository as owner/name: no usable "
-            f"'Git Repo:' line in {SETTINGS_PATH} and no origin remote in "
-            f"{Path.cwd()}"
-        )
-    return repo
+    return gitops_workspace.resolve_repo(SETTINGS_PATH)
 
 
 def repo_root() -> Path:
@@ -2731,7 +2694,7 @@ def repo_root_best_effort() -> Path:
         return Path.cwd()
 
 
-def dry_run_repo_root() -> Path:
+def dry_run_repo_root(audit_id: str) -> Path:
     """Where a dry run looks for the manifests the real run would stage.
 
     The real run resolves every `remediation.path` inside the GitOps clone that
@@ -2742,17 +2705,19 @@ def dry_run_repo_root() -> Path:
     one command whose job is "show me what would happen" into a command that
     degraded every finding to `manual` and printed no pull request body at all.
 
-    The clone's location is a pure function of the repository name, so it can be
-    derived without cloning, fetching, or any other side effect — which keeps
-    the dry run's promise intact. If it is not on disk yet (nothing has cloned
-    it, or `SETTINGS.md` is absent because this is a laptop and not the pod),
-    fall back rather than fail: a command that is safe to run anywhere has to
-    run anywhere.
+    The clone's location is a pure function of the repository name and this
+    stream's lease, so it can be derived without cloning, fetching, or any other
+    side effect — which keeps the dry run's promise intact. If it is not on disk
+    yet (nothing has cloned it, or `SETTINGS.md` is absent because this is a
+    laptop and not the pod), fall back rather than fail: a command that is safe
+    to run anywhere has to run anywhere.
     """
     try:
         import gitops_workspace
 
-        target = gitops_workspace.workspace_path(resolve_repo(), GITOPS_WORKSPACE)
+        target = gitops_workspace.workspace_path(
+            resolve_repo(), GITOPS_WORKSPACE, lease=audit_id
+        )
     except Exception:
         return repo_root_best_effort()
     return target if target.is_dir() else repo_root_best_effort()
@@ -3536,12 +3501,20 @@ def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-def ensure_workspace(repo: str, *, reset: bool = False) -> Path:
+def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
     """Establish (and enter) the clone every git and gh call runs inside.
 
-    Lazy and idempotent: the first audit of the day clones, the other four
-    fetch. Nothing in the pod does this at startup, and nothing should — a
-    clone baked into the image is stale before the first cron fires.
+    Lazy and idempotent: the first run of a stream clones, later ones fetch.
+    Nothing in the pod does this at startup, and nothing should — a clone baked
+    into the image is stale before the first cron fires.
+
+    The lease is the audit id, which makes the path deterministic across the
+    two invocations of a run: `start` and `finish` are separate processes and
+    must land in the same tree. It also gives each of the five streams a tree of
+    its own, so two whose schedules collide no longer interleave `checkout -B`,
+    `add` and `push` in one working directory. `validate_audit_id` has already
+    constrained the id to a closed enum, so it is a safe path segment by
+    construction.
 
     `reset` scrubs the working tree, and only `start` may ask for it. Between
     `start` and `finish` the agent writes its remediation manifests into this
@@ -3551,15 +3524,16 @@ def ensure_workspace(repo: str, *, reset: bool = False) -> Path:
     """
     import gitops_workspace
 
-    with gitops_workspace.workspace_lock(GITOPS_WORKSPACE):
-        target = gitops_workspace.ensure_workspace(
-            repo,
-            _workspace_runner,
-            root=GITOPS_WORKSPACE,
-            base_branch=BASE_BRANCH,
-            reset=reset,
-        )
-        gitops_workspace.configure_identity(target, _workspace_runner)
+    target = gitops_workspace.ensure_workspace(
+        repo,
+        _workspace_runner,
+        lease=audit_id,
+        root=GITOPS_WORKSPACE,
+        base_branch=BASE_BRANCH,
+        reset=reset,
+        owner=f"fleet-audit:{audit_id}",
+    )
+    gitops_workspace.configure_identity(target, _workspace_runner)
     set_workspace(target)
     return target
 
@@ -3584,7 +3558,7 @@ def handle_start(args: argparse.Namespace) -> None:
     refresh_credentials(repo)
     # The one place a scrub is correct: the audit has not written anything yet,
     # so whatever is in the tree is debris from a run that did not finish.
-    root = ensure_workspace(repo, reset=True)
+    root = ensure_workspace(repo, audit_id, reset=True)
     ensure_labels(repo, audit_id)
 
     # No branch is created or reset here. The report branch is gone: the ledger
@@ -3610,10 +3584,11 @@ def handle_start(args: argparse.Namespace) -> None:
             {
                 "issue": existing_issue,
                 "repo": repo,
-                # Where the GitOps clone actually is. The agent does not start
-                # in a working tree and cannot guess this: a `remediation.path`
-                # is resolved against this directory, so a manifest written
-                # anywhere else is a file the harness will never find.
+                # Where this stream's GitOps clone actually is. The agent does
+                # not start in a working tree and cannot guess this — the path
+                # carries a lease segment, and it is private to this audit, so
+                # a manifest written anywhere else is either a file the harness
+                # will never find or a write into another agent's tree.
                 "workspace": str(root),
                 "findings_path": findings_path,
                 "pending_remediation_requests": pending,
@@ -3626,7 +3601,7 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
     findings = list(data["findings"])
 
     log("DRY RUN: validated findings; nothing will be committed, pushed, or published.")
-    root = dry_run_repo_root()
+    root = dry_run_repo_root(audit_id)
     log(f"DRY RUN: resolving remediation paths under {root}.")
 
     # The same degradation the real run applies, so a dry run shows the body
@@ -3878,7 +3853,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
         # command is to show what the pull request would say, and an operator
         # drafting a document before writing its manifests would otherwise get a
         # blank preview and no explanation.
-        dry_root = dry_run_repo_root()
+        dry_root = dry_run_repo_root(audit_id)
         log(f"DRY RUN: resolving remediation paths under {dry_root}.")
         for fid in args.finding:
             if remediation_file_problem(by_id[fid], dry_root):
@@ -3909,7 +3884,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
 
     repo = resolve_repo()
     refresh_credentials(repo)
-    root = ensure_workspace(repo)
+    root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
 
     # A named finding whose manifest was never written cannot become a pull
@@ -4005,7 +3980,7 @@ def handle_finish(args: argparse.Namespace) -> None:
 
     repo = resolve_repo()
     refresh_credentials(repo)
-    root = ensure_workspace(repo)
+    root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
 
     # A fix the audit promised but did not write degrades that one finding to

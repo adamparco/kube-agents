@@ -18,7 +18,7 @@ Run `./skills/fleet-audit/scripts/audit_report.py start --audit fleet-wide-cost-
 {
   "issue": 128,
   "repo": "acme/fleet",
-  "workspace": "/opt/data/gitops/acme__fleet",
+  "workspace": "/opt/data/gitops/fleet-wide-cost-analysis/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_fleet-wide-cost-analysis.json",
   "pending_remediation_requests": [
     "overrequest--prod-us-east--deployment-payments-api"

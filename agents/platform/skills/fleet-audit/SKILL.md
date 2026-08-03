@@ -44,12 +44,15 @@ fails if the two drift apart. Do not restate a title anywhere else.
 
 ## The two-command lifecycle
 
-Run both commands from your normal working directory — the same one `submit-suggestion` assumes,
-where `./skills/...` resolves. **You are not in a git checkout, and you do not need to be.** The
+Run both commands from your normal working directory — the profile directory, where `./skills/...`
+resolves. **You are not in a git checkout, and you do not need to be.** The
 audit crons start in the profile directory; the harness clones the GitOps repository itself, into
-`/opt/data/gitops/<owner>__<name>` on the shared volume, and runs every git and gh call inside it.
-The repository comes from the `Git Repo:` line of `/opt/data/SETTINGS.md`, which the operator writes
-at provisioning time and which is readable before any clone exists.
+`/opt/data/gitops/<audit-id>/<owner>__<name>` on the shared volume, and runs every git and gh call
+inside it. The clone is keyed by audit id because the five streams share the volume with each other
+and with every kanban worker: each one gets a tree nobody else writes in, so a colliding schedule
+can no longer reset another stream's working copy out from under it. The repository comes from the
+`Git Repo:` line of `/opt/data/SETTINGS.md`, which the operator writes at provisioning time and
+which is readable before any clone exists.
 
 ### Step 1 — `start`
 
@@ -68,7 +71,7 @@ stream's open ledger issue, and clears any findings document a crashed run left 
 {
   "issue": 128,
   "repo": "acme/fleet",
-  "workspace": "/opt/data/gitops/acme__fleet",
+  "workspace": "/opt/data/gitops/compliance-audit/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
   "pending_remediation_requests": ["netpol-missing-payments"]
 }

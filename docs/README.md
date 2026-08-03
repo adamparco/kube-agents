@@ -14,7 +14,7 @@ editing any doc.
 
 ## 1. Directory overview
 
-The repository tracks **143** `.md`/`.mdx` documents outside the root-level
+The repository tracks **144** `.md`/`.mdx` documents outside the root-level
 dot-directories — `docs-check-map` verifies this total against `git ls-files`
 and fails CI when it drifts. Dot-directories at the repository root
 (`.agents/`, `.github/`, `.claude/`) hold tooling — review skills, PR
@@ -120,6 +120,7 @@ identifier appears, add its source here.
 | Controller permissions                                    | `k8s-operator/config/rbac/`                                                            |
 | `make` targets                                            | the root `Makefile` and `k8s-operator/Makefile`                                        |
 | Paths baked into the agent image (`/opt/defaults/...`)    | `deploy/docker/Dockerfile`                                                             |
+| GitOps clone layout (`/opt/data/gitops/...`) and leases   | `agents/platform/scripts/gitops_workspace.py`                                          |
 
 ## 3. Documentation eras and status
 
@@ -200,6 +201,7 @@ row's glob matches. Paths are repository-root-relative.
 | `docs/designs/audit-logging-user-attribution.md`     | Feature design    | Closes the gap where audit logs identify the agent SA but not the requesting human, by carrying requester and trace/session IDs through existing telemetry.                                                  | Attribution contract per plane, correlation recipes, trust model             | Draft, P0; per-plane implemented-vs-planned split declared inline             |
 | `docs/designs/fleet-audit-issue-ledger.md`           | Feature design    | Replaces the audit's PR-as-report with one ledger issue per stream plus narrow per-finding remediation PRs; hybrid auto/pull-based gating and a first-class `recommendation` field.                          | Ledger issue, remediation PR lifecycle, promotion gating, migration          | Design of record; implemented (banner in file)                                |
 | `docs/designs/gchat-session-metadata-data-flow.md`   | Feature design    | The implemented attribution path from a Google Chat message to Hermes OTel spans via the `session_store` plugin and the `session_otel_bridge`.                                                               | Session metadata allowlist, span stamping, SQLite KV store                   | Documents implemented behavior; site `reference/attribution.md` summarizes it |
+| `docs/designs/gitops-workspace-leases.md`            | Feature design    | Gives every concurrent agent a private GitOps clone keyed by a lease, replacing the one shared working tree that audits and suggestions corrupted for each other.                                            | Lease layout, `.lease` marker, reaper, credential-proxy `git` gate           | Design of record; implemented (banner in file)                                |
 | `docs/contributing.md`                               | Contributor guide | Short entry point: Google CLA and community guidelines, deferring everything else to the site's contributing page and `AGENTS.md`.                                                                           | CLA, pointers                                                                | Human contributors                                                            |
 | `docs/credential-isolation-design.md`                | Feature design    | Design keeping API keys, tokens, and SA credentials out of the agent sandbox container; credentialed operations proxied through an Envoy credential-proxy sidecar.                                           | Pod anatomy, CLI forwarding, guarantee and stated limitation                 | Canonical design; site `reference/credential-isolation.md` defers here        |
 | `docs/security-requirements.md`                      | Requirements      | Provider-neutral security configuration model across three dimensions (permission, interaction, authorization), explicitly distinguishing current behavior from planned capabilities.                        | Permission sets, credential-isolation requirements, attribution requirements | Referenced by the site's security pages; current-vs-planned marked inline     |

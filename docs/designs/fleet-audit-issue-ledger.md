@@ -349,7 +349,7 @@ stream's open ledger issue, and returns the scratch path for `findings.json`. Em
 {
   "issue": 128,
   "repo": "acme/fleet",
-  "workspace": "/opt/data/gitops/acme__fleet",
+  "workspace": "/opt/data/gitops/compliance-audit/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
   "pending_remediation_requests": ["netpol-missing-payments"]
 }
@@ -362,7 +362,9 @@ surfaced early so the agent knows which findings need a manifest written during 
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
 `git config --get remote.origin.url` to answer. The harness therefore clones lazily on the way in,
 and **every `remediation.path` is resolved against this directory**. A manifest written anywhere
-else is a file the harness will never find.
+else is a file the harness will never find. The clone is keyed by audit id so the five streams do
+not share a working tree; [`gitops-workspace-leases.md`](gitops-workspace-leases.md) owns that
+layout.
 
 That also fixes an ordering problem worth recording: the GitHub App token is repo-scoped, so it
 cannot be minted before the repo is known, and the repo used to be derived from the clone the token

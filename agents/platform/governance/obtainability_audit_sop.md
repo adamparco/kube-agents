@@ -16,7 +16,7 @@
 ./skills/fleet-audit/scripts/audit_report.py start --audit obtainability-audit
 ```
 
-Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/org__repo", "findings_path":"/opt/data/scratch/findings_obtainability-audit.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.
+Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/obtainability-audit/org__repo", "findings_path":"/opt/data/scratch/findings_obtainability-audit.json", "pending_remediation_requests":[…]}`. Keep `findings_path` and `workspace` from this call; you write into both.
 
 - `workspace` is the GitOps clone `start` made for you. The audit pod does not begin life inside a checkout, so this is the only tree that exists, and every `remediation.path` in Step 4 is resolved against it — a manifest written elsewhere is one the harness cannot find.
 - `issue` is this stream's open ledger issue, or `null` when it has none. Either way you never create it — `finish` owns that.

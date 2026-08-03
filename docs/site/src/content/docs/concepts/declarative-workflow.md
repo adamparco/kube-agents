@@ -18,15 +18,16 @@ The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the
 
 Source: [`agents/platform/skills/submit-suggestion/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion).
 
-The agent invokes this skill whenever an SOP or on-request task decides "propose a change". The agent works inside the GitOps repo checkout (whose URL it resolves on startup from `/opt/data/SETTINGS.md`, per `SOUL.md §1`). The flow:
+The agent invokes this skill whenever an SOP or on-request task decides "propose a change". The pod holds no checkout of its own; the skill's helper makes one, from the repository URL the agent resolves on startup out of `/opt/data/SETTINGS.md` (per `SOUL.md §1`). The flow:
 
-1. Starts from an up-to-date default branch (`git checkout main && git pull origin main`).
-2. Creates a topic branch named `platform-agent/<change_type>-<target_id>` (e.g. `platform-agent/upgrade-policy-baseline`).
-3. Applies the change (file writes, YAML patches), then stages **only** the specific files it edited — `git add .` / `git add -A` are explicitly forbidden — and commits using Conventional Commit messages.
-4. Runs the packaged helper `./skills/submit-suggestion/scripts/submit_suggestion.py --branch … --title … --body …`, which mints a fresh GitHub App token (via `github_token_refresh.py`), pushes the branch, and opens a PR against `main` with `gh pr create`.
-5. The script prints the PR URL to stdout; the agent posts it to Chat.
+1. Runs `./skills/submit-suggestion/scripts/submit_suggestion.py prepare --branch platform-agent/<change_type>-<target_id>` (e.g. `platform-agent/upgrade-policy-baseline`). That leases a private clone, refreshes it, cuts the topic branch off `origin/main`, and prints the workspace path as JSON.
+2. Applies the change **inside the printed workspace** (file writes, YAML patches), then stages **only** the specific files it edited — `git add .` / `git add -A` are explicitly forbidden — and commits using Conventional Commit messages.
+3. Runs the same helper with `submit --workspace … --branch … --title … --body …`, which mints a fresh GitHub App token (via `github_token_refresh.py`), pushes the branch, and opens a PR against `main` with `gh pr create`.
+4. The script prints the PR URL to stdout; the agent posts it to Chat.
 
-Safety red lines enforced by the skill: direct/manual cluster mutations are forbidden, blanket staging (`git add .`) is refused, and `submit_suggestion.py` hard-blocks force-pushes to the protected branches `main`, `master`, and `production`.
+The lease in step 1 is what keeps concurrent agents apart: a Pod runs five audit crons alongside every kanban worker, and they used to share one working tree. `submit` refuses outright if the workspace it is handed belongs to another lease, and the credential proxy refuses tree-mutating `git` anywhere outside a leased directory — see [Credential isolation](/kube-agents/reference/credential-isolation/), with [`docs/designs/gitops-workspace-leases.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gitops-workspace-leases.md) canonical for the layout.
+
+Safety red lines enforced by the skill: direct/manual cluster mutations are forbidden, blanket staging (`git add .`) is refused, and `submit_suggestion.py` hard-blocks pushes to the protected branches `main`, `master`, and `production`. The push is `--force-with-lease`, so re-submitting after review feedback updates the existing PR branch but will not overwrite one somebody else has moved.
 
 ## The `fleet-audit` skill
 

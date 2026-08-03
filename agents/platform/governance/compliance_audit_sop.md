@@ -12,7 +12,7 @@
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit
-# -> {"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/org__repo",
+# -> {"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/compliance-audit/org__repo",
 #     "findings_path":"/opt/data/scratch/findings_compliance-audit.json",
 #     "pending_remediation_requests":["<finding-id>", ...]}
 ```

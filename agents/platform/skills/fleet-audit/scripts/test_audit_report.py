@@ -25,6 +25,11 @@ from subprocess import CalledProcessError, CompletedProcess
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# `gitops_workspace` is a shared module now — `submit-suggestion` leases a
+# workspace from the same code — so it lives in the Platform Agent scripts
+# directory the image stages into /opt. Its own tests live beside it, in
+# agents/platform/scripts/test_gitops_workspace.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import audit_report  # noqa: E402
 import gitops_workspace  # noqa: E402
@@ -329,7 +334,9 @@ class HarnessTestCase(BaseTestCase):
         super().setUp()
         self.harness = Recorder()
         self.gitops_root = self.tmp_path / "gitops"
-        self.workspace = self.gitops_root / "acme__fleet"
+        # The lease segment is the audit id: each stream gets a private clone so
+        # two whose schedules collide cannot branch over each other.
+        self.workspace = self.gitops_root / AUDIT / "acme__fleet"
         self.patch_attr("GITOPS_WORKSPACE", str(self.gitops_root))
         self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
         self.patch_attr("run_cmd", self.harness)
@@ -1426,6 +1433,32 @@ class TestStart(HarnessTestCase):
         reported = Path(json.loads(self.out)["workspace"])
         self.assertEqual(reported, self.workspace)
         self.assertTrue((reported / ".git").exists())
+
+    def test_each_audit_gets_its_own_clone(self):
+        # Five audits run from one cron file and their schedules collide. They
+        # used to share a directory, so whichever one reached `finish` first
+        # ran `checkout --force -B` over the other four's untracked manifests.
+        self.harness.replies = {"issue list": "[]"}
+        self.run_main(["start", "--audit", AUDIT])
+        mine = Path(json.loads(self.out)["workspace"])
+        self.out = ""
+        self.run_main(["start", "--audit", "obtainability-audit"])
+        theirs = Path(json.loads(self.out)["workspace"])
+
+        self.assertNotEqual(mine, theirs)
+        self.assertEqual(mine.parent.name, AUDIT)
+        self.assertEqual(theirs.parent.name, "obtainability-audit")
+        self.assertEqual(mine.parent.parent, theirs.parent.parent)
+
+    def test_the_clone_is_marked_as_leased(self):
+        # The marker the credential proxy looks for. Without it every git verb
+        # that writes a tree is refused, including the audit's own.
+        self.harness.replies = {"issue list": "[]"}
+        self.run_main(["start", "--audit", AUDIT])
+        reported = Path(json.loads(self.out)["workspace"])
+        record = gitops_workspace.read_lease(reported.parent)
+        self.assertEqual(record["lease"], AUDIT)
+        self.assertEqual(record["owner"], f"fleet-audit:{AUDIT}")
 
     def test_null_issue_when_none_open(self):
         self.harness.replies = {"issue list": "[]"}
@@ -4251,164 +4284,6 @@ class TestRenderedIssue(unittest.TestCase):
         self.assertIsNotNone(comment)
         self.assertIn("partial", comment)
         self.assertIn("12", comment)
-
-
-# --------------------------------------------------------------------------- #
-# The GitOps workspace — the clone that was never made
-# --------------------------------------------------------------------------- #
-
-
-class TestGitopsWorkspace(BaseTestCase):
-    def setUp(self):
-        super().setUp()
-        self.root = self.tmp_path / "gitops"
-        self.calls = []
-
-    def runner(self, cmd, *, cwd=None, check=True):
-        self.calls.append(list(cmd))
-        if cmd[:2] == ["git", "clone"]:
-            (Path(cmd[-1]) / ".git").mkdir(parents=True, exist_ok=True)
-        return CompletedProcess(cmd, 0, "", "")
-
-    def test_the_path_is_one_flat_directory_per_repository(self):
-        self.assertEqual(
-            gitops_workspace.workspace_path("acme/fleet", self.root),
-            self.root / "acme__fleet",
-        )
-
-    def test_a_malformed_repository_is_refused(self):
-        for repo in ("fleet", "", "acme/"):
-            with self.subTest(repo=repo):
-                with self.assertRaises(ValueError):
-                    gitops_workspace.workspace_path(repo, self.root)
-
-    def test_the_first_run_clones_and_lands_on_main(self):
-        target = gitops_workspace.ensure_workspace(
-            "acme/fleet", self.runner, root=self.root
-        )
-        self.assertTrue((target / ".git").is_dir())
-        self.assertEqual(self.calls[0][:2], ["git", "clone"])
-        self.assertIn(["git", "checkout", "-B", "main", "origin/main"], self.calls)
-
-    def test_a_later_run_fetches_instead_of_cloning(self):
-        gitops_workspace.ensure_workspace("acme/fleet", self.runner, root=self.root)
-        self.calls.clear()
-        gitops_workspace.ensure_workspace("acme/fleet", self.runner, root=self.root)
-        self.assertFalse([c for c in self.calls if c[:2] == ["git", "clone"]])
-        self.assertIn(["git", "fetch", "--quiet", "--prune", "origin"], self.calls)
-
-    def test_a_half_finished_clone_is_cleared_rather_than_blocking_forever(self):
-        target = gitops_workspace.workspace_path("acme/fleet", self.root)
-        (target / "leftover").mkdir(parents=True)
-        gitops_workspace.ensure_workspace("acme/fleet", self.runner, root=self.root)
-        self.assertFalse((target / "leftover").exists())
-        self.assertTrue((target / ".git").is_dir())
-
-    def test_a_clone_that_produced_no_tree_raises(self):
-        def dead(cmd, *, cwd=None, check=True):
-            return CompletedProcess(cmd, 0, "", "")
-
-        with self.assertRaises(RuntimeError):
-            gitops_workspace.ensure_workspace("acme/fleet", dead, root=self.root)
-
-    def test_the_working_tree_is_reset_before_use(self):
-        gitops_workspace.ensure_workspace("acme/fleet", self.runner, root=self.root)
-        joined = [" ".join(c) for c in self.calls]
-        self.assertIn("git reset --hard --quiet", joined)
-        self.assertIn("git clean -fdq", joined)
-
-    def test_reset_false_fetches_but_scrubs_nothing(self):
-        # `finish` reattaches to a tree that already holds the audit's
-        # remediation manifests, untracked. A clean here deletes every one of
-        # them and the run then reports each fix as a file the model forgot.
-        gitops_workspace.ensure_workspace("acme/fleet", self.runner, root=self.root)
-        self.calls.clear()
-        gitops_workspace.ensure_workspace(
-            "acme/fleet", self.runner, root=self.root, reset=False
-        )
-        joined = [" ".join(c) for c in self.calls]
-        self.assertIn("git fetch --quiet --prune origin", joined)
-        self.assertNotIn("git clean -fdq", joined)
-        self.assertNotIn("git reset --hard --quiet", joined)
-        self.assertFalse([c for c in self.calls if c[:2] == ["git", "checkout"]])
-
-    def test_reset_false_still_clones_when_there_is_nothing_to_preserve(self):
-        target = gitops_workspace.ensure_workspace(
-            "acme/fleet", self.runner, root=self.root, reset=False
-        )
-        self.assertEqual(self.calls[0][:2], ["git", "clone"])
-        self.assertTrue((target / ".git").is_dir())
-
-    def test_an_untracked_manifest_survives_a_real_reattach(self):
-        """The mocked runner cannot see this one, so run real git.
-
-        `git clean -fd` on the way into `finish` is invisible to a recorded
-        runner: nothing actually deletes anything, so the fixture the test
-        wrote is still on disk and the assertion passes on code that would
-        wipe the tree in production.
-        """
-        if shutil.which("git") is None:  # pragma: no cover - git is always present
-            self.skipTest("git is not on PATH")
-
-        def real(cmd, *, cwd=None, check=True):
-            return subprocess.run(
-                cmd, cwd=cwd, check=check, capture_output=True, text=True
-            )
-
-        origin = self.tmp_path / "origin.git"
-        seed = self.tmp_path / "seed"
-        seed.mkdir()
-        for cmd in (
-            ["git", "init", "--quiet", "--bare", "--initial-branch=main", str(origin)],
-            ["git", "init", "--quiet", "--initial-branch=main", str(seed)],
-        ):
-            subprocess.run(cmd, check=True, capture_output=True)
-        (seed / "README.md").write_text("seed\n", encoding="utf-8")
-        for cmd in (
-            ["git", "config", "user.email", "t@example.com"],
-            ["git", "config", "user.name", "T"],
-            ["git", "add", "README.md"],
-            ["git", "commit", "--quiet", "-m", "seed"],
-            ["git", "remote", "add", "origin", str(origin)],
-            ["git", "push", "--quiet", "origin", "main"],
-        ):
-            subprocess.run(cmd, cwd=seed, check=True, capture_output=True)
-
-        target = gitops_workspace.ensure_workspace(
-            "acme/fleet", real, root=self.root, remote_url=str(origin)
-        )
-        manifest = target / "clusters/prod/netpol.yaml"
-        manifest.parent.mkdir(parents=True, exist_ok=True)
-        manifest.write_text("kind: NetworkPolicy\n", encoding="utf-8")
-
-        gitops_workspace.ensure_workspace(
-            "acme/fleet", real, root=self.root, remote_url=str(origin), reset=False
-        )
-        self.assertTrue(manifest.is_file(), "finish deleted the fix it was about to open")
-
-        gitops_workspace.ensure_workspace(
-            "acme/fleet", real, root=self.root, remote_url=str(origin), reset=True
-        )
-        self.assertFalse(manifest.exists(), "start must hand the audit a clean tree")
-
-    def test_the_identity_is_repository_local_never_global(self):
-        target = gitops_workspace.workspace_path("acme/fleet", self.root)
-        gitops_workspace.configure_identity(target, self.runner)
-        self.assertTrue(self.calls)
-        for call in self.calls:
-            self.assertNotIn("--global", call)
-        self.assertEqual(self.calls[0][:3], ["git", "config", "user.name"])
-
-    def test_the_lock_is_best_effort_not_a_reason_to_skip_the_audit(self):
-        # A read-only or absent PVC must cost a retry, not the day's audit.
-        with gitops_workspace.workspace_lock("/proc/nonexistent/gitops"):
-            pass
-
-    def test_the_lock_serialises_and_releases(self):
-        with gitops_workspace.workspace_lock(self.root):
-            pass
-        with gitops_workspace.workspace_lock(self.root):
-            pass
 
 
 # --------------------------------------------------------------------------- #
