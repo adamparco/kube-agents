@@ -120,6 +120,22 @@ def make_finding(
     }
 
 
+def ran(check, cluster="prod-us-east"):
+    """One `checks_run` entry: a slug and the command that backs it.
+
+    The command is synthetic, but it has to satisfy `validate_check_command`
+    for real — an inspection binary, a target, long enough to be a command —
+    because a fixture that produced something the validator rejects would fail
+    every test in this file for the same uninformative reason. It varies by
+    check and by cluster so a renderer assertion can tell two evidence rows
+    apart.
+    """
+    return {
+        "check": check,
+        "command": f"kubectl --context {cluster} get {check} --all-namespaces -o json",
+    }
+
+
 def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
     if clusters is None:
         clusters = [
@@ -139,13 +155,33 @@ def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
     # a default of "no checks ran" would turn every unrelated test in this file
     # into a coverage test — and would make a *partial* run the baseline the
     # renderer, the delta and the ledger-closing tests are all written against.
+    #
+    # A call site that *does* say otherwise may write its `checks_run` as bare
+    # slugs — `["netpol-missing"]` — and have them expanded here. The wire
+    # format is `{check, command}`, but a coverage test is about which checks
+    # ran, and making thirty of those tests spell out a command each would bury
+    # the thing they assert. A test that is genuinely about the entry shape
+    # assigns `checks_run` after this returns, so nothing expands it.
     full = list(audit_report.audit_checks(audit))
-    clusters = [
-        cluster
-        if not isinstance(cluster, dict) or "checks_run" in cluster
-        else {**cluster, "checks_run": full}
-        for cluster in clusters
-    ]
+
+    def with_checks(cluster):
+        if not isinstance(cluster, dict):
+            return cluster
+        name = str(cluster.get("name", "prod-us-east"))
+        if "checks_run" not in cluster:
+            return {**cluster, "checks_run": [ran(c, name) for c in full]}
+        entries = cluster["checks_run"]
+        if not isinstance(entries, list):
+            return cluster
+        return {
+            **cluster,
+            "checks_run": [
+                ran(entry, name) if isinstance(entry, str) else entry
+                for entry in entries
+            ],
+        }
+
+    clusters = [with_checks(cluster) for cluster in clusters]
     return {
         "audit": audit,
         "scope": {
@@ -879,6 +915,41 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"{sop.name}. The SOP defines {found}",
                 )
 
+    def test_every_sop_states_the_checks_run_wire_format(self):
+        """The SOP is what the cron prompt sends the worker to read.
+
+        If it still describes `checks_run` as a list of slugs, the worker
+        writes one, `finish` exits 2, and the audit is spent re-guessing a
+        format the SOP could have stated. Prose drifting from the validator is
+        how the last incident began, so pin the two fields.
+        """
+        sop_dir = Path(__file__).resolve().parents[4] / "platform" / "governance"
+        if not sop_dir.is_dir():
+            self.skipTest("governance SOPs not present")
+        for audit_id, spec in audit_report.AUDITS.items():
+            with self.subTest(audit=audit_id):
+                body = (sop_dir / spec.sop).read_text(encoding="utf-8")
+                self.assertIn('"check"', body)
+                self.assertIn('"command"', body)
+
+    def test_every_stream_names_the_sop_that_defines_it(self):
+        """`AuditSpec.sop` is what a rejection points at instead of the roster.
+
+        A rejection cannot name the valid slugs without becoming an answer key
+        (`test_no_rejection_ever_prints_the_roster`), so it names the file that
+        does. A wrong filename there sends a worker that already failed once to
+        a document that does not exist — the worst possible moment for a broken
+        pointer. `SOP_FILENAMES` above is spelled out independently, so this
+        compares two hand-written mappings rather than one against itself.
+        """
+        sop_dir = Path(__file__).resolve().parents[4] / "platform" / "governance"
+        for audit_id, spec in audit_report.AUDITS.items():
+            with self.subTest(audit=audit_id):
+                self.assertEqual(SOP_FILENAMES[audit_id], spec.sop)
+                self.assertEqual(spec.sop, audit_report.audit_sop(audit_id))
+                if sop_dir.is_dir():
+                    self.assertTrue((sop_dir / spec.sop).is_file())
+
     def test_cron_prompts_cite_the_real_sop_geography(self):
         """A stale line number is worse than no line number.
 
@@ -1572,16 +1643,52 @@ class TestStart(HarnessTestCase):
 
         out = self.out.strip()
         self.assertNotIn("\n", out)
+        payload = json.loads(out)
+        contract = payload.pop("checks_contract", "")
         self.assertEqual(
-            json.loads(out),
+            payload,
             {
                 "issue": 42,
                 "repo": "acme/fleet",
                 "workspace": str(self.workspace),
                 "findings_path": str(self.tmp_path / "findings_compliance-audit.json"),
                 "pending_remediation_requests": [],
+                "sop": "governance/compliance_audit_sop.md",
+                "checks": list(audit_report.audit_checks(AUDIT)),
             },
         )
+        # Popped rather than pinned: the contract is prose, and a test that
+        # asserts it verbatim turns every wording improvement into a failure.
+        # What must hold is that it states the shape and the consequence.
+        self.assertIn("checks_run", contract)
+        self.assertIn("command", contract)
+
+    def test_start_hands_over_the_roster(self):
+        """Coverage must not depend on how far into the SOP the worker read.
+
+        The roster is in the SOP and the SOP is required reading, but "it will
+        read far enough" is not a mechanism. Hermes's `read_file` defaults to
+        500 lines and every audit SOP fits inside that — and the run that
+        published five false all-clears still asked for 100 lines of each, on
+        files whose checks start past line 60 and run past 270. Printing the
+        roster here is free and removes the failure mode outright.
+
+        Safe at `start` in a way it is never safe at `finish`: this is the
+        instruction, issued before any work. The same list inside a rejection
+        is an answer key — see `test_no_rejection_ever_prints_the_roster`.
+        """
+        for audit_id in audit_report.AUDITS:
+            with self.subTest(audit=audit_id):
+                self.out = ""
+                self.harness.replies = {"issue list": "[]"}
+                self.assertEqual(self.run_main(["start", "--audit", audit_id]), 0)
+                payload = json.loads(self.out)
+                self.assertEqual(
+                    list(audit_report.audit_checks(audit_id)), payload["checks"]
+                )
+                self.assertEqual(
+                    f"governance/{audit_report.audit_sop(audit_id)}", payload["sop"]
+                )
 
     def test_the_workspace_is_named_so_manifests_can_be_written_into_it(self):
         # The agent does not start in a working tree, so a `remediation.path`
@@ -3963,13 +4070,46 @@ class TestChecksRun(unittest.TestCase):
             audit_report.validate_findings(doc, AUDIT)
         self.assertIn("must be a list", str(exc.exception))
 
-    def test_the_rejection_names_the_checks_it_expected(self):
-        """A rejection that does not say what to run teaches the model nothing."""
-        doc = self._omitting_checks_run()
-        with self.assertRaises(audit_report.ValidationError) as exc:
-            audit_report.validate_findings(doc, AUDIT)
-        for check in audit_report.audit_checks(AUDIT):
-            self.assertIn(check, str(exc.exception))
+    def test_no_rejection_ever_prints_the_roster(self):
+        """A rejection that lists the valid slugs is an answer key.
+
+        This test asserts the opposite of what it used to. Naming the roster
+        looked like the helpful thing to do, and it inverted the guard: a run
+        that inspected nothing could submit guesses, read the real slugs off
+        the `exit 2`, and resubmit the same empty document with the right words
+        in it. On 2026-08-03 four of the five streams did exactly that — one of
+        them without re-reading its SOP in between, which is how we know where
+        the slugs came from — and published a fleet-wide all-clear.
+
+        So: every way of getting `checks_run` rejected, and none of the
+        messages may contain a slug. The pointer to the SOP is what replaces
+        it, and `start` hands the roster over before any work begins.
+        """
+        roster = list(audit_report.audit_checks(AUDIT))
+        rejected = [
+            self._omitting_checks_run(),
+            make_doc(clusters=[self._cluster(checks_run=[])]),
+            make_doc(clusters=[self._cluster(checks_run="privileged-container")]),
+            make_doc(clusters=[self._cluster(checks_run=["not-a-real-check"])]),
+        ]
+        # A bare slug list — the pre-2026-08-03 wire format — is its own
+        # rejection path and must stay just as tight-lipped.
+        bare = make_doc()
+        bare["scope"]["clusters"][0]["checks_run"] = list(roster)
+        rejected.append(bare)
+
+        for i, doc in enumerate(rejected):
+            with self.subTest(case=i):
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
+                message = str(exc.exception)
+                leaked = [check for check in roster if check in message]
+                self.assertEqual(
+                    [],
+                    leaked,
+                    f"rejection leaked the roster: {leaked}",
+                )
+                self.assertIn(audit_report.audit_sop(AUDIT), message)
 
     def test_a_check_outside_the_roster_is_rejected(self):
         doc = make_doc(
@@ -4039,6 +4179,179 @@ class TestChecksRun(unittest.TestCase):
                     audit_report.validate_findings(doc, audit_id)
 
 
+class TestCheckCommands(unittest.TestCase):
+    """Every claimed check carries the command that ran it.
+
+    A bare slug list was free to write. The roster is a fixed, guessable set of
+    ten or so words, so a run that inspected nothing could type all of them in
+    one line and publish an all-clear — which is what happened on 2026-08-03.
+    Requiring the command does not *prove* the check ran: this harness is a
+    subprocess of the agent and cannot see its tool calls. It buys three other
+    things, and the tests below are about those three:
+
+    1. Fabrication gets expensive — a distinct plausible invocation per check
+       per cluster, not ten words.
+    2. Fabrication gets falsifiable — the commands are published, so a reader
+       or the next run can re-run them.
+    3. The trivially-cheap path is gone — the document that published five
+       clean audits contained no command anywhere.
+    """
+
+    def _with(self, entry):
+        doc = make_doc(findings=[])
+        doc["scope"]["clusters"][0]["checks_run"] = [entry]
+        doc["scope"]["clusters"][1]["checks_run"] = [ran("netpol-missing", "stage-eu")]
+        return doc
+
+    def _reject(self, entry, fragment):
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(self._with(entry), AUDIT)
+        self.assertIn(fragment, str(exc.exception))
+        return str(exc.exception)
+
+    def test_a_bare_slug_is_no_longer_a_checks_run_entry(self):
+        self._reject("netpol-missing", "expected an object")
+
+    def test_an_entry_without_a_command_is_rejected(self):
+        self._reject({"check": "netpol-missing"}, "checks_run[0].command")
+
+    def test_an_empty_command_is_rejected(self):
+        self._reject({"check": "netpol-missing", "command": "   "}, "command")
+
+    def test_a_command_that_inspects_nothing_is_rejected(self):
+        """`echo`, `cat` and friends cannot read a cluster, so they cannot be how a check ran."""
+        for command in (
+            "echo checked netpol-missing on prod-us-east",
+            "cat /tmp/notes-about-the-netpol-check.txt",
+            "printf 'ran the check\\n'",
+            "python3 -c \"print('netpol-missing: ok')\"",
+            "true  # netpol-missing passed",
+        ):
+            with self.subTest(command=command):
+                self._reject(
+                    {"check": "netpol-missing", "command": command}, "cannot inspect"
+                )
+
+    def test_a_command_naming_no_inspection_binary_is_rejected(self):
+        """The catch-all: prose, or a tool that reads nothing on a cluster."""
+        self._reject(
+            {
+                "check": "netpol-missing",
+                "command": "reviewed the NetworkPolicy inventory for every namespace",
+            },
+            "names none of",
+        )
+
+    def test_calling_this_harness_is_not_inspecting_the_fleet(self):
+        """`checks_run` records how the fleet was read, not how it was reported."""
+        self._reject(
+            {
+                "check": "netpol-missing",
+                "command": "./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit",
+            },
+            "call to this harness",
+        )
+
+    def test_a_command_too_short_to_be_one_is_rejected(self):
+        self._reject({"check": "netpol-missing", "command": "kubectl"}, "too short")
+
+    def test_an_oversized_command_is_rejected(self):
+        oversized = "kubectl get networkpolicy -A " + ("x" * audit_report.MAX_COMMAND_CHARS)
+        self._reject(
+            {"check": "netpol-missing", "command": oversized},
+            f"exceeds {audit_report.MAX_COMMAND_CHARS}",
+        )
+
+    def test_a_real_invocation_is_accepted(self):
+        doc = self._with(
+            {
+                "check": "netpol-missing",
+                "command": (
+                    "kubectl --context prod-us-east get networkpolicy -A "
+                    "-o custom-columns=NS:.metadata.namespace --no-headers"
+                ),
+            }
+        )
+        self.assertEqual(audit_report.validate_findings(doc, AUDIT), doc)
+
+    def test_one_command_may_back_several_checks(self):
+        """A single `describe` is honestly how the drift audit reads most facets.
+
+        Duplicate *checks* are rejected; duplicate commands are not, because
+        rejecting them would force the consistency audit to invent nine
+        distinct invocations for nine fields it read from one JSON blob — which
+        is exactly the fabrication this field exists to discourage.
+        """
+        shared = (
+            "gcloud container clusters describe prod-usc1 --location us-central1 "
+            "--project acme-prod --format=json"
+        )
+        doc = make_doc(
+            audit="fleet-consistency-drift",
+            findings=[],
+            clusters=[
+                {
+                    "name": "prod-usc1",
+                    "location": "us-central1",
+                    "project": "acme-prod",
+                    "checks_run": [
+                        {"check": "shielded-nodes", "command": shared},
+                        {"check": "secure-boot", "command": shared},
+                        {"check": "private-nodes", "command": shared},
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(
+            audit_report.validate_findings(doc, "fleet-consistency-drift"), doc
+        )
+
+    def test_checks_ran_reads_the_slugs_back_out(self):
+        cluster = {
+            "checks_run": [
+                ran("netpol-missing"),
+                ran("wildcard-rbac"),
+                {"check": "", "command": "kubectl get ns"},
+                "netpol-missing",
+            ]
+        }
+        self.assertEqual(
+            ["netpol-missing", "wildcard-rbac"], audit_report.checks_ran(cluster)
+        )
+        self.assertEqual([], audit_report.checks_ran(None))
+        self.assertEqual([], audit_report.checks_ran({}))
+
+    def test_the_commands_are_published_in_the_ledger(self):
+        """Falsifiability is the whole mechanism — an unpublished command proves nothing."""
+        command = (
+            "kubectl --context prod-us-east get networkpolicy -A "
+            "-o custom-columns=NS:.metadata.namespace --no-headers"
+        )
+        doc = self._with({"check": "netpol-missing", "command": command})
+        body = render_body(doc, generated_at=NOW)
+        self.assertIn("How this run checked the fleet", body)
+        self.assertIn(command, body)
+        self.assertIn("netpol-missing", body)
+        self.assertIn("prod-us-east", body)
+
+    def test_the_evidence_table_is_dropped_whole_or_not_at_all(self):
+        """Half a table reads as a short one, and "we ran three checks" is a worse lie than silence."""
+        findings = [
+            make_finding(
+                fid=f"finding-{i}",
+                title=f"Finding {i} " + "padding " * 20,
+                impact="x" * 1400,
+            )
+            for i in range(60)
+        ]
+        doc = self._with({"check": "netpol-missing", "command": "kubectl get netpol -A"})
+        doc["findings"] = findings
+        body = render_body(doc, generated_at=NOW)
+        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
+        if "How this run checked the fleet" in body:
+            self.assertIn("kubectl get netpol -A", body)
+
+
 class TestPartialCoverageGating(HarnessTestCase):
     """A run that could not look must not conclude anything from absence."""
 
@@ -4079,6 +4392,57 @@ class TestPartialCoverageGating(HarnessTestCase):
         self.run_finish(make_doc(skipped=self.PARTIAL))
         self.assertEqual(self.harness.gh_calls("pr", "close"), [])
         self.assertIn("no remediation pull request was closed", self.err)
+
+    def test_a_gapped_clean_run_opens_a_ledger_when_the_stream_has_none(self):
+        """The quietest failure the harness had: nothing found, nothing looked at, nothing said.
+
+        Zero findings and no open ledger used to mean "nothing to do" — no
+        issue, no comment, no artifact of any kind. A stream could report a
+        clean fleet every morning for weeks while never having looked at it.
+        Four streams did exactly that on 2026-08-03; the only reason it was
+        caught is that a fifth happened to have a ledger open from the day
+        before. An audit that cannot speak for the fleet has something to say,
+        and it must land somewhere durable.
+        """
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/77\n",
+        }
+        self.assertEqual(
+            self.run_finish(make_doc(findings=[], skipped=self.PARTIAL)), 0
+        )
+        created = self.harness.gh_calls("issue", "create")
+        self.assertEqual(1, len(created))
+        argv = created[0]
+        self.assertIn("coverage incomplete", " ".join(argv))
+        self.assertIn("agent:audit", argv)
+        self.assertIn(f"audit:{AUDIT}", argv)
+
+        out = self.stdout_json()
+        self.assertEqual("CLEAN", out["status"])
+        self.assertTrue(out["partial"])
+        self.assertEqual("https://github.com/acme/fleet/issues/77", out["issue_url"])
+
+    def test_a_truly_clean_run_with_no_ledger_still_opens_nothing(self):
+        """Complete coverage, nothing found, no ledger: there is genuinely nothing to say."""
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertEqual([], self.harness.gh_calls("issue", "create"))
+        self.assertFalse(self.stdout_json()["partial"])
+
+    def test_the_coverage_ledger_is_not_titled_like_an_all_clear(self):
+        """`0 findings (0 critical)` is the phrasing this issue exists to avoid."""
+        title = audit_report.coverage_issue_title(AUDIT, ["dr-west: unreadable"])
+        self.assertIn("coverage incomplete", title)
+        self.assertIn("1 gap,", title)
+        self.assertNotIn("0 findings (0 critical)", title)
+        self.assertIn(
+            "2 gaps", audit_report.coverage_issue_title(AUDIT, ["a", "b"])
+        )
+
+    def test_a_gapped_clean_body_does_not_call_the_fleet_compliant(self):
+        body = render_body(make_doc(findings=[], skipped=self.PARTIAL), generated_at=NOW)
+        self.assertNotIn("Every audited cluster is compliant", body)
 
     def test_a_partial_run_announces_nothing_as_resolved(self):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")

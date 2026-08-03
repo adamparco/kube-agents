@@ -583,15 +583,21 @@ and it was byte-for-byte indistinguishable from a complete run over a healthy fl
 four of five streams finished in about fourteen seconds each having issued no inspection command at
 all, because the SOP's checks sit past the point a partial read of the file stops.
 
-So `scope.clusters[]` also gains a **mandatory** `checks_run`, the list of checks that actually ran
-against that cluster, named by the backticked slug in the SOP heading that defines them. `AUDITS`
-carries the roster per stream as an `AuditSpec`, which makes three things enforceable that were not:
-an unknown or duplicated slug is rejected; an absent field is rejected outright; and an empty list is
-rejected unless that cluster's `limitations` says why nothing ran. The last of those is a
-concession, not an oversight — a drift cohort below the comparability floor legitimately compares
-nothing on a cluster it read perfectly well, and a hard non-empty rule would force the agent to
-invent a slug to get published. An explained zero is still a coverage gap, so it stays partial and
+So `scope.clusters[]` also gains a **mandatory** `checks_run`: one entry per check that actually ran
+against that cluster, as `{check, command}` — the backticked slug from the SOP heading that defines
+the check, and the literal invocation that ran it. `AUDITS` carries the roster per stream as an
+`AuditSpec`, which makes four things enforceable that were not: an unknown or duplicated slug is
+rejected; an absent field is rejected outright; an entry whose `command` is missing, is a call back
+into this harness, or names none of `kubectl`/`gcloud`/`gsutil`/`bq`/`helm`/`curl` is rejected; and
+an empty list is rejected unless that cluster's `limitations` says why nothing ran. The last of those
+is a concession, not an oversight — a drift cohort below the comparability floor legitimately
+compares nothing on a cluster it read perfectly well, and a hard non-empty rule would force the agent
+to invent a slug to get published. An explained zero is still a coverage gap, so it stays partial and
 the ledger stays open; only the false all-clear is foreclosed.
+
+The same command may back several checks. The consistency audit reads nine facets out of one
+`describe`, and rejecting the repeat would force it to invent nine distinct invocations — precisely
+the fabrication the field exists to discourage.
 
 The roster lives in code and the checks live in prose, so the two will drift. A test re-derives each
 roster from its SOP's `####` headings and fails on any difference: a check added to an SOP but not to
@@ -601,10 +607,51 @@ Unlike `limitations`, the `Checks` column renders on **every** run as `n/total`,
 it falls short. A column that appears only when something went wrong is a column nobody learns to
 read on the days it matters.
 
-One residual risk is worth naming because the design cannot remove it: the harness never observes
-the commands the agent issued, only the list it hands over. An inflated `checks_run` converts a
-partial audit straight back into a false all-clear. Every SOP therefore says so at the point of
-writing the field, in those words.
+#### The guard's first failure, and what it cost
+
+`checks_run` shipped as a bare list of slugs, and the validator was helpful about rejecting one:
+`Known checks: {the roster}`. That message inverted the guard. A run that inspected nothing could
+submit guesses, read the real slugs off the `exit 2`, and resubmit the same empty document with the
+right words in it — and on 2026-08-03 four of the five streams did exactly that. One of them never
+re-read its SOP between the two attempts, which is how we know where the slugs came from. The
+harness had turned itself into an answer key for the one claim it could not verify.
+
+Four changes close it, and none of them pretend to verify anything:
+
+- **No rejection names a slug.** Every `checks_run` message now points at the SOP filename that
+  defines the roster (`AuditSpec.sop`, the same string a test pins against an independent map)
+  instead of listing it. A test asserts that no rejection on any path contains any roster slug.
+- **`start` hands the roster over.** The roster is in the SOP and the SOP is required reading, but
+  "it will read far enough" is not a mechanism: Hermes's `read_file` defaults to 500 lines and every
+  audit SOP fits inside that, and the run still asked for 100 lines of each, on files whose checks
+  start past line 60. Printing `checks` and `sop` at `start` is free and removes the failure mode.
+  Safe there in a way it is never safe in a rejection: `start` is the instruction, issued before any
+  work; a rejection is a hint, issued after a failed attempt.
+- **Each claim carries its command.** Typing ten slugs is free — the roster is a fixed, guessable
+  list. Ten distinct plausible per-cluster invocations are not, and they have to be redone per
+  cluster.
+- **The commands are published.** The ledger's last section, _How this run checked the fleet_, is a
+  collapsed table of every entry, rendered against whatever body budget the findings left and
+  dropped whole rather than half if it does not fit.
+
+One residual risk is worth naming because the design cannot remove it: the harness runs as a
+subprocess of the agent, so it never observes the commands the agent issued — only the document
+handed to it. An inflated `checks_run` still converts a partial audit into a false all-clear. What
+changed is the cost and the aftermath: fabrication is no longer a ten-word line, and every
+fabrication is published verbatim where the next run, or a reader, can re-run it. The mitigation is
+the record, not the validator. Every SOP says so at the point of writing the field.
+
+#### A clean run with nothing to publish
+
+There was one more silence. With zero findings and no open ledger, `finish` logged "nothing to do"
+and exited: no issue, no comment, no artefact. A stream could report a clean fleet every morning for
+weeks while never having looked at it, and leave nothing behind to notice. That is why the incident
+surfaced through issue #27 alone — it was the one stream with a ledger open from the day before.
+
+So zero findings **plus a coverage gap** now opens a ledger of its own, titled
+`coverage incomplete (n gaps, 0 findings)` rather than the all-clear phrasing, carrying the gap list
+and the evidence table. Zero findings with complete coverage and no ledger still does nothing, which
+is correct: there is genuinely nothing to say.
 
 ### 7.3 Untrusted text in a rendered body
 
@@ -807,11 +854,23 @@ unchanged. As shipped it is **346**. New cases:
 - Scope: `clusters` and `skipped` must be disjoint; a finding naming a skipped cluster is rejected; a
   cluster with `limitations` is accepted and renders the extra column, and the column is absent when
   no cluster carries one.
-- `checks_run`: absent is rejected; a non-list is rejected; an unknown slug and a duplicate are each
-  rejected and the message names the roster; empty is rejected without a `limitations` string and
-  accepted with one; the full roster validates and is complete coverage, a subset validates and is
-  not; the rejection fires for every stream against its own roster; and the roster in `AUDITS`
-  matches the slugs its SOP's `####` headings declare.
+- `checks_run`: absent is rejected; a non-list is rejected; a bare slug in place of an entry object
+  is rejected; an unknown slug and a duplicate are each rejected; empty is rejected without a
+  `limitations` string and accepted with one; the full roster validates and is complete coverage, a
+  subset validates and is not; the rejection fires for every stream against its own roster; and the
+  roster in `AUDITS` matches the slugs its SOP's `####` headings declare.
+- **No rejection names a roster slug**, on any of the five paths that reject the field. This is the
+  test that would have caught the 2026-08-03 answer-key inversion, and it is written as the negative
+  of the test it replaces.
+- `command`: absent, empty, shorter than eight characters, over `MAX_COMMAND_CHARS`, a call back into
+  `audit_report.py`, an `echo`/`cat`/`printf`/`python3 -c`/`true`, and prose naming no inspection
+  binary are each rejected; a real invocation is accepted; one command backing three checks is
+  accepted; and the accepted commands appear in the rendered body.
+- `start` prints `checks` and `sop` for every stream, and `AuditSpec.sop` agrees with an independently
+  spelled-out filename map and with a file that exists.
+- Zero findings with a coverage gap and no ledger opens one, titled `coverage incomplete` and
+  labelled `agent:audit` + `audit:<id>`; zero findings with complete coverage and no ledger opens
+  nothing.
 - Grouping: disjoint paths, two findings one path, transitive union across three findings.
 - Promotion eligibility: critical+manifest auto; critical+gcloud not; major+manifest only on request;
   already-has-PR is a no-op in every state; the sixth eligible critical in a run is withheld and

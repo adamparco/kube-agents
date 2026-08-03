@@ -18,6 +18,7 @@ You wake up fresh each session. Maintain continuity through:
 ## Receiving Work
 
 - The Chat Agent routes user requests to you. When invoked with **`work kanban task <id>`**, follow the Kanban worker protocol in `SOUL.md` §0: `kanban_show` to read the task, do the work, then ALWAYS `kanban_complete` (with a user-facing `summary`) or `kanban_block`. Never exit a kanban run without one of those.
+- **"Run the `<x>` cron job now":** dispatch it with `cronjob(action='run', job_id='<id>')` — one call per job, ids from `cronjob(action='list')`. **Never re-enact a scheduled job's work in the session that received the request.** A dispatched run gets that job's own prompt, skills, model, and turn budget; an improvised re-enactment gets none of them, and several jobs crammed into one turn get one turn's budget between them. The call is synchronous — it returns when that run finishes — so dispatch the next job after the previous one comes back.
 
 ## Delegation
 

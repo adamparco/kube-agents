@@ -42,6 +42,28 @@ watchdog — **not** a prettified form of the audit id:
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
 fails if the two drift apart. Do not restate a title anywhere else.
 
+## Running a stream on demand
+
+Each stream's cron job id **is** its audit id, so an operator asking for a run off-schedule is asking
+for one tool call:
+
+```
+cronjob(action='run', job_id='compliance-audit')
+```
+
+**Dispatch it. Do not run the audit yourself in the session that received the request.** A
+dispatched job runs the same path the 06:20 tick runs: its own session, its own prompt naming the
+SOP and the line range its checks live in, its own skills, model, and turn budget. A session that
+improvises the audit instead has none of that — and when the request is "run all five", it has one
+turn budget for work the schedule spreads across five runs and two days. That is not a hypothetical
+failure mode: on 2026-08-03 a single worker asked to run all five streams issued zero `kubectl`
+commands, hand-typed five empty findings documents, and published a fleet-wide all-clear.
+
+One call per job, and the call is synchronous — it returns after that stream's run finishes, with
+`execution_success` in the result. Dispatch the next one once it comes back rather than firing five
+and assuming. If `executed` is `false` nothing ran: the scheduler already owns the fire, or the job
+is paused, and the response says which.
+
 ## The two-command lifecycle
 
 Run both commands from your normal working directory — the profile directory, where `./skills/...`
@@ -73,11 +95,19 @@ stream's open ledger issue, and clears any findings document a crashed run left 
   "repo": "acme/fleet",
   "workspace": "/opt/data/gitops/compliance-audit/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
-  "pending_remediation_requests": ["netpol-missing-payments"]
+  "pending_remediation_requests": ["netpol-missing-payments"],
+  "sop": "governance/compliance_audit_sop.md",
+  "checks": ["privileged-container", "host-namespace", "…"],
+  "checks_contract": "Run every check above against every cluster you can read. …"
 }
 ```
 
 Write your findings to the `findings_path` it gives you. Do not pick your own path.
+
+`checks` is your stream's full roster, handed over so coverage never depends on how far into the SOP
+you read. **It is the work list, not a substitute for the SOP** — the slug says which check, the SOP
+says what the check _is_ and what counts as a violation, so read the whole file before you start.
+`sop` names it.
 
 `workspace` is the clone. **Every `remediation.path` is resolved against it**, so a manifest written
 anywhere else is a file the harness will never find — the finding degrades to a manual one and no
@@ -92,9 +122,14 @@ still reproducing at `finish`, its pull request opens immediately instead of a w
 
 Enumerate the clusters in scope and inspect them **read-only** (`kubectl get/describe`,
 `gcloud ... describe/list`). For every deviation you intend to report, capture the exact command you
-ran and the output that proves it. Keep a per-cluster tally of which of your SOP's checks you have
-actually run as you go — `finish` requires it as `checks_run`, and reconstructing it afterwards from
-memory is how a check that never ran gets recorded as one that did.
+ran and the output that proves it.
+
+Keep a per-cluster tally as you go: for each check in the roster `start` printed, the slug and **the
+exact command you issued for it**, appended the moment that check completes. `finish` requires it as
+`checks_run` and rejects a slug with no command. Reconstructing the tally afterwards from memory is
+how a check that never ran gets recorded as one that did — and now that each entry carries a command
+that gets published, reconstructing it from memory is also how you end up publishing a command you
+never issued.
 
 If a remediation is a declarative file, write that file **under the `workspace` directory `start`
 reported** and name its repo-relative path in the finding. The harness puts it on a branch of its
@@ -170,17 +205,18 @@ A partial run is never `[SILENT]`. Report the issue URL and say which clusters w
         "location": "us-east1",
         "project": "acme-prod",
         "checks_run": [
-          "privileged-container",
-          "host-namespace",
-          "hostpath-mount",
-          "cluster-admin-binding",
-          "wildcard-rbac",
-          "netpol-missing",
-          "default-sa-automount",
-          "workload-identity-off",
-          "legacy-metadata",
-          "public-control-plane",
-          "podsecurity-gaps"
+          {
+            "check": "privileged-container",
+            "command": "kubectl --context prod-us-east get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{\"/\"}{.metadata.name}{\"\\t\"}{.spec.containers[*].securityContext.privileged}{\"\\n\"}{end}'"
+          },
+          {
+            "check": "netpol-missing",
+            "command": "kubectl --context prod-us-east get networkpolicy -A -o custom-columns=NS:.metadata.namespace --no-headers"
+          },
+          {
+            "check": "workload-identity-off",
+            "command": "gcloud container clusters describe prod-us-east --location us-east1 --project acme-prod --format='value(workloadIdentityConfig.workloadPool)'"
+          }
         ]
       },
       {
@@ -188,13 +224,14 @@ A partial run is never `[SILENT]`. Report the issue URL and say which clusters w
         "location": "us-central1",
         "project": "acme-prod",
         "checks_run": [
-          "cluster-admin-binding",
-          "wildcard-rbac",
-          "netpol-missing",
-          "default-sa-automount",
-          "workload-identity-off",
-          "public-control-plane",
-          "podsecurity-gaps"
+          {
+            "check": "netpol-missing",
+            "command": "kubectl --context prod-autopilot get networkpolicy -A -o custom-columns=NS:.metadata.namespace --no-headers"
+          },
+          {
+            "check": "workload-identity-off",
+            "command": "gcloud container clusters describe prod-autopilot --location us-central1 --project acme-prod --format='value(workloadIdentityConfig.workloadPool)'"
+          }
         ],
         "limitations": "Autopilot: node-level checks 2.1-2.3 and 2.9 do not apply."
       }
@@ -235,12 +272,22 @@ field, and publishes nothing:
 - `audit` must equal the `--audit` argument. An audit may only write to its own ledger.
 - `scope.clusters` must be **non-empty**. An audit that enumerated nothing is a failure, not a clean
   run — if you could not list the fleet, say so loudly instead of reporting zero findings.
-- `checks_run` is **required on every cluster**: the list of checks that actually ran against it,
-  named by the backticked slug in the SOP heading that defines them (`netpol-missing`, not "2.6" and
-  not prose). An unknown slug, a duplicate, or a missing field is rejected, and so is an empty list
-  unless that cluster's `limitations` says why nothing ran. Enumerating a cluster and checking
-  nothing on it is not a clean cluster — it is an audit that did not happen, and without this field
-  the harness cannot tell the two apart. See [Scope, skipped, and limitations](#scope-skipped-and-limitations).
+- `checks_run` is **required on every cluster** (the example above shows three entries per cluster
+  for brevity; a real run carries one per check it ran). Each entry is an object with two required
+  fields:
+  - **`check`** — the backticked slug from the SOP heading that defines it (`netpol-missing`, not
+    "2.6" and not prose). An unknown slug or a duplicate is rejected.
+  - **`command`** — the literal invocation you issued on that cluster for that check, with its
+    `--context`/`--project` and the namespace or resource it targeted. It must name one of
+    `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`; `echo`, `cat`, `python3 -c`, a call back
+    into `audit_report.py`, and anything under eight characters are all rejected. One command per
+    entry — the one that produced the evidence, not a summary of your approach.
+
+  An empty list is rejected too, unless that cluster's `limitations` says why nothing ran.
+  Enumerating a cluster and checking nothing on it is not a clean cluster — it is an audit that did
+  not happen, and without this field the harness cannot tell the two apart. See
+  [Scope, skipped, and limitations](#scope-skipped-and-limitations).
+
 - `id` is a stable slug, unique within the file, matching `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with
   no `..` run and no `.lock` suffix. Two rules ride on this. **Stability is what makes the delta
   work**: the same underlying problem must produce the same id on every run, or it will churn as
@@ -282,11 +329,18 @@ not close on it. That is the point. A run that skipped eight of eleven checks an
 not found nothing; it has not looked, and before this field existed it published as `CLEAN` and
 closed the ledger.
 
-Which means the one way to defeat all of this is to write a slug for a check you did not run. The
-harness cannot see the commands you issued, only the list you hand it, so an inflated `checks_run`
-converts a partial audit straight back into a false all-clear. Add each slug as its check completes,
-never in advance, and never round the list up to the roster because the SOP happens to define that
-many.
+Which means the one way to defeat all of this is to claim a check you did not run. The harness runs
+as a subprocess of you; it cannot see your tool calls, so it cannot verify a claim — an inflated
+`checks_run` converts a partial audit straight back into a false all-clear. The `command` field is
+what makes that expensive and, more importantly, **falsifiable**: every command you name is
+published in the ledger under _How this run checked the fleet_, where a reviewer or the next run can
+re-run it. Record the entry as its check completes and paste the command you actually issued. Never
+add entries in advance, never round the list up to the roster because the SOP happens to define that
+many, and never write a command you did not run — a fabricated one is a lie with your name on it in
+a public issue, which is a worse outcome for you than an honest `7/11`.
+
+An honest shortfall costs you nothing. It marks the run `partial`, keeps the ledger open, and gets
+picked up next run. That is the system working.
 
 ### `recommendation`
 
@@ -479,6 +533,12 @@ against different sets: **new** is judged against what the body rendered, and **
 every finding in the document, rendered or not. A finding cut for space still reproduces and is
 never reported as fixed.
 
+The ledger's last section, **How this run checked the fleet**, is a collapsed table of every
+`checks_run` entry — cluster, check, command. It is rendered last, against whatever budget the
+findings left, and is dropped whole rather than half if it does not fit: a partial evidence table
+reads as a short one, and "this run ran three checks" is a worse lie than saying nothing. You do not
+write this section; you supply the commands and the harness publishes them.
+
 ## The clean run
 
 If the audit finds nothing, still call `finish` with `"findings": []` and a populated
@@ -486,6 +546,13 @@ If the audit finds nothing, still call `finish` with `"findings": []` and a popu
 unanswered in the thread, comments the date and the clusters covered, closes the ledger issue **as
 completed**, and closes every remediation pull request still open for the stream. The answers come
 first, deliberately: a reply posted after the close would land on an issue nobody is watching.
+
+**Zero findings plus a coverage gap is not a clean run, and it is not silent even on a stream with
+no ledger.** With gaps, the harness opens one — titled `coverage incomplete (n gaps, 0 findings)`
+rather than the all-clear phrasing — so the run leaves a durable artifact saying what it could not
+see. Without this, a stream that inspected nothing produced no issue, no comment, and nothing to
+notice: four streams did exactly that on 2026-08-03, and the only reason it surfaced is that a fifth
+happened to have a ledger open from the day before.
 
 A clean run is usually not news, and the closed issue is the record — but "clean" alone does not
 decide it. Read the `finish` JSON and apply the full rule:
@@ -542,6 +609,10 @@ rewritten correctly. Treat it as `[SILENT]` — the issue carries the truth eith
 - **Never report a cluster you could not read as clean.** Put it in `scope.skipped`, or name what
   did not run in that cluster's `limitations`. Both make the run `partial`, which is the mechanism
   that stops the harness from closing fixes and retiring the ledger on evidence it never gathered.
-- **Never name a check in `checks_run` that you did not run.** It is the only claim in the document
-  the harness has to take on trust, and padding it turns every protection above back off: the run
-  stops being `partial`, the ledger closes, and a fleet nobody looked at publishes as clean.
+- **Never name a check in `checks_run` that you did not run, and never a command you did not issue.**
+  It is the only claim in the document the harness has to take on trust, and padding it turns every
+  protection above back off: the run stops being `partial`, the ledger closes, and a fleet nobody
+  looked at publishes as clean. The commands are published verbatim, so a padded entry is not a
+  private shortcut — it is a false statement in a public issue, with your run's name on it.
+- **Never run the audit inline when asked to run the cron job.** Dispatch it; see
+  [Running a stream on demand](#running-a-stream-on-demand).

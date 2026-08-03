@@ -25,7 +25,18 @@ Returns `{"issue":…, "repo":…, "workspace":"/opt/data/gitops/fleet-consisten
 3. For every enumerated cluster capture the authoritative JSON with `gcloud container clusters describe <name> --location <loc> --project <proj> --format=json`. That literal invocation, with real values, is the `evidence.command` of every finding about that cluster. Never record a command you did not run.
 4. **The one-question scope rule.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; if some checks did not run there, name them in that cluster's `limitations`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator enforces all three.
 
-   **Each `scope.clusters` entry is `{name, location, project, checks_run}`, and `checks_run` is mandatory.** List the backticked slug of every §4 facet you actually compared for that cluster — `release-channel`, `shielded-nodes`, `datapath-provider`, and so on — never the section number and never prose. There are nineteen; 4.2 and 4.10 are owned by other streams and are not among them. The validator rejects an unknown slug and rejects the field being absent: a cluster you read but compared nothing on is not a clean cluster, it is an audit that did not happen. Anything short of all nineteen makes the run **partial**, so the ledger stays open and nothing is announced as resolved.
+   **Each `scope.clusters` entry is `{name, location, project, checks_run}`, and `checks_run` is mandatory.** Each entry in it is an object, never a bare string:
+
+   ```json
+   {
+     "check": "shielded-nodes",
+     "command": "gcloud container clusters describe prod-usc1 --location us-central1 --project acme-prod --format='value(shieldedNodes.enabled)'"
+   }
+   ```
+
+   `check` is the backticked slug of the §4 facet you compared — `release-channel`, `shielded-nodes`, `datapath-provider`, and so on — never the section number and never prose. There are nineteen; 4.2 and 4.10 are owned by other streams and are not among them. (`start` prints the full roster; the SOP still says what each facet _is_ and how its cohort is drawn.) `command` is the literal invocation you issued to read that facet on that cluster. The step-3 `describe` is the honest answer for most of them, written out with real values — the same command may legitimately back several facets, since one `describe` is where you read them. It must name one of `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`; `echo`, `cat`, `python3 -c`, and a call back into `audit_report.py` are all rejected.
+
+   The validator rejects an unknown slug, a duplicate, a missing or unusable command, and the field being absent: a cluster you read but compared nothing on is not a clean cluster, it is an audit that did not happen. Anything short of all nineteen makes the run **partial**, so the ledger stays open and nothing is announced as resolved. Every command is published verbatim in the ledger under _How this run checked the fleet_, so paste what you ran rather than reconstructing it afterwards.
 
    A cluster excluded from every cohort is the one case where `checks_run` is legitimately `[]` — nothing was compared, because there was nothing to compare it against. That is allowed **only** alongside the `limitations` string below saying so, which is what keeps an unexplained empty list from reading as a clean cluster.
 
@@ -183,7 +194,7 @@ consensus: <r to 2dp> -> severity <sev> (base <base>, <downgrades applied or "no
 
 Write the document to the `findings_path` from §0, with `"audit": "fleet-consistency-drift"`.
 
-- `scope.clusters` — every cluster you read, with `name`, `location`, `project`, and `checks_run` naming the §4 facets you actually compared for it, plus a non-empty `limitations` string wherever a cluster was read but not compared (§1.4, §2.4, §3.1); non-empty or the run fails. Pad a `checks_run` to nineteen because the SOP lists nineteen facets and you convert a partial audit into a false all-clear — the harness cannot see the comparison you skipped, so it believes you.
+- `scope.clusters` — every cluster you read, with `name`, `location`, `project`, and `checks_run` as `{check, command}` objects naming the §4 facets you actually compared for it and the commands you read them with, plus a non-empty `limitations` string wherever a cluster was read but not compared (§1.4, §2.4, §3.1); non-empty or the run fails. Pad a `checks_run` to nineteen because the SOP lists nineteen facets and you convert a partial audit into a false all-clear — the harness cannot see the comparison you skipped, so it believes you. The `command` is what makes that padding falsifiable rather than free: it is published verbatim, so an invented one is a false statement in a public issue.
 - `scope.skipped` — only the clusters `describe` could not read, each with the quoted error (`[]` when nothing was skipped). No cluster may appear in both lists and no finding may name a skipped cluster; the validator rejects either.
 - Per finding: `namespace` is `""` and `object` is `Cluster/<name>` for cluster-scoped facets; `id` per §3.7 and unique within the file; `severity` one of `critical`/`major`/`minor`.
 - `title` names the facet and the divergence and carries **no counts** — the harness renders the body deterministically, so a stable title keeps an unchanged fleet's findings section byte-identical between runs. (The body itself is not byte-identical: it carries generated timestamps.) Counts belong in the excerpt.

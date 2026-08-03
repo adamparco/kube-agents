@@ -53,7 +53,7 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 # --------------------------------------------------------------------------- #
 
 class AuditSpec(NamedTuple):
-    """What a stream is called, and every check its SOP defines.
+    """What a stream is called, which SOP defines it, and every check in it.
 
     `checks` is the roster: the backticked slug in each `####` check heading of
     the stream's SOP, in SOP order. It exists so the harness can tell an audit
@@ -64,12 +64,17 @@ class AuditSpec(NamedTuple):
     published as a confident all-clear. That is not hypothetical: it is how five
     streams reported a clean fleet on a fleet that was not.
 
-    `test_check_rosters_match_the_sops` re-derives this from the SOP headings,
-    so a check added to an SOP without being added here fails CI rather than
-    becoming a check no run is ever required to perform.
+    `sop` is the filename under `agents/platform/governance/`. The validator
+    names it when it rejects a slug, because the roster itself must never appear
+    in an error message — see `_reject_unknown_check`.
+
+    `test_check_rosters_match_the_sops` re-derives `checks` from the SOP
+    headings, so a check added to an SOP without being added here fails CI
+    rather than becoming a check no run is ever required to perform.
     """
 
     title: str
+    sop: str
     checks: tuple[str, ...]
 
 
@@ -81,6 +86,7 @@ class AuditSpec(NamedTuple):
 AUDITS: dict[str, AuditSpec] = {
     "compliance-audit": AuditSpec(
         "Security & RBAC Posture Audit",
+        "compliance_audit_sop.md",
         (
             "privileged-container",
             "host-namespace",
@@ -97,6 +103,7 @@ AUDITS: dict[str, AuditSpec] = {
     ),
     "security-patch-orchestrator": AuditSpec(
         "Upgrade & Patch Readiness Audit",
+        "security_patch_orchestrator_sop.md",
         (
             "master-behind",
             "pool-skew",
@@ -112,6 +119,7 @@ AUDITS: dict[str, AuditSpec] = {
     ),
     "obtainability-audit": AuditSpec(
         "Workload Reliability Audit",
+        "obtainability_audit_sop.md",
         (
             "no-requests",
             "no-memory-limit",
@@ -127,6 +135,7 @@ AUDITS: dict[str, AuditSpec] = {
     ),
     "fleet-wide-cost-analysis": AuditSpec(
         "Fleet Waste Audit",
+        "fleet_wide_cost_analysis_sop.md",
         (
             "overrequest",
             "orphan-pv",
@@ -142,6 +151,7 @@ AUDITS: dict[str, AuditSpec] = {
     ),
     "fleet-consistency-drift": AuditSpec(
         "Fleet Consistency Drift Audit",
+        "fleet_consistency_drift_sop.md",
         (
             "release-channel",
             "shielded-nodes",
@@ -542,6 +552,30 @@ def audit_checks(audit_id: str) -> tuple[str, ...]:
     return spec.checks if spec else ()
 
 
+def audit_sop(audit_id: str) -> str:
+    """The SOP filename that defines this stream's checks."""
+    spec = AUDITS.get(audit_id)
+    return spec.sop if spec else ""
+
+
+def checks_ran(cluster: object) -> list[str]:
+    """The check slugs a `scope.clusters` entry claims to have run.
+
+    Entries are `{check, command}` objects post-validation, but this also has to
+    survive being handed a half-built document: `coverage_gaps` and the scope
+    table both run against data that reached them from a dry-run path, and a
+    renderer that raises on a malformed entry turns a bad findings file into a
+    stack trace instead of a validation error naming the field.
+    """
+    out: list[str] = []
+    for entry in (cluster.get("checks_run") or []) if isinstance(cluster, dict) else []:
+        if isinstance(entry, dict):
+            slug = str(entry.get("check", "")).strip()
+            if slug:
+                out.append(slug)
+    return out
+
+
 def findings_path_for(audit_id: str) -> str:
     return f"{SCRATCH_DIR}/findings_{audit_id}.json"
 
@@ -569,6 +603,100 @@ def _require_str(value: object, where: str, *, allow_empty: bool = True) -> str:
     if not allow_empty and not value.strip():
         raise ValidationError(f"{where}: required, must be a non-empty string")
     return value
+
+
+def _sop_pointer(audit_id: str) -> str:
+    """Where to find the roster, said without saying what the roster is.
+
+    Every rejection that concerns `checks_run` ends here rather than in a list
+    of valid slugs. The distinction is the whole point of the message: a run
+    that genuinely inspected the fleet already knows the slugs and needs a
+    pointer at most, while a run that inspected nothing needs the list — and
+    handing it over is what lets a fabricated document be corrected into a
+    published one without a single additional command being issued.
+    """
+    sop = audit_sop(audit_id)
+    where = f"governance/{sop}" if sop else "the stream's SOP"
+    return (
+        f"The roster is the `####` check headings in {where} — read the whole "
+        "file, not its first page, and run the checks before naming them. "
+        "`start` prints the roster too."
+    )
+
+
+# Commands that cannot have inspected anything. This is a smell filter, not a
+# proof: nothing reachable from inside this process can confirm that a command
+# in `checks_run` was ever executed (see `validate_check_command`). What it does
+# rule out is the specific shape the 2026-08-03 false all-clear took — a run
+# that issued no cluster command at all and assembled its scope with
+# `python3 -c "import json; print(json.dumps({...}))"`.
+NON_INSPECTING_COMMAND_RE = re.compile(
+    r"^\s*(?:sudo\s+)?(?:echo|printf|cat|true|false|:|#|python3?\s+-c|"
+    r"node\s+-e|jq\b|sleep|ls|pwd)\b",
+    re.I,
+)
+
+# A command has to reach a cluster or the cloud API to have checked anything.
+# An allowlist rather than a deny-list because the failure mode being closed is
+# an agent inventing plausible-looking filler; a new SOP that needs another
+# binary adds it here and `test_check_commands_use_an_inspection_binary` says so.
+INSPECTION_BINARIES = ("kubectl", "gcloud", "gsutil", "bq", "helm", "curl")
+
+MIN_CHECK_COMMAND_CHARS = 8
+
+
+def validate_check_command(value: object, where: str, check: str) -> str:
+    """The command that backs one `checks_run` entry.
+
+    **This is attestation, not verification, and the limit is structural.** The
+    harness runs as a subprocess of the agent; it cannot see the agent's tool
+    calls, so it cannot know whether this command was ever executed. What
+    requiring it buys is threefold, and none of it is proof:
+
+    1. It makes fabrication expensive. Typing ten slugs is free — the roster is
+       a fixed, guessable list. Inventing ten distinct, plausible, per-cluster
+       invocations is not, and it has to be redone for every cluster.
+    2. It makes fabrication *falsifiable*. The commands are published in the
+       ledger (`_render_check_evidence`), so a reader — or the next run — can
+       re-run them and find out. A bare slug list left nothing to check.
+    3. It removes the trivially-cheap path. The document that published five
+       clean audits contained no command anywhere; it cannot be written now
+       without inventing thirty of them.
+
+    A run determined to lie can still lie. The mitigation for that is the
+    published record, not this function.
+    """
+    command = _require_str(value, where, allow_empty=False)
+    text = command.strip()
+    if len(text) < MIN_CHECK_COMMAND_CHARS:
+        raise ValidationError(
+            f"{where}: {text!r} is too short to be the command that ran check "
+            f"{check!r}. Give the literal invocation, with its --context/--project "
+            "and the namespace or resource it targeted."
+        )
+    if len(text) > MAX_COMMAND_CHARS:
+        raise ValidationError(
+            f"{where}: command for {check!r} exceeds {MAX_COMMAND_CHARS} characters"
+        )
+    if "audit_report.py" in text:
+        raise ValidationError(
+            f"{where}: the command for {check!r} is a call to this harness. "
+            "`checks_run` records how you inspected the fleet, not how you "
+            "reported on it."
+        )
+    if NON_INSPECTING_COMMAND_RE.match(text):
+        raise ValidationError(
+            f"{where}: {text.split()[0]!r} cannot inspect a cluster, so it "
+            f"cannot be how check {check!r} ran. Give the kubectl or gcloud "
+            "command you actually issued."
+        )
+    if not any(binary in text for binary in INSPECTION_BINARIES):
+        raise ValidationError(
+            f"{where}: the command for {check!r} names none of "
+            f"{', '.join(INSPECTION_BINARIES)}, so it did not read a cluster or "
+            "the cloud API. A check is only 'run' if something was queried."
+        )
+    return command
 
 
 def _require_repo_relative(path: str, where: str) -> str:
@@ -713,10 +841,10 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 allow_empty=False,
             )
 
-        # Which checks actually ran here. This is the field that makes an empty
-        # `findings` list mean something: without it, a run that evaluated every
-        # check and a run that evaluated none are the same document, and the
-        # harness publishes both as an all-clear.
+        # Which checks actually ran here, and the command each one ran. This is
+        # the field that makes an empty `findings` list mean something: without
+        # it, a run that evaluated every check and a run that evaluated none are
+        # the same document, and the harness publishes both as an all-clear.
         #
         # Absent is always a rejection. Empty is a rejection *unless* the cluster
         # also explains itself in `limitations` — the consistency-drift audit has
@@ -731,11 +859,11 @@ def validate_findings(data: object, audit_id: str) -> dict:
         cluster_label = str(cluster.get("name", "")) or "this cluster"
         if not isinstance(checks_run, list):
             raise ValidationError(
-                f"scope.clusters[{i}].checks_run: required, must be a list naming "
-                "the checks this run actually executed against "
-                f"{cluster_label}. Zero checks on a cluster you could read is not "
-                "a clean result — it is an audit that did not run. The "
-                f"{audit_id} checks are: {', '.join(roster)}"
+                f"scope.clusters[{i}].checks_run: required, must be a list of "
+                "{check, command} objects naming the checks this run actually "
+                f"executed against {cluster_label} and the command each one ran. "
+                "Zero checks on a cluster you could read is not a clean result — "
+                f"it is an audit that did not run. {_sop_pointer(audit_id)}"
             )
         if not checks_run and not str(cluster.get("limitations", "")).strip():
             raise ValidationError(
@@ -743,23 +871,38 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "claims the cluster was read and nothing was checked on it. That is "
                 "an audit that did not run, not a clean cluster. Name the checks you "
                 "ran, or — if nothing could run there — say why in that cluster's "
-                "limitations, or move it to scope.skipped with a reason. The "
-                f"{audit_id} checks are: {', '.join(roster)}"
+                "limitations, or move it to scope.skipped with a reason. "
+                f"{_sop_pointer(audit_id)}"
             )
         seen_checks: set[str] = set()
-        for j, slug in enumerate(checks_run):
+        for j, entry in enumerate(checks_run):
             where = f"scope.clusters[{i}].checks_run[{j}]"
-            _require_str(slug, where, allow_empty=False)
-            name = str(slug)
-            if name not in roster_set:
+            if not isinstance(entry, dict):
                 raise ValidationError(
-                    f"{where}: {name!r} is not a check in the {audit_id} SOP. "
-                    "Name checks by the backticked slug in their heading, not by "
-                    f"section number or prose. Known checks: {', '.join(roster)}"
+                    f"{where}: expected an object with 'check' and 'command'. A "
+                    "bare slug is no longer accepted — naming a check costs "
+                    "nothing, so the claim has to carry the command that backs "
+                    f"it. {_sop_pointer(audit_id)}"
+                )
+            _require_str(entry.get("check"), f"{where}.check", allow_empty=False)
+            name = str(entry["check"])
+            if name not in roster_set:
+                # Deliberately no roster in this message. An error that lists
+                # the valid slugs turns the validator into an answer key: a run
+                # that inspected nothing can submit guesses, read the roster off
+                # the rejection, and resubmit the same empty document with the
+                # right words in it. That is not a hypothetical either — it is
+                # how four streams turned an `exit 2` into a published
+                # all-clear on 2026-08-03.
+                raise ValidationError(
+                    f"{where}.check: {name!r} is not a check in the {audit_id} "
+                    "SOP. Name checks by the backticked slug in their `####` "
+                    f"heading, not by section number or prose. {_sop_pointer(audit_id)}"
                 )
             if name in seen_checks:
-                raise ValidationError(f"{where}: duplicate check {name!r}")
+                raise ValidationError(f"{where}.check: duplicate check {name!r}")
             seen_checks.add(name)
+            validate_check_command(entry.get("command"), f"{where}.command", name)
 
     skipped = scope.get("skipped", [])
     if not isinstance(skipped, list):
@@ -959,7 +1102,7 @@ def coverage_gaps(data: dict) -> list[str]:
         gaps.append(f"{cluster}: not audited — {entry.get('reason', 'no reason given')}")
     for cluster in scope.get("clusters") or []:
         limitation = str(cluster.get("limitations", "")).strip()
-        ran = {str(c) for c in (cluster.get("checks_run") or [])}
+        ran = set(checks_ran(cluster))
         missing = [check for check in roster if check not in ran]
         if not limitation and not missing:
             continue
@@ -1069,6 +1212,20 @@ def issue_title(audit_id: str, findings: list[dict]) -> str:
     return (
         f"[audit] {audit_name(audit_id)} — {findings_phrase(len(findings))} "
         f"({counts['critical']} critical)"
+    )
+
+
+def coverage_issue_title(audit_id: str, gaps: list[str]) -> str:
+    """Title for a ledger opened by a run that found nothing but saw too little.
+
+    Deliberately not `issue_title`'s "0 findings (0 critical)": that phrasing is
+    an all-clear, and this issue exists precisely because the run is not one.
+    """
+    count = len(gaps)
+    noun = "gap" if count == 1 else "gaps"
+    return (
+        f"[audit] {audit_name(audit_id)} — coverage incomplete "
+        f"({count} {noun}, 0 findings)"
     )
 
 
@@ -2126,7 +2283,7 @@ def _render_scope(
             f"| `{_cell(cluster.get('project', ''))}` "
         )
         if roster:
-            ran = {str(c) for c in (cluster.get("checks_run") or [])}
+            ran = set(checks_ran(cluster))
             complete = len(ran & set(roster))
             flag = "" if complete == len(roster) else " ⚠"
             row += f"| {complete}/{len(roster)}{flag} "
@@ -2164,11 +2321,28 @@ def _render_findings(
     *,
     states: dict[str, str] | None = None,
     pr_urls: dict[str, str] | None = None,
+    gaps: list[str] | None = None,
 ) -> tuple[list[str], list[dict]]:
     """The findings section, plus the findings that did not fit the budget."""
     out = ["", "## Findings", ""]
     if not findings:
-        out.append("No findings. Every audited cluster is compliant with this audit.")
+        # "Every audited cluster is compliant" is only true if the audit
+        # audited them. Over a coverage gap that sentence is the false
+        # all-clear this whole mechanism exists to prevent — and it is the
+        # first thing a reader sees on a ledger opened *because* coverage was
+        # incomplete.
+        if gaps:
+            out.append(
+                "No findings — but this run did not see the whole fleet, so that "
+                "is not an all-clear. A finding's absence only means something "
+                "if the audit looked; see the Scope table above for what did "
+                "not run. This ledger stays open until a run with complete "
+                "coverage comes back clean."
+            )
+        else:
+            out.append(
+                "No findings. Every audited cluster is compliant with this audit."
+            )
         return out, []
 
     states = states or {}
@@ -2293,6 +2467,58 @@ class RenderedIssue(NamedTuple):
         return bool(self.omitted)
 
 
+def _render_check_evidence(
+    clusters: list[dict], audit_id: str, budget: int
+) -> list[str]:
+    """The command behind every check this run claims to have performed.
+
+    This section is why `checks_run` carries commands at all. The harness cannot
+    verify that any of them ran — it is a subprocess of the agent and never sees
+    the agent's tool calls — so the guarantee it can offer instead is
+    *falsifiability*: the claims are published verbatim, next to the check they
+    are supposed to back, where a reader can re-run one and find out. A slug
+    list offered nothing to re-run.
+
+    Collapsed, and last of the optional sections, because on a healthy fleet
+    this is the longest thing in the document and the findings are what people
+    open the issue for. It yields the whole section rather than half of one when
+    the budget runs out: a truncated evidence list reads as "these are the
+    commands", and it would not be.
+    """
+    if not audit_checks(audit_id):
+        return []
+    rows: list[tuple[str, str, str]] = []
+    for cluster in clusters:
+        name = str(cluster.get("name", "")).strip() or "(unnamed)"
+        for entry in cluster.get("checks_run") or []:
+            if not isinstance(entry, dict):
+                continue
+            check = str(entry.get("check", "")).strip()
+            command = str(entry.get("command", "")).strip()
+            if check and command:
+                rows.append((name, check, command))
+    if not rows:
+        return []
+
+    out = [
+        "",
+        "<details>",
+        f"<summary>How this run checked the fleet ({len(rows)} checks)</summary>",
+        "",
+        "One row per check that ran, with the command that ran it, as reported "
+        "by the audit. The harness cannot confirm a command was issued — these "
+        "are re-runnable so that it does not have to be taken on trust.",
+        "",
+        "| Cluster | Check | Command |",
+        "| ------- | ----- | ------- |",
+    ]
+    for name, check, command in rows:
+        out.append(f"| `{_cell(name)}` | `{_cell(check)}` | `{_cell(command)}` |")
+    out.append("")
+    out.append("</details>")
+    return out if len("\n".join(out)) <= budget else []
+
+
 def render_issue_body(
     data: dict,
     *,
@@ -2337,15 +2563,20 @@ def render_issue_body(
         max(BODY_BUDGET - overhead, 0),
         states=states,
         pr_urls=pr_urls,
+        gaps=coverage_gaps(data),
     )
     omitted_ids = {str(f.get("id", "")) for f in omitted}
     rendered_ids = [fid for fid in finding_ids(findings) if fid not in omitted_ids]
 
+    footer = _render_footer(audit_id, generated_at, rendered_ids)
+    # Whatever the findings did not need. The evidence appendix is the last
+    # claim on the budget, never a competitor for it — a run with 400 findings
+    # publishes the findings and drops the appendix, not the reverse.
+    spent = len("\n".join(fixed + findings_lines + withheld_section + footer))
+    evidence = _render_check_evidence(clusters, audit_id, max(BODY_BUDGET - spent, 0))
+
     body = "\n".join(
-        fixed
-        + findings_lines
-        + withheld_section
-        + _render_footer(audit_id, generated_at, rendered_ids)
+        fixed + findings_lines + withheld_section + evidence + footer
     )
     if len(body) > MAX_BODY_CHARS:
         raise BodyTooLargeError(
@@ -3781,6 +4012,32 @@ def handle_start(args: argparse.Namespace) -> None:
                 "workspace": str(root),
                 "findings_path": findings_path,
                 "pending_remediation_requests": pending,
+                # The roster, handed over rather than left to be discovered.
+                #
+                # It is in the SOP, and the SOP is required reading, but "the
+                # agent will read far enough" is not a mechanism: `read_file`
+                # defaults to 500 lines and every audit SOP fits inside that,
+                # yet the run that published five false all-clears asked for
+                # 100 lines of each — under the default, on files whose checks
+                # start at line 56 and run past 270. Printing the roster here
+                # costs nothing and removes the failure entirely.
+                #
+                # Safe at `start` in a way it is not at `finish`: this is the
+                # instruction, issued before any work. The same list in a
+                # `finish` rejection is an answer key — it lets a document that
+                # inspected nothing be corrected into a published all-clear.
+                # See `_sop_pointer`.
+                "sop": f"governance/{audit_sop(audit_id)}",
+                "checks": list(audit_checks(audit_id)),
+                "checks_contract": (
+                    "Run every check above against every cluster you can read. "
+                    "`finish` requires scope.clusters[].checks_run as a list of "
+                    "{check, command} objects — the slug, and the literal "
+                    "command you issued for it. A check you did not run is left "
+                    "out and makes the run partial; naming one you did not run "
+                    "is the single entry in the document that turns a partial "
+                    "audit into a false all-clear."
+                ),
             }
         )
     )
@@ -4266,6 +4523,44 @@ def handle_finish(args: argparse.Namespace) -> None:
                 ]
             )
             log(f"Audit {audit_id} is clean; closed issue #{existing_issue}.")
+        elif gaps:
+            # Zero findings, incomplete coverage, and no ledger to say so on.
+            # Left alone this is the quietest failure the harness has: the run
+            # that inspected nothing produces no issue, no comment and no
+            # artifact of any kind, so a stream can report a clean fleet every
+            # morning for weeks while never having looked at it. Four streams
+            # did exactly that on 2026-08-03 and the only reason it was caught
+            # is that a fifth happened to have a ledger open from the day
+            # before. Open one: an audit that cannot speak for the fleet has
+            # something to say, and it must land somewhere durable.
+            rendered = render_issue_body(data, generated_at=now, audit_id=audit_id)
+            body_file = _write_temp(rendered.body)
+            try:
+                res = gh(
+                    [
+                        "issue",
+                        "create",
+                        "-R",
+                        repo,
+                        "--title",
+                        coverage_issue_title(audit_id, gaps),
+                        "--body-file",
+                        body_file,
+                        "--label",
+                        "agent:audit",
+                        "--label",
+                        f"audit:{audit_id}",
+                    ]
+                )
+            finally:
+                _unlink(body_file)
+            lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
+            existing_url = lines[-1] if lines else None
+            log(
+                f"Audit {audit_id} found nothing and had no ledger, but "
+                f"{len(gaps)} coverage gap(s) mean it cannot speak for the "
+                f"fleet; opened {existing_url or 'a coverage ledger'}."
+            )
         else:
             log(f"Audit {audit_id} is clean and has no open ledger; nothing to do.")
         print(
