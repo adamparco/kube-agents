@@ -645,13 +645,21 @@ GIT_LEASE_MARKER = ".lease"
 # and a new one silently failing closed would be a worse outcome than the race
 # this closes. `clone` is absent on purpose: it runs at the lease root, one
 # directory above the tree it is about to create, and it cannot damage a tree
-# that does not exist yet. `fetch`, `config`, `remote` and every read verb are
-# likewise untouched.
+# that does not exist yet. `fetch` is absent for the same reason it is safe —
+# it writes remote-tracking refs and nothing in the working tree. `config`,
+# `remote` and every read verb are likewise untouched.
+#
+# `pull`, `submodule` and `sparse-checkout` are here because each one is a
+# working-tree write wearing another word: `pull` is `fetch` plus the `merge`
+# or `rebase` two lines up, `submodule update` checks out whole directories,
+# and `sparse-checkout set` adds and removes files across the entire tree. All
+# three were reachable in a clone another agent was midway through.
 GIT_MUTATING_SUBCOMMANDS = frozenset(
     {
         "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean",
-        "commit", "merge", "mv", "push", "rebase", "reset", "restore", "revert",
-        "rm", "stash", "switch", "tag", "update-ref", "worktree",
+        "commit", "merge", "mv", "pull", "push", "rebase", "reset", "restore",
+        "revert", "rm", "sparse-checkout", "stash", "submodule", "switch",
+        "tag", "update-ref", "worktree",
     }
 )
 

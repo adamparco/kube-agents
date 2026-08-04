@@ -33,23 +33,32 @@ through. `prepare` hands you a clone that is yours alone:
 
 _(Example: `platform-agent/provision-mercury-09` or `platform-agent/upgrade-policy-baseline`)_
 
-It clones and refreshes the GitOps repository, cuts the branch off `origin/main`,
-and prints one JSON line:
+It clones and refreshes the GitOps repository, takes the branch, and prints one
+JSON line:
 
 ```json
 {
   "workspace": "/opt/data/gitops/t_9f3c1e07/acme__fleet",
   "lease": "t_9f3c1e07",
   "branch": "platform-agent/provision-mercury-09",
-  "repo": "acme/fleet"
+  "base": "main",
+  "repo": "acme/fleet",
+  "started_from": "origin/main"
 }
 ```
 
-**Read `workspace` out of that line and do everything else inside it.** The
+**Keep that whole line. Step 3 needs `workspace` and `lease` back.** The
 credential proxy refuses `git add`, `commit`, `checkout`, `push` and every other
 tree-mutating verb outside a leased workspace, so a command run anywhere else
 comes back as a security refusal rather than quietly damaging another agent's
 work.
+
+`base` is the repository's own default branch, not a hardcoded `main` —
+`started_from` records what the branch was actually cut from. When the branch
+already exists on the remote (Step 5, addressing feedback on an open PR),
+`started_from` is `origin/<branch>` and your commits land **on top of** the ones
+already under review. When it does not, the branch is cut fresh from
+`origin/<base>`.
 
 ### Step 2: Make and Commit the Changes
 
@@ -66,13 +75,14 @@ work.
 ### Step 3: Call the Secure Submit Suggestion Script
 
 Invoke the same helper with `submit` to handle the GitHub App token exchange, git
-credential configuration, branch push, and Pull Request creation. Pass the
-`workspace` from Step 1 — the script verifies the lease on it is still yours and
-refuses outright if the tree belongs to another agent:
+credential configuration, branch push, and Pull Request creation. Pass **both**
+the `workspace` and the `lease` from Step 1 — the script verifies the lease on
+that tree is still yours and refuses outright if it belongs to another agent:
 
 ```bash
 ./skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --workspace "<workspace>" \
+  --lease "<lease>" \
   --branch "platform-agent/<change_type>-<target_id>" \
   --title "<pr_title>" \
   --body "This Pull Request was generated automatically by the **Platform Agent** control plane.
@@ -83,7 +93,14 @@ refuses outright if the tree belongs to another agent:
 Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollout!"
 ```
 
-The script will return the clean, live GitHub PR URL dynamically!
+`--lease` is not optional bookkeeping. `prepare` and `submit` are separate
+processes, and outside a kanban card there is no session identity for `submit`
+to re-derive the lease from — so without it the script stops and tells you to
+pass it, rather than inventing an id that could never match the workspace.
+
+The script returns the clean, live GitHub PR URL. If a Pull Request for this
+branch is already open, it updates that one's title and body in place and
+returns its URL — resubmitting is not an error.
 
 ### Step 4: Confirm Suggestion
 
@@ -101,10 +118,13 @@ When you are asked to **address review comments / reviewer feedback** on an exis
    ```
 3. **Apply the requested changes on the PR's own branch.** Lease a workspace for
    that branch the same way Step 1 does — `prepare --branch <headRefName>` — and
-   work inside the `workspace` it prints. Make the targeted edits, then —
+   work inside the `workspace` it prints. Because the branch already exists on
+   the remote, `prepare` bases it on `origin/<headRefName>`, so the commits
+   already under review are still there and yours go on top;
+   `started_from` in its JSON says which. Make the targeted edits, then —
    following the **same CRITICAL security rule as Step 2** — stage only the
    specific files (**never `git add .` / `-A`**), commit with a Conventional
-   Commit message, and run `submit` with the same `--workspace` and
+   Commit message, and run `submit` with the same `--workspace`, `--lease` and
    `--branch <headRefName>` so the existing PR updates in place. `submit` pushes
    with `--force-with-lease`: it will update the branch your workspace fetched,
    and refuse rather than overwrite one somebody else has moved in the meantime.

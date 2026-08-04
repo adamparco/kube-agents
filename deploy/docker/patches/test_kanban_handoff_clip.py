@@ -61,6 +61,21 @@ class ClipHandoffTest(unittest.TestCase):
     def test_non_positive_limit_returns_the_body(self):
         self.assertEqual(clip_handoff("hello", 0), "hello")
 
+    def test_a_limit_too_small_for_the_marker_is_still_a_limit(self):
+        # `budget = max(1, limit - len(ELLIPSIS))` kept a character and then
+        # appended the four-character marker to it, so every limit from 1 to 4
+        # returned MORE than it was asked for — the one thing a clip must not
+        # do. Below the marker's own width the marker is what gets dropped.
+        for limit in range(1, len(ELLIPSIS) + 1):
+            with self.subTest(limit=limit):
+                clipped = clip_handoff(PRODUCTION_SUMMARY, limit)
+                self.assertLessEqual(len(clipped), limit)
+
+    def test_the_budget_holds_at_every_limit(self):
+        for limit in range(1, 260):
+            with self.subTest(limit=limit):
+                self.assertLessEqual(len(clip_handoff(PRODUCTION_SUMMARY, limit)), limit)
+
     def test_default_limit_is_generous_enough_for_a_real_summary(self):
         self.assertGreaterEqual(DEFAULT_LIMIT, 1000)
 

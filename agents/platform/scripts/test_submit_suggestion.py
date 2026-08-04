@@ -93,10 +93,18 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.patch_attr(gitops_workspace, "ensure_workspace", local_ensure)
 
         env = patch.dict(
-            os.environ, {"HERMES_KANBAN_TASK": "t_card", "HERMES_SESSION_ID": ""}
+            os.environ,
+            {
+                "HERMES_KANBAN_TASK": "t_card",
+                "HERMES_SESSION_ID": "",
+                "GITOPS_BASE_BRANCH": "",
+            },
         )
         env.start()
         self.addCleanup(env.stop)
+        # Memoised per clone, and these clones live at per-test temp paths.
+        gitops_workspace.forget_base_branch()
+        self.addCleanup(gitops_workspace.forget_base_branch)
 
         # `gh pr create` needs a GitHub. Record the call instead.
         self.gh_calls = []
@@ -324,24 +332,109 @@ class TestSubmit(SubmitSuggestionTestCase):
         self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
         self.assertEqual(self.gh_calls, [])
 
-    def test_a_second_round_of_review_feedback_updates_the_same_pr_branch(self):
-        # Why the force was there in the first place. `prepare` resets the
-        # branch back onto origin/main, so the second round is not a
-        # fast-forward of the first — a plain push would be rejected and the
-        # reviewer's feedback would never land.
+    def test_a_second_round_of_review_feedback_keeps_the_first_round(self):
+        """Step 5, and the data loss it used to cause.
+
+        `prepare --branch <headRefName>` against an open pull request's branch
+        used to reset that branch onto `origin/main` and force-push, so round
+        two did not amend the pull request — it replaced every reviewed commit
+        with one that no longer contained them. `--force-with-lease` could not
+        object either: the clone had just fetched the very ref it would have
+        compared against.
+        """
         payload = self.prepare()
         self.commit(payload["workspace"])
         self.submit(payload["branch"], payload["workspace"])
 
         again = self.prepare()
+        self.assertEqual(again["started_from"], "origin/platform-agent/fix-netpol")
         self.commit(again["workspace"], name="clusters/prod/netpol-v2.yaml")
         self.submit(again["branch"], again["workspace"])
 
-        landed = self.origin_git(
-            ["show", "--stat", "--format=", "platform-agent/fix-netpol"]
+        files = self.origin_git(
+            ["ls-tree", "-r", "--name-only", "platform-agent/fix-netpol"]
+        ).split()
+        self.assertIn("clusters/prod/netpol-v2.yaml", files)
+        self.assertIn(
+            "clusters/prod/netpol.yaml", files, "round one's reviewed work was erased"
         )
-        self.assertIn("netpol-v2.yaml", landed)
-        self.assertEqual(len(self.gh_calls), 2)
+
+    def test_a_brand_new_branch_still_starts_from_the_base(self):
+        # The other half of the same rule: only an existing remote branch is
+        # continued. A new one must not inherit whatever a same-named branch
+        # once held, and must carry no commits but the base's.
+        payload = self.prepare(branch="platform-agent/brand-new")
+        self.assertEqual(payload["started_from"], "origin/main")
+        self.assertEqual(payload["base"], "main")
+
+    def test_resubmitting_returns_the_open_pr_instead_of_failing(self):
+        """`gh pr create` refuses after the push has already landed.
+
+        Reported as a failure, that is the worst possible shape: the branch is
+        updated and the reviewer sees the new commits, but the skill says the
+        submission failed — so the agent retries, pushes again, and fails
+        again, for as many rounds of feedback as the pull request gets.
+        """
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        first = self.submit(payload["branch"], payload["workspace"], title="round one")
+
+        again = self.prepare()
+        self.commit(again["workspace"], name="clusters/prod/netpol-v2.yaml")
+        second = self.submit(again["branch"], again["workspace"], title="round two")
+
+        self.assertEqual(second, first)
+        verbs = [argv[1:3] for argv, _ in self.gh_calls]
+        self.assertEqual(
+            verbs,
+            [["pr", "create"], ["pr", "create"], ["pr", "edit"], ["pr", "view"]],
+        )
+        # Refreshed, not merely located: the title and body describe the
+        # commits just pushed, and the old ones are no longer on the branch.
+        stub = submit_suggestion.subprocess
+        self.assertEqual(stub.titles["platform-agent/fix-netpol"], "round two")
+
+    def test_a_gh_failure_that_is_not_an_existing_pr_still_raises(self):
+        # The fallback must not swallow "not authenticated" or "base branch is
+        # protected" — those are real failures and the run has to stop.
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+
+        stub = submit_suggestion.subprocess
+        original = stub._create
+        stub._create = lambda argv: subprocess.CompletedProcess(
+            argv, 1, "", "HTTP 403: Resource not accessible by integration\n"
+        )
+        self.addCleanup(setattr, stub, "_create", original)
+
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.submit(payload["branch"], payload["workspace"])
+
+    def test_submit_without_a_lease_or_a_session_says_what_to_pass(self):
+        """The unrecoverable loop, turned into one line of instruction.
+
+        Outside a kanban card neither HERMES_KANBAN_TASK nor HERMES_SESSION_ID
+        is set, and `lease_id` would mint `adhoc-<random>` — a different random
+        string in `submit`'s process than in `prepare`'s. The ownership check
+        would then refuse the workspace `prepare` had just handed over, and
+        would refuse it identically however many times the agent retried.
+        """
+        payload = self.prepare(lease="t_explicit")
+        self.commit(payload["workspace"])
+        with patch.dict(
+            os.environ, {"HERMES_KANBAN_TASK": "", "HERMES_SESSION_ID": ""}
+        ):
+            with self.assertRaises(ValueError) as caught:
+                self.submit(payload["branch"], payload["workspace"])
+        self.assertIn("--lease", str(caught.exception))
+        # And the documented round-trip works.
+        with patch.dict(
+            os.environ, {"HERMES_KANBAN_TASK": "", "HERMES_SESSION_ID": ""}
+        ):
+            url = self.submit(
+                payload["branch"], payload["workspace"], lease=payload["lease"]
+            )
+        self.assertTrue(url.startswith("https://github.com/acme/fleet/pull/"))
 
     def test_someone_elses_branch_of_the_same_name_is_not_destroyed(self):
         """`--force-with-lease`, and the reason it replaced a blind `-f`.
@@ -435,25 +528,65 @@ class TestArgvCompatibility(unittest.TestCase):
 class _GhStub:
     """Stand in for the `subprocess` module inside submit_suggestion.
 
-    Only `gh pr create` is intercepted — it is the one call that needs a real
-    GitHub. Everything else is handed to the real module so the git in these
-    tests stays real.
+    Only `gh` is intercepted — it is the one tool that needs a real GitHub.
+    Everything else is handed to the real module so the git in these tests
+    stays real.
+
+    It models one behaviour beyond recording, because that behaviour is the
+    bug: GitHub refuses a second `pr create` for a branch that already has an
+    open pull request, and the refusal arrives *after* the push has landed. A
+    stub that always succeeded made the resubmission path untestable, which is
+    how the skill shipped exiting 1 on every round of review feedback.
     """
 
     def __init__(self, test):
         self._test = test
+        self.open_prs: dict[str, str] = {}
+        self.titles: dict[str, str] = {}
 
     def __getattr__(self, name):
         return getattr(subprocess, name)
 
     def run(self, cmd, **kwargs):
-        if list(cmd[:3]) == ["gh", "pr", "create"]:
-            self._test.gh_calls.append((list(cmd), kwargs.get("cwd")))
-            number = len(self._test.gh_calls)
+        argv = list(cmd)
+        if argv[:1] != ["gh"]:
+            return subprocess.run(cmd, **kwargs)
+        self._test.gh_calls.append((argv, kwargs.get("cwd")))
+        verb = argv[1:3]
+        if verb == ["pr", "create"]:
+            return self._create(argv)
+        if verb == ["pr", "edit"]:
+            return self._edit(argv)
+        if verb == ["pr", "view"]:
+            return self._view(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def _create(self, argv):
+        branch = argv[argv.index("--head") + 1]
+        if branch in self.open_prs:
+            # Verbatim shape of the real refusal, because the code keys on it.
             return subprocess.CompletedProcess(
-                cmd, 0, f"https://github.com/acme/fleet/pull/{number}\n", ""
+                argv, 1, "",
+                f'a pull request for branch "{branch}" into branch "main" '
+                f"already exists:\n{self.open_prs[branch]}\n",
             )
-        return subprocess.run(cmd, **kwargs)
+        url = f"https://github.com/acme/fleet/pull/{len(self.open_prs) + 1}"
+        self.open_prs[branch] = url
+        self.titles[branch] = argv[argv.index("--title") + 1]
+        return subprocess.CompletedProcess(argv, 0, url + "\n", "")
+
+    def _edit(self, argv):
+        branch = argv[3]
+        if branch not in self.open_prs:
+            return subprocess.CompletedProcess(argv, 1, "", "no pull requests found\n")
+        self.titles[branch] = argv[argv.index("--title") + 1]
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def _view(self, argv):
+        branch = argv[3]
+        if branch not in self.open_prs:
+            return subprocess.CompletedProcess(argv, 1, "", "no pull requests found\n")
+        return subprocess.CompletedProcess(argv, 0, self.open_prs[branch] + "\n", "")
 
 
 if __name__ == "__main__":  # pragma: no cover

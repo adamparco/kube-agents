@@ -63,17 +63,41 @@ The validator rejects an unknown slug, a duplicate, a missing or unusable comman
 
 Same slugs as `checks_run`, and the `reason` has to say why the check _cannot_ apply here — "N/A" and "not applicable" are rejected; name the property of the cluster that rules it out. Those checks leave the denominator rather than counting as missing, so an Autopilot cluster where 2.1–2.3 and 2.9 cannot apply reads as complete at seven of seven instead of forever-incomplete at seven of eleven. Without this the ledger can never close on an Autopilot fleet, nothing is ever announced as resolved, and no stale remediation PR is ever cleaned up. Use it only for checks the cluster's shape rules out. A check you could have run and did not is a `limitations` note and a real gap, and the validator rejects a slug that appears in both lists, a duplicate, an unknown slug, and a reason under sixteen characters.
 
-**The one-question scope rule.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; if some checks did not run there, name them in that cluster's `limitations`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding.
+**The one-question scope rule.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; if some checks did not run there, split them — the ones that could have run and did not go in that cluster's `limitations`, the ones its shape rules out in `checks_not_applicable`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding.
 
 `scope.skipped` is only for clusters you could **not** read, as `{cluster, reason}`:
 
 - `status != RUNNING` → `"cluster status <STATUS>, not queried"`.
 - `get-credentials` / `auth can-i` fails → `"no read access: <trimmed stderr>"`. Never infer a finding from a cluster you could not reach.
 
-`scope.clusters[].limitations` is an optional string on a cluster you **did** read, naming the checks that did not run there and why. When present it must be non-empty and must name the checks by number. Partial coverage is never a reason to move the cluster to `scope.skipped` — that would suppress every real finding from the checks that _did_ run.
+`scope.clusters[].limitations` is an optional string on a cluster you **did** read, naming the checks that _could_ have run there and did not, and why. When present it must be non-empty and must name the checks by number. It is the coverage flag, so keep it for what a later run could clear: a check the cluster's shape rules out belongs in `checks_not_applicable` instead. Partial coverage is never a reason to move the cluster to `scope.skipped` — that would suppress every real finding from the checks that _did_ run.
 
-- **Autopilot** (`autopilot.enabled == true`): checks 2.1–2.3 are rejected by admission and 2.9 has no user-managed node pools, so all four are inapplicable. The cluster still belongs in `scope.clusters`, carrying `"limitations": "Autopilot cluster: checks 2.1-2.3 are admission-enforced and 2.9 has no user-managed node pools; those four did not run."` Checks 2.4–2.8, 2.10 and 2.11 run there exactly as on a Standard cluster and **their findings are real** — an Autopilot cluster is audited, not skipped. A privileged-container finding on Autopilot is a false positive by construction; a missing-NetworkPolicy finding on Autopilot is not.
-- Any other gap on a reachable cluster — a check whose command errored, an API group that is absent — is recorded the same way, in that cluster's `limitations`, naming the check and the reason.
+- **Autopilot** (`autopilot.enabled == true`): checks 2.1–2.3 are rejected by admission and 2.9 has no user-managed node pools, so all four are inapplicable. The cluster still belongs in `scope.clusters`, and those four go in its `checks_not_applicable`, one entry each:
+
+  ```json
+  [
+    {
+      "check": "privileged-container",
+      "reason": "GKE Autopilot: privileged containers are rejected at admission and cannot exist here."
+    },
+    {
+      "check": "host-namespace",
+      "reason": "GKE Autopilot: hostPID/hostIPC/hostNetwork are rejected at admission and cannot exist here."
+    },
+    {
+      "check": "hostpath-mount",
+      "reason": "GKE Autopilot: hostPath volumes are rejected at admission and cannot exist here."
+    },
+    {
+      "check": "legacy-metadata",
+      "reason": "GKE Autopilot: no user-managed node pools to carry a metadata setting."
+    }
+  ]
+  ```
+
+  **Do not also name those four in `limitations`.** That field is the coverage flag: any non-empty string in it makes the run `partial`, and a fact about the cluster's shape does not stop being true next week, so the daily security stream would be pinned at `partial: true` forever — `resolved: 0`, no stale remediation PR ever closed, the ledger never able to retire. `checks_not_applicable` says the same thing without that cost, because it takes the four out of the denominator instead of adding them to the gaps. Checks 2.4–2.8, 2.10 and 2.11 run there exactly as on a Standard cluster and **their findings are real** — an Autopilot cluster is audited, not skipped. A privileged-container finding on Autopilot is a false positive by construction; a missing-NetworkPolicy finding on Autopilot is not.
+
+- Any other gap on a reachable cluster — a check whose command errored, an API group that is absent — is the other case, and that one _is_ a `limitations` note: name the check and the reason there. The test is whether re-running the audit could close it. A command that errored could succeed tomorrow, so it is a gap; Autopilot's admission policy could not, so it is not.
 
 ### 2. Checks
 
@@ -115,7 +139,7 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 ```
 
 - **Flag when:** a container or initContainer sets `securityContext.privileged: true`, or adds capability `SYS_ADMIN`.
-- **Do NOT flag:** universal suppressions; CSI node drivers and CNI agents shipped as GKE add-ons; Autopilot clusters — the check does not run there and §1 records that in the cluster's `limitations`; `allowPrivilegeEscalation: true` on its own — that is the Kubernetes default and would fire on nearly every workload.
+- **Do NOT flag:** universal suppressions; CSI node drivers and CNI agents shipped as GKE add-ons; Autopilot clusters — the check does not run there and §1 records that in the cluster's `checks_not_applicable`, not its `limitations`; `allowPrivilegeEscalation: true` on its own — that is the Kubernetes default and would fire on nearly every workload.
 - **Severity:** `critical` — a privileged container is one escape away from owning the node and every workload on it.
 - **Impact:** "Container has full host device and kernel access; compromising this workload compromises the node."
 - **Remediation:** `kind: manual`. Dropping privilege can break a workload that needs one specific capability, so the owner confirms. Note the minimal replacement: remove `privileged`, add only the required `capabilities.add` entries.
@@ -129,7 +153,7 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 ```
 
 - **Flag when:** the pod spec sets `hostNetwork`, `hostPID`, or `hostIPC` to `true`.
-- **Do NOT flag:** universal suppressions; Autopilot clusters (§1 `limitations`); ingress/gateway data-plane DaemonSets that legitimately bind host ports — verify `hostNetwork` is the only flag set **and** a `hostPort` is declared, then record `minor` rather than suppressing silently.
+- **Do NOT flag:** universal suppressions; Autopilot clusters (§1 `checks_not_applicable`); ingress/gateway data-plane DaemonSets that legitimately bind host ports — verify `hostNetwork` is the only flag set **and** a `hostPort` is declared, then record `minor` rather than suppressing silently.
 - **Severity:** `critical` when `hostPID` or `hostIPC` is set (direct visibility into other tenants' processes and memory); `major` when only `hostNetwork` is set — it bypasses NetworkPolicy enforcement and exposes node loopback, but does not cross the process boundary.
 - **Impact:** "Workload shares the node's process/IPC/network namespace, bypassing pod isolation and NetworkPolicy enforcement."
 - **Remediation:** `kind: manual`. Name the field to remove; for `hostNetwork`, note that a `NodePort` Service or a Gateway listener is the supported replacement for `hostPort`.
@@ -145,7 +169,7 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 ```
 
 - **Flag when:** the pod spec declares a `hostPath` volume that a container actually mounts.
-- **Do NOT flag:** universal suppressions; Autopilot clusters (§1 `limitations`); a declared-but-unmounted `hostPath`; the log-shipper pattern (`/var/log`, `/var/lib/docker/containers`) when **every** mount of it is `readOnly: true` — record those `minor`.
+- **Do NOT flag:** universal suppressions; Autopilot clusters (§1 `checks_not_applicable`); a declared-but-unmounted `hostPath`; the log-shipper pattern (`/var/log`, `/var/lib/docker/containers`) when **every** mount of it is `readOnly: true` — record those `minor`.
 - **Severity:** `critical` when the path is `/`, `/etc`, `/proc`, `/var/run/docker.sock`, `/run/containerd/containerd.sock`, or under `/var/lib/kubelet`, **or** when any mount of it is writable — those are node takeover or credential theft. `major` otherwise: still a persistence and cross-tenant leak path.
 - **Impact:** "Workload mounts a node filesystem path, giving it access to state belonging to the node and to other tenants' pods."
 - **Remediation:** `kind: manual`. Name the replacement — a PersistentVolumeClaim, a ConfigMap/Secret projection, or the CSI driver appropriate to the data.
@@ -246,7 +270,7 @@ gcloud container node-pools list --cluster="$C" --location="$L" --project="$PROJ
 ```
 
 - **Flag when:** a node pool's `config.workloadMetadataConfig.mode` is empty or `GCE_METADATA` — metadata concealment is off and any pod can read `169.254.169.254`.
-- **Do NOT flag:** Autopilot clusters — there are no user-managed node pools, and §1 records that in the cluster's `limitations`; pools already reporting `GKE_METADATA`. Detection is configuration-only **by design** — probing the endpoint live would need `kubectl run`/`exec`, both write verbs forbidden by the Red Lines, and the node pool mode is authoritative for this control anyway.
+- **Do NOT flag:** Autopilot clusters — there are no user-managed node pools, and §1 records that in the cluster's `checks_not_applicable`; pools already reporting `GKE_METADATA`. Detection is configuration-only **by design** — probing the endpoint live would need `kubectl run`/`exec`, both write verbs forbidden by the Red Lines, and the node pool mode is authoritative for this control anyway.
 - **Severity:** `critical` — one unauthenticated HTTP request from any pod to a node-wide credential.
 - **Impact:** "Any pod on this node pool can read the node service account's access token from the legacy metadata endpoint and escalate to that identity's full Google Cloud permissions."
 - **Remediation:** `kind: gcloud` — `gcloud container node-pools update <POOL> --cluster=<C> --location=<L> --project=<PROJECT> --workload-metadata=GKE_METADATA`. Note that this drains and recreates the pool's nodes.
@@ -308,7 +332,7 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 
 ### 4. Emit findings.json
 
-Write the whole document to `findings_path` in one shot, with `audit: "compliance-audit"`, `scope.clusters` listing every cluster you queried — each carrying the `checks_run` list §1 required and the `limitations` string §1 recorded for it, where there is one — and `scope.skipped` listing only the clusters you could not read. Self-check before writing:
+Write the whole document to `findings_path` in one shot, with `audit: "compliance-audit"`, `scope.clusters` listing every cluster you queried — each carrying the `checks_run` list §1 required and, where §1 recorded them, that cluster's `checks_not_applicable` entries and `limitations` string — and `scope.skipped` listing only the clusters you could not read. Self-check before writing:
 
 - Every cluster carries a non-empty `checks_run` of `{check, command}` objects naming the §2 checks that actually ran there and the commands that ran them. Never write the full eleven because the SOP lists eleven — write the ones you ran. An inflated `checks_run` is the one entry in this document that converts a partial audit back into a false all-clear, which is the exact failure the field exists to prevent, and a fabricated `command` is that lie published verbatim in a public issue. `checks_not_applicable` is the same lie wearing a different field: it removes checks from the denominator, so a slug parked there because you ran out of turns is a coverage gap the ledger will never show. It is published too — every exclusion and its reason render under _Not applicable_, where a reviewer who knows the cluster can call it. An honest seven-of-eleven costs you nothing but an open ledger, and an honest seven-of-seven on a cluster where the other four cannot apply closes it.
 
@@ -377,6 +401,6 @@ What to report in each case:
 - **No unreproducible findings.** No `evidence.command`, no finding. Never soften something you could not verify into a lower severity or a "possible issue" — delete it.
 - **No finding without a `recommendation`.** All three sub-fields, non-empty, on every finding, written while the evidence is still in front of you.
 - **No unstable identity.** The id is derived, so the way to destabilise it is to write an unstable `object` — a pod name with its ReplicaSet suffix, a generated resource name, the binding one run and the role the next. Name the durable object the check judged and audit the owning controller, never the pod. A finding whose identity moves is reported as fixed and re-reported as new, on a ledger people trust to tell them what is still broken.
-- **No inference from an unaudited cluster.** A cluster you could not read goes in `scope.skipped` and never appears in a finding. A cluster you read where some checks did not run — Autopilot's 2.1–2.3 and 2.9, a command that errored — stays in `scope.clusters` with a `limitations` string. Never demote a partially-checked cluster to `scope.skipped`: that silently discards every real finding from the checks that did run on a cluster you were told to audit.
+- **No inference from an unaudited cluster.** A cluster you could not read goes in `scope.skipped` and never appears in a finding. A cluster you read where some checks did not run stays in `scope.clusters`, with Autopilot's 2.1–2.3 and 2.9 in `checks_not_applicable` and anything a later run could still clear — a command that errored, an absent API group — in `limitations`. Never demote a partially-checked cluster to `scope.skipped`: that silently discards every real finding from the checks that did run on a cluster you were told to audit.
 - **No forbidden sources.** No BigQuery, Prometheus, Policy Controller / Gatekeeper, Security Command Center, external blueprint, or CMDB — and no kanban delegation to Cluster Agents. This audit runs entirely in the Platform Agent.
 - **Never print raw credentials.** ServiceAccount tokens, kubeconfig contents, Secret `data:` blocks, and private keys never appear in `evidence.excerpt` — record the object reference, or re-run with a field selector or `-o jsonpath` that omits the value. The harness's redaction is a backstop, not permission.

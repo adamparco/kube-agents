@@ -52,8 +52,14 @@ def clip_handoff(text: object, limit: int = DEFAULT_LIMIT) -> str:
     if limit <= 0 or len(body) <= limit:
         return body
 
-    budget = max(1, limit - len(ELLIPSIS))
-    head = body[:budget]
+    # Too small to hold a character and the marker: the marker is what gives
+    # way, not the budget. `max(1, limit - 4)` kept one character and then
+    # appended four more, so `limit=1` returned five — a clip that overshot the
+    # only number it was given.
+    if limit <= len(ELLIPSIS):
+        return body[:limit].rstrip()
+
+    head = body[: limit - len(ELLIPSIS)]
     cut = max(head.rfind(" "), head.rfind("\n"), head.rfind("\t"))
     if cut > 0:
         head = head[:cut]

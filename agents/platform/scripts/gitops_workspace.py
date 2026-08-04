@@ -59,12 +59,41 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
-# Must be under the credential proxy's workspace root (`/opt/data`, the shared
-# PVC). The sidecar executes `git` and `gh` in *its own* filesystem at the cwd
-# the client reports, and refuses any path outside that root — so a clone in
-# /tmp, which is a per-container emptyDir, is invisible to the process that
-# would have to run git in it.
-DEFAULT_ROOT = "/opt/data/gitops"
+DEFAULT_AGENT_HOME = "/opt/data"
+
+
+def agent_home() -> str:
+    """The agent's data root — which is not always `/opt/data`.
+
+    `PlatformAgent.spec.harness.hermes.agentHome` moves it, and the operator
+    then writes that same value into two places: `PLATFORM_AGENT_HOME` on the
+    agent container and `CREDENTIAL_PROXY_WORKSPACE_ROOT` on the sidecar
+    (`platformagent_manifests.go`). Reading the environment is what keeps this
+    module's idea of the root and the proxy's containment check the same string.
+    A clone under a hardcoded `/opt/data` on a deployment whose home is
+    elsewhere is *outside* the sidecar's workspace root, and every `git` in it
+    is refused — the whole skill fails, with an error about containment rather
+    than about the constant that drifted.
+
+    Deliberately not `HERMES_HOME`. In the agent container that names the
+    *profile* home — `<agent home>/profiles/platform` for a platform worker —
+    so it points a level or two too deep.
+    """
+    return (os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME).rstrip(
+        "/"
+    ) or "/"
+
+
+def default_root() -> str:
+    """Where leased clones live: `<agent home>/gitops`.
+
+    Must be under the credential proxy's workspace root (the shared PVC). The
+    sidecar executes `git` and `gh` in *its own* filesystem at the cwd the
+    client reports, and refuses any path outside that root — so a clone in
+    /tmp, which is a per-container emptyDir, is invisible to the process that
+    would have to run git in it.
+    """
+    return str(Path(agent_home()) / "gitops")
 
 # The name the credential proxy also looks for. Changing it here without
 # changing `credential_proxy._GIT_LEASE_MARKER` locks every skill out of git.
@@ -77,10 +106,22 @@ LEASE_FILENAME = ".lease"
 # is the same outcome a crashed run already had.
 DEFAULT_LEASE_TTL_HOURS = 24.0
 
-# Written by the operator at provisioning time, so it is present from the first
-# second of the pod's life — unlike a clone, which is what makes it the only
-# usable repository source before anything has been cloned.
-DEFAULT_SETTINGS_PATH = "/opt/data/SETTINGS.md"
+def default_settings_path() -> str:
+    """`<agent home>/SETTINGS.md`.
+
+    Written by the operator at provisioning time, so it is present from the
+    first second of the pod's life — unlike a clone, which is what makes it the
+    only usable repository source before anything has been cloned. Derived from
+    `agent_home` for the same reason `default_root` is: on a deployment that
+    moved its home, a hardcoded path is simply a file that is not there, and
+    `resolve_repo` then falls through to a git remote that does not exist yet.
+    """
+    return str(Path(agent_home()) / "SETTINGS.md")
+
+
+# The branch a pull request targets when nothing better can be determined —
+# which is only when there is no clone to ask yet. See `resolve_base_branch`.
+DEFAULT_BASE_BRANCH = "main"
 
 # Tolerates the operator's Markdown bullet and bold markers, and the literal
 # `None` when the CR leaves it unset.
@@ -96,7 +137,93 @@ def settings_path() -> str:
     return (
         os.environ.get("GITOPS_SETTINGS")
         or os.environ.get("FLEET_AUDIT_SETTINGS")
-        or DEFAULT_SETTINGS_PATH
+        or default_settings_path()
+    )
+
+
+# One `git symbolic-ref` per clone per process, keyed by workspace path. The
+# answer cannot change while a process runs, and the call is not free: `git`
+# here is a shim that POSTs to the sidecar, so every repeat is an HTTP round
+# trip and a line of log noise. Tests that switch repositories clear it.
+_BASE_BRANCH_CACHE: dict[str, str] = {}
+
+
+def forget_base_branch(workspace: str | Path | None = None) -> None:
+    """Drop the cached default branch for `workspace`, or for every workspace."""
+    if workspace is None:
+        _BASE_BRANCH_CACHE.clear()
+    else:
+        _BASE_BRANCH_CACHE.pop(str(Path(workspace)), None)
+
+
+def resolve_base_branch(
+    workspace: str | Path | None = None, runner: Runner | None = None
+) -> str:
+    """The branch a pull request should target, for *this* repository.
+
+    Hardcoding `main` was wrong in a quiet way. This harness clones whatever
+    repository `SETTINGS.md` names, and a fleet whose GitOps repo still calls
+    its trunk `master` got `origin/main` — a ref that does not resolve. Every
+    remediation branch then failed at checkout, and the audit reported the fix
+    it could not push as a fix the model never wrote.
+
+    Resolution order:
+
+    1. `GITOPS_BASE_BRANCH`. For a repository whose default branch is not the
+       branch the fleet deploys from — a `release` line, say. Nothing this
+       function can observe would tell it that, so an operator has to.
+    2. `origin/HEAD` in the clone. `git clone` sets it from the default the
+       remote advertises, which is the right answer for every ordinary
+       repository, and it costs one `symbolic-ref`.
+    3. `main`, when there is no clone to ask yet.
+    """
+    override = os.environ.get("GITOPS_BASE_BRANCH", "").strip()
+    if override:
+        return override
+    if workspace is None:
+        return DEFAULT_BASE_BRANCH
+    key = str(Path(workspace))
+    cached = _BASE_BRANCH_CACHE.get(key)
+    if cached:
+        return cached
+    resolved = _detect_base_branch(workspace, runner) or DEFAULT_BASE_BRANCH
+    _BASE_BRANCH_CACHE[key] = resolved
+    return resolved
+
+
+def _detect_base_branch(workspace: str | Path, runner: Runner | None) -> str | None:
+    run = runner or _plain_runner
+    head = _origin_head(run, workspace)
+    if head:
+        return head
+    # `git clone` sets origin/HEAD, but a clone this module made before it
+    # started asking, or a remote that changed its default afterwards, leaves
+    # the ref absent or stale. `set-head --auto` re-asks the remote. Not fatal
+    # if it fails: a repository with no reachable remote is a reason to fall
+    # back to the default, not to abort the run.
+    run(["git", "remote", "set-head", "origin", "--auto"], cwd=str(workspace), check=False)
+    return _origin_head(run, workspace)
+
+
+def _origin_head(run: Runner, workspace: str | Path) -> str | None:
+    result = run(
+        ["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        cwd=str(workspace),
+        check=False,
+    )
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    ref = (getattr(result, "stdout", "") or "").strip()
+    # `--short` renders the ref as `origin/main`; callers want the branch name
+    # on its own, because they compose both `origin/<branch>` and a bare
+    # `--base <branch>` from it.
+    name = ref.split("/", 1)[1] if ref.startswith("origin/") else ref
+    return name.strip() or None
+
+
+def _plain_runner(cmd: list[str], *, cwd: str | Path | None = None, check: bool = True):
+    return subprocess.run(
+        cmd, cwd=str(cwd) if cwd else None, check=check, capture_output=True, text=True
     )
 
 
@@ -126,6 +253,25 @@ def sanitize_lease(lease: str) -> str:
     return cleaned
 
 
+def session_lease() -> str | None:
+    """The lease this session is identified by, or None if it has no identity.
+
+    Separate from `lease_id` because the difference matters to a caller that
+    runs *second*. `lease_id` always answers, minting `adhoc-<random>` when
+    there is nothing to key off — correct for the process that takes the lease,
+    and a trap for the process that has to find it again. A `submit` that
+    minted its own would compare two unrelated random strings and refuse the
+    tree `prepare` had just handed it, identically on every retry.
+    """
+    for candidate in (
+        os.environ.get("HERMES_KANBAN_TASK"),
+        os.environ.get("HERMES_SESSION_ID"),
+    ):
+        if candidate and str(candidate).strip():
+            return sanitize_lease(candidate)
+    return None
+
+
 def lease_id(explicit: str | None = None) -> str:
     """Resolve the lease this process should work under.
 
@@ -135,16 +281,15 @@ def lease_id(explicit: str | None = None) -> str:
     pinned into every dispatcher-spawned worker and is exactly the granularity
     wanted — one card, one unit of work, one tree.
     """
-    for candidate in (
-        explicit,
-        os.environ.get("HERMES_KANBAN_TASK"),
-        os.environ.get("HERMES_SESSION_ID"),
-    ):
-        if candidate and str(candidate).strip():
-            return sanitize_lease(candidate)
+    if explicit and str(explicit).strip():
+        return sanitize_lease(explicit)
+    inherited = session_lease()
+    if inherited:
+        return inherited
     # No session identity to key off. A fresh lease is still correct — it is
     # isolated from everyone else, which is the point — it just is not
-    # recoverable by a later process that did not keep the path.
+    # recoverable by a later process that did not keep the path. Callers that
+    # run second must use `session_lease` and say so, rather than mint one here.
     return f"adhoc-{os.urandom(4).hex()}"
 
 
@@ -152,16 +297,18 @@ def lease_dir(root: str | Path, lease: str) -> Path:
     return Path(root) / sanitize_lease(lease)
 
 
-def workspace_path(repo: str, root: str | Path = DEFAULT_ROOT, *, lease: str) -> Path:
+def workspace_path(
+    repo: str, root: str | Path | None = None, *, lease: str
+) -> Path:
     """Where `owner/name` is cloned for `lease`. One clone per lease, per repo."""
     owner, _, name = str(repo).partition("/")
     if not owner or not name:
         raise ValueError(f"expected a repository as owner/name, got {repo!r}")
-    return lease_dir(root, lease) / f"{owner}__{name}"
+    return lease_dir(root if root is not None else default_root(), lease) / f"{owner}__{name}"
 
 
 @contextmanager
-def workspace_lock(root: str | Path = DEFAULT_ROOT) -> Iterator[None]:
+def workspace_lock(root: str | Path | None = None) -> Iterator[None]:
     """Serialise the shared *bookkeeping* under the root — nothing more.
 
     An advisory `flock` on a file beside the lease directories. What it guards
@@ -175,7 +322,7 @@ def workspace_lock(root: str | Path = DEFAULT_ROOT) -> Iterator[None]:
     — the caller proceeds unserialised rather than refusing to run. A missed
     lock costs a retry; a refused run costs the day's audit.
     """
-    root = Path(root)
+    root = Path(root if root is not None else default_root())
     handle = None
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -238,23 +385,50 @@ def write_lease(
     return record
 
 
+def lease_holder(path: str | Path) -> Path | None:
+    """The nearest ancestor of `path` carrying a lease marker, or None.
+
+    Mirrors `credential_proxy._lease_holder`, which walks the ancestors rather
+    than looking only one level up — and has to, because the working directory
+    it is handed is whatever the caller reported. So does this: `submit` takes
+    `--workspace`, defaulting to `os.getcwd()`, and an agent that has `cd`'d
+    into `manifests/` to write a file is two levels below the tree the marker
+    sits beside. Checking only the immediate parent would refuse exactly the
+    calls the proxy lets through, and the skill would be the thing that broke.
+
+    The walk stops at the filesystem root. A marker anywhere above the path is
+    a real lease over it — that is the same rule the proxy applies, bounded
+    there by its workspace root rather than by `/`, and reaching `/` here means
+    the caller was outside any workspace at all.
+    """
+    start = Path(path).resolve()
+    for directory in (start, *start.parents):
+        try:
+            if (directory / LEASE_FILENAME).is_file():
+                return directory
+        except OSError:
+            break
+    return None
+
+
 def assert_lease_owner(workspace: str | Path, lease: str) -> dict:
     """Refuse to act inside a working tree this lease does not hold.
 
     The credential proxy can tell that a `git push` is happening inside *some*
     lease, but not whose — the shim reports argv and a working directory, not a
     caller identity. That last mile is here: a skill that was handed a path
-    checks the marker beside it before it writes, which is the check that would
+    checks the marker above it before it writes, which is the check that would
     have stopped `submit-suggestion` from branching inside a running audit's
     tree.
     """
-    holder = Path(workspace).resolve().parent
-    record = read_lease(holder)
+    holder = lease_holder(workspace)
+    record = read_lease(holder) if holder is not None else None
     if record is None:
         raise PermissionError(
             f"{workspace} is not inside a leased GitOps workspace (no "
-            f"{LEASE_FILENAME} in {holder}). Run the skill's `prepare` step to "
-            "get a workspace of your own instead of writing in a shared clone."
+            f"{LEASE_FILENAME} in it or in any directory above it). Run the "
+            "skill's `prepare` step to get a workspace of your own instead of "
+            "writing in a shared clone."
         )
     held = str(record.get("lease", ""))
     if held != sanitize_lease(lease):
@@ -314,8 +488,8 @@ def ensure_workspace(
     runner: Runner,
     *,
     lease: str,
-    root: str | Path = DEFAULT_ROOT,
-    base_branch: str = "main",
+    root: str | Path | None = None,
+    base_branch: str | None = None,
     remote_url: str | None = None,
     reset: bool = True,
     owner: str | None = None,
@@ -325,7 +499,10 @@ def ensure_workspace(
     With `reset=True` the working tree is returned scrubbed and positioned on
     `base_branch` at the remote's tip, which is what an audit wants before it
     starts: a leftover branch or a dirty tree from a run that crashed is not
-    authored by a human and there is nothing in it to preserve.
+    authored by a human and there is nothing in it to preserve. `base_branch`
+    defaults to whatever the remote says its default branch is, resolved after
+    the clone by `resolve_base_branch` — a repository whose trunk is `master`
+    used to fail here on a `origin/main` that does not exist.
 
     With `reset=False` the tree is left exactly as the caller found it and only
     `origin` is fetched. This is not a nicety — it is the difference between a
@@ -335,7 +512,7 @@ def ensure_workspace(
     into `finish` deletes every fix the audit just produced and the run reports
     them all as "the file was never written".
     """
-    root = Path(root)
+    root = Path(root if root is not None else default_root())
     lease = sanitize_lease(lease)
     holder = lease_dir(root, lease)
     target = workspace_path(repo, root, lease=lease)
@@ -362,6 +539,10 @@ def ensure_workspace(
     runner(["git", "fetch", "--quiet", "--prune", "origin"], cwd=str(target))
     if not reset:
         return target
+
+    # Resolved here rather than defaulted in the signature: it takes a `git` in
+    # the clone, and the clone is what the lines above just established.
+    base_branch = base_branch or resolve_base_branch(target, runner)
 
     runner(["git", "reset", "--hard", "--quiet"], cwd=str(target), check=False)
     runner(["git", "clean", "-fdq"], cwd=str(target), check=False)

@@ -14,6 +14,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -269,6 +270,11 @@ class Recorder:
         # commit to make". Defaulting to rc 0 like everything else would make
         # every remediation test silently take the no-op path.
         self.staged = True
+        # What `git symbolic-ref refs/remotes/origin/HEAD` reports — the base
+        # branch every remediation branch is cut from. Set it to a different
+        # branch to describe a repository that is not on `main`, or to None to
+        # describe a clone with no origin/HEAD recorded (rc 1).
+        self.origin_head = "origin/main"
 
     def __call__(self, cmd, *, check=True, capture=True, cwd=None):
         self.calls.append(list(cmd))
@@ -282,6 +288,10 @@ class Recorder:
                 return CompletedProcess(cmd, code, "", "simulated failure")
         if "diff --cached --quiet" in joined:
             return CompletedProcess(cmd, 1 if self.staged else 0, "", "")
+        if cmd[:2] == ["git", "symbolic-ref"]:
+            if not self.origin_head:
+                return CompletedProcess(cmd, 1, "", "")
+            return CompletedProcess(cmd, 0, self.origin_head + "\n", "")
         self._simulate_clone(cmd)
         for key, payload in self.replies.items():
             if key in joined:
@@ -373,6 +383,19 @@ class BaseTestCase(unittest.TestCase):
         self.tmp_path = Path(tmp.name)
         self.out = ""
         self.err = ""
+        # Both of these outlive a single test. `_WORKSPACE` is a module global
+        # that `ensure_workspace` sets and nothing clears, and the base-branch
+        # answer is memoised per workspace inside `gitops_workspace`; a
+        # developer with GITOPS_BASE_BRANCH exported would move it again.
+        # Leaving any of the three alone makes a test's result depend on which
+        # tests ran before it.
+        audit_report.set_workspace(None)
+        self.addCleanup(audit_report.set_workspace, None)
+        gitops_workspace.forget_base_branch()
+        self.addCleanup(gitops_workspace.forget_base_branch)
+        env = patch.dict(os.environ, {"GITOPS_BASE_BRANCH": ""})
+        env.start()
+        self.addCleanup(env.stop)
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
         return json.dumps([{"number": number, "url": url}])
@@ -450,6 +473,12 @@ class HarnessTestCase(BaseTestCase):
         # already exists and `ensure_workspace` takes the fetch path. Tests
         # about the first run call `self.unclone()` to remove it.
         (self.workspace / ".git").mkdir(parents=True)
+        # Every harness test describes code that runs *after* the workspace was
+        # established, so say so. A test that calls `open_remediation_pr`
+        # directly and leaves this at None resolves the base branch without ever
+        # asking git — it would assert `origin/main` on a repository whose
+        # default branch the harness was never consulted about.
+        audit_report.set_workspace(self.workspace)
 
     def unclone(self):
         """Put the workspace back to how a freshly started pod finds it."""
@@ -3187,6 +3216,22 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, ["netpol-missing"])
         self.assertEqual(refusals, [])
 
+    def test_remediate_all_with_nothing_promotable_is_answered(self):
+        # `all` over a report of `gcloud` and `manual` fixes expands to the
+        # empty set, which produced neither an acceptance nor a refusal — so
+        # nothing was posted and no marker was written, and every later run
+        # reached the same silence. The requester waits on an answer that was
+        # never coming.
+        self.findings = [
+            make_finding(fid="cluster-old", remediation={"kind": "gcloud", "note": "g"})
+        ]
+        targets, refusals, accepted, _ = self.parse([comment("/remediate all")])
+        self.assertEqual(targets, [])
+        self.assertEqual(accepted, {})
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("matched nothing", refusals[0]["reasons"][0])
+        self.assertIn("nothing to promote", refusals[0]["reasons"][0])
+
     def test_a_command_must_start_the_line(self):
         targets, _, _, _ = self.parse([comment("maybe we should /remediate netpol-missing")])
         self.assertEqual(targets, [])
@@ -3558,7 +3603,14 @@ class TestOpenRemediationPr(HarnessTestCase):
 
         self.assertEqual(url, "https://github.com/acme/fleet/pull/8")
         branch = self.branch
-        order = [c for c in self.harness.calls if c[0] in ("git", "gh")]
+        # The base-branch lookup is a read, not a step in the sequence this
+        # test is about, and it happens once per workspace rather than once per
+        # group. Dropped here; `TestRemediationBaseBranch` is what asserts it.
+        order = [
+            c
+            for c in self.harness.calls
+            if c[0] in ("git", "gh") and c[1] not in ("symbolic-ref", "remote")
+        ]
         self.assertEqual(order[0], ["git", "fetch", "origin", "main"])
         self.assertEqual(
             order[1], ["git", "checkout", "--force", "-B", branch, "origin/main"]
@@ -3623,6 +3675,95 @@ class TestOpenRemediationPr(HarnessTestCase):
         self.open_it(existing=pr(8, self.branch, state="CLOSED"))
         self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
         self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+
+
+class TestRemediationBaseBranch(HarnessTestCase):
+    """Remediation branches are cut from the repository's default branch.
+
+    Hardcoding `main` did not degrade on a repository that uses something else,
+    it aborted: `git fetch origin main` fails, and the remediation half of the
+    run dies after the findings have already been written and the ledger
+    updated. So these assert the fetch, the checkout *and* the `--base` handed
+    to `gh pr create` — all three have to agree, and a fix that only changed
+    the fetch would open pull requests against a branch they were never cut
+    from.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.group = [make_finding(fid="a")]
+        self.snapshot = {
+            "clusters/prod-us-east/payments-netpol.yaml": b"# fix\n",
+        }
+        self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/8\n"}
+
+    def open_it(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return audit_report.open_remediation_pr(
+                "acme/fleet",
+                AUDIT,
+                self.group,
+                snapshot=self.snapshot,
+                root=self.workspace,
+                issue_number=42,
+                existing=None,
+                generated_at=NOW,
+            )
+
+    def base_used(self):
+        create = self.harness.gh_calls("pr", "create")[0]
+        return create[create.index("--base") + 1]
+
+    def test_a_master_repository_is_branched_from_master(self):
+        self.harness.origin_head = "origin/master"
+        self.open_it()
+        self.assertIn(["git", "fetch", "origin", "master"], self.harness.calls)
+        self.assertTrue(
+            any(c[:2] == ["git", "checkout"] and "origin/master" in c for c in self.harness.calls)
+        )
+        self.assertEqual(self.base_used(), "master")
+
+    def test_the_env_override_wins_over_origin_head(self):
+        # An operator whose GitOps flow merges into a long-running release
+        # trunk sets GITOPS_BASE_BRANCH; origin/HEAD still says main, and the
+        # override is the whole point.
+        self.harness.origin_head = "origin/main"
+        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "release-1.29"}):
+            self.open_it()
+        self.assertIn(["git", "fetch", "origin", "release-1.29"], self.harness.calls)
+        self.assertEqual(self.base_used(), "release-1.29")
+
+    def test_a_clone_with_no_origin_head_repairs_it_then_falls_back(self):
+        # `git symbolic-ref` exits 1 on a clone that never recorded origin/HEAD
+        # — `git remote set-head --auto` is the repair, and `main` is the answer
+        # when even that turns up nothing. Aborting here would be worse than a
+        # guess: the guess is right for almost every repository.
+        self.harness.origin_head = None
+        self.open_it()
+        self.assertIn(
+            ["git", "remote", "set-head", "origin", "--auto"], self.harness.calls
+        )
+        self.assertIn(["git", "fetch", "origin", "main"], self.harness.calls)
+        self.assertEqual(self.base_used(), "main")
+
+    def test_the_lookup_is_not_repeated_for_a_second_group(self):
+        # Two groups, one workspace: the answer is memoised, so the second
+        # group costs a checkout and not another round-trip.
+        self.open_it()
+        before = len(self.harness.matching("symbolic-ref"))
+        self.group = [
+            make_finding(
+                fid="b",
+                remediation={
+                    "kind": "manifest",
+                    "path": "clusters/stage-eu/psp.yaml",
+                    "note": "n",
+                },
+            )
+        ]
+        self.snapshot = {"clusters/stage-eu/psp.yaml": b"# fix\n"}
+        self.open_it()
+        self.assertEqual(len(self.harness.matching("symbolic-ref")), before)
 
 
 class TestRemediationPrBody(BaseTestCase):
@@ -3730,10 +3871,15 @@ class TestStaleCloseEligibility(HarnessTestCase):
             {"a": "Old title"},
             {},
             NOW,
-            live_branches={"platform-agent/fix-current"},
+            branch_by_finding={"a": "platform-agent/fix-current"},
         )
         self.assertEqual(closed, ["https://github.com/acme/fleet/pull/8"])
-        self.assertIn("Old title", "".join(self.harness.bodies_for("pr", "comment")))
+        body = "".join(self.harness.bodies_for("pr", "comment"))
+        self.assertIn("Old title", body)
+        # The ids do not join under this scheme, so "no longer reproduces" is
+        # not something this run established. The branch is.
+        self.assertIn("lives on a different branch", body)
+        self.assertNotIn("no longer reproduces", body)
 
 
 class TestMergedButPersists(HarnessTestCase):
@@ -5453,7 +5599,7 @@ class TestGhTimestamps(BaseTestCase):
 
 
 class TestStaleCloseLabelling(HarnessTestCase):
-    def close_it(self, prs, current_ids=(), live_branches=None):
+    def close_it(self, prs, current_ids=(), branch_by_finding=None):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             closed = audit_report.close_stale_remediation_prs(
@@ -5464,7 +5610,7 @@ class TestStaleCloseLabelling(HarnessTestCase):
                 {},
                 {},
                 NOW,
-                live_branches=live_branches,
+                branch_by_finding=branch_by_finding,
             )
         self.err = err.getvalue()
         return closed
@@ -5522,7 +5668,7 @@ class TestStaleCloseLabelling(HarnessTestCase):
         closed = self.close_it(
             [self.stale_pr()],
             current_ids={"gone"},
-            live_branches={"platform-agent/fix-x-new"},
+            branch_by_finding={"gone": "platform-agent/fix-x-new"},
         )
         self.assertEqual(len(closed), 1)
         comment = self.harness.gh_calls("pr", "comment")[0]
@@ -5533,10 +5679,40 @@ class TestStaleCloseLabelling(HarnessTestCase):
             self.close_it(
                 [self.stale_pr()],
                 current_ids={"gone"},
-                live_branches={"platform-agent/fix-x-old"},
+                branch_by_finding={"gone": "platform-agent/fix-x-old"},
             ),
             [],
         )
+
+    def test_a_finding_with_no_branch_at_all_keeps_its_pull_request(self):
+        # The finding still reproduces but has dropped out of the manifest
+        # groups — `degrade_missing_remediations` turned it `manual` because
+        # the model did not write the file this run. There is no replacement
+        # branch, so this pull request is the only fix in existence and the
+        # orphan rule must not touch it.
+        closed = self.close_it(
+            [self.stale_pr()],
+            current_ids={"gone"},
+            branch_by_finding={"other": "platform-agent/fix-y"},
+        )
+        self.assertEqual(closed, [])
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        self.assertIn("no remediation branch this run", self.err)
+
+    def test_a_resolved_finding_on_an_orphaned_branch_is_told_it_resolved(self):
+        # Both rules fire at once: nothing this pull request covers still
+        # reproduces *and* the surviving groups rearranged onto other branches.
+        # "The work now lives on a different branch" would send the reviewer
+        # hunting for a replacement that was never opened, for a problem that
+        # is already gone.
+        self.close_it(
+            [self.stale_pr()],
+            current_ids={"someone-else"},
+            branch_by_finding={"someone-else": "platform-agent/fix-x-new"},
+        )
+        body = self.harness.bodies_for("pr", "comment")[0]
+        self.assertIn("no longer reproduces", body)
+        self.assertNotIn("lives on a different branch", body)
 
 
 # --------------------------------------------------------------------------- #

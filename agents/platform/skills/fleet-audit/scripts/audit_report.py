@@ -210,7 +210,6 @@ RECOMMENDATION_FIELDS: tuple[tuple[str, str], ...] = (
 )
 
 PROTECTED_BRANCHES = {"main", "master", "production"}
-BASE_BRANCH = "main"
 
 # Both directories must live on the PVC. `gh` and `git` are not binaries in the
 # agent container: /opt/credential-proxy/bin/{gh,git} POST argv and cwd to a
@@ -669,6 +668,28 @@ def checks_na(cluster: object) -> list[str]:
 
 def findings_path_for(audit_id: str) -> str:
     return f"{SCRATCH_DIR}/findings_{audit_id}.json"
+
+
+def base_branch() -> str:
+    """The branch remediation pull requests target: this repository's own default.
+
+    Not the constant `main` it used to be. A GitOps repository on `master`, or
+    one whose fleet configuration lives on a long-running `production` trunk,
+    made every audit fetch a ref that is not there — `checkout -B <branch>
+    origin/main` then failed, and the whole remediation half of the run died
+    after the findings had already been written. Resolution lives in
+    `gitops_workspace` so that `submit-suggestion` gets the same answer; see
+    `resolve_base_branch` for the order (`GITOPS_BASE_BRANCH`, then
+    `origin/HEAD`, then `main`).
+
+    Answering `main` with no workspace is deliberate, not a fallback that got
+    forgotten: `resolve_base_branch` cannot ask a clone that does not exist yet,
+    and the callers that reach it in that state are the dry run's renderers,
+    which print the base rather than push to it.
+    """
+    import gitops_workspace
+
+    return gitops_workspace.resolve_base_branch(workspace(), _workspace_runner)
 
 
 def assert_pushable(branch: str) -> str:
@@ -2066,6 +2087,19 @@ def parse_remediate_commands(
                 )
                 continue
             if target == "all":
+                if not promotable:
+                    # An `all` that expands to nothing is still a command that
+                    # was read, and it used to produce neither an acceptance
+                    # nor a refusal — so nothing was posted, no marker was
+                    # written, and the next run reached the same silence. The
+                    # requester waits on a comment that will never be answered
+                    # and asks again. Every other way of asking for something
+                    # unpromotable already says so; this one has to as well.
+                    reasons.append(
+                        "`/remediate all` matched nothing to open"
+                        + _promotable_hint(promotable)
+                    )
+                    continue
                 targets |= promotable
                 accepted.extend(sorted(promotable))
                 continue
@@ -4074,19 +4108,20 @@ def open_remediation_pr(
     existing: dict | None,
     generated_at: datetime,
 ) -> str | None:
-    """Branch off main, write the group's files, push, and open/refresh its PR.
+    """Branch off the base, write the group's files, push, and open/refresh its PR.
 
     `finish` owns the working tree while it runs: the checkout is forced, and
     the files are re-materialised from `snapshot` afterwards, because a branch
-    switch is the only way to get a diff against `main` and an unforced switch
-    fails whenever `main` already carries a path the agent left untracked.
+    switch is the only way to get a diff against the base and an unforced switch
+    fails whenever the base already carries a path the agent left untracked.
     Do not leave unrelated uncommitted work in the tree during an audit.
     """
     branch = assert_pushable(group_branch_for(audit_id, group))
     paths = group_paths(group)
+    base = base_branch()
 
-    git(["fetch", "origin", BASE_BRANCH])
-    git(["checkout", "--force", "-B", branch, f"origin/{BASE_BRANCH}"])
+    git(["fetch", "origin", base])
+    git(["checkout", "--force", "-B", branch, f"origin/{base}"])
 
     for path in paths:
         # Re-proven after the checkout, not carried over from before it: the
@@ -4108,7 +4143,7 @@ def open_remediation_pr(
     staged = git(["diff", "--cached", "--quiet"], check=False)
     if staged.returncode == 0:
         log(
-            f"{branch}: the remediation is already present on {BASE_BRANCH}; "
+            f"{branch}: the remediation is already present on {base}; "
             "no pull request opened."
         )
         return None
@@ -4153,7 +4188,7 @@ def open_remediation_pr(
                 "-R",
                 repo,
                 "--base",
-                BASE_BRANCH,
+                base,
                 "--head",
                 branch,
                 "--title",
@@ -4186,7 +4221,7 @@ def close_stale_remediation_prs(
     resolved_findings: dict[str, dict],
     generated_at: datetime,
     *,
-    live_branches: set[str] | None = None,
+    branch_by_finding: dict[str, str] | None = None,
 ) -> list[str]:
     """Close every open remediation PR the current findings no longer justify.
 
@@ -4197,6 +4232,11 @@ def close_stale_remediation_prs(
     file set changed. The second rule subsumes the first for grouped findings
     and catches the orphans the first rule cannot see.
 
+    `branch_by_finding` maps each still-live finding to the branch its group is
+    on this run. A plain set of branch names is not enough: the orphan rule has
+    to tell "this work moved to another branch" from "this work has no branch
+    at all", and only the second is a reason to leave a pull request open.
+
     The branch is never deleted: if the finding returns, the audit pushes to it
     again. The `audit:stale-closed` label is applied *before* the close and the
     close is abandoned if the label does not stick, so a later run can always
@@ -4205,6 +4245,8 @@ def close_stale_remediation_prs(
     announcement happened, not that the pull request shut.
     """
     closed: list[str] = []
+    branch_by_finding = branch_by_finding or {}
+    live_branches = set(branch_by_finding.values())
     for pr in prs:
         if str(pr.get("state", "")).upper() != "OPEN":
             continue
@@ -4223,9 +4265,30 @@ def close_stale_remediation_prs(
         orphaned = bool(live_branches) and not any(
             head == branch or head.endswith(f":{branch}") for branch in live_branches
         )
+        # Which of this pull request's findings this run still sees. Empty for
+        # an unjoinable body: that is "cannot tell", not "none of them", and the
+        # branch rule below is the only one allowed to act on it.
+        persisting = [fid for fid in covered if fid in current_ids] if joinable else []
         if not orphaned:
-            if not covered or not joinable or any(fid in current_ids for fid in covered):
+            if not covered or not joinable or persisting:
                 continue
+
+        # An orphaned branch means the work *moved* only if the work still has
+        # somewhere to be. A finding that still reproduces and has no branch
+        # this run has been degraded out of the manifest groups — usually by
+        # `degrade_missing_remediations`, because the model did not write the
+        # manifest this time — and then this pull request holds the only copy
+        # of the fix that exists anywhere. Closing it destroys reviewed work to
+        # correct a grouping that never changed, and points the reviewer at a
+        # replacement branch that was never pushed.
+        stranded = sorted(fid for fid in persisting if fid not in branch_by_finding)
+        if orphaned and stranded:
+            log(
+                f"PR #{number} covers {', '.join(stranded)}, which still "
+                "reproduce and have no remediation branch this run; leaving it "
+                "open rather than closing the only fix there is."
+            )
+            continue
 
         # Announce at most once; close as many times as it takes. Every pull
         # request reaching this point is OPEN — the top of the loop skipped the
@@ -4244,8 +4307,17 @@ def close_stale_remediation_prs(
             or {"id": fid, "title": previous_titles.get(fid, ""), "evidence": {}}
             for fid in covered
         ]
+        # What is *known*, not what fired. A pull request can be both stale by
+        # findings and orphaned by branch — its findings stopped reproducing
+        # and the surviving groups rearranged themselves onto other branches —
+        # and saying "the work now lives on a different branch" then sends the
+        # reviewer hunting for a replacement that was never opened, for a
+        # problem that is already gone. The default reason ("no longer
+        # reproduces") is claimable only when the ids joined and none of them
+        # came back; over an unjoinable body the branch is the one fact this
+        # run actually established, so that is what the comment says.
         reason = ""
-        if orphaned:
+        if persisting or not joinable:
             reason = (
                 f"Closing unmerged: the `{audit_id}` audit no longer groups its "
                 f"findings onto `{head}`. The set of files this fix would touch "
@@ -4510,7 +4582,6 @@ def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
         _workspace_runner,
         lease=audit_id,
         root=GITOPS_WORKSPACE,
-        base_branch=BASE_BRANCH,
         reset=reset,
         owner=f"fleet-audit:{audit_id}",
     )
@@ -5302,9 +5373,10 @@ def handle_finish(args: argparse.Namespace) -> None:
             previous_titles,
             {},
             now,
-            live_branches={
-                group_branch_for(audit_id, group)
+            branch_by_finding={
+                str(finding.get("id", "")): group_branch_for(audit_id, group)
                 for group in remediation_groups(findings)
+                for finding in group
             },
         )
 

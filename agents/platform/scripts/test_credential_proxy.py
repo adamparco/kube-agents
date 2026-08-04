@@ -247,6 +247,23 @@ class GitLeaseGateTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertIsNone(executor.git_lease_violation(argv, str(workspace)))
 
+    def test_the_verbs_that_write_a_tree_without_saying_so_are_refused(self):
+        # Each of these is a working-tree write under another name: `pull` is
+        # `fetch` plus a merge or a rebase, `submodule update` checks out whole
+        # directories, `sparse-checkout set` adds and removes files across the
+        # entire tree. All three used to be reachable in a clone another agent
+        # was midway through, because the denylist only named the obvious verbs.
+        executor = self.executor()
+        self.leased(executor)
+        unleased = str(executor.workspace_dir)
+        for argv in (
+            ["git", "pull", "--rebase", "origin", "main"],
+            ["git", "submodule", "update", "--init", "--recursive"],
+            ["git", "sparse-checkout", "set", "clusters/prod"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(executor.git_lease_violation(argv, unleased))
+
     def test_a_subdirectory_of_the_lease_is_still_inside_it(self):
         # The agent `cd`s into the manifests it is editing.
         executor = self.executor()

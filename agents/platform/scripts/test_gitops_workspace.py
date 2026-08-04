@@ -35,11 +35,22 @@ class WorkspaceTestCase(unittest.TestCase):
         self.tmp_path = Path(self.tmp.name)
         self.root = self.tmp_path / "gitops"
         self.calls = []
+        # Resolved once per clone and memoised; a temp path is unique per test,
+        # but clearing keeps a rename or a reused fixture from leaking an answer.
+        gitops_workspace.forget_base_branch()
+        self.addCleanup(gitops_workspace.forget_base_branch)
+        # What the remote advertises, in the shape `git symbolic-ref --short`
+        # prints it. Tests that model a `master` fleet reassign this.
+        self.origin_head = "origin/main"
 
     def runner(self, cmd, *, cwd=None, check=True):
         self.calls.append(list(cmd))
         if cmd[:2] == ["git", "clone"]:
             (Path(cmd[-1]) / ".git").mkdir(parents=True, exist_ok=True)
+        if cmd[1:2] == ["symbolic-ref"]:
+            if not self.origin_head:
+                return CompletedProcess(cmd, 1, "", "")
+            return CompletedProcess(cmd, 0, self.origin_head + "\n", "")
         return CompletedProcess(cmd, 0, "", "")
 
     def ensure(self, repo="acme/fleet", **kwargs):
@@ -341,6 +352,169 @@ class TestLeaseMarker(WorkspaceTestCase):
             gitops_workspace.assert_lease_owner(target, LEASE)["lease"], LEASE
         )
 
+    def test_a_subdirectory_of_our_own_tree_is_allowed(self):
+        # `submit --workspace` defaults to os.getcwd(), and an agent that has
+        # `cd`'d in to write a manifest reports the subdirectory. The credential
+        # proxy walks ancestors for exactly this reason, so a check here that
+        # only looked one level up would refuse a push the proxy allows.
+        target = self.ensure()
+        deep = target / "clusters" / "prod"
+        deep.mkdir(parents=True)
+        self.assertEqual(
+            gitops_workspace.assert_lease_owner(deep, LEASE)["lease"], LEASE
+        )
+
+    def test_a_subdirectory_of_someone_else_tree_is_still_refused(self):
+        # The walk must not turn the ownership check into a formality.
+        target = self.ensure(lease="audit-one")
+        deep = target / "clusters" / "prod"
+        deep.mkdir(parents=True)
+        with self.assertRaises(PermissionError) as caught:
+            gitops_workspace.assert_lease_owner(deep, "t_someone_else")
+        self.assertIn("audit-one", str(caught.exception))
+
+
+# --------------------------------------------------------------------------- #
+# Where the root is — `agentHome` moves it, and the proxy moves with it
+# --------------------------------------------------------------------------- #
+
+
+class TestAgentHome(WorkspaceTestCase):
+    def test_the_default_is_the_operator_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(gitops_workspace.agent_home(), "/opt/data")
+            self.assertEqual(gitops_workspace.default_root(), "/opt/data/gitops")
+            self.assertEqual(
+                gitops_workspace.default_settings_path(), "/opt/data/SETTINGS.md"
+            )
+
+    def test_a_custom_agent_home_moves_the_root_and_the_settings_file(self):
+        # `spec.harness.hermes.agentHome` sets PLATFORM_AGENT_HOME on the agent
+        # and CREDENTIAL_PROXY_WORKSPACE_ROOT on the sidecar to the same value.
+        # A clone under a hardcoded /opt/data would be outside the sidecar's
+        # workspace root, and every git in it refused.
+        with patch.dict(os.environ, {"PLATFORM_AGENT_HOME": "/srv/agent/"}, clear=True):
+            self.assertEqual(gitops_workspace.agent_home(), "/srv/agent")
+            self.assertEqual(gitops_workspace.default_root(), "/srv/agent/gitops")
+            self.assertEqual(
+                gitops_workspace.default_settings_path(), "/srv/agent/SETTINGS.md"
+            )
+
+    def test_the_root_defaults_are_resolved_per_call_not_at_import(self):
+        # The signatures take None rather than a constant evaluated at import,
+        # so a test — or a process that learns its home late — is not stuck with
+        # whatever the environment said when the module first loaded.
+        with patch.dict(os.environ, {"PLATFORM_AGENT_HOME": "/srv/agent"}, clear=True):
+            self.assertEqual(
+                gitops_workspace.workspace_path("acme/fleet", lease=LEASE),
+                Path("/srv/agent/gitops") / LEASE / "acme__fleet",
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Which branch a pull request targets — not every fleet calls its trunk `main`
+# --------------------------------------------------------------------------- #
+
+
+class TestResolveBaseBranch(WorkspaceTestCase):
+    def resolve(self, workspace=None):
+        return gitops_workspace.resolve_base_branch(
+            workspace if workspace is not None else self.tmp_path, self.runner
+        )
+
+    def test_the_remote_default_is_used(self):
+        self.assertEqual(self.resolve(), "main")
+
+    def test_a_master_fleet_is_not_forced_onto_main(self):
+        # The bug this closes: `origin/main` does not resolve on this
+        # repository, so every remediation checkout failed and the audit
+        # reported the fix it could not push as one the model never wrote.
+        self.origin_head = "origin/master"
+        self.assertEqual(self.resolve(), "master")
+
+    def test_an_operator_override_beats_the_remote(self):
+        # A repository whose default branch is not the branch the fleet deploys
+        # from. Nothing observable here would say so.
+        self.origin_head = "origin/main"
+        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "release"}):
+            self.assertEqual(self.resolve(), "release")
+
+    def test_no_clone_yet_falls_back_without_running_git(self):
+        self.assertEqual(
+            gitops_workspace.resolve_base_branch(None, self.runner), "main"
+        )
+        self.assertEqual(self.calls, [])
+
+    def test_an_absent_origin_head_is_re_asked_then_defaulted(self):
+        # A clone made before this module started asking, or a remote that
+        # changed its default afterwards, leaves the ref missing.
+        self.origin_head = ""
+        self.assertEqual(self.resolve(), "main")
+        self.assertIn(
+            ["git", "remote", "set-head", "origin", "--auto"], self.calls
+        )
+
+    def test_set_head_repairing_the_ref_is_believed(self):
+        calls = []
+
+        def runner(cmd, *, cwd=None, check=True):
+            calls.append(list(cmd))
+            if cmd[1:2] == ["symbolic-ref"]:
+                if ["git", "remote", "set-head", "origin", "--auto"] in calls:
+                    return CompletedProcess(cmd, 0, "origin/trunk\n", "")
+                return CompletedProcess(cmd, 1, "", "")
+            return CompletedProcess(cmd, 0, "", "")
+
+        self.assertEqual(
+            gitops_workspace.resolve_base_branch(self.tmp_path, runner), "trunk"
+        )
+
+    def test_the_answer_is_asked_for_once_per_clone(self):
+        self.resolve()
+        before = len(self.calls)
+        self.resolve()
+        self.assertEqual(len(self.calls), before)
+
+    def test_ensure_workspace_checks_out_what_the_remote_advertises(self):
+        self.origin_head = "origin/master"
+        self.ensure()
+        self.assertIn(
+            ["git", "checkout", "-B", "master", "origin/master"], self.calls
+        )
+
+    def test_an_explicit_base_branch_still_wins(self):
+        self.origin_head = "origin/master"
+        self.ensure(base_branch="develop")
+        self.assertIn(
+            ["git", "checkout", "-B", "develop", "origin/develop"], self.calls
+        )
+
+    def test_a_real_master_repository_is_detected(self):
+        """Driven through real git, because the ref this reads is git's own.
+
+        A recorded runner proves only that the module parses whatever it is
+        handed. Whether `git clone` leaves `refs/remotes/origin/HEAD` pointing
+        at the remote's default — which is the entire premise — can only be
+        settled by git.
+        """
+        if shutil.which("git") is None:  # pragma: no cover - git is always present
+            self.skipTest("git is not on PATH")
+
+        def real(cmd, *, cwd=None, check=True):
+            return subprocess.run(
+                cmd, cwd=cwd, check=check, capture_output=True, text=True
+            )
+
+        origin = seed_origin(self.tmp_path, branch="master")
+        target = gitops_workspace.ensure_workspace(
+            "acme/fleet", real, lease=LEASE, root=self.root, remote_url=str(origin)
+        )
+        self.assertEqual(gitops_workspace.resolve_base_branch(target, real), "master")
+        head = real(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(target), check=True
+        )
+        self.assertEqual(head.stdout.strip(), "master")
+
 
 class TestReaper(WorkspaceTestCase):
     def age(self, path, hours):
@@ -471,14 +645,19 @@ class TestResolveRepo(WorkspaceTestCase):
             self.assertEqual(gitops_workspace.repo_from_settings(), "acme/fleet")
 
 
-def seed_origin(tmp_path: Path) -> Path:
-    """A local bare repository with one commit on `main`."""
+def seed_origin(tmp_path: Path, branch: str = "main") -> Path:
+    """A local bare repository with one commit on `branch`.
+
+    `branch` is a parameter because the harness must work against a repository
+    whose trunk is not `main` — that is the case the hardcoded base branch got
+    wrong, and a fixture that can only be `main` cannot show it.
+    """
     origin = tmp_path / "origin.git"
     seed = tmp_path / "seed"
     seed.mkdir()
     for cmd in (
-        ["git", "init", "--quiet", "--bare", "--initial-branch=main", str(origin)],
-        ["git", "init", "--quiet", "--initial-branch=main", str(seed)],
+        ["git", "init", "--quiet", "--bare", f"--initial-branch={branch}", str(origin)],
+        ["git", "init", "--quiet", f"--initial-branch={branch}", str(seed)],
     ):
         subprocess.run(cmd, check=True, capture_output=True)
     (seed / "README.md").write_text("seed\n", encoding="utf-8")
@@ -488,7 +667,7 @@ def seed_origin(tmp_path: Path) -> Path:
         ["git", "add", "README.md"],
         ["git", "commit", "--quiet", "-m", "seed"],
         ["git", "remote", "add", "origin", str(origin)],
-        ["git", "push", "--quiet", "origin", "main"],
+        ["git", "push", "--quiet", "origin", branch],
     ):
         subprocess.run(cmd, cwd=seed, check=True, capture_output=True)
     return origin

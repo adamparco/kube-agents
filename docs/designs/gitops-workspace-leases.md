@@ -90,12 +90,16 @@ directory is not inside a lease directory. It catches "an agent ran `git push` f
 directory" and any future skill that skips the convention entirely.
 
 The rule uses an explicit **mutating-verb denylist** — `add`, `am`, `apply`, `branch`, `checkout`,
-`cherry-pick`, `clean`, `commit`, `merge`, `mv`, `push`, `rebase`, `reset`, `restore`, `revert`, `rm`,
-`stash`, `switch`, `tag`, `update-ref`, `worktree` — rather than a read-only allowlist. The set of
+`cherry-pick`, `clean`, `commit`, `merge`, `mv`, `pull`, `push`, `rebase`, `reset`, `restore`,
+`revert`, `rm`, `sparse-checkout`, `stash`, `submodule`, `switch`, `tag`, `update-ref`, `worktree` —
+rather than a read-only allowlist. The set of
 verbs that can stomp a working tree is closed and well known; the set of read verbs is not, and a new
 one silently failing closed would be a worse failure than the race being fixed. `clone` is absent on
 purpose: it runs at the lease root, one directory above a tree that does not exist yet. `fetch`,
-`config`, `remote`, and every read verb are untouched.
+`config`, `remote`, and every read verb are untouched. The last three in the list are there because
+each is a tree write wearing another word: `pull` is `fetch` plus the `merge` or `rebase` beside it,
+`submodule update` checks out whole directories, and `sparse-checkout set` adds and removes files
+across the entire tree.
 
 `-C` is applied the way git applies it — cumulatively, before the subcommand runs — so
 `git -C /elsewhere commit` is checked against `/elsewhere` and not against the directory the caller
@@ -120,7 +124,10 @@ that used to share one tree now hold five, so `finish`'s forced checkout and the
 `start` left behind are no longer racing anyone.
 
 **submit-suggestion** grows two subcommands. `prepare --branch <name>` leases a clone, resets it,
-cuts the branch off `origin/main`, and prints `{"workspace", "lease", "branch", "repo"}`; the agent
+cuts the branch off the repository's default branch — `origin/HEAD`, overridable with
+`GITOPS_BASE_BRANCH`, falling back to `main` — or off `origin/<name>` when that branch already
+exists, so a second round of review feedback builds on the open pull request rather than replacing
+it. It prints `{"workspace", "lease", "branch", "repo"}`; the agent
 works inside the printed `workspace`. `submit --workspace <path> --branch --title --body` asserts
 ownership first, verifies HEAD is on the named branch, then pushes and opens the pull request with
 `cwd` set on every subprocess. The pre-`prepare` bare-flag call shape is still accepted as an alias
