@@ -11,6 +11,7 @@ import types
 import unittest
 import urllib.error
 import urllib.request
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -25,6 +26,7 @@ from credential_proxy import (
     Policy,
     SlackRelay,
     _slack_error_detail,
+    _slack_error_fields,
     is_valid_repository,
     parse_gke_context,
     read_current_context,
@@ -1226,6 +1228,111 @@ class SlackRelayTest(unittest.TestCase):
 
         exc_without_response = Exception("network error")
         self.assertEqual("unknown", _slack_error_detail(exc_without_response))
+
+    def test_slack_error_fields_relays_only_the_whitelist(self):
+        """The payload is a response to a call made with the relay's token.
+
+        It goes both into the log and back across the proxy boundary to the
+        agent, so only the diagnostic keys may cross — never whatever else a
+        future Slack error body decides to carry.
+        """
+        exc = Exception()
+        exc.response = types.SimpleNamespace(
+            data={
+                "ok": False,
+                "error": "missing_scope",
+                "needed": "chat:write",
+                "provided": "channels:read",
+                "response_metadata": {"messages": ["internal detail"]},
+            }
+        )
+        self.assertEqual(
+            {
+                "ok": False,
+                "error": "missing_scope",
+                "needed": "chat:write",
+                "provided": "channels:read",
+            },
+            _slack_error_fields(exc),
+        )
+
+    def test_slack_error_fields_separates_no_payload_from_an_empty_one(self):
+        # An empty dict means Slack answered but said nothing relayable; None
+        # means there was no response object at all. The handler branches on
+        # the difference, so the two must not collapse into one another.
+        exc_with_unrelayable_payload = Exception()
+        exc_with_unrelayable_payload.response = {"warning": "superfluous_charset"}
+        self.assertEqual({}, _slack_error_fields(exc_with_unrelayable_payload))
+
+        self.assertIsNone(_slack_error_fields(Exception("network error")))
+
+    def _slack_api_post(self, api_call):
+        """Drive the relay's POST handler with an api_call of our choosing."""
+        relay = self.relay()
+        relay.api_call = api_call
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.slack_relay = relay
+        handler.slack_max_request_bytes = 1024
+        handler.path = "/v1/chat/slack/api"
+        handler._read_json_body = lambda _max_bytes=None: {
+            "teamId": "T123",
+            "method": "chat.postMessage",
+            "arguments": {},
+        }
+        captured = {}
+        handler._json = lambda status, payload: captured.update(
+            status=status, payload=payload
+        )
+        with self.assertLogs("credential-proxy", level="WARNING"):
+            handler._handle_slack_post()
+        return captured
+
+    def test_a_rejected_call_tells_the_agent_why(self):
+        """The Slack error code has to survive the trip back, not just be logged.
+
+        Every failure behind the proxy answers 502, so without the ``slack``
+        object the caller cannot tell channel_not_found from missing_scope from
+        the relay being down — and slack_relay_patch has nothing to rebuild the
+        SlackApiError from.
+        """
+
+        def rejected(*_args, **_kwargs):
+            exc = Exception("The request to the Slack API failed.")
+            exc.response = types.SimpleNamespace(
+                data={
+                    "ok": False,
+                    "error": "channel_not_found",
+                    "response_metadata": {"messages": ["internal detail"]},
+                }
+            )
+            raise exc
+
+        captured = self._slack_api_post(rejected)
+
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, captured["status"])
+        self.assertEqual(
+            {
+                "error": "Slack operation failed",
+                "slack": {"ok": False, "error": "channel_not_found"},
+            },
+            captured["payload"],
+        )
+        self.assertNotIn("internal detail", json.dumps(captured["payload"]))
+
+    def test_a_relay_failure_carries_no_slack_object(self):
+        """Nothing to relay means no ``slack`` key, so the shim re-raises.
+
+        A transport failure has to stay distinguishable from a Slack rejection
+        on the agent side, and its only signal is the key's absence.
+        """
+
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("connection reset")
+
+        captured = self._slack_api_post(broken)
+
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, captured["status"])
+        self.assertEqual({"error": "Slack operation failed"}, captured["payload"])
 
 
 if __name__ == "__main__":

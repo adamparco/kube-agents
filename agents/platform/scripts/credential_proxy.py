@@ -249,8 +249,15 @@ class GoogleChatRelay:
         return operation.execute()
 
 
-def _slack_error_detail(exc: Exception) -> str:
-    """Return Slack API error details as a JSON string or fallback text."""
+def _slack_error_fields(exc: Exception) -> dict[str, Any] | None:
+    """Return the whitelisted diagnostic fields a Slack API error carried.
+
+    ``None`` means the exception carried no payload at all, which is a
+    different thing from a payload holding nothing worth relaying — the caller
+    distinguishes the two. Only SLACK_ERROR_DIAGNOSTIC_FIELDS cross this
+    boundary: the payload is a response body from a call made with the relay's
+    own credential, and this value is both logged and returned to the agent.
+    """
     response = getattr(exc, "response", None)
     payload = None
     if response is not None:
@@ -263,11 +270,20 @@ def _slack_error_detail(exc: Exception) -> str:
                 payload = None
         elif isinstance(response, dict):
             payload = response
-    if payload is not None:
+    if not isinstance(payload, dict):
+        return None
+    return {k: payload[k] for k in SLACK_ERROR_DIAGNOSTIC_FIELDS if k in payload}
+
+
+def _slack_error_detail(exc: Exception) -> str:
+    """Return Slack API error details as a JSON string or fallback text."""
+    fields = _slack_error_fields(exc)
+    if fields is not None:
         try:
-            return json.dumps({k: payload[k] for k in SLACK_ERROR_DIAGNOSTIC_FIELDS if k in payload}, sort_keys=True)
+            return json.dumps(fields, sort_keys=True)
         except Exception:
             pass
+    response = getattr(exc, "response", None)
     try:
         detail = (
             response.get("error")
@@ -1467,7 +1483,18 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 type(exc).__name__,
                 _slack_error_detail(exc),
             )
-            self._json(HTTPStatus.BAD_GATEWAY, {"error": "Slack operation failed"})
+            # Carry the whitelisted diagnostic fields back to the agent, not
+            # just to this log. slack_sdk raises SlackApiError for an
+            # ``ok: false``, so without this the specific cause —
+            # channel_not_found, not_in_channel, missing_scope — dies here and
+            # the caller sees an indistinguishable "Slack operation failed"
+            # for every one of them. slack_relay_patch turns the ``slack`` key
+            # back into the SlackApiError the real client would have raised.
+            body: dict[str, Any] = {"error": "Slack operation failed"}
+            fields = _slack_error_fields(exc)
+            if fields:
+                body["slack"] = fields
+            self._json(HTTPStatus.BAD_GATEWAY, body)
 
     def log_message(self, message: str, *args: Any) -> None:
         LOGGER.info("http " + message, *args)
