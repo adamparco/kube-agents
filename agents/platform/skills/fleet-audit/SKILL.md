@@ -59,10 +59,25 @@ turn budget for work the schedule spreads across five runs and two days. That is
 failure mode: on 2026-08-03 a single worker asked to run all five streams issued zero `kubectl`
 commands, hand-typed five empty findings documents, and published a fleet-wide all-clear.
 
-One call per job, and the call is synchronous — it returns after that stream's run finishes, with
-`execution_success` in the result. Dispatch the next one once it comes back rather than firing five
-and assuming. If `executed` is `false` nothing ran: the scheduler already owns the fire, or the job
-is paused, and the response says which.
+One call per job, and the call is synchronous — it returns after that stream's run finishes.
+Dispatch the next one once it comes back rather than firing five and assuming. If `executed` is
+`false` nothing ran: the scheduler already owns the fire, or the job is paused, and the response
+says which.
+
+**The run reports back to you. Relay what it says; do not reconstruct it.** A completed dispatch
+returns the run's own closing report in `response` — the ledger issue URL, the finding counts, any
+coverage gap it hit — alongside `execution_success`, the `output_file` holding the run's full
+transcript, and a `delivery_error` if the chat delivery leg failed (which says nothing about whether
+the audit itself succeeded). The run has already published its ledger by the time you read this. You
+have nothing left to publish, and the scratch directory it worked in is shared and already consumed;
+anything you rebuild from it belongs to some other run. If `response` is empty, say the run returned
+no report and point at `output_file` — that is a real, reportable failure, not an invitation to run
+the audit yourself. A `response` of `[SILENT]` is the same situation wearing a different hat: the
+run suppressed its own delivery, which the SOPs forbid on an on-demand run, so read the
+`output_file` it named and report from that.
+
+Your own kanban card is yours to close. The dispatched run cannot close it for you and will be told
+so if it tries.
 
 ## The two-command lifecycle
 
@@ -695,3 +710,13 @@ rewritten correctly — the issue carries the truth either way.
   private shortcut — it is a false statement in a public issue, with your run's name on it.
 - **Never run the audit inline when asked to run the cron job.** Dispatch it; see
   [Running a stream on demand](#running-a-stream-on-demand).
+- **Never call `start`, `finish`, or `remediate` for a stream you dispatched.** The run owns its
+  stream's lifecycle end to end and has already published by the time the call returns to you. A
+  second `finish` reads a findings document the run's own `start` consumed, so it publishes whatever
+  happens to be left in the shared scratch directory — which on 2026-08-04 meant a ledger closed as
+  clean, then a second ledger opened and closed from eight-hour-old data. Report the run's
+  `response`; that is your entire job once the dispatch returns.
+- **Never restore or hand-edit a `findings.json` to get a command to pass.** Not from a `.bak`, not
+  by editing a `check` value until validation accepts it, not by blanking the list to force a close.
+  `/opt/data/scratch` is shared and unversioned, so a file you did not write this run is not your
+  run's data. If `finish` rejects your document, fix the audit, not the file.

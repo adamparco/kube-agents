@@ -790,9 +790,9 @@ the second half of the rule lives with the agent and cannot be moved into the ha
 on-demand run is never silent.** A run dispatched from a kanban card, from chat, or from
 `cronjob(action='run')` reports its outcome and its ledger URL whatever `silent_ok` says. Two places
 say so: every SOP's close section, and the Platform Agent's `AGENTS.md`, which additionally requires
-the dispatching session to read `cron/output/<job-id>/<timestamp>.md` and relay the URL on the card
-when the dispatched run answers `[SILENT]` — because the card summary is what reaches Slack, and the
-worker's own transcript reaches nothing.
+the dispatching session to relay the run's report on the card — from the `response` the dispatch
+returns, or from the `output_file` it names when the run answers `[SILENT]` — because the card
+summary is what reaches Slack, and the worker's own transcript reaches nothing.
 
 ## 8. Labels
 
