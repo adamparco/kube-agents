@@ -4,14 +4,14 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main, feat/platform-admin-cron-audits]
+    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
-  python-tests:
-    name: Python Unit Tests
+  test:
+    name: Run Python Unit Tests
     runs-on: ubuntu-latest
 
     env:
@@ -29,8 +29,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The suite itself is stdlib unittest; these are only the third-party
-      # imports the modules under test pull in. The runtime image gets them
+      # Most of the suite is stdlib unittest; these are only the third-party
+      # imports the agent scripts pull in. The runtime image gets them
       # transitively from hermes-agent (deploy/docker/Dockerfile), which is far
       # too heavy to install for a unit-test run. mcp is held below 2.0 because
       # agent_common_server imports mcp.server.fastmcp, which 2.x moved.
@@ -39,18 +39,9 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install fastapi "mcp<2" python-dotenv pyyaml
 
-      # Two runs rather than one: unittest discovery only recurses into
-      # importable packages, and neither scripts directory is one, so a single
-      # run rooted above them finds zero tests. Each also has to be its own
-      # top-level dir — the tests import their subjects by bare module name.
-      - name: Platform Agent scripts
-        run: python3 -m unittest discover -s agents/platform/scripts -p 'test_*.py' -t agents/platform/scripts
-
-      - name: Fleet audit scripts
-        run: python3 -m unittest discover -s agents/platform/skills/fleet-audit/scripts -p 'test_*.py' -t agents/platform/skills/fleet-audit/scripts
-
-      - name: Chat Agent legacy_slash_commands plugin
-        run: python3 -m unittest discover -s agents/chat/defaults/plugins/legacy_slash_commands -p 'test_*.py' -t agents/chat/defaults/plugins/legacy_slash_commands
-
-      - name: Image patches
-        run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches
+      # Deliberately unfiltered. The suite runs in seconds, and a paths filter
+      # is precisely what kept these tests from running: k8s-operator-test.yml
+      # filters on `k8s-operator/**`, so a change to a skill helper script
+      # never started a job at all.
+      - name: Run Python unit tests
+        run: make test-python
