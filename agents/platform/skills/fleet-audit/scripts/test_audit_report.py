@@ -81,7 +81,13 @@ SHARED_RULES = (
     (
         "credentials never reach an excerpt",
         "red-lines",
-        r"credential",
+        # Both halves of the rule, on one line. A bare `credential` anchor is
+        # satisfied by the compliance SOP's read-only Red Line two bullets
+        # above, which names `gcloud container clusters get-credentials` as its
+        # permitted exception — so the rule this row exists to protect could be
+        # deleted outright and the row would stay green. All five SOPs put both
+        # words on one line.
+        r"credential[^\n]*excerpt|excerpt[^\n]*credential",
         "the harness redacts high-confidence shapes as a backstop, not as the "
         "primary control; the primary control is this line",
     ),
@@ -1457,8 +1463,17 @@ class TestAuditCatalogue(unittest.TestCase):
         )
         if not jobs_file.is_file():  # not shipped alongside the skill at runtime
             self.skipTest(f"{jobs_file} not present")
-        jobs = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
-        return {job["id"]: job for job in jobs}
+        jobs = {
+            job["id"]: job
+            for job in json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
+        }
+        # Callers index this by audit id. The set equality has its own test, but
+        # unittest orders alphabetically and two callers sort ahead of it, so a
+        # stream that lost its watchdog would otherwise surface as three
+        # KeyError tracebacks around one real failure.
+        missing = sorted(set(audit_report.AUDITS) - set(jobs))
+        self.assertFalse(missing, f"no cron watchdog for {', '.join(missing)}")
+        return jobs
 
     def sop_dir(self):
         """The governance directory, or a skip when it is not shipped."""
@@ -1540,6 +1555,70 @@ class TestAuditCatalogue(unittest.TestCase):
                     found,
                     f"audit_report.AUDITS[{audit_id!r}].checks has drifted from "
                     f"{sop.name}. The SOP defines {found}",
+                )
+
+    def test_one_system_namespace_set_spelled_three_ways(self):
+        """Three SOPs suppress "system namespaces"; they must mean one set.
+
+        The security audit writes the set as a `$SYS` regex alternation, the
+        cost audit as a `SYSTEM_NS` backtick list and the reliability audit as
+        exclusion S1 — three notations, one intended set. They were three
+        different sets when the streams shipped: the same namespace was
+        suppressed by one audit and reported by another, which reads to an
+        operator as a finding that will not stay fixed. Re-derive all three
+        from the documents and compare them as sets, so the next namespace
+        added to one is required to reach the other two.
+
+        Globs are normalised to shell form (`gke-.*` and `gke-*` are the same
+        member). The narrower inline `jq` set in compliance check 2.4 is
+        deliberately not read here: it answers which ServiceAccount namespaces
+        are system-owned for a `cluster-admin` binding, not which namespaces an
+        audit skips.
+        """
+        sop_dir = self.sop_dir()
+
+        def regex_set(name):
+            """The alternation in `SYS='^(a|b|c)$'`, as shell globs."""
+            body = (sop_dir / name).read_text(encoding="utf-8")
+            match = re.search(r"^SYS='\^\((?P<alt>[^']+)\)\$'$", body, re.M)
+            self.assertIsNotNone(match, f"{name} no longer defines SYS")
+            return {a.replace(".*", "*") for a in match.group("alt").split("|")}
+
+        # A prose list runs from the anchor to the first token whose preceding
+        # gap is not a list connector, so the sentence *after* the list — the
+        # cost SOP's "Note it is `anthos-identity-service` and not `anthos-*`"
+        # — cannot leak members in.
+        connector = re.compile(r"^,?\s*(or\s+)?(plus\s+)?(any namespace matching\s+)?$")
+
+        def prose_set(name, anchor):
+            body = (sop_dir / name).read_text(encoding="utf-8")
+            start = body.find(anchor)
+            self.assertNotEqual(start, -1, f"{name} no longer defines {anchor!r}")
+            tail = body[start + len(anchor) :].split("\n", 1)[0]
+            found, end = [], None
+            for match in re.finditer(r"`([A-Za-z0-9\-.*]+)`", tail):
+                if end is not None and not connector.match(tail[end : match.start()]):
+                    break
+                found.append(match.group(1))
+                end = match.end()
+            self.assertEqual(
+                len(found), len(set(found)), f"{name} lists a namespace twice"
+            )
+            return set(found)
+
+        canonical = regex_set("compliance_audit_sop.md")
+        self.assertIn("kube-system", canonical)  # a parse that found nothing
+        self.assertNotIn("kubeagents-system", canonical)  # the harness audits itself
+        for name, anchor in (
+            ("fleet_wide_cost_analysis_sop.md", "`SYSTEM_NS` ="),
+            ("obtainability_audit_sop.md", "**S1 — system namespace:**"),
+        ):
+            with self.subTest(sop=name):
+                self.assertEqual(
+                    canonical,
+                    prose_set(name, anchor),
+                    f"{name} suppresses a different set of system namespaces "
+                    f"than compliance_audit_sop.md's $SYS",
                 )
 
     def test_every_sop_states_the_checks_run_wire_format(self):

@@ -181,7 +181,8 @@ cap_guard() {
 }
 
 for CONSTANT in MAX_EXCERPT_LINES MAX_EXCERPT_CHARS MAX_COMMAND_CHARS \
-  MAX_BODY_CHARS BODY_BUDGET MAX_SCOPE_ROWS AUTO_PROMOTION_CAP MIN_NA_REASON_CHARS; do
+  MAX_BODY_CHARS BODY_BUDGET MAX_SCOPE_ROWS AUTO_PROMOTION_CAP MIN_NA_REASON_CHARS \
+  MIN_CHECK_COMMAND_CHARS; do
   if ! spellings "$CONSTANT" > /dev/null; then
     echo "ERROR: could not read ${CONSTANT} from ${AUDIT_SCRIPT}." >&2
     exit 1
@@ -190,8 +191,12 @@ done
 
 # The excerpt clip is always written as a pair — "40 lines / 2,000 characters"
 # — so one probe pins both halves; splitting them would let a line quote the
-# right line count beside the wrong character count and pass twice.
-JOIN='( ?/ ?| and \*\* )'
+# right line count beside the wrong character count and pass twice. The second
+# alternative is the skill's bolded phrasing, `**40 lines and** 2,000
+# characters`: the closing `**` falls between "and" and the number, with no
+# space before it. Spelling it `and \*\* ` instead matches nothing, which the
+# copies floor cannot catch while the slash form still matches six files.
+JOIN='( ?/ ?| and\*\* )'
 cap_guard \
   "[0-9]+ lines${JOIN}[0-9,]+" \
   "$(spellings MAX_EXCERPT_LINES) lines${JOIN}$(spellings MAX_EXCERPT_CHARS)" \
@@ -210,8 +215,11 @@ cap_guard \
   "GitHub caps an? [a-z]* ?body at $(spellings MAX_BODY_CHARS)" \
   "Documented GitHub body limit does not match MAX_BODY_CHARS in ${AUDIT_SCRIPT}."
 
+# `targets` is an ordinary English verb, so its arm requires a four-or-more
+# digit figure — otherwise a future "the sweep targets 3 clusters" would be read
+# as a stale copy of this cap. `body at` is specific enough to take any number.
 cap_guard \
-  '(body at |targets \*{0,2})[0-9][0-9,]*' \
+  'body at [0-9][0-9,]*|targets \*{0,2}[0-9]{1,3},?[0-9]{3}' \
   "(body at |targets \*{0,2})$(spellings BODY_BUDGET)" \
   "Documented body budget does not match BODY_BUDGET in ${AUDIT_SCRIPT}." \
   'GitHub caps an? '
@@ -232,6 +240,16 @@ cap_guard \
   "reason under $(spellings MIN_NA_REASON_CHARS) characters" \
   "Documented not-applicable reason floor does not match MIN_NA_REASON_CHARS in ${AUDIT_SCRIPT}."
 
+# The check-command floor. The five SOPs and the skill write it "anything under
+# eight characters"; the ledger design writes it "shorter than eight
+# characters". Both spellings are in the probe so the ledger is covered too, and
+# the subject word keeps this distinct from the reason floor above, so the two
+# cannot satisfy each other.
+cap_guard \
+  '(anything under|shorter than) [a-z0-9]+ characters' \
+  "(anything under|shorter than) $(spellings MIN_CHECK_COMMAND_CHARS) characters" \
+  "Documented check-command floor does not match MIN_CHECK_COMMAND_CHARS in ${AUDIT_SCRIPT}."
+
 # --- fleet-audit cron prompts ---------------------------------------------
 # Ground truth: the prompts in the cron manifest. Two site pages quote the
 # compliance watchdog's prompt verbatim to show what an anti-skim prompt looks
@@ -239,6 +257,12 @@ cap_guard \
 # was 348 lines with its checks at 56-270 when it was 406 lines with its checks
 # at 102-314. A quotation that has drifted from the thing it quotes is worse
 # than no quotation, so require it to be a literal substring of the manifest.
+#
+# The consequence to know before you write: `all N lines of it` is treated as a
+# claim to be quoting a prompt, not as a phrase. Prose that paraphrases a
+# watchdog rather than quoting it will fail this check even though nothing has
+# drifted. Quote the prompt verbatim from the manifest, or describe it in words
+# that avoid the idiom.
 CRON_JOBS=agents/platform/cron/jobs.json
 if [ ! -f "$CRON_JOBS" ]; then
   echo "ERROR: ${CRON_JOBS} not found; the cron-prompt guard cannot run." >&2

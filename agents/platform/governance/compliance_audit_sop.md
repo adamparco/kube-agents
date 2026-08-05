@@ -32,7 +32,7 @@ gcloud container clusters list --project="$PROJECT" \
 For each cluster with `status == RUNNING`, pin a per-cluster kubeconfig (local-only, mutates nothing) the way `platform_mcp_server.switch_kube_context` does, then confirm read access:
 
 ```bash
-export KUBECONFIG="$HERMES_HOME/.kubeconfigs/kubeconfig_${PROJECT}_${C}_${L}.yaml"
+export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_${PROJECT}_${C}_${L}.yaml"
 gcloud container clusters get-credentials "$C" --location="$L" --project="$PROJECT"
 kubectl auth can-i list pods --all-namespaces
 ```
