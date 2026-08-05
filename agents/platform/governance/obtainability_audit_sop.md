@@ -279,4 +279,4 @@ What to report in each case:
 - **A finding you cannot reproduce is dropped, not softened.** `evidence.command` is the literal command you executed; if the confirm read fails or the condition has cleared, the finding does not ship.
 - **No fabricated numbers.** Resource quantities, replica counts, autoscaling targets, and probe endpoints are either read off the live object or left to a human.
 - **No forbidden sources.** BigQuery, Prometheus/GMP, VPA recommendations, Policy Controller, and external blueprints are out of scope; so is delegating any part of this audit to a Cluster Agent.
-- **Stable ids or the delta lies.** An id that varies between runs turns one persistent problem into an infinite stream of "new" findings.
+- **Stable ids or the delta lies.** An unstable id — one that varies between runs because the `object` it is derived from moved — turns one persistent problem into an infinite stream of "new" findings.

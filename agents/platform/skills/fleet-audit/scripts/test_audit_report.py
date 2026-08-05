@@ -50,6 +50,57 @@ SOP_FILENAMES = {
     "fleet-consistency-drift": "fleet_consistency_drift_sop.md",
 }
 
+# Rules that hold on every stream — because the harness enforces them, or
+# because a worker gets them wrong the same way whatever it is auditing — and
+# therefore have to be stated in all five SOPs. Every one of these was missing
+# from at least one SOP when the streams shipped, and nothing noticed: the five
+# documents share an outline but almost no text, so a fix written into one of
+# them reaches the other four only if somebody remembers. This table is what
+# remembers.
+#
+# Each row is `(label, scope, pattern, why)`.
+#
+# `scope` is "body" for a rule the SOP may state anywhere, and "red-lines" for
+# one that must appear in the closing Red Lines list. The distinction is not
+# cosmetic: two of these were already in body prose on every stream and still
+# absent from the boundaries list two hundred lines further down, which is the
+# part a worker re-reads before it publishes.
+#
+# `pattern` is deliberately noun-blind. The drift SOP calls its checks
+# "facets", so an anchor carrying the word "check" reports a rule as missing
+# from a document that states it perfectly well. Anchor on the distinctive
+# words of the rule itself and nothing else.
+SHARED_RULES = (
+    (
+        "eight-character command floor",
+        "body",
+        r"under eight characters",
+        "audit_report.MIN_CHECK_COMMAND_CHARS rejects anything shorter, and a "
+        "worker that does not know this discovers it from a rejection",
+    ),
+    (
+        "credentials never reach an excerpt",
+        "red-lines",
+        r"credential",
+        "the harness redacts high-confidence shapes as a backstop, not as the "
+        "primary control; the primary control is this line",
+    ),
+    (
+        "/remediate all is accepted",
+        "body",
+        r"`/remediate all`",
+        "audit_report.REMEDIATE_RE parses it on every stream, and `finish` "
+        "expands it against that run's manifest findings",
+    ),
+    (
+        "no unstable finding identity",
+        "red-lines",
+        r"unstable",
+        "the id is derived from check/cluster/namespace/object, so an object "
+        "that moves is reported as fixed and re-reported as new",
+    ),
+)
+
 # What GitHub enforces on an issue body, a comment and a pull request body,
 # written out here rather than imported. The harness's `MAX_BODY_CHARS` is only
 # the harness's *belief* about that number, and a size test asserting a body
@@ -59,6 +110,54 @@ SOP_FILENAMES = {
 # prevent. The real number is not ours to change, so it is a literal, and the
 # constant is checked against it once (`test_the_budget_matches_github`).
 GITHUB_BODY_LIMIT = 65_536
+
+# The cron prompts spell their check counts out ("Its eleven checks are
+# section 2"), because a numeral in that sentence reads as a section number.
+NUMBER_WORDS = {
+    word: n
+    for n, word in enumerate(
+        (
+            "zero",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+            "eleven",
+            "twelve",
+            "thirteen",
+            "fourteen",
+            "fifteen",
+            "sixteen",
+            "seventeen",
+            "eighteen",
+            "nineteen",
+            "twenty",
+        )
+    )
+}
+
+
+def _outside_fences(lines):
+    """Yield `(1-indexed line number, text)` for lines outside ``` fences.
+
+    Every heading scan below has to skip fenced blocks. A `### ` inside one is
+    a shell comment or a JSON fragment, and counting it as a section heading
+    shifts every span derived afterwards — silently, in the direction that
+    makes a stale citation look correct.
+    """
+    fenced = False
+    for number, line in enumerate(lines, start=1):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            continue
+        if not fenced:
+            yield number, line
 
 
 def render_body(doc, **kwargs):
@@ -1351,25 +1450,59 @@ class TestSchemeMigration(HarnessTestCase):
 
 
 class TestAuditCatalogue(unittest.TestCase):
-    def test_human_names_match_the_cron_watchdogs(self):
-        """The PR title must name the same audit the cron catalogue does."""
+    def cron_jobs(self):
+        """The cron catalogue keyed by id, or a skip when it is not shipped."""
         jobs_file = (
             Path(__file__).resolve().parents[4] / "platform" / "cron" / "jobs.json"
         )
         if not jobs_file.is_file():  # not shipped alongside the skill at runtime
             self.skipTest(f"{jobs_file} not present")
         jobs = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
-        names = {job["id"]: job["name"] for job in jobs}
+        return {job["id"]: job for job in jobs}
+
+    def sop_dir(self):
+        """The governance directory, or a skip when it is not shipped."""
+        sop_dir = Path(__file__).resolve().parents[4] / "platform" / "governance"
+        if not sop_dir.is_dir():  # not shipped alongside the skill at runtime
+            self.skipTest(f"{sop_dir} not present")
+        return sop_dir
+
+    def test_every_stream_has_a_watchdog_and_every_watchdog_a_stream(self):
+        """The two catalogues are one set, not two that mostly overlap.
+
+        Every test below this one used to be written as "for each audit, *if*
+        the cron catalogue happens to know it, check X" — which is green by
+        construction for a stream nobody scheduled. A stream in `AUDITS` with
+        no watchdog never runs and never publishes, and the ledger it would
+        have opened simply does not appear; a watchdog carrying the fleet-audit
+        skill with no matching stream fails at `start` at 06:20. Assert the
+        equality once, here, so the rest can index the catalogue directly.
+        """
+        jobs = self.cron_jobs()
+        scheduled = {
+            job_id
+            for job_id, job in jobs.items()
+            if "fleet-audit" in (job.get("skills") or [])
+        }
+        self.assertEqual(
+            set(audit_report.AUDITS),
+            scheduled,
+            "audit_report.AUDITS and the cron jobs carrying the fleet-audit "
+            "skill have diverged",
+        )
+
+    def test_human_names_match_the_cron_watchdogs(self):
+        """The PR title must name the same audit the cron catalogue does."""
+        jobs = self.cron_jobs()
         for audit_id, spec in audit_report.AUDITS.items():
-            if audit_id in names:
-                with self.subTest(audit=audit_id):
-                    self.assertEqual(
-                        spec.title,
-                        names[audit_id],
-                        f"audit_report.AUDITS[{audit_id!r}].title is "
-                        f"{spec.title!r} but cron/jobs.json calls it "
-                        f"{names[audit_id]!r}",
-                    )
+            with self.subTest(audit=audit_id):
+                self.assertEqual(
+                    spec.title,
+                    jobs[audit_id]["name"],
+                    f"audit_report.AUDITS[{audit_id!r}].title is "
+                    f"{spec.title!r} but cron/jobs.json calls it "
+                    f"{jobs[audit_id]['name']!r}",
+                )
 
     def test_check_rosters_match_the_sops(self):
         """The roster is the SOP's check list, or it is a lie the validator tells.
@@ -1455,24 +1588,29 @@ class TestAuditCatalogue(unittest.TestCase):
         file so that editing an SOP without re-measuring fails here rather than
         at 06:20 in production.
         """
-        root = Path(__file__).resolve().parents[4] / "platform"
-        jobs_file = root / "cron" / "jobs.json"
-        sop_dir = root / "governance"
-        if not jobs_file.is_file() or not sop_dir.is_dir():
-            self.skipTest("cron catalogue and governance SOPs not present")
-        jobs = {
-            job["id"]: job["prompt"]
-            for job in json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
-        }
+        jobs = self.cron_jobs()
+        sop_dir = self.sop_dir()
         total = re.compile(r"all (\d+) lines of it")
         span = re.compile(r"are section (\d+), lines (\d+)-(\d+)")
-        for audit_id in audit_report.AUDITS:
-            prompt = jobs.get(audit_id)
-            if prompt is None:
-                continue
-            body = (sop_dir / SOP_FILENAMES[audit_id]).read_text(encoding="utf-8")
-            lines = body.splitlines()
+        # "Its eleven checks are section 2" / "Its nineteen facets are section
+        # 4" — the noun differs by stream, the count must not.
+        counted = re.compile(r"\bIts ([a-z]+) \w+ are section\b")
+        # A `#### ` check heading names its slugs in a trailing parenthesis;
+        # same anchoring as test_check_rosters_match_the_sops, and same reason.
+        trailing = re.compile(r"\((((?:`[^`]+`)(?:,\s*)?)+)\)\s*$")
+        token = re.compile(r"`([^`]+)`")
+        for audit_id, spec in audit_report.AUDITS.items():
+            prompt = jobs[audit_id]["prompt"]
+            name = SOP_FILENAMES[audit_id]
+            lines = (sop_dir / name).read_text(encoding="utf-8").splitlines()
             with self.subTest(audit=audit_id):
+                self.assertIn(
+                    f"governance/{spec.sop}",
+                    prompt,
+                    f"the {audit_id} prompt does not send the worker to "
+                    f"{spec.sop}, which is the file these numbers describe",
+                )
+
                 claimed = total.search(prompt)
                 self.assertIsNotNone(
                     claimed, f"{audit_id} prompt no longer states the SOP length"
@@ -1481,35 +1619,98 @@ class TestAuditCatalogue(unittest.TestCase):
                     len(lines),
                     int(claimed.group(1)),
                     f"{audit_id} prompt claims {claimed.group(1)} lines but "
-                    f"{SOP_FILENAMES[audit_id]} has {len(lines)}",
+                    f"{name} has {len(lines)}",
                 )
+
                 cited = span.search(prompt)
                 self.assertIsNotNone(
                     cited, f"{audit_id} prompt no longer locates the checks"
                 )
                 section, first, last = cited.groups()
                 # Sections are `### <n>. Title`; the section ends where the next
-                # one begins, so the checks span up to the line before it.
-                starts = [
-                    n
-                    for n, line in enumerate(lines, start=1)
-                    if line.startswith("### ")
-                ]
+                # one begins, so the checks span up to the line before it. Only
+                # headings outside a fenced block count — the compliance SOP
+                # opens with a bash fence, and a `### ` inside one is a comment
+                # or a shell heredoc, not a section.
+                starts = [n for n, line in _outside_fences(lines) if line.startswith("### ")]
                 heading = f"### {section}. "
                 where = [n for n in starts if lines[n - 1].startswith(heading)]
                 self.assertEqual(
                     1,
                     len(where),
-                    f"{SOP_FILENAMES[audit_id]} has {len(where)} sections "
-                    f"headed {heading!r}; the {audit_id} prompt cites one",
+                    f"{name} has {len(where)} sections headed {heading!r}; "
+                    f"the {audit_id} prompt cites one",
                 )
                 after = [n for n in starts if n > where[0]]
+                first, last = int(first), int(last)
                 self.assertEqual(
                     (where[0], (after[0] - 1) if after else len(lines)),
-                    (int(first), int(last)),
+                    (first, last),
                     f"{audit_id} prompt cites lines {first}-{last} for section "
-                    f"{section} of {SOP_FILENAMES[audit_id]}, which has moved",
+                    f"{section} of {name}, which has moved",
                 )
+
+                # The span being *a* real section is not the claim the prompt
+                # makes. It says the checks are in there, and a worker that
+                # reads only that range has to come out holding the whole
+                # roster. Point it at the preamble and every number above still
+                # checks out while the worker reads nothing it needs.
+                inside = [
+                    slug
+                    for n, line in _outside_fences(lines)
+                    if first <= n <= last and line.startswith("#### ")
+                    for match in [trailing.search(line)]
+                    if match
+                    for slug in token.findall(match.group(1))
+                ]
+                self.assertEqual(
+                    sorted(spec.checks),
+                    sorted(inside),
+                    f"lines {first}-{last} of {name} do not define the roster "
+                    f"the {audit_id} stream validates against",
+                )
+
+                # And the prompt's own count, which is what tells a worker
+                # mid-read whether it has found them all.
+                says = counted.search(prompt)
+                self.assertIsNotNone(
+                    says, f"{audit_id} prompt no longer counts its checks"
+                )
+                self.assertEqual(
+                    len(spec.checks),
+                    NUMBER_WORDS.get(says.group(1)),
+                    f"{audit_id} prompt says {says.group(1)!r} but the stream "
+                    f"has {len(spec.checks)} checks",
+                )
+
+    def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
+        """A fix written into one SOP has to reach the other four.
+
+        The five documents share an outline and almost no text, so there is no
+        shared file to edit and no include to follow: the only thing that
+        carries a cross-stream rule into all five is somebody remembering. Six
+        rules were stated in some SOPs and silently missing from others from
+        the day the streams shipped — including two the harness rejects a
+        document for. SHARED_RULES is the roll-call; adding a row to it is how
+        the next such fix gets propagated instead of forgotten.
+        """
+        sop_dir = self.sop_dir()
+        for audit_id, spec in audit_report.AUDITS.items():
+            body = (sop_dir / spec.sop).read_text(encoding="utf-8")
+            head, sep, red_lines = body.partition("\n## Red Lines\n")
+            self.assertTrue(
+                sep, f"{spec.sop} has no Red Lines section to check against"
+            )
+            for label, scope, pattern, why in SHARED_RULES:
+                haystack = red_lines if scope == "red-lines" else body
+                with self.subTest(audit=audit_id, rule=label):
+                    self.assertRegex(
+                        haystack,
+                        pattern,
+                        f"{spec.sop} never states {label!r}"
+                        + (" in its Red Lines" if scope == "red-lines" else "")
+                        + f" — {why}",
+                    )
 
     def test_no_audit_prompt_restates_the_silence_rule(self):
         """`[SILENT]` is the SOP's to define, and the prompt's to stay out of.
@@ -1520,25 +1721,16 @@ class TestAuditCatalogue(unittest.TestCase):
         qualifiers dropped, and does so before the run starts — telling the
         worker what its answer looks like while it still decides what to check.
         """
-        jobs_file = (
-            Path(__file__).resolve().parents[4] / "platform" / "cron" / "jobs.json"
-        )
-        if not jobs_file.is_file():
-            self.skipTest(f"{jobs_file} not present")
-        jobs = {
-            job["id"]: job["prompt"]
-            for job in json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
-        }
+        jobs = self.cron_jobs()
         for audit_id in audit_report.AUDITS:
-            if audit_id in jobs:
-                with self.subTest(audit=audit_id):
-                    self.assertNotIn(
-                        "SILENT",
-                        jobs[audit_id],
-                        f"the {audit_id} cron prompt has picked the silence rule "
-                        "back up; it belongs in the SOP's closing section, where "
-                        "it is stated in full",
-                    )
+            with self.subTest(audit=audit_id):
+                self.assertNotIn(
+                    "SILENT",
+                    jobs[audit_id]["prompt"],
+                    f"the {audit_id} cron prompt has picked the silence rule "
+                    "back up; it belongs in the SOP's closing section, where "
+                    "it is stated in full",
+                )
 
 
 # --------------------------------------------------------------------------- #
