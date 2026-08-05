@@ -100,6 +100,31 @@ exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None"
     /opt/hermes/.venv/bin/python3 /tmp/verify_cron_run_scope.py && \
     rm /tmp/apply_cron_run_scope.py /tmp/verify_cron_run_scope.py
 
+# Hotfix: stop a card that asked for information closing with none attached.
+# Upstream gates kanban_complete on `summary or result`, so a summary alone
+# always closes a card — and the tool schema calls `result` a "legacy field"
+# the model should avoid. On 2026-08-05 card t_7f3e0a5e ("List enabled cron
+# jobs… report back with their schedules") closed done with result_len 0 and a
+# summary asserting a manifest had been provided. The manifest was the worker's
+# final chat message, so it reached the session log and nobody else. Four
+# anchored edits: two install the gate, two rewrite the schema wording that
+# caused it — a prompt that stops the mistake beats a gate that rejects it.
+# Must run after apply_cron_run_scope.py: its import anchor survives that
+# patch, not the reverse. verify_report_back_completion.py then exercises the
+# patched _handle_complete against a recording kernel, because the anchors
+# cannot show that a rejection leaves the card unwritten — which is exactly
+# what the rejection message promises the worker.
+# See the module docstring in deploy/docker/patches/report_back_completion.py.
+COPY deploy/docker/patches/report_back_completion.py /opt/hermes/tools/report_back_completion.py
+COPY deploy/docker/patches/apply_report_back_completion.py /tmp/apply_report_back_completion.py
+COPY deploy/docker/patches/verify_report_back_completion.py /tmp/verify_report_back_completion.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_report_back_completion.py /opt/hermes && \
+    grep -q "report_back_violation(" /opt/hermes/tools/kanban_tools.py && \
+    grep -q "if not carries_content(\*posted):" /opt/hermes/tools/kanban_tools.py && \
+    ! grep -q "Short result log line (legacy field" /opt/hermes/tools/kanban_tools.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_report_back_completion.py && \
+    rm /tmp/apply_report_back_completion.py /tmp/verify_report_back_completion.py
+
 
 # 3. Clone and build mcp-remote proxy. Git is a build-only dependency here;
 # the sandbox runtime exposes only the credential-proxy Git wrapper.
