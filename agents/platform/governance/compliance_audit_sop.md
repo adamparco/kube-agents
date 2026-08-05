@@ -104,7 +104,7 @@ Same slugs as `checks_run`, and the `reason` has to say why the check _cannot_ a
 Shared setup, evaluated once per cluster. `$PRE` normalises every auditable workload to `{kind, ns, name, spec}` and applies the universal suppressions, so each workload check below is `$WL | jq -r --arg sys "$SYS" "$PRE"'| <filter>'`.
 
 ```bash
-SYS='^(kube-system|kube-public|kube-node-lease|gke-.*|gmp-system|gke-gmp-system|gke-managed-.*|cnrm-system|configconnector-operator-system|krmapihosting-system|istio-system|asm-system|anthos-identity-service|config-management-.*|gatekeeper-system|composer-system)$'
+SYS='^(kube-system|kube-public|kube-node-lease|gke-.*|gmp-system|gmp-public|gke-gmp-system|gke-managed-.*|cnrm-system|configconnector-operator-system|krmapihosting-system|istio-system|asm-system|anthos-identity-service|config-management-.*|gatekeeper-system|composer-system)$'
 WL='kubectl get deploy,sts,ds,cronjob,pod -A -o json'
 PRE='.items[]
  | select((.metadata.namespace|test($sys)|not)

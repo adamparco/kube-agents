@@ -87,7 +87,7 @@ horizontalpodautoscalers,services,limitranges -A -o json > /opt/data/scratch/wra
 
 **Standard exclusions — apply to every check below.** Skip an object if any holds:
 
-- **S1 — system namespace:** `kube-system`, `kube-public`, `kube-node-lease`, `gmp-system`, `gmp-public`, `cnrm-system`, `configconnector-operator-system`, `istio-system`, `asm-system`, `gatekeeper-system`, `krmapihosting-system`, `anthos-identity-service`, or any namespace matching `gke-*` or `config-management-*`.
+- **S1 — system namespace:** `kube-system`, `kube-public`, `kube-node-lease`, `gmp-system`, `gmp-public`, `gke-gmp-system`, `cnrm-system`, `configconnector-operator-system`, `krmapihosting-system`, `istio-system`, `asm-system`, `anthos-identity-service`, `gatekeeper-system`, `composer-system`, or any namespace matching `gke-*`, `gke-managed-*`, or `config-management-*`. This is the fleet-wide system-namespace set, spelled the same way in the Security & RBAC Posture Audit (`$SYS`) and the Fleet Waste Audit (`SYSTEM_NS`); `kubeagents-system` is deliberately **not** in it, because the harness audits itself.
 - **S2 — GKE-managed object:** carries the label `addonmanager.kubernetes.io/mode` (any value). GKE reverts edits to these; a finding is unactionable.
 - **S3 — operator-owned:** the workload has a non-empty `metadata.ownerReferences` (its replica count, PDB, and probes belong to its controller, not to a human).
 - **S4 — explicit opt-out:** the workload carries `kubeagents.x-k8s.io/reliability-audit: exempt` as a label or annotation.
