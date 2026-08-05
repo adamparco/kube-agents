@@ -110,6 +110,22 @@ kanban:
   # Dispatcher tick. Upstream defaults to 60s, which added a 0-60s (median ~38s)
   # dead wait to every delegation before the worker was claimed.
   dispatch_interval_seconds: 5
+  # Which terminal events wake this agent for a follow-up turn. Upstream wakes
+  # on all five and offers no way to say otherwise; the image patches that key
+  # in (deploy/docker/patches/kanban_wake_kinds.py).
+  #
+  # `completed` is deliberately absent. The notifier has already delivered the
+  # worker's own summary to the thread by the time it wakes anyone, so the woken
+  # turn just re-reads the card and paraphrases a message the user is looking
+  # at — 5.9s and 32,460 input tokens on task t_c31a1f00, for nothing.
+  #
+  # The failure kinds stay: they deliver a terse status line and no more, and
+  # the front door genuinely has to decide what to do about them.
+  wake_on_events:
+    - gave_up
+    - crashed
+    - timed_out
+    - blocked
 
 # Denylist applied last for every platform key — the authoritative guarantee that
 # the front door cannot touch the system. Everything except the delegation

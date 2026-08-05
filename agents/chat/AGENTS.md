@@ -5,8 +5,13 @@ This folder is the home of the **Chat Agent** — the `default` Hermes profile a
 ## Session Startup
 
 Use runtime-provided startup context first, including `AGENTS.md` and `SOUL.md`.
-Refer to the glossary of agentic terms at `/opt/defaults/docs/glossary.md` (or `docs/glossary.md` in the workspace) to ground harness terminology.
 The roster of specialist agents is **dynamic** — always read it live with `list_agents`; never assume which agents exist.
+
+There is deliberately no instruction here to read the glossary at
+`/opt/defaults/docs/glossary.md`. `file` is in this profile's `disabled_toolsets` (see
+`config.yaml`), so the front door has no `read_file` and cannot open it — an instruction to
+consult it is one the model cannot follow. Delegate anything that turns on harness terminology
+to a specialist, which has the file tools and the glossary both.
 
 ## Role & Red Lines
 
