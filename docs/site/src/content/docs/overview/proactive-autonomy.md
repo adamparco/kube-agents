@@ -18,13 +18,14 @@ Every step is real code shipping in the repo. The SOPs live in [`agents/platform
 
 ## What runs on its own
 
-Five fleet audits run enabled, each on its own schedule and each maintaining a single GitHub issue as its standing report:
+Six fleet audits run enabled, each on its own schedule and each maintaining a single GitHub issue as its standing report:
 
 - **Security & RBAC posture** (daily) — privileged and host-namespace containers, over-privileged RBAC bindings, namespaces with no `NetworkPolicy`, Workload Identity and metadata-concealment gaps.
 - **Workload reliability** (daily) — missing resource requests, drain-blocking or absent PodDisruptionBudgets, unscalable Deployments, zone-pinned scheduling, missing probes.
 - **Upgrade & patch readiness** (weekly) — control-plane and node versions against the cluster's release channel, version skew, `autoUpgrade`/`autoRepair` off, missing maintenance windows.
 - **Fleet waste** (weekly) — over-provisioned requests, orphaned PersistentVolumes and disks, idle reserved IPs, near-empty node pools. Reported in resource units, not dollars: there is no billing export to price against.
 - **Fleet consistency drift** (weekly) — clusters that diverge from the rest of the fleet on release channel, Workload Identity, Shielded Nodes, logging config and similar facets. The baseline is derived from the fleet itself, so it needs no blueprint to compare against.
+- **AI workload security** (daily) — inference endpoints on external load balancers, model repositories trusted to execute their own code, weights mounted writable under the serving process, unpinned model artifact sources, registry credentials in plaintext environment variables, model-server images on floating tags. It scopes itself to workloads running a known inference runtime or holding a GPU or TPU, and evaluates the deployment, never the model.
 
 Alongside them, `github-issue-resolver` polls the target repo every 30 minutes and triages open issues within tight guardrails — audit ledgers, which carry `agent:audit`, are excluded from its poll.
 

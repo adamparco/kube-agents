@@ -5,7 +5,7 @@
 > back to it. It replaces the model in which each audit stream owned one continuously-rewritten Pull
 > Request.
 
-**Scope:** How the five autonomous audit watchdogs publish findings and propose fixes.
+**Scope:** How the six autonomous audit watchdogs publish findings and propose fixes.
 **Supersedes:** the PR-as-report model introduced in `424a345`.
 
 ---
@@ -116,7 +116,7 @@ A remediation PR opens automatically **iff** the finding satisfies all of:
 3. there is no **live** pull request on its branch.
 
 Every other finding stays prose in the ledger until a human asks for it. Rationale: the highest-risk
-findings that have a mergeable diff should arrive ready to merge; the long tail must not turn five
+findings that have a mergeable diff should arrive ready to merge; the long tail must not turn six
 streams into a notification firehose. At most five auto-promotions per run (§13 Q4); the surplus is
 named in the ledger.
 
@@ -364,7 +364,7 @@ surfaced early so the agent knows which findings need a manifest written during 
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
 `git config --get remote.origin.url` to answer. The harness therefore clones lazily on the way in,
 and **every `remediation.path` is resolved against this directory**. A manifest written anywhere
-else is a file the harness will never find. The clone is keyed by audit id so the five streams do
+else is a file the harness will never find. The clone is keyed by audit id so the six streams do
 not share a working tree; [`gitops-workspace-leases.md`](gitops-workspace-leases.md) owns that
 layout.
 
@@ -540,7 +540,7 @@ headroom for the trailing marker and for anything a later section appends.
   roll-up rule; that SOP now caps a check at 25 findings per cluster
   ([obtainability_audit_sop.md:78](../../agents/platform/governance/obtainability_audit_sop.md)),
   so no single documented rule licenses a run that large today. Bounding the marker is still right:
-  the cap is per check per cluster, five streams run against a fleet of unknown size, and a size
+  the cap is per check per cluster, six streams run against a fleet of unknown size, and a size
   term that grows with the fleet and is invisible in the rendered body is the worst kind to leave
   unbounded.
 - **The two halves of the delta are measured against different sets**, because "appeared" and "was
@@ -760,7 +760,7 @@ and the flag has one job. A coverage gap means the audit did not look, which is 
 suppresses the resolved count. Truncation means it looked, found everything, counted it all in the
 title, and could not print the tail; resolution accounting is untouched, because the delta block
 already carries only the ids the body rendered (§2). Folding them together produced
-`partial: true` with an empty `coverage_gaps` — a flag five SOPs instruct the agent to explain to a
+`partial: true` with an empty `coverage_gaps` — a flag six SOPs instruct the agent to explain to a
 human, with nothing to explain it with. Truncation is surfaced where it belongs: a line in the body
 naming the count it dropped, and a `WARNING` in the run log.
 
@@ -1049,7 +1049,7 @@ things.
 remediation PR opened or closed — asserted on both `finish` branches, since each prints its own
 JSON. Three prose tests pin the handover the flag cannot cover on its own: the `AGENTS.md` cron
 bullet names both `kanban_complete` and `[SILENT]`, `SOUL.md` requires the artifact URL in the card
-summary before its first numbered section, and every one of the five SOPs contains both `silent_ok`
+summary before its first numbered section, and every one of the six SOPs contains both `silent_ok`
 and "on-demand".
 
 **Workspace cases.** Exactly **one** of these runs real git against a real bare origin rather than

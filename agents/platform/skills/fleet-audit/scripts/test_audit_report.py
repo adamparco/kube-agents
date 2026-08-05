@@ -48,14 +48,15 @@ SOP_FILENAMES = {
     "obtainability-audit": "obtainability_audit_sop.md",
     "fleet-wide-cost-analysis": "fleet_wide_cost_analysis_sop.md",
     "fleet-consistency-drift": "fleet_consistency_drift_sop.md",
+    "ai-security-audit": "ai_security_audit_sop.md",
 }
 
 # Rules that hold on every stream — because the harness enforces them, or
 # because a worker gets them wrong the same way whatever it is auditing — and
-# therefore have to be stated in all five SOPs. Every one of these was missing
-# from at least one SOP when the streams shipped, and nothing noticed: the five
+# therefore have to be stated in all six SOPs. Every one of these was missing
+# from at least one SOP when the streams shipped, and nothing noticed: the six
 # documents share an outline but almost no text, so a fix written into one of
-# them reaches the other four only if somebody remembers. This table is what
+# them reaches the other five only if somebody remembers. This table is what
 # remembers.
 #
 # Each row is `(label, scope, pattern, why)`.
@@ -1684,11 +1685,11 @@ class TestAuditCatalogue(unittest.TestCase):
                 )
 
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
-        """A fix written into one SOP has to reach the other four.
+        """A fix written into one SOP has to reach the other five.
 
-        The five documents share an outline and almost no text, so there is no
+        The six documents share an outline and almost no text, so there is no
         shared file to edit and no include to follow: the only thing that
-        carries a cross-stream rule into all five is somebody remembering. Six
+        carries a cross-stream rule into all six is somebody remembering. Six
         rules were stated in some SOPs and silently missing from others from
         the day the streams shipped — including two the harness rejects a
         document for. SHARED_RULES is the roll-call; adding a row to it is how
@@ -2401,9 +2402,9 @@ class TestStart(HarnessTestCase):
         self.assertTrue((reported / ".git").exists())
 
     def test_each_audit_gets_its_own_clone(self):
-        # Five audits run from one cron file and their schedules collide. They
+        # Six audits run from one cron file and their schedules collide. They
         # used to share a directory, so whichever one reached `finish` first
-        # ran `checkout --force -B` over the other four's untracked manifests.
+        # ran `checkout --force -B` over the other five's untracked manifests.
         self.harness.replies = {"issue list": "[]"}
         self.run_main(["start", "--audit", AUDIT])
         mine = Path(json.loads(self.out)["workspace"])
@@ -4633,7 +4634,7 @@ class TestFailurePaths(HarnessTestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Credential redaction — the backstop the five SOPs promise
+# Credential redaction — the backstop the six SOPs promise
 # --------------------------------------------------------------------------- #
 
 

@@ -3,7 +3,8 @@
 audit_report.py — Deterministic reporting harness for the fleet-audit skill.
 
 Every autonomous audit watchdog (compliance, security patch, obtainability,
-cost, consistency drift) funnels its findings through this script. Each audit
+cost, consistency drift, AI workload security) funnels its findings through
+this script. Each audit
 stream owns exactly ONE open GitHub **issue** — its ledger — rewritten in place
 on every run and closed as completed when the fleet comes back clean. Fixes
 travel separately, as narrow remediation pull requests carrying only the files
@@ -89,7 +90,7 @@ class AuditSpec(NamedTuple):
 
 
 # The audit streams allowed to own a ledger. An id not listed here is rejected
-# before any git/gh call: a typo must not silently open a sixth ledger stream.
+# before any git/gh call: a typo must not silently open a seventh ledger stream.
 # The human names mirror the `name` of the matching watchdog in
 # agents/platform/cron/jobs.json — keep the two in step so the issue title and
 # the cron catalogue name the same thing.
@@ -190,6 +191,18 @@ AUDITS: dict[str, AuditSpec] = {
         # telling the admin to fix the cohort labelling.
         derived=("uncohorted",),
     ),
+    "ai-security-audit": AuditSpec(
+        "AI Workload Security Audit",
+        "ai_security_audit_sop.md",
+        (
+            "inference-endpoint-public",
+            "model-remote-code-trusted",
+            "weights-mount-writable",
+            "model-artifact-unpinned-source",
+            "model-credential-plaintext-env",
+            "model-image-floating-tag",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")
@@ -265,7 +278,7 @@ FINDING_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?\Z")
 # The id is *derived*, never model-written — see `derive_finding_id` for what
 # went wrong when it was prose. These three describe the derived shape.
 #
-# `<check>.<cluster>.<namespace>.<object>`, one grammar for all five streams.
+# `<check>.<cluster>.<namespace>.<object>`, one grammar for all six streams.
 # The per-SOP `wra-`/`spo-` prefixes it replaces carried no information the
 # ledger did not already have: an id never leaves the stream that minted it.
 ID_SEGMENTS = 4
@@ -544,7 +557,7 @@ def _redact_secret_blocks(text: str) -> str:
 def redact_secrets(text: str | None) -> str:
     """Strip high-confidence credential shapes out of model-authored text.
 
-    The five governance SOPs tell the model never to paste a Secret's `data:`,
+    The six governance SOPs tell the model never to paste a Secret's `data:`,
     a token, or a private key into evidence, and promise this backstop for when
     it does anyway. It is deliberately conservative: it fires on a *named* field,
     a self-identifying token prefix, or a PEM header — never on bare base64,
@@ -4563,7 +4576,7 @@ def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
 
     The lease is the audit id, which makes the path deterministic across the
     two invocations of a run: `start` and `finish` are separate processes and
-    must land in the same tree. It also gives each of the five streams a tree of
+    must land in the same tree. It also gives each of the six streams a tree of
     its own, so two whose schedules collide no longer interleave `checkout -B`,
     `add` and `push` in one working directory. `validate_audit_id` has already
     constrained the id to a closed enum, so it is a safe path segment by
