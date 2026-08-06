@@ -240,7 +240,7 @@ cap_guard \
   "reason under $(spellings MIN_NA_REASON_CHARS) characters" \
   "Documented not-applicable reason floor does not match MIN_NA_REASON_CHARS in ${AUDIT_SCRIPT}."
 
-# The check-command floor. The five SOPs and the skill write it "anything under
+# The check-command floor. The six SOPs and the skill write it "anything under
 # eight characters"; the ledger design writes it "shorter than eight
 # characters". Both spellings are in the probe so the ledger is covered too, and
 # the subject word keeps this distinct from the reason floor above, so the two
