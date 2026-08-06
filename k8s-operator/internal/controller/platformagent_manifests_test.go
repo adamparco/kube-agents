@@ -493,8 +493,8 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
 			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
 		}
-		if len(dashboardC.Env) != 3 {
-			t.Errorf("expected 3 env vars on dashboard container, got %d", len(dashboardC.Env))
+		if len(dashboardC.Env) != 4 {
+			t.Errorf("expected 4 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
 			dashboardEnvMap := make(map[string]corev1.EnvVar)
 			for _, env := range dashboardC.Env {
@@ -508,6 +508,14 @@ func TestBuildDeployment(t *testing.T) {
 			}
 			if dashboardEnvMap["SESSION_KV_DB_PATH"].Value != sessionKVDBPath {
 				t.Errorf("expected SESSION_KV_DB_PATH %s, got %s", sessionKVDBPath, dashboardEnvMap["SESSION_KV_DB_PATH"].Value)
+			}
+			// The dashboard has no `command:`, so it re-runs the image ENTRYPOINT
+			// against the same volume as the agent container. Without this the
+			// entrypoint treats it as a second primary: two session KV servers
+			// racing for :8699, and an OTel service-name stamp blanked by the
+			// container that has no OTEL_SERVICE_NAME.
+			if dashboardEnvMap["PLATFORM_AGENT_ROLE"].Value != "sidecar" {
+				t.Errorf("expected PLATFORM_AGENT_ROLE sidecar, got %q", dashboardEnvMap["PLATFORM_AGENT_ROLE"].Value)
 			}
 		}
 
@@ -2654,6 +2662,43 @@ func TestRenderConfigYAMLExcludesTargetedPlugins(t *testing.T) {
 	}
 	if got["stockout"] {
 		t.Errorf("plugin targeting 'platform' must not be enabled on the default profile, got %v", enabled)
+	}
+}
+
+// The default profile's plugins.enabled must name only plugins that are on disk for
+// THAT profile. Hermes resolves the list against the profile's own plugins/ directory,
+// so a name that is in the image but not in agents/chat/defaults/plugins (plus the
+// hermes_otel the Dockerfile installs into /opt/defaults) resolves to nothing.
+// incident_context is the specific one: it is a built-in — DefaultBuiltInPlugins exists
+// to stop an AgentPlugin shadowing it — but it is COPYed from agents/platform/plugins
+// and reaches the platform profile alone.
+func TestRenderConfigYAMLEnablesOnlyPluginsTheDefaultProfileHas(t *testing.T) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	section, _ := parsed["plugins"].(map[string]any)
+	enabled, _ := section["enabled"].([]any)
+	got := make([]string, 0, len(enabled))
+	for _, v := range enabled {
+		got = append(got, fmt.Sprint(v))
+	}
+	// Same list, same order, as agents/chat/config.yaml's plugins.enabled.
+	want := []string{
+		"hermes_otel",
+		"session_store",
+		"session_otel_bridge",
+		"tool_call_audit",
+		"bootstrap_onboarding",
+		"legacy_slash_commands",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("default profile plugins.enabled = %v, want %v", got, want)
+	}
+	// Guards the pair above from drifting back together: incident_context must stay in
+	// the shadow-protection roster even though it is not enabled here.
+	if !IsBuiltInPlugin("incident_context") {
+		t.Errorf("incident_context must remain a built-in so an AgentPlugin cannot shadow it")
 	}
 }
 

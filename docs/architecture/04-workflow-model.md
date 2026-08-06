@@ -208,17 +208,16 @@ polling to notice things. Proactivity is driven, in order of preference:
    bounds worst-case detection latency. It is the last resort, not the primary mechanism, because a poll
    lags a fast-moving problem and burns cycles when nothing changed.
 
-The Platform Agent already ships **11 governance jobs** (`agents/platform/cron/jobs.json`) mapped to SOPs
+The Platform Agent ships a roster of governance jobs (`agents/platform/cron/jobs.json`) mapped to SOPs
 in `agents/platform/governance/`; these are the cron (scheduled-push) tier, and reactive concerns should
-migrate to event triggers rather than new poll loops:
+migrate to event triggers rather than new poll loops. The current roster and its cadences are generated
+from that file onto [the cron-jobs reference page](../site/src/content/docs/reference/cron-jobs.md) —
+restating them here is how the count goes stale, which it had (this section claimed eleven jobs against
+a file holding seven).
 
-| Cadence      | Jobs (examples)                                                                        |
-| ------------ | -------------------------------------------------------------------------------------- |
-| Hourly       | Policy propagation, global capacity orchestration                                      |
-| Every 30 min | GitHub issue resolver                                                                  |
-| Daily        | Compliance audit, obtainability audit, AI workload security audit, blueprint sync      |
-| Weekly       | Security patch scan, cost analysis, fleet consistency drift, standardization validator |
-| Monthly      | Lifecycle / deprecation manager                                                        |
+Target cadence tiers, which the roster is expected to fill out: hourly for policy propagation and global
+capacity orchestration, every 30 minutes for issue triage, daily for the compliance and security audits,
+weekly for cost and consistency sweeps, and monthly for lifecycle/deprecation.
 
 The heartbeat pattern (`INSTALL.md §3`): read the relevant SOP → run due checks → update
 heartbeat state → if healthy respond `NO_REPLY`, else surface concise blockers. **Anything the
@@ -240,7 +239,7 @@ subsets:
 
 | Tier                           | Proactive jobs (scoped to its authority; event-triggered, cron, or heartbeat-swept)                                                                                                                      | Not run here (owned by a higher tier)                                                                                         |
 | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| **Platform** (fleet)           | All 11 governance jobs above                                                                                                                                                                             | —                                                                                                                             |
+| **Platform** (fleet)           | Every governance job above                                                                                                                                                                               | —                                                                                                                             |
 | **Cluster Admin** (cluster)    | Cluster capacity / node health; security patch scan (its cluster); compliance audit (cluster-policy conformance); standardization validator (config vs. blueprint); deploy/drift detection (its cluster) | Policy propagation, lifecycle/deprecation, blueprint sync (authoring), fleet cost, obtainability audit, GitHub issue resolver |
 | **Developer Team** (namespace) | Workload health / reliability; workload security posture; cost / right-sizing; drift detection — all **its namespace only**                                                                              | Everything cluster- and fleet-level                                                                                           |
 

@@ -176,13 +176,35 @@ func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMa
 	}
 }
 
-// DefaultBuiltInPlugins defines the built-in plugins pre-installed in the Hermes container image.
+// DefaultBuiltInPlugins defines the built-in plugins pre-installed in the Hermes container
+// image. This is the roster an AgentPlugin may not shadow (see IsBuiltInPlugin) — being in
+// the image anywhere is enough to make a same-named AgentPlugin a collision. It is NOT the
+// list to enable on a profile: `incident_context` is COPYed to /opt/hermes/plugins from
+// agents/platform/plugins and reaches the platform profile only.
 var DefaultBuiltInPlugins = []string{
 	"hermes_otel",
 	"session_store",
 	"session_otel_bridge",
 	"tool_call_audit",
 	"incident_context",
+	"bootstrap_onboarding",
+}
+
+// defaultProfilePlugins is what is actually installed under the DEFAULT profile's plugin
+// directory: agents/chat/defaults/plugins/ (bootstrap_onboarding, legacy_slash_commands,
+// session_otel_bridge, session_store, tool_call_audit) plus hermes_otel, which the
+// Dockerfile installs into /opt/defaults separately.
+//
+// Kept apart from DefaultBuiltInPlugins deliberately. Enabling a plugin that is not on
+// disk for the profile is not a no-op — Hermes resolves plugins.enabled against that
+// profile's plugins/ directory — and rendering `incident_context` here named one the Chat
+// Agent has never had. Keep in sync with agents/chat/config.yaml's plugins.enabled, which
+// is the same list built at image build time.
+var defaultProfilePlugins = []string{
+	"hermes_otel",
+	"session_store",
+	"session_otel_bridge",
+	"tool_call_audit",
 	"bootstrap_onboarding",
 }
 
@@ -504,6 +526,22 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
+// renderConfigYAML builds the default (Chat Agent) profile's config.yaml.
+//
+// KNOWN GAP — this output does not currently reach the agent. It is subPath-mounted over
+// $HOME/config.yaml by buildDefaultVolumeMounts, but deploy/shared/docker-entrypoint.sh
+// step 2a force-copies the image's agents/chat/config.yaml to that same path on every
+// start, and no other reader consumes it: profile_overlay.py matches `*.overlay.yaml`
+// only, and profile_overlay.valid_profile_name excludes the default profile outright.
+// Observed on a running pod — the live file was byte-identical to the image's, with 13
+// keys rendered here absent, including platforms.slack.enabled and approvals.cron_mode.
+//
+// Deliberately not "fixed" by letting the mount win: this rendering is a whole-file
+// REPLACEMENT and is not a superset of the image's config (it omits, for example,
+// platforms.google_chat.typing_status_text), so making it authoritative would silently
+// drop settings rather than add them. The shape that works is the one the named profiles
+// already use — emit a `profile-default.overlay.yaml` and let profile_overlay.py merge it
+// — which needs the default profile admitted to that path first.
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	cwd := defaultAgentHome
@@ -740,16 +778,18 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	// Default built-in plugins pre-installed in the Hermes container image, plus
-	// legacy_slash_commands. That one rides on the default profile because it hooks
-	// pre_gateway_dispatch on inbound chat messages so a typed "/hermes sethome" reaches
-	// the gateway command dispatcher instead of drawing an unknown-command reply — chat
-	// ingress lands here, not on the platform specialist. It is not in
-	// DefaultBuiltInPlugins because that list is also the roster an AgentPlugin may not
-	// shadow, and this plugin ships in agents/chat/defaults/plugins rather than the image.
-	// Keep in sync with agents/chat/config.yaml — this copy is authoritative on the
-	// deployed default profile.
-	cfg.Plugins.Enabled = append(slices.Clone(DefaultBuiltInPlugins), "legacy_slash_commands")
+	// The plugins installed under the default profile, plus legacy_slash_commands. That
+	// one rides on the default profile because it hooks pre_gateway_dispatch on inbound
+	// chat messages so a typed "/hermes sethome" reaches the gateway command dispatcher
+	// instead of drawing an unknown-command reply — chat ingress lands here, not on the
+	// platform specialist. It is not in defaultProfilePlugins because that list is
+	// ordered to mirror agents/chat/config.yaml, where it also comes last.
+	//
+	// Built from defaultProfilePlugins, NOT DefaultBuiltInPlugins: the latter is the
+	// image-wide roster an AgentPlugin may not shadow, and it includes incident_context,
+	// which ships to the platform profile alone. Rendering that name here enabled a
+	// plugin the Chat Agent does not have on disk.
+	cfg.Plugins.Enabled = append(slices.Clone(defaultProfilePlugins), "legacy_slash_commands")
 	cfg.Display.Platforms = map[string]map[string]any{}
 	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
 	// multiuser_memory provider replaces it and keys each user's notes off the
@@ -1935,6 +1975,18 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			{
 				Name:  "SESSION_KV_DB_PATH",
 				Value: sessionKVDBPath,
+			},
+			// This container carries no `command:`, so it inherits the image's
+			// ENTRYPOINT (deploy/shared/docker-entrypoint.sh) and runs the full
+			// bootstrap a second time, concurrently with the agent container and
+			// against the same ReadWriteOnce volume. The entrypoint serialises the
+			// shared-volume writes with a lock; this flag tells it which of the two
+			// owns the things a lock cannot share — the session KV server's fixed
+			// port, and the OTel service-name stamp, which this container would
+			// otherwise blank because it has no OTEL_SERVICE_NAME of its own.
+			{
+				Name:  "PLATFORM_AGENT_ROLE",
+				Value: "sidecar",
 			},
 		}
 

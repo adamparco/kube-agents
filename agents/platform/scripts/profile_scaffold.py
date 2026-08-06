@@ -295,7 +295,22 @@ def overlay_template(
             shutil.copy2(src, dest)
     _merge_after_overlay(home, template_dir, names, prior, cron_job_ids)
     if plugins_dir and plugins_dir.is_dir():
-        shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)
+        try:
+            shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)
+        except (shutil.Error, OSError) as exc:
+            # Reported, not raised, for the reason _merge_after_overlay gives.
+            # The plugins are observability parity — hermes_otel and friends —
+            # and they are the LAST thing this function does, but an exception
+            # here still leaves the caller's `|| echo WARN` as the only handler,
+            # and the entrypoint reads that as "the whole scaffold failed". It
+            # did not: the persona, config, skills, cron and governance above
+            # all landed. shutil.Error in particular is a *collection* of
+            # per-file failures that copytree accumulates and raises at the end,
+            # so the tree is as complete as it was going to get either way.
+            # The entrypoint re-runs this copy on every start, so a transient
+            # failure self-heals on the next boot.
+            log(f"WARN: could not overlay plugins into {home / 'plugins'}; "
+                f"this profile may be missing observability plugins ({exc})")
 
 
 def main() -> None:

@@ -21,6 +21,73 @@ if [ -f "/opt/hermes/docker/stage2-hook.sh" ]; then
     /opt/hermes/docker/stage2-hook.sh
 fi
 
+# Which container of the pod this is. The operator stamps PLATFORM_AGENT_ROLE
+# `sidecar` on platform-agent-dashboard and leaves it unset on the agent itself,
+# so an image running anywhere else — plain docker, the kustomize bases, a
+# cluster profile — is the primary by default and behaves exactly as before.
+#
+# This gates only what genuinely admits one owner per pod: the session KV server
+# (one process may hold :8699) and the OTel service-name stamp (the dashboard
+# carries no OTEL_SERVICE_NAME, so its run of step 4 DELETED the name the agent
+# had just written — the observed `resource_attributes: {}`). Shared-state
+# writes are serialised by the lock below instead, not skipped, so a sidecar
+# still leaves the volume usable on its own.
+if [ "$PLATFORM_AGENT_ROLE" = "sidecar" ]; then
+    IS_BOOTSTRAP_PRIMARY=0
+else
+    IS_BOOTSTRAP_PRIMARY=1
+fi
+
+# 1.5 Serialise everything below that writes to $TARGET_DIR.
+#
+# More than one container in this pod runs this entrypoint against the same
+# ReadWriteOnce volume. The operator gives platform-agent-dashboard `args`
+# ([hermes dashboard]) but no `command:`, so it inherits this ENTRYPOINT and
+# performs the identical bootstrap, concurrently, on the identical paths.
+#
+# Observed damage, not theoretical: both containers abort step 2.5 with
+# `shutil.Error` from the plugin copytree, each naming DIFFERENT files (one
+# `hermes_otel/website/README.md`, the other `hermes_otel/docker-compose/...`)
+# on the same boot — the signature of a write-write race rather than a
+# permission problem. Two concurrent overlays of cron/jobs.json can likewise
+# interleave a read-merge-write and lose one side's run history.
+#
+# Nothing downstream was corrupted only because the two partial copies happened
+# to union to a complete tree. That is luck: --plugins is passed in step 2.5
+# alone, which is gated on first scaffold, so a genuine gap would persist for
+# the life of the PVC.
+#
+# A lock rather than "only the primary bootstraps", deliberately: each container
+# still leaves the volume ready by itself, so there is no start-order dependency
+# and no wait-for-peer timeout to tune. The loser of the race runs second and
+# finds every step already idempotently satisfied. Steps that are singletons
+# rather than shared-state writes (the session KV server, the OTel service-name
+# stamp) are guarded by IS_BOOTSTRAP_PRIMARY instead — a lock cannot serialise a
+# port bind held for the container's lifetime.
+#
+# Absent flock, or an unwritable volume, this degrades to today's behaviour
+# rather than refusing to start.
+BOOTSTRAP_LOCK="$TARGET_DIR/.bootstrap.lock"
+BOOTSTRAP_LOCK_FD=""
+if command -v flock >/dev/null 2>&1; then
+    mkdir -p "$TARGET_DIR" 2>/dev/null || true
+    # `touch`, not `: >>"$LOCK"`. A redirection that fails on a POSIX *special*
+    # builtin — and `:` is one — exits a non-interactive shell outright, before
+    # the `2>/dev/null` on the same line is even installed. Under dash (Debian's
+    # /bin/sh) an unwritable $TARGET_DIR then killed the container at this line
+    # instead of falling through to the unlocked path. Proving writability with
+    # an external command first also makes the `exec` below safe, which would
+    # abort the shell the same way.
+    if touch "$BOOTSTRAP_LOCK" 2>/dev/null; then
+        exec 9>>"$BOOTSTRAP_LOCK"
+        BOOTSTRAP_LOCK_FD=9
+        # Bounded: a peer wedged mid-bootstrap must not hold this container at
+        # the starting line forever. Timing out and proceeding is the current
+        # behaviour, so the worst case is no worse than before the lock.
+        flock -w 300 9 || echo "WARN: timed out waiting for the $TARGET_DIR bootstrap lock; proceeding concurrently with the peer container" >&2
+    fi
+fi
+
 # 2. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)
 if [ -d "/opt/defaults" ]; then
     mkdir -p "$TARGET_DIR"
@@ -170,7 +237,15 @@ fi
 # take the new CAPABILITIES.md and none of what it describes. --items copies each
 # entry with copytree(dirs_exist_ok=True), which handles both. The profile already
 # exists here, so the scaffold's `hermes profile create` is a no-op and only the
-# overlay runs; --plugins is deliberately omitted (step 2.5 owns that).
+# overlay runs.
+#
+# --plugins is passed here as well as in step 2.5, for the reason this whole step
+# exists: 2.5 runs on first scaffold only, so a plugin the image adds or changes
+# after the PVC was created would otherwise never arrive, and a plugin copy that
+# failed part-way through would stay half-copied for the volume's lifetime. The
+# copy adds and overwrites without pruning, so plugin-owned runtime state on the
+# volume — hermes_otel's live.db and the rest — is not in the source tree and
+# survives. Targeted plugin volumes are linked in afterwards by step 2.65.
 #
 # cron/jobs.json is the one entry that is merged rather than replaced, inside
 # profile_scaffold.py. It is image-owned and runtime state in the same file: the
@@ -195,6 +270,7 @@ if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLA
         "$SCAFFOLD" \
         --name platform \
         --template "$PLATFORM_TEMPLATE" \
+        --plugins /opt/defaults/plugins \
         --items "config.yaml SOUL.md AGENTS.md CAPABILITIES.md cron skills governance" \
         >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
@@ -317,8 +393,17 @@ if [ -f "$TARGET_DIR/config.yaml" ] && [ -w "$TARGET_DIR/config.yaml" ]; then
 fi
 
 # 4. Inject dynamic OpenTelemetry service name (if writable)
+#
+# The write is the primary's alone. This file is shared through the PVC but the
+# value is per-container, and the sidecar's value is "none" — so letting the
+# sidecar run this turns the agent's service.name into an empty
+# resource_attributes map, which is what the deployed pod was observed doing.
+# The compat symlink below is per-container ($HOME differs) and must still run
+# in both.
 if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plugins/hermes_otel/config.yaml" ]; then
-    "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" 2>/dev/null || true
+    if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ]; then
+        "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" 2>/dev/null || true
+    fi
 
     # hermes-otel resolves config below ~/.hermes even when HERMES_HOME points
     # elsewhere. Expose the generated config at both locations.
@@ -330,9 +415,23 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     fi
 fi
 
+# Everything that writes shared volume state is done; release the bootstrap lock
+# before starting anything long-lived, so a peer container is not blocked behind
+# this one for the life of the pod. Closing the fd releases it too, but do both
+# explicitly — the fd is inherited across the `exec` in step 6 otherwise.
+if [ -n "$BOOTSTRAP_LOCK_FD" ]; then
+    flock -u 9 2>/dev/null || true
+    exec 9>&-
+fi
+
 # 5. Start background microservices (FastAPI proxy)
+#
+# Primary only: this binds a fixed port in the pod's shared network namespace,
+# and the sidecar's copy lost the race with `[Errno 98] address already in use`
+# every boot while both wrote the same log file, interleaved. The port is what
+# both containers reach it on, so one server serves the pod.
 mkdir -p "$TARGET_DIR/logs"
-if [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
     echo "Starting Session KV server on port 8699..."
     PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 0.0.0.0 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
 fi
