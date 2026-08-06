@@ -54,25 +54,29 @@ prettier-write:
 # a local run needs them on the path too.
 #
 # The wildcards are what keep this honest: a new skill's tests are picked up
-# without editing this file. Five globs rather than one because the tests do
+# without editing this file. Six globs rather than one because the tests do
 # not all live under skills -- the agent scripts the skills share, the Chat
-# Agent plugins, the image patches and the repository's own tooling in
-# scripts/ each hold their own. That last one is here because it was not: the
-# tests for the upstream-skill sync sat in scripts/ outside every glob, so
-# they had never once run in CI. Discovery is then run once per directory
-# rather than once over the tree, because none of them are packages --
-# `unittest discover` pointed at agents/platform/skills finds nothing and
-# still exits 0, which reads as a passing suite.
+# Agent plugins, the image patches, the image build itself and the
+# repository's own tooling in scripts/ each hold their own. scripts/ is here
+# because it was not: the tests for the upstream-skill sync sat outside every
+# glob, so they had never once run in CI. Discovery is then run once per
+# directory rather than once over the tree, because none of them are packages
+# -- `unittest discover` pointed at agents/platform/skills finds nothing and
+# still exits 0, which reads as a passing suite. That also keeps
+# deploy/docker and deploy/docker/patches separate, which they must be: the
+# patch tests import their subject by bare module name, which only resolves
+# with their own directory as the discovery root.
 PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard agents/*/skills/*/scripts/test_*.py) \
 	$(wildcard agents/*/scripts/test_*.py) \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
+	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard scripts/test_*.py)))
 
 test-python:
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
-		echo "Error: no test_*.py files found under agents/, deploy/docker/patches or scripts/."; \
+		echo "Error: no test_*.py files found under agents/, deploy/docker or scripts/."; \
 		echo "Either the tests moved or the globs are stale -- failing rather than reporting success."; \
 		exit 1; \
 	fi

@@ -305,13 +305,40 @@ fi
 # 5.5. The default kubectl context is NOT established here. `gcloud` in this
 # container is the credential-proxy shim, so get-credentials would execute in
 # the sidecar and write the sidecar's kubeconfig, not ours — and it is rejected
-# outright, because this script runs from a working directory outside
-# CREDENTIAL_PROXY_WORKSPACE_ROOT. The sidecar bootstraps its own context from
+# outright, because the steps above run from a working directory outside
+# CREDENTIAL_PROXY_WORKSPACE_ROOT (step 6 moves into it, but only for the agent
+# process it execs). The sidecar bootstraps its own context from
 # CREDENTIAL_PROXY_BOOTSTRAP_COMMAND (see buildCredentialProxyEnv in the
 # operator), which runs inside the workspace root before the proxy serves any
 # request. The event-watcher does not need a copy either: it reads
 # /var/run/event-watcher/watcher.config and falls back to its in-cluster config
 # when that file is absent, which it always is.
 
-# 6. Execute primary process
+# 6. Execute primary process from inside the shared workspace.
+#
+# The image inherits WORKDIR /opt/hermes from the upstream base, and every
+# credentialed CLI in this container (kubectl, gcloud, gh, git) is a PATH shim
+# for credential_proxy_client.py. That client posts `"cwd": os.getcwd()` on
+# every request unconditionally, and the proxy refuses any cwd outside
+# CREDENTIAL_PROXY_WORKSPACE_ROOT — which the operator sets to this same
+# $TARGET_DIR. Launched from /opt/hermes, therefore, a plain `kubectl version
+# --client` fails with "working directory is outside the shared workspace"
+# before it runs, purely because of where the process was started.
+#
+# The cwd is the only lever that reaches every caller. Hermes resolves the
+# terminal and execute_code working directories from a ladder that ends at
+# os.getcwd(), and for the `local` backend the CLI *overwrites* any configured
+# terminal.cwd with os.getcwd() outright ("Local backend: always os.getcwd().
+# Use `cd /dir && hermes` to control it."), so a config key cannot fix this —
+# and kanban workers, which the dispatcher spawns as child processes, inherit
+# whatever cwd the agent was started with.
+#
+# Guarded rather than unconditional: `set -e` would abort the container on a
+# missing directory, and a shell whose cd fails silently continues in the old
+# one. $TARGET_DIR is created in step 2 and written throughout, so the warning
+# is a canary for a broken mount rather than an expected path.
+if ! cd "$TARGET_DIR"; then
+    echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (kubectl/gcloud/gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+fi
+
 exec "$@"
