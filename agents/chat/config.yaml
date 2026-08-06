@@ -9,10 +9,19 @@
 # from shared defaults. The whole point of the Chat Agent is a minimal, low-
 # privilege front door, so its config must be self-contained.
 #
-# NOTE: This file mirrors what the operator renders into the platform-agent-config
-# ConfigMap (k8s-operator renderConfigYAML), which is mounted over
-# /opt/data/config.yaml and is the AUTHORITATIVE config at runtime. Keep the two
-# in sync; the operator's version wins on the deployed default profile.
+# NOTE: THIS file is what the deployed default profile runs. The operator renders
+# its own copy into the platform-agent-config ConfigMap (k8s-operator
+# renderConfigYAML) and subPath-mounts it over /opt/data/config.yaml, but that
+# mount does not survive: docker-entrypoint.sh step 2a force-copies this file to
+# the same path on every start, and nothing else reads the ConfigMap's config.yaml
+# (profile_overlay.py matches only `*.overlay.yaml`, and it skips the default
+# profile by design — see valid_profile_name). Verified on a running pod: the live
+# file is byte-identical to this one and 13 operator-rendered keys are absent.
+#
+# So keep the two in sync in the direction that matters — a setting only the
+# operator renders will NOT reach the agent. Which of the two should own this
+# path is an open design question, not a settled one; see the notes in
+# renderConfigYAML.
 #
 # TOOL LOCKDOWN — the Chat Agent's job is to analyze a message, choose the best
 # specialist, delegate, and proxy the chat session. It has NO runtime tools of its

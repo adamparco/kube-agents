@@ -25,15 +25,12 @@ model:
 # platform_mcp_server.py and session_kv_server.py import helpers from it — so
 # only the tool surface is gone.
 mcp_servers:
-  # Remote MCP endpoints, proxied over stdio by mcp-remote. Both carry an
-  # explicit timeout because the unset default is 300s and these calls can fail
-  # in a way that never returns: when the remote answers non-2xx, mcp-remote
-  # logs the transport rejection and drops the request id instead of replying,
-  # so the client waits out its full deadline. Task t_b9544b00 spent 300.0s that
-  # way on a single list_clusters, and a sibling tool call in the same batch sat
-  # finished and unused for the duration. deploy/docker/Dockerfile patches the
-  # proxy to answer instead of hanging; this bounds the damage if that patch
-  # ever stops applying. Healthy calls to these endpoints measure 0.47-0.48s.
+  # Remote MCP endpoints, proxied over stdio by mcp-remote. The explicit
+  # timeouts are a backstop: unpatched, mcp-remote drops the request id when the
+  # remote answers non-2xx, so the client parks for the whole 300s default.
+  # deploy/docker/patches/apply_mcp_remote_forward_errors.py fixes that at build
+  # time and carries the full analysis; this bounds the damage if it ever stops
+  # applying. Healthy calls to these endpoints measure 0.47-0.48s.
   developer_knowledge:
     command: "node"
     args:
