@@ -127,6 +127,12 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "disabled_toolsets:") {
 		t.Errorf("expected default profile to disable runtime toolsets, got:\n%s", yamlContent)
 	}
+	// This rendered file is mounted over whatever the image shipped, so the
+	// matching key in agents/chat/config.yaml is not enough on its own — the
+	// value has to survive the render or the probe comes back on in the cluster.
+	if !strings.Contains(yamlContent, "environment_probe: false") {
+		t.Errorf("expected the Python-toolchain probe pinned off, got:\n%s", yamlContent)
+	}
 	// The front door must NOT hold privileged/runtime tools — those live in the
 	// separate platform/cluster profiles, not the default (chat) profile.
 	for _, forbidden := range []string{"platform_control", "agent_common", "hermes-api-server", "hermes-cli"} {

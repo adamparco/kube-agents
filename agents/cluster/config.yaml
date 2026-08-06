@@ -63,3 +63,10 @@ web:
 plugins:
   enabled:
     - hermes_otel
+
+# This template is copied verbatim into /opt/cluster-template rather than merged
+# with deploy/shared/defaults/config.yaml, so the probe has to be turned off
+# again here. Rationale lives in that file; in short, it spawns four interpreters
+# to publish a Python-toolchain line that is factually wrong on this image.
+agent:
+  environment_probe: false

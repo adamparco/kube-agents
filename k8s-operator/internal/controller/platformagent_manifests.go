@@ -539,6 +539,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			// omitted unless spec.harness.tuning.default sets it, so the front
 			// door keeps the upstream default it has never needed more than.
 			MaxTurns int `json:"max_turns,omitempty"`
+			// Hermes' Python-toolchain probe, which this deployment always wants
+			// off — see the rationale in deploy/shared/defaults/config.yaml. No
+			// omitempty: upstream defaults the key to true, so `false` has to be
+			// written out to mean anything.
+			EnvironmentProbe bool `json:"environment_probe"`
 		} `json:"agent,omitempty"`
 		Kanban struct {
 			DispatchInGateway       bool `json:"dispatch_in_gateway"`
@@ -713,6 +718,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		"session_search", "project", "homeassistant", "discord",
 		"discord_admin", "spotify",
 	}
+	// Explicit rather than relying on the zero value: this is a deliberate
+	// override of an upstream default that is true, not an unset field.
+	cfg.Agent.EnvironmentProbe = false
+
 	// Execution limits are NOT pinned here: Hermes' own defaults apply unless a
 	// deployment opts in. What a given fleet needs depends on its model quota and on
 	// what its agents actually do, so the values belong in the CR rather than baked

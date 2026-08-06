@@ -40,6 +40,27 @@ platform_toolsets:
     - mcp-developer_knowledge
     - mcp-gke
 
+# Turn off Hermes' Python-toolchain probe. It is both wrong here and expensive.
+#
+# Wrong: on the common path it publishes "Python toolchain: python3=missing,
+# pip=missing, uv=installed." into the system prompt while python3 is present at
+# 3.13.5 — observed verbatim in 20 live platform sessions. Even when it reports
+# accurately it is telling an agent in an immutable sandbox about a pip it must
+# never use and a venv it must never create.
+#
+# Expensive: the probe spawns four Python interpreters per session to discover
+# that fixed state, and agent/system_prompt.py blocks the prompt build on the
+# result for up to 10s. Under gVisor, where a bare interpreter start measures
+# ~1s, that is the single largest avoidable item on the cold-start path, and
+# kanban pays it again for every card.
+#
+# agent/agent_init.py reads this key (default True) and agent/system_prompt.py
+# gates the prompt line on it. Set on every profile that ships a config: this
+# file feeds only the platform template, because the Chat Agent and Cluster
+# Agent configs are copied verbatim rather than merged (see deploy/docker/Dockerfile).
+agent:
+  environment_probe: false
+
 # Approval settings. Allow dangerous commands to execute autonomously in cron watchdogs.
 approvals:
   cron_mode: approve

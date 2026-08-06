@@ -131,6 +131,11 @@ kanban:
 # the front door cannot touch the system. Everything except the delegation
 # surface (mcp-router + kanban) is off.
 agent:
+  # This file overwrites /opt/defaults/config.yaml rather than merging with
+  # deploy/shared/defaults/config.yaml, so the probe has to be turned off again
+  # here. Rationale lives in that file; in short, it spawns four interpreters to
+  # publish a Python-toolchain line that is factually wrong on this image.
+  environment_probe: false
   disabled_toolsets:
     - terminal # shell / gcloud / kubectl / command execution + process mgmt
     - file # read_file / write_file / patch / search_files
