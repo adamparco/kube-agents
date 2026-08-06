@@ -143,15 +143,34 @@ exit(1) if not check_kanban_worker_mode() else None" && \
 
 # 3. Clone and build mcp-remote proxy. Git is a build-only dependency here;
 # the sandbox runtime exposes only the credential-proxy Git wrapper.
+#
+# The source is a fork, and deliberately so: it is the only build that speaks
+# Google ADC. Its commits ahead of upstream add `google-auth-library`, mint a
+# fresh bearer token per call (handling expiry), and attach the
+# `X-Goog-User-Project` header. Upstream geelen/mcp-remote has none of that, so
+# switching the clone URL to the official repository would break every GKE and
+# developer_knowledge MCP call. Do not "clean this up" without replacing the
+# auth path first.
+#
+# The SDK is pinned explicitly because the git SHA alone does not pin it. The
+# fork commits only a `pnpm-lock.yaml`, which `npm install` ignores, and
+# declares `^1.23.0`; with tsup's `external: []` the SDK is bundled into the
+# shipped chunk. Without this line the transport baked into the image is
+# whatever was latest on build day, so two builds of this same Dockerfile can
+# ship different error semantics (1.24.0 changed the thrown class).
+COPY deploy/docker/patches/apply_mcp_remote_forward_errors.py /tmp/apply_mcp_remote_forward_errors.py
 RUN apt-get update && apt-get install -y --no-install-recommends git && \
     git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
     cd /opt/mcp-remote && \
     git checkout 2ff8f16753d8c744e6982b99e6ed5ab62f44f311 && \
+    npm pkg set devDependencies.@modelcontextprotocol/sdk=1.30.0 && \
     npm install && \
+    /opt/hermes/.venv/bin/python3 /tmp/apply_mcp_remote_forward_errors.py /opt/mcp-remote && \
     npm run build && \
+    grep -q 'Failed to forward message to remote server' dist/*.js && \
     npm prune --production && \
     npm cache clean --force && \
-    rm -rf .git
+    rm -rf .git /tmp/apply_mcp_remote_forward_errors.py
 
 # 5. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults

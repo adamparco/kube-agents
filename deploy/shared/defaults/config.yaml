@@ -11,16 +11,29 @@ mcp_servers:
     command: "/opt/hermes/.venv/bin/python3"
     args:
       - "/opt/data/scripts/agent_common_server.py"
+  # Remote MCP endpoints, proxied over stdio by mcp-remote. Both carry an
+  # explicit timeout because the unset default is 300s and these calls can fail
+  # in a way that never returns: when the remote answers non-2xx, mcp-remote
+  # logs the transport rejection and drops the request id instead of replying,
+  # so the client waits out its full deadline. Task t_b9544b00 spent 300.0s that
+  # way on a single list_clusters, and a sibling tool call in the same batch sat
+  # finished and unused for the duration. deploy/docker/Dockerfile patches the
+  # proxy to answer instead of hanging; this bounds the damage if that patch
+  # ever stops applying. Healthy calls to these endpoints measure 0.47-0.48s.
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://developerknowledge.googleapis.com/mcp"
+    connect_timeout: 30
+    timeout: 60
   gke:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://container.googleapis.com/mcp"
+    connect_timeout: 30
+    timeout: 60
 
 # Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
 # platform_toolsets is a reserved framework key in Hermes. Other reserved top-level keys

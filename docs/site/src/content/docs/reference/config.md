@@ -28,11 +28,15 @@ mcp_servers:
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
+  # Bounded deliberately: a remote MCP call that fails can hang for the full
+  # default deadline. See the comment in the source file for the mechanism.
   gke:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://container.googleapis.com/mcp"
+    connect_timeout: 30
+    timeout: 60
 
 platform_toolsets:
   cli:
@@ -81,7 +85,7 @@ MCP servers Hermes starts and connects to.
 - **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles session state and agent-internal ops (chat ingress lives with the Chat Agent). Env vars are injected from the pod's environment (Kubernetes DNS variables, Hermes home, Chat Pub/Sub config, API server key).
 - **`gke`** — Remote GKE MCP server proxied via `mcp-remote`. All Kubernetes/GKE reads and writes route through this endpoint.
 
-`connect_timeout: 120` allows for cold-start latency; `timeout: 300` accommodates long reasoning chains.
+The two servers are timed out differently on purpose. `platform_control` gets `connect_timeout: 120` for cold-start latency and `timeout: 300` for long reasoning chains — it is a local subprocess, so a slow call is a slow call. `gke` gets `connect_timeout: 30` / `timeout: 60` because it is a remote endpoint reached through `mcp-remote`, where a failed call can consume the whole deadline without ever returning; the rationale is recorded in full alongside the block in [`agents/platform/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/config.yaml). Healthy calls to it measure under a second.
 
 ### `platform_toolsets`
 
