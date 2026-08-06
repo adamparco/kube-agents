@@ -57,6 +57,48 @@ if [ -d "/opt/defaults/scripts" ]; then
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
 fi
 
+# The image's own copy of the scaffolder, never the volume's. Step 2 seeds
+# $TARGET_DIR/scripts with `cp -u`, which SKIPS any file the PVC holds a newer
+# mtime for — the same trap step 2a exists to work around for config.yaml. This
+# is the one script in the pod whose job is to make the volume track the image,
+# so it is the one script that must not be read back off the volume: last
+# release's scaffolder running this release's template is how a partial upgrade
+# looks like a successful one. (Step 2b force-syncs the rest of the scripts for
+# the same reason; this one cannot wait for that to have worked.)
+SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
+
+# 2c. Merge the image's default-profile cron roster into the volume's.
+#
+# Step 2's `cp -ru` cannot do this and never could: the scheduler rewrites
+# $TARGET_DIR/cron/jobs.json on every tick, so the volume's copy is always newer
+# than the image's and the update-only copy always skips it. On a fresh PVC the
+# roster lands with everything else and the gap is invisible; on every existing
+# PVC a newly shipped job simply never arrives. That is how `profile-cron-tick`
+# — the job that ticks every OTHER profile's cron store — would have shipped to
+# nobody.
+#
+# Same merge, same reasons, as the platform profile's roster in step 2.6: the
+# file is image-owned definitions and live scheduler state at once, so the image
+# wins every key it ships and the volume keeps every key it does not (see
+# merge_cron_store). `--home` overlays the default profile in place, because that
+# profile IS $TARGET_DIR and has no entry under profiles/ to name.
+#
+# `--cron-jobs` names the one id this merge may force, and that restriction is
+# load-bearing: two of the jobs in this roster DELETE THEMSELVES. Once the
+# onboarding report is delivered, bootstrap_delivery.py calls remove_job on the
+# scan/delivery pair, and an unfiltered merge would put both back on the next
+# restart — polling once a minute forever to no-op on a marker. Add an id here
+# only when the image genuinely owns that job's definition on a live volume.
+if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
+    HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$SCAFFOLD" \
+        --home "$TARGET_DIR" \
+        --template /opt/defaults \
+        --items "cron" \
+        --cron-jobs "profile-cron-tick" \
+        >/dev/null || echo "WARN: default-profile cron merge failed; jobs added by this image will not run" >&2
+fi
+
 # 2.5 Scaffold the Platform Agent specialist profile (idempotent).
 # The `default` profile is the front-door Chat Agent (synced above). Today's
 # Platform Agent runs as a separate named `platform` profile so the Chat Agent
@@ -71,15 +113,6 @@ fi
 # gate is the belt to that pair of braces: on a PVC already carrying such a directory,
 # the scaffold now still runs instead of being skipped forever.
 PLATFORM_TEMPLATE="/opt/platform-template"
-# The image's own copy of the scaffolder, never the volume's. Step 2 seeds
-# $TARGET_DIR/scripts with `cp -u`, which SKIPS any file the PVC holds a newer
-# mtime for — the same trap step 2a exists to work around for config.yaml. This
-# is the one script in the pod whose job is to make the volume track the image,
-# so it is the one script that must not be read back off the volume: last
-# release's scaffolder running this release's template is how a partial upgrade
-# looks like a successful one. (Step 2b force-syncs the rest of the scripts for
-# the same reason; this one cannot wait for that to have worked.)
-SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 if [ -d "$PLATFORM_TEMPLATE" ] && [ ! -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -f "$SCAFFOLD" ]; then
     PLATFORM_DESC="Platform Agent: fleet-wide GKE architecture, cluster lifecycle/provisioning, multi-tenancy, and the GitOps write path (Pull Requests). Owns per-cluster agent lifecycle."
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \

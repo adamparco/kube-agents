@@ -4,8 +4,10 @@ This document describes the first-time onboarding and GKE environment-discovery 
 
 **The flow lives on the `default` (Chat Agent) profile.** That placement is forced by two constraints introduced with the profile split:
 
-- Only the `default` profile's cron ticks. A job placed on the `platform` profile never fires at all — silently, with `enabled: true` and `last_run: None` forever.
+- Every marker that makes onboarding once-only — `.bootstrap_scan_filed`, `.bootstrap_completed`, `INVENTORY.md` — lives in the Chat Agent's home, and a job on another profile would gate itself on a different directory.
 - The Chat Agent's toolsets are stripped to `mcp-router` + `kanban` (no terminal, gcloud, or kubectl), so it cannot perform the sweep itself.
+
+A third constraint used to be the decisive one: only the `default` profile's cron ticked at all, so a job on `platform` stayed `enabled: true` with `last_run: None` forever. That is fixed — `profile_cron_tick.py` ticks every named profile's store — but the two above still hold.
 
 The sweep is therefore **delegated to the `platform` specialist as a kanban task**, while every piece of onboarding state stays in the Chat Agent's home (`/opt/data`) so both halves read the same files.
 
@@ -162,7 +164,7 @@ When changing onboarding instructions, scripts, or the plugin under `agents/chat
 ### 0. Keep the whole flow on the `default` (Chat Agent) profile
 
 - **Rule:** Do not relocate any part of this flow to `agents/platform/`.
-- **Why:** Only the default profile's cron ticks. A job moved to the platform profile is disabled _silently_ — it stays `enabled: true` with `last_run: None` forever, with no error anywhere. If a step needs privileged tools, delegate it as a kanban task to `platform` (as the scan does) instead of moving the job.
+- **Why:** Onboarding's state lives in the Chat Agent's home. A job moved to the platform profile would gate itself on that profile's `HERMES_HOME` instead, so `.bootstrap_scan_filed` would stop being the marker the delivery job and the greeting hook read — and the sweep would re-file, or be delivered twice. (Cron on a named profile does fire now, via `profile_cron_tick.py`; it did not before, and that used to be the reason for this rule.) If a step needs privileged tools, delegate it as a kanban task to `platform` (as the scan does) instead of moving the job.
 - **Corollary:** Any file the two halves share must be an absolute path under `/opt/data`. A `platform` worker's `HERMES_HOME` is its own profile home, so a relative path silently lands somewhere the delivery job will never look.
 
 ### 1. Keep discovery and delivery in separate jobs (avoids a scheduler race)

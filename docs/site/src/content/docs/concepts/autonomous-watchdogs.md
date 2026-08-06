@@ -9,7 +9,7 @@ sidebar:
 
 Watchdog runs execute autonomously: the agent config sets `approvals.cron_mode: approve` (see `deploy/shared/defaults/config.yaml`), so commands that would otherwise require human approval run without prompting when triggered by a scheduled job.
 
-Full JSON is annotated on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/), along with the Chat Agent profile's separate job file of `no_agent` script jobs (Cluster Agent reconciliation and first-run onboarding).
+Full JSON is annotated on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/), along with the Chat Agent profile's separate job file of `no_agent` script jobs (the named-profile cron ticker described in [What fires the schedule](#what-fires-the-schedule), Cluster Agent reconciliation, and first-run onboarding).
 
 ## The shipping jobs
 
@@ -40,6 +40,23 @@ Five watchdogs — `blueprint-sync`, `policy-propagation`, `global-capacity-orch
 Their SOPs are retained under `agents/platform/governance/`, so reviving one is a matter of rewriting the SOP against something a stock install actually has and re-adding the job — see [Adding a watchdog](#adding-a-watchdog). Re-adding the entry alone will not help; the SOP is why they were retired.
 
 On a cluster provisioned before they were dropped, the five entries remain on the volume's `cron/jobs.json` in the disabled state that release left them in — see [Disabling a watchdog](#disabling-a-watchdog) for why. They stay off; the image simply no longer has a say.
+
+## What fires the schedule
+
+Hermes' cron ticker is a thread inside `hermes gateway run`, and everything it touches — the job store, the execution ledger, the tick lock — resolves from that process's `HERMES_HOME`. It never enumerates profiles. This image runs a single gateway, homed at `/opt/data`, so the only roster that thread ticks is the Chat Agent's. The Platform Agent's lives at `/opt/data/profiles/platform/cron/jobs.json`, which the thread never opens.
+
+`profile-cron-tick` is what ticks it. It is a `no_agent` script job on the Chat Agent's roster — the one store that does tick — and each minute it runs `hermes cron tick` as a subprocess against every named profile with work due:
+
+```text
+gateway ticker              →  profile-cron-tick  →  hermes cron tick
+(HERMES_HOME=/opt/data)        (every 1m)            (HERMES_HOME=<profile>)
+```
+
+A watchdog therefore fires through the same execute → deliver → record path a manual `hermes cron tick` takes, with its own profile's persona, toolsets, and `max_turns`. Three consequences worth knowing:
+
+- **One minute is the granularity.** A named profile's schedule is only ever inspected as often as the dispatcher runs, so a cadence finer than `* * * * *` cannot be honoured there. This is well below the sweet spot in [Adding a watchdog](#adding-a-watchdog) and does not constrain the shipping roster.
+- **Overlap and backlog are `tick()`'s problem, not the dispatcher's.** A tick takes an exclusive lock on the profile's store and holds it for the whole run, so a second dispatch returns immediately rather than firing a job twice; and each due job's `next_run_at` is advanced under that lock before the job executes, so an agent down for two days runs each missed daily audit once on return, not once per missed day.
+- **A broken ticker is loud.** Dispatches are silent on a quiet minute, but a tick that fails is recorded as a failed `profile-cron-tick` run with the subprocess output in `<profile-home>/cron/tick.log` — the one failure mode this job must not have is the silence it exists to end. Individual watchdog runs stay where every other run is: the profile's own execution ledger, and `cronjob(action='history')`.
 
 ## Job shape
 
