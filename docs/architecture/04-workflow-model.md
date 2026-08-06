@@ -212,13 +212,13 @@ The Platform Agent already ships **11 governance jobs** (`agents/platform/cron/j
 in `agents/platform/governance/`; these are the cron (scheduled-push) tier, and reactive concerns should
 migrate to event triggers rather than new poll loops:
 
-| Cadence      | Jobs (examples)                                                         |
-| ------------ | ----------------------------------------------------------------------- |
-| Hourly       | Policy propagation, global capacity orchestration                       |
-| Every 30 min | GitHub issue resolver                                                   |
-| Daily        | Blueprint sync, cost analysis, security patch scan, obtainability audit |
-| Weekly       | Compliance audit, standardization validator                             |
-| Monthly      | Lifecycle / deprecation manager                                         |
+| Cadence      | Jobs (examples)                                                                        |
+| ------------ | -------------------------------------------------------------------------------------- |
+| Hourly       | Policy propagation, global capacity orchestration                                      |
+| Every 30 min | GitHub issue resolver                                                                  |
+| Daily        | Compliance audit, obtainability audit, AI workload security audit, blueprint sync      |
+| Weekly       | Security patch scan, cost analysis, fleet consistency drift, standardization validator |
+| Monthly      | Lifecycle / deprecation manager                                                        |
 
 The heartbeat pattern (`INSTALL.md §3`): read the relevant SOP → run due checks → update
 heartbeat state → if healthy respond `NO_REPLY`, else surface concise blockers. **Anything the

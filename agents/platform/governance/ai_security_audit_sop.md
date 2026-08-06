@@ -22,7 +22,7 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
 
 - `workspace` is the GitOps clone `start` made for you. The audit pod does not begin life inside a checkout, so this is the only tree that exists, and every `remediation.path` in Step 4 is resolved against it — a manifest written elsewhere is one the harness cannot find.
 - `issue` is this stream's open ledger issue, or `null` when it has none. Either way you never create it — `finish` owns that.
-- `pending_remediation_requests` lists finding ids a repo writer asked for with a `/remediate` comment on the ledger. Write a manifest for each one while you inspect (Step 4), or the promotion fails for want of a file. Each comment is answered once and only once — an acknowledgement listing every target and its outcome, or a single refusal with the reason (no write access, an id absent from the current document, a target that is not a `manifest`, or a command not written at the start of its own line and so never parsed as one) — with a hidden marker keeping yesterday's request from being answered again today. `/remediate all` is accepted too, and expands against this run's manifest findings.
+- `pending_remediation_requests` lists finding ids a repo writer asked for with a `/remediate` comment on the ledger. Write a manifest for each one while you inspect (Step 4), or the promotion fails for want of a file. Each comment is answered once and only once — an acknowledgement listing every target and its outcome, a refusal naming the reason, or both when one comment mixes valid and invalid targets (the reasons the harness emits are: the commenter is not recorded as a collaborator, reported as the `authorAssociation` it saw rather than as a write-access check it never makes; an id absent from the current document; a target that is not a `manifest`; a bare `/remediate` naming nothing; a `/remediate all` that matched nothing promotable; and a command not written at the start of its own line and so never parsed as one) — with a hidden marker keeping yesterday's request from being answered again today. `/remediate all` is accepted too, and expands against this run's manifest findings.
 - `start` creates and resets no branch. There is no report branch.
 
 The helper owns every `git`/`gh` operation and renders the ledger issue body and every remediation PR body — **never hand-write an issue or PR body, never run `git commit`, `git push`, `gh issue create`, `gh pr create`, or `gh issue comment` yourself.**
@@ -41,13 +41,13 @@ gcloud container clusters list --format=json
   ```json
   {
     "check": "model-image-floating-tag",
-    "command": "kubectl --context prod-usc1 get deploy,sts,ds -A -o json | jq -r '.items[].spec.template.spec.containers[].image'"
+    "command": "kubectl --context gke_<project>_<location>_<cluster> get deploy,sts,ds,cronjob,pod -A -o json"
   }
   ```
 
-  `check` is the backticked slug from the §3 heading that defines it — `inference-endpoint-public`, `weights-mount-writable`, and so on — never the section number and never prose. (`start` prints the full roster of six; the SOP still says what each check _is_.) `command` is the literal invocation you issued on that cluster for that check, with its `--context` and the namespace or resource it targeted. It must name one of `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`; `echo`, `cat`, `python3 -c`, and a call back into `audit_report.py` are all rejected, as is anything under eight characters.
+  `check` is the backticked slug from the §3 heading that defines it — `inference-endpoint-public`, `weights-mount-writable`, and so on — never the section number and never prose. (`start` prints the full roster of six; the SOP still says what each check _is_.) `command` is the literal invocation you issued on that cluster for that check, with its `--context` and the namespace or resource it targeted. It must name one of `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl` — that is the harness's allowlist, not this stream's roster: `curl` has no legitimate use here, because §1 restricts this audit's data sources to `kubectl` and `gcloud` and the Red Lines forbid any request to a model endpoint. `echo`, `cat`, `python3 -c`, and a call back into `audit_report.py` are all rejected, as is anything under eight characters.
 
-  **Keep this command short — under 120 characters.** The ledger renders `checks_run` as a table and the harness clips every cell at 120 characters, so a 700-character `jq` program publishes as an unreadable stub and the coverage table stops being re-runnable, which is the only thing it is for. Give the _collection_ command here — the `kubectl get … -o json` that produced the dump this check read, with its `--context` — and put the full expanded filter in the finding's `evidence.command`, which is allowed 2,000 characters. The two fields answer different questions: `checks_run[].command` proves the check ran against that cluster, `evidence.command` proves the individual finding.
+  **Keep this command short — under 120 characters.** The ledger renders `checks_run` as a table and the harness clips every cell at 120 characters, so a 700-character `jq` program publishes as an unreadable stub and the coverage table stops being re-runnable, which is the only thing it is for. Give the _collection_ command here — the `kubectl get … -o json` that produced the dump this check read, with its `--context`, and never the `cat` of the dump that `$WL` expands to, which the validator rejects as a command that inspected nothing — and put the object-scoped confirm read from §2 in the finding's `evidence.command`, which is allowed 2,000 characters. The two fields answer different questions: `checks_run[].command` proves the check ran against that cluster, `evidence.command` proves the individual finding.
 
   The validator rejects an unknown slug, a duplicate, a missing or unusable command, the field being absent, and an empty list unless that cluster's `limitations` says why nothing ran: a cluster you could read but ran nothing against is not a clean cluster, it is an audit that did not happen. Anything short of the checks that apply to that cluster makes the run **partial** exactly as a `limitations` note does, so the ledger stays open and nothing is announced as resolved. Append the entry when its check completes, not when you intend to run it.
 
@@ -56,13 +56,13 @@ gcloud container clusters list --format=json
   ```json
   {
     "check": "inference-endpoint-public",
-    "reason": "This cluster runs no AI workloads; the §2 discriminator matched no Deployment, StatefulSet, DaemonSet, CronJob, or standalone Pod."
+    "reason": "Illustrative only — no §3 check on this stream is ruled out by a cluster's shape; read the next two bullets before you use this field."
   }
   ```
 
   Same slugs as `checks_run`, and the `reason` must say why the check _cannot_ apply here — "N/A" and "not applicable" are rejected; name the property of the cluster that rules it out. Those checks leave the denominator instead of counting as missing, so the cluster reads as complete rather than forever-incomplete, and the ledger can eventually close.
 
-- **A cluster with no AI workloads is the common case, and it is not a gap.** Most clusters in a fleet run none. When the §2 discriminator matches nothing on a cluster, put **all six** checks in that cluster's `checks_not_applicable` with the reason above, leave `checks_run` empty, and do **not** write a `limitations` note. This is the single most important instruction in this section: a `limitations` string would mark the run `partial`, and on a fleet where nine of ten clusters serve no models the daily stream would be pinned at `partial: true` forever — `resolved: 0`, no stale remediation PR ever retired, the ledger never able to close. The cluster was fully audited. The answer was "there is nothing here to audit", and `checks_not_applicable` is the field that says so without lying about coverage.
+- **A cluster with no AI workloads is the common case, and it is still a fully audited cluster.** Most clusters in a fleet run none. The six checks still _ran_ there: you took the §2 dump and every filter returned nothing. So record **all six** in that cluster's `checks_run` against that cluster's collection command, leave `checks_not_applicable` empty, and do **not** write a `limitations` note. This is the single most important instruction in this section, and the harness enforces half of it: the validator rejects an empty `checks_run` on a cluster you could read, whatever `checks_not_applicable` says, so a document written the other way publishes nothing at all. The other half is yours: a `limitations` string would mark the run `partial`, and on a fleet where nine of ten clusters serve no models the daily stream would be pinned at `partial: true` forever — `resolved: 0`, no stale remediation PR ever retired, the ledger never able to close. "Six checks ran and matched nothing" is the honest record of a cluster that runs no models.
 - **Autopilot changes nothing here.** Every §3 check reads a workload spec, and Autopilot admits all six shapes. Do not put anything in `checks_not_applicable` on account of Autopilot.
 - **One question decides the scope list.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; name any check that could have run there and did not in that cluster's `limitations`, and any check its shape rules out in `checks_not_applicable`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator enforces both halves.
 - A cluster you cannot read goes in `scope.skipped` with a literal reason: `"status=STOPPING"`, `"get-credentials failed: <stderr first line>"`, `"timeout after 30s"`. A skipped cluster is never silently dropped.
@@ -85,20 +85,20 @@ KUBECONFIG=$KC kubectl get svc -A -o json > /opt/data/scratch/ai_svc_<cluster>.j
 
 `job` is deliberately excluded while `cronjob` is included: a CronJob-generated Job carries a random name suffix, so a finding on one is announced as fixed and re-announced as new on the next run, and the daily delta this ledger exists to produce becomes noise. Audit the CronJob, which is what a human edits.
 
-Shared setup, evaluated once per cluster. `$PRE` applies the universal suppressions, normalises every workload to `{kind, ns, name, lbl, spec}`, and then keeps only the AI workloads — so each check below is `$WL | jq -r --arg sys "$SYS" --arg mdl "$MDL" "$PRE"'| <filter>'`.
+Shared setup, evaluated once per cluster. `$WL` reads the dump you just took rather than re-querying, which is what keeps every check below pinned to the cluster whose credentials Step 1 fetched: a bare `kubectl` here carries no `KUBECONFIG=$KC` and would answer from whatever context the pod's default kubeconfig points at, reporting one cluster's contents under another cluster's name. `$PRE` applies the universal suppressions, normalises every workload to `{kind, ns, name, lbl, spec}`, and then keeps only the AI workloads — so each check below is `$WL | jq -r --arg sys "$SYS" --arg mdl "$MDL" "$PRE"'| <filter>'`.
 
 ```bash
 SYS='^(kube-system|kube-public|kube-node-lease|gke-.*|gmp-system|gmp-public|gke-gmp-system|gke-managed-.*|cnrm-system|configconnector-operator-system|krmapihosting-system|istio-system|asm-system|anthos-identity-service|config-management-.*|gatekeeper-system|composer-system)$'
 MDL='(^|/)(vllm|sglang|text-generation-inference|tgi|tritonserver|torchserve|tensorflow-serving|kserve|ollama|ray|llama|mlserver|seldon|lorax|aibrix)([-:@/]|$)'
-WL='kubectl get deploy,sts,ds,cronjob,pod -A -o json'
+WL='cat /opt/data/scratch/ai_wl_<cluster>.json'
 PRE='.items[]
  | select((.metadata.namespace|test($sys)|not)
       and (.kind!="Pod" or ((.metadata.ownerReferences//[])|length)==0)
       and (((.metadata.labels//{})["addonmanager.kubernetes.io/mode"] // (.metadata.annotations//{})["components.gke.io/component-name"])==null))
  | {kind, ns:.metadata.namespace, name:.metadata.name,
-    lbl:(.spec.template.metadata.labels // .metadata.labels // {}),
+    lbl:(.spec.template.metadata.labels // .spec.jobTemplate.spec.template.metadata.labels // .metadata.labels // {}),
     spec:(.spec.template.spec // .spec.jobTemplate.spec.template.spec // .spec)}
- | select(([(.spec.containers//[])[].image] | any(test($mdl)))
+ | select(([(.spec.containers//[])[].image // ""] | any(test($mdl)))
        or ([(.spec.containers//[])[] | (.resources.limits//{}) | keys[]]
              | any(test("nvidia\\.com/gpu|cloud\\.google\\.com/tpu"))))'
 ```
@@ -111,7 +111,7 @@ PRE='.items[]
 
 Read workload **templates** (`spec.template.spec`), not live Pods. Templates are what an admin edits, and they are unaffected by admission-time defaulting.
 
-**Evidence discipline.** The dump is the _detector_; a live single-object read is the _confirmer_. For every candidate finding, run the object-scoped command below, capture a trimmed excerpt, and store that exact string in `evidence.command`, with `$WL`, `$SYS`, `$MDL` and `$PRE` **expanded** so a human can paste it unchanged — a published command containing an unset shell variable is not re-runnable, which defeats the point of publishing it. If the confirm command fails or the condition no longer holds, **drop the finding — do not soften it.**
+**Evidence discipline.** The dump is the _detector_; a live single-object read is the _confirmer_. For every candidate finding, run the object-scoped command below, capture a trimmed excerpt, and store that exact string in `evidence.command`, with `<kind>`, `<ns>` and `<name>` filled in and every shell variable **expanded** so a human can paste it unchanged — a published command containing an unset shell variable is not re-runnable, which defeats the point of publishing it. If the confirm command fails or the condition no longer holds, **drop the finding — do not soften it.** And **check `jq`'s exit status on every filter**: a non-zero exit is an aborted program, not an empty result, and because `jq` streams it aborts partway through — record it in that cluster's `limitations` and never read it as a clean cluster.
 
 ```bash
 KUBECONFIG=$KC kubectl get <kind> -n <ns> <name> -o yaml
@@ -131,7 +131,7 @@ Identity is only as stable as those four fields, so **never** let a timestamp, i
 
 ```bash
 AI=$($WL | jq -c --arg sys "$SYS" --arg mdl "$MDL" "[$PRE"' | {ns, lbl}]')
-kubectl get svc -A -o json | jq -r --argjson ai "$AI" '.items[]
+cat /opt/data/scratch/ai_svc_<cluster>.json | jq -r --argjson ai "$AI" '.items[]
  | select(.spec.type=="LoadBalancer"
       and ((.metadata.annotations//{})["networking.gke.io/load-balancer-type"]//"") != "Internal"
       and (((.spec.selector//{})|length) > 0))
@@ -153,14 +153,14 @@ kubectl get svc -A -o json | jq -r --argjson ai "$AI" '.items[]
 
 ```bash
 $WL | jq -r --arg sys "$SYS" --arg mdl "$MDL" "$PRE"'
- | . as $w | (.spec.containers//[])[]
+ | . as $w | (.spec.containers//[]) + (.spec.initContainers//[]) | .[]
  | select(([(.args//[]),(.command//[])] | flatten | any(test("trust[-_]remote[-_]code")))
        or ([(.env//[])[] | select(.name|test("TRUST_REMOTE_CODE";"i")) | (.value//"")]
              | any(test("^(1|true|yes)$";"i"))))
  | "\($w.ns)/\($w.kind)/\($w.name) \(.name)"'
 ```
 
-- **Flag when:** an AI workload's container passes `--trust-remote-code` (or `--trust_remote_code`) in `args`/`command`, or sets `TRUST_REMOTE_CODE` to a truthy value in `env`.
+- **Flag when:** an AI workload's container or init container passes `--trust-remote-code` (or `--trust_remote_code`) in `args`/`command`, or sets `TRUST_REMOTE_CODE` to a truthy value in `env`. Init containers count because a weights-fetch step that trusts remote code executes it with the same ServiceAccount and writes into the same volume the server then loads.
 - **Do NOT flag:** standard exclusions; the flag present but explicitly disabled (`TRUST_REMOTE_CODE=false`, `--trust-remote-code=false`); a workload that does not match the §2 discriminator.
 - **Severity:** `critical`. This is not a hardening nicety. The flag instructs the loader to execute Python that ships _inside the model repository_, at start-up, with the serving container's identity — its ServiceAccount token, its Workload Identity binding, its network position, and its mounted weights. It converts "we pulled a model" into "we ran that publisher's code", and combined with 3.4 (unpinned source) it converts it into "we run whatever that publisher pushes next".
 - **Impact:** "The model loader executes arbitrary code shipped inside the model repository, with this pod's ServiceAccount, network access, and mounted volumes. A compromised or swapped model artifact is remote code execution in this namespace."
@@ -178,7 +178,7 @@ $WL | jq -r --arg sys "$SYS" --arg mdl "$MDL" "$PRE"'
  | ($vols[] | select(.name == $m.name)) as $v
  | select(($v.csi != null and ($v.csi.readOnly//false) == false)
        or ($v.persistentVolumeClaim != null and ($v.persistentVolumeClaim.readOnly//false) == false))
- | "\($w.ns)/\($w.kind)/\($w.name) \(.name) \($m.mountPath)"'
+ | "\($w.ns)/\($w.kind)/\($w.name) \($c.name) \($m.name) \($m.mountPath)"'
 ```
 
 - **Flag when:** a container in an AI workload mounts a CSI volume or a PersistentVolumeClaim read-write — neither the `volumeMount` nor the volume itself sets `readOnly: true`.
@@ -196,13 +196,13 @@ $WL | jq -r --arg sys "$SYS" --arg mdl "$MDL" "$PRE"'
  | . as $c
  | ([(.args//[]),(.command//[])] | flatten) as $a
  | ([(.env//[])[] | (.value//"")]) as $e
- | select((($a + $e) | any(test("^http://|[^s]://.*\\.(bin|safetensors|gguf|pt|tar\\.gz)$")))
+ | select((($a + $e) | any(test("(^|=)(http|ftp)://")))
        or (($a | any(test("^--model(-id)?$"))) and ($a | any(test("^--revision$")) | not)))
  | "\($w.ns)/\($w.kind)/\($w.name) \(.name)"'
 ```
 
-- **Flag when:** an AI workload's container or init container either (a) names a model artifact over plaintext `http://`, or names one at a URL ending in a weights extension (`.bin`, `.safetensors`, `.gguf`, `.pt`, `.tar.gz`) over a non-TLS scheme; or (b) passes `--model` / `--model-id` without a companion `--revision`, which resolves the repository's moving default branch at every pod start.
-- **Do NOT flag:** standard exclusions; a `--model` argument accompanied by `--revision`; a model path that is a local filesystem path already populated by an image layer or a read-only volume (there is no fetch, so there is no source to pin); `https://` URLs to a pinned object; a Cloud Storage URI (`gs://`) — object versioning and bucket IAM are the control there and this audit cannot read either, so reporting it would be a guess.
+- **Flag when:** an AI workload's container or init container either (a) names a model artifact over a plaintext `http://` or `ftp://` URL — as a bare argument, as `--flag=<url>`, or as an environment-variable value; or (b) passes `--model` / `--model-id` without a companion `--revision`, which resolves the repository's moving default branch at every pod start.
+- **Do NOT flag:** standard exclusions; a `--model` argument accompanied by `--revision`; a model path that is a local filesystem path already populated by an image layer or a read-only volume (there is no fetch, so there is no source to pin); `https://` URLs to a pinned object; an object-store URI (`gs://`, `s3://`) — object versioning and bucket IAM are the control there and this audit cannot read either, so reporting it would be a guess.
 - **Severity:** `major`. On its own it is a supply-chain exposure rather than a live compromise. **Escalate to `critical` in `impact` and severity when the same container is also flagged by 3.2** — an unpinned source plus trusted remote code means the publisher can push new code into your cluster at the next pod restart, with no change to any manifest and nothing for a reviewer to see. Say so explicitly in the `impact` when both hold, and cross-reference the 3.2 finding.
 - **Impact:** "The model artifact this container loads is not pinned: the bytes that arrive at the next pod restart are whatever the source serves then. Nothing in the manifest records which model is actually running."
 - **Remediation:** `kind: manual`. The correct revision is a fact about the model the owner chose, and this audit cannot read it — inventing a commit SHA or picking the current `main` would pin the workload to whatever happens to be live at 08:50 today, which is not a security improvement, it is a silent version change. Put the exact argument to add in `recommendation.action` (`--revision <sha>`, with the sha to be read from the model repository) and name the `https://` replacement for any `http://` URL.
@@ -214,8 +214,8 @@ $WL | jq -r --arg sys "$SYS" --arg mdl "$MDL" "$PRE"'
  | . as $w | (.spec.containers//[]) + (.spec.initContainers//[]) | .[]
  | . as $c | (.env//[])[]
  | select((.value//"") != "" and (.valueFrom == null)
-      and (.name | test("HF_TOKEN|HUGGING_?FACE.*TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|WANDB_API_KEY|(MODEL|REGISTRY|INFERENCE).*(TOKEN|KEY|SECRET|PASSWORD)";"i")))
- | "\($w.ns)/\($w.kind)/\($w.name) \(.name) \(.name)"'
+      and (.name | test("HF_[A-Z_]*TOKEN|HUGGING_?FACE.*TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|WANDB_API_KEY|(MODEL|REGISTRY|INFERENCE).*(TOKEN|KEY|SECRET|PASSWORD)";"i")))
+ | "\($w.ns)/\($w.kind)/\($w.name) \($c.name) \(.name)"'
 ```
 
 - **Flag when:** an AI workload's container declares an environment variable whose **name** matches a model-registry or model-API credential pattern and which carries a literal `value:` rather than a `valueFrom.secretKeyRef`.
@@ -229,23 +229,23 @@ $WL | jq -r --arg sys "$SYS" --arg mdl "$MDL" "$PRE"'
 
 ```bash
 $WL | jq -r --arg sys "$SYS" --arg mdl "$MDL" "$PRE"'
- | . as $w | (.spec.containers//[])[]
- | select((.image|test("@sha256:")|not)
-      and ((.image|test(":(latest|main|master|dev|nightly|stable)$")) or (.image|test(":")|not)))
- | "\($w.ns)/\($w.kind)/\($w.name) \(.image)"'
+ | . as $w | (.spec.containers//[])[] | (.image//"") as $img
+ | select($img != "" and ($img|test("@sha256:")|not)
+      and (($img|test(":(latest|main|master|dev|nightly|stable)$")) or ($img|test(":[^/]*$")|not)))
+ | "\($w.ns)/\($w.kind)/\($w.name) \($img)"'
 ```
 
 - **Flag when:** an AI workload's container image carries no digest and either ends in a mutable tag (`:latest`, `:main`, `:master`, `:dev`, `:nightly`, `:stable`) or has no tag at all.
 - **Do NOT flag:** standard exclusions; any image pinned by digest (`@sha256:…`), whatever tag it also carries; a version-like tag (`:24.05-py3`, `:v0.6.2`) — conventionally immutable, and treating every tag as floating would flag most of the fleet and make the check worthless.
 - **Severity:** `minor`. Nothing is currently wrong; the workload is simply not reproducible, and the next pod restart may serve a different inference runtime than the one that was reviewed.
 - **Impact:** "The inference runtime this workload runs is not reproducible: a restart can pull a different image than the one running now, with no manifest change to review."
-- **Remediation:** `kind: manifest` (subject to §4's declaration rule) **only when the digest can be read from the live cluster** — take it from the Pod's `status.containerStatuses[].imageID`, which records the digest actually pulled, and rewrite the declaration to `<repo>@sha256:<digest>`. That is a fact read off the running object, not an invented value. If no Pod is running, or `imageID` carries no digest, the finding is `kind: manual` naming the digest the owner must resolve. **Never guess a digest and never substitute a tag you did not read from the cluster.**
+- **Remediation:** `kind: manifest` (subject to §4's declaration rule) **only when the digest can be read from the live cluster** — take it from a live Pod of that workload — `kubectl get pod -n <ns> -l <the workload's pod labels> -o jsonpath='{.items[0].status.containerStatuses[*].imageID}'`, the one read in this audit that goes to a Pod rather than a template, and only ever to copy a digest the cluster has already resolved — and rewrite the declaration to `<repo>@sha256:<digest>`. That is a fact read off the running object, not an invented value. If no Pod is running, or `imageID` carries no digest, the finding is `kind: manual` naming the digest the owner must resolve. **Never guess a digest and never substitute a tag you did not read from the cluster.**
 
 **Dropped deliberately.** Prompt-injection and jailbreak resistance, output filtering, model licence compliance, training-data provenance, GPU driver CVEs, and inference-latency anomalies are all real AI-security concerns and none of them are decidable from a `kubectl` read; a check that guessed would publish an unfalsifiable finding. Model Armor and Cloud Armor coverage are deliberately out of scope: verifying either requires API calls this SOP's data-source rule forbids, and the obvious `gcloud` probe for Model Armor mutates the caller's gcloud configuration, which an unattended daily job must never do. Accelerator cost and idle GPU capacity belong to the Fleet Waste Audit; privileged containers, host namespaces, RBAC, and NetworkPolicy on AI workloads belong to the Security & RBAC Posture Audit, which already audits them there.
 
 ### 4. Generate remediation artifacts
 
-- **The declaration rule decides where the file goes, and every branch of it discovers a directory that is already there.** All three of this audit's manifest remediations (3.2, 3.3, 3.6) _change an object that already exists_, so each must go to that object's **existing declaration in the GitOps repo**: locate it (`grep -rl "name: <object>" --include='*.yaml' .`), give that file's repo-relative path as `remediation.path`, and rewrite it as the object's complete desired manifest. Never emit a patch fragment. A file carrying `metadata.name` and a partial `spec` is not valid `kubectl apply` input, and a second file claiming an object the repo already declares is a duplicate resource id that both Config Sync and Argo reject.
+- **The declaration rule decides where the file goes, and every branch of it discovers a directory that is already there.** All three of this audit's manifest remediations (3.2, 3.3, 3.6) _change an object that already exists_, so each must go to that object's **existing declaration in the GitOps repo**: locate it (`grep -rl "name: <workload-name>" --include='*.yaml' .` — the bare object name, not the `Kind/name` form the `object` field carries), give that file's repo-relative path as `remediation.path`, and rewrite it as the object's complete desired manifest. Never emit a patch fragment. A file carrying `metadata.name` and a partial `spec` is not valid `kubectl apply` input, and a second file claiming an object the repo already declares is a duplicate resource id that both Config Sync and Argo reject.
 - **Narrow by namespace first** (`grep -rl "namespace: <namespace>" --include='*.yaml' .`), then **open the hits and confirm one actually declares that workload on the target cluster.** Do not anchor on `grep "name: <workload>"` alone — `grep` is kind-blind and unanchored, so it also matches `app.kubernetes.io/name:` label lines and any object whose name merely starts with the workload's, and it will happily return a file under another cluster's directory. **If the hits land in more than one directory, or none can be tied to the target cluster, the finding is `kind: manual`.**
 - **This audit's workloads are the ones most likely to be Helm-templated, and a templated workload has no declaration to rewrite.** An inference stack installed from a chart appears in the clone as `values.yaml` plus a chart reference, or does not appear at all. Neither is a manifest this audit can rewrite: editing a rendered template is meaningless because the next render overwrites it, and editing `values.yaml` means guessing at a chart's parameter names. **When the workload's declaration is a Helm chart or is absent, the finding is `kind: manual`** — put the exact change in `recommendation.action`, naming the field as it appears in the live object, and say in the recommendation that the change has to be made wherever the chart's values are maintained. Do not write a file. This is expected to be the common outcome on this stream, and a `manual` finding with a precise action is a good finding; a manifest written into a path nothing applies is a fix that merges, closes the finding for one run, and leaves the model exactly as exposed as it was.
 - **Never create a new top-level directory, and never write to a path whose parent directory does not already exist in the clone.**
@@ -258,9 +258,9 @@ $WL | jq -r --arg sys "$SYS" --arg mdl "$MDL" "$PRE"'
 
 ### 5. Emit findings.json
 
-Write the schema exactly as the helper validates it to the `findings_path` returned in Step 0: `audit` set to `ai-security-audit`; `scope.clusters` non-empty, each entry carrying the mandatory `checks_run` list of `{check, command}` objects for the §3 checks that actually ran there, optionally `checks_not_applicable`, and optionally a non-empty `limitations` string; `scope.skipped` complete and disjoint from `scope.clusters`; and, for each finding, `check` (the §3 slug that produced it), `severity`, `title`, `cluster`, `namespace`, `object` (as `Kind/name`), `evidence.command` (the literal confirm command you ran, variables expanded) and `evidence.excerpt` (trimmed to the few lines that prove the finding, and never carrying a credential), `impact`, `recommendation`, and `remediation` — with `remediation.path` present and the file on disk whenever `kind == "manifest"`. No `id`: the harness derives it (§2) from `check`, `cluster`, `namespace` and `object`. Sort findings by severity (`critical`, `major`, `minor`), then cluster, then namespace. A schema violation publishes nothing: `finish` exits 2 and the ledger is untouched. Validate your own JSON before calling it.
+Write the schema exactly as the helper validates it to the `findings_path` returned in Step 0: `audit` set to `ai-security-audit`; a top-level `findings` array, required even when empty (`[]` on a clean run); `scope.clusters` non-empty, each entry carrying the mandatory `checks_run` list of `{check, command}` objects for the §3 checks that actually ran there, optionally `checks_not_applicable`, and optionally a non-empty `limitations` string; `scope.skipped` complete and disjoint from `scope.clusters`; and, for each finding, `check` (the §3 slug that produced it), `severity`, `title`, `cluster`, `namespace`, `object` (as `Kind/name`), `evidence.command` (the literal confirm command you ran, variables expanded) and `evidence.excerpt` (trimmed to the few lines that prove the finding, and never carrying a credential), `impact`, `recommendation`, and `remediation` — with `remediation.path` present and the file on disk whenever `kind == "manifest"`. No `id`: the harness derives it (§2) from `check`, `cluster`, `namespace` and `object`. Sort findings by severity (`critical`, `major`, `minor`), then cluster, then namespace. A schema violation publishes nothing: `finish` exits 2 and the ledger is untouched. Validate your own JSON before calling it.
 
-Read your `checks_run` and `checks_not_applicable` lists once more before you write. Padding `checks_run` to six because §3 lists six checks is the one entry in this document that converts a partial audit back into a false all-clear — the harness cannot see the check you skipped, so it takes the list at its word. `checks_not_applicable` is the same lie wearing a different field: it removes checks from the denominator, so a slug parked there because you ran out of turns is a coverage gap the ledger will never show. It is published too — every exclusion and its reason render under _Not applicable_, where a reviewer who knows the cluster can call it. On this stream the honest and common answer is six-of-six not applicable because the cluster runs no models; the dishonest one is six-of-six run on a cluster you never dumped.
+Read your `checks_run` and `checks_not_applicable` lists once more before you write. Padding `checks_run` to six because §3 lists six checks is the one entry in this document that converts a partial audit back into a false all-clear — the harness cannot see the check you skipped, so it takes the list at its word. `checks_not_applicable` is the same lie wearing a different field: it removes checks from the denominator, so a slug parked there because you ran out of turns is a coverage gap the ledger will never show. It is published too — every exclusion and its reason render under _Not applicable_, where a reviewer who knows the cluster can call it. On this stream the honest and common answer is six-of-six run against a dump that held no AI workload; the dishonest one is six-of-six run on a cluster you never dumped.
 
 **`recommendation` is required on every finding.** Three sub-fields, all non-empty strings, no exceptions — a `manual` finding that will never become a PR needs it exactly as much as a promotable one. Most of this stream's findings are `manual`, so this field is where most of its value lives.
 
@@ -287,7 +287,7 @@ Worked example, for a 3.2 finding on `serving/vllm-llama`:
 
 One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`. Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
 
-`partial` is `true` when the run could not read the whole fleet: any cluster in `scope.skipped`, or any cluster kept in scope with a `limitations` note. `coverage_gaps` names each one in a sentence. The harness then refuses to draw conclusions from silence: `resolved` comes back `0`, no resolved-delta is posted, no remediation PR is retired as stale, and the ledger issue stays open even at zero findings. A check declared in `checks_not_applicable` is not a gap and does not raise the flag — which is exactly why a model-free cluster belongs there and not in `limitations`.
+`partial` is `true` when the run could not read the whole fleet: any cluster in `scope.skipped`, or any cluster kept in scope with a `limitations` note. `coverage_gaps` names each one in a sentence. The harness then refuses to draw conclusions from silence: `resolved` comes back `0`, no resolved-delta is posted, no remediation PR is retired as stale, and the ledger issue stays open even at zero findings. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; a model-free cluster needs neither field, because its six checks ran and matched nothing.
 
 **`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
 
