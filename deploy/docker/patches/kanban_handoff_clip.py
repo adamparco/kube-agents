@@ -19,14 +19,28 @@ Two things go wrong with that, and both were observed in production on
 2. **Everything after the first line is discarded**, so a worker that writes a
    perfectly good multi-line summary sees all but its opening line vanish.
 
-``clip_handoff`` fixes both: it keeps the whole summary up to a much larger
-budget and, when it must clip, clips on a whitespace boundary so the text
-always ends at a whole token. A URL therefore either survives intact or is
-dropped entirely — it is never truncated into a dead link.
+``clip_handoff`` raises the budget well past anything the notifier is handed
+and, if it ever does have to clip, clips on a whitespace boundary so the text
+ends at a whole token — a URL survives intact or is dropped entirely, never
+truncated into a dead link.
 
-Delivery-side length is not a concern here: the notifier calls
-``adapter.send()`` directly rather than going through ``gateway/delivery.py``,
-and the Slack adapter declares ``splits_long_messages`` and chunks internally.
+What this patch does **not** reach, and what the numbers above are easy to
+misread as: the notifier is not the first thing to cut the summary.
+``hermes_cli/kanban_db.py`` stores the completion event as
+``summary.strip().splitlines()[0][:400]``, and ``ev.payload["summary"]`` is all
+the notifier ever reads. So by the time ``clip_handoff`` sees the text it is
+already one line of at most 400 characters and the 1200-character budget never
+binds — the real effect of this patch is that all 400 of those characters now
+survive instead of 200. The upstream 400-character cut is still a hard slice
+that can sever a URL; a summary has to carry its link inside that budget, which
+is what ``agents/platform/SOUL.md`` §0 tells the Platform Agent. The
+``task.result`` slice is patched for symmetry only: ``ev_summary`` falls back to
+``result``, so ``payload_summary`` is truthy whenever a result exists and the
+``elif`` branch is unreachable in practice.
+
+A deliverable therefore cannot travel in ``summary`` at all. It travels in
+``result``, which ``gateway/kanban_result_delivery.py`` posts as a follow-up
+message.
 """
 
 from __future__ import annotations

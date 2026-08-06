@@ -127,6 +127,29 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_report_back_completion.py /opt/herm
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_report_back_completion.py && \
     rm /tmp/apply_report_back_completion.py /tmp/verify_report_back_completion.py
 
+# Hotfix: put a completed card's answer in front of the person who asked for
+# it. The gate above makes the answer durable on the card; it does not make it
+# arrive. The notifier builds the completion line from the run's `summary` and
+# reads `task.result` only for legacy rows with no summary at all, so a worker
+# doing what the gate now demands — status line in `summary`, deliverable in
+# `result` — sends a message announcing a manifest it never shows. Two anchored
+# edits post the result as a follow-up, ahead of the artifact upload, skipping
+# it when the line just sent already carried the same text.
+# verify_kanban_result_delivery.py then imports the patched notifier — a
+# circular import here would pass every static check and take the gateway down
+# at boot — and asserts the call site reads `handoff`, a loop local that no
+# anchor and no parse can prove is in scope.
+# See the module docstring in deploy/docker/patches/kanban_result_delivery.py.
+COPY deploy/docker/patches/kanban_result_delivery.py /opt/hermes/gateway/kanban_result_delivery.py
+COPY deploy/docker/patches/apply_kanban_result_delivery.py /tmp/apply_kanban_result_delivery.py
+COPY deploy/docker/patches/verify_kanban_result_delivery.py /tmp/verify_kanban_result_delivery.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_result_delivery.py /opt/hermes && \
+    grep -q "from gateway.kanban_result_delivery import" /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q "await _deliver_kanban_result(" /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q "delivered=handoff," /opt/hermes/gateway/kanban_watchers.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_result_delivery.py && \
+    rm /tmp/apply_kanban_result_delivery.py /tmp/verify_kanban_result_delivery.py
+
 
 # 3. Clone and build mcp-remote proxy. Git is a build-only dependency here;
 # the sandbox runtime exposes only the credential-proxy Git wrapper.

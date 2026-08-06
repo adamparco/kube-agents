@@ -287,6 +287,37 @@ class TriggersTest(unittest.TestCase):
                     )
                 )
 
+    def test_an_adjective_before_an_ordinary_noun_promises_nothing(self):
+        # The "full|complete|detailed …" arm takes no verb and no article, so
+        # it reads plain English as a promise unless its noun set is narrow.
+        # Every phrase here closed a card before the noun groups were split.
+        for phrase in (
+            "Scaled the prod node pool from 3 to 8. Full details are in the change ticket.",
+            "Rolled out the complete plan to all three clusters.",
+            "Reconciled drift. Complete results verified against the blueprint.",
+            "Patched 4 clusters. Detailed findings were walked through with the on-call SRE.",
+            "Applied the fix and confirmed the full metrics recovered.",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertFalse(promises_deliverable(phrase, ""))
+                self.assertIsNone(
+                    report_back_violation(
+                        title="Scale the prod node pool",
+                        body="Bump prod-us-east1 from 3 to 8 nodes.",
+                        summary=phrase,
+                    )
+                )
+
+    def test_an_adjective_before_a_report_noun_still_promises(self):
+        # …and narrowing the set must not switch the arm off entirely.
+        for phrase in (
+            "Compiled a full inventory of every enabled job.",
+            "Attached the complete audit for all three clusters.",
+            "Wrote up a detailed breakdown of the cost drivers.",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(promises_deliverable(phrase, ""))
+
 
 class SatisfiedElsewhereTest(unittest.TestCase):
     """Content the card already holds makes the gate unnecessary."""

@@ -112,15 +112,28 @@ _IGNORED_METADATA_KEYS = STAMPED_METADATA_KEYS | PROCESS_METADATA_KEYS
 
 # --- did the card ask for information back? ---------------------------------
 
-#: Nouns that name a deliverable. Used on both sides: a card asking for one is
-#: asking for a report, and a handoff claiming to have supplied one has to have
-#: supplied it somewhere.
+#: Nouns that can name a deliverable, wide. Safe only behind an explicit verb —
+#: "provide a …", "provided the …" — where the sentence has already said the
+#: thing was asked for or handed over. Used on the ask side and on the
+#: ``provide(d) a …`` arms, never bare.
 _DELIVERABLE_NOUN = r"""
     (?: list | report | manifest | breakdown | inventory | catalog(?:ue)?
       | audit | summary | mapping | analysis | rundown | table | overview
       | comparison | plan | postmortem | figures | numbers | metrics
       | totals? | counts? | details | results | findings | answers?
       | recommendations? | estimate )
+"""
+
+#: The same idea, narrow: nouns that are a report and almost nothing else.
+#: This is the set for the bare ``full|complete|detailed … <noun>`` arm, which
+#: needs no verb and no article and so reads ordinary English as a promise.
+#: With the wide group there, "Scaled the pool from 3 to 8. Full details are in
+#: the change ticket." blocked an action card that had asked for nothing — the
+#: false positive the ``provided a …`` narrowing three lines down exists to
+#: prevent, reintroduced on twenty-seven nouns instead of one.
+_REPORT_NOUN = r"""
+    (?: list | report | manifest | breakdown | inventory | catalog(?:ue)?
+      | audit | summary | mapping | analysis | rundown )
 """
 
 # Matched against title + body. Deliberately broad: on its own this predicate
@@ -171,9 +184,9 @@ _PROMISES_DELIVERABLE = re.compile(
     | \bbelow\s+(?:is|are)\b
     | \bthe\s+following\b
     | \bas\s+follows\b
-    | \b(?:full|complete|detailed|comprehensive|itemi[sz]ed)\s+<NOUN>\b
+    | \b(?:full|complete|detailed|comprehensive|itemi[sz]ed)\s+<REPORT>\b
     | \bsee\s+attached\b
-    """.replace("<NOUN>", _DELIVERABLE_NOUN),
+    """.replace("<NOUN>", _DELIVERABLE_NOUN).replace("<REPORT>", _REPORT_NOUN),
     re.IGNORECASE | re.VERBOSE,
 )
 
