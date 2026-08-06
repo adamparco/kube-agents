@@ -34,6 +34,19 @@ spec:
       apiServerSecretRef:
         name: "platformagent-secrets"
         key: "api-key"
+    # Tuning bounds what the harness may consume. Left unset here on purpose:
+    # every value below is a deployment trade, not a default the operator can
+    # pick for you.
+    # +optional
+    # tuning:
+    #   # MaxInProgress caps concurrent kanban workers board-wide. Uncapped, a
+    #   # fan-out spawns one sandboxed worker per card at once, and they contend
+    #   # for the same CPU and the same model quota, so each card takes several
+    #   # times longer than it would alone. Capping trades throughput for a
+    #   # bounded worst case: one long-running worker holds a slot. Pick the
+    #   # number your model quota can absorb; 2 is a reasonable starting point
+    #   # for a single small node pool.
+    #   maxInProgress: 2
   # Deployment abstracts the Kubernetes Pod/Deployment configuration,
   # decoupling the compute payload from the agent's application logic.
   # +optional
