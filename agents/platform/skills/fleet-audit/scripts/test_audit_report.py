@@ -82,7 +82,11 @@ SHARED_RULES = (
     (
         "credentials never reach an excerpt",
         "red-lines",
-        r"credential",
+        # Anchored on the bolded lead of the boundary itself. A bare
+        # `credential` passes on a Red Lines list that only mentions
+        # `get-credentials failed` in a skip-reason example, which is the
+        # opposite of stating the rule.
+        r"\*\*(Never (print|paste)[^*]*credential|No credentials? in evidence)",
         "the harness redacts high-confidence shapes as a backstop, not as the "
         "primary control; the primary control is this line",
     ),
@@ -1713,6 +1717,51 @@ class TestAuditCatalogue(unittest.TestCase):
                         + f" — {why}",
                     )
 
+    def test_no_sop_tells_a_worker_to_leave_checks_run_empty(self):
+        """Prose that prescribes a document the validator refuses is a defect.
+
+        The AI stream shipped telling a worker that a cluster running no models
+        should record all six checks in `checks_not_applicable` and "leave
+        `checks_run` empty" with no `limitations` note. That is precisely the
+        silent zero `validate_scope` rejects, so every run on a fleet whose
+        clusters mostly serve no models would have exited 2 and published
+        nothing — an audit that reads as clean because it never got to speak.
+        Nothing caught it: the roster matched, the wire format was described
+        correctly, and the one wrong sentence was the one nothing reads.
+
+        Deliberately not a ban on the word "empty". The drift SOP has a real
+        empty-`checks_run` state and says so; what it never does is *instruct*
+        one. Match the imperative, and let a negation clear it.
+        """
+        sop_dir = self.sop_dir()
+        # `put` is in the verb list because that is how the defect was worded
+        # in a neighbouring clause; the leading group is the clause it sits in,
+        # which is where a "never" or a "not" would be if there were one.
+        instruction = re.compile(
+            r"(?P<lead>[^.;]{0,80}?)\b(leave|record|write|submit|put)\s+"
+            r"(an?\s+)?(empty\s+`?checks_run`?|`?checks_run`?\s+empty)",
+            re.IGNORECASE,
+        )
+        negation = re.compile(
+            r"\b(never|not|no|rejects?|refuses?|instead of)\b", re.IGNORECASE
+        )
+        for audit_id, spec in audit_report.AUDITS.items():
+            sop = sop_dir / spec.sop
+            with self.subTest(audit=audit_id):
+                for n, line in enumerate(
+                    sop.read_text(encoding="utf-8").splitlines(), start=1
+                ):
+                    for match in instruction.finditer(line):
+                        self.assertRegex(
+                            match.group("lead"),
+                            negation,
+                            f"{sop.name}:{n} instructs an empty `checks_run` "
+                            f"({match.group(0).strip()!r}). validate_scope "
+                            "rejects that unless the cluster also carries a "
+                            "limitations note, so the run exits 2 and the "
+                            "ledger is never written.",
+                        )
+
     def test_no_audit_prompt_restates_the_silence_rule(self):
         """`[SILENT]` is the SOP's to define, and the prompt's to stay out of.
 
@@ -2615,6 +2664,122 @@ class TestDryRun(BaseTestCase):
         rendered = re.findall(r"^branch: (\S+)$", self.out, re.M)
         self.assertEqual(len(rendered), 2)
         self.assertEqual(sorted(announced), sorted(rendered))
+
+
+class TestAiSecurityAuditStream(BaseTestCase):
+    """The AI stream driven through validate, coverage and render together.
+
+    Every other document in this file carries the compliance roster, so the
+    newest stream's six checks were exercised only by the catalogue tests —
+    which compare names and never build a document. What that missed is the
+    run this watchdog actually makes most days: a fleet where most clusters
+    serve no models at all. That is not a partial audit and not a pile of
+    inapplicable checks; the six filters ran against the workload dump and
+    matched nothing. The two tests below pin both halves — the honest document
+    publishes, and the shape the SOP originally prescribed does not.
+    """
+
+    STREAM = "ai-security-audit"
+
+    def model_free(self, name="prod-us-east", location="us-east1"):
+        """A cluster that was fully swept and holds no AI workload.
+
+        One collection command backs all six checks because that is how the
+        SOP reads the cluster: a single `get` into a dump every filter then
+        runs over. Under `MAX_CELL_CHARS` on purpose — the coverage table
+        clips, and a fixture that overflowed would hide that from the renderer.
+        """
+        collect = (
+            f"kubectl --context gke_acme_{location}_{name} "
+            "get deploy,sts,ds,cronjob,pod -A -o json"
+        )
+        self.assertLessEqual(len(collect), audit_report.MAX_CELL_CHARS)
+        return {
+            "name": name,
+            "location": location,
+            "project": "acme-prod",
+            "checks_run": [
+                {"check": check, "command": collect}
+                for check in audit_report.audit_checks(self.STREAM)
+            ],
+        }
+
+    def test_a_fleet_that_runs_no_models_publishes_a_complete_all_clear(self):
+        doc = make_doc(
+            audit=self.STREAM,
+            findings=[],
+            clusters=[self.model_free(), self.model_free("stage-eu", "europe-west1")],
+        )
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+
+        self.patch_attr("run_cmd", Recorder())
+        rc = self.run_finish(doc, argv_extra=("--dry-run",), audit=self.STREAM)
+        self.assertEqual(rc, 0, self.err)
+        # Complete, so the ledger closes. A run that had excused the roster
+        # into `checks_not_applicable` would not even reach this line.
+        self.assertIn("is now clean", self.out)
+
+    def test_the_whole_roster_excused_as_not_applicable_publishes_nothing(self):
+        """The shape the SOP used to prescribe, and the validator refuses.
+
+        `checks_not_applicable` does not satisfy the empty-`checks_run` rule —
+        only a `limitations` note does, and a `limitations` note would pin the
+        daily stream at `partial: true` forever. So there is no way to write
+        this document that both validates and closes the ledger, which is why
+        the SOP has to send model-free clusters down the `checks_run` path.
+        """
+        excused = {
+            "name": "prod-us-east",
+            "location": "us-east1",
+            "project": "acme-prod",
+            "checks_run": [],
+            "checks_not_applicable": [
+                {"check": check, "reason": "the cluster runs no AI workloads"}
+                for check in audit_report.audit_checks(self.STREAM)
+            ],
+        }
+        doc = make_doc(audit=self.STREAM, findings=[], clusters=[excused])
+
+        rc = self.run_finish(doc, argv_extra=("--dry-run",), audit=self.STREAM)
+        self.assertEqual(rc, 2)
+        self.assertIn("checks_run: empty for prod-us-east", self.err)
+
+    def test_a_finding_from_every_check_renders_over_a_complete_coverage_row(self):
+        """Each of the six reaches the body, above a scope table reading 6/6.
+
+        A check present in `AUDITS` but mis-spelled in the SOP is caught by the
+        roster test; a check whose findings never render is not. The coverage
+        row rides along because this is the only path that renders one — a
+        clean run publishes the close comment instead — and `6/6` with no n/a
+        annotation is what a fully swept model-free cluster has to look like.
+        """
+        checks = list(audit_report.audit_checks(self.STREAM))
+        findings = [
+            make_finding(
+                fid=check,
+                check=check,
+                severity="major",
+                title=f"AI workload violates {check}",
+                namespace="serving",
+                obj=f"Deployment/{check}",
+                command=(
+                    f"kubectl --context gke_acme_us-east1_prod-us-east -n serving "
+                    f"get deployment {check} -o json"
+                ),
+                remediation={"kind": "manual", "note": "Fix it by hand."},
+            )
+            for check in checks
+        ]
+        doc = make_doc(audit=self.STREAM, findings=findings, clusters=[self.model_free()])
+
+        self.patch_attr("run_cmd", Recorder())
+        self.assertEqual(
+            self.run_finish(doc, argv_extra=("--dry-run",), audit=self.STREAM), 0, self.err
+        )
+        for check in checks:
+            self.assertIn(f"`{check}`", self.out)
+        self.assertIn("| 6/6 |", self.out)
+        self.assertNotIn("n/a", self.out)
 
 
 # --------------------------------------------------------------------------- #

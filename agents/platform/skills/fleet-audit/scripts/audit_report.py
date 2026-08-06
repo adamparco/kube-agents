@@ -265,11 +265,13 @@ GLOB_METACHARACTERS = "*?[]"
 # took the id back out of the branch name; it costs nothing and the gate is
 # already in place the day an id returns to a ref.
 #
-# The five SOPs and SKILL.md quote a *normalised* form of this pattern —
-# capturing group, `$` for `\Z` — because neither difference means anything to
-# a model reading prose. `hack/check-docs-terminology.sh` derives that form
-# from this constant and fails the build if any of the seven copies drifts, so
-# edit here and let the gate tell you which document to follow.
+# Two documents quote a *normalised* form of this pattern — SKILL.md and the
+# ledger design doc, both with a capturing group and `$` for `\Z`, because
+# neither difference means anything to a model reading prose. The governance
+# SOPs no longer quote it at all: the id is derived, so a worker never types
+# one. `hack/check-docs-terminology.sh` derives the normalised form from this
+# constant and fails the build if either copy drifts, so edit here and let the
+# gate tell you which document to follow.
 #
 # The optional tail makes a one-character id legal. Nothing about a single
 # letter is unsafe, and the SOP fixtures use them.
