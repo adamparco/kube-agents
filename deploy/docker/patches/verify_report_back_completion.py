@@ -24,6 +24,8 @@ import types
 
 CARD = "t_7f3e0a5e"
 SESSION = "20260805_223456_eeda96"
+PROFILE = "platform"      # HERMES_PROFILE — how kanban_comment stamps an author
+REQUESTER = "default"     # the Chat Agent, relaying the user's ask
 
 TITLE = "List enabled cron jobs and scheduled audits"
 BODY = (
@@ -61,7 +63,12 @@ class _Err(Exception):
 
 
 def _fake_kernel(task, comments=(), comments_raise=False):
-    """A kanban kernel that records writes instead of performing them."""
+    """A kanban kernel that records writes instead of performing them.
+
+    ``comments`` is a sequence of ``(author, body)`` pairs — the real rows
+    carry an author (``kanban_tools._handle_comment`` stamps it from
+    ``HERMES_PROFILE``) and the gate filters on it.
+    """
 
     def get_task(conn, tid):
         return task
@@ -74,7 +81,7 @@ def _fake_kernel(task, comments=(), comments_raise=False):
         comment_reads.append(tid)
         if comments_raise:
             raise RuntimeError("comment table is on fire")
-        return [types.SimpleNamespace(body=b) for b in comments]
+        return [types.SimpleNamespace(author=a, body=b) for a, b in comments]
 
     return types.SimpleNamespace(
         get_task=get_task,
@@ -94,6 +101,7 @@ def main() -> int:
     # The environment a dispatched kanban worker runs in.
     os.environ["HERMES_KANBAN_TASK"] = CARD
     os.environ["HERMES_SESSION_ID"] = SESSION
+    os.environ["HERMES_PROFILE"] = PROFILE
 
     import tools.kanban_tools as kt
 
@@ -122,10 +130,24 @@ def main() -> int:
     # No cheaper check failed, so nothing should have paid for a comment read.
     check("no comment query on the happy path", comment_reads, [])
 
+    # --- the other half of the rule: the card asked, the handoff is silent ---
+    # Nothing here claims a deliverable, so only requests_report(title, body)
+    # can fire — which is the only check that proves task.title and task.body
+    # are wired through to the gate at all.
+    out = run({"summary": "Checked every namespace. Done."})
+    check("an ask with a claimless handoff is refused", "kanban_complete blocked" in out, True)
+    check("that card was not written either", writes, [])
+
     # --- content already on the card ----------------------------------------
-    out = run({"summary": SUMMARY}, comments=["chatter", ANSWER])
+    out = run({"summary": SUMMARY}, comments=[(PROFILE, "chatter"), (PROFILE, ANSWER)])
     check("a comment carrying the report is accepted", json.loads(out).get("ok"), True)
     check("the card was written", len(writes), 1)
+
+    # The requester's own comment relays the ask, often as a list. It is not
+    # the answer, and must not be mistaken for one.
+    out = run({"summary": SUMMARY}, comments=[(REQUESTER, ANSWER)])
+    check("a comment from the requester does not count", "kanban_complete blocked" in out, True)
+    check("and the card stays unwritten", writes, [])
 
     out = run(
         {"summary": SUMMARY, "artifacts": ["/tmp/cron-manifest.md"]},
@@ -141,12 +163,19 @@ def main() -> int:
     check("no comment query for a card that asked nothing", comment_reads, [])
 
     # --- a broken comment read must not crash the completion -----------------
-    # The handler logs the failure with a traceback, so one appears in the
-    # build output here. It is the assertion passing, not the build breaking.
+    # Without the try/except around list_comments this raises out of
+    # _handle_complete and the script dies here, so reaching either check at
+    # all is the assertion. The handler logs the failure with a traceback, so
+    # one appears in the build output. It is the guard working, not the build
+    # breaking.
     print("  (expect one logged traceback below — the comment read is meant to fail)")
     out = run({"summary": SUMMARY}, comments_raise=True)
-    check("a failed comment read still refuses", "error" in out.lower(), True)
-    check("and does not raise", "traceback" not in out.lower(), True)
+    check(
+        "a failed comment read still refuses, with the guidance intact",
+        "kanban_complete blocked" in out,
+        True,
+    )
+    check("and the card was not written", writes, [])
 
     # --- the schema no longer steers the model away from result --------------
     prop = kt.KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]["result"]

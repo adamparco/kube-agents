@@ -39,8 +39,8 @@ Reject a completion when **all** of the following hold:
 1. ``result`` is empty — nothing durable on the card,
 2. no ``artifacts`` were declared and no other structured facts ride in
    ``metadata`` — the deliverable is not a file and not a data payload,
-3. neither ``summary`` nor any comment on the card carries content of its own
-   (see ``carries_content``) — nobody wrote the answer down anywhere,
+3. neither ``summary`` nor any comment *this worker wrote* carries content of
+   its own (see ``carries_content``) — nobody wrote the answer down anywhere,
 4. and the card *asked* for information back, or the handoff *claims* to have
    supplied some.
 
@@ -81,7 +81,7 @@ import re
 from typing import Iterable, Optional
 
 #: A handoff at least this long is carrying its own content, whatever it says.
-#: Sized above a 1-3 sentence summary (the incident's was 251 characters) and
+#: Sized above a 1-3 sentence summary (the incident's was 245 characters) and
 #: below any real report — the manifest that should have been on the card was
 #: roughly 4 KB.
 CONTENT_MIN_CHARS = 600
@@ -89,12 +89,39 @@ CONTENT_MIN_CHARS = 600
 #: …or this many list-shaped lines, which is a report of any length.
 CONTENT_MIN_LIST_LINES = 3
 
+#: …whose "Key: value" form only counts while the value stays this short. A
+#: label has a short value; a sentence with a colon in it does not. Without the
+#: bound, three lines of "Scope: … / Result: … / Manifest: …" prose read as a
+#: report and switch the gate off — the incident, reformatted and undetected.
+CONTENT_MAX_LABEL_VALUE = 25
+
 #: Metadata keys the kernel stamps itself. Their presence says nothing about
 #: whether the worker attached anything, so they do not count as a payload.
 #: ``worker_session_id`` is added by ``_stamp_worker_session_metadata``.
 STAMPED_METADATA_KEYS = frozenset({"worker_session_id"})
 
+#: Metadata keys that describe *the attempt* rather than its deliverable. The
+#: tool schema asks for these by name ("machine-readable facts in ``metadata``
+#: (changed_files, tests_run, …)"), so a worker following it lands them on
+#: nearly every completion; counting them as a payload would switch the gate
+#: off almost everywhere. ``findings`` and ``decisions`` are deliberately not
+#: here — those can be the answer.
+PROCESS_METADATA_KEYS = frozenset({"changed_files", "files_changed", "tests_run"})
+
+_IGNORED_METADATA_KEYS = STAMPED_METADATA_KEYS | PROCESS_METADATA_KEYS
+
 # --- did the card ask for information back? ---------------------------------
+
+#: Nouns that name a deliverable. Used on both sides: a card asking for one is
+#: asking for a report, and a handoff claiming to have supplied one has to have
+#: supplied it somewhere.
+_DELIVERABLE_NOUN = r"""
+    (?: list | report | manifest | breakdown | inventory | catalog(?:ue)?
+      | audit | summary | mapping | analysis | rundown | table | overview
+      | comparison | plan | postmortem | figures | numbers | metrics
+      | totals? | counts? | details | results | findings | answers?
+      | recommendations? | estimate )
+"""
 
 # Matched against title + body. Deliberately broad: on its own this predicate
 # decides nothing, because the gate also requires an empty result, no
@@ -103,7 +130,9 @@ _REQUESTS_REPORT = re.compile(
     r"""
       \breport(?:s|ing)?\s+back\b
     | \breport\s+(?:on|with)\b
-    | \blist\b                      # \b keeps "blacklist" and "listing" out
+    | (?<![-\w])                    # not the "-list" of "allow-list"…
+      (?<!allow\s)(?<!deny\s)(?<!block\s)   # …nor its spaced form
+      list\b                        # \b keeps "blacklist" and "listing" out
     | \bwhat\s+(?:are|is|was|were)\b
     | \bhow\s+(?:many|much)\b
     | \b(?:tell|show|give|send)\s+(?:me|us)\b
@@ -119,8 +148,8 @@ _REQUESTS_REPORT = re.compile(
     | \bfind\s+out\b
     | \bwrite\s+up\b
     | \bbreakdown\b
-    | \bprovide\s+(?:a|an|the)\b
-    """,
+    | \bprovide\s+(?:a|an|the)\s+(?:\w+\s+){0,2}<NOUN>\b
+    """.replace("<NOUN>", _DELIVERABLE_NOUN),
     re.IGNORECASE | re.VERBOSE,
 )
 
@@ -130,27 +159,35 @@ _REQUESTS_REPORT = re.compile(
 # points at content: either deictically ("the following", "see below") or by
 # assertion ("provided a detailed manifest" — the incident, verbatim). If the
 # text carrying them also carries no content, the thing pointed at is missing.
+#
+# "Provided a…" has to name a deliverable to count. Unqualified it also catches
+# "provided a fix", "provided a workaround" — action cards whose handoff is
+# honest and whose card asked for nothing, blocked by a message telling them to
+# attach a report they were never asked for.
 _PROMISES_DELIVERABLE = re.compile(
     r"""
-      \bprovided?\s+(?:a|an|the)\b
+      \bprovided?\s+(?:a|an|the)\s+(?:\w+\s+){0,2}<NOUN>\b
     | \b(?:see|listed|outlined|detailed|documented|shown|described)\s+below\b
     | \bbelow\s+(?:is|are)\b
     | \bthe\s+following\b
     | \bas\s+follows\b
-    | \b(?:full|complete|detailed|comprehensive|itemi[sz]ed)\s+
-      (?:list|report|manifest|breakdown|inventory|catalog(?:ue)?
-        |audit|summary|mapping|analysis|rundown)\b
+    | \b(?:full|complete|detailed|comprehensive|itemi[sz]ed)\s+<NOUN>\b
     | \bsee\s+attached\b
-    """,
+    """.replace("<NOUN>", _DELIVERABLE_NOUN),
     re.IGNORECASE | re.VERBOSE,
 )
 
 # --- does a piece of text carry content of its own? -------------------------
 
-#: A bullet, a number, a table row, or a "Key: value" line. Three of them are a
-#: report; one is a sentence that happens to start with a dash.
+#: A bullet, a number, a table row, or a short "Key: value" label. Three of
+#: them are a report; one is a sentence that happens to start with a dash.
 _LIST_LINE = re.compile(
-    r"^\s*(?:[-*•+]\s+|\d+[.)]\s+|\|)|\S.*\|.*\S|^\s*\S[^:\n]{0,60}:\s+\S",
+    r"""
+      ^\s*(?:[-*•+]\s+|\d+[.)]\s+|\|)   # bullet, numbered, or leading pipe
+    | \S.*\|.*\S                        # a table row without the leading pipe
+    | ^\s*\S[^:\n]{0,60}:\s+\S[^\n]{0,MAXVAL}$   # "Key: short value"
+    """.replace("MAXVAL", str(CONTENT_MAX_LABEL_VALUE)),
+    re.VERBOSE,
 )
 
 #: A URL or an absolute path — the answer is elsewhere, and this says where.
@@ -168,6 +205,17 @@ def _text(value: object) -> str:
     return str(value).strip()
 
 
+def _is_empty(value: object) -> bool:
+    """True for a metadata value that carries nothing — including ``"  "``."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set, dict, frozenset)):
+        return not value
+    return False
+
+
 def carries_content(*texts: object) -> bool:
     """True when any of ``texts`` is plausibly the answer rather than a label.
 
@@ -175,7 +223,9 @@ def carries_content(*texts: object) -> bool:
 
     * length — past ``CONTENT_MIN_CHARS`` nobody is writing a 1-3 sentence
       handoff, they are writing the report;
-    * shape — three or more bullet, numbered, table, or ``Key: value`` lines;
+    * shape — three or more bullet, numbered, table, or short ``Key: value``
+      label lines (long-valued colon lines are prose, not a label — see
+      ``CONTENT_MAX_LABEL_VALUE``);
     * a pointer — a URL or absolute path, which is a legitimate handoff for
       work whose deliverable was published to an issue, a PR, or a file.
 
@@ -205,15 +255,19 @@ def declares_payload(metadata: object) -> bool:
     findings" handoffs are covered by the one check. Keys the kernel stamps
     itself are ignored — see ``STAMPED_METADATA_KEYS``.
 
+    Keys describing the attempt rather than its output do not count either —
+    see ``PROCESS_METADATA_KEYS``, without which a worker following the tool
+    schema's own advice to report ``tests_run`` would disable the gate.
+
     ``_handle_complete`` rejects a non-dict ``metadata`` before this runs, so
     the type check here is belt-and-braces for direct callers and tests.
     """
     if not isinstance(metadata, dict):
         return False
     for key, value in metadata.items():
-        if key in STAMPED_METADATA_KEYS:
+        if key in _IGNORED_METADATA_KEYS:
             continue
-        if value in (None, "", [], {}, ()):
+        if _is_empty(value):
             continue
         return True
     return False
@@ -243,10 +297,15 @@ def report_back_violation(
     ``comments`` is accepted lazily on purpose. Reading a card's comments costs
     a query on every completion, and the answer only ever matters for the small
     minority of handoffs that have already failed every cheaper check — so the
-    call site passes them in only once this function has been asked without
-    them and said no. Callers that cannot read comments may omit them; the
-    worst case is a rejection a comment would have prevented, and the message
-    tells the worker how to clear it.
+    call site queries them only once this function has said no without them,
+    and then re-asks the same question by calling ``carries_content`` on them
+    directly. Callers that cannot read comments may omit them; the worst case
+    is a rejection a comment would have prevented, and the message tells the
+    worker how to clear it.
+
+    Only comments *this worker wrote* should be passed. A card's comment thread
+    also carries the request — the Chat Agent relays the user's ask there, often
+    as a bulleted list — and a request is not an answer.
     """
     try:
         if _text(result):

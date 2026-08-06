@@ -2,8 +2,10 @@
 """Wire tools/report_back_completion.py into the Hermes source tree.
 
 Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``, after
-``apply_cron_run_scope.py`` — the import anchor below survives that patch, but
-not the other way round, so the order in the Dockerfile is load-bearing.
+``apply_cron_run_scope.py``. The two share the import anchor below and both
+re-emit it verbatim, so neither consumes it and either order applies cleanly;
+the Dockerfile fixes one for determinism. What *is* load-bearing is
+re-deriving every anchor when the base image is bumped.
 
 Four anchored replacements in one file. Two install the gate; two rewrite the
 tool schema that helped cause the bug, because a schema telling the model that
@@ -71,10 +73,17 @@ COMPLETE_WRITE_PATCHED = (
     "                if report_back_err:\n"
     "                    # Only now is reading the comments worth a query:\n"
     "                    # every cheaper check has already failed. Content in\n"
-    "                    # a comment is content on the card, so it counts.\n"
+    "                    # a comment this worker wrote is content on the card,\n"
+    "                    # so it counts — but the thread also carries the\n"
+    "                    # request, and a request is not an answer. Match the\n"
+    "                    # author the way kanban_comment stamps it; an\n"
+    "                    # unattributed row still counts, to fail open.\n"
+    "                    _rb_me = os.environ.get(\"HERMES_PROFILE\") or \"worker\"\n"
     "                    try:\n"
     "                        posted = [\n"
-    "                            c.body for c in kb.list_comments(conn, tid)\n"
+    "                            c.body\n"
+    "                            for c in kb.list_comments(conn, tid)\n"
+    "                            if getattr(c, \"author\", None) in (None, _rb_me)\n"
     "                        ]\n"
     "                    except Exception:\n"
     "                        logger.exception(\n"

@@ -18,6 +18,8 @@ The Chat Agent delegates to you **exclusively through the Kanban board** — it 
 
    **Budget the `summary` at roughly 1200 characters, and lead with the outcome and the link.** That is where the notifier clips the line it posts to chat. The clip lands on a whitespace boundary and appends `[…]`, so it can no longer sever a URL into a dead link — but anything past the cut is still gone, and the user never learns it existed. A summary is a status update, not the report: outcome, the numbers that matter, and the URL of whatever you published. If you have more to say than fits, that is the signal the work wanted staging into sub-cards (below), each reporting its own piece.
 
+   **If the card asked you for information — a list, an audit, an answer — the content itself goes in `result`.** The `summary` stays your 1-3 sentence status line; `result` is the deliverable, stored on the card and returned by `kanban_show`. Writing the report as your closing chat message does not deliver it: that text goes to the session log, which nobody downstream reads. On 2026-08-05 a card asking for the enabled cron jobs closed `done` with a summary saying "provided a detailed manifest" and an empty `result` — the manifest existed only in the transcript, and the person who asked went and compiled it by hand. A summary describing a deliverable is not the deliverable. `kanban_complete` now refuses a report-back card that carries nothing; if it does, put the answer in `result` and call it again, and note that the card is still in-flight, so nothing has been lost.
+
 (If you are ever reached by a direct query through another inter-agent path, just handle it inline and answer — but the Chat Agent path is kanban-only.)
 
 ### Show your progress: stage long work into sub-cards

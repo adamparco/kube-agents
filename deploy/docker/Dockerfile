@@ -109,11 +109,12 @@ exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None"
 # final chat message, so it reached the session log and nobody else. Four
 # anchored edits: two install the gate, two rewrite the schema wording that
 # caused it — a prompt that stops the mistake beats a gate that rejects it.
-# Must run after apply_cron_run_scope.py: its import anchor survives that
-# patch, not the reverse. verify_report_back_completion.py then exercises the
-# patched _handle_complete against a recording kernel, because the anchors
-# cannot show that a rejection leaves the card unwritten — which is exactly
-# what the rejection message promises the worker.
+# Runs after apply_cron_run_scope.py for a determinate import order; the two
+# share an import anchor and both re-emit it, so neither order breaks the
+# other. verify_report_back_completion.py then exercises the patched
+# _handle_complete against a recording kernel, because the anchors cannot show
+# that a rejection leaves the card unwritten — which is exactly what the
+# rejection message promises the worker.
 # See the module docstring in deploy/docker/patches/report_back_completion.py.
 COPY deploy/docker/patches/report_back_completion.py /opt/hermes/tools/report_back_completion.py
 COPY deploy/docker/patches/apply_report_back_completion.py /tmp/apply_report_back_completion.py
@@ -121,6 +122,7 @@ COPY deploy/docker/patches/verify_report_back_completion.py /tmp/verify_report_b
 RUN /opt/hermes/.venv/bin/python3 /tmp/apply_report_back_completion.py /opt/hermes && \
     grep -q "report_back_violation(" /opt/hermes/tools/kanban_tools.py && \
     grep -q "if not carries_content(\*posted):" /opt/hermes/tools/kanban_tools.py && \
+    grep -q 'getattr(c, "author", None) in (None, _rb_me)' /opt/hermes/tools/kanban_tools.py && \
     ! grep -q "Short result log line (legacy field" /opt/hermes/tools/kanban_tools.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_report_back_completion.py && \
     rm /tmp/apply_report_back_completion.py /tmp/verify_report_back_completion.py

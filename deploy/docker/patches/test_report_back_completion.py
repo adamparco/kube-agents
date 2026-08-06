@@ -61,6 +61,10 @@ class TheIncidentTest(unittest.TestCase):
     def test_the_rejection_says_where_to_put_the_answer(self):
         message = self.violation()
         self.assertIn("kanban_complete blocked", message)
+        # The incident's own summary claims a manifest, so the rejection has
+        # to lead with the claim, not with the card's ask.
+        self.assertIn("your handoff says you provided one", message)
+        self.assertNotIn("this card asked for information", message)
         self.assertIn("`result`", message)
         self.assertIn("artifacts", message)
         # The belief that produced the bug: the chat message is the delivery.
@@ -143,11 +147,24 @@ class TriggersTest(unittest.TestCase):
     """Either signal fires the gate: the ask, or the claim."""
 
     def test_a_request_with_no_content_is_caught(self):
+        message = report_back_violation(
+            title="List the pods stuck in CrashLoopBackOff",
+            body="",
+            summary="Checked every namespace.",
+        )
+        self.assertIsNotNone(message)
+        # Nothing was claimed here, so the rejection names the ask instead.
+        self.assertIn("this card asked for information", message)
+        self.assertNotIn("your handoff says you provided one", message)
+
+    def test_a_request_that_lives_only_in_the_body_is_caught(self):
+        # The title is a bare label; only task.body asks for anything. This is
+        # the shape the Chat Agent creates cards in.
         self.assertIsNotNone(
             report_back_violation(
-                title="List the pods stuck in CrashLoopBackOff",
-                body="",
-                summary="Checked every namespace.",
+                title="Quarterly hygiene pass",
+                body="Give us a breakdown of the unpatched clusters.",
+                summary="Swept the fleet.",
             )
         )
 
@@ -173,18 +190,34 @@ class TriggersTest(unittest.TestCase):
         )
 
     def test_report_verbs(self):
+        # One phrase per alternative in _REQUESTS_REPORT, so that breaking any
+        # single one of them breaks a test.
         for phrase in (
-            "List the enabled jobs",
             "Report back with the totals",
+            "Report on the quota usage",
+            "List the enabled jobs",
             "What are the current quotas?",
             "How many clusters are unpatched?",
             "Tell me which nodes are cordoned",
+            "Show me the failing probes",
+            "Give me a breakdown of spend",
+            "Send us the rollout status",
+            "Let me know which nodes are cordoned",
             "Summarize the incident",
+            "Write a summary of the outage",
             "Enumerate the open findings",
+            "Catalogue the enabled jobs",
+            "Inventory the unpatched clusters",
             "Audit the RBAC bindings",
             "Investigate the latency spike",
             "Analyze the cost trend",
+            "Analyse the cost trend",
+            "Identify the top cost drivers",
+            "Find out why the rollout stalled",
+            "Write up the postmortem",
+            "Give a breakdown of the spend",
             "Provide a rollout plan",
+            "Provide the full cost analysis",
         ):
             with self.subTest(phrase=phrase):
                 self.assertTrue(requests_report(phrase, ""))
@@ -195,6 +228,29 @@ class TriggersTest(unittest.TestCase):
             "Update the blacklist entry",
             "Fix the listing page",
             "Rename the whitelist file",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertFalse(requests_report(phrase, ""))
+
+    def test_an_access_list_is_a_noun_not_a_request(self):
+        # "Add prod-eu to the cluster allow list" is an action card. Blocking
+        # it would demand a report nobody asked for.
+        for phrase in (
+            "Add prod-eu to the cluster allow-list",
+            "Add prod-eu to the cluster allow list",
+            "Drop the stale entry from the deny-list",
+            "Drop the stale entry from the deny list",
+            "Regenerate the egress block-list",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertFalse(requests_report(phrase, ""))
+
+    def test_an_action_card_that_says_provide_is_not_a_request(self):
+        # "Provide a <deliverable>" asks for a report; "provide a fix" does not.
+        for phrase in (
+            "Provide a fix for the crashing sidecar",
+            "Provide an override for the quota",
+            "Provide the missing IAM binding",
         ):
             with self.subTest(phrase=phrase):
                 self.assertFalse(requests_report(phrase, ""))
@@ -212,6 +268,24 @@ class TriggersTest(unittest.TestCase):
         ):
             with self.subTest(phrase=phrase):
                 self.assertTrue(promises_deliverable(phrase, ""))
+
+    def test_an_honest_action_handoff_promises_nothing(self):
+        # Without a deliverable noun, "provided a …" is just plain English on
+        # a card that asked for a change. It must not fire the gate.
+        for phrase in (
+            "Provided a fix and redeployed.",
+            "Provided a workaround until the upstream release lands.",
+            "Provided the new service account to the cluster.",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertFalse(promises_deliverable(phrase, ""))
+                self.assertIsNone(
+                    report_back_violation(
+                        title="Fix the crashing sidecar",
+                        body="It restarts every few minutes.",
+                        summary=phrase,
+                    )
+                )
 
 
 class SatisfiedElsewhereTest(unittest.TestCase):
@@ -239,9 +313,25 @@ class SatisfiedElsewhereTest(unittest.TestCase):
         )
 
     def test_an_empty_metadata_value_is_not_a_payload(self):
-        for empty in ({}, [], "", None):
+        for empty in ({}, [], (), set(), "", "   ", None):
             with self.subTest(empty=empty):
                 self.assertFalse(declares_payload({"findings": empty, **STAMPED}))
+
+    def test_process_metadata_is_not_a_payload(self):
+        # The tool schema asks for these by name, so a compliant worker sends
+        # them on nearly every completion. If they counted as a deliverable
+        # the gate would be off almost everywhere — including the incident.
+        for process in ({"tests_run": 12}, {"changed_files": ["a.py"]}):
+            with self.subTest(process=process):
+                self.assertFalse(declares_payload({**process, **STAMPED}))
+                self.assertIsNotNone(
+                    report_back_violation(
+                        title=INCIDENT_TITLE,
+                        body=INCIDENT_BODY,
+                        summary=INCIDENT_SUMMARY,
+                        metadata={**process, **STAMPED},
+                    )
+                )
 
     def test_a_summary_that_is_itself_the_report_is_accepted(self):
         self.assertIsNone(
@@ -289,6 +379,12 @@ class CarriesContentTest(unittest.TestCase):
         self.assertTrue(carries_content("x" * CONTENT_MIN_CHARS))
         self.assertFalse(carries_content("x" * (CONTENT_MIN_CHARS - 1)))
 
+    def test_the_threshold_sits_between_a_handoff_and_a_report(self):
+        # Pinned in absolute terms, not relative to the constant, so that
+        # moving CONTENT_MIN_CHARS somewhere useless fails a test.
+        self.assertFalse(carries_content("word " * 40))    # 200 chars: a handoff
+        self.assertTrue(carries_content("word " * 800))    # 4 KB: the manifest
+
     def test_the_incident_summary_does_not_qualify(self):
         self.assertFalse(carries_content(INCIDENT_SUMMARY))
 
@@ -305,6 +401,24 @@ class CarriesContentTest(unittest.TestCase):
 
     def test_two_list_lines_are_not_yet_a_report(self):
         self.assertFalse(carries_content("- a\n- b"))
+
+    def test_colon_prose_is_not_a_key_value_report(self):
+        # The incident, cosmetically reformatted. Three sentences that happen
+        # to carry a colon are not a manifest, and if they counted as one the
+        # gate would wave through exactly the handoff it exists to catch.
+        prose = (
+            "Scope: all platform cron jobs, scheduled audits and GKE "
+            "controllers.\n"
+            "Result: audited and cataloged every one of them.\n"
+            "Manifest: provided a detailed mapping of schedules, targets and "
+            "states."
+        )
+        self.assertFalse(carries_content(prose))
+        self.assertIsNotNone(
+            report_back_violation(
+                title=INCIDENT_TITLE, body=INCIDENT_BODY, summary=prose
+            )
+        )
 
     def test_pointers_qualify(self):
         self.assertTrue(carries_content("see https://example.invalid/x"))
