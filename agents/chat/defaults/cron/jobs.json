@@ -1,6 +1,21 @@
 {
   "jobs": [
     {
+      "id": "profile-cron-tick",
+      "name": "Named-Profile Cron Ticker",
+      "schedule": {
+        "kind": "interval",
+        "minutes": 1,
+        "display": "every 1m"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "profile_cron_tick.py",
+      "skills": [],
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
       "id": "cluster-agent-reconcile",
       "name": "Cluster Agent Reconcile",
       "schedule": {

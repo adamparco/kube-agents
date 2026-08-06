@@ -192,6 +192,51 @@ class CronStoreMergeTest(unittest.TestCase):
         self.assertEqual(2, store["version"])
         self.assertEqual({"tick": 9}, store["scheduler_state"])
 
+    def test_a_named_id_list_leaves_every_other_shipped_job_to_the_volume(self):
+        # What the default profile's merge needs. Two jobs on that roster
+        # remove themselves once first-run onboarding is delivered
+        # (`bootstrap_delivery.py` calls `remove_job`), so an unfiltered merge
+        # would put them back on the next restart — polling every minute
+        # forever to no-op on a marker. Only the named id is forced.
+        write(
+            self.template / "cron" / "jobs.json",
+            json.dumps({"jobs": [job("profile-cron-tick"), job("bootstrap-inventory-scan")]}),
+        )
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("reconcile")]}))
+        ps.overlay_template(self.home, self.template, None, ("cron",), ("profile-cron-tick",))
+        merged = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        self.assertEqual(["profile-cron-tick", "reconcile"], [j["id"] for j in merged])
+
+    def test_a_named_id_still_takes_the_image_definition_and_keeps_its_state(self):
+        write(
+            self.template / "cron" / "jobs.json",
+            json.dumps({"jobs": [job("profile-cron-tick", prompt="new")]}),
+        )
+        write(
+            self.home / "cron" / "jobs.json",
+            json.dumps(
+                {"jobs": [job("profile-cron-tick", prompt="old", last_run="2026-08-05T00:00:00Z")]}
+            ),
+        )
+        ps.overlay_template(self.home, self.template, None, ("cron",), ("profile-cron-tick",))
+        merged = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        self.assertEqual("new", merged[0]["prompt"])
+        self.assertEqual("2026-08-05T00:00:00Z", merged[0]["last_run"])
+
+    def test_an_empty_id_list_forces_nothing(self):
+        # `--cron-jobs ""` reaches overlay_template as None, not (), so the
+        # empty tuple can only come from a caller that means it: force no job.
+        write(self.template / "cron" / "jobs.json", json.dumps({"jobs": [job("audit")]}))
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("only-here")]}))
+        ps.overlay_template(self.home, self.template, None, ("cron",), ())
+        merged = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        self.assertEqual(["only-here"], [j["id"] for j in merged])
+
+    def test_no_id_list_merges_the_whole_shipped_roster(self):
+        # The platform profile's path, unchanged: it passes no filter.
+        merged = self.overlay([job("audit"), job("drift")], [job("audit")])
+        self.assertEqual(["audit", "drift"], [j["id"] for j in merged])
+
     def test_the_merge_is_skipped_when_cron_is_not_being_overlaid(self):
         # `--items` without `cron` means the caller is not touching the cron
         # directory; rewriting jobs.json anyway would be this function editing
