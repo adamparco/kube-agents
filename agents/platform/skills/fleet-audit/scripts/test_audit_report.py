@@ -48,14 +48,15 @@ SOP_FILENAMES = {
     "obtainability-audit": "obtainability_audit_sop.md",
     "fleet-wide-cost-analysis": "fleet_wide_cost_analysis_sop.md",
     "fleet-consistency-drift": "fleet_consistency_drift_sop.md",
+    "ai-security-audit": "ai_security_audit_sop.md",
 }
 
 # Rules that hold on every stream — because the harness enforces them, or
 # because a worker gets them wrong the same way whatever it is auditing — and
-# therefore have to be stated in all five SOPs. Every one of these was missing
-# from at least one SOP when the streams shipped, and nothing noticed: the five
+# therefore have to be stated in all six SOPs. Every one of these was missing
+# from at least one SOP when the streams shipped, and nothing noticed: the six
 # documents share an outline but almost no text, so a fix written into one of
-# them reaches the other four only if somebody remembers. This table is what
+# them reaches the other five only if somebody remembers. This table is what
 # remembers.
 #
 # Each row is `(label, scope, pattern, why)`.
@@ -85,11 +86,24 @@ SHARED_RULES = (
         # satisfied by the compliance SOP's read-only Red Line two bullets
         # above, which names `gcloud container clusters get-credentials` as its
         # permitted exception — so the rule this row exists to protect could be
-        # deleted outright and the row would stay green. All five SOPs put both
+        # deleted outright and the row would stay green. All six SOPs put both
         # words on one line.
         r"credential[^\n]*excerpt|excerpt[^\n]*credential",
         "the harness redacts high-confidence shapes as a backstop, not as the "
         "primary control; the primary control is this line",
+    ),
+    (
+        "the credentials rule is stated as a boundary, not in passing",
+        "red-lines",
+        # The row above pins the two words together; this one pins the shape of
+        # the line carrying them. A Red Lines list that only mentions
+        # `get-credentials failed` in a skip-reason example satisfies a looser
+        # anchor while stating the opposite of the rule, so the boundary has to
+        # lead with its own bolded imperative. Both rows pass on all six SOPs
+        # today — they are kept apart because they fail on different drifts.
+        r"\*\*(Never (print|paste)[^*]*credential|No credentials? in evidence)",
+        "a boundary a worker re-reads before publishing has to read as a "
+        "boundary, not as an aside inside an example",
     ),
     (
         "/remediate all is accepted",
@@ -1763,11 +1777,11 @@ class TestAuditCatalogue(unittest.TestCase):
                 )
 
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
-        """A fix written into one SOP has to reach the other four.
+        """A fix written into one SOP has to reach the other five.
 
-        The five documents share an outline and almost no text, so there is no
+        The six documents share an outline and almost no text, so there is no
         shared file to edit and no include to follow: the only thing that
-        carries a cross-stream rule into all five is somebody remembering. Six
+        carries a cross-stream rule into all six is somebody remembering. Six
         rules were stated in some SOPs and silently missing from others from
         the day the streams shipped — including two the harness rejects a
         document for. SHARED_RULES is the roll-call; adding a row to it is how
@@ -1790,6 +1804,51 @@ class TestAuditCatalogue(unittest.TestCase):
                         + (" in its Red Lines" if scope == "red-lines" else "")
                         + f" — {why}",
                     )
+
+    def test_no_sop_tells_a_worker_to_leave_checks_run_empty(self):
+        """Prose that prescribes a document the validator refuses is a defect.
+
+        The AI stream shipped telling a worker that a cluster running no models
+        should record all six checks in `checks_not_applicable` and "leave
+        `checks_run` empty" with no `limitations` note. That is precisely the
+        silent zero `validate_scope` rejects, so every run on a fleet whose
+        clusters mostly serve no models would have exited 2 and published
+        nothing — an audit that reads as clean because it never got to speak.
+        Nothing caught it: the roster matched, the wire format was described
+        correctly, and the one wrong sentence was the one nothing reads.
+
+        Deliberately not a ban on the word "empty". The drift SOP has a real
+        empty-`checks_run` state and says so; what it never does is *instruct*
+        one. Match the imperative, and let a negation clear it.
+        """
+        sop_dir = self.sop_dir()
+        # `put` is in the verb list because that is how the defect was worded
+        # in a neighbouring clause; the leading group is the clause it sits in,
+        # which is where a "never" or a "not" would be if there were one.
+        instruction = re.compile(
+            r"(?P<lead>[^.;]{0,80}?)\b(leave|record|write|submit|put)\s+"
+            r"(an?\s+)?(empty\s+`?checks_run`?|`?checks_run`?\s+empty)",
+            re.IGNORECASE,
+        )
+        negation = re.compile(
+            r"\b(never|not|no|rejects?|refuses?|instead of)\b", re.IGNORECASE
+        )
+        for audit_id, spec in audit_report.AUDITS.items():
+            sop = sop_dir / spec.sop
+            with self.subTest(audit=audit_id):
+                for n, line in enumerate(
+                    sop.read_text(encoding="utf-8").splitlines(), start=1
+                ):
+                    for match in instruction.finditer(line):
+                        self.assertRegex(
+                            match.group("lead"),
+                            negation,
+                            f"{sop.name}:{n} instructs an empty `checks_run` "
+                            f"({match.group(0).strip()!r}). validate_scope "
+                            "rejects that unless the cluster also carries a "
+                            "limitations note, so the run exits 2 and the "
+                            "ledger is never written.",
+                        )
 
     def test_no_audit_prompt_restates_the_silence_rule(self):
         """`[SILENT]` is the SOP's to define, and the prompt's to stay out of.
@@ -2480,9 +2539,9 @@ class TestStart(HarnessTestCase):
         self.assertTrue((reported / ".git").exists())
 
     def test_each_audit_gets_its_own_clone(self):
-        # Five audits run from one cron file and their schedules collide. They
+        # Six audits run from one cron file and their schedules collide. They
         # used to share a directory, so whichever one reached `finish` first
-        # ran `checkout --force -B` over the other four's untracked manifests.
+        # ran `checkout --force -B` over the other five's untracked manifests.
         self.harness.replies = {"issue list": "[]"}
         self.run_main(["start", "--audit", AUDIT])
         mine = Path(json.loads(self.out)["workspace"])
@@ -2693,6 +2752,167 @@ class TestDryRun(BaseTestCase):
         rendered = re.findall(r"^branch: (\S+)$", self.out, re.M)
         self.assertEqual(len(rendered), 2)
         self.assertEqual(sorted(announced), sorted(rendered))
+
+
+class TestAiSecurityAuditStream(BaseTestCase):
+    """The AI stream driven through validate, coverage and render together.
+
+    Every other document in this file carries the compliance roster, so the
+    newest stream's six checks were exercised only by the catalogue tests —
+    which compare names and never build a document. What that missed is the
+    run this watchdog actually makes most days: a fleet where most clusters
+    serve no models at all. That is not a partial audit and not a pile of
+    inapplicable checks; the six filters ran against the workload dump and
+    matched nothing. The tests below pin both halves — the honest document
+    publishes, and the shape the SOP originally prescribed does not — then the
+    roster's rendering, and the one thing this stream must never publish.
+    """
+
+    STREAM = "ai-security-audit"
+
+    def model_free(self, name="prod-us-east", location="us-east1"):
+        """A cluster that was fully swept and holds no AI workload.
+
+        One collection command backs all six checks because that is how the
+        SOP reads the cluster: a single `get` into a dump every filter then
+        runs over. Under `MAX_CELL_CHARS` on purpose — the coverage table
+        clips, and a fixture that overflowed would hide that from the renderer.
+        """
+        collect = (
+            f"kubectl --context gke_acme_{location}_{name} "
+            "get deploy,sts,ds,cronjob,pod -A -o json"
+        )
+        self.assertLessEqual(len(collect), audit_report.MAX_CELL_CHARS)
+        return {
+            "name": name,
+            "location": location,
+            "project": "acme-prod",
+            "checks_run": [
+                {"check": check, "command": collect}
+                for check in audit_report.audit_checks(self.STREAM)
+            ],
+        }
+
+    def test_a_fleet_that_runs_no_models_publishes_a_complete_all_clear(self):
+        doc = make_doc(
+            audit=self.STREAM,
+            findings=[],
+            clusters=[self.model_free(), self.model_free("stage-eu", "europe-west1")],
+        )
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+
+        self.patch_attr("run_cmd", Recorder())
+        rc = self.run_finish(doc, argv_extra=("--dry-run",), audit=self.STREAM)
+        self.assertEqual(rc, 0, self.err)
+        # Complete, so the ledger closes. A run that had excused the roster
+        # into `checks_not_applicable` would not even reach this line.
+        self.assertIn("is now clean", self.out)
+
+    def test_the_whole_roster_excused_as_not_applicable_publishes_nothing(self):
+        """The shape the SOP used to prescribe, and the validator refuses.
+
+        `checks_not_applicable` does not satisfy the empty-`checks_run` rule —
+        only a `limitations` note does, and a `limitations` note would pin the
+        daily stream at `partial: true` forever. So there is no way to write
+        this document that both validates and closes the ledger, which is why
+        the SOP has to send model-free clusters down the `checks_run` path.
+        """
+        excused = {
+            "name": "prod-us-east",
+            "location": "us-east1",
+            "project": "acme-prod",
+            "checks_run": [],
+            "checks_not_applicable": [
+                {"check": check, "reason": "the cluster runs no AI workloads"}
+                for check in audit_report.audit_checks(self.STREAM)
+            ],
+        }
+        doc = make_doc(audit=self.STREAM, findings=[], clusters=[excused])
+
+        rc = self.run_finish(doc, argv_extra=("--dry-run",), audit=self.STREAM)
+        self.assertEqual(rc, 2)
+        self.assertIn("checks_run: empty for prod-us-east", self.err)
+
+    def test_a_finding_from_every_check_renders_over_a_complete_coverage_row(self):
+        """Each of the six reaches the body, above a scope table reading 6/6.
+
+        A check present in `AUDITS` but mis-spelled in the SOP is caught by the
+        roster test; a check whose findings never render is not. The coverage
+        row rides along because this is the only path that renders one — a
+        clean run publishes the close comment instead — and `6/6` with no n/a
+        annotation is what a fully swept model-free cluster has to look like.
+        """
+        checks = list(audit_report.audit_checks(self.STREAM))
+        findings = [
+            make_finding(
+                fid=check,
+                check=check,
+                severity="major",
+                title=f"AI workload violates {check}",
+                namespace="serving",
+                obj=f"Deployment/{check}",
+                command=(
+                    f"kubectl --context gke_acme_us-east1_prod-us-east -n serving "
+                    f"get deployment {check} -o json"
+                ),
+                remediation={"kind": "manual", "note": "Fix it by hand."},
+            )
+            for check in checks
+        ]
+        doc = make_doc(audit=self.STREAM, findings=findings, clusters=[self.model_free()])
+
+        self.patch_attr("run_cmd", Recorder())
+        self.assertEqual(
+            self.run_finish(doc, argv_extra=("--dry-run",), audit=self.STREAM), 0, self.err
+        )
+        for check in checks:
+            self.assertIn(f"`{check}`", self.out)
+        self.assertIn("| 6/6 |", self.out)
+        self.assertNotIn("n/a", self.out)
+
+    def test_the_check_that_hunts_credentials_cannot_publish_one(self):
+        """The credential does not reach the ledger, whatever the model pastes.
+
+        The SOP tells the model to write `HF_TOKEN is set with a literal
+        value: (contents withheld)` and never the value. This is the run where
+        it pasted the pod spec instead — the case the backstop exists for, and
+        the case it used to wave through, because `HF_TOKEN` reads as ordinary
+        output to a pattern anchored on the bare word `token`.
+        """
+        secret = "9f8e7d6c5b4a3928170695"
+        doc = make_doc(
+            audit=self.STREAM,
+            findings=[
+                make_finding(
+                    fid="model-credential-plaintext-env",
+                    check="model-credential-plaintext-env",
+                    severity="major",
+                    title="HF_TOKEN is set with a literal value",
+                    namespace="serving",
+                    obj="Deployment/llama-serve",
+                    command=(
+                        "kubectl --context gke_acme_us-east1_prod-us-east -n serving "
+                        "get deployment llama-serve -o json"
+                    ),
+                    excerpt=f"        - name: HF_TOKEN\n          value: {secret}",
+                    remediation={
+                        "kind": "manual",
+                        "note": "Rotate the token, then move it to a Secret.",
+                    },
+                )
+            ],
+            clusters=[self.model_free()],
+        )
+
+        self.patch_attr("run_cmd", Recorder())
+        self.assertEqual(
+            self.run_finish(doc, argv_extra=("--dry-run",), audit=self.STREAM), 0, self.err
+        )
+        self.assertNotIn(secret, self.out)
+        self.assertNotIn(secret, self.err)
+        # The variable is the finding. Only its value goes.
+        self.assertIn("HF_TOKEN", self.out)
+        self.assertIn(audit_report.REDACTED, self.out)
 
 
 # --------------------------------------------------------------------------- #
@@ -4712,7 +4932,7 @@ class TestFailurePaths(HarnessTestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Credential redaction — the backstop the five SOPs promise
+# Credential redaction — the backstop the six SOPs promise
 # --------------------------------------------------------------------------- #
 
 
@@ -4742,6 +4962,112 @@ class TestRedaction(unittest.TestCase):
     def test_the_field_name_survives_so_the_reader_knows_what_was_hidden(self):
         out = audit_report.redact_secrets("password: hunter2correcthorse")
         self.assertTrue(out.startswith("password: "))
+
+    def test_a_credential_field_carrying_a_prefix_is_blanked(self):
+        """The spellings a real workload uses, all of which used to publish.
+
+        Anchored on the bare word, this pattern blanked `api_key=` and let
+        `HF_TOKEN=` through — and a prefix is the normal case, not the exotic
+        one. The prefix has to survive into the output with the key: a
+        `[redacted]` sitting under a bare `TOKEN:` misnames the variable the
+        finding is about.
+        """
+        for line, name in (
+            ("HF_TOKEN=hf_notARealTokenNotARealToken", "HF_TOKEN="),
+            ("OPENAI_API_KEY=notARealKeyNotARealKey", "OPENAI_API_KEY="),
+            ("AWS_SECRET_ACCESS_KEY=notARealKeyNotAReal", "AWS_SECRET_ACCESS_KEY="),
+            ("  db_password: hunter2correcthorse", "db_password: "),
+            ("x-goog-api-key: notARealKeyNotARealKey", "x-goog-api-key: "),
+        ):
+            with self.subTest(line=line):
+                out = audit_report.redact_secrets(line)
+                self.assertIn(audit_report.REDACTED, out)
+                self.assertIn(name, out)
+
+    def test_an_environment_pair_hides_the_value_and_keeps_the_variable(self):
+        """`model-credential-plaintext-env` finds exactly this shape.
+
+        Which makes it the shape most likely to arrive here carrying a live
+        credential — and the one the key-name scan structurally cannot see,
+        since `value` names nothing and `name` carries nothing. The payload is
+        deliberately opaque rather than a recognisable token prefix, so this
+        proves the pair rule fired and not the token-shape one.
+        """
+        secret = "9f8e7d6c5b4a3928170695"
+        for excerpt, name in (
+            (f"- name: HF_TOKEN\n  value: {secret}", "HF_TOKEN"),
+            (f'  "name": "OPENAI_API_KEY",\n  "value": "{secret}"', "OPENAI_API_KEY"),
+            (f'{{"name":"HF_TOKEN","value":"{secret}"}}', "HF_TOKEN"),
+        ):
+            with self.subTest(excerpt=excerpt):
+                out = self.assertRedacted(excerpt, secret)
+                self.assertIn(name, out)
+
+    def test_a_name_that_only_points_at_a_credential_is_left_alone(self):
+        # The AI security SOP draws this line itself, telling the model not to
+        # flag `HF_TOKEN_PATH` or `OPENAI_API_KEY_FILE`: a name whose last
+        # segment is `PATH`, `FILE` or `NAME` says where a credential is kept,
+        # and that is the fact the finding exists to publish.
+        for benign in (
+            "- name: TOKEN_PATH\n  value: /var/run/secrets/hf/token",
+            "- name: SECRET_NAME\n  value: hf-creds",
+            "- name: MODEL_NAME\n  value: llama-3-70b",
+            "- name: HF_TOKEN\n  valueFrom:\n    secretKeyRef:\n"
+            "      name: hf-creds\n      key: token",
+        ):
+            with self.subTest(benign=benign):
+                self.assertEqual(audit_report.redact_secrets(benign), benign)
+
+    def test_an_object_named_after_a_credential_does_not_arm_the_next_value(self):
+        # `hf-token` is a perfectly ordinary Secret name, and the `name:` that
+        # carries it is a metadata field rather than half of an env pair. What
+        # separates the two is indentation: the env variable's `value:` sits
+        # under its `name:`, and this one outdents past it first.
+        benign = (
+            "metadata:\n"
+            "  name: hf-token\n"
+            "spec:\n"
+            "  replicas: 2\n"
+            "  value: 3"
+        )
+        self.assertEqual(audit_report.redact_secrets(benign), benign)
+
+    def test_a_boolean_or_a_path_is_not_a_credential_however_it_is_named(self):
+        # `gcloud container clusters describe` is full of both, and the prefix
+        # allowance is what newly reaches them.
+        for benign in (
+            "workload_identity_auth: enabled",
+            "gke_auth: false",
+            "GOOGLE_APPLICATION_CREDENTIALS=/var/secrets/google/key.json",
+            "HF_TOKEN_PATH=/var/run/hf/token",
+        ):
+            with self.subTest(benign=benign):
+                self.assertEqual(audit_report.redact_secrets(benign), benign)
+
+    def test_a_credential_in_a_limitations_note_never_reaches_the_run_summary(self):
+        """Gap strings leave by two doors and only one of them redacts.
+
+        Every other piece of model-authored text is redacted by the renderer,
+        on its way into a cell. `coverage_gaps` output also goes out in the
+        run-summary JSON on stdout — which the agent reads back and relays into
+        chat — and to the pod log, neither of which is a cell.
+        """
+        secret = "hf_notARealTokenNotARealTokenNot"
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {
+                    "name": "prod-us-east",
+                    "location": "us-east1",
+                    "project": "acme-prod",
+                    "checks_run": [],
+                    "limitations": f"Read with a static kubeconfig ({secret})",
+                }
+            ],
+        )
+        gaps = audit_report.coverage_gaps(doc)
+        self.assertTrue(gaps)
+        self.assertNotIn(secret, "\n".join(gaps))
 
     def test_a_secret_payload_block_is_blanked_whatever_the_keys_are_called(self):
         out = self.assertRedacted(
@@ -4774,6 +5100,10 @@ class TestRedaction(unittest.TestCase):
             "github_pat_11ABCDEFG0123456789abcdef",
             "ya29.a0ARrdaM9abcdefghijklmnop",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
+            # The three an AI workload carries.
+            "hf_notARealTokenNotARealTokenNot",
+            "sk-notARealKeyNotARealKeyNotARealKey",
+            "nvapi-notARealKeyNotARealKeyNotARealKey",
         ):
             with self.subTest(secret=secret):
                 self.assertRedacted(f"log line before {secret} and after", secret)
@@ -4792,6 +5122,14 @@ class TestRedaction(unittest.TestCase):
             "image: gcr.io/acme/api@sha256:3f5b1c2d4e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
             "sizeGb: 500",
             "c3VwZXJzZWNyZXQK",
+            # The excerpt the AI security SOP prescribes for the credential
+            # check, verbatim. A rule keyed on `value:` anywhere after a
+            # credential word would blank the SOP's own worked example and
+            # leave it describing output no reader will ever see.
+            "HF_TOKEN is set with a literal value: (contents withheld)",
+            "secretName: tls-cert",
+            "topologyKey: kubernetes.io/hostname",
+            "gcloud container clusters get-credentials failed: permission denied",
         ):
             with self.subTest(benign=benign):
                 self.assertEqual(audit_report.redact_secrets(benign), benign)

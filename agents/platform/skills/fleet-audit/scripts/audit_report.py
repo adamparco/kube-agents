@@ -3,7 +3,8 @@
 audit_report.py — Deterministic reporting harness for the fleet-audit skill.
 
 Every autonomous audit watchdog (compliance, security patch, obtainability,
-cost, consistency drift) funnels its findings through this script. Each audit
+cost, consistency drift, AI workload security) funnels its findings through
+this script. Each audit
 stream owns exactly ONE open GitHub **issue** — its ledger — rewritten in place
 on every run and closed as completed when the fleet comes back clean. Fixes
 travel separately, as narrow remediation pull requests carrying only the files
@@ -89,7 +90,7 @@ class AuditSpec(NamedTuple):
 
 
 # The audit streams allowed to own a ledger. An id not listed here is rejected
-# before any git/gh call: a typo must not silently open a sixth ledger stream.
+# before any git/gh call: a typo must not silently open a seventh ledger stream.
 # The human names mirror the `name` of the matching watchdog in
 # agents/platform/cron/jobs.json — keep the two in step so the issue title and
 # the cron catalogue name the same thing.
@@ -190,6 +191,18 @@ AUDITS: dict[str, AuditSpec] = {
         # telling the admin to fix the cohort labelling.
         derived=("uncohorted",),
     ),
+    "ai-security-audit": AuditSpec(
+        "AI Workload Security Audit",
+        "ai_security_audit_sop.md",
+        (
+            "inference-endpoint-public",
+            "model-remote-code-trusted",
+            "weights-mount-writable",
+            "model-artifact-unpinned-source",
+            "model-credential-plaintext-env",
+            "model-image-floating-tag",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")
@@ -252,11 +265,13 @@ GLOB_METACHARACTERS = "*?[]"
 # took the id back out of the branch name; it costs nothing and the gate is
 # already in place the day an id returns to a ref.
 #
-# The five SOPs and SKILL.md quote a *normalised* form of this pattern —
-# capturing group, `$` for `\Z` — because neither difference means anything to
-# a model reading prose. `hack/check-docs-terminology.sh` derives that form
-# from this constant and fails the build if any of the seven copies drifts, so
-# edit here and let the gate tell you which document to follow.
+# Two documents quote a *normalised* form of this pattern — SKILL.md and the
+# ledger design doc, both with a capturing group and `$` for `\Z`, because
+# neither difference means anything to a model reading prose. The governance
+# SOPs no longer quote it at all: the id is derived, so a worker never types
+# one. `hack/check-docs-terminology.sh` derives the normalised form from this
+# constant and fails the build if either copy drifts, so edit here and let the
+# gate tell you which document to follow.
 #
 # The optional tail makes a one-character id legal. Nothing about a single
 # letter is unsafe, and the SOP fixtures use them.
@@ -265,7 +280,7 @@ FINDING_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?\Z")
 # The id is *derived*, never model-written — see `derive_finding_id` for what
 # went wrong when it was prose. These three describe the derived shape.
 #
-# `<check>.<cluster>.<namespace>.<object>`, one grammar for all five streams.
+# `<check>.<cluster>.<namespace>.<object>`, one grammar for all six streams.
 # The per-SOP `wra-`/`spo-` prefixes it replaces carried no information the
 # ledger did not already have: an id never leaves the stream that minted it.
 ID_SEGMENTS = 4
@@ -471,17 +486,30 @@ def normalise_newlines(text: str | None) -> str:
 REDACTED = "[redacted by audit_report.py]"
 
 # Field names whose value is a credential often enough that publishing it to a
-# GitHub issue is never worth the convenience. Matched as a YAML/JSON key with a
-# value on the same line, so `kubectl get secret -o jsonpath='{.data.token}'`
-# in an evidence *command* is untouched — there is no value after the colon.
+# GitHub issue is never worth the convenience. Shared with the environment-pair
+# scan below, which asks the same question of a name on a different line.
+_SECRET_KEY_WORDS = r"""
+    password|passwd|token|secret|api[_-]?key|access[_-]?key
+    |auth|authorization|credentials?
+    |private[_-]?key|privatekey|clientkey|clientcertificate
+    |client-key-data|client-certificate-data|cluster-?ca-?certificate
+    |access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key
+"""
+
+# Matched as a YAML/JSON key with a value on the same line, so
+# `kubectl get secret -o jsonpath='{.data.token}'` in an evidence *command* is
+# untouched — there is no value after the colon.
+#
+# `lead` swallows a separator-delimited prefix because the credential word is
+# almost never the whole name in the wild: anchored on the bare word, this
+# pattern blanked `api_key=` and published `HF_TOKEN=`, `OPENAI_API_KEY=` and
+# `AWS_SECRET_ACCESS_KEY=` intact. Separator-delimited, so a camelCase tail like
+# `topologyKey:` still does not match — that is a field name far more often than
+# it is a credential.
 _SECRET_KEY_RE = re.compile(
-    r"""(?ix)
-    ^(?P<lead>[\s"'\-]*"?)
-    (?P<key>password|passwd|token|secret|api[_-]?key|access[_-]?key
-        |auth|authorization|credentials?
-        |private[_-]?key|privatekey|clientkey|clientcertificate
-        |client-key-data|client-certificate-data|cluster-?ca-?certificate
-        |access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key)
+    rf"""(?ix)
+    ^(?P<lead>[\s"'\-]*"?(?:[A-Za-z0-9]+[_.\-])*)
+    (?P<key>{_SECRET_KEY_WORDS})
     (?P<sep>"?\s*[:=]\s*)
     (?P<value>\S.*?)
     (?P<trail>\s*,?)$
@@ -489,15 +517,36 @@ _SECRET_KEY_RE = re.compile(
     re.M,
 )
 
+# Values no field name can make secret. A boolean or an enum literal carries
+# nothing, and an absolute path is where a credential lives rather than the
+# credential itself — blanking `GOOGLE_APPLICATION_CREDENTIALS` costs the reader
+# the one fact the finding is about. Both shapes are everywhere in
+# `gcloud container clusters describe` output, which the prefix above newly
+# reaches: without this, `workload_identity_auth: enabled` disappears.
+_NON_SECRET_VALUE_RE = re.compile(
+    r"""(?ix)^["']?(?:
+        true|false|yes|no|on|off|enabled|disabled|none|null|nil|unset|\d+
+        |/[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-]+)+
+    )["']?$"""
+)
+
 # Token shapes that identify themselves. Redacted anywhere they appear, because
 # a bearer token in the middle of a log line is still a bearer token.
+#
+# The last three are the ones an AI workload carries: a Hugging Face token, an
+# OpenAI or Anthropic key, an NVIDIA NGC key. Their lengths are set well above
+# the real minimum so that a Kubernetes object named `sk-something` has to be
+# implausibly long before it is mistaken for a key.
 _TOKEN_SHAPE_RE = re.compile(
     r"(?:gh[pousr]_[A-Za-z0-9]{16,}"
     r"|github_pat_[A-Za-z0-9_]{20,}"
     r"|ya29\.[A-Za-z0-9._\-]{20,}"
     r"|AIza[A-Za-z0-9_\-]{30,}"
     r"|xox[baprs]-[A-Za-z0-9\-]{10,}"
-    r"|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})"
+    r"|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
+    r"|hf_[A-Za-z0-9]{20,}"
+    r"|sk-[A-Za-z0-9_\-]{32,}"
+    r"|nvapi-[A-Za-z0-9_\-]{32,})"
 )
 
 # The body between a PEM header and its footer, header and footer preserved so
@@ -541,15 +590,97 @@ def _redact_secret_blocks(text: str) -> str:
     return "\n".join(out)
 
 
+# An environment variable splits itself in half: the credential-ness lives on
+# the `name:` line and the credential on the `value:` line below it, so the
+# key-name scan sees neither — `value` names nothing and `name` carries nothing.
+# That two-line pair is the exact shape `model-credential-plaintext-env` exists
+# to find, which makes it the one shape this backstop must not miss.
+#
+# The credential word has to END the variable's name. The AI security SOP draws
+# the same line when it tells the model not to flag `HF_TOKEN_PATH` or
+# `OPENAI_API_KEY_FILE`: a name whose last segment is `PATH` or `FILE` says
+# where a credential is kept, and that is a fact worth publishing.
+_CREDENTIAL_NAME_RE = re.compile(rf"(?ix)^(?:[A-Za-z0-9]+[_.\-])*(?:{_SECRET_KEY_WORDS})$")
+_ENV_NAME_RE = re.compile(r"""^[\s\-]*"?name"?\s*:\s*"?([A-Za-z0-9_.\-]+)"?,?\s*$""")
+_ENV_VALUE_RE = re.compile(
+    r"""^(?P<head>[\s\-]*"?value"?\s*:\s*)(?P<value>\S.*?)(?P<trail>,?\s*)$"""
+)
+
+# The same pair collapsed onto one line, which is what `-o json | jq -c` gives.
+_ENV_PAIR_INLINE_RE = re.compile(
+    rf"""(?ix)
+    (?P<head>"name"\s*:\s*"(?:[A-Za-z0-9]+[_.\-])*(?:{_SECRET_KEY_WORDS})"
+        \s*,\s*"value"\s*:\s*")
+    [^"]*
+    (?P<tail>")
+    """
+)
+
+
+def _redact_env_value_pairs(text: str) -> str:
+    """Blank a `value:` whose `name:` names a credential.
+
+    A line scan rather than a YAML parse for the same reason as the block scan
+    above: an excerpt is a fragment, not a document. `name:` both arms and
+    disarms, so a `valueFrom.secretKeyRef` block's inner `name: hf-creds`
+    disarms before any `value:` is reached, and an excerpt that begins partway
+    through an item — no `name:` line at all — never arms.
+
+    Indentation closes the pair, as it does for a `data:` block. An env
+    variable's `value:` sits at or below its `name:`, so anything that
+    outdents past the `name:` has left the item — which keeps a Secret
+    *called* `hf-token` from arming some unrelated `value:` further down the
+    excerpt.
+    """
+    out: list[str] = []
+    armed_indent: int | None = None
+    for line in text.split("\n"):
+        indent = len(line) - len(line.lstrip())
+        name = _ENV_NAME_RE.match(line)
+        if name:
+            armed_indent = indent if _CREDENTIAL_NAME_RE.match(name.group(1)) else None
+            out.append(line)
+            continue
+        value = _ENV_VALUE_RE.match(line)
+        if value:
+            if armed_indent is not None and indent >= armed_indent:
+                armed_indent = None
+                out.append(f"{value.group('head')}{REDACTED}{value.group('trail')}")
+                continue
+            armed_indent = None
+        elif line.strip() and armed_indent is not None and indent <= armed_indent:
+            armed_indent = None
+        out.append(line)
+    return "\n".join(out)
+
+
+def _blank_named_value(match: re.Match[str]) -> str:
+    """Replace a credential-named field's value, keeping the name visible.
+
+    The name survives so the reader knows what was hidden — including the
+    prefix, since `[redacted]` under a bare `TOKEN:` would misname the variable
+    the finding is about.
+    """
+    if _NON_SECRET_VALUE_RE.match(match.group("value")):
+        return match.group(0)
+    lead, key, sep, trail = (match.group(g) for g in ("lead", "key", "sep", "trail"))
+    return f"{lead}{key}{sep}{REDACTED}{trail}"
+
+
 def redact_secrets(text: str | None) -> str:
     """Strip high-confidence credential shapes out of model-authored text.
 
-    The five governance SOPs tell the model never to paste a Secret's `data:`,
+    The six governance SOPs tell the model never to paste a Secret's `data:`,
     a token, or a private key into evidence, and promise this backstop for when
-    it does anyway. It is deliberately conservative: it fires on a *named* field,
-    a self-identifying token prefix, or a PEM header — never on bare base64,
-    because audit evidence legitimately contains base64 and long opaque
-    identifiers, and over-redaction destroys the artifact's whole purpose.
+    it does anyway. Six shapes: a PEM body, a `data:`/`stringData:` payload, an
+    environment variable whose *name* is a credential, a *named* field with a
+    value on the same line, an `Authorization:` header, and a self-identifying
+    token prefix.
+
+    It is deliberately conservative — never bare base64, never a boolean, never
+    an absolute path — because audit evidence legitimately contains base64 and
+    long opaque identifiers, and over-redaction destroys the artifact's whole
+    purpose.
 
     A backstop, not a licence. Anything that reaches here has already been
     written into a file on disk.
@@ -558,10 +689,9 @@ def redact_secrets(text: str | None) -> str:
         return ""
     out = _PEM_RE.sub(rf"\1\n{REDACTED}\n\3", str(text))
     out = _redact_secret_blocks(out)
-    out = _SECRET_KEY_RE.sub(
-        lambda m: f"{m.group('lead')}{m.group('key')}{m.group('sep')}{REDACTED}{m.group('trail')}",
-        out,
-    )
+    out = _redact_env_value_pairs(out)
+    out = _ENV_PAIR_INLINE_RE.sub(rf"\g<head>{REDACTED}\g<tail>", out)
+    out = _SECRET_KEY_RE.sub(_blank_named_value, out)
     out = _BEARER_RE.sub(rf"\1 {REDACTED}", out)
     return _TOKEN_SHAPE_RE.sub(REDACTED, out)
 
@@ -1472,9 +1602,14 @@ def coverage_gaps(data: dict) -> list[str]:
     gaps: list[str] = []
     for entry in scope.get("skipped") or []:
         cluster = str(entry.get("cluster", "")).strip() or "(unnamed)"
-        gaps.append(f"{cluster}: not audited — {entry.get('reason', 'no reason given')}")
+        # Redacted here rather than at render time, unlike every other piece of
+        # model-authored text. These strings leave by two doors: the renderer,
+        # which redacts, and the run-summary JSON on stdout — which the agent
+        # reads back and relays into chat, and which never sees a cell.
+        reason = redact_secrets(entry.get("reason", "no reason given"))
+        gaps.append(f"{cluster}: not audited — {reason}")
     for cluster in scope.get("clusters") or []:
-        limitation = str(cluster.get("limitations", "")).strip()
+        limitation = redact_secrets(cluster.get("limitations", "")).strip()
         ran = set(checks_ran(cluster))
         na = set(checks_na(cluster))
         applicable = [check for check in roster if check not in na]
@@ -4563,7 +4698,7 @@ def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
 
     The lease is the audit id, which makes the path deterministic across the
     two invocations of a run: `start` and `finish` are separate processes and
-    must land in the same tree. It also gives each of the five streams a tree of
+    must land in the same tree. It also gives each of the six streams a tree of
     its own, so two whose schedules collide no longer interleave `checkout -B`,
     `add` and `push` in one working directory. `validate_audit_id` has already
     constrained the id to a closed enum, so it is a safe path segment by

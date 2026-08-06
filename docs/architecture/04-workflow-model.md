@@ -208,17 +208,17 @@ polling to notice things. Proactivity is driven, in order of preference:
    bounds worst-case detection latency. It is the last resort, not the primary mechanism, because a poll
    lags a fast-moving problem and burns cycles when nothing changed.
 
-The Platform Agent already ships **10 governance jobs** (`agents/platform/cron/jobs.json`) mapped to SOPs
+The Platform Agent already ships **11 governance jobs** (`agents/platform/cron/jobs.json`) mapped to SOPs
 in `agents/platform/governance/`; these are the cron (scheduled-push) tier, and reactive concerns should
 migrate to event triggers rather than new poll loops:
 
-| Cadence      | Jobs (examples)                                                         |
-| ------------ | ----------------------------------------------------------------------- |
-| Hourly       | Policy propagation, global capacity orchestration                       |
-| Every 30 min | GitHub issue resolver                                                   |
-| Daily        | Blueprint sync, cost analysis, security patch scan, obtainability audit |
-| Weekly       | Compliance audit, standardization validator                             |
-| Monthly      | Lifecycle / deprecation manager                                         |
+| Cadence      | Jobs (examples)                                                                        |
+| ------------ | -------------------------------------------------------------------------------------- |
+| Hourly       | Policy propagation, global capacity orchestration                                      |
+| Every 30 min | GitHub issue resolver                                                                  |
+| Daily        | Compliance audit, obtainability audit, AI workload security audit, blueprint sync      |
+| Weekly       | Security patch scan, cost analysis, fleet consistency drift, standardization validator |
+| Monthly      | Lifecycle / deprecation manager                                                        |
 
 The heartbeat pattern (`INSTALL.md §3`): read the relevant SOP → run due checks → update
 heartbeat state → if healthy respond `NO_REPLY`, else surface concise blockers. **Anything the
@@ -240,7 +240,7 @@ subsets:
 
 | Tier                           | Proactive jobs (scoped to its authority; event-triggered, cron, or heartbeat-swept)                                                                                                                      | Not run here (owned by a higher tier)                                                                                         |
 | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| **Platform** (fleet)           | All 10 governance jobs above                                                                                                                                                                             | —                                                                                                                             |
+| **Platform** (fleet)           | All 11 governance jobs above                                                                                                                                                                             | —                                                                                                                             |
 | **Cluster Admin** (cluster)    | Cluster capacity / node health; security patch scan (its cluster); compliance audit (cluster-policy conformance); standardization validator (config vs. blueprint); deploy/drift detection (its cluster) | Policy propagation, lifecycle/deprecation, blueprint sync (authoring), fleet cost, obtainability audit, GitHub issue resolver |
 | **Developer Team** (namespace) | Workload health / reliability; workload security posture; cost / right-sizing; drift detection — all **its namespace only**                                                                              | Everything cluster- and fleet-level                                                                                           |
 

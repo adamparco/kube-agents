@@ -80,11 +80,11 @@ if [ -n "$WRONG_GO" ]; then
 fi
 
 # --- fleet-audit finding id pattern ---------------------------------------
-# Ground truth: FINDING_ID_RE in the fleet-audit harness. Seven documents quote
-# this pattern back to the model — SKILL.md, the five governance SOPs, and the
-# design doc — and an id that does not match is rejected before anything is
-# published. When the pattern was last relaxed, all seven copies silently went
-# stale, so the docs told the model to generate ids the validator refused.
+# Ground truth: FINDING_ID_RE in the fleet-audit harness. Two documents quote
+# this pattern back to the model — SKILL.md and the ledger design doc — and an
+# id that does not match is rejected before anything is published. When the
+# pattern was last relaxed, every copy silently went stale, so the docs told
+# the model to generate ids the validator refused.
 AUDIT_SCRIPT=agents/platform/skills/fleet-audit/scripts/audit_report.py
 if [ ! -f "$AUDIT_SCRIPT" ]; then
   echo "ERROR: ${AUDIT_SCRIPT} not found; the finding-id guard cannot run." >&2
@@ -182,7 +182,7 @@ cap_guard() {
 
 for CONSTANT in MAX_EXCERPT_LINES MAX_EXCERPT_CHARS MAX_COMMAND_CHARS \
   MAX_BODY_CHARS BODY_BUDGET MAX_SCOPE_ROWS AUTO_PROMOTION_CAP MIN_NA_REASON_CHARS \
-  MIN_CHECK_COMMAND_CHARS; do
+  MAX_CELL_CHARS MIN_CHECK_COMMAND_CHARS; do
   if ! spellings "$CONSTANT" > /dev/null; then
     echo "ERROR: could not read ${CONSTANT} from ${AUDIT_SCRIPT}." >&2
     exit 1
@@ -244,11 +244,36 @@ cap_guard \
 # eight characters"; the ledger design writes it "shorter than eight
 # characters". Both spellings are in the probe so the ledger is covered too, and
 # the subject word keeps this distinct from the reason floor above, so the two
-# cannot satisfy each other.
+# cannot satisfy each other. This probe subsumes the bare "anything under" form,
+# so the audit stream's narrower copy of the same guard is not carried alongside
+# it — two guards on one cap would report every drift twice.
 cap_guard \
   '(anything under|shorter than) [a-z0-9]+ characters' \
   "(anything under|shorter than) $(spellings MIN_CHECK_COMMAND_CHARS) characters" \
   "Documented check-command floor does not match MIN_CHECK_COMMAND_CHARS in ${AUDIT_SCRIPT}."
+
+# The coverage-table clip is quoted twice in the same breath — once as the
+# instruction ("keep this command short") and once as the consequence ("the
+# harness clips every cell") — so both spellings get a probe. A document that
+# corrected one and not the other would teach a length the renderer disagrees
+# with, which is the whole failure mode.
+cap_guard \
+  'command short .{1,3} under [0-9,]+ characters' \
+  "command short .{1,3} under $(spellings MAX_CELL_CHARS) characters" \
+  "Documented coverage-command length does not match MAX_CELL_CHARS in ${AUDIT_SCRIPT}."
+
+cap_guard \
+  'clips every cell at [0-9,]+' \
+  "clips every cell at $(spellings MAX_CELL_CHARS)" \
+  "Documented table-cell clip does not match MAX_CELL_CHARS in ${AUDIT_SCRIPT}."
+
+# `evidence.command` is the roomy field, and the SOPs contrast it against the
+# cell clip above. Anchored on "allowed", since "command to 2,000" already has
+# its own guard and the two idioms must not satisfy each other.
+cap_guard \
+  'allowed [0-9,]+ characters' \
+  "allowed $(spellings MAX_COMMAND_CHARS) characters" \
+  "Documented evidence.command budget does not match MAX_COMMAND_CHARS in ${AUDIT_SCRIPT}."
 
 # --- fleet-audit cron prompts ---------------------------------------------
 # Ground truth: the prompts in the cron manifest. Two site pages quote the
