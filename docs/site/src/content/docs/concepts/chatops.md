@@ -84,7 +84,7 @@ On a fresh install the first chat interaction gets a guided onboarding instead o
 
 The `bootstrap_onboarding` plugin (enabled in `agents/chat/config.yaml`) hooks the first human turn: it greets the user, binds the delivery job to that chat thread, and marks that a human is present. Once the report is delivered, the flow marks itself complete and removes its own jobs — it never runs again on that data volume.
 
-Both jobs tick every minute while the work they guard takes minutes, so each stage records its own marker the moment it acts rather than inferring from the report or from completion. The full design, state markers, and maintenance rules live in the plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/bootstrap_onboarding/README.md).
+Both jobs are on a one-minute interval — in practice a minute or two, see [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/#what-fires-the-schedule) — while the work they guard takes minutes, so each stage records its own marker the moment it acts rather than inferring from the report or from completion. The full design, state markers, and maintenance rules live in the plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/bootstrap_onboarding/README.md).
 
 ## What's not here
 
