@@ -448,11 +448,12 @@ Corollaries:
   reviewer sees the rest, under their own credentials.
 
   The harness redacts high-confidence credential shapes as a backstop — a `data:`/`stringData:`
-  block, a field named like a secret, a self-identifying token prefix, a PEM header, an
+  block, an environment variable whose name ends in a credential word, a field named like a secret
+  carrying a value on the same line, a self-identifying token prefix, a PEM header, an
   `Authorization:` value — replacing them with `[redacted by audit_report.py]`. It is deliberately
-  conservative and **does not** touch bare base64, because legitimate audit output is full of it.
-  Treat the backstop as a seatbelt, not a licence: it will not catch a credential that looks like
-  ordinary output.
+  conservative and **does not** touch bare base64, a boolean, or an absolute path, because
+  legitimate audit output is full of all three. Treat the backstop as a seatbelt, not a licence: it
+  will not catch a credential that looks like ordinary output.
 
 - Report what the command showed, not what you infer it implies. Inference belongs in `impact`.
 - One finding per object. Do not roll up "12 namespaces lack NetworkPolicies" into one finding — each

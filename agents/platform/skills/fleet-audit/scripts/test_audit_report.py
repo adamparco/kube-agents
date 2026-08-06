@@ -2675,8 +2675,9 @@ class TestAiSecurityAuditStream(BaseTestCase):
     run this watchdog actually makes most days: a fleet where most clusters
     serve no models at all. That is not a partial audit and not a pile of
     inapplicable checks; the six filters ran against the workload dump and
-    matched nothing. The two tests below pin both halves — the honest document
-    publishes, and the shape the SOP originally prescribed does not.
+    matched nothing. The tests below pin both halves — the honest document
+    publishes, and the shape the SOP originally prescribed does not — then the
+    roster's rendering, and the one thing this stream must never publish.
     """
 
     STREAM = "ai-security-audit"
@@ -2780,6 +2781,50 @@ class TestAiSecurityAuditStream(BaseTestCase):
             self.assertIn(f"`{check}`", self.out)
         self.assertIn("| 6/6 |", self.out)
         self.assertNotIn("n/a", self.out)
+
+    def test_the_check_that_hunts_credentials_cannot_publish_one(self):
+        """The credential does not reach the ledger, whatever the model pastes.
+
+        The SOP tells the model to write `HF_TOKEN is set with a literal
+        value: (contents withheld)` and never the value. This is the run where
+        it pasted the pod spec instead — the case the backstop exists for, and
+        the case it used to wave through, because `HF_TOKEN` reads as ordinary
+        output to a pattern anchored on the bare word `token`.
+        """
+        secret = "9f8e7d6c5b4a3928170695"
+        doc = make_doc(
+            audit=self.STREAM,
+            findings=[
+                make_finding(
+                    fid="model-credential-plaintext-env",
+                    check="model-credential-plaintext-env",
+                    severity="major",
+                    title="HF_TOKEN is set with a literal value",
+                    namespace="serving",
+                    obj="Deployment/llama-serve",
+                    command=(
+                        "kubectl --context gke_acme_us-east1_prod-us-east -n serving "
+                        "get deployment llama-serve -o json"
+                    ),
+                    excerpt=f"        - name: HF_TOKEN\n          value: {secret}",
+                    remediation={
+                        "kind": "manual",
+                        "note": "Rotate the token, then move it to a Secret.",
+                    },
+                )
+            ],
+            clusters=[self.model_free()],
+        )
+
+        self.patch_attr("run_cmd", Recorder())
+        self.assertEqual(
+            self.run_finish(doc, argv_extra=("--dry-run",), audit=self.STREAM), 0, self.err
+        )
+        self.assertNotIn(secret, self.out)
+        self.assertNotIn(secret, self.err)
+        # The variable is the finding. Only its value goes.
+        self.assertIn("HF_TOKEN", self.out)
+        self.assertIn(audit_report.REDACTED, self.out)
 
 
 # --------------------------------------------------------------------------- #
@@ -4830,6 +4875,112 @@ class TestRedaction(unittest.TestCase):
         out = audit_report.redact_secrets("password: hunter2correcthorse")
         self.assertTrue(out.startswith("password: "))
 
+    def test_a_credential_field_carrying_a_prefix_is_blanked(self):
+        """The spellings a real workload uses, all of which used to publish.
+
+        Anchored on the bare word, this pattern blanked `api_key=` and let
+        `HF_TOKEN=` through — and a prefix is the normal case, not the exotic
+        one. The prefix has to survive into the output with the key: a
+        `[redacted]` sitting under a bare `TOKEN:` misnames the variable the
+        finding is about.
+        """
+        for line, name in (
+            ("HF_TOKEN=hf_notARealTokenNotARealToken", "HF_TOKEN="),
+            ("OPENAI_API_KEY=notARealKeyNotARealKey", "OPENAI_API_KEY="),
+            ("AWS_SECRET_ACCESS_KEY=notARealKeyNotAReal", "AWS_SECRET_ACCESS_KEY="),
+            ("  db_password: hunter2correcthorse", "db_password: "),
+            ("x-goog-api-key: notARealKeyNotARealKey", "x-goog-api-key: "),
+        ):
+            with self.subTest(line=line):
+                out = audit_report.redact_secrets(line)
+                self.assertIn(audit_report.REDACTED, out)
+                self.assertIn(name, out)
+
+    def test_an_environment_pair_hides_the_value_and_keeps_the_variable(self):
+        """`model-credential-plaintext-env` finds exactly this shape.
+
+        Which makes it the shape most likely to arrive here carrying a live
+        credential — and the one the key-name scan structurally cannot see,
+        since `value` names nothing and `name` carries nothing. The payload is
+        deliberately opaque rather than a recognisable token prefix, so this
+        proves the pair rule fired and not the token-shape one.
+        """
+        secret = "9f8e7d6c5b4a3928170695"
+        for excerpt, name in (
+            (f"- name: HF_TOKEN\n  value: {secret}", "HF_TOKEN"),
+            (f'  "name": "OPENAI_API_KEY",\n  "value": "{secret}"', "OPENAI_API_KEY"),
+            (f'{{"name":"HF_TOKEN","value":"{secret}"}}', "HF_TOKEN"),
+        ):
+            with self.subTest(excerpt=excerpt):
+                out = self.assertRedacted(excerpt, secret)
+                self.assertIn(name, out)
+
+    def test_a_name_that_only_points_at_a_credential_is_left_alone(self):
+        # The AI security SOP draws this line itself, telling the model not to
+        # flag `HF_TOKEN_PATH` or `OPENAI_API_KEY_FILE`: a name whose last
+        # segment is `PATH`, `FILE` or `NAME` says where a credential is kept,
+        # and that is the fact the finding exists to publish.
+        for benign in (
+            "- name: TOKEN_PATH\n  value: /var/run/secrets/hf/token",
+            "- name: SECRET_NAME\n  value: hf-creds",
+            "- name: MODEL_NAME\n  value: llama-3-70b",
+            "- name: HF_TOKEN\n  valueFrom:\n    secretKeyRef:\n"
+            "      name: hf-creds\n      key: token",
+        ):
+            with self.subTest(benign=benign):
+                self.assertEqual(audit_report.redact_secrets(benign), benign)
+
+    def test_an_object_named_after_a_credential_does_not_arm_the_next_value(self):
+        # `hf-token` is a perfectly ordinary Secret name, and the `name:` that
+        # carries it is a metadata field rather than half of an env pair. What
+        # separates the two is indentation: the env variable's `value:` sits
+        # under its `name:`, and this one outdents past it first.
+        benign = (
+            "metadata:\n"
+            "  name: hf-token\n"
+            "spec:\n"
+            "  replicas: 2\n"
+            "  value: 3"
+        )
+        self.assertEqual(audit_report.redact_secrets(benign), benign)
+
+    def test_a_boolean_or_a_path_is_not_a_credential_however_it_is_named(self):
+        # `gcloud container clusters describe` is full of both, and the prefix
+        # allowance is what newly reaches them.
+        for benign in (
+            "workload_identity_auth: enabled",
+            "gke_auth: false",
+            "GOOGLE_APPLICATION_CREDENTIALS=/var/secrets/google/key.json",
+            "HF_TOKEN_PATH=/var/run/hf/token",
+        ):
+            with self.subTest(benign=benign):
+                self.assertEqual(audit_report.redact_secrets(benign), benign)
+
+    def test_a_credential_in_a_limitations_note_never_reaches_the_run_summary(self):
+        """Gap strings leave by two doors and only one of them redacts.
+
+        Every other piece of model-authored text is redacted by the renderer,
+        on its way into a cell. `coverage_gaps` output also goes out in the
+        run-summary JSON on stdout — which the agent reads back and relays into
+        chat — and to the pod log, neither of which is a cell.
+        """
+        secret = "hf_notARealTokenNotARealTokenNot"
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {
+                    "name": "prod-us-east",
+                    "location": "us-east1",
+                    "project": "acme-prod",
+                    "checks_run": [],
+                    "limitations": f"Read with a static kubeconfig ({secret})",
+                }
+            ],
+        )
+        gaps = audit_report.coverage_gaps(doc)
+        self.assertTrue(gaps)
+        self.assertNotIn(secret, "\n".join(gaps))
+
     def test_a_secret_payload_block_is_blanked_whatever_the_keys_are_called(self):
         out = self.assertRedacted(
             "apiVersion: v1\nkind: Secret\ndata:\n  benign-name: c3VwZXJzZWNyZXQ=\n"
@@ -4861,6 +5012,10 @@ class TestRedaction(unittest.TestCase):
             "github_pat_11ABCDEFG0123456789abcdef",
             "ya29.a0ARrdaM9abcdefghijklmnop",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
+            # The three an AI workload carries.
+            "hf_notARealTokenNotARealTokenNot",
+            "sk-notARealKeyNotARealKeyNotARealKey",
+            "nvapi-notARealKeyNotARealKeyNotARealKey",
         ):
             with self.subTest(secret=secret):
                 self.assertRedacted(f"log line before {secret} and after", secret)
@@ -4879,6 +5034,14 @@ class TestRedaction(unittest.TestCase):
             "image: gcr.io/acme/api@sha256:3f5b1c2d4e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
             "sizeGb: 500",
             "c3VwZXJzZWNyZXQK",
+            # The excerpt the AI security SOP prescribes for the credential
+            # check, verbatim. A rule keyed on `value:` anywhere after a
+            # credential word would blank the SOP's own worked example and
+            # leave it describing output no reader will ever see.
+            "HF_TOKEN is set with a literal value: (contents withheld)",
+            "secretName: tls-cert",
+            "topologyKey: kubernetes.io/hostname",
+            "gcloud container clusters get-credentials failed: permission denied",
         ):
             with self.subTest(benign=benign):
                 self.assertEqual(audit_report.redact_secrets(benign), benign)

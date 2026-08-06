@@ -847,10 +847,11 @@ New:
   so where the fields are written.
 - **Never put a credential in `evidence.excerpt`.** No Secret `data:` or `stringData:` block, no
   token, no password, no private key. The SOPs say this to the model; `audit_report.py` also
-  enforces it on the way out, replacing a `data:` block, a secret-named field, a self-identifying
-  token prefix, a PEM header, or an `Authorization:` value with `[redacted by audit_report.py]`. The
-  backstop exists because the ledger is a public artefact and one leaked excerpt cannot be recalled;
-  it is a backstop and not a licence, since it cannot recognise bare base64.
+  enforces it on the way out, replacing a `data:` block, an environment variable whose name ends in
+  a credential word, a secret-named field, a self-identifying token prefix, a PEM header, or an
+  `Authorization:` value with `[redacted by audit_report.py]`. The backstop exists because the
+  ledger is a public artefact and one leaked excerpt cannot be recalled; it is a backstop and not a
+  licence, since it cannot recognise bare base64.
 
 ## 10. Work breakdown
 
