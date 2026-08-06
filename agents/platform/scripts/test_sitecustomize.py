@@ -12,6 +12,7 @@ without it.
 """
 
 import importlib
+import importlib.util
 import os
 import subprocess
 import sys
@@ -24,7 +25,24 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-import sitecustomize  # noqa: E402
+# Loaded by path rather than by name, because `import sitecustomize` cannot
+# reach this one. CPython's `site.py` imports whatever `sitecustomize` it finds
+# at interpreter startup, before any test code runs, so `sys.modules` is
+# already bound by the time the `sys.path.insert` above happens. Debian and
+# Ubuntu ship their own at `/usr/lib/python3.N/sitecustomize.py` — including on
+# `ubuntu-latest`, where `.github/workflows/k8s-operator-test.yml` runs
+# `make -C k8s-operator test` against the system interpreter with no
+# `actions/setup-python` step. The plain import bound that module and every
+# test here failed with `AttributeError: no attribute 'install_hook'`.
+#
+# Loading by path also removes the quieter half of the hazard: had the system
+# module happened to export these names, the suite would have exercised the
+# wrong module and passed.
+_spec = importlib.util.spec_from_file_location(
+    "_repo_sitecustomize", SCRIPTS_DIR / "sitecustomize.py"
+)
+sitecustomize = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(sitecustomize)
 
 
 class InstallHookRegistrationTest(unittest.TestCase):
