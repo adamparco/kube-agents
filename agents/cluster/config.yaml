@@ -7,9 +7,10 @@
 #
 # Scoping vs the Platform Agent:
 #   - Only the read-only `gke` MCP + `developer_knowledge` are exposed.
-#   - The `platform_control` (provisioning/Config-Connector) and `agent_common`
-#     (A2A) MCP servers are intentionally omitted — a Cluster Agent diagnoses,
-#     it does not provision or delegate.
+#   - The `platform_control` (provisioning/Config-Connector) MCP server is
+#     intentionally omitted — a Cluster Agent diagnoses, it does not provision.
+#     Nor does it delegate, but nothing has to be withheld for that any more:
+#     the `agent_common` A2A server is no longer declared for any profile.
 #   - KUBECONFIG is pinned to the target cluster at scaffold time by
 #     cluster_agent_profile.py, which writes `KUBECONFIG=<home>/kubeconfig.yaml`
 #     into the profile's `.env`. A dispatcher-spawned worker (`hermes -p <name>`)
@@ -36,7 +37,7 @@ mcp_servers:
       - "https://container.googleapis.com/mcp"
 
 # Explicitly list platform_toolsets (reserved Hermes key) to bypass the upstream
-# loader prefix-mapping bug. Scoped: no mcp-platform_control, no mcp-agent_common.
+# loader prefix-mapping bug. Scoped: no mcp-platform_control.
 platform_toolsets:
   cli:
     - hermes-cli

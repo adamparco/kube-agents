@@ -40,7 +40,7 @@ The `gke` MCP server proxies to Google's remote MCP endpoint for GKE, so cluster
 - `cli` — used by the Hermes CLI (interactive terminal usage).
 - `api_server` — used by the Hermes REST API (Chat, external callers).
 
-Both include `hermes-cli`/`hermes-api-server` plus `mcp-agent_common`, `mcp-platform_control`, `mcp-developer_knowledge`, and `mcp-gke`.
+Both include `hermes-cli`/`hermes-api-server` plus `mcp-platform_control`, `mcp-developer_knowledge`, and `mcp-gke`.
 
 ### Toolsets (kanban)
 

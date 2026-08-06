@@ -6,11 +6,25 @@ model:
   api_key: none
 
 # MCP Servers configuration.
+#
+# `agent_common` (the `call_agent` A2A tool) was declared here and is not any
+# more. It could not work in this deployment and never had: the agent container
+# holds API_SERVER_KEY="cluster-internal-trusted", the non-secret loopback
+# sentinel, while the Service URL the tool targets
+# (https://platform-agent…:8642) forwards to the credential sidecar's plaintext
+# agent-API listener on 8643, which authenticates against the real
+# API_SERVER_EXTERNAL_KEY it alone holds. So the request failed the TLS
+# handshake, and would have been refused as unauthenticated had it completed.
+# Making it work would mean putting the external key in the agent container,
+# collapsing a split the operator's own tests pin.
+#
+# Removed rather than repaired for the reason `ask_agent` was removed before it
+# (agents/chat/config.yaml, and renderConfigYAML in the operator): a
+# synchronous cross-agent call blocks up to 300s with no visible progress.
+# Delegation here is kanban-only. agent_common_server.py stays on disk —
+# platform_mcp_server.py and session_kv_server.py import helpers from it — so
+# only the tool surface is gone.
 mcp_servers:
-  agent_common:
-    command: "/opt/hermes/.venv/bin/python3"
-    args:
-      - "/opt/data/scripts/agent_common_server.py"
   developer_knowledge:
     command: "node"
     args:
@@ -31,12 +45,10 @@ mcp_servers:
 platform_toolsets:
   cli:
     - hermes-cli
-    - mcp-agent_common
     - mcp-developer_knowledge
     - mcp-gke
   api_server:
     - hermes-api-server
-    - mcp-agent_common
     - mcp-developer_knowledge
     - mcp-gke
 

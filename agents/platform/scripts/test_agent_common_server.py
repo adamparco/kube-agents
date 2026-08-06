@@ -1,3 +1,15 @@
+"""Credential handling in agent_common_server.
+
+The module's one tool, `call_agent`, is no longer mounted — no profile declares
+the `agent_common` MCP server (see the note above `mcp_servers` in
+deploy/shared/defaults/config.yaml). The module itself stays, because
+platform_mcp_server and session_kv_server import helpers from it, and so does
+this contract: resolve_agent_credentials must fail closed on an unconfigured
+key rather than authenticate as a guessable literal. That is the property any
+future synchronous delegation path would have to keep, and the reason the tool
+failed the way it did rather than reaching the network with a bad key.
+"""
+
 import importlib
 import os
 import sys

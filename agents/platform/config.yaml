@@ -14,6 +14,13 @@ mcp_servers:
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
+      # platform_mcp_server.py resolves the session-KV database from this, and
+      # its code default happens to equal the value the operator sets on the
+      # container, so leaving it undeclared has been harmless. Declared so the
+      # two cannot drift apart in silence: the child receives only what this
+      # block names, so if the operator's path ever moves, an undeclared
+      # variable would leave the server reading a database nothing writes.
+      SESSION_KV_DB_PATH: "${SESSION_KV_DB_PATH}"
   gke:
     command: "node"
     args:
@@ -22,16 +29,20 @@ mcp_servers:
 
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.
+#
+# These lists are UNIONED with the shared defaults', not replaced —
+# deploy/docker/merge_configs.py merges two lists as
+# `list(dict.fromkeys(a + b))`. So an entry removed here but left in
+# deploy/shared/defaults/config.yaml comes back at image build. Both copies of
+# `mcp-agent_common` had to go; see the note above that file's `mcp_servers`.
 platform_toolsets:
   cli:
     - hermes-cli
-    - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
   api_server:
     - hermes-api-server
-    - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
