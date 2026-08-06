@@ -25,16 +25,29 @@ model:
 # platform_mcp_server.py and session_kv_server.py import helpers from it — so
 # only the tool surface is gone.
 mcp_servers:
+  # Remote MCP endpoints, proxied over stdio by mcp-remote. Both carry an
+  # explicit timeout because the unset default is 300s and these calls can fail
+  # in a way that never returns: when the remote answers non-2xx, mcp-remote
+  # logs the transport rejection and drops the request id instead of replying,
+  # so the client waits out its full deadline. Task t_b9544b00 spent 300.0s that
+  # way on a single list_clusters, and a sibling tool call in the same batch sat
+  # finished and unused for the duration. deploy/docker/Dockerfile patches the
+  # proxy to answer instead of hanging; this bounds the damage if that patch
+  # ever stops applying. Healthy calls to these endpoints measure 0.47-0.48s.
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://developerknowledge.googleapis.com/mcp"
+    connect_timeout: 30
+    timeout: 60
   gke:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://container.googleapis.com/mcp"
+    connect_timeout: 30
+    timeout: 60
 
 # Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
 # platform_toolsets is a reserved framework key in Hermes. Other reserved top-level keys
@@ -51,6 +64,27 @@ platform_toolsets:
     - hermes-api-server
     - mcp-developer_knowledge
     - mcp-gke
+
+# Turn off Hermes' Python-toolchain probe. It is both wrong here and expensive.
+#
+# Wrong: on the common path it publishes "Python toolchain: python3=missing,
+# pip=missing, uv=installed." into the system prompt while python3 is present at
+# 3.13.5 — observed verbatim in 20 live platform sessions. Even when it reports
+# accurately it is telling an agent in an immutable sandbox about a pip it must
+# never use and a venv it must never create.
+#
+# Expensive: the probe spawns four Python interpreters per session to discover
+# that fixed state, and agent/system_prompt.py blocks the prompt build on the
+# result for up to 10s. Under gVisor, where a bare interpreter start measures
+# ~1s, that is the single largest avoidable item on the cold-start path, and
+# kanban pays it again for every card.
+#
+# agent/agent_init.py reads this key (default True) and agent/system_prompt.py
+# gates the prompt line on it. Set on every profile that ships a config: this
+# file feeds only the platform template, because the Chat Agent and Cluster
+# Agent configs are copied verbatim rather than merged (see deploy/docker/Dockerfile).
+agent:
+  environment_probe: false
 
 # Approval settings. Allow dangerous commands to execute autonomously in cron watchdogs.
 approvals:

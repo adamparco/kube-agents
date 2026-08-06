@@ -121,8 +121,17 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "dispatch_interval_seconds: 5") {
 		t.Errorf("expected kanban dispatch_interval_seconds pinned to 5, got:\n%s", yamlContent)
 	}
+	if !strings.Contains(yamlContent, "wake_on_events:") {
+		t.Errorf("expected kanban wake_on_events to be rendered, got:\n%s", yamlContent)
+	}
 	if !strings.Contains(yamlContent, "disabled_toolsets:") {
 		t.Errorf("expected default profile to disable runtime toolsets, got:\n%s", yamlContent)
+	}
+	// This rendered file is mounted over whatever the image shipped, so the
+	// matching key in agents/chat/config.yaml is not enough on its own — the
+	// value has to survive the render or the probe comes back on in the cluster.
+	if !strings.Contains(yamlContent, "environment_probe: false") {
+		t.Errorf("expected the Python-toolchain probe pinned off, got:\n%s", yamlContent)
 	}
 	// The front door must NOT hold privileged/runtime tools — those live in the
 	// separate platform/cluster profiles, not the default (chat) profile.
@@ -2873,6 +2882,44 @@ func TestRenderConfigYAMLMaxInProgressFromTuning(t *testing.T) {
 	// The rest of the kanban block must survive the opt-in.
 	if fmt.Sprint(kanban["dispatch_interval_seconds"]) != "5" {
 		t.Errorf("dispatch_interval_seconds = %v, want 5", kanban["dispatch_interval_seconds"])
+	}
+}
+
+// The front door is woken for a follow-up turn only by terminal events it can
+// actually act on. `completed` is not one of them: the notifier has already
+// delivered the worker's summary to the thread, so waking on it buys a model
+// turn that paraphrases a message the user is looking at (5.9s / 32,460 input
+// tokens, measured on t_c31a1f00). The failure kinds deliver a bare status line
+// and do need a decision, so they must stay.
+//
+// The key is only honoured because deploy/docker/patches/kanban_wake_kinds.py
+// patches it in — upstream Hermes hardcodes the set. If that patch is ever
+// dropped, this config becomes inert rather than wrong, but the pairing is why
+// both sides are asserted.
+func TestDefaultProfileWakesOnFailuresOnly(t *testing.T) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	kanban, _ := parsed["kanban"].(map[string]any)
+	raw, ok := kanban["wake_on_events"].([]any)
+	if !ok {
+		t.Fatalf("wake_on_events = %v (%T), want a list", kanban["wake_on_events"], kanban["wake_on_events"])
+	}
+
+	got := make([]string, 0, len(raw))
+	for _, v := range raw {
+		got = append(got, fmt.Sprint(v))
+	}
+	want := []string{"gave_up", "crashed", "timed_out", "blocked"}
+	if !slices.Equal(got, want) {
+		t.Errorf("wake_on_events = %v, want %v", got, want)
+	}
+	for _, kind := range got {
+		if kind == "completed" {
+			t.Error("wake_on_events must not contain `completed`: the notifier has " +
+				"already delivered that summary, so the woken turn is pure overhead")
+		}
 	}
 }
 

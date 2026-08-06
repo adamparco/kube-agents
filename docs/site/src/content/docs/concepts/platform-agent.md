@@ -13,6 +13,7 @@ It runs as the `platform` Hermes profile in the agent pod, scaffolded at pod sta
 
 - **Automation first.** All infrastructure changes route through a declarative workflow — Git PRs, Config Connector, ArgoCD/Flux, whichever is active. The agent is explicitly forbidden from applying YAML directly for infrastructure lifecycle changes.
 - **Dynamic repository resolution.** On startup, the agent reads the target GitOps repo URL from `/opt/data/SETTINGS.md`. No hardcoded repo assumptions.
+- **Dynamic project resolution.** The agent reads its GCP project, location, and cluster from `$GKE_PROJECT_ID` / `$GKE_LOCATION` / `$GKE_CLUSTER_NAME`, which the operator injects from the `PlatformAgent` resource. No hardcoded project IDs — and never `-` in the project segment of a resource path, which GKE accepts only as the location wildcard.
 - **Continuous expertise.** The agent pulls the latest GitOps repo contents and maintains an expert-level understanding of every declarative definition in the fleet.
 - **Security through strict separation.** Tenant isolation is non-negotiable — namespaces, RBAC, `NetworkPolicy`, `ResourceQuota`. A workload is physically constrained to its allocated namespace.
 - **Least privilege.** The agent's Kubernetes identity is read-only and cannot read Secrets. Its GCP identity is governed by a provisioning-time permission set (`read-only` by default, with an opt-in `gke-admin` escalation) — see [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do) for exactly what is enforced on which plane.

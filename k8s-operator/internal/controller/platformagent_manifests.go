@@ -539,6 +539,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			// omitted unless spec.harness.tuning.default sets it, so the front
 			// door keeps the upstream default it has never needed more than.
 			MaxTurns int `json:"max_turns,omitempty"`
+			// Hermes' Python-toolchain probe, which this deployment always wants
+			// off — see the rationale in deploy/shared/defaults/config.yaml. No
+			// omitempty: upstream defaults the key to true, so `false` has to be
+			// written out to mean anything.
+			EnvironmentProbe bool `json:"environment_probe"`
 		} `json:"agent,omitempty"`
 		Kanban struct {
 			DispatchInGateway       bool `json:"dispatch_in_gateway"`
@@ -550,6 +555,13 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			// `max_in_progress: 0` would be both meaningless (Hermes ignores
 			// anything below 1) and misleading to anyone reading the ConfigMap.
 			MaxInProgress int `json:"max_in_progress,omitempty"`
+			// Terminal event kinds that wake the card's creator for a follow-up
+			// turn. Read by the image patch in
+			// deploy/docker/patches/kanban_wake_kinds.py; upstream Hermes
+			// hardcodes the set and ignores this key. omitempty so an unset
+			// value leaves upstream behaviour rather than emitting an empty
+			// list, which the patch reads as "never wake".
+			WakeOnEvents []string `json:"wake_on_events,omitempty"`
 		} `json:"kanban,omitempty"`
 		Approvals struct {
 			CronMode string `json:"cron_mode,omitempty"`
@@ -667,6 +679,17 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// dead wait to every delegation before the worker was even claimed. 5s matches
 	// the notifier watcher's cadence and makes delegation feel immediate.
 	cfg.Kanban.DispatchIntervalSeconds = 5
+	// Which terminal events wake the front door for a follow-up turn. Upstream
+	// wakes on all five and hardcodes the set; the image patches the key in
+	// (deploy/docker/patches/kanban_wake_kinds.py).
+	//
+	// `completed` is deliberately absent. By the time the notifier wakes anyone
+	// it has already sent the worker's own summary to the thread, so the woken
+	// turn re-reads the card and paraphrases a message the user is looking at —
+	// measured at 5.9s and 32,460 input tokens on task t_c31a1f00. The failure
+	// kinds stay: those deliver a bare status line, and the front door has to
+	// decide whether to retry, escalate, or explain.
+	cfg.Kanban.WakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
 	// Dispatch concurrency is NOT pinned here. Upstream leaves it unbounded, and that
 	// suits a fleet with headroom; capping it is a deployment decision, because every
 	// worker draws on the same model quota and the right number depends on how much
@@ -695,6 +718,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		"session_search", "project", "homeassistant", "discord",
 		"discord_admin", "spotify",
 	}
+	// Explicit rather than relying on the zero value: this is a deliberate
+	// override of an upstream default that is true, not an unset field.
+	cfg.Agent.EnvironmentProbe = false
+
 	// Execution limits are NOT pinned here: Hermes' own defaults apply unless a
 	// deployment opts in. What a given fleet needs depends on its model quota and on
 	// what its agents actually do, so the values belong in the CR rather than baked

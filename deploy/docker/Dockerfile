@@ -100,18 +100,77 @@ exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None"
     /opt/hermes/.venv/bin/python3 /tmp/verify_cron_run_scope.py && \
     rm /tmp/apply_cron_run_scope.py /tmp/verify_cron_run_scope.py
 
+# Perf: stop the notifier waking a card's creator for a completion it has
+# already delivered. On a terminal event the notifier both sends the worker's
+# summary to the thread AND injects a synthetic message that costs the creator a
+# full model turn — which then re-reads the card and paraphrases a message the
+# user is already looking at. Measured at 5.9s and 32,460 input tokens on task
+# t_c31a1f00. Upstream hardcodes the wake set with no config key; this makes it
+# read kanban.wake_on_events, defaulting to the upstream tuple.
+# See the module docstring in deploy/docker/patches/kanban_wake_kinds.py.
+COPY deploy/docker/patches/kanban_wake_kinds.py /opt/hermes/gateway/kanban_wake_kinds.py
+COPY deploy/docker/patches/apply_kanban_wake_kinds.py /tmp/apply_kanban_wake_kinds.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_wake_kinds.py /opt/hermes && \
+    grep -q '_wake_kinds = _wake_kinds_for(d\["events"\])' /opt/hermes/gateway/kanban_watchers.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
+from gateway.kanban_wake_kinds import DEFAULT_WAKE_KINDS, resolve_wake_kinds; \
+exit(1) if resolve_wake_kinds(lambda: {}) != DEFAULT_WAKE_KINDS else None; \
+exit(1) if resolve_wake_kinds(lambda: {'kanban': {'wake_on_events': ['crashed']}}) != ('crashed',) else None" && \
+    rm /tmp/apply_kanban_wake_kinds.py
+
+# Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
+# every lifecycle tool with _check_kanban_mode, which is true for any profile
+# carrying the kanban toolset — so the Chat Agent front door is shipped
+# kanban_complete/block/heartbeat/link/attach* on every call despite SOUL.md
+# §1.5 forbidding it from calling them. Hermes has no per-tool denylist, so the
+# 10,041 characters (~2,510 tokens) of schema cannot be dropped by config.
+# See the module docstring in deploy/docker/patches/kanban_worker_tools.py.
+COPY deploy/docker/patches/kanban_worker_tools.py /opt/hermes/tools/kanban_worker_tools.py
+# Also staged next to the applier: it imports WORKER_ONLY_TOOLS, and only the
+# script's own directory is on sys.path.
+COPY deploy/docker/patches/kanban_worker_tools.py /tmp/kanban_worker_tools.py
+COPY deploy/docker/patches/apply_kanban_worker_tools.py /tmp/apply_kanban_worker_tools.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_worker_tools.py /opt/hermes && \
+    test "$(grep -c 'check_fn=_check_kanban_worker_mode' /opt/hermes/tools/kanban_tools.py)" = "7" && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
+import os; \
+from tools.kanban_worker_tools import check_kanban_worker_mode; \
+exit(1) if check_kanban_worker_mode() else None; \
+os.environ['HERMES_KANBAN_TASK'] = 't_probe'; \
+exit(1) if not check_kanban_worker_mode() else None" && \
+    rm /tmp/apply_kanban_worker_tools.py /tmp/kanban_worker_tools.py
+
 
 # 3. Clone and build mcp-remote proxy. Git is a build-only dependency here;
 # the sandbox runtime exposes only the credential-proxy Git wrapper.
+#
+# The source is a fork, and deliberately so: it is the only build that speaks
+# Google ADC. Its commits ahead of upstream add `google-auth-library`, mint a
+# fresh bearer token per call (handling expiry), and attach the
+# `X-Goog-User-Project` header. Upstream geelen/mcp-remote has none of that, so
+# switching the clone URL to the official repository would break every GKE and
+# developer_knowledge MCP call. Do not "clean this up" without replacing the
+# auth path first.
+#
+# The SDK is pinned explicitly because the git SHA alone does not pin it. The
+# fork commits only a `pnpm-lock.yaml`, which `npm install` ignores, and
+# declares `^1.23.0`; with tsup's `external: []` the SDK is bundled into the
+# shipped chunk. Without this line the transport baked into the image is
+# whatever was latest on build day, so two builds of this same Dockerfile can
+# ship different error semantics (1.24.0 changed the thrown class).
+COPY deploy/docker/patches/apply_mcp_remote_forward_errors.py /tmp/apply_mcp_remote_forward_errors.py
 RUN apt-get update && apt-get install -y --no-install-recommends git && \
     git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
     cd /opt/mcp-remote && \
     git checkout 2ff8f16753d8c744e6982b99e6ed5ab62f44f311 && \
+    npm pkg set devDependencies.@modelcontextprotocol/sdk=1.30.0 && \
     npm install && \
+    /opt/hermes/.venv/bin/python3 /tmp/apply_mcp_remote_forward_errors.py /opt/mcp-remote && \
     npm run build && \
+    grep -q 'Failed to forward message to remote server' dist/*.js && \
     npm prune --production && \
     npm cache clean --force && \
-    rm -rf .git
+    rm -rf .git /tmp/apply_mcp_remote_forward_errors.py
 
 # 5. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
