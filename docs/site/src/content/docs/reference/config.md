@@ -28,6 +28,7 @@ mcp_servers:
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
+      SESSION_KV_DB_PATH: "${SESSION_KV_DB_PATH}"
   gke:
     command: "node"
     args:
@@ -37,13 +38,11 @@ mcp_servers:
 platform_toolsets:
   cli:
     - hermes-cli
-    - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
   api_server:
     - hermes-api-server
-    - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
@@ -56,6 +55,9 @@ platform_toolsets:
 # any other tools.
 toolsets:
   - kanban
+
+agent:
+  max_turns: 250
 
 memory:
   memory_enabled: false
@@ -78,10 +80,12 @@ plugins:
 
 MCP servers Hermes starts and connects to.
 
-- **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles session state and agent-internal ops (chat ingress lives with the Chat Agent). Env vars are injected from the pod's environment (Kubernetes DNS variables, Hermes home, Chat Pub/Sub config, API server key).
+- **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles session state and agent-internal ops (chat ingress lives with the Chat Agent). Env vars are injected from the pod's environment (Kubernetes DNS variables, Hermes home, Chat Pub/Sub config, API server key, session-KV database path).
 - **`gke`** — Remote GKE MCP server proxied via `mcp-remote`. All Kubernetes/GKE reads and writes route through this endpoint.
 
 `connect_timeout: 120` allows for cold-start latency; `timeout: 300` accommodates long reasoning chains.
+
+A local server's `env:` block is not a filter over the pod's environment but the whole of what that server receives: Hermes strips an MCP child down to a small allowlist, so a variable the server reads and the block does not name arrives unset, and the read silently yields its default. Adding an `os.environ` read to a local MCP server means adding it here too.
 
 ### `platform_toolsets`
 
@@ -90,11 +94,19 @@ Toolsets group MCP servers into named bundles for different Hermes surfaces:
 - **`cli`** — Exposed to the Hermes CLI (interactive terminal usage inside the pod).
 - **`api_server`** — Exposed to the Hermes REST API (Chat integrations, external callers).
 
-Both include the same MCP servers plus their respective Hermes-native tools (`hermes-cli` / `hermes-api-server`). `mcp-agent_common` (a local Python server, `agent_common_server.py`) and `mcp-developer_knowledge` (a remote proxy to `developerknowledge.googleapis.com/mcp`) are declared in the shared defaults config ([`deploy/shared/defaults/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/defaults/config.yaml)) and merged in at runtime.
+Both include the same MCP servers plus their respective Hermes-native tools (`hermes-cli` / `hermes-api-server`). `mcp-developer_knowledge` (a remote proxy to `developerknowledge.googleapis.com/mcp`) is declared in the shared defaults config ([`deploy/shared/defaults/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/defaults/config.yaml)) and merged in at build time.
+
+Note that the two files' toolset lists are **unioned**, not overridden — the build-time merge combines two lists as `list(dict.fromkeys(a + b))`. Removing an entry from `agents/platform/config.yaml` alone has no effect if the shared defaults still list it.
+
+There is no `mcp-agent_common` entry. That server exposed a `call_agent` A2A tool that could not reach the Platform Agent in this deployment, and it was removed rather than repaired; delegation is kanban-only.
 
 ### `toolsets`
 
 A second, top-level gate distinct from `platform_toolsets`: listing `kanban` here exposes the kanban orchestrator tools (`kanban_create`, `kanban_list`, …) to the Platform Agent as a non-worker profile, so it can create and route delegation cards itself. Workers spawned by the dispatcher get the kanban tools automatically via `HERMES_KANBAN_TASK`.
+
+### `agent`
+
+`max_turns` is the per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet audits outgrow — the cost audit runs ten checks against every cluster and the drift audit nineteen — so this profile raises it to 250. It is set here rather than in the operator's generated root config because both dispatch paths read the profile's `config.yaml`: kanban workers are spawned with `HERMES_HOME` pinned to the profile, and the cron scheduler resolves `agent.max_turns` from `$HERMES_HOME/config.yaml`. Scoping it to this profile leaves the Chat Agent and the Cluster Agents on the default. The comment in the file itself records the runs that motivated the number.
 
 ### `memory`
 
