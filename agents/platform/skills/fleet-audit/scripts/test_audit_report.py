@@ -2775,14 +2775,12 @@ class TestAiSecurityAuditStream(BaseTestCase):
 
         One collection command backs all six checks because that is how the
         SOP reads the cluster: a single `get` into a dump every filter then
-        runs over. Under `MAX_CELL_CHARS` on purpose — the coverage table
-        clips, and a fixture that overflowed would hide that from the renderer.
+        runs over.
         """
         collect = (
             f"kubectl --context gke_acme_{location}_{name} "
             "get deploy,sts,ds,cronjob,pod -A -o json"
         )
-        self.assertLessEqual(len(collect), audit_report.MAX_CELL_CHARS)
         return {
             "name": name,
             "location": location,
@@ -5044,6 +5042,84 @@ class TestRedaction(unittest.TestCase):
             with self.subTest(benign=benign):
                 self.assertEqual(audit_report.redact_secrets(benign), benign)
 
+    def test_a_name_ending_in_a_bare_key_is_blanked(self):
+        """The shape the `ai-security-audit` stream goes looking for.
+
+        Its check 3.5 detector matches `(MODEL|REGISTRY|INFERENCE).*(TOKEN|KEY
+        |SECRET|PASSWORD)`, so the stream surfaces `MODEL_REGISTRY_KEY` by
+        design and the SOP asks the model to quote the offending variable as
+        evidence. `api_key`/`access_key`/`session_key` were listed; a bare
+        trailing `KEY` was not, so this exact name published verbatim.
+        """
+        secret = "9f3a2b7c1d4e5f60718293a4b5c6d7e8"
+        for excerpt, name in (
+            (f"- name: MODEL_REGISTRY_KEY\n  value: {secret}", "MODEL_REGISTRY_KEY"),
+            (f"- name: INFERENCE_KEY\n  value: {secret}", "INFERENCE_KEY"),
+            (f"MODEL_REGISTRY_KEY={secret}", "MODEL_REGISTRY_KEY="),
+        ):
+            with self.subTest(excerpt=excerpt):
+                out = self.assertRedacted(excerpt, secret)
+                self.assertIn(name, out)
+
+    def test_a_secret_key_ref_still_says_which_entry_it_mounts(self):
+        # Why the bare-`key` case requires a prefix segment rather than being
+        # listed as a word: `key: token` inside a `secretKeyRef` names which
+        # entry of a Secret is mounted, which is a fact the finding is about.
+        benign = "valueFrom:\n  secretKeyRef:\n    name: hf-creds\n    key: token"
+        self.assertEqual(audit_report.redact_secrets(benign), benign)
+
+    def test_a_password_inside_a_url_is_blanked_and_the_host_survives(self):
+        # No field name announces this one — it arrives inside a
+        # `--model-url=` argument, which check 3.4 hunts for plaintext HTTP.
+        out = self.assertRedacted(
+            "- --model-url=http://svcacct:hunter2Pass@models.internal/llama",
+            "hunter2Pass",
+        )
+        self.assertIn("http://svcacct:", out)
+        self.assertIn("@models.internal/llama", out)
+
+    def test_an_all_numeric_credential_is_not_waved_through(self):
+        # The non-secret exemptions are consulted only once the key is already
+        # a credential word, so `\d+` could only ever exempt
+        # `<credential-word>: <number>` — and it was unbounded.
+        for line, secret in (
+            ("password: 8675309", "8675309"),
+            ("api_key: 90210847362518490273645019", "90210847362518490273645019"),
+        ):
+            with self.subTest(line=line):
+                self.assertRedacted(line, secret)
+
+    def test_base64_that_merely_starts_with_a_slash_is_not_mistaken_for_a_path(self):
+        # Standard base64 emits `/` as one character in 64, so a payload can
+        # open with one and contain another. The path exemption exists for
+        # `GOOGLE_APPLICATION_CREDENTIALS`, which points at a real root.
+        self.assertRedacted(
+            "password: /9j/4AAQSkZJRgABAQAAAQABAAD", "4AAQSkZJRgABAQAAAQABAAD"
+        )
+
+    def test_a_block_scalar_value_is_blanked_and_stays_parseable(self):
+        """kubectl emits `value: |` whenever the variable contains a newline.
+
+        A JSON service-account blob or a multi-line registry credential is
+        exactly that. Blanking the `|` header replaced the one part of the
+        shape that was not the credential, leaving the body published and the
+        excerpt no longer valid YAML.
+        """
+        secret = "supersecretvalue-not-token-shaped"
+        excerpt = (
+            "- name: API_TOKEN\n"
+            "  value: |\n"
+            f"    {secret}\n"
+            "    second-line-of-it\n"
+            "- name: MODEL_NAME\n"
+            "  value: llama-3-70b\n"
+        )
+        out = self.assertRedacted(excerpt, secret)
+        self.assertNotIn("second-line-of-it", out)
+        self.assertIn("  value: |", out)
+        # The item after the block is outside it and must survive untouched.
+        self.assertIn("value: llama-3-70b", out)
+
     def test_a_credential_in_a_limitations_note_never_reaches_the_run_summary(self):
         """Gap strings leave by two doors and only one of them redacts.
 
@@ -5209,6 +5285,62 @@ class TestClipText(unittest.TestCase):
         self.assertNotIn("Pod/x`", body)
         self.assertIn("Pod/x' <script>", body)
         self.assertIn("`a b`", body)
+
+    def test_a_coverage_cell_cannot_break_out_of_its_code_span(self):
+        # The same control as the test above, on the other path that wraps its
+        # result in a code span. `_render_check_evidence` renders `command`
+        # and `check` through `_cell`, and both arrive verbatim from the model.
+        self.assertNotIn(
+            "`",
+            audit_report._cell(
+                "kubectl get svc -A ` <script>alert(1)</script> "
+                "[click](https://evil.example) `"
+            ),
+        )
+
+    def test_clipping_an_escaped_pipe_does_not_leave_a_dangling_backslash(self):
+        # `|` is escaped to `\|` before the clip, so a cut landing between the
+        # two leaves a backslash that escapes the ellipsis instead.
+        clipped = audit_report._cell("a" * (audit_report.MAX_CELL_CHARS - 2) + "|b")
+        self.assertTrue(clipped.endswith("…"))
+        self.assertFalse(clipped.endswith("\\…"))
+
+    def test_the_evidence_appendix_publishes_a_long_command_unclipped(self):
+        """A clipped command is not re-runnable, and the appendix says it is.
+
+        The three `command` exemplars the governance SOPs hand the model are
+        127-131 characters, so a command written exactly to spec used to reach
+        the reader as 119 characters and an ellipsis — under a heading
+        promising the opposite. Pinned with a real one of those.
+        """
+        command = (
+            "gcloud container clusters describe prod-usc1 --location us-central1 "
+            "--project acme-prod --format='value(shieldedNodes.enabled)'"
+        )
+        self.assertGreater(len(command), audit_report.MAX_CELL_CHARS)
+        body = render_body(
+            make_doc(
+                audit="fleet-consistency-drift",
+                findings=[],
+                clusters=[
+                    {
+                        "name": "prod-usc1",
+                        "location": "us-central1",
+                        "project": "acme-prod",
+                        "checks_run": [
+                            {"check": check, "command": command}
+                            for check in audit_report.audit_checks(
+                                "fleet-consistency-drift"
+                            )
+                        ],
+                    }
+                ],
+            ),
+            generated_at=NOW,
+        )
+        # Backticks are still swapped for quotes; nothing else is touched.
+        self.assertIn(command, body)
+        self.assertNotIn("…", body)
 
 
 class TestNewlineNormalisation(unittest.TestCase):

@@ -182,7 +182,7 @@ cap_guard() {
 
 for CONSTANT in MAX_EXCERPT_LINES MAX_EXCERPT_CHARS MAX_COMMAND_CHARS \
   MAX_BODY_CHARS BODY_BUDGET MAX_SCOPE_ROWS AUTO_PROMOTION_CAP MIN_NA_REASON_CHARS \
-  MAX_CELL_CHARS MIN_CHECK_COMMAND_CHARS; do
+  MIN_CHECK_COMMAND_CHARS; do
   if ! spellings "$CONSTANT" > /dev/null; then
     echo "ERROR: could not read ${CONSTANT} from ${AUDIT_SCRIPT}." >&2
     exit 1
@@ -252,20 +252,26 @@ cap_guard \
   "(anything under|shorter than) $(spellings MIN_CHECK_COMMAND_CHARS) characters" \
   "Documented check-command floor does not match MIN_CHECK_COMMAND_CHARS in ${AUDIT_SCRIPT}."
 
-# The coverage-table clip is quoted twice in the same breath — once as the
-# instruction ("keep this command short") and once as the consequence ("the
-# harness clips every cell") — so both spellings get a probe. A document that
-# corrected one and not the other would teach a length the renderer disagrees
-# with, which is the whole failure mode.
+# `checks_run[].command` is published at MAX_COMMAND_CHARS, not MAX_CELL_CHARS:
+# the appendix exists so a reader can re-run a command, and one clipped to an
+# ellipsis cannot be re-run while still reading as though it could. Two guards
+# here used to pin MAX_CELL_CHARS to that field instead, which taught the model
+# a 120-character ceiling the renderer stopped enforcing. The allowance is
+# quoted twice in the same breath — once as what the field gets, once as what
+# `evidence.command` gets — so both spellings get a probe, because a document
+# that corrected one and not the other would still teach a length the renderer
+# disagrees with. MAX_CELL_CHARS itself is now an internal legibility clip on
+# the remaining columns and is deliberately not documented anywhere; a guard on
+# an undocumented cap can only be satisfied by inventing prose for it.
 cap_guard \
-  'command short .{1,3} under [0-9,]+ characters' \
-  "command short .{1,3} under $(spellings MAX_CELL_CHARS) characters" \
-  "Documented coverage-command length does not match MAX_CELL_CHARS in ${AUDIT_SCRIPT}."
+  '[0-9,]+-character allowance' \
+  "$(spellings MAX_COMMAND_CHARS)-character allowance" \
+  "Documented checks_run command allowance does not match MAX_COMMAND_CHARS in ${AUDIT_SCRIPT}."
 
 cap_guard \
-  'clips every cell at [0-9,]+' \
-  "clips every cell at $(spellings MAX_CELL_CHARS)" \
-  "Documented table-cell clip does not match MAX_CELL_CHARS in ${AUDIT_SCRIPT}."
+  'allowed [0-9,]+ characters' \
+  "allowed $(spellings MAX_COMMAND_CHARS) characters" \
+  "Documented evidence.command allowance does not match MAX_COMMAND_CHARS in ${AUDIT_SCRIPT}."
 
 # `evidence.command` is the roomy field, and the SOPs contrast it against the
 # cell clip above. Anchored on "allowed", since "command to 2,000" already has

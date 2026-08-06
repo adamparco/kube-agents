@@ -488,12 +488,20 @@ REDACTED = "[redacted by audit_report.py]"
 # Field names whose value is a credential often enough that publishing it to a
 # GitHub issue is never worth the convenience. Shared with the environment-pair
 # scan below, which asks the same question of a name on a different line.
+# The trailing `[A-Za-z0-9]+[_-]key` alternative is what catches a name whose
+# last segment is a bare `KEY` — `MODEL_REGISTRY_KEY`, `INFERENCE_KEY`. The
+# `ai-security-audit` stream hunts exactly that shape (its check 3.5 detector
+# matches `(MODEL|REGISTRY|INFERENCE).*(TOKEN|KEY|SECRET|PASSWORD)`), so the
+# backstop has to know it too. A prefix segment is *required* rather than
+# listing bare `key`, because a `secretKeyRef` block's `key: token` names which
+# entry of a Secret is mounted, and that is a fact the finding is about.
 _SECRET_KEY_WORDS = r"""
     password|passwd|token|secret|api[_-]?key|access[_-]?key
     |auth|authorization|credentials?
     |private[_-]?key|privatekey|clientkey|clientcertificate
     |client-key-data|client-certificate-data|cluster-?ca-?certificate
     |access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key
+    |[A-Za-z0-9]+[_-]key
 """
 
 # Matched as a YAML/JSON key with a value on the same line, so
@@ -523,12 +531,32 @@ _SECRET_KEY_RE = re.compile(
 # the one fact the finding is about. Both shapes are everywhere in
 # `gcloud container clusters describe` output, which the prefix above newly
 # reaches: without this, `workload_identity_auth: enabled` disappears.
+#
+# Consulted only from `_blank_named_value`, i.e. only once the key has already
+# been established as a credential word. Every exemption therefore has to be
+# defensible for the input `<credential-word>: <value>` specifically, which is
+# why two earlier ones are gone:
+#
+#   * `\d+` — nothing in the GKE describe surface emits a credential word
+#     followed by a bare integer (`token_ttl:` and friends do not match, since
+#     the credential word has to end the segment), and it was unbounded, so a
+#     40-digit numeric token published verbatim.
+#   * an unrooted path — `password: /9j/4AAQSkZJRgABAQAAAQABAAD` is base64,
+#     not a path. Requiring a real filesystem root keeps the case the comment
+#     above defends and drops the one it never meant to cover.
 _NON_SECRET_VALUE_RE = re.compile(
     r"""(?ix)^["']?(?:
-        true|false|yes|no|on|off|enabled|disabled|none|null|nil|unset|\d+
-        |/[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-]+)+
+        true|false|yes|no|on|off|enabled|disabled|none|null|nil|unset
+        |/(?:etc|var|opt|run|usr|srv|mnt|home|root|tmp|data|secrets?|workspace)
+            (?:/[A-Za-z0-9._\-]+)+
     )["']?$"""
 )
+
+# `scheme://user:password@host`. No field name announces this one — it arrives
+# inside a `--model-url=` argument or a connection string — so it is redacted
+# on shape wherever it appears, like a self-identifying token. The host survives
+# because it is the half of the finding worth reading.
+_URL_CREDENTIAL_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+:)[^\s@/]+(@)")
 
 # Token shapes that identify themselves. Redacted anywhere they appear, because
 # a bearer token in the middle of a log line is still a bearer token.
@@ -606,6 +634,12 @@ _ENV_VALUE_RE = re.compile(
     r"""^(?P<head>[\s\-]*"?value"?\s*:\s*)(?P<value>\S.*?)(?P<trail>,?\s*)$"""
 )
 
+# A `value:` whose payload is a YAML block scalar — `|`, `>`, either with a
+# chomping indicator and/or an explicit indentation indicator. kubectl emits
+# this whenever an environment variable contains a newline, which is exactly
+# what a JSON service-account blob or a multi-line registry credential is.
+_BLOCK_SCALAR_RE = re.compile(r"^[|>][+\-]?\d*$|^[|>]\d*[+\-]?$")
+
 # The same pair collapsed onto one line, which is what `-o json | jq -c` gives.
 _ENV_PAIR_INLINE_RE = re.compile(
     rf"""(?ix)
@@ -631,11 +665,24 @@ def _redact_env_value_pairs(text: str) -> str:
     outdents past the `name:` has left the item — which keeps a Secret
     *called* `hf-token` from arming some unrelated `value:` further down the
     excerpt.
+
+    A block scalar is the one shape where the `value:` line does not carry the
+    value: `value: |` is a header, and the credential is on the indented lines
+    below it. Blanking the header alone left the payload published *and* the
+    excerpt unparseable, so the header is kept and the body is what gets
+    replaced.
     """
     out: list[str] = []
     armed_indent: int | None = None
+    block_indent: int | None = None
     for line in text.split("\n"):
         indent = len(line) - len(line.lstrip())
+        if block_indent is not None:
+            # A block scalar runs until something indents no further than the
+            # `value:` that opened it. Blank lines belong to the body.
+            if not line.strip() or indent > block_indent:
+                continue
+            block_indent = None
         name = _ENV_NAME_RE.match(line)
         if name:
             armed_indent = indent if _CREDENTIAL_NAME_RE.match(name.group(1)) else None
@@ -645,7 +692,12 @@ def _redact_env_value_pairs(text: str) -> str:
         if value:
             if armed_indent is not None and indent >= armed_indent:
                 armed_indent = None
-                out.append(f"{value.group('head')}{REDACTED}{value.group('trail')}")
+                if _BLOCK_SCALAR_RE.match(value.group("value").strip()):
+                    out.append(line)
+                    out.append(f"{' ' * (indent + 2)}{REDACTED}")
+                    block_indent = indent
+                else:
+                    out.append(f"{value.group('head')}{REDACTED}{value.group('trail')}")
                 continue
             armed_indent = None
         elif line.strip() and armed_indent is not None and indent <= armed_indent:
@@ -693,6 +745,7 @@ def redact_secrets(text: str | None) -> str:
     out = _ENV_PAIR_INLINE_RE.sub(rf"\g<head>{REDACTED}\g<tail>", out)
     out = _SECRET_KEY_RE.sub(_blank_named_value, out)
     out = _BEARER_RE.sub(rf"\1 {REDACTED}", out)
+    out = _URL_CREDENTIAL_RE.sub(rf"\1{REDACTED}\2", out)
     return _TOKEN_SHAPE_RE.sub(REDACTED, out)
 
 
@@ -2589,17 +2642,42 @@ def any_marker(texts: list[str | None], pattern: re.Pattern[str], value: str) ->
 # --------------------------------------------------------------------------- #
 
 
-def _cell(text: str) -> str:
+def _cell(text: str, limit: int = MAX_CELL_CHARS) -> str:
     """Make a value safe, and short, inside a Markdown table cell.
 
     A cell is a summary line — a title that runs to two thousand characters
     turns the findings table into an unreadable wall and spends budget the
     detail section needs. Clipped here rather than at validation so an
     over-long title costs its own legibility and nothing else.
+
+    *Backticks replaced*, for the same reason `_ident` replaces them: two of
+    this function's callers wrap its result in an inline code span, and one
+    backtick closes it — after which the rest of a model-authored `command`,
+    `check` or `reason` renders as live Markdown in the reader's browser.
+
+    `limit` exists for the one column where legibility is not the thing being
+    protected. The evidence appendix publishes commands so a reader can re-run
+    one; a command clipped to an ellipsis cannot be re-run, and reads as though
+    it could. All three of the `command` exemplars the governance SOPs give the
+    model are 127-131 characters, so the default clipped every command written
+    to spec. That section is measured against the body budget as a whole and
+    yields entirely when it does not fit, so the length it costs is already
+    accounted for honestly — see `_render_check_evidence`.
     """
-    value = redact_secrets(text).replace("|", "\\|").replace("\n", " ").strip()
-    if len(value) > MAX_CELL_CHARS:
-        value = value[: MAX_CELL_CHARS - 1].rstrip() + "…"
+    value = (
+        redact_secrets(text)
+        .replace("`", "'")
+        .replace("|", "\\|")
+        .replace("\n", " ")
+        .strip()
+    )
+    if len(value) > limit:
+        value = value[: limit - 1].rstrip()
+        # An odd run of trailing backslashes is the left half of an escaped
+        # `\|` the clip cut in two, which would escape the ellipsis instead.
+        if (len(value) - len(value.rstrip("\\"))) % 2:
+            value = value[:-1]
+        value += "…"
     return value
 
 
@@ -3218,7 +3296,13 @@ def _render_check_evidence(
         "| ------- | ----- | ------- |",
     ]
     for name, check, command in rows:
-        out.append(f"| `{_cell(name)}` | `{_cell(check)}` | `{_cell(command)}` |")
+        # The command keeps its own ceiling: validation already refused
+        # anything over MAX_COMMAND_CHARS, so this clips only a value the
+        # escaping above pushed past what was accepted.
+        out.append(
+            f"| `{_cell(name)}` | `{_cell(check)}` "
+            f"| `{_cell(command, limit=MAX_COMMAND_CHARS)}` |"
+        )
     if na_rows:
         # Published for the same reason the commands are. A check declared
         # inapplicable leaves the coverage denominator, so this is the one claim
