@@ -4,8 +4,8 @@
       "id": "profile-cron-tick",
       "name": "Named-Profile Cron Ticker",
       "schedule": {
-        "kind": "interval",
-        "minutes": 1,
+        "kind": "cron",
+        "expr": "* * * * *",
         "display": "every 1m"
       },
       "prompt": "",
@@ -33,8 +33,8 @@
       "id": "bootstrap-inventory-scan",
       "name": "First-Time Environment Discovery & Inventory Scan",
       "schedule": {
-        "kind": "interval",
-        "minutes": 1,
+        "kind": "cron",
+        "expr": "* * * * *",
         "display": "every 1m"
       },
       "prompt": "",
@@ -48,8 +48,8 @@
       "id": "bootstrap-inventory-delivery",
       "name": "First-Time Onboarding Inventory Chat Delivery",
       "schedule": {
-        "kind": "interval",
-        "minutes": 1,
+        "kind": "cron",
+        "expr": "* * * * *",
         "display": "every 1m"
       },
       "prompt": "",

@@ -345,8 +345,10 @@ class DispatchTest(unittest.TestCase):
         The gateway ticker skips a job that is still in flight, so a dispatcher
         that waited for a 20-minute audit would cancel its own next twenty
         dispatches and starve every other profile with it. A tick still alive
-        at the deadline is reported and left alone — it holds the profile's
-        tick lock, and `next_run_at` was advanced before it started.
+        at the deadline is reported and left alone — `next_run_at` was advanced
+        before it started, and it holds a per-job lock for the job it is
+        running, so the next spawn re-dispatches nothing for that job while
+        still dispatching anything else that has come due.
         """
         slow = self.tmp / "hermes-slow"
         slow.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
@@ -407,8 +409,44 @@ class ShippedRosterTest(unittest.TestCase):
         self.assertTrue(entry.get("no_agent"), "the ticker is a plain subprocess; it must not prompt the model")
         self.assertEqual(
             entry.get("schedule"),
-            {"kind": "interval", "minutes": 1, "display": "every 1m"},
-            "the granularity of every named profile's cron is this interval",
+            {"kind": "cron", "expr": "* * * * *", "display": "every 1m"},
+            "the granularity of every named profile's cron is this expression",
+        )
+
+    def test_no_job_on_this_roster_uses_an_interval_schedule(self):
+        """An `interval` schedule fires at half its configured rate on this image.
+
+        Hermes re-anchors an interval job to the moment the last run
+        *finished*: `mark_job_run` stamps `last_run_at` with the completion
+        time and then overwrites the `next_run_at` that `tick()` had already
+        advanced, recomputing it as `last_run_at + minutes` (`cron/jobs.py`,
+        the `kind == "interval"` branch of `compute_next_run`). The gateway
+        ticker meanwhile sleeps a fixed sixty seconds *after* each tick
+        returns, so its wake grid is anchored a little earlier than every
+        completion. The new due time therefore lands just past the next wake,
+        `next_run_dt <= now` is false, and the job fires on the wake after
+        that -- forever, because each fire re-anchors to a point later than
+        the loop's own reference.
+
+        Measured on a live pod before this was fixed: of 557 gaps between
+        `profile-cron-tick` runs, 497 were 120s and only 47 were 60s.
+
+        A cron expression is immune. Its branch bases croniter on the same
+        completion timestamp but snaps forward to the next wall-clock minute,
+        which lands *before* the next wake instead of after it. Do not
+        "simplify" these back to `{kind: interval, minutes: 1}`.
+        """
+        offenders = [
+            j.get("id")
+            for j in self.jobs
+            if isinstance(j.get("schedule"), dict)
+            and j["schedule"].get("kind") == "interval"
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            f"{offenders}: an `interval` schedule fires at half its configured rate on this "
+            "image -- use a cron expression instead (see this test's docstring)",
         )
 
     def test_the_entrypoint_forces_the_ticker_onto_an_existing_volume(self):

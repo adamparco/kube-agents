@@ -100,6 +100,35 @@ exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None"
     /opt/hermes/.venv/bin/python3 /tmp/verify_cron_run_scope.py && \
     rm /tmp/apply_cron_run_scope.py /tmp/verify_cron_run_scope.py
 
+# Fix: one slow cron job no longer blocks every other job on the same profile.
+# `tick()` defaults to sync=True and holds <HERMES_HOME>/cron/.tick.lock across
+# the whole `as_completed` wait, so on the platform profile -- ticked only by
+# spawning `hermes cron tick`, which takes that default -- a fleet audit starved
+# every other job for its full runtime. Measured over 17h: 3 of 35
+# github-issue-resolver firings 418s / 179s / 1142s late, each unblocking within
+# seconds of the blocking audit finishing. Six anchored edits, so the surgery
+# lives in an applier. The lock now covers only what its own comment says it is
+# for -- get_due_jobs, advance_next_runs, create_execution, pool.submit -- and a
+# per-job flock replaces the cross-process in-flight guard the wide lock was
+# implicitly providing. flock rather than a ledger row on purpose: the platform
+# ledger is never swept (recover_interrupted() runs only under the in-process
+# ticker) and already carries 6 permanent status='running' rows, so a ledger
+# gate would have wedged those job ids forever.
+# Must stay AFTER the cron_run_scope block: every anchor was verified against
+# the post-cron_run_scope source.
+# See the module docstring in deploy/docker/patches/cron_tick_lock_scope.py.
+COPY deploy/docker/patches/cron_tick_lock_scope.py /opt/hermes/tools/cron_tick_lock_scope.py
+COPY deploy/docker/patches/apply_cron_tick_lock_scope.py /tmp/apply_cron_tick_lock_scope.py
+COPY deploy/docker/patches/verify_cron_tick_lock_scope.py /tmp/verify_cron_tick_lock_scope.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_tick_lock_scope.py /opt/hermes && \
+    grep -q "from tools.cron_tick_lock_scope import AdvisoryLock, JobLocks" /opt/hermes/cron/scheduler.py && \
+    grep -q "_tick_lock = AdvisoryLock(lock_fd, fcntl, globals().get(\"msvcrt\"))" /opt/hermes/cron/scheduler.py && \
+    grep -q "if not _job_locks.claim(job_id):" /opt/hermes/cron/scheduler.py && \
+    grep -q "_job_locks.release(j\[\"id\"\])" /opt/hermes/cron/scheduler.py && \
+    ! grep -q "fcntl.flock(lock_fd, fcntl.LOCK_UN)" /opt/hermes/cron/scheduler.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_cron_tick_lock_scope.py && \
+    rm /tmp/apply_cron_tick_lock_scope.py /tmp/verify_cron_tick_lock_scope.py
+
 # Perf: stop the notifier waking a card's creator for a completion it has
 # already delivered. On a terminal event the notifier both sends the worker's
 # summary to the thread AND injects a synthetic message that costs the creator a
@@ -226,6 +255,59 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_dependency_repair.py /opt/he
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_scheduling.py && \
     rm /tmp/apply_kanban_dependency_repair.py /tmp/apply_kanban_claim_fencing.py \
        /tmp/verify_kanban_scheduling.py
+
+# Hotfix: the circuit breaker's trip does not survive the tick that wrote it.
+#
+# `dispatch_once` calls `detect_crashed_workers` and then, twenty lines later,
+# `recompute_ready`. Both decide whether a card is over its retry budget, and
+# they do not use the same threshold. `_record_task_failure` persists
+# `consecutive_failures = old + 1` -- the raw attempt count -- while the two
+# callers that trip early pass a threshold the dispatcher never sees: the
+# clean-exit protocol-violation path adjudicates its own streak and passes
+# `force_trip=True`, and the systemic same-error path passes `failure_limit=1`.
+# `recompute_ready` re-derives the verdict from the column alone against the
+# dispatcher's limit (2), sees 1 < 2, flips the card back to `ready` and emits
+# `promoted`; the next lines of the same tick claim and respawn it. The policy
+# "stop after 3 protocol violations and hand to a human" silently means 4.
+#
+# The fix stores the exhausted budget rather than the raw attempt count, so the
+# counter -- which stays the single arbiter -- says what the trip decided. That
+# matters more than it sounds: the obvious alternative, having `recompute_ready`
+# read the `gave_up` event, was built and rejected because `assign_task` zeroes
+# the counter and emits `assigned`, not `unblocked`, so an event-stickiness
+# guard pins every reassigned card in `blocked` forever.
+#
+# The anchors prove only that the text landed. verify_kanban_breaker_counter.py
+# replays all three trip arms plus the spawn path against a real board through
+# the real `_record_task_failure` and `recompute_ready`, and -- the part that
+# actually earns its runtime -- asserts that `assign_task`, `unblock_task`,
+# parent-dependency promotion and worker `kanban_block` stickiness all still
+# behave exactly as they did before.
+#
+# Two consequences operators need, both pinned by that gate rather than only
+# written down. `assign_task` to the SAME profile no longer frees a tripped card
+# -- it only zeroes the counter when the assignee actually changes, which was
+# survivable while a systemic trip stored 1 (below the dispatcher's 2). Reassign
+# elsewhere or `hermes kanban unblock`. And the floor is `DEFAULT_FAILURE_LIMIT`,
+# not the configured limit, because `detect_crashed_workers` never sees the
+# latter: raise `kanban.failure_limit` above 2 and systemic trips become
+# revertible again, above 3 and protocol trips follow.
+#
+# Ordered after kanban_claim_fencing on purpose. That patch edits
+# `detect_crashed_workers` and `_error_fingerprint`; this one edits only
+# `_record_task_failure`, so the anchors do not overlap, but the fingerprint fix
+# is what made the systemic arm rare, and reading them in this order is how the
+# story makes sense.
+# See the module docstring in
+# deploy/docker/patches/apply_kanban_breaker_counter.py.
+COPY deploy/docker/patches/apply_kanban_breaker_counter.py /tmp/apply_kanban_breaker_counter.py
+COPY deploy/docker/patches/verify_kanban_breaker_counter.py /tmp/verify_kanban_breaker_counter.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_breaker_counter.py /opt/hermes && \
+    grep -q "persisted_failures = max(failures, effective_limit)" /opt/hermes/hermes_cli/kanban_db.py && \
+    test "$(grep -c '(persisted_failures, error\[:500\], task_id),' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
+    test "$(grep -c '(failures, error\[:500\], task_id),' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_breaker_counter.py && \
+    rm /tmp/apply_kanban_breaker_counter.py /tmp/verify_kanban_breaker_counter.py
 
 # Hotfix: kanban workers leaving `run_conversation` without a board write.
 #

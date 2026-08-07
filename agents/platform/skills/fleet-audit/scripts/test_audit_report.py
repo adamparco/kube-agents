@@ -1496,6 +1496,37 @@ class TestAuditCatalogue(unittest.TestCase):
             self.skipTest(f"{sop_dir} not present")
         return sop_dir
 
+    def test_every_watchdog_declares_local_delivery(self):
+        """No watchdog fans its report out to whatever chat happens to be wired.
+
+        `deliver` is resolved at fire time, and `"all"` expands to every
+        platform holding a home channel in that process' environment right
+        then. On the Platform Agent profile that is the wrong shape twice
+        over. On the scheduled tick it expands to nothing, so a run that
+        published its ledger perfectly still records
+        `no delivery target resolved for deliver=all` and looks broken. And if
+        a home channel ever does appear, seven watchdogs begin chat-delivering
+        to a destination nobody chose — the profile carries no `platforms:`
+        section precisely because it should hold no chat destination of its
+        own.
+
+        `local` is the honest declaration: Tier 1 is the ledger issue, and a
+        dispatched run reports back through the response the Chat Agent
+        relays. If a chat ping is ever added it belongs on the Chat Agent, and
+        this assertion is the place that will make someone say so out loud.
+        """
+        for job_id, job in sorted(self.cron_jobs().items()):
+            with self.subTest(job=job_id):
+                self.assertEqual(
+                    job.get("deliver"),
+                    "local",
+                    f"cron/jobs.json[{job_id}] declares "
+                    f"deliver={job.get('deliver')!r}; the Platform Agent "
+                    f"profile has no chat transport, so anything but 'local' "
+                    f"either records a phantom delivery failure or fans the "
+                    f"report out to an unreviewed destination",
+                )
+
     def test_every_stream_has_a_watchdog_and_every_watchdog_a_stream(self):
         """The two catalogues are one set, not two that mostly overlap.
 

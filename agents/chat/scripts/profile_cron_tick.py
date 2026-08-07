@@ -34,10 +34,15 @@ ticker uses, with the profile's own persona, toolsets and ``max_turns``.
 
 Correctness comes from ``tick()`` itself, not from bookkeeping here:
 
-* it takes an exclusive file lock on the profile's store and holds it for the
-  whole run, so a duplicate spawn returns 0 rather than double-firing a job;
+* it takes an exclusive file lock on the profile's store while it decides what
+  is due and claims it, so two spawns cannot dispatch the same tick. The lock
+  is released once dispatch is done, not held for the run -- holding it for the
+  run is what used to starve every other job on the profile behind a fleet
+  audit (see ``deploy/docker/patches/cron_tick_lock_scope.py``);
 * it advances every due job's ``next_run_at`` under that lock *before*
-  executing, so the next pass no longer sees the job as due;
+  executing, so the next pass no longer sees the job as due, and it holds a
+  per-job lock for the run so a job that outlives its own period is not fired
+  twice by two spawns;
 * ``get_due_jobs()`` collapses a backlog — a job 57 hours overdue fires once,
   not 114 times.
 
@@ -267,10 +272,12 @@ def main() -> int:
         try:
             code = child.wait(timeout=max(deadline - time.monotonic(), 0))
         except subprocess.TimeoutExpired:
-            # Handed off, not killed. It holds the profile's tick lock, so the
-            # next pass costs one no-op spawn for that profile, and
-            # `next_run_at` was advanced before the job started — killing it
-            # would abandon work the ledger already records as running.
+            # Handed off, not killed. `next_run_at` was advanced before the job
+            # started and the child holds a per-job lock for as long as it
+            # lives, so the next pass costs one spawn that re-dispatches
+            # nothing for this job — while still dispatching anything else that
+            # has come due. Killing it would abandon work the ledger already
+            # records as running.
             lines.append(
                 f"{profile.name}: tick still running after {budget}s "
                 f"(pid {child.pid}); handed off, see {profile / 'cron' / TICK_LOG}"

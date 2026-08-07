@@ -794,6 +794,15 @@ the dispatching session to relay the run's report on the card — from the `resp
 returns, or from the `output_file` it names when the run answers `[SILENT]` — because the card
 summary is what reaches Slack, and the worker's own transcript reaches nothing.
 
+On a scheduled run there is no channel on the other side of that verdict today, and the watchdogs
+say so: every job in `agents/platform/cron/jobs.json` declares `deliver: "local"`. The Platform
+Agent profile holds no chat destination — it ships no `platforms:` section, and a privileged
+fleet-management profile should not acquire one — so a scheduled run's report reaches humans through
+the Tier 1 ledger and nowhere else. `silent_ok` still earns its keep on the dispatched path, where a
+person is demonstrably waiting; on the scheduled path it currently gates a delivery leg that has no
+destination. If a scheduled chat ping is ever wanted it belongs on the Chat Agent, which owns
+ingress, and it should carry a pointer — title, counts, ledger URL — not the report.
+
 ## 8. Labels
 
 `ensure_labels` gains two entries; the rest are unchanged.
