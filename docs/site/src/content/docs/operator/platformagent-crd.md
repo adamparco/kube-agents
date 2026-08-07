@@ -89,10 +89,13 @@ them at once — including ones onboarded after the pod last started, which pick
 are scaffolded.
 
 Both limits matter because they fail the same way, and it is not an obvious way. A run that
-exhausts either stops mid-task without calling a terminal kanban tool, so the dispatcher records a
-**protocol violation** — a message that describes the symptom and hides the cause. Retrying then
-re-runs into the same wall. If you see repeated protocol violations, check these limits and the
-upstream error rate before suspecting the worker.
+exhausts either stops mid-task without ever calling a terminal kanban tool. The card is charged a
+`timed_out` failure whose error text names how the turn ended — `Iteration budget exhausted (N/M)`
+for `maxTurns`, `turn_exit_reason=all_retries_exhausted_no_response` for `apiMaxRetries` — and
+retrying re-runs into the same wall, so read that text and the upstream error rate before suspecting
+the worker. An exit like this that reaches the dispatcher unexplained surfaces instead as a
+**protocol violation**, which describes the symptom and hides the cause; the image narrows that
+window in [`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py).
 
 Sizing notes: `maxTurns` is consumed mostly by repository exploration, so scale it against how much
 the agent has to read rather than how complex the request is. `apiMaxRetries` exists because
