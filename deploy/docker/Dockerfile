@@ -357,6 +357,65 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_guardrail_exit.py /opt/herme
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_guardrail_exit.py && \
     rm /tmp/apply_kanban_guardrail_exit.py /tmp/verify_kanban_guardrail_exit.py
 
+# Perf: let a board mutation wake the kanban watchers instead of waiting out a
+# poll. The dispatcher and notifier are pure 5s polls, so every hop of a task
+# chain pays avg 2.5s (max 5s) for rows that were already committed: measured
+# 2026-08-07, 4.9s coordinator claim wait + 2.2s synthesizer claim wait +
+# notify delays on an 87s round trip. Workers are separate processes, so the
+# nudge is a wake file derived from the board DB path (<db>.wake):
+# create/complete/unblock bump its mtime after their commits, and each watcher
+# loop swaps its fixed sleep for a wait sliced at <=0.25s that breaks early on
+# the bump. Claims and heartbeats deliberately do not nudge -- a dispatcher
+# that wakes on its own tick's writes is a busy loop. Everything fails towards
+# upstream: an unwritable wake file means 5s polling again, and
+# verify_kanban_wake_nudge.py proves that property (and the nudges, and the
+# dispatcher's silence) against the real patched engine on a real board.
+# Must stay AFTER the scheduling/breaker/guardrail blocks above: the anchors
+# were derived from the fully-patched tree.
+# See the module docstring in deploy/docker/patches/kanban_wake_nudge.py.
+#
+# Hotfix: a worker's child cards inherit the chat subscription of the card the
+# worker is running. `_maybe_auto_subscribe` needs session context that exists
+# only on inbound user messages, and upstream's create-time inheritance only
+# follows explicit `parents=[...]` edges -- a worker's own card is neither, so
+# the user's thread lost the fan-out at the first hop. Measured 2026-08-07
+# 12:58: coordinator t_b9659077 was subscribed, the 4 cards it created as a
+# WORKER were not, and the synthesizer's answer sat undelivered for 91.3s
+# (gateway.log: zero Slack sends 12:59:02-13:02:15) until the user asked. The
+# manual remedy (scripts/kanban_notify_propagate.py) relies on the worker
+# remembering to run it; it didn't. Same column set and INSERT OR IGNORE
+# idempotency as that script, so keeping it around as a back-fill tool
+# double-writes harmlessly. verify_kanban_auto_subscribe.py replays the
+# incident through the real patched create handler on a real board.
+# See the module docstring in deploy/docker/patches/kanban_auto_subscribe.py.
+#
+# Both patches ship in ONE COPY + ONE RUN on purpose. `credential-proxy` builds
+# FROM `platform`, and the two-blocks-of-four layout these would normally get
+# pushed that stage past Docker's layer-depth ceiling ("max depth exceeded" on
+# build f9f1747c, 2026-08-07). The guarantees are unchanged — same appliers,
+# same grep guards, same behavioural verifies — only the layer count differs.
+COPY deploy/docker/patches/kanban_wake_nudge.py \
+     deploy/docker/patches/apply_kanban_wake_nudge.py \
+     deploy/docker/patches/verify_kanban_wake_nudge.py \
+     deploy/docker/patches/kanban_auto_subscribe.py \
+     deploy/docker/patches/apply_kanban_auto_subscribe.py \
+     deploy/docker/patches/verify_kanban_auto_subscribe.py \
+     /tmp/latency-patches/
+RUN cp /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_wake_nudge.py && \
+    cp /tmp/latency-patches/kanban_auto_subscribe.py /opt/hermes/tools/kanban_auto_subscribe.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_wake_nudge.py /opt/hermes && \
+    test "$(grep -c '_kanban_record_wake(conn)' /opt/hermes/hermes_cli/kanban_db.py)" = "3" && \
+    test "$(grep -c '_wake_monitor = _KanbanWakeMonitor(_kb.kanban_db_path)' /opt/hermes/gateway/kanban_watchers.py)" = "2" && \
+    test "$(grep -c 'await _kanban_wait_interval(' /opt/hermes/gateway/kanban_watchers.py)" = "2" && \
+    ! grep -q "Sleep with cancellation checks" /opt/hermes/gateway/kanban_watchers.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_auto_subscribe.py /opt/hermes && \
+    grep -q "_kanban_inherit_worker_subs(conn, new_tid)" /opt/hermes/tools/kanban_tools.py && \
+    grep -q "from tools.kanban_auto_subscribe import" /opt/hermes/tools/kanban_tools.py && \
+    cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_nudge.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_auto_subscribe.py && \
+    rm -rf /tmp/latency-patches
+
 
 # 3. Clone and build mcp-remote proxy. Git is a build-only dependency here;
 # the sandbox runtime exposes only the credential-proxy Git wrapper.

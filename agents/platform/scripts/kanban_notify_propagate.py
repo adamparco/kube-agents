@@ -2,6 +2,10 @@
 # kanban_notify_propagate.py - Copy a parent kanban card's chat subscription onto
 # a child card, so the child's completion pings the user's chat thread too.
 #
+# NOTE: the agent image now does this automatically at kanban_create time (the
+# kanban_auto_subscribe patch in deploy/docker/patches/); this script remains a
+# manual/back-fill tool, and its INSERT OR IGNORE makes the double-write harmless.
+#
 # Why this exists
 # ---------------
 # The gateway kanban notifier delivers thread updates by iterating rows in the

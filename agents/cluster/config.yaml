@@ -31,11 +31,17 @@ mcp_servers:
   # deploy/docker/patches/apply_mcp_remote_forward_errors.py fixes that at build
   # time and carries the full analysis; this bounds the damage if it ever stops
   # applying. Healthy calls to these endpoints measure 0.47-0.48s.
+  # `lazy: true`: register tools from the per-profile schema cache without
+  # spawning the node proxy; the child starts on first actual tool call.
+  # Cluster-agent kanban workers are fresh processes per card and were paying
+  # both proxy spawns at boot whether or not the card touched an MCP tool. See
+  # the fuller note in agents/platform/config.yaml.
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://developerknowledge.googleapis.com/mcp"
+    lazy: true
     connect_timeout: 30
     timeout: 60
   gke:
@@ -43,6 +49,7 @@ mcp_servers:
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://container.googleapis.com/mcp"
+    lazy: true
     connect_timeout: 30
     timeout: 60
 
