@@ -756,11 +756,12 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// (deploy/docker/patches/kanban_wake_kinds.py).
 	//
 	// `completed` is deliberately absent. By the time the notifier wakes anyone
-	// it has already sent the worker's own summary to the thread, so the woken
-	// turn re-reads the card and paraphrases a message the user is looking at —
-	// measured at 5.9s and 32,460 input tokens on task t_c31a1f00. The failure
-	// kinds stay: those deliver a bare status line, and the front door has to
-	// decide whether to retry, escalate, or explain.
+	// it has already sent the worker's own status line and its full `result` to
+	// the thread, so the woken turn re-reads the card and paraphrases a message
+	// the user is looking at — measured at 5.9s and 32,460 input tokens on task
+	// t_c31a1f00, and a paraphrase of a verbatim answer can only lose detail.
+	// The failure kinds stay: those deliver a bare status line, and the front
+	// door has to decide whether to retry, escalate, or explain.
 	cfg.Kanban.WakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
 	// Dispatch concurrency is NOT pinned here. Upstream leaves it unbounded, and that
 	// suits a fleet with headroom; capping it is a deployment decision, because every

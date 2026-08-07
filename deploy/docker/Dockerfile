@@ -140,6 +140,45 @@ os.environ['HERMES_KANBAN_TASK'] = 't_probe'; \
 exit(1) if not check_kanban_worker_mode() else None" && \
     rm /tmp/apply_kanban_worker_tools.py /tmp/kanban_worker_tools.py
 
+# Hotfix: make a card's answer reach the person who asked for it. On 2026-08-07
+# a user asked which cron jobs were enabled; three cards ran, all closed `done`,
+# and the list never arrived. The board shows why: `tasks.result IS NULL` on all
+# three. The workers built the catalogue, printed it to their own stdout, and
+# dropped it at the kanban_complete call -- because upstream's schema calls
+# `result` a "Short result log line (legacy field)... Use ``summary`` instead"
+# and accepts `summary or result`, while the kernel stores the chat line as
+# `(summary or result).strip().splitlines()[0][:400]`. So the only field that
+# can carry a report is marked legacy, the field the model is steered to holds
+# one line of 400 characters, and nothing posts `result` to chat at all.
+#
+# Two patches, applied last so they compose with the four above rather than
+# competing for the same lines. Both are deterministic -- neither tries to
+# classify a card as "asked for information", because every card has an answer.
+#   * kanban_result_required: rewrites the schema wording and requires `result`.
+#     Refuses ONCE per task, then accepts and promotes `summary`, so the gate
+#     can never wedge a card shut.
+#   * kanban_result_delivery: appends `result` to the completion message the
+#     notifier already builds -- one send, inheriting the existing failure
+#     counter, cursor rewind, and subscription-drop machinery.
+# See the module docstrings in deploy/docker/patches/kanban_result_*.py.
+COPY deploy/docker/patches/kanban_result_required.py /opt/hermes/tools/kanban_result_required.py
+COPY deploy/docker/patches/kanban_result_delivery.py /opt/hermes/gateway/kanban_result_delivery.py
+COPY deploy/docker/patches/apply_kanban_result_required.py /tmp/apply_kanban_result_required.py
+COPY deploy/docker/patches/apply_kanban_result_delivery.py /tmp/apply_kanban_result_delivery.py
+COPY deploy/docker/patches/verify_kanban_result.py /tmp/verify_kanban_result.py
+# The applier imports OLD_GATE/NEW_GATE from the module, and only the script's
+# own directory is on sys.path.
+COPY deploy/docker/patches/kanban_result_required.py /tmp/kanban_result_required.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_result_required.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_result_delivery.py /opt/hermes && \
+    grep -q "_result_err, result = _require_result(tid, summary, result)" /opt/hermes/tools/kanban_tools.py && \
+    grep -q "_apply_result_schema(KANBAN_COMPLETE_SCHEMA)" /opt/hermes/tools/kanban_tools.py && \
+    grep -q "handoff += _kanban_result_block(handoff, task)" /opt/hermes/gateway/kanban_watchers.py && \
+    ! grep -q "provide at least one of: summary (preferred), result" /opt/hermes/tools/kanban_tools.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_result.py && \
+    rm /tmp/apply_kanban_result_required.py /tmp/apply_kanban_result_delivery.py \
+       /tmp/verify_kanban_result.py /tmp/kanban_result_required.py
+
 
 # 3. Clone and build mcp-remote proxy. Git is a build-only dependency here;
 # the sandbox runtime exposes only the credential-proxy Git wrapper.

@@ -51,7 +51,7 @@ Card B (clusterB):
 
 ## Decide & declare (Card C)
 
-- **Both green →** generate the relocation change (move the workload's manifest from clusterB's overlay to clusterA's, or flip its target-cluster field) and open **one** PR via `submit-suggestion`. KCC/Config Sync performs the move. Record the decision in `kanban_complete(metadata={"decision":"proceed","from":"clusterB","to":"clusterA","pr_url":"...","rationale":"..."})`.
+- **Both green →** generate the relocation change (move the workload's manifest from clusterB's overlay to clusterA's, or flip its target-cluster field) and open **one** PR via `submit-suggestion`. KCC/Config Sync performs the move. Report the decision and the PR URL in `kanban_complete(result=...)`, and record the machine-readable form alongside it: `metadata={"decision":"proceed","from":"clusterB","to":"clusterA","pr_url":"...","rationale":"..."}`.
 - **Either red →** do not declare. Report blockers to the user, or `kanban_block(kind="needs_input")` if a human must decide.
 
 ## Safety

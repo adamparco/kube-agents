@@ -29,7 +29,7 @@ Delegation runs on the shared kanban board — agents never pass context to each
 
 1. The Platform Agent resolves the cluster's profile name (`cluster_agent_profile.py name ...`) and files a card: `kanban_create(assignee="<profile>", body="<namespace/workload, symptom, time window>")`.
 2. The gateway's dispatcher auto-spawns the Cluster Agent as a worker on that card; `kanban_notify_propagate.py` copies the chat subscription onto it so the user sees the cluster's progress in the thread.
-3. The worker completes the card with a structured `metadata` handoff — a grounded root-cause analysis plus a proposed manifest patch.
+3. The worker completes the card with the grounded root-cause analysis in `result` — the field the gateway posts into the requesting chat thread verbatim — and the machine-readable form of it, including the proposed manifest patch, in `metadata`.
 4. The Platform Agent reads the result and decides whether to submit the fix through the [declarative workflow](/kube-agents/concepts/declarative-workflow/) (`submit-suggestion`). The write path never moves to the cluster side.
 
 For multi-cluster work the Platform Agent fans out one card per cluster plus a fan-in card assigned to itself, synthesizing every parent's `metadata` once all complete — see the `workload-rebalancing` skill for the pattern.

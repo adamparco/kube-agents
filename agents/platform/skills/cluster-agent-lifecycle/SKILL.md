@@ -45,7 +45,7 @@ For any request that concerns runtime behavior of workloads on a **single, speci
    )
    ```
 
-   The dispatcher spawns the Cluster Agent (`hermes -p <profile> chat -q "work kanban task <id>"`) automatically; it reads the card, does read-only diagnostics, and calls `kanban_complete(summary=..., metadata={...})`.
+   The dispatcher spawns the Cluster Agent (`hermes -p <profile> chat -q "work kanban task <id>"`) automatically; it reads the card, does read-only diagnostics, and calls `kanban_complete(result=<the RCA>, summary=<one-line status>, metadata={...})`.
 
 3. **Read the result** — you are auto-subscribed, so the completion (or a `needs_input` block) is pushed into your chat. You can also inspect it: `kanban_show(<id>)`. The RCA and any proposed patch are in the card's `metadata`, not the worker's chat reply.
 
