@@ -17,9 +17,16 @@ entitled to adjudicate using only the host half::
 
 Upstream's docstring says "the whole design is single-host", and on a single
 host that holds. In a container it does not: a container restart keeps the pod
-name and resets the PID namespace. The new process therefore matches
-``host_prefix`` against claims made by its *predecessor* and runs
-``os.kill(pid, 0)`` against PIDs from a namespace that no longer exists.
+name while every process that made those claims is gone. The new process
+therefore matches ``host_prefix`` against claims made by its *predecessor* and
+runs ``os.kill(pid, 0)`` against PIDs it never issued.
+
+(The pod runs with ``shareProcessNamespace: true``, so the PID *namespace* is the
+pod's and does outlive the container — which is why the replacement dispatcher
+came up as PID 12329 rather than reusing 4. That makes a false *positive* on
+``os.kill(pid, 0)`` less likely than it would be with a fresh namespace, but it
+does not make the adjudication correct: the predecessor's workers are dead, and
+attributing their deaths to the cards is exactly the bug below.)
 
 What that cost us on 2026-08-07
 -------------------------------
@@ -73,6 +80,13 @@ The three fixes
    Cards released this way are ``reclaimed``, not ``crashed``: an infrastructure
    event is not the card's fault and must not spend its retry budget.
 
+   The sweep honours the same launch-window grace period the per-row loop below
+   it applies, for the same reason and from the same source
+   (``_resolve_crash_grace_seconds``, injected). Running ahead of that check
+   would give foreign claims a stricter liveness test than the process's own —
+   a divergence with no justification behind it, since a card claimed seconds
+   ago by any process is a card whose worker may not be on ``/proc`` yet.
+
 3. **Keep the PID in the fingerprint.** ``pid 1044 not alive`` and
    ``pid 1045 not alive`` are two workers, not one systemic fault. Leaving the
    PID in place means the systemic heuristic no longer fires on them and each
@@ -100,25 +114,34 @@ def claim_is_self(lock: str | None, claimer_id: str) -> bool:
     return bool(lock) and lock == claimer_id
 
 
-def release_dead_foreign_claims(conn, claimer_id: str, pid_alive) -> list[str]:
+def release_dead_foreign_claims(
+    conn, claimer_id: str, pid_alive, grace_seconds=None
+) -> list[str]:
     """Return ``running`` cards whose owner is gone to ``todo``.
 
-    A card qualifies when all three hold:
+    A card qualifies when all four hold:
 
     * its ``claim_lock`` is not this process life's token,
     * it has a recorded ``worker_pid``,
+    * it is past the launch-window grace period,
     * that PID is not alive.
+
+    ``grace_seconds`` is ``_resolve_crash_grace_seconds`` — injected rather than
+    imported so this module never depends on ``kanban_db``. Omitting it skips
+    the grace check, which is what the tests want and what a caller with no
+    ``started_at`` column can live with.
 
     Must be called inside an open write transaction. Returns the released ids.
     """
     rows = conn.execute(
-        "SELECT id, worker_pid, claim_lock, current_run_id FROM tasks "
+        "SELECT id, worker_pid, claim_lock, current_run_id, started_at FROM tasks "
         "WHERE status = 'running' AND claim_lock IS NOT NULL "
         "AND worker_pid IS NOT NULL"
     ).fetchall()
 
     released: list[str] = []
     now = int(time.time())
+    grace = None
     for row in rows:
         lock = row["claim_lock"] or ""
         if claim_is_self(lock, claimer_id):
@@ -127,6 +150,16 @@ def release_dead_foreign_claims(conn, claimer_id: str, pid_alive) -> list[str]:
             pid = int(row["worker_pid"])
         except (TypeError, ValueError):
             continue
+        if grace_seconds is not None:
+            started_at = row["started_at"]
+            if started_at is not None:
+                if grace is None:
+                    grace = grace_seconds()
+                if time.time() - started_at < grace:
+                    # Too new to adjudicate: the worker may not be on /proc yet.
+                    # Same test, same source as the per-row loop in
+                    # ``detect_crashed_workers``.
+                    continue
         if pid_alive(pid):
             # Either a real live worker or a PID collision. The TTL remains the
             # backstop; never take a card away from something that might be
@@ -139,9 +172,12 @@ def release_dead_foreign_claims(conn, claimer_id: str, pid_alive) -> list[str]:
             "WHERE id = ?",
             (row["id"],),
         )
+        # ``ended_at IS NULL`` mirrors ``_end_run``: a run already closed by some
+        # other path must not have its outcome rewritten to ``reclaimed``.
         conn.execute(
             "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
-            "ended_at = ?, error = ? WHERE task_id = ? AND status = 'running'",
+            "ended_at = ?, error = ? WHERE task_id = ? AND status = 'running' "
+            "AND ended_at IS NULL",
             (now, RECLAIM_ERROR, row["id"]),
         )
         conn.execute(

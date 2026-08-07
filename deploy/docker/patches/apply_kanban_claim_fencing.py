@@ -4,7 +4,9 @@ Two anchored edits in ``hermes_cli/kanban_db.py`` plus an import trailer:
 
 1. ``detect_crashed_workers`` — sweep dead owners' claims back to ``todo`` first,
    then adjudicate worker PIDs only for claims this exact process made, rather
-   than for anything sharing the pod name.
+   than for anything sharing the pod name. The sweep is handed
+   ``_resolve_crash_grace_seconds`` so it applies the same launch-window grace
+   as the per-row loop it runs ahead of.
 2. ``_error_fingerprint`` — stop normalising ``pid <N>`` to ``pid N``, which
    collapsed N per-worker crashes into one "systemic" fingerprint and dropped
    every affected card's failure limit to 1.
@@ -45,12 +47,16 @@ FENCE_ANCHOR = (
 
 FENCE_PATCHED = (
     '        # kube-agents patch: under Kubernetes the host half of the claim\n'
-    '        # token is the pod name, which survives a container restart while\n'
-    '        # the PID namespace does not. Hand back whatever a dead owner still\n'
-    '        # holds, then adjudicate PIDs only for claims this exact process\n'
-    '        # made. See hermes_cli/kanban_claim_fencing.py.\n'
+    '        # token is the pod name, so it survives a container restart even\n'
+    '        # though every process that wrote it is gone. Hand back whatever a\n'
+    '        # dead owner still holds, then adjudicate PIDs only for claims this\n'
+    '        # exact process made. The sweep gets the same launch-window grace\n'
+    '        # period as the per-row loop below.\n'
+    '        # See hermes_cli/kanban_claim_fencing.py.\n'
     '        _kanban_claimer = _claimer_id()\n'
-    '        _kanban_release_dead_foreign_claims(conn, _kanban_claimer, _pid_alive)\n'
+    '        _kanban_release_dead_foreign_claims(\n'
+    '            conn, _kanban_claimer, _pid_alive, _resolve_crash_grace_seconds\n'
+    '        )\n'
     '        rows = conn.execute(\n'
     '            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "\n'
     '            "WHERE status = \'running\' AND worker_pid IS NOT NULL"\n'

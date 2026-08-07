@@ -206,28 +206,57 @@ class RepairTest(unittest.TestCase):
             links, {("A", "P"), ("P", "DONE"), ("P", "SHARED"), ("OTHER", "SHARED")}
         )
 
-    def test_cycle_is_refused_not_created(self):
-        """P -> A and A -> ... -> P already exists; inverting P->A would close a loop.
+    def test_cycle_is_refused_when_the_new_edge_is_the_one_that_closes_it(self):
+        """T -> X -> C and T -> C, X settled. Inverting T->C would close a loop.
 
-        M is ``done`` so both guards pass and the cycle probe is what stops this:
-        P has no unsettled parent, and M does not gate A.
+        This is the shape the probe exists for, and the only one that produces a
+        cycle: the edge being *inserted* is C -> T, so what matters is whether T
+        can still reach C after T -> C is dropped. Here it can, via X.
+
+        Both guards pass first, which is what makes the probe load-bearing — T
+        has no unsettled parent, and C's only other parent (X) is ``done``, so C
+        is genuinely deadlocked on T alone.
         """
         conn = board(
-            {"P": "running", "A": "todo", "M": "done"},
-            [("P", "A"), ("A", "M"), ("M", "P")],
+            {"T": "running", "X": "done", "C": "todo"},
+            [("T", "X"), ("X", "C"), ("T", "C")],
         )
-        self.assertEqual(repair_inverted_dependencies(conn, "P"), [])
+        self.assertEqual(repair_inverted_dependencies(conn, "T"), [])
         links = set(
             (r["parent_id"], r["child_id"])
             for r in conn.execute("SELECT parent_id, child_id FROM task_links")
         )
         self.assertEqual(
-            links, {("P", "A"), ("A", "M"), ("M", "P")}, "graph restored unchanged"
+            links, {("T", "X"), ("X", "C"), ("T", "C")}, "graph restored unchanged"
         )
+        kind, payload = events(conn, "T")[0]
+        self.assertEqual(kind, EVENT_KIND)
+        self.assertEqual(payload["skipped_would_cycle"], ["C"])
+        self.assertEqual(payload["inverted"], [])
+
+    def test_a_pre_existing_cycle_through_the_gated_child_is_repaired(self):
+        """P -> A -> M -> P, M ``done``. Inverting P->A breaks the loop, not makes one.
+
+        The old probe walked from the child, which answered a question about the
+        edge being deleted rather than the one being inserted, and refused this
+        repair. Nothing here closes a loop: after P->A is dropped, P reaches
+        nothing, so A -> P is safe and A becomes claimable.
+        """
+        conn = board(
+            {"P": "running", "A": "todo", "M": "done"},
+            [("P", "A"), ("A", "M"), ("M", "P")],
+        )
+        self.assertEqual(repair_inverted_dependencies(conn, "P"), ["A"])
+        links = set(
+            (r["parent_id"], r["child_id"])
+            for r in conn.execute("SELECT parent_id, child_id FROM task_links")
+        )
+        self.assertEqual(links, {("A", "M"), ("M", "P"), ("A", "P")})
+        self.assertTrue(claimable(conn, "A"))
         kind, payload = events(conn, "P")[0]
         self.assertEqual(kind, EVENT_KIND)
-        self.assertEqual(payload["skipped_would_cycle"], ["A"])
-        self.assertEqual(payload["inverted"], [])
+        self.assertEqual(payload["inverted"], ["A"])
+        self.assertEqual(payload["skipped_would_cycle"], [])
 
     def test_self_link_would_cycle_and_is_skipped(self):
         conn = board({"P": "running"}, [("P", "P")])

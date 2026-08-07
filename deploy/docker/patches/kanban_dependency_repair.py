@@ -185,7 +185,10 @@ def repair_inverted_dependencies(conn, task_id: str, reason: str = "") -> list[s
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (task_id, child),
         )
-        if _reaches(conn, child, task_id):
+        # The probe has to follow the edge about to be *inserted*, not the one
+        # just deleted: adding child -> task_id closes a loop exactly when
+        # task_id can still reach child by some other path.
+        if _reaches(conn, task_id, child):
             # Inverting would close a loop. Put it back and leave this one be.
             conn.execute(
                 "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",

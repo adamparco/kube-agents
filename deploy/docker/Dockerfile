@@ -220,12 +220,60 @@ COPY deploy/docker/patches/verify_kanban_scheduling.py /tmp/verify_kanban_schedu
 RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_dependency_repair.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_claim_fencing.py /opt/hermes && \
     grep -q "_kanban_repair_inverted_deps(conn, task_id, reason)" /opt/hermes/hermes_cli/kanban_db.py && \
-    grep -q "_kanban_release_dead_foreign_claims(conn, _kanban_claimer, _pid_alive)" /opt/hermes/hermes_cli/kanban_db.py && \
+    grep -q "conn, _kanban_claimer, _pid_alive, _resolve_crash_grace_seconds" /opt/hermes/hermes_cli/kanban_db.py && \
     grep -q "_kanban_claim_is_self(lock, _kanban_claimer)" /opt/hermes/hermes_cli/kanban_db.py && \
     test "$(grep -c 'lock.startswith(host_prefix)' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_scheduling.py && \
     rm /tmp/apply_kanban_dependency_repair.py /tmp/apply_kanban_claim_fencing.py \
        /tmp/verify_kanban_scheduling.py
+
+# Hotfix: kanban workers leaving `run_conversation` without a board write.
+#
+# Upstream guards this in exactly one place -- the end of the no-tool-calls
+# branch, where `build_kanban_stop_nudge` gives a worker that is about to stop
+# talking another turn to call `kanban_complete`/`kanban_block`. Every other way
+# out of that loop is a bare `break` several hundred lines earlier and jumps
+# straight over it. The worker exits rc=0 having never touched the board and the
+# reaper stamps a `protocol_violation` after the fact -- a failure with no
+# explanation in it, because by then the reason is gone.
+#
+# Card t_d3efabef burned four runs and 38 minutes this way on 2026-08-07. Each
+# run halted on `loop_web_search_cap` with 173 successful searches in hand and
+# was never told; the halt path breaks out of the tool-call branch without
+# showing the model the block result.
+#
+#   * kanban_guardrail_exit's first edit makes that halt kanban-aware: reuse
+#     upstream's own nudge helper (already bounded at two attempts, already a
+#     no-op for non-workers) and add the one thing its text does not say -- the
+#     tool is gone for this run, stop trying to use it. Clearing
+#     `_tool_guardrail_halt_decision` is mandatory; `reset_for_turn` clears it
+#     per turn, not per iteration.
+#   * The second edit backstops the six sibling exits that leak identically, in
+#     `finalize_turn` -- the single funnel every `break` passes through. An
+#     unexplained protocol violation becomes a counted `timed_out` whose error
+#     text names the exit reason. Goal-mode workers are excluded: they call
+#     `finalize_turn` once per turn, so recording on turn 1 of N would release
+#     the claim underneath the loop.
+#
+# The anchors prove only that the text landed. verify_kanban_guardrail_exit.py
+# additionally parses the patched loop to prove the nudge is reachable, ahead of
+# the break, and terminal; drives it against the real `agent.kanban_stop` (whose
+# signature the patch would otherwise absorb in silence); and records a leak on a
+# real board through the real `_record_task_failure`.
+#
+# The per-turn `max_web_searches` ceiling that triggered this is a config change
+# rather than a patch -- see the /opt/platform-template/config.yaml assertion
+# further down. It must not ship alone: raising the cap only moves when the bug
+# fires.
+# See the module docstring in deploy/docker/patches/kanban_guardrail_exit.py.
+COPY deploy/docker/patches/kanban_guardrail_exit.py /opt/hermes/hermes_cli/kanban_guardrail_exit.py
+COPY deploy/docker/patches/apply_kanban_guardrail_exit.py /tmp/apply_kanban_guardrail_exit.py
+COPY deploy/docker/patches/verify_kanban_guardrail_exit.py /tmp/verify_kanban_guardrail_exit.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_guardrail_exit.py /opt/hermes && \
+    grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/conversation_loop.py && \
+    grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_guardrail_exit.py && \
+    rm /tmp/apply_kanban_guardrail_exit.py /tmp/verify_kanban_guardrail_exit.py
 
 
 # 3. Clone and build mcp-remote proxy. Git is a build-only dependency here;
@@ -367,11 +415,26 @@ COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/go
 # merging the shared defaults base with the platform overrides and bake it into
 # the template. This reproduces the exact config the platform ran with as the
 # former default profile.
+#
+# The two ceilings the platform overlay raises are asserted here rather than
+# eyeballed, because a merge that dropped either fails silently: the agent falls
+# back to the stock default and the only symptom is a run that dies early. They
+# are read back the way the agent reads them -- through `load_config_readonly`,
+# which deep-merges DEFAULT_CONFIG *under* the file -- so this also proves the
+# overlay did not clobber its untouched siblings.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-base-config.yaml
 COPY agents/platform/config.yaml /tmp/platform-overlay-config.yaml
 COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
 RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /tmp/platform-base-config.yaml /tmp/platform-overlay-config.yaml && \
     cp /tmp/platform-base-config.yaml /opt/platform-template/config.yaml && \
+    cd /opt/hermes && HERMES_HOME=/opt/platform-template /opt/hermes/.venv/bin/python3 -c "\
+from hermes_cli.config import load_config_readonly; \
+from agent.tool_guardrails import ToolCallGuardrailConfig; \
+cfg = load_config_readonly(); \
+caps = ToolCallGuardrailConfig.from_mapping(cfg.get('tool_loop_guardrails', {})).loop_caps; \
+assert caps.max_web_searches == 200, 'per-card web_search budget lost: %r' % caps.max_web_searches; \
+assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.max_subagents; \
+assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     rm -f /tmp/merge_configs.py /tmp/platform-base-config.yaml /tmp/platform-overlay-config.yaml
 
 # Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded

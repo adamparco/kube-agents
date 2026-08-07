@@ -82,6 +82,30 @@ toolsets:
 agent:
   max_turns: 250
 
+# Per-turn web_search ceiling. Hermes defaults to 50, and the docstring on that
+# default is right about interactive sessions: fifty searches in one turn is
+# pathological. It is not right about a kanban worker. Those are spawned
+# non-goal-mode, so `chat -q` gives the whole card exactly one turn, and the
+# per-turn cap is really a per-card research budget.
+#
+# Card t_d3efabef ("Evaluate Config Connector Setup Patterns") hit that ceiling
+# on all four of its runs — 208 searches, 173 of them successful, 38 minutes,
+# nothing delivered. It was researching a topic honestly; fifty sources is a
+# thin answer for it, not a runaway loop.
+#
+# 200 is a ceiling, not a target: a card that reaches it is misbehaving and
+# should be stopped. Never set 0 (unlimited) — the cap is the backstop, and the
+# reason those four runs produced nothing was the *exit path* taken when it
+# fired, which is fixed in deploy/docker/patches/kanban_guardrail_exit.py.
+# Raising this alone would only move when the failure happens.
+#
+# Scoped here for the same reason as max_turns above: both dispatch paths read
+# the profile config.yaml, so this leaves the Chat Agent and the per-cluster
+# Cluster Agents on the stock 50, where nothing has come close.
+tool_loop_guardrails:
+  loop_caps:
+    max_web_searches: 200
+
 # No memory provider. `multiuser_memory` keys its per-user store off the gateway
 # identity (agent._user_id), which only the Chat Agent has — the Platform Agent is
 # reached through the kanban dispatcher, which spawns workers with no human

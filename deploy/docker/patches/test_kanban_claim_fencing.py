@@ -2,17 +2,18 @@
 
 Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches
 
-The scenario under test is the 2026-08-07 gateway SIGBUS: the container restarted,
-kept its pod name, and reset its PID namespace, so the replacement dispatcher
-adjudicated its predecessor's worker PIDs and abandoned six cards. Every test
-here is written in that vocabulary — OLD is the process life that died, NEW is
-the one that came up.
+The scenario under test is the 2026-08-07 gateway SIGBUS: the container restarted
+and kept its pod name, so the replacement dispatcher adjudicated its
+predecessor's worker PIDs — every one of them belonging to a process it never
+spawned — and abandoned six cards. Every test here is written in that vocabulary
+— OLD is the process life that died, NEW is the one that came up.
 """
 
 import ast
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -41,7 +42,8 @@ CREATE TABLE tasks (
     worker_pid INTEGER,
     claim_lock TEXT,
     claim_expires INTEGER,
-    current_run_id INTEGER
+    current_run_id INTEGER,
+    started_at INTEGER
 );
 CREATE TABLE task_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,6 +209,61 @@ class ReleaseDeadForeignClaimsTest(unittest.TestCase):
         conn.execute("UPDATE tasks SET worker_pid = 'x' WHERE id = 't1'")
         self.assertEqual(release_dead_foreign_claims(conn, NEW, DEAD), [])
 
+    def test_a_card_inside_the_grace_window_is_left_alone(self):
+        """The sweep must not be stricter than the per-row loop it runs ahead of.
+
+        A worker claimed one second ago may not be on ``/proc`` yet, so a dead
+        PID reading proves nothing — for a foreign claim exactly as much as for
+        our own.
+        """
+        conn = board([("t1", "running", 1044, OLD)])
+        conn.execute("UPDATE tasks SET started_at = ? WHERE id = 't1'", (time.time(),))
+        self.assertEqual(
+            release_dead_foreign_claims(conn, NEW, DEAD, lambda: 30), []
+        )
+        self.assertEqual(task(conn, "t1")["status"], "running")
+
+    def test_a_card_past_the_grace_window_is_released(self):
+        conn = board([("t1", "running", 1044, OLD)])
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = 't1'", (time.time() - 31,)
+        )
+        self.assertEqual(
+            release_dead_foreign_claims(conn, NEW, DEAD, lambda: 30), ["t1"]
+        )
+
+    def test_a_null_started_at_does_not_confer_grace(self):
+        """``board()`` leaves ``started_at`` NULL, as an un-migrated row would."""
+        conn = board([("t1", "running", 1044, OLD)])
+        self.assertEqual(
+            release_dead_foreign_claims(conn, NEW, DEAD, lambda: 30), ["t1"]
+        )
+
+    def test_the_grace_resolver_is_consulted_at_most_once(self):
+        conn = board([("t1", "running", 1044, OLD), ("t2", "running", 1045, OLD)])
+        conn.execute("UPDATE tasks SET started_at = ?", (time.time() - 31,))
+        calls = []
+
+        def resolver():
+            calls.append(1)
+            return 30
+
+        self.assertEqual(
+            release_dead_foreign_claims(conn, NEW, DEAD, resolver), ["t1", "t2"]
+        )
+        self.assertEqual(len(calls), 1)
+
+    def test_an_already_closed_run_is_not_rewritten(self):
+        conn = board([("t1", "running", 1044, OLD)])
+        conn.execute(
+            "UPDATE task_runs SET ended_at = 123, outcome = 'completed' "
+            "WHERE task_id = 't1'"
+        )
+        self.assertEqual(release_dead_foreign_claims(conn, NEW, DEAD), ["t1"])
+        row = run_row(conn, "t1")
+        self.assertEqual(row["outcome"], "completed")
+        self.assertEqual(row["ended_at"], 123)
+
 
 class FingerprintTest(unittest.TestCase):
     """The fingerprint change lives in kanban_db.py, so assert on the patched text."""
@@ -284,7 +341,12 @@ class ApplierTest(unittest.TestCase):
         root, target = self._tree(self._pristine())
         apply(root)
         out = target.read_text()
-        self.assertIn("_kanban_release_dead_foreign_claims(conn, _kanban_claimer", out)
+        self.assertIn(
+            "_kanban_release_dead_foreign_claims(\n"
+            "            conn, _kanban_claimer, _pid_alive, "
+            "_resolve_crash_grace_seconds\n        )",
+            out,
+        )
         self.assertIn("_kanban_claim_is_self(lock, _kanban_claimer)", out)
         self.assertIn("fp = error_text[:80]", out)
         self.assertIn("from hermes_cli.kanban_claim_fencing import", out)

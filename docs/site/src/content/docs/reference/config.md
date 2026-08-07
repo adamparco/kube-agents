@@ -63,6 +63,10 @@ toolsets:
 agent:
   max_turns: 250
 
+tool_loop_guardrails:
+  loop_caps:
+    max_web_searches: 200
+
 memory:
   memory_enabled: false
   user_profile_enabled: false
@@ -111,6 +115,14 @@ A second, top-level gate distinct from `platform_toolsets`: listing `kanban` her
 ### `agent`
 
 `max_turns` is the per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet audits outgrow — the cost audit runs ten checks against every cluster and the drift audit nineteen — so this profile raises it to 250. It is set here rather than in the operator's generated root config because both dispatch paths read the profile's `config.yaml`: kanban workers are spawned with `HERMES_HOME` pinned to the profile, and the cron scheduler resolves `agent.max_turns` from `$HERMES_HOME/config.yaml`. Scoping it to this profile leaves the Chat Agent and the Cluster Agents on the default. The comment in the file itself records the runs that motivated the number.
+
+### `tool_loop_guardrails`
+
+`loop_caps.max_web_searches` bounds how many `web_search` calls one turn may make. Hermes defaults to 50 and resets the counter in `reset_for_turn`, which is the right shape for an interactive session — fifty searches in a single turn there is pathological. A kanban worker is not that shape: outside goal mode the dispatcher spawns it with `chat -q`, so the whole card is one turn and the per-turn cap is really a per-card research budget. A genuine research card exhausts it, and the run ends where it was cut off.
+
+Raised to 200 for this profile only, for the same reason as `max_turns` above: both dispatch paths read the profile's `config.yaml`, so the Chat Agent and the Cluster Agents keep the stock 50, which nothing has approached. 200 is a ceiling rather than a target — a card that reaches it is misbehaving and should be stopped, so do not set `0` (unlimited).
+
+The cap was never the whole defect. What made hitting it expensive was the exit taken when it fired: the halt broke out of the agent loop without showing the model the block result, so a worker with 173 successful searches in hand was never told, never got another turn, and exited without closing its card. That path is repaired in [`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py), whose module docstring carries the analysis. Raising the cap alone would only have moved when the failure happened.
 
 ### `memory`
 
