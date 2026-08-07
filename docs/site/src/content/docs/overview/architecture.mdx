@@ -14,7 +14,7 @@ flowchart TB
     subgraph Ingress
         GC[Google Chat]
         SL[Slack]
-        CR[cron jobs.json<br/>scheduled prompts]
+        CR[cron jobs.json<br/>gateway ticker]
     end
 
     subgraph Cluster["Kubernetes cluster"]
@@ -40,7 +40,7 @@ flowchart TB
 
     GC -->|Pub/Sub subscription| CA
     SL -->|Socket Mode / bot token| CA
-    CR -->|scheduled prompt| PA
+    CR -->|scheduled tick| CA
 
     CA -->|kanban card| PA
     PA -->|kanban card| CL
@@ -86,12 +86,12 @@ flowchart TB
 
 ### 2. Cron tick → autonomous run
 
-1. The Hermes runtime evaluates `agents/platform/cron/jobs.json` on schedule. The gateway's own ticker is bound to the Chat Agent's store, so the Platform Agent's roster is dispatched from there, once a minute, by the `profile-cron-tick` job below — see [What fires the schedule](/kube-agents/concepts/autonomous-watchdogs/#what-fires-the-schedule).
-2. Each firing sends the pre-authored `prompt` (usually "read `governance/<sop>.md` in your profile home and execute") to the Platform Agent as a synthetic message. The path is relative to the profile home, where `profile_scaffold.py` overlays the baked `/opt/platform-template/governance/` directory.
+1. The Chat Agent profile's gateway — the only ticking one, since cron ticking belongs to a running gateway — evaluates its own `jobs.json` on schedule. The governance watchdogs live there: each is a `no_agent` script that files one kanban card assigned to `platform`, carrying that job's pre-authored `prompt` verbatim (see [How a watchdog fires](/kube-agents/concepts/autonomous-watchdogs/#how-a-watchdog-fires)). The same store's `profile-cron-tick` job also ticks every named profile's cron store once a minute, so anything scheduled on the Platform Agent's own `agents/platform/cron/jobs.json` fires from the same gateway, its prompt delivered as a synthetic message rather than a card. Nothing shipped takes that route — every relocated watchdog stays on that roster as a disabled tombstone, so it cannot fire both there and on a card; see [What fires the schedule](/kube-agents/concepts/autonomous-watchdogs/#what-fires-the-schedule).
+2. A Platform Agent worker takes the card (or, for a job an operator schedules on the platform roster itself, the Platform Agent receives the prompt directly). The prompt is usually "read `governance/<sop>.md` in your profile home and execute"; the path is relative to the profile home, where `profile_scaffold.py` overlays the baked `/opt/platform-template/governance/` directory.
 3. The agent reads the SOP, executes the diagnostic queries, produces findings.
 4. The six fleet audits hand their findings to the `fleet-audit` skill, which renders and maintains one GitHub **issue** per audit stream — the ledger — and promotes findings with a mergeable manifest into narrow per-finding remediation PRs linked back to it. A run with no findings closes the ledger as completed and returns `[SILENT]` — unless it could not read the whole fleet, in which case the ledger stays open and the gaps are reported, or it resolved findings on the way, in which case it says what closed. Other SOPs post to the configured Chat channel instead.
 
-The Chat Agent profile carries its own, separate job file — [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json), four `no_agent` script jobs: `profile-cron-tick`, which ticks every named profile's cron store; the hourly `cluster-agent-reconcile` sweep that keeps Cluster Agent profiles aligned with the live GKE fleet; and the `bootstrap-inventory-scan` / `bootstrap-inventory-delivery` pair behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding). These run as plain subprocesses (no LLM turn) and delegate any reasoning work to the `platform` profile via kanban cards.
+The Chat Agent profile's own job file — [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) — holds nothing but `no_agent` script jobs: plain subprocesses, no LLM turn, delegating any reasoning to the `platform` profile via kanban cards. Alongside the seven governance triggers above are four that do work of their own: `profile-cron-tick`, which ticks every named profile's cron store; the hourly `cluster-agent-reconcile` sweep that keeps Cluster Agent profiles aligned with the live GKE fleet; and the `bootstrap-inventory-scan` / `bootstrap-inventory-delivery` pair behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding).
 
 ### 3. Remediation → GitHub PR
 

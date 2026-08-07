@@ -21,29 +21,178 @@ if [ -f "/opt/hermes/docker/stage2-hook.sh" ]; then
     /opt/hermes/docker/stage2-hook.sh
 fi
 
-# Which container of the pod this is. The operator stamps PLATFORM_AGENT_ROLE
-# `sidecar` on platform-agent-dashboard and leaves it unset on the agent itself,
-# so an image running anywhere else — plain docker, the kustomize bases, a
-# cluster profile — is the primary by default and behaves exactly as before.
+# 1.5 Exactly one container per pod runs the setup BELOW this line. The others stop here.
 #
-# This gates only what genuinely admits one owner per pod: the session KV server
-# (one process may hold :8699) and the OTel service-name stamp (the dashboard
-# carries no OTEL_SERVICE_NAME, so its run of step 4 DELETED the name the agent
-# had just written — the observed `resource_attributes: {}`). Shared-state
-# writes are serialised by the lock below instead, not skipped, so a sidecar
-# still leaves the volume usable on its own.
+# "Below this line" is the whole of the claim. Step 1 is deliberately above it and runs in
+# every container, including the sidecars — stage2-hook.sh is upstream's own container-local
+# init, and it touches the shared tree too (it chowns $TARGET_DIR and $TARGET_DIR/profiles,
+# and lays down the Hermes skeleton: config.yaml, sessions/, skills/, logs/). That is
+# unchanged from before this gate existed and is not what corrupts a profile; it is
+# idempotent and every container genuinely needs it. Worth knowing all the same, because
+# "the sidecar does not write to the PVC" is the obvious reading of this gate and it is
+# false. If you are hunting a write nobody claims to make, look above, not below. It also
+# means $TARGET_DIR/logs is NOT evidence that this setup ran — use scripts/ or
+# profiles/platform/profile.yaml, which only the steps below create.
+#
+# The Deployment runs this image more than once against ONE data PVC — the gateway and
+# the dashboard (`hermes dashboard`) — and they are not equivalent. The operator mounts
+# the plugin OCI volumes and the operator-rendered overlay ConfigMap into the gateway
+# container ONLY, so the same setup code sees a different world in each, and everything
+# below writes to the shared tree.
+#
+# Left ungated, the dashboard's pass actively undoes the gateway's:
+#
+#   - Step 2.65 links profiles/<p>/plugins/<plugin> -> /opt/agent-plugins/... . That path
+#     does not exist in the dashboard container, so its prune_stale_links() reads the
+#     gateway's fresh link as dangling and silently removes it.
+#   - Step 2.7 merges /opt/agent-config. That directory does not exist there either, so
+#     the merge finds no overlay and reverts the one already applied — it logs
+#     "unapplied previous overlay" — dropping the plugin from plugins.enabled.
+#
+# Both containers race to finish, and the loser's work is erased. The symptom lands far
+# away and looks like something else entirely: a worker exits 1 with "Unknown skill(s)",
+# the task retries twice, the dispatcher gives up, and the board fills with blocked tasks
+# while the AgentPlugin still reports Ready and the image is still correctly mounted.
+# Step 5's Session KV server has the same shape of problem — two containers, one pod
+# network namespace, one port 8699.
+#
+# WHO OWNS IT is answered by AGENT_SHARED_STATE_SETUP first and by the command line only
+# as a fallback. Under the operator the variable is always set — `owner` on the gateway,
+# `skip` on the dashboard (buildBaseContainers in platformagent_manifests.go) — so the
+# fallback never runs there. It exists for deployments with no operator to ask: compose,
+# plain manifests, `docker run`.
+#
+# The variable comes first because argv is not reliable evidence. At more than one replica
+# the gateway container runs `python3 $HERMES_HOME/leader_elect.py`, which starts
+# `hermes gateway run` as a child; the word `gateway` appears nowhere in its own argv, so
+# argv detection excludes the one container that must do the setup. It reads as a sidecar
+# and is not one.
+agent_owns_shared_state() {
+    # An unrecognised value falls back to auto-detection rather than guessing, but it says
+    # so: `Owner`, `true` and `1` are all plausible things to write, and every one of them
+    # would otherwise be indistinguishable from not having set the variable at all. The
+    # operator who wrote one believes the override took effect. `auto` is spelled out so
+    # that the documented default is not itself reported as a typo; the `:-auto` above has
+    # already turned unset and empty into it.
+    case "${AGENT_SHARED_STATE_SETUP:-auto}" in
+        owner|always) return 0 ;;
+        skip|never) return 1 ;;
+        auto) ;;
+        *)
+            echo "[ENTRYPOINT] WARN: ignoring unrecognised AGENT_SHARED_STATE_SETUP='$AGENT_SHARED_STATE_SETUP' (expected owner|always|skip|never|auto); falling back to auto-detection." >&2
+            ;;
+    esac
+    # An empty argv is NOT the image CMD arriving. The ENTRYPOINT is exec-form, so the
+    # CMD is passed through as "$@" — `hermes gateway run` reaches here as three
+    # arguments, not none. Nothing at all means the caller cleared both the CMD and any
+    # `args:`, leaving no process to hand over to: a setup-only invocation. Run the setup
+    # and let the tail of the script fall off the end.
+    [ "$#" -eq 0 ] && return 0
+    # Whole-word, not a substring: `*gateway*` would also match a command that merely
+    # mentions one, such as `hermes kanban ls --board gateway-migration`. Matching the
+    # argument exactly also survives being invoked by absolute path.
+    for arg in "$@"; do
+        [ "$arg" = "gateway" ] && return 0
+    done
+    # Unrecognised means excluded, so a new sidecar is opted out by default rather than
+    # having to be remembered. The cost of that default is the leader-election case above,
+    # which is why the operator names its owner outright instead of relying on this.
+    return 1
+}
+
+if ! agent_owns_shared_state "$@"; then
+    echo "[ENTRYPOINT] '$*' does not own the shared state; skipping setup ($TARGET_DIR belongs to the container that does)." >&2
+    # `exec` with no operands is not an error and does not replace the shell: it applies
+    # any redirections and RETURNS. So an empty argv here would fall straight through this
+    # branch into the setup it exists to skip, reach the identical no-op `exec` at the
+    # bottom, and exit 0 as though it had started something — an explicit `skip` doing the
+    # exact opposite of what it was told, and reporting success for it. Reachable only by
+    # clearing the CMD by hand, which is also the one case where there is nothing to hand
+    # over to, so stop here.
+    if [ "$#" -eq 0 ]; then
+        echo "[ENTRYPOINT] ...and there is no command to exec; nothing to do." >&2
+        exit 0
+    fi
+    # Starting before the owner has populated a fresh PVC is TOLERATED, not prevented.
+    # Nothing orders containers within a pod, so on a brand-new volume `hermes dashboard`
+    # can reach its first read while $TARGET_DIR is still empty. Its config.yaml is the
+    # one thing always present — the operator mounts the rendered ConfigMap over that
+    # path, the same file it gives the gateway — but that config names
+    # scripts/router_server.py and a plugins.enabled list only the owner lands, moments
+    # later. The container carries no probes, so the failure mode is a restart or two
+    # against the kubelet's backoff until the tree appears, not a wedge.
+    #
+    # KNOWN LIMIT, deliberately accepted rather than fixed here: that ordering is the
+    # kubelet's to lose. Moving this setup into an initContainer — one carrying the plugin
+    # volumes and the overlay ConfigMap, running to completion, leaving every app
+    # container on `skip` — is what would turn it into an ordering the pod spec states
+    # instead of one it happens to get. It is only the WRITES below that have to belong to
+    # one container; the reads merely have to survive being early.
+    #
+    # Skipping the SETUP is not skipping the cwd. This branch execs ~600 lines above the
+    # `cd "$TARGET_DIR"` at the bottom, so without this the handed-over process keeps
+    # whatever directory the container started in — /opt/hermes for the dashboard sidecar.
+    # That is not cosmetic: the credential proxy refuses any cwd outside
+    # CREDENTIAL_PROXY_WORKSPACE_ROOT, which the operator sets to this same $TARGET_DIR,
+    # so every kubectl/gcloud/gh/git call in a non-owner container fails with "working
+    # directory is outside the shared workspace" before it runs. The reasoning for the
+    # cd, and why the cwd is the only lever that reaches every caller, is at the bottom.
+    # Guarded for the same reason it is there: a non-owner can legitimately start before
+    # the owner has created the tree, and that must not abort the container.
+    if ! cd "$TARGET_DIR"; then
+        echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (kubectl/gcloud/gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+    fi
+    exec "$@"
+fi
+
+# The matching half of the skip message above, and the only positive evidence the gate
+# leaves. Both branches announce, so "which container built the tree" is answered by the
+# logs of the container that did it rather than inferred from the silence of the ones that
+# did not — and the decision is readable without inspecting the filesystem it is about to
+# change.
+#
+# That last part is why this line exists rather than being obvious. The tests assert on
+# this pair, because a filesystem side effect is only evidence where the setup can actually
+# run, and on a developer host it cannot: every step below is guarded on /opt/defaults or
+# /opt/hermes. The marker they used to key on, $TARGET_DIR/logs, is worse than merely
+# unavailable there — inside the real image step 1 creates it in EVERY container, so it
+# reports "the setup ran" in precisely the containers this gate exists to stop.
+echo "[ENTRYPOINT] '$*' owns the shared state; building $TARGET_DIR." >&2
+
+# Which member of the deployment this is. The step-1.5 gate above answers "which
+# container of THIS POD owns the shared state" and has already sent the
+# dashboard sidecar off to exec; this answers the question the gate cannot: at
+# more than one replica EVERY pod's owner container runs the setup below against
+# the same volume, and a few steps must still happen exactly once. The operator
+# stamps PLATFORM_AGENT_ROLE `sidecar` on non-primary replicas (and on
+# platform-agent-dashboard, though the gate now stops that container before it
+# gets here) and leaves it unset on the primary agent itself, so an image
+# running anywhere else — plain docker, the kustomize bases, a cluster profile
+# — is the primary by default and behaves exactly as before.
+#
+# This gates only what genuinely admits one owner per volume: the session KV
+# server (one process may hold a pod's :8699), the step-2d rebuild of the
+# default profile's config.yaml (its own comment has the reasoning), and the
+# OTel service-name stamp (a container with no OTEL_SERVICE_NAME running step 4
+# DELETED the name the agent had just written — the observed
+# `resource_attributes: {}`). Shared-state writes are serialised by the lock
+# below instead, not skipped, so a non-primary owner still leaves the volume
+# usable on its own.
 if [ "$PLATFORM_AGENT_ROLE" = "sidecar" ]; then
     IS_BOOTSTRAP_PRIMARY=0
 else
     IS_BOOTSTRAP_PRIMARY=1
 fi
 
-# 1.5 Serialise everything below that writes to $TARGET_DIR.
+# 1.6 Serialise everything below that writes to $TARGET_DIR.
 #
-# More than one container in this pod runs this entrypoint against the same
-# ReadWriteOnce volume. The operator gives platform-agent-dashboard `args`
-# ([hermes dashboard]) but no `command:`, so it inherits this ENTRYPOINT and
-# performs the identical bootstrap, concurrently, on the identical paths.
+# The step-1.5 gate leaves at most one owner per POD, not one owner per VOLUME.
+# At more than one replica the operator declares every pod's gateway container
+# the owner (AGENT_SHARED_STATE_SETUP=owner — argv cannot identify the
+# leader-election wrapper, see above), so each replica performs the identical
+# bootstrap, concurrently, on the identical paths of the same shared volume.
+# Before the gate existed the dashboard sidecar raced the gateway the same way
+# inside a single pod.
 #
 # Observed damage, not theoretical: both containers abort step 2.5 with
 # `shutil.Error` from the plugin copytree, each naming DIFFERENT files (one
@@ -57,7 +206,7 @@ fi
 # alone, which is gated on first scaffold, so a genuine gap would persist for
 # the life of the PVC.
 #
-# A lock rather than "only the primary bootstraps", deliberately: each container
+# A lock rather than "only the primary bootstraps", deliberately: each owner
 # still leaves the volume ready by itself, so there is no start-order dependency
 # and no wait-for-peer timeout to tune. The loser of the race runs second and
 # finds every step already idempotently satisfied. Steps that are singletons
@@ -172,7 +321,7 @@ DEFAULT_CONFIG_SCRIPT="/opt/defaults/scripts/default_profile_config.py"
 # and losing the live file to it, in either container, before this step reads it would
 # discard exactly the runtime state this step exists to keep.
 #
-# PRIMARY ONLY, not merely serialised by the step-1.5 lock. The lock's own rule is that
+# PRIMARY ONLY, not merely serialised by the step-1.6 lock. The lock's own rule is that
 # a step is lockable when each container can leave the volume ready by itself; this one
 # fails that test because its INPUTS are per-container. platform-agent-dashboard does not
 # mount platform-agent-config-vol at all (the operator's dashboardVolumeMounts), so
@@ -228,19 +377,38 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # merge_cron_store). `--home` overlays the default profile in place, because that
 # profile IS $TARGET_DIR and has no entry under profiles/ to name.
 #
-# `--cron-jobs` names the one id this merge may force, and that restriction is
-# load-bearing: two of the jobs in this roster DELETE THEMSELVES. Once the
+# `--cron-jobs` names the ids this merge may force, and the list is load-bearing
+# in both directions — what it leaves out and what it names.
+#
+# What it leaves out: two of the jobs in this roster DELETE THEMSELVES. Once the
 # onboarding report is delivered, bootstrap_delivery.py calls remove_job on the
 # scan/delivery pair, and an unfiltered merge would put both back on the next
-# restart — polling once a minute forever to no-op on a marker. Add an id here
-# only when the image genuinely owns that job's definition on a live volume.
+# restart — polling once a minute forever to no-op on a marker.
+#
+# What it names, beyond the ticker: the seven `dispatch_*.py` governance entries.
+# Nothing removes those at runtime — each one only files a kanban card for the
+# Platform Agent (agents/chat/scripts/platform_cron_dispatch.py) — so the image
+# owns their definitions on a live volume, which is the whole test for belonging
+# here. Leaving them off is not a smaller change, it is the relocation reaching
+# fresh installs only: step 2.6 merges the platform profile's roster UNFILTERED,
+# so the `enabled: false` tombstones it now ships DO land and switch off the
+# copies an upgraded volume has been firing through `profile-cron-tick`. If this
+# list stopped at the ticker, the default profile's roster would never learn
+# about the dispatch entries that replaced them, and all seven watchdogs — five
+# fleet audits, the AI workload security audit, the issue resolver — would stop
+# running on every already-provisioned cluster, with nothing failing and nothing
+# logged. That is the worst shape this can fail in: an audit that never runs
+# reads exactly like an audit that found nothing wrong.
+#
+# Add an id here only when the image genuinely owns that job's definition on a
+# live volume.
 if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$SCAFFOLD" \
         --home "$TARGET_DIR" \
         --template /opt/defaults \
         --items "cron" \
-        --cron-jobs "profile-cron-tick" \
+        --cron-jobs "profile-cron-tick compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit github-issue-resolver" \
         >/dev/null || echo "WARN: default-profile cron merge failed; jobs added by this image will not run" >&2
 fi
 
@@ -476,11 +644,13 @@ fi
 # 4. Inject dynamic OpenTelemetry service name (if writable)
 #
 # The write is the primary's alone. This file is shared through the PVC but the
-# value is per-container, and the sidecar's value is "none" — so letting the
-# sidecar run this turns the agent's service.name into an empty
-# resource_attributes map, which is what the deployed pod was observed doing.
-# The compat symlink below is per-container ($HOME differs) and must still run
-# in both.
+# value is per-container, and a container with no OTEL_SERVICE_NAME running it
+# turns the agent's service.name into an empty resource_attributes map — which
+# is what the deployed pod was observed doing back when the dashboard sidecar
+# still got this far. The step-1.5 gate now stops that container much earlier;
+# this guard is what keeps a non-primary owner (an HA replica) from repeating
+# the damage. The compat symlink below is per-container ($HOME can differ) and
+# idempotent, so it still runs in every container that reaches this step.
 if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plugins/hermes_otel/config.yaml" ]; then
     if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ]; then
         "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" 2>/dev/null || true
@@ -525,9 +695,8 @@ fi
 # process it execs). The sidecar bootstraps its own context from
 # CREDENTIAL_PROXY_BOOTSTRAP_COMMAND (see buildCredentialProxyEnv in the
 # operator), which runs inside the workspace root before the proxy serves any
-# request. The event-watcher does not need a copy either: it reads
-# /var/run/event-watcher/watcher.config and falls back to its in-cluster config
-# when that file is absent, which it always is.
+# request. The k8s-event-watcher does not need a copy either: it runs inside the
+# credential-proxy container, not this one.
 
 # 6. Execute primary process from inside the shared workspace.
 #

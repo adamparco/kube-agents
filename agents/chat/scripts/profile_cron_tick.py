@@ -10,12 +10,19 @@ image replaces the s6 entrypoint with a single ``hermes gateway run`` homed at
 ``/opt/data``, so exactly one store ticks: the ``default`` (Chat Agent) one.
 
 Every job under ``profiles/<name>/cron/jobs.json`` was therefore inert. On the
-Platform Agent's roster that is the entire watchdog set — the compliance and
-obtainability audits, the security-patch orchestrator, the cost and drift
-sweeps, and the every-30-minutes GitHub issue resolver. They sat at
-``state: scheduled`` with a ``next_run_at`` in the past, ``enabled: true``, and
-no error anywhere; the only runs any of them ever had came from an agent
-calling ``cronjob(action='run')`` by hand.
+Platform Agent's roster that was the entire watchdog set — the compliance,
+obtainability and AI-workload-security audits, the security-patch
+orchestrator, the cost and drift sweeps, and the every-30-minutes GitHub issue
+resolver. They sat at ``state: scheduled`` with a ``next_run_at`` in the past,
+``enabled: true``, and no error anywhere; the only runs any of them ever had
+came from an agent calling ``cronjob(action='run')`` by hand.
+
+Those seven have since moved to the Chat Agent's roster and reach the Platform
+Agent as kanban cards (``platform_cron_dispatch.py``); their platform-side
+copies stay as ``enabled: false`` tombstones exactly because of this script —
+once the store ticks, an enabled copy would fire alongside the card. What still
+needs a ticker here is anything an operator schedules on a named profile's own
+store.
 
 This script is the ticker those profiles never had. It runs as a ``no_agent``
 job on the one store that does tick, and each minute runs ``hermes cron tick``
@@ -85,7 +92,7 @@ LOG_MAX_BYTES = 1 << 20
 TICK_LOG = "tick.log"
 
 # How many job ids a per-profile summary line names before it counts the rest.
-# Six shipping watchdogs can come due together after an outage.
+# A profile's whole roster can come due at once after an outage.
 SUMMARY_IDS = 5
 
 
