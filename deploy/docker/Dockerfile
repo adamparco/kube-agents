@@ -179,6 +179,54 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_result_required.py /opt/herm
     rm /tmp/apply_kanban_result_required.py /tmp/apply_kanban_result_delivery.py \
        /tmp/verify_kanban_result.py /tmp/kanban_result_required.py
 
+# Hotfix: two kanban scheduler faults, both measured on the cluster 2026-08-07.
+#
+#   * Self-parenting deadlock. `task_links` is a predecessor edge, so a card
+#     that creates work with `parents=[<itself>]` and then blocks on it can
+#     never be satisfied -- claim_task refuses the children until the parent is
+#     done, and the parent is waiting on them. Worse, a `dependency` block
+#     routes to `todo` rather than `blocked`, which skips the block-recurrence
+#     loop breaker, so the parent respawned a full agent run every few seconds.
+#     One worker escaped by shelling out to sqlite3 and closing three cards
+#     `done` with a fabricated 27-character result. kanban_dependency_repair
+#     inverts the mis-directed edges at the block point, under two guards: the
+#     block must be provably unsatisfiable (no unsettled parents of its own),
+#     and inverting must actually free the child (this card is its last
+#     unfinished parent). Real fan-ins and real pipelines are untouched.
+#
+#   * Claim tokens outlive the process that made them. `_claimer_id()` is
+#     `hostname:pid`, and under Kubernetes hostname is the pod name --
+#     pod-scoped, not restart-scoped. When the gateway took a SIGBUS (exit 135)
+#     the replacement container kept the pod name, reset its PID namespace, and
+#     adjudicated its predecessor's worker PIDs: six cards marked `crashed`.
+#     `_error_fingerprint` then normalised the PID out of "pid <N> not alive",
+#     so six independent crashes read as one systemic fault, which drops
+#     failure_limit to 1 -- every one of them gave up on its first failure.
+#     kanban_claim_fencing narrows the liveness check to this exact process
+#     life, hands back cards whose owner is provably gone (closing the 900s
+#     dark window a rollout otherwise costs), and keeps the PID in the
+#     fingerprint.
+#
+# Both are emergent scheduling behaviour rather than a bad string, so the
+# anchors alone prove nothing: verify_kanban_scheduling.py replays both
+# incidents against a real board through the patched engine.
+# See the module docstrings in deploy/docker/patches/kanban_dependency_repair.py
+# and deploy/docker/patches/kanban_claim_fencing.py.
+COPY deploy/docker/patches/kanban_dependency_repair.py /opt/hermes/hermes_cli/kanban_dependency_repair.py
+COPY deploy/docker/patches/kanban_claim_fencing.py /opt/hermes/hermes_cli/kanban_claim_fencing.py
+COPY deploy/docker/patches/apply_kanban_dependency_repair.py /tmp/apply_kanban_dependency_repair.py
+COPY deploy/docker/patches/apply_kanban_claim_fencing.py /tmp/apply_kanban_claim_fencing.py
+COPY deploy/docker/patches/verify_kanban_scheduling.py /tmp/verify_kanban_scheduling.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_dependency_repair.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_claim_fencing.py /opt/hermes && \
+    grep -q "_kanban_repair_inverted_deps(conn, task_id, reason)" /opt/hermes/hermes_cli/kanban_db.py && \
+    grep -q "_kanban_release_dead_foreign_claims(conn, _kanban_claimer, _pid_alive)" /opt/hermes/hermes_cli/kanban_db.py && \
+    grep -q "_kanban_claim_is_self(lock, _kanban_claimer)" /opt/hermes/hermes_cli/kanban_db.py && \
+    test "$(grep -c 'lock.startswith(host_prefix)' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_scheduling.py && \
+    rm /tmp/apply_kanban_dependency_repair.py /tmp/apply_kanban_claim_fencing.py \
+       /tmp/verify_kanban_scheduling.py
+
 
 # 3. Clone and build mcp-remote proxy. Git is a build-only dependency here;
 # the sandbox runtime exposes only the credential-proxy Git wrapper.
