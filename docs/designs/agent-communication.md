@@ -320,10 +320,12 @@ Net effect: delegated cluster subagents **emit their thoughts and results to the
 Card A  (assignee = clusterA):  "Can you host workload W?"      ─┐  parents
 Card B  (assignee = clusterB):  "Is it safe to evacuate W?"     ─┤  (parallel — independent checks)
                                                                  ▼
-Card C  (assignee = platform, parents = [A, B]):  "Decide & declare"   fan-in child
+Card C  (assignee = platform, parents = [A, B]):  "Decide & declare"   fan-in card
 ```
 
 The two validation cards are **parallel** (no ordering dependency — they're read-only checks). The make-before-break _execution_ ordering is handled later by KCC when it reconciles the PR, not by the agents.
+
+`parents` is a **"runs after"** list, not a "belongs to" list: an edge points at what must finish _first_, and a card is unclaimable until every parent is settled. So A and B are created with **no** `parents` — in particular not the orchestrator's own in-flight card, which would deadlock them behind a card that is itself waiting on them. The image guards this: `deploy/docker/patches/kanban_dependency_repair.py` inverts an edge when a card blocks and is the last unfinished prerequisite of its own children, and records a `dependency_repaired` task event.
 
 **Card A result — clusterA feasibility (`kanban_complete` metadata):**
 

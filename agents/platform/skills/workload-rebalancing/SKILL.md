@@ -19,7 +19,7 @@ Resolve each cluster's profile name first (`cluster_agent_profile.py name --proj
 2. **Card B — is clusterB safe to evacuate?** `kanban_create(assignee="<clusterB-profile>", title="Validate safe-to-evacuate <workload>", body="Is it safe to evacuate <ns/workload>? Check PDBs, statefulness/local PVs, in-flight work. Do NOT mutate.")`
 3. **Card C — decide & declare (you):** `kanban_create(assignee="<your-own-platform-profile>", title="Rebalance <workload> B→A: decide & declare", parents=[<A id>, <B id>])`
 
-Cards A and B run in **parallel** (independent read-only checks). Card C is gated until both finish; the dispatcher then spawns you on it with both parents' `metadata` in your worker context. (The actual make-before-break ordering of the move is handled by KCC when it reconciles the PR, not by the agents.)
+Cards A and B are created with **no `parents`** so they run in **parallel** immediately (independent read-only checks). Card C is gated until both finish; the dispatcher then spawns you on it with both prerequisites' `metadata` in your worker context. Do not add your own currently-running card to A or B's `parents` — `parents` means "runs after", and that would stop them being claimed at all (`SOUL.md` §0). (The actual make-before-break ordering of the move is handled by KCC when it reconciles the PR, not by the agents.)
 
 ## Expected validation `metadata`
 
