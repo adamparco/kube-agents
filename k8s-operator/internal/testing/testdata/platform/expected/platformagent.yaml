@@ -191,7 +191,8 @@ status: {}
 ---
 apiVersion: v1
 data:
-  config.yaml: |
+  leader_elect.py: <OMITTED_FOR_TESTS>
+  profile-default.overlay.yaml: |
     agent:
       disabled_toolsets:
       - terminal
@@ -281,7 +282,6 @@ data:
       - session_store
       - session_otel_bridge
       - tool_call_audit
-      - incident_context
       - bootstrap_onboarding
       - legacy_slash_commands
     terminal:
@@ -291,7 +291,6 @@ data:
     - kanban
     web:
       backend: ddgs
-  leader_elect.py: <OMITTED_FOR_TESTS>
 kind: ConfigMap
 metadata:
   creationTimestamp: null
@@ -460,7 +459,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 19f311d85aa3f5bbda751a4548358c6bf68134e45239c1868b7fea3394d30ba1
+        kubeagents.x-k8s.io/config-hash: baca0bec483a062287986130da74044b2e1e8db023511744d7ce179909e1e7d0
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
@@ -547,9 +546,6 @@ spec:
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
-            - mountPath: /opt/data/config.yaml
-              name: platform-agent-config-vol
-              subPath: config.yaml
             - mountPath: /opt/data/leader_elect.py
               name: platform-agent-config-vol
               subPath: leader_elect.py
@@ -573,6 +569,8 @@ spec:
               value: /opt/data/home
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
+            - name: PLATFORM_AGENT_ROLE
+              value: sidecar
           image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
           imagePullPolicy: IfNotPresent
           name: platform-agent-dashboard

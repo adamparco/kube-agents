@@ -1,27 +1,33 @@
 # Chat Agent profile config (self-contained; the `default` profile).
 #
 # This is the config.yaml for the front-door Chat Agent — the `default` Hermes
-# profile that receives all chat ingress. It is written to /opt/defaults/config.yaml
-# at build time and synced to the default profile home ($HERMES_HOME) at startup.
+# profile that receives all chat ingress. It is written to
+# /opt/chat-template/config.yaml at build time and is the BASE from which
+# docker-entrypoint.sh rebuilds the default profile home's config.yaml
+# ($HERMES_HOME/config.yaml) on every start.
 #
 # It is deliberately NOT merged with deploy/shared/defaults/config.yaml: the
 # merge helper only unions keys, so it could never REMOVE the cloud/cluster tools
 # from shared defaults. The whole point of the Chat Agent is a minimal, low-
 # privilege front door, so its config must be self-contained.
 #
-# NOTE: THIS file is what the deployed default profile runs. The operator renders
-# its own copy into the platform-agent-config ConfigMap (k8s-operator
-# renderConfigYAML) and subPath-mounts it over /opt/data/config.yaml, but that
-# mount does not survive: docker-entrypoint.sh step 2a force-copies this file to
-# the same path on every start, and nothing else reads the ConfigMap's config.yaml
-# (profile_overlay.py matches only `*.overlay.yaml`, and it skips the default
-# profile by design — see valid_profile_name). Verified on a running pod: the live
-# file is byte-identical to this one and 13 operator-rendered keys are absent.
+# THE LIVE FILE HAS THREE AUTHORS, and this is only one of them:
 #
-# So keep the two in sync in the direction that matters — a setting only the
-# operator renders will NOT reach the agent. Which of the two should own this
-# path is an open design question, not a settled one; see the notes in
-# renderConfigYAML.
+#   1. this file, the base;
+#   2. the operator's render (k8s-operator renderConfigYAML), delivered as the
+#      ConfigMap key profile-default.overlay.yaml and merged on top;
+#   3. the running agent, which writes to its own config — /sethome records the
+#      home channel, the monitoring policy mints monitoring.install_id.
+#
+# deploy/shared/default_profile_config.py reconciles the three with a three-way
+# merge: the operator wins any key it and the runtime both changed, the runtime
+# keeps its own edits everywhere else. The file is NOT mounted from the ConfigMap;
+# it was once, and that made it read-only, which is what made /sethome fail.
+#
+# Keep this file and renderConfigYAML in sync in BOTH directions. Lists are
+# unioned, so an entry dropped from one side survives in the other — removing a
+# toolset or plugin means removing it here AND there. The operator's
+# TestRenderConfigYAMLListsMatchChatConfig fails when the two diverge.
 #
 # TOOL LOCKDOWN — the Chat Agent's job is to analyze a message, choose the best
 # specialist, delegate, and proxy the chat session. It has NO runtime tools of its
@@ -140,10 +146,10 @@ kanban:
 # the front door cannot touch the system. Everything except the delegation
 # surface (mcp-router + kanban) is off.
 agent:
-  # This file overwrites /opt/defaults/config.yaml rather than merging with
-  # deploy/shared/defaults/config.yaml, so the probe has to be turned off again
-  # here. Rationale lives in that file; in short, it spawns four interpreters to
-  # publish a Python-toolchain line that is factually wrong on this image.
+  # This file is not merged with deploy/shared/defaults/config.yaml (see the
+  # header), so the probe has to be turned off again here. Rationale lives in
+  # that file; in short, it spawns four interpreters to publish a
+  # Python-toolchain line that is factually wrong on this image.
   environment_probe: false
   disabled_toolsets:
     - terminal # shell / gcloud / kubectl / command execution + process mgmt
@@ -178,8 +184,8 @@ agent:
 # Google Chat ingress presentation. The platform itself is enabled/seeded from
 # env at runtime; this block only overrides the adapter's default "thinking"
 # marker card text ("Hermes is thinking…") with our product name. Kept in sync
-# with the operator's renderConfigYAML, which is authoritative on the deployed
-# default profile.
+# with the operator's renderConfigYAML, which is merged over this file on the
+# deployed default profile and wins any key both set.
 platforms:
   google_chat:
     typing_status_text: "Kage is thinking…"

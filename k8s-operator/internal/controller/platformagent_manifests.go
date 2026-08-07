@@ -106,14 +106,23 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1a
 	}
 }
 
-// buildConfigMapData renders the default profile's config.yaml plus one overlay per
-// named profile targeted by a plugin. Overlays ride in the same ConfigMap so a change
-// to either moves the existing config hash and rolls the pod — the merge happens at
-// startup, so a live update without a restart would be a no-op that silently lies.
+// buildConfigMapData renders one config overlay per profile the operator has something
+// to say about, including the default profile. Overlays ride in the same ConfigMap so a
+// change to any of them moves the existing config hash and rolls the pod — the merge
+// happens at startup, so a live update without a restart would be a no-op that silently
+// lies.
+//
+// The default profile's entry is keyed like every other profile's, `profile-default.
+// overlay.yaml`, because that is what makes it reachable: docker-entrypoint.sh globs
+// $OVERLAY_DIR for that shape. It was previously keyed `config.yaml` and subPath-mounted
+// over $HERMES_HOME/config.yaml, which both failed to reach the agent (the entrypoint
+// force-copied the image's file over the mount) and made the live config read-only, so
+// nothing the agent itself writes there — `/sethome`'s home channel above all — could be
+// saved. See renderConfigYAML.
 func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) map[string]string {
 	data := map[string]string{
-		"config.yaml":     renderConfigYAML(agent, agentPlugins),
-		"leader_elect.py": leaderElectScript,
+		profileOverlayKey(defaultProfileName): renderConfigYAML(agent, agentPlugins),
+		"leader_elect.py":                     leaderElectScript,
 	}
 
 	_, targeted := partitionPluginsByProfile(filterValidAgentPlugins(agentPlugins))
@@ -129,6 +138,15 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 		profiles[platformProfileName] = true
 	}
 	for profile := range profiles {
+		// "default" is not a named profile — its key is the whole-config render written
+		// above, and letting a plugin reach this loop with that name would replace the
+		// entire front-door config with the plugin's overlay. AgentPlugin's CEL rule
+		// rejects the value at admission, but a cluster running an older CRD, or one
+		// whose apiserver has CEL disabled, would not. Two code paths must never be able
+		// to write one ConfigMap key.
+		if profile == defaultProfileName {
+			continue
+		}
 		var limits *agentv1alpha1.AgentLimits
 		if profile == platformProfileName {
 			limits = platformProfileLimits(agent)
@@ -307,6 +325,11 @@ func profileOverlayKey(profile string) string {
 
 // platformProfileName is the profile the Platform Agent runs as.
 const platformProfileName = "platform"
+
+// defaultProfileName is the front-door Chat Agent's profile. Unlike every other profile
+// it has no directory under $HERMES_HOME/profiles — its home IS $HERMES_HOME — but it
+// takes its config through the same `profile-<name>.overlay.yaml` key as the rest.
+const defaultProfileName = "default"
 
 // clusterProfileClassKey is the ConfigMap key holding the overlay applied to EVERY
 // cluster-* profile.
@@ -526,22 +549,33 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
-// renderConfigYAML builds the default (Chat Agent) profile's config.yaml.
+// renderConfigYAML builds the default (Chat Agent) profile's config overlay.
 //
-// KNOWN GAP — this output does not currently reach the agent. It is subPath-mounted over
-// $HOME/config.yaml by buildDefaultVolumeMounts, but deploy/shared/docker-entrypoint.sh
-// step 2a force-copies the image's agents/chat/config.yaml to that same path on every
-// start, and no other reader consumes it: profile_overlay.py matches `*.overlay.yaml`
-// only, and profile_overlay.valid_profile_name excludes the default profile outright.
-// Observed on a running pod — the live file was byte-identical to the image's, with 13
-// keys rendered here absent, including platforms.slack.enabled and approvals.cron_mode.
+// It is emitted as `profile-default.overlay.yaml`, the same ConfigMap key shape every
+// other profile's overlay uses, and reaches the agent the same way: the ConfigMap is
+// mounted read-only at /opt/agent-config and docker-entrypoint.sh step 2d merges this
+// file onto the image's agents/chat/config.yaml.
 //
-// Deliberately not "fixed" by letting the mount win: this rendering is a whole-file
-// REPLACEMENT and is not a superset of the image's config (it omits, for example,
-// platforms.google_chat.typing_status_text), so making it authoritative would silently
-// drop settings rather than add them. The shape that works is the one the named profiles
-// already use — emit a `profile-default.overlay.yaml` and let profile_overlay.py merge it
-// — which needs the default profile admitted to that path first.
+// MERGED, not mounted over. Two earlier arrangements failed and the merge is what
+// replaced them. Mounting this rendering over $HOME/config.yaml made the file read-only,
+// so the agent could no longer save its own settings there — `/sethome` returned EACCES —
+// and the entrypoint force-copied the image's config over the mount anyway, so none of
+// the keys below ever reached a running pod. Letting the mount simply win was not the
+// answer either: this is a whole-file rendering but it is not always a superset of the
+// image's config. platforms.google_chat.typing_status_text is only rendered when the CR
+// enables Google Chat, so on a Slack-only deployment an authoritative replacement would
+// drop a setting rather than add one.
+//
+// What "merged" means for the keys here: the operator wins every scalar it renders, the
+// image keeps every key the operator says nothing about, and list-valued keys UNION.
+// Union has no way to express a removal, which matters because the lists below are
+// duplicated in agents/chat/config.yaml — drop an entry from one copy only and the other
+// puts it straight back. TestRenderConfigYAMLListsMatchChatConfig fails the build when
+// the two drift, which is the only thing keeping that honest.
+//
+// Runtime state — a home channel, an install id, saved preferences — survives the merge
+// because step 2d carries the live file's own edits across; see
+// deploy/shared/default_profile_config.py for the rules.
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	cwd := defaultAgentHome
@@ -764,8 +798,8 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// deployment opts in. What a given fleet needs depends on its model quota and on
 	// what its agents actually do, so the values belong in the CR rather than baked
 	// into every deployment. spec.harness.tuning.default sets them for the front door.
-	// The default profile takes them here rather than through an overlay: this rendered
-	// file IS the default profile's config, mounted over whatever the image shipped.
+	// The default profile takes them here rather than in a separate overlay: this
+	// rendering IS that profile's overlay, so there is no second file to put them in.
 	if limits := defaultProfileLimits(agent); limits != nil {
 		if limits.APIMaxRetries != nil {
 			cfg.Agent.APIMaxRetries = *limits.APIMaxRetries
@@ -1574,14 +1608,16 @@ func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
 		},
 		{
 			Name:      "platform-agent-config-vol",
-			MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
-			SubPath:   "config.yaml",
-		},
-		{
-			Name:      "platform-agent-config-vol",
 			MountPath: fmt.Sprintf("%s/leader_elect.py", homeDir),
 			SubPath:   "leader_elect.py",
 		},
+		// config.yaml is deliberately NOT mounted here. A subPath mount is a read-only
+		// mount POINT, and this is the one file the running agent writes to — `/sethome`
+		// persisting a home channel, the monitoring policy minting an install id, saved
+		// slash-command preferences. Mounting it made every one of those fail with
+		// EACCES. The rendering reaches the agent through the read-only directory mount
+		// below instead, as `profile-default.overlay.yaml`, and docker-entrypoint.sh step
+		// 2d merges it into a real, writable file on the PVC.
 		{
 			// Whole-ConfigMap directory mount so docker-entrypoint.sh can glob the
 			// per-profile overlays without the operator having to enumerate them as

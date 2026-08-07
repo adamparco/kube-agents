@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -34,6 +35,21 @@ import (
 	"gopkg.in/yaml.v3"
 	k8syaml "sigs.k8s.io/yaml"
 )
+
+// The default profile's rendered config used to be a `config.yaml` key mounted
+// straight over the agent's own config.yaml. That made the file read-only, so every
+// runtime write to it failed — `/sethome` with an EACCES, `monitoring.install_id`
+// silently. It now ships as an overlay the entrypoint merges into that file at
+// startup, so the assertions below read the same rendered YAML under a different key.
+func defaultProfileYAML(t *testing.T, cm *corev1.ConfigMap) string {
+	t.Helper()
+	key := profileOverlayKey(defaultProfileName)
+	content, ok := cm.Data[key]
+	if !ok {
+		t.Fatalf("%s missing from ConfigMap data, got keys %v", key, mapKeys(cm.Data))
+	}
+	return content
+}
 
 func TestBuildConfigMap(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
@@ -60,7 +76,7 @@ func TestBuildConfigMap(t *testing.T) {
 		t.Errorf("expected configmap name test-agent-config, got %s", cm.Name)
 	}
 
-	yamlContent := cm.Data["config.yaml"]
+	yamlContent := defaultProfileYAML(t, cm)
 	if !strings.Contains(yamlContent, "provider: custom") {
 		t.Errorf("expected config to contain provider: custom, got:\n%s", yamlContent)
 	}
@@ -160,7 +176,7 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 	}
 
 	cm := buildConfigMap(agent, nil)
-	yamlContent := cm.Data["config.yaml"]
+	yamlContent := defaultProfileYAML(t, cm)
 	if !strings.Contains(yamlContent, "memory_enabled: true") {
 		t.Errorf("expected config to contain memory_enabled: true, got:\n%s", yamlContent)
 	}
@@ -187,7 +203,7 @@ func TestBuildConfigMap_MemoryGateOpenByDefault(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "default-agent", Namespace: "test-ns"},
 	}
 
-	yamlContent := buildConfigMap(agent, nil).Data["config.yaml"]
+	yamlContent := defaultProfileYAML(t, buildConfigMap(agent, nil))
 	if !strings.Contains(yamlContent, "memory_enabled: false") {
 		t.Errorf("expected memory_enabled: false by default, got:\n%s", yamlContent)
 	}
@@ -248,7 +264,7 @@ func TestDisplayMode(t *testing.T) {
 			},
 		},
 	}
-	defaultConfig := buildConfigMap(defaultAgent, nil).Data["config.yaml"]
+	defaultConfig := defaultProfileYAML(t, buildConfigMap(defaultAgent, nil))
 	if !strings.Contains(defaultConfig, "tool_progress: \"off\"") || !strings.Contains(defaultConfig, "memory_notifications: \"off\"") {
 		t.Errorf("expected default mode to turn off tool_progress and memory_notifications, got:\n%s", defaultConfig)
 	}
@@ -264,7 +280,7 @@ func TestDisplayMode(t *testing.T) {
 			},
 		},
 	}
-	debugConfig := buildConfigMap(debugAgent, nil).Data["config.yaml"]
+	debugConfig := defaultProfileYAML(t, buildConfigMap(debugAgent, nil))
 	if !strings.Contains(debugConfig, "tool_progress: all") || !strings.Contains(debugConfig, "memory_notifications: verbose") {
 		t.Errorf("expected debug mode to enable all tool_progress and verbose memory_notifications, got:\n%s", debugConfig)
 	}
@@ -1296,7 +1312,7 @@ func TestBuildConfigMapSlackEnabled(t *testing.T) {
 	}
 
 	cm := buildConfigMap(agent, nil)
-	yamlContent := cm.Data["config.yaml"]
+	yamlContent := defaultProfileYAML(t, cm)
 	if !strings.Contains(yamlContent, "slack:") || !strings.Contains(yamlContent, "enabled: true") {
 		t.Errorf("expected config.yaml to enable slack platform, got:\n%s", yamlContent)
 	}
@@ -1868,7 +1884,7 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 	}
 
 	cm := buildConfigMap(agent, nil)
-	yamlContent := cm.Data["config.yaml"]
+	yamlContent := defaultProfileYAML(t, cm)
 	if !strings.Contains(yamlContent, "leader_election:") || !strings.Contains(yamlContent, "enabled: true") {
 		t.Errorf("expected leader_election enabled in config.yaml for replicas > 1, got:\n%s", yamlContent)
 	}
@@ -2768,6 +2784,112 @@ func TestRenderProfileOverlayYAMLOperatorLimitsBeatPluginConfig(t *testing.T) {
 	}
 }
 
+// The rendered config is merged into the image's agents/chat/config.yaml at pod
+// startup, and that merge UNIONS lists (deploy/shared/profile_overlay.py merge). So a
+// list this render and the image both name can only ever grow: drop an entry here and
+// the image's copy puts it straight back, with nothing in any log to say why. The two
+// files have to agree entry for entry, which also means a new entry has to be added in
+// both places — this test is the thing that says so.
+//
+// Order is not compared. The merge preserves the base's order and appends, so the
+// rendered order is not what reaches the pod anyway.
+func TestRenderConfigYAMLListsMatchChatConfig(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "agents", "chat", "config.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var image map[string]any
+	if err := yaml.Unmarshal(raw, &image); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+
+	// No CR overrides: only the lists this render always emits are in play. Ones it
+	// emits solely because of spec.harness.tuning are the CR's business, not the
+	// image's, and are covered by the tuning tests.
+	var rendered map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &rendered); err != nil {
+		t.Fatalf("unmarshaling rendered YAML: %v", err)
+	}
+
+	listPaths := sortedListPaths(rendered)
+	if len(listPaths) == 0 {
+		t.Fatalf("no lists found in the rendered config — the walk is broken, not the render")
+	}
+	compared := 0
+	for _, at := range listPaths {
+		want, ok := lookup(image, at)
+		if !ok {
+			// The image says nothing about it, so there is nothing to union with.
+			continue
+		}
+		wantList, ok := want.([]any)
+		if !ok {
+			t.Errorf("%s is a list in the render but %T in %s", strings.Join(at, "."), want, path)
+			continue
+		}
+		compared++
+		if a, b := sortedStrings(t, listAt(t, rendered, at)), sortedStrings(t, wantList); !slices.Equal(a, b) {
+			t.Errorf("%s differs between the render and agents/chat/config.yaml:\n  rendered: %v\n  image:    %v\n"+
+				"the startup merge unions these, so the image's extras survive whatever this render omits",
+				strings.Join(at, "."), a, b)
+		}
+	}
+	if compared == 0 {
+		t.Errorf("no list was compared against %s — a rename would make this test vacuous", path)
+	}
+}
+
+// sortedListPaths returns every path in `m` whose value is a list, deepest-last, in a
+// stable order so failures read the same way on every run.
+func sortedListPaths(m map[string]any) [][]string {
+	var out [][]string
+	var walk func(any, []string)
+	walk = func(v any, at []string) {
+		switch t := v.(type) {
+		case map[string]any:
+			for _, k := range slices.Sorted(maps.Keys(t)) {
+				walk(t[k], append(append([]string{}, at...), k))
+			}
+		case []any:
+			out = append(out, at)
+		}
+	}
+	walk(m, nil)
+	return out
+}
+
+func lookup(m map[string]any, path []string) (any, bool) {
+	var cur any = m
+	for _, key := range path {
+		asMap, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		if cur, ok = asMap[key]; !ok {
+			return nil, false
+		}
+	}
+	return cur, true
+}
+
+func listAt(t *testing.T, m map[string]any, path []string) []any {
+	t.Helper()
+	v, _ := lookup(m, path)
+	list, _ := v.([]any)
+	return list
+}
+
+func sortedStrings(t *testing.T, list []any) []string {
+	t.Helper()
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		out = append(out, fmt.Sprint(v))
+	}
+	sort.Strings(out)
+	return out
+}
+
 func TestRenderProfileOverlayYAMLEmptyWhenNothingToSay(t *testing.T) {
 	if got := renderProfileOverlayYAML(nil, nil); got != "" {
 		t.Errorf("expected empty overlay, got %q (an empty map marshals to \"{}\" and would rewrite the profile config every start)", got)
@@ -2779,15 +2901,41 @@ func TestBuildConfigMapDataEmitsOverlays(t *testing.T) {
 		pluginWithProfile("adapter", "", ""),
 		pluginWithProfile("stockout", "platform", ""),
 	})
-	if _, ok := data["config.yaml"]; !ok {
-		t.Errorf("config.yaml missing from ConfigMap data")
+	// An untargeted plugin belongs to the default profile, whose whole rendered config
+	// is now itself an overlay.
+	def, ok := data["profile-default.overlay.yaml"]
+	if !ok {
+		t.Fatalf("the default profile's overlay is missing, got keys %v", mapKeys(data))
+	}
+	if !strings.Contains(def, "adapter") {
+		t.Errorf("untargeted plugin must be enabled in the default overlay, got:\n%s", def)
 	}
 	// Key shape is a contract with docker-entrypoint.sh, which globs for it.
 	if _, ok := data["profile-platform.overlay.yaml"]; !ok {
 		t.Errorf("expected profile-platform.overlay.yaml, got keys %v", mapKeys(data))
 	}
+	// The empty TargetProfile above must be spelled "default", not left empty: the
+	// entrypoint's glob would read this key as a profile literally named "" and
+	// scaffold one.
 	if _, ok := data["profile-.overlay.yaml"]; ok {
-		t.Errorf("default-profile plugins must not produce an overlay, got keys %v", mapKeys(data))
+		t.Errorf("an untargeted plugin must not produce an empty-named overlay, got keys %v", mapKeys(data))
+	}
+}
+
+// The default profile's render and the per-profile overlay loop must never be able to
+// write the same key. AgentPlugin's CEL rule rejects `targetProfile: default` at
+// admission, but an older CRD or an apiserver with CEL disabled would let it through,
+// and the loser of that collision would be the entire front-door config.
+func TestBuildConfigMapDataDefaultTargetCannotCollide(t *testing.T) {
+	data := buildConfigMapData(newTestPlatformAgent(), []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("smuggled", defaultProfileName, ""),
+	})
+	def := data[profileOverlayKey(defaultProfileName)]
+	if !strings.Contains(def, "model:") {
+		t.Errorf("a plugin naming the default profile replaced the rendered config with its own overlay:\n%s", def)
+	}
+	if strings.Contains(def, "smuggled") {
+		t.Errorf("a plugin naming the default profile must be ignored, not merged, got:\n%s", def)
 	}
 }
 
@@ -2825,6 +2973,11 @@ func TestBuildConfigMapDataClusterTargetedPluginGetsItsOwnOverlay(t *testing.T) 
 func TestBuildConfigMapDataNoOverlayWithoutTargetedPlugins(t *testing.T) {
 	data := buildConfigMapData(newTestPlatformAgent(), []*agentv1alpha1.AgentPlugin{pluginWithProfile("adapter", "", "")})
 	for k := range data {
+		// The default profile's overlay is unconditional — it carries the whole
+		// rendered config, so its absence, not its presence, would be the bug.
+		if k == profileOverlayKey(defaultProfileName) {
+			continue
+		}
 		if strings.HasPrefix(k, profileOverlayPrefix) || k == clusterProfileClassKey {
 			t.Errorf("unexpected overlay key %q when no plugin targets a profile and no tuning is set", k)
 		}
@@ -2867,7 +3020,8 @@ func TestBuildConfigMapDataTuningOnlyOverlay(t *testing.T) {
 	}
 }
 
-// tuning.default reaches the authoritative rendered config, not an overlay.
+// tuning.default reaches the rendered config, which ships as the default profile's
+// overlay.
 func TestRenderConfigYAMLAppliesDefaultTuning(t *testing.T) {
 	agent := agentWithTuning(&agentv1alpha1.TuningSpec{Default: limits(30, 120)})
 
@@ -2883,10 +3037,16 @@ func TestRenderConfigYAMLAppliesDefaultTuning(t *testing.T) {
 		t.Errorf("max_turns = %v, want 120", agentSection["max_turns"])
 	}
 
-	// And the default profile never gets an overlay — it is rendered whole.
-	for k := range buildConfigMapData(agent, nil) {
-		if strings.HasPrefix(k, profileOverlayPrefix) {
-			t.Errorf("tuning.default must not produce an overlay, got key %q", k)
+	// And that render is what the ConfigMap publishes for the default profile. It is
+	// the only route those limits have to the pod: nothing else writes that key, and
+	// the entrypoint merges nothing else into the front door's config.
+	data := buildConfigMapData(agent, nil)
+	if got := data[profileOverlayKey(defaultProfileName)]; !strings.Contains(got, "max_turns: 120") {
+		t.Errorf("tuning.default did not reach the default profile's overlay, got:\n%s", got)
+	}
+	for k := range data {
+		if strings.HasPrefix(k, profileOverlayPrefix) && k != profileOverlayKey(defaultProfileName) {
+			t.Errorf("tuning.default must not produce any other profile's overlay, got key %q", k)
 		}
 	}
 }
@@ -3084,5 +3244,10 @@ func TestProfileOverlayKey(t *testing.T) {
 	// overlay applied to every cluster-* profile.
 	if profileOverlayKey("cluster") == clusterProfileClassKey {
 		t.Error("per-profile and class overlay keys must not collide")
+	}
+	// The default profile is keyed by the same function as every other, so the
+	// entrypoint needs no special case to find it.
+	if got := profileOverlayKey(defaultProfileName); got != "profile-default.overlay.yaml" {
+		t.Errorf("profileOverlayKey(default) = %q", got)
 	}
 }
