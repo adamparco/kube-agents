@@ -130,12 +130,11 @@ What is deliberately *not* excluded is the halt nudge. It fires during a cron ru
 too — ``kanban_stop_nudge_enabled()`` is on whenever ``HERMES_KANBAN_TASK`` is
 set, and upstream interpolates that id straight into the text — so the run is
 told by name to complete a card it will be refused. That wastes at most two
-turns and is upstream's behaviour in its own stop guard either way. The reason to
-leave it is that ``_in_cron_run`` can only over-report: the marker's environment
-half is process-wide, so a second worker running concurrently with somebody
-else's dispatch reads it as its own. For the board write that direction is free
-(skip a record, never write a wrong one); for the nudge it would silence the fix
-on an unrelated worker, which is the whole thing this module exists to prevent.
+turns and is upstream's behaviour in its own stop guard either way, and the two
+answers are wanted in opposite directions: for the board write, a wrong "yes,
+cron" is free (skip a record, never write a wrong one), while for the nudge it
+would silence the fix on an unrelated worker, which is the whole thing this
+module exists to prevent.
 """
 
 from __future__ import annotations
@@ -199,11 +198,13 @@ CRON_RUN_ENV = "HERMES_KANBAN_CRON_RUN"
 def _in_cron_run() -> bool:
     """Whether this turn is a cron job borrowing a worker's environment.
 
-    Delegates to ``cron_run_scope.current_cron_job`` so the *context variable*
-    is consulted first. That distinction is the point: ``cron_run_scope`` sets
-    both halves of the marker, and the environment half is process-wide, so with
-    ``dispatch_in_gateway`` several workers share it. Only the context variable
-    is scoped to the thread ``run_job`` submitted the run on.
+    Delegates to ``cron_run_scope.current_cron_job`` rather than reading the
+    environment, and that is the point: the marker lives in a context variable
+    scoped to the thread ``run_job`` submitted the run on, so under
+    ``dispatch_in_gateway`` a second worker running concurrently with somebody
+    else's dispatch does not read it as its own. ``cron_run_scope`` used to write
+    an ``os.environ`` half as well, which is process-wide and did exactly that;
+    see that module's docstring for why it no longer does.
 
     Reading the env var directly is the fallback for a host where neither module
     resolves — the tests, mostly, since ``cron_run_scope`` is a sibling there.

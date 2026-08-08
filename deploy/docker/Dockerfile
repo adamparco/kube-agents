@@ -347,7 +347,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_breaker_counter.py /opt/herm
 #     same reason from the other end: cron_run_scope (above) leaves
 #     HERMES_KANBAN_TASK pointing at the DISPATCHER's card so its claim keeps
 #     heart-beating, and the run may not terminate that card -- so recording
-#     would charge a caller that is still blocked on the run.
+#     would charge a caller that is still blocked on the run. `delegate_task`
+#     children are excluded on the same argument once more: they run in the
+#     parent's process with the parent's HERMES_KANBAN_TASK still set and own no
+#     card, which is why upstream's `_reject_delegated_child_mutation` refuses
+#     every board mutation from one.
 #
 # The anchors prove only that the text landed. verify_kanban_guardrail_exit.py
 # additionally parses the patched loop to prove the nudge is reachable, ahead of

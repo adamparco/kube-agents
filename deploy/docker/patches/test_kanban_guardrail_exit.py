@@ -311,8 +311,11 @@ class CronRunExclusionTest(unittest.TestCase):
         self.assertTrue(leaked(cron_run=None))
 
     def test_a_forked_run_is_recognised_from_the_environment_alone(self):
-        # cron_run_scope sets a context variable AND an env var; a cron agent
-        # that shells out to `hermes kanban …` inherits only the second.
+        # current_cron_job falls back to the environment, which is the one
+        # thing a ContextVar cannot do — cross a fork. Nothing in the image
+        # writes the marker there today (cron_run_scope deliberately does not;
+        # see its docstring), so this covers a process launched with it already
+        # set rather than anything the scope produces.
         import os
 
         prior = os.environ.get("HERMES_KANBAN_CRON_RUN")
