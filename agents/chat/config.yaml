@@ -153,6 +153,50 @@ agent:
 platforms:
   google_chat:
     typing_status_text: "Kage is thinking…"
+  # Slack egress presentation. `enabled` is the operator's to set, from the CR's
+  # spec.integration.slack.
+  #
+  # This block is one of the two copies the header warns about, and the one that
+  # does NOT run on a deployed agent: the operator's rendered config.yaml is
+  # subPath-mounted straight over $HERMES_HOME/config.yaml, so the file below is
+  # what the adapter reads only where nothing mounts over it — a local `docker
+  # run`, or a profile started off the image alone. Setting `rich_blocks` here
+  # and nowhere else changes nothing in a cluster. Its twin is
+  # renderConfigYAML in k8s-operator/internal/controller/platformagent_manifests.go
+  # (search `Platforms.Slack.Extra`), pinned by TestBuildConfigMapSlackRichBlocks.
+  # Change one, change both.
+  slack:
+    extra:
+      # Render outbound messages as Block Kit rather than a flat mrkdwn string.
+      #
+      # SlackAdapter.format_message already rewrites the inline markdown an
+      # agent emits — `**bold**` → `*bold*`, `[label](url)` → `<url|label>`,
+      # `# Heading` → `*Heading*` — so prose has always arrived readable. What
+      # it cannot rewrite is structure, because flat mrkdwn has none: a pipe
+      # table goes out as literal `|---|` rows, `---` stays three hyphens, a
+      # heading flattens into bold with no hierarchy, and a nested list loses
+      # its indentation. Every fleet report this harness delivers is exactly
+      # that shape — the kanban notifier hands a card's whole `result` to
+      # adapter.send(), tables and all.
+      #
+      # With this on, block_kit.render_blocks turns those into real `header`
+      # blocks, `divider`s, `rich_text_list`s that keep their nesting, and
+      # native `table` blocks with per-column alignment.
+      #
+      # Safe by construction, in three ways. A `text` fallback always ships
+      # alongside the blocks, so notifications, screen readers and old clients
+      # are unaffected. The renderer returns None — and the adapter falls back
+      # to the flat string — for anything it cannot express: over Slack's
+      # 50-block cap, or a table past 100 rows / 20 columns / 10k cell chars
+      # (that one degrades to aligned monospace first). And a message long
+      # enough to be split across chunks skips blocks entirely. A six-section,
+      # six-table report measures 26 blocks, so the reports that motivated this
+      # are well inside the cap.
+      #
+      # Note for anyone editing a persona: this expects STANDARD markdown as
+      # its input. Teaching an agent to emit Slack mrkdwn directly would defeat
+      # both this renderer and format_message.
+      rich_blocks: true
 
 # Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
 # `multiuser_memory` provider replaces it and is the ONLY memory on this profile.

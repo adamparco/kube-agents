@@ -588,6 +588,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			} `json:"google_chat"`
 			Slack struct {
 				Enabled bool `json:"enabled"`
+				// Adapter presentation knobs, passed through to the Slack plugin
+				// untouched. Carries `rich_blocks` — see the note where it is set.
+				Extra map[string]any `json:"extra,omitempty"`
 			} `json:"slack"`
 		} `json:"platforms"`
 		Plugins struct {
@@ -778,6 +781,24 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	if cfg.Memory.MemoryEnabled {
 		cfg.Agent.DisabledToolsets = append(cfg.Agent.DisabledToolsets, "memory")
 	}
+
+	// Render outbound Slack messages as Block Kit rather than one flat mrkdwn
+	// string. SlackAdapter.format_message already rewrites the inline markdown an
+	// agent emits (`**bold**` → `*bold*`, `[label](url)` → `<url|label>`), so prose
+	// has always arrived readable; what it cannot rewrite is structure, because flat
+	// mrkdwn has none. A pipe table ships as literal `|---|` rows, `---` stays three
+	// hyphens, a heading flattens into bold, and a nested list loses its indentation
+	// — and a fleet report handed to the kanban notifier is exactly that shape. With
+	// this on, block_kit.render_blocks emits real header/divider/table/rich_text
+	// blocks instead. It degrades safely: a `text` fallback always ships alongside,
+	// and the renderer declines (falling back to the flat string) for anything past
+	// Slack's 50-block cap or its table limits.
+	//
+	// Set unconditionally, unlike Google Chat's typing text above. It is inert while
+	// Slack is off, and rendering it regardless means the setting cannot be missed by
+	// whichever path ends up turning Slack on. Kept in sync with the same block in
+	// agents/chat/config.yaml, which carries the full note.
+	cfg.Platforms.Slack.Extra = map[string]any{"rich_blocks": true}
 
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
