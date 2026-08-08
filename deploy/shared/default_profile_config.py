@@ -30,9 +30,7 @@ to remove.
 The three inputs
 ----------------
   base   the baseline this script wrote last time, kept beside the config in
-         `.default-config-baseline.yaml`. Absent on the first start after this code
-         ships, in which case the image config stands in for it — which is exactly right,
-         because before this code existed the live file WAS the image config.
+         `.default-config-baseline.yaml`.
   ours   the live config.yaml, i.e. base plus whatever the runtime has written since.
   theirs the new baseline: the image's config.yaml merged with the operator's
          `profile-default.overlay.yaml`.
@@ -57,6 +55,27 @@ Lists follow the same rule, with one refinement: when the baseline changed, the 
 the runtime added are appended to it rather than the runtime list replacing it. When the
 baseline did not change, the runtime list stands verbatim — a toolset toggled OFF in the
 dashboard writes a SHORTER list, and unioning would resurrect the entry on every restart.
+
+The first start, when there is no recorded baseline
+---------------------------------------------------
+All three rules above need `base`, and on the very first start on a volume there is no
+`base`: this script has never run here, so nothing recorded what the runtime started
+from. There is no way to recover it either — the previous image is gone.
+
+`adopt` is that case, and it does not guess. A key the image or the operator declares is
+taken from the new baseline; a key neither of them mentions is runtime state and is
+carried across. So `/sethome`'s home channel and `monitoring.install_id` survive the
+upgrade, and a pre-upgrade local edit to a *declared* key does not — which is the same
+answer the steady-state rules give that edit on the next CR change anyway.
+
+Standing the image config in for the missing `base` was the first design and is wrong in
+exactly the case it exists for. That start is an image *upgrade*: the live file is the
+OLD image's config plus runtime edits, and the stand-in is the NEW image's. Every key the
+release changed then reads as a runtime edit and `ours` wins — and because the baseline
+written at the end is the correct new one, every later start re-derives the same verdict.
+An upgraded volume pins its old config for good, silently. This branch's own two fixes
+(the `${HERMES_HOME}` router path, the `incident_context` plugin) were both discarded
+that way; `tests/test_default_profile_config.py` has the regression.
 
 What this deliberately does not preserve
 ----------------------------------------
@@ -171,6 +190,29 @@ def _reconcile_list(base, ours, theirs):
     return copy.deepcopy(theirs) + copy.deepcopy(added)
 
 
+def adopt(ours, theirs):
+    """No recorded baseline: take the declarations, keep what only the runtime knows.
+
+    Used on the first start on a volume, where `reconcile`'s three-way rules have no
+    third input. See the module docstring for why the image config must not be
+    substituted for it. Nothing is mutated.
+    """
+    if not isinstance(ours, dict):
+        return copy.deepcopy(theirs)
+    out = copy.deepcopy(theirs) if isinstance(theirs, dict) else {}
+    for key, ours_v in ours.items():
+        theirs_v = out.get(key, _ABSENT)
+        if theirs_v is _ABSENT:
+            # Neither the image nor the operator has ever mentioned this key, so it is
+            # runtime state and nothing else can restore it.
+            out[key] = copy.deepcopy(ours_v)
+        elif isinstance(ours_v, dict) and isinstance(theirs_v, dict):
+            # Recurse: a declared subtree can still hold undeclared runtime keys, which
+            # is precisely where `/sethome` writes (platforms.<adapter>.home_channel).
+            out[key] = adopt(ours_v, theirs_v)
+    return out
+
+
 def build_baseline(image_path, overlay_paths):
     """The config as the image and the operator jointly declare it, with no runtime state.
 
@@ -214,15 +256,14 @@ def rebuild(config_path, image_path, overlay_paths=(), baseline_path=None) -> st
 
     baseline = build_baseline(image_path, overlay_paths)
 
-    # No record of a previous baseline means this is the first start on this volume
-    # since the rebuild shipped. The image config is the right stand-in: until now the
-    # entrypoint force-copied it over the live file on every start, so that IS what the
-    # runtime last started from, and using it means an unmodified volume produces an
-    # empty set of runtime edits rather than a spurious one.
-    previous = load_yaml(baseline_path) if baseline_path.is_file() else copy.deepcopy(load_yaml(image_path))
     live = load_yaml(config_path)
 
-    config = reconcile(previous, live, baseline)
+    # No record of a previous baseline means this is the first start on this volume, so
+    # there is no third input to merge against and `adopt` decides instead.
+    if baseline_path.is_file():
+        config = reconcile(load_yaml(baseline_path), live, baseline)
+    else:
+        config = adopt(live, baseline)
 
     _atomic_write_yaml(config_path, config)
     _atomic_write_yaml(baseline_path, baseline)

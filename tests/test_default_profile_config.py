@@ -116,6 +116,39 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual({"a": 9}, baseline)
 
 
+class AdoptTest(unittest.TestCase):
+    """The first start on a volume, where there is no third input to merge against."""
+
+    def test_a_declared_key_comes_from_the_new_baseline(self):
+        self.assertEqual({"a": 9}, dpc.adopt({"a": 1}, {"a": 9}))
+
+    def test_an_undeclared_key_is_runtime_state_and_survives(self):
+        self.assertEqual({"a": 9, "b": 2}, dpc.adopt({"a": 1, "b": 2}, {"a": 9}))
+
+    def test_undeclared_keys_survive_inside_a_declared_subtree(self):
+        # Where `/sethome` writes: `platforms` and `platforms.slack` are both declared,
+        # `home_channel` is not.
+        self.assertEqual(
+            {"platforms": {"slack": {"enabled": True, "home_channel": {"id": "C1"}}}},
+            dpc.adopt(
+                {"platforms": {"slack": {"enabled": False, "home_channel": {"id": "C1"}}}},
+                {"platforms": {"slack": {"enabled": True}}},
+            ),
+        )
+
+    def test_a_declared_list_is_not_negotiated(self):
+        # The whole point: no `base` means no way to tell a runtime removal from an
+        # older image's shorter list, and only one of those two mistakes is silent and
+        # permanent. Take the declaration.
+        self.assertEqual({"t": ["a", "b", "c"]}, dpc.adopt({"t": ["a", "b"]}, {"t": ["a", "b", "c"]}))
+
+    def test_inputs_are_not_mutated(self):
+        ours, theirs = {"a": 1, "b": {"c": 2}}, {"a": 9}
+        dpc.adopt(ours, theirs)
+        self.assertEqual({"a": 1, "b": {"c": 2}}, ours)
+        self.assertEqual({"a": 9}, theirs)
+
+
 class RebuildTest(unittest.TestCase):
     """End-to-end against files, the way the entrypoint calls it."""
 
@@ -168,6 +201,59 @@ class RebuildTest(unittest.TestCase):
         self.assertFalse(self.baseline.exists())
         self.rebuild()
         self.assertEqual(read(self.config), read(self.baseline))
+
+    def test_an_image_upgrade_reaches_a_pre_existing_volume(self):
+        # The regression. A volume that predates this script holds the OLD image's
+        # config; the first start sees the NEW one. Substituting the new image for the
+        # missing baseline made every key the release changed look like a runtime edit,
+        # so `ours` won — and since the baseline written at the end is the correct new
+        # one, every later start re-derived the same verdict. The upgrade never landed,
+        # on any restart, with no log line. Both of the `${HERMES_HOME}` router path and
+        # the `incident_context` plugin were lost this way.
+        old_image = {
+            "mcp_servers": {"router": {"args": ["/opt/data/scripts/router_server.py"]}},
+            "plugins": {"enabled": ["hermes_otel"]},
+            "platforms": {"google_chat": {"typing_status_text": "old"}},
+        }
+        new_image = {
+            "mcp_servers": {"router": {"args": ["${HERMES_HOME}/scripts/router_server.py"]}},
+            "plugins": {"enabled": ["hermes_otel", "incident_context"]},
+            "platforms": {"google_chat": {"typing_status_text": "new"}},
+        }
+        write(self.config, old_image)  # the pre-upgrade volume
+        write(self.image, new_image)
+        self.overlay.unlink()
+        self.assertFalse(self.baseline.exists())
+
+        for start in range(1, 4):  # and it must not drift back on a later restart
+            self.rebuild()
+            got = read(self.config)
+            self.assertEqual(
+                ["${HERMES_HOME}/scripts/router_server.py"],
+                got["mcp_servers"]["router"]["args"],
+                f"start {start}",
+            )
+            self.assertIn("incident_context", got["plugins"]["enabled"], f"start {start}")
+            self.assertEqual("new", got["platforms"]["google_chat"]["typing_status_text"])
+
+    def test_the_upgrade_keeps_the_runtime_state_it_finds(self):
+        # The other half of the case above: adopting the declarations must not cost the
+        # volume the keys only the runtime knows about.
+        live = dict(self.IMAGE)
+        live["platforms"] = {
+            "google_chat": {"typing_status_text": "Kage is thinking…"},
+            "slack": {"home_channel": {"id": "C123", "platform": "slack"}},
+        }
+        live["monitoring"] = {"install_id": "d3adbeef"}
+        write(self.config, live)
+        self.assertFalse(self.baseline.exists())
+
+        self.rebuild()
+
+        got = read(self.config)
+        self.assertEqual({"id": "C123", "platform": "slack"}, got["platforms"]["slack"]["home_channel"])
+        self.assertEqual("d3adbeef", got["monitoring"]["install_id"])
+        self.assertTrue(got["platforms"]["slack"]["enabled"])  # and the overlay still lands
 
     def test_home_channel_survives_a_restart(self):
         self.rebuild()
