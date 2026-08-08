@@ -29,9 +29,12 @@ ANCHOR = (
     f'{INDENT}_wake_kinds = {{ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}}\n'
 )
 
+# `adapter=` is load-bearing, not decoration: without it the narrowing also
+# applies to adapters whose send() the notifier deliberately skips, where the
+# wake IS the delivery. See wake_kinds_for's docstring.
 PATCHED = (
     f"{INDENT}# kube-agents patch: see gateway/kanban_wake_kinds.py\n"
-    f'{INDENT}_wake_kinds = _wake_kinds_for(d["events"])\n'
+    f'{INDENT}_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)\n'
 )
 
 # Appended rather than inserted: unlike a `check_fn=`, this name is resolved

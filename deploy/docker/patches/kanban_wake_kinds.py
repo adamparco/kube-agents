@@ -32,6 +32,11 @@ a decision, not for the one that already answered itself".
 ``resolve_wake_kinds`` reads ``kanban.wake_on_events`` from config and falls
 back to the upstream tuple, so an image built without that key set behaves
 exactly as upstream does.
+
+All of that reasoning is conditional on step 1 having happened, which is why
+``wake_kinds_for`` takes the adapter and leaves a non-push one alone: where the
+notifier skips the send, the wake is not a third hop over a delivered answer,
+it is the only delivery there is.
 """
 
 from __future__ import annotations
@@ -136,15 +141,60 @@ def resolve_wake_kinds(
     return tuple(kinds)
 
 
+def _adapter_can_push(adapter: object) -> bool:
+    """Whether *adapter* has a push channel.
+
+    Defers to ``gateway.wake.adapter_supports_push`` so this stays correct if
+    upstream ever makes the capability something richer than one attribute. That
+    module is not importable outside the image, so the fallback re-states its
+    current one-line contract rather than guessing: an adapter that does not
+    declare the flag is push-capable.
+    """
+    try:
+        from gateway.wake import adapter_supports_push
+    except Exception:
+        return bool(getattr(adapter, "supports_async_delivery", True))
+    try:
+        return bool(adapter_supports_push(adapter))
+    except Exception:
+        logger.warning(
+            "kanban notifier: adapter_supports_push(%s) raised; treating it as "
+            "push-capable and applying kanban.%s as configured",
+            type(adapter).__name__,
+            CONFIG_KEY,
+        )
+        return True
+
+
 def wake_kinds_for(
     events: Iterable[object],
     load_config: Optional[Callable[[], object]] = None,
+    adapter: object = None,
 ) -> set:
     """Return the subset of ``events``' kinds that should wake the creator.
 
     Mirrors the upstream expression it replaces::
 
         {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+
+    ``adapter`` opts a non-push adapter out of the narrowing entirely, and
+    passing it is not optional in the notifier. The whole argument for dropping
+    ``completed`` is that ``adapter.send()`` already put the worker's summary in
+    the thread, so the wake is a third hop over an answer the user is looking
+    at. On an adapter with no push channel — the API server, whose ``send()``
+    returns ``SendResult(success=False)`` by design — the notifier skips that
+    send and says so in its own comment: *"the wake self-post below IS the
+    delivery"*. Narrow the set there and a card that completes successfully is
+    never announced to anyone; upstream added that self-post to fix the
+    api_server wrong-session bug, and dropping ``completed`` re-breaks it.
+
+    So the config key governs the push path only. On the non-push path the full
+    upstream set always applies, including an explicit ``wake_on_events: []``:
+    that key means "do not spend a turn re-reading an answer already
+    delivered", which is not a thing anyone can be asking for where nothing was
+    delivered.
     """
     allowed = resolve_wake_kinds(load_config)
+    if adapter is not None and not _adapter_can_push(adapter):
+        allowed = DEFAULT_WAKE_KINDS
     return {ev.kind for ev in events if getattr(ev, "kind", None) in allowed}

@@ -135,16 +135,24 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_tick_lock_scope.py /opt/hermes
 # full model turn — which then re-reads the card and paraphrases a message the
 # user is already looking at. Measured at 5.9s and 32,460 input tokens on task
 # t_c31a1f00. Upstream hardcodes the wake set with no config key; this makes it
-# read kanban.wake_on_events, defaulting to the upstream tuple.
+# read kanban.wake_on_events, defaulting to the upstream tuple. The narrowing is
+# scoped to push-capable adapters: where the notifier skips its own send(), the
+# wake is the delivery rather than a duplicate of it.
 # See the module docstring in deploy/docker/patches/kanban_wake_kinds.py.
 COPY deploy/docker/patches/kanban_wake_kinds.py /opt/hermes/gateway/kanban_wake_kinds.py
 COPY deploy/docker/patches/apply_kanban_wake_kinds.py /tmp/apply_kanban_wake_kinds.py
 RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_wake_kinds.py /opt/hermes && \
-    grep -q '_wake_kinds = _wake_kinds_for(d\["events"\])' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q '_wake_kinds = _wake_kinds_for(d\["events"\], adapter=adapter)' /opt/hermes/gateway/kanban_watchers.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
-from gateway.kanban_wake_kinds import DEFAULT_WAKE_KINDS, resolve_wake_kinds; \
+from gateway.kanban_wake_kinds import DEFAULT_WAKE_KINDS, resolve_wake_kinds, wake_kinds_for; \
 exit(1) if resolve_wake_kinds(lambda: {}) != DEFAULT_WAKE_KINDS else None; \
-exit(1) if resolve_wake_kinds(lambda: {'kanban': {'wake_on_events': ['crashed']}}) != ('crashed',) else None" && \
+exit(1) if resolve_wake_kinds(lambda: {'kanban': {'wake_on_events': ['crashed']}}) != ('crashed',) else None; \
+ev = type('E', (), {'kind': 'completed'})(); \
+cfg = lambda: {'kanban': {'wake_on_events': ['crashed']}}; \
+push = type('A', (), {'supports_async_delivery': True})(); \
+nopush = type('A', (), {'supports_async_delivery': False})(); \
+exit(1) if wake_kinds_for([ev], cfg, adapter=push) != set() else None; \
+exit(1) if wake_kinds_for([ev], cfg, adapter=nopush) != {'completed'} else None" && \
     rm /tmp/apply_kanban_wake_kinds.py
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates

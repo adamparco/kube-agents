@@ -112,6 +112,58 @@ class WakeKindsForTest(unittest.TestCase):
         self.assertEqual(wake_kinds_for([object()], loader({})), set())
 
 
+class Adapter:
+    def __init__(self, supports_async_delivery):
+        self.supports_async_delivery = supports_async_delivery
+
+
+class NonPushAdapterTest(unittest.TestCase):
+    """The narrowing applies to the push path only.
+
+    Where the notifier skips its own ``send()`` it says the wake self-post IS
+    the delivery, so a narrowed set there loses the result instead of saving a
+    turn.
+    """
+
+    def test_a_non_push_adapter_still_wakes_on_completion(self):
+        events = [Event("completed")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(wake_kinds_for(events, cfg, adapter=Adapter(False)), {"completed"})
+
+    def test_a_push_adapter_still_honours_the_narrowed_set(self):
+        events = [Event("completed")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(wake_kinds_for(events, cfg, adapter=Adapter(True)), set())
+
+    def test_an_adapter_that_does_not_declare_the_flag_counts_as_push(self):
+        # gateway.wake.adapter_supports_push defaults a missing attribute to
+        # True; reading it as non-push would restore the redundant turn on
+        # every Slack and Google Chat card.
+        events = [Event("completed")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(wake_kinds_for(events, cfg, adapter=object()), set())
+
+    def test_an_explicit_empty_list_does_not_silence_the_non_push_path(self):
+        # `wake_on_events: []` means "do not re-read an answer already
+        # delivered". Nothing was delivered here, so there is no such answer.
+        events = [Event("completed")]
+        self.assertEqual(
+            wake_kinds_for(events, loader({"wake_on_events": []}), adapter=Adapter(False)),
+            {"completed"},
+        )
+        self.assertEqual(
+            wake_kinds_for(events, loader({"wake_on_events": []}), adapter=Adapter(True)),
+            set(),
+        )
+
+    def test_omitting_the_adapter_leaves_the_config_in_charge(self):
+        # The notifier always passes it; the default keeps every other caller
+        # (and the pre-existing tests above) on the documented config path.
+        events = [Event("completed")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(wake_kinds_for(events, cfg), set())
+
+
 # The notifier loop, reduced to the two lines the patch rewrites.
 UPSTREAM_WATCHER = '''\
 class GatewayKanbanWatchers:
@@ -143,7 +195,9 @@ class ApplyTest(unittest.TestCase):
 
     def test_the_hardcoded_tuple_is_replaced_by_the_helper(self):
         patched = patch_tree(UPSTREAM_WATCHER)
-        self.assertIn('_wake_kinds = _wake_kinds_for(d["events"])', patched)
+        # `adapter=adapter` is part of the assertion: the notifier must hand the
+        # helper the adapter, or the non-push carve-out above never engages.
+        self.assertIn('_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)', patched)
         # Only the prose reference in the surrounding comment may survive.
         self.assertNotIn("_WAKE_KINDS = (", patched)
         self.assertNotIn("in _WAKE_KINDS}", patched)
