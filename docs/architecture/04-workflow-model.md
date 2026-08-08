@@ -208,10 +208,13 @@ polling to notice things. Proactivity is driven, in order of preference:
    bounds worst-case detection latency. It is the last resort, not the primary mechanism, because a poll
    lags a fast-moving problem and burns cycles when nothing changed.
 
-The Platform Agent ships a roster of governance jobs (`agents/platform/cron/jobs.json`) mapped to SOPs
-in `agents/platform/governance/`; these are the cron (scheduled-push) tier, and reactive concerns should
-migrate to event triggers rather than new poll loops. The current roster and its cadences are generated
-from that file onto [the cron-jobs reference page](../site/src/content/docs/reference/cron-jobs.md) —
+The harness ships a roster of governance jobs mapped to SOPs in `agents/platform/governance/` — the
+watchdog triggers live in the Chat Agent's cron store (`agents/chat/defaults/cron/jobs.json`), the only
+profile whose gateway ticks, and the Platform Agent's own roster (`agents/platform/cron/jobs.json`) is
+dispatched from that same store's `profile-cron-tick` job; these are the cron (scheduled-push) tier, and
+reactive concerns should migrate to event triggers rather than new poll loops. The current roster and
+its cadences are generated onto
+[the cron-jobs reference page](../site/src/content/docs/reference/cron-jobs.md) —
 restating them here is how the count goes stale, which it had (this section claimed eleven jobs against
 a file holding seven).
 

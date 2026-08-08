@@ -92,8 +92,10 @@ class AuditSpec(NamedTuple):
 # The audit streams allowed to own a ledger. An id not listed here is rejected
 # before any git/gh call: a typo must not silently open a seventh ledger stream.
 # The human names mirror the `name` of the matching watchdog in
-# agents/platform/cron/jobs.json — keep the two in step so the issue title and
-# the cron catalogue name the same thing.
+# agents/chat/defaults/cron/jobs.json — the Chat Agent's roster, which holds
+# every live schedule because its profile owns the only running gateway (the
+# platform-side copies are disabled tombstones). Keep the two in step so the
+# issue title and the cron catalogue name the same thing.
 AUDITS: dict[str, AuditSpec] = {
     "compliance-audit": AuditSpec(
         "Security & RBAC Posture Audit",

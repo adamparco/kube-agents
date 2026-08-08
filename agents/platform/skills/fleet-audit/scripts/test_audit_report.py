@@ -1471,9 +1471,18 @@ class TestSchemeMigration(HarnessTestCase):
 
 class TestAuditCatalogue(unittest.TestCase):
     def cron_jobs(self):
-        """The cron catalogue keyed by id, or a skip when it is not shipped."""
+        """The cron catalogue keyed by id, or a skip when it is not shipped.
+
+        The Chat Agent's roster, not this profile's: cron ticking is a property
+        of a running gateway and only the `default` profile has one, so every
+        governance job lives there and reaches this agent as a kanban card.
+        """
         jobs_file = (
-            Path(__file__).resolve().parents[4] / "platform" / "cron" / "jobs.json"
+            Path(__file__).resolve().parents[4]
+            / "chat"
+            / "defaults"
+            / "cron"
+            / "jobs.json"
         )
         if not jobs_file.is_file():  # not shipped alongside the skill at runtime
             self.skipTest(f"{jobs_file} not present")
@@ -1496,35 +1505,87 @@ class TestAuditCatalogue(unittest.TestCase):
             self.skipTest(f"{sop_dir} not present")
         return sop_dir
 
-    def test_every_watchdog_declares_local_delivery(self):
-        """No watchdog fans its report out to whatever chat happens to be wired.
+    def governance_jobs(self):
+        """The relocated governance jobs on the Chat Agent's roster, keyed by id.
 
-        `deliver` is resolved at fire time, and `"all"` expands to every
-        platform holding a home channel in that process' environment right
-        then. On the Platform Agent profile that is the wrong shape twice
-        over. On the scheduled tick it expands to nothing, so a run that
-        published its ledger perfectly still records
-        `no delivery target resolved for deliver=all` and looks broken. And if
-        a home channel ever does appear, seven watchdogs begin chat-delivering
-        to a destination nobody chose — the profile carries no `platforms:`
-        section precisely because it should hold no chat destination of its
-        own.
-
-        `local` is the honest declaration: Tier 1 is the ledger issue, and a
-        dispatched run reports back through the response the Chat Agent
-        relays. If a chat ping is ever added it belongs on the Chat Agent, and
-        this assertion is the place that will make someone say so out loud.
+        A `dispatch_<id>.py` script is what marks one: the other entries on
+        that roster — `profile-cron-tick`, the reconcile sweep and the two
+        onboarding jobs — do work of their own rather than filing a card.
         """
-        for job_id, job in sorted(self.cron_jobs().items()):
+        return {
+            job_id: job
+            for job_id, job in self.cron_jobs().items()
+            if str(job.get("script", "")).startswith("dispatch_")
+        }
+
+    def platform_roster(self):
+        """This profile's own cron store, or a skip when it is not shipped."""
+        jobs_file = (
+            Path(__file__).resolve().parents[4] / "platform" / "cron" / "jobs.json"
+        )
+        if not jobs_file.is_file():  # not shipped alongside the skill at runtime
+            self.skipTest(f"{jobs_file} not present")
+        return {
+            job["id"]: job
+            for job in json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
+        }
+
+    def test_every_watchdog_declares_all_delivery(self):
+        """A governance tick that stops filing cards has to be audible.
+
+        The tick is a `no_agent` subprocess, and on success it prints nothing
+        and is delivered as a silent run — so `deliver` only ever decides what
+        happens on failure. `"all"` sends that failure to the Chat Agent's
+        configured target, which exists because that profile is the chat front
+        door; `"local"` resolves to no target and drops it, leaving a bridge
+        that has stopped filing cards indistinguishable from a fleet with
+        nothing to report.
+
+        The audit's own findings do not travel this leg — Tier 1 is the ledger
+        issue — so this is not a route for reports, only for the failure of
+        the thing that files them.
+        """
+        watchdogs = self.governance_jobs()
+        self.assertTrue(
+            watchdogs,
+            "no dispatch_<id>.py entries on the Chat Agent's roster; either the "
+            "governance jobs moved again or the marker changed",
+        )
+        for job_id, job in sorted(watchdogs.items()):
             with self.subTest(job=job_id):
                 self.assertEqual(
                     job.get("deliver"),
-                    "local",
-                    f"cron/jobs.json[{job_id}] declares "
-                    f"deliver={job.get('deliver')!r}; the Platform Agent "
-                    f"profile has no chat transport, so anything but 'local' "
-                    f"either records a phantom delivery failure or fans the "
-                    f"report out to an unreviewed destination",
+                    "all",
+                    f"chat roster[{job_id}] declares "
+                    f"deliver={job.get('deliver')!r}; a tick that failed to "
+                    f"file its card would then resolve to no delivery target "
+                    f"and vanish",
+                )
+
+    def test_platform_roster_ships_only_disabled_tombstones(self):
+        """An entry left enabled here runs its audit twice.
+
+        This roster is not inert: `profile-cron-tick` runs `hermes cron tick`
+        against every named profile with work due, so an enabled entry fires
+        here *and* arrives as a card from the Chat Agent's dispatch script.
+        The entries are kept rather than deleted because
+        `profile_scaffold.merge_cron_store` adds and overwrites but never
+        prunes — shipping them disabled is what switches off the enabled copies
+        an upgraded volume was given by an earlier release.
+        """
+        roster = self.platform_roster()
+        self.assertTrue(
+            roster,
+            "the tombstones are load-bearing: emptying this roster stops the "
+            "start-up merge disabling the enabled copies on upgraded volumes",
+        )
+        for job_id, job in sorted(roster.items()):
+            with self.subTest(job=job_id):
+                self.assertIs(
+                    job.get("enabled"),
+                    False,
+                    f"platform roster[{job_id}] is enabled; it would run in "
+                    f"duplicate with the card the Chat Agent files",
                 )
 
     def test_every_stream_has_a_watchdog_and_every_watchdog_a_stream(self):
@@ -7099,13 +7160,35 @@ class TestDispatchAndHandover(unittest.TestCase):
             self.skipTest(f"{relative} not present")
         return path.read_text(encoding="utf-8")
 
-    def test_the_dispatch_rule_requires_reporting_the_result(self):
-        text = self.read("AGENTS.md")
-        bullet = next(
-            line for line in text.splitlines() if "cronjob(action='run'" in line
-        )
+    def bullet(self, marker):
+        """The whole of the AGENTS.md bullet whose first line holds `marker`.
+
+        A bullet is no longer one line: the on-demand rule carries a numbered
+        sub-list and a trailing paragraph, and the rule under test lives in
+        them. Matching a single line would silently pass on a bullet whose
+        substance had been indented away.
+        """
+        lines = self.read("AGENTS.md").splitlines()
+        start = next(i for i, line in enumerate(lines) if marker in line)
+        end = start + 1
+        while end < len(lines) and not lines[end].startswith(("- ", "#")):
+            end += 1
+        return "\n".join(lines[start:end])
+
+    def test_a_scheduled_card_must_still_be_closed_out(self):
+        bullet = self.bullet("A governance job arrives as a card")
         self.assertIn("kanban_complete", bullet)
-        self.assertIn("[SILENT]", bullet)
+
+    def test_an_on_demand_run_files_a_card_and_makes_it_speak(self):
+        """On demand, two commands or the report lands nowhere.
+
+        The dispatch script files the card; without `kanban_notify_propagate`
+        no subscription is copied onto it, so the worker's summary — the
+        report, ledger URL and all — completes into silence.
+        """
+        bullet = self.bullet("file its card, do not re-enact it")
+        self.assertIn("platform_cron_dispatch.py", bullet)
+        self.assertIn("kanban_notify_propagate.py", bullet)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
         section = self.read("SOUL.md").split("## 1.")[0]
