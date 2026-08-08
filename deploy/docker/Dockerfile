@@ -100,20 +100,28 @@ exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None"
     /opt/hermes/.venv/bin/python3 /tmp/verify_cron_run_scope.py && \
     rm /tmp/apply_cron_run_scope.py /tmp/verify_cron_run_scope.py
 
-# Fix: one slow cron job no longer blocks every other job on the same profile.
-# `tick()` defaults to sync=True and holds <HERMES_HOME>/cron/.tick.lock across
-# the whole `as_completed` wait, so on the platform profile -- ticked only by
-# spawning `hermes cron tick`, which takes that default -- a fleet audit starved
-# every other job for its full runtime. Measured over 17h: 3 of 35
-# github-issue-resolver firings 418s / 179s / 1142s late, each unblocking within
-# seconds of the blocking audit finishing. Six anchored edits, so the surgery
-# lives in an applier. The lock now covers only what its own comment says it is
-# for -- get_due_jobs, advance_next_runs, create_execution, pool.submit -- and a
-# per-job flock replaces the cross-process in-flight guard the wide lock was
-# implicitly providing. flock rather than a ledger row on purpose: the platform
-# ledger is never swept (recover_interrupted() runs only under the in-process
-# ticker) and already carries 6 permanent status='running' rows, so a ledger
-# gate would have wedged those job ids forever.
+# Fix: give a spawned `hermes cron tick` the scheduler lifecycle it never had.
+# The platform profile has no ticker thread -- it is ticked once a minute by
+# spawning `hermes cron tick`, whose body is verbatim `tick(verbose=True)` --
+# so everything Hermes hangs off the ticker's lifetime is absent or wrong there.
+# Three consequences, all fixed by the eleven anchored edits in the applier:
+#   * `tick()` defaults to sync=True and held <HERMES_HOME>/cron/.tick.lock
+#     across the whole `as_completed` wait, so a fleet audit starved every other
+#     job for its full runtime. Measured over 17h: 3 of 35
+#     github-issue-resolver firings 418s / 179s / 1142s late, each unblocking
+#     within seconds of the blocking audit finishing. The lock now covers only
+#     what its own comment says it is for -- get_due_jobs, advance_next_runs,
+#     create_execution, pool.submit -- and a per-job flock replaces the
+#     cross-process in-flight guard the wide lock was implicitly providing.
+#     flock rather than a ledger row on purpose: the kernel drops it when the
+#     holder dies, so unlike a `running` row it cannot wedge a job id forever.
+#   * `cronjob(action='run')` took no per-job lock at all, and the
+#     claim_job_for_fire CAS it relied on never blocked a tick, so a dispatched
+#     audit could run on top of a scheduled one and share its output file.
+#   * recover_interrupted_executions() runs only from the two gateway-ticker
+#     lifecycles, so nothing ever reaped an abandoned attempt on this profile:
+#     the live ledger held 6 permanently `running` rows, the oldest a day old,
+#     against 0 of 1000 on the default store the gateway does sweep.
 # Must stay AFTER the cron_run_scope block: every anchor was verified against
 # the post-cron_run_scope source.
 # See the module docstring in deploy/docker/patches/cron_tick_lock_scope.py.
@@ -123,9 +131,11 @@ COPY deploy/docker/patches/verify_cron_tick_lock_scope.py /tmp/verify_cron_tick_
 RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_tick_lock_scope.py /opt/hermes && \
     grep -q "from tools.cron_tick_lock_scope import AdvisoryLock, JobLocks" /opt/hermes/cron/scheduler.py && \
     grep -q "_tick_lock = AdvisoryLock(lock_fd, fcntl, globals().get(\"msvcrt\"))" /opt/hermes/cron/scheduler.py && \
-    grep -q "if not _job_locks.claim(job_id):" /opt/hermes/cron/scheduler.py && \
-    grep -q "_job_locks.release(j\[\"id\"\])" /opt/hermes/cron/scheduler.py && \
+    grep -q "_job_lock = _job_locks.claim(job_id)" /opt/hermes/cron/scheduler.py && \
+    grep -q "_run_lock = _job_locks.claim(job_id)" /opt/hermes/tools/cronjob_tools.py && \
+    grep -q "recover_interrupted_executions" /opt/hermes/hermes_cli/cron.py && \
     ! grep -q "fcntl.flock(lock_fd, fcntl.LOCK_UN)" /opt/hermes/cron/scheduler.py && \
+    ! grep -q "_job_locks.release(" /opt/hermes/cron/scheduler.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_cron_tick_lock_scope.py && \
     rm /tmp/apply_cron_tick_lock_scope.py /tmp/verify_cron_tick_lock_scope.py
 

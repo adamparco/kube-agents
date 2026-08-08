@@ -2,36 +2,62 @@
 """Build gate for the cron tick-lock-scope patch.
 
 Run by deploy/docker/Dockerfile from /opt/hermes after
-apply_cron_tick_lock_scope.py. The applier only proves six anchors matched; it
-proves nothing about WHERE the release landed, and a release placed one
+apply_cron_tick_lock_scope.py. The applier only proves eleven anchors matched;
+it proves nothing about WHERE the release landed, and a release placed one
 statement too early would silently break at-most-once.
 
-Three checks, each a way the patch could match its anchors and still be wrong
-or harmful:
+Six checks, each a way the patch could match its anchors and still be wrong or
+harmful:
 
-1. STATIC ORDERING. Parse the patched ``cron/scheduler.py::tick`` and assert the
-   ``_tick_lock.release()`` statement sits inside the ``try``, strictly AFTER
-   the ``advance_next_runs(...)`` call and after the last ``_submit_with_guard``
-   call, and strictly BEFORE the ``if sync:`` node. Releasing before the advance
-   or before dispatch would reintroduce double-firing. The ``finally`` is also
-   asserted to be the idempotent backstop and nothing else -- if it still
-   touches ``lock_fd`` directly, the old wide-scope unlock survived alongside
-   the new one.
+1. RELEASE PLACEMENT. Parse the patched ``cron/scheduler.py::tick`` and assert
+   the ``_tick_lock.release()`` statement sits inside the ``try``, strictly
+   AFTER the ``advance_next_runs(...)`` call and after the last
+   ``_submit_with_guard`` call, and strictly BEFORE the ``if sync:`` node.
+   Releasing before the advance or before dispatch would reintroduce
+   double-firing. The ``finally`` is also asserted to be the idempotent
+   backstop and nothing else -- if it still touches ``lock_fd`` directly, the
+   old wide-scope unlock survived alongside the new one.
 
-2. HEAD-OF-LINE IS GONE. Against a throwaway HERMES_HOME with one ``no_agent``
-   job whose script sleeps, run ``tick(sync=True)`` in a child process; once the
-   ledger shows the job running, assert ``.tick.lock`` can be flock'd from the
-   parent. On today's image that flock fails; on the patched image it succeeds.
-   This is the defect, stated as an assertion.
+2. THE CLAIM IS CARRIED, NOT LOOKED UP. Assert the dispatch guard binds
+   ``_job_lock`` from ``_job_locks.claim(...)``, hands that object to
+   ``_run_and_release`` as a default argument, releases through it, and that
+   ``_job_locks.release(`` appears nowhere. Releasing by job id meant
+   recomputing the lock path on a worker thread whose context can no longer
+   resolve the profile -- see the "caller owns its claim" section of
+   ``cron_tick_lock_scope.py``. The binding is also what keeps the lock object
+   alive for the run's duration.
 
-3. THE DOUBLE-FIRE GUARD IS ARMED. In the same window, assert
-   ``.job-<id>.lock`` can NOT be flock'd -- and that after the child exits it
-   CAN be, proving the kernel released it rather than a janitor having to.
-   Check 3 exists because the guard is the thing the narrowing trades away;
-   shipping it untested by the build is how the fix becomes worse than the bug.
+3. THE DISPATCH PATH CLAIMS BEFORE THE CAS. Assert
+   ``tools/cronjob_tools.py::_execute_job_now`` claims the per-job flock on a
+   line strictly before ``claim_job_for_fire`` -- after would leave
+   ``next_run_at`` advanced for a run that was then refused -- and releases in
+   a ``finally``, which is the only path out that a BaseException cannot skip.
 
-Checks 2 and 3 are real cross-process lock exercises, not AST assertions: a
-separate interpreter holds the locks, and this process is the second claimant.
+4. THE SPAWNED TICK SWEEPS FIRST. Assert ``hermes_cli/cron.py::cron_tick``
+   calls ``recover_interrupted_executions`` before ``tick``, and inside a
+   ``try`` -- a bookkeeping sweep that raises must never cost the profile its
+   tick.
+
+5. HEAD-OF-LINE IS GONE, AND THE GUARD IS ARMED. Against a throwaway
+   HERMES_HOME with one ``no_agent`` job whose script sleeps, run a real
+   ``tick(sync=True)`` in a child process; once the ledger shows the job
+   running, assert ``.tick.lock`` can be flock'd from this process (on the
+   unpatched image it cannot -- that is the defect, stated as an assertion)
+   and that ``.job-<id>.lock`` cannot. Then, with the child STILL ALIVE after
+   its tick returns, assert the per-job lock is free: that proves the patched
+   code released the claim rather than the kernel reaping it at exit, which is
+   the half a dying process would hide.
+
+6. A STUCK LEDGER ROW IS REAPED. Leave a ``running`` row behind from a child
+   that exits without finishing it -- the live platform profile had six of
+   these, the oldest a day old -- then run the patched ``cron_tick`` in another
+   child and assert the row became ``unknown``.
+
+Checks 5 and 6 are real cross-process exercises, not AST assertions: separate
+interpreters hold the locks and own the ledger rows, and this process is the
+second claimant. The kernel-releases-on-death property is pinned by the host
+suite instead (``test_cron_tick_lock_scope.py``), because it needs a SIGKILL
+that would make this file's child bookkeeping much harder to read.
 
 Usage::
 
@@ -66,12 +92,29 @@ def check(label: str, condition: object, detail: str = "") -> None:
     print(f"  FAIL {label}{': ' + detail if detail else ''}")
 
 
-# --- 1. static ordering ------------------------------------------------------
+def function_named(path: Path, name: str):
+    """The named function node in ``path``, or None."""
+    tree = ast.parse(path.read_text())
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == name), None)
+    return tree, fn
+
+
+def call_linenos(node, pred) -> list[int]:
+    return [n.lineno for n in ast.walk(node) if isinstance(n, ast.Call) and pred(n)]
+
+
+def named_call(name: str):
+    """Matches ``name(...)`` however it is spelled -- bare or as an attribute."""
+    return lambda n: (getattr(n.func, "id", None) == name
+                      or getattr(n.func, "attr", None) == name)
+
+
+# --- 1 + 2. cron/scheduler.py -----------------------------------------------
 def check_release_placement() -> None:
     print("release placement (cron/scheduler.py::tick):")
-    tree = ast.parse((HERMES / "cron" / "scheduler.py").read_text())
-    fn = next((n for n in ast.walk(tree)
-               if isinstance(n, ast.FunctionDef) and n.name == "tick"), None)
+    scheduler = HERMES / "cron" / "scheduler.py"
+    tree, fn = function_named(scheduler, "tick")
     check("tick() is still a module-level function", fn is not None)
     if fn is None:
         return
@@ -86,17 +129,12 @@ def check_release_placement() -> None:
     outer = tries[0]
     body = outer.body
 
-    def linenos(pred):
-        return [n.lineno for n in ast.walk(outer) if pred(n)]
-
     releases = [n.lineno for n in body
                 if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
                 and getattr(n.value.func, "attr", None) == "release"
                 and getattr(getattr(n.value.func, "value", None), "id", None) == "_tick_lock"]
-    advances = linenos(lambda n: isinstance(n, ast.Call)
-                       and getattr(n.func, "id", None) == "advance_next_runs")
-    submits = linenos(lambda n: isinstance(n, ast.Call)
-                      and getattr(n.func, "id", None) == "_submit_with_guard")
+    advances = call_linenos(outer, named_call("advance_next_runs"))
+    submits = call_linenos(outer, named_call("_submit_with_guard"))
     syncs = [n.lineno for n in body
              if isinstance(n, ast.If) and getattr(n.test, "id", None) == "sync"]
 
@@ -138,14 +176,137 @@ def check_release_placement() -> None:
           f"found {module_src!r}")
 
 
-# --- 2 + 3. behavioural ------------------------------------------------------
+def check_claim_is_carried() -> None:
+    print("claim ownership (cron/scheduler.py dispatch guard):")
+    scheduler = HERMES / "cron" / "scheduler.py"
+    source = scheduler.read_text()
+    _tree, fn = function_named(scheduler, "tick")
+    if fn is None:
+        check("tick() is still a module-level function", False)
+        return
+    src = ast.unparse(fn)
+
+    check("the guard binds the claim it took",
+          "_job_lock = _job_locks.claim(job_id)" in src,
+          "the claim is not held in a local, so nothing keeps the lock object "
+          "alive and the flock is dropped the moment it is garbage collected")
+    check("a lost claim skips the job", "if _job_lock is None:" in src)
+
+    # Scoped to the nested worker rather than searched for across tick(): the
+    # tick lock's own `_tick_lock.release()` would satisfy a loose substring
+    # match and the check would pass on an unpatched image.
+    worker = next((n for n in ast.walk(fn) if isinstance(n, ast.FunctionDef)
+                   and n.name == "_run_and_release"), None)
+    check("_run_and_release still wraps the dispatch", worker is not None)
+    if worker is not None:
+        params = [a.arg for a in worker.args.args]
+        defaults = [ast.unparse(d) for d in worker.args.defaults]
+        check("the claim travels into the worker as a default argument",
+              "lock" in params and "_job_lock" in defaults,
+              f"params={params}, defaults={defaults} — the worker cannot "
+              "resolve the store the claim was taken under, so it has to be "
+              "handed the object")
+        finals = "\n".join(ast.unparse(s) for t in worker.body
+                           if isinstance(t, ast.Try) for s in t.finalbody)
+        check("the worker releases through that object in its finally",
+              "lock.release()" in finals,
+              f"finally body: {finals!r}")
+
+    check("nothing releases a claim by job id", "_job_locks.release(" not in source,
+          "release-by-id recomputes the lock path from get_hermes_home(), whose "
+          "override is a ContextVar the worker thread does not have — the pop "
+          "misses and the job is suppressed for the gateway's whole life")
+
+
+# --- 3. tools/cronjob_tools.py ----------------------------------------------
+def check_dispatch_claims_before_the_cas() -> None:
+    print("dispatch gate (tools/cronjob_tools.py::_execute_job_now):")
+    path = HERMES / "tools" / "cronjob_tools.py"
+    _tree, fn = function_named(path, "_execute_job_now")
+    check("_execute_job_now still exists", fn is not None)
+    if fn is None:
+        return
+
+    claims = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
+              and getattr(n.func, "attr", None) == "claim"
+              and getattr(getattr(n.func, "value", None), "id", None) == "_job_locks"]
+    cas = call_linenos(fn, named_call("claim_job_for_fire"))
+    check("it claims the per-job flock", len(claims) == 1, f"found {len(claims)}")
+    check("it still performs the store CAS", len(cas) == 1, f"found {len(cas)}")
+    if claims and cas:
+        check("the flock is claimed BEFORE the CAS", claims[0] < cas[0],
+              f"claim at {claims[0]}, claim_job_for_fire at {cas[0]} — a "
+              "refusal discovered after the CAS leaves next_run_at advanced "
+              "for a run that never happened")
+
+    tries = [n for n in fn.body if isinstance(n, ast.Try) and n.finalbody]
+    check("_execute_job_now has exactly one try/finally", len(tries) == 1,
+          f"found {len(tries)}")
+    if len(tries) == 1:
+        finally_src = "\n".join(ast.unparse(s) for s in tries[0].finalbody)
+        check("the claim is released in the finally",
+              "_run_lock.release()" in finally_src,
+              "a return or a BaseException would leak the claim, and a leaked "
+              f"claim silently suppresses the job: {finally_src!r}")
+
+
+# --- 4. hermes_cli/cron.py ---------------------------------------------------
+def check_spawned_tick_sweeps_first() -> None:
+    print("recovery sweep (hermes_cli/cron.py::cron_tick):")
+    path = HERMES / "hermes_cli" / "cron.py"
+    _tree, fn = function_named(path, "cron_tick")
+    check("cron_tick still exists", fn is not None)
+    if fn is None:
+        return
+
+    sweeps = call_linenos(fn, named_call("recover_interrupted_executions"))
+    ticks = call_linenos(fn, named_call("tick"))
+    check("it sweeps interrupted executions", len(sweeps) == 1,
+          f"found {len(sweeps)} — a spawned tick is this profile's entire "
+          "scheduler lifecycle, so nothing else will ever reap a stuck row")
+    check("it still ticks", len(ticks) == 1, f"found {len(ticks)}")
+    if sweeps and ticks:
+        check("the sweep runs before the tick", sweeps[0] < ticks[0],
+              f"sweep at {sweeps[0]}, tick at {ticks[0]}")
+
+    guarded = any(sweeps and t.lineno <= sweeps[0] <= (t.end_lineno or t.lineno)
+                  for t in ast.walk(fn) if isinstance(t, ast.Try))
+    check("the sweep is wrapped in a try", guarded,
+          "bookkeeping that raises would cost the profile its tick")
+
+
+# --- 5 + 6. behavioural ------------------------------------------------------
 SLOW_SCRIPT = "import time\ntime.sleep(12)\nprint('slow job done')\n"
 
+# The child stays alive after the tick returns on purpose: it lets the parent
+# tell "the patch released the per-job claim" from "the process died and the
+# kernel released it for us". Only the first is evidence the code is correct.
 CHILD = (
-    "import sys\n"
+    "import sys, time\n"
     "sys.path.insert(0, {root!r})\n"
     "from cron.scheduler import tick\n"
     "tick(verbose=False)\n"
+    "print('TICK RETURNED', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+# Exits without a terminal ledger state, exactly as the kanban worker processes
+# that left six immortal `running` rows on the live platform profile did.
+GHOST = (
+    "import os, sys\n"
+    "sys.path.insert(0, {root!r})\n"
+    "from cron.executions import create_execution, mark_execution_running\n"
+    "row = create_execution('ghost-job', source='direct')\n"
+    "mark_execution_running(row['id'])\n"
+    "print(row['id'], flush=True)\n"
+    "os._exit(0)\n"
+)
+
+SWEEPER = (
+    "import sys\n"
+    "sys.path.insert(0, {root!r})\n"
+    "from hermes_cli.cron import cron_tick\n"
+    "cron_tick()\n"
 )
 
 
@@ -186,20 +347,35 @@ def flockable_within(path: Path, seconds: float = 3.0) -> bool:
         time.sleep(0.05)
 
 
+def write_job_store(home: Path, jobs: list) -> None:
+    (home / "cron").mkdir(parents=True, exist_ok=True)
+    (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": jobs}))
+
+
+def wait_for_line(log: Path, needle: str, child, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if log.is_file() and needle in log.read_text(errors="replace"):
+            return True
+        if child.poll() is not None:
+            return log.is_file() and needle in log.read_text(errors="replace")
+        time.sleep(0.2)
+    return False
+
+
 def check_behaviour() -> None:
     print("lock behaviour (a real second process holds the locks):")
     with tempfile.TemporaryDirectory() as d:
         home = Path(d)
-        (home / "cron").mkdir(parents=True)
         (home / "scripts").mkdir(parents=True)
         (home / "scripts" / "slow_job.py").write_text(SLOW_SCRIPT)
-        (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{
+        write_job_store(home, [{
             "id": "slow-job", "name": "Slow Job",
             "schedule": {"kind": "interval", "minutes": 1, "display": "every 1m"},
             "prompt": "", "no_agent": True, "script": "slow_job.py", "skills": [],
             "enabled": True, "deliver": "local",
             "next_run_at": "2000-01-01T00:00:00+00:00", "state": "scheduled",
-        }]}))
+        }])
 
         env = dict(os.environ, HERMES_HOME=str(home))
         # The child's output is kept, not discarded: if the throwaway
@@ -232,7 +408,6 @@ def check_behaviour() -> None:
                   "the throwaway HERMES_HOME never dispatched — the harness "
                   "is broken, not the patch")
             if not running:
-                child.wait(timeout=60)
                 child_log.close()
                 print("--- child output ---")
                 print(log.read_text()[-4000:] or "(empty)")
@@ -247,20 +422,71 @@ def check_behaviour() -> None:
                   not flockable(home / "cron" / ".job-slow-job.lock"),
                   "nothing replaced the cross-process in-flight guard the wide "
                   "lock used to provide")
+
+            returned = wait_for_line(log, "TICK RETURNED", child, 60)
+            check("the child's tick returned", returned,
+                  "the slow job never finished, so the release cannot be "
+                  f"observed: {log.read_text()[-2000:]!r}")
+            check("the claim is released by the code, not by the child dying",
+                  returned and child.poll() is None
+                  and flockable_within(home / "cron" / ".job-slow-job.lock"),
+                  "the per-job claim outlived the run inside a process that is "
+                  "still alive — _run_and_release did not release it, which is "
+                  "the leak that suppresses the job on every later tick")
         finally:
-            child.wait(timeout=60)
+            child.kill()
+            child.wait(timeout=30)
             child_log.close()
 
-        check("per-job lock is released by the kernel on process exit",
-              flockable(home / "cron" / ".job-slow-job.lock"),
-              "the claim outlived its holder — this is the wedging failure "
-              "mode flock was chosen to avoid")
+
+def check_recovery_sweep() -> None:
+    print("recovery sweep (a stuck row from a process that is gone):")
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        write_job_store(home, [])
+        env = dict(os.environ, HERMES_HOME=str(home))
+
+        ghost = subprocess.run(
+            [sys.executable, "-c", GHOST.format(root=str(HERMES))], env=env,
+            capture_output=True, text=True, timeout=60)
+        row_id = ghost.stdout.strip().splitlines()[-1] if ghost.stdout.strip() else ""
+        check("a running row was left behind", bool(row_id),
+              f"stdout={ghost.stdout!r} stderr={ghost.stderr[-2000:]!r}")
+        if not row_id:
+            return
+
+        ledger = home / "cron" / "executions.db"
+
+        def status() -> str:
+            con = sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)
+            try:
+                found = list(con.execute(
+                    "SELECT status FROM executions WHERE id=?", (row_id,)))
+            finally:
+                con.close()
+            return found[0][0] if found else ""
+
+        check("the row starts out running", status() == "running",
+              f"status={status()!r}")
+
+        swept = subprocess.run(
+            [sys.executable, "-c", SWEEPER.format(root=str(HERMES))], env=env,
+            capture_output=True, text=True, timeout=120)
+        check("the row was reaped as unknown", status() == "unknown",
+              f"status={status()!r} — a spawned tick still never sweeps, so a "
+              "run whose process died stays in flight forever and its failure "
+              f"is invisible. sweeper stdout={swept.stdout[-2000:]!r} "
+              f"stderr={swept.stderr[-2000:]!r}")
 
 
 if __name__ == "__main__":
     print("verify_cron_tick_lock_scope")
     check_release_placement()
+    check_claim_is_carried()
+    check_dispatch_claims_before_the_cas()
+    check_spawned_tick_sweeps_first()
     check_behaviour()
+    check_recovery_sweep()
     print()
     if FAILURES:
         print(f"verify_cron_tick_lock_scope: {len(FAILURES)} FAILED")
