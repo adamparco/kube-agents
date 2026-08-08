@@ -47,6 +47,7 @@ Usage::
 from __future__ import annotations
 
 import ast
+import inspect
 import os
 import sys
 import tempfile
@@ -162,10 +163,7 @@ if nudge_if is not None:
 # --- 2. It still composes with the upstream helper it borrows ---------------
 print("composition with agent.kanban_stop:")
 
-from agent.kanban_stop import (  # noqa: E402
-    build_kanban_stop_nudge,
-    session_called_kanban_terminal,
-)
+from agent.kanban_stop import build_kanban_stop_nudge  # noqa: E402
 from hermes_cli.kanban_guardrail_exit import (  # noqa: E402
     DEFAULT_MAX_NUDGES,
     DETECTOR,
@@ -319,15 +317,20 @@ def leaks(**over):
         interrupted=False,
         failed=False,
         iteration_limit_fallback=False,
-        messages=[{"role": "assistant", "content": "I will write the report now."}],
-        session_called_terminal=session_called_kanban_terminal,
     )
     kwargs.update(over)
     return should_record_missing_terminal(**kwargs)
 
 
 check("a worker that never closed its card is a leak", leaks() is True)
-check("a card that was completed is not", leaks(messages=TERMINAL_MESSAGES) is False)
+check(
+    "the transcript is not consulted — the board is",
+    "session_called_terminal"
+    not in inspect.signature(should_record_missing_terminal).parameters,
+    "a REJECTED kanban_complete still lands as a tool message named "
+    "kanban_complete, so the transcript check let one refusal from "
+    "kanban_result_required silence the backstop for the rest of the run",
+)
 check("an interrupt is not", leaks(interrupted=True) is False)
 check("an already-failed turn is not", leaks(failed=True) is False)
 check(
@@ -370,6 +373,35 @@ check(
     "and the scope hands the marker back on the way out",
     leaks() is True,
     "a leaked marker disables the backstop for every worker after it",
+)
+
+check(
+    "a delegate_task child is not a leak", leaks(delegated_child=True) is False
+)
+
+# Same argument as the cron scope above, against the module the runtime really
+# reads. A child runs in the parent's process with the parent's
+# HERMES_KANBAN_TASK still set, so a default that did not consult this would
+# charge the PARENT a timed_out and release its claim mid-run.
+from agent.delegation_context import (  # noqa: E402
+    delegated_child_context,
+    is_delegated_child_context,
+)
+
+check(
+    "outside a delegation the real context says 'not a child'",
+    is_delegated_child_context() is False,
+)
+with delegated_child_context():
+    check(
+        "the exclusion defaults to agent.delegation_context",
+        leaks() is False,
+        "upstream refuses every board mutation from a delegate_task child for "
+        "the same reason: an inherited HERMES_KANBAN_TASK is not ownership",
+    )
+check(
+    "and the delegation context hands control back on the way out",
+    leaks() is True,
 )
 
 

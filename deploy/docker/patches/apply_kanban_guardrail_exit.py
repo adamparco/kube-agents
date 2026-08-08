@@ -120,7 +120,6 @@ FINALIZER_INSERT = '''    # kube-agents patch: the guardrail-halt break and six 
     # See hermes_cli/kanban_guardrail_exit.py.
     _kanban_task_id = os.environ.get("HERMES_KANBAN_TASK")
     try:
-        from agent.kanban_stop import session_called_kanban_terminal
         from hermes_cli.kanban_guardrail_exit import (
             should_record_missing_terminal as _kanban_should_record_missing,
         )
@@ -130,8 +129,6 @@ FINALIZER_INSERT = '''    # kube-agents patch: the guardrail-halt break and six 
             interrupted=interrupted,
             failed=failed,
             iteration_limit_fallback=iteration_limit_fallback,
-            messages=messages,
-            session_called_terminal=session_called_kanban_terminal,
         )
     except Exception:
         logger.debug("kanban terminal-call backstop check failed", exc_info=True)

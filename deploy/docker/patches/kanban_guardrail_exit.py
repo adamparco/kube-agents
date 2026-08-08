@@ -74,7 +74,18 @@ The two fixes here
    ``_record_task_failure`` call the iteration-budget path directly above it
    already uses.
 
-Three exclusions matter, and all of them are load-bearing:
+Four exclusions matter, and all of them are load-bearing:
+
+* **``delegate_task`` children.** A child agent runs ``run_conversation`` *in the
+  parent's own process*, so it reaches ``finalize_turn`` with the parent's
+  ``HERMES_KANBAN_TASK`` still in the environment and no card of its own. Upstream
+  treats that as the defining case: ``tools/kanban_tools.py``'s
+  ``_reject_delegated_child_mutation`` refuses every board mutation from a child
+  precisely because "stale or inherited ``HERMES_KANBAN_*`` env vars are not proof
+  of dispatcher ownership", and both of upstream's own kanban gates open with the
+  same short-circuit. Without it, a parent that delegates twice charges its own
+  card two ``timed_out`` failures and has its claim released underneath it — mid
+  run, while it is still working — and then completes a card it no longer holds.
 
 * **Goal mode.** ``_run_kanban_goal_loop_q`` calls ``run_conversation`` once per
   turn, so ``finalize_turn`` runs many times for one card and intermediate turns
@@ -94,11 +105,26 @@ Three exclusions matter, and all of them are load-bearing:
   blocked on the run — has its claim released and a ``timed_out`` charged to its
   failure budget by its own child.
 
-* **The task's own status.** ``session_called_kanban_terminal`` reads
-  ``messages``, which compaction can rewrite. The board is the authority: if the
-  card is no longer ``running``, a terminal tool already moved it and there is
-  nothing to record. This is what makes a false positive impossible rather than
-  merely unlikely.
+* **The task's own status.** The board is the authority: if the card is no longer
+  ``running``, a terminal tool already moved it and there is nothing to record.
+  This is what makes a false positive impossible rather than merely unlikely.
+
+  It is also the *only* authority consulted, and that is deliberate. This check
+  used to be preceded by ``agent.kanban_stop.session_called_kanban_terminal``,
+  which asks the transcript instead of the board — and gets it wrong in both
+  directions. Compaction can drop a terminal tool call out of ``messages``
+  (false leak, harmless: the board check catches it). Worse, a terminal call
+  that was *rejected* still lands in the transcript as a tool message named
+  ``kanban_complete`` (``agent/tool_dispatch_helpers.py``), and that function
+  matches on the name alone. ``tools/kanban_result_required.py`` rejects a
+  completion with an empty ``result``, so one refused call made the transcript
+  claim the card was terminated for the rest of the run — silencing this
+  backstop, upstream's stop guard, and the halt nudge in one move, and leaving
+  the card ``running`` on a worker that has exited rc=0. The dispatcher then
+  charges it a ``protocol_violation`` naming none of that.
+
+  Dropping the transcript check costs one SQLite read on an exit path that is
+  already exceptional, and the board cannot be wrong about its own rows.
 
 What is deliberately *not* excluded is the halt nudge. It fires during a cron run
 too — ``kanban_stop_nudge_enabled()`` is on whenever ``HERMES_KANBAN_TASK`` is
@@ -199,27 +225,48 @@ def _in_cron_run() -> bool:
         return True
 
 
+def _is_delegated_child() -> bool:
+    """Whether this turn is a ``delegate_task`` child sharing its parent's process.
+
+    Mirrors ``tools/kanban_tools.py``'s ``_is_delegated_child_context``, injected
+    the same way ``_in_cron_run`` is so this module stays importable outside the
+    image. Upstream's copy answers ``False`` when the import fails, because there
+    a wrong answer only over-refuses a tool call. Here it answers ``True``: a
+    wrong answer the other way charges a failure to a card that is still being
+    worked, which is the one outcome this module must never produce.
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_context
+    except Exception:
+        return False
+    try:
+        return bool(is_delegated_child_context())
+    except Exception:
+        return True
+
+
 def should_record_missing_terminal(
     *,
     task_id,
     interrupted,
     failed,
     iteration_limit_fallback,
-    messages,
-    session_called_terminal,
     goal_mode=None,
     cron_run=None,
+    delegated_child=None,
 ) -> bool:
-    """Whether ``finalize_turn`` is about to leak a kanban worker.
+    """Whether this exit is one ``record_missing_terminal_call`` should look at.
 
-    ``session_called_terminal`` is
-    ``agent.kanban_stop.session_called_kanban_terminal`` — a **module function**,
-    not a method on the agent. ``goal_mode`` defaults to reading
-    ``HERMES_KANBAN_GOAL_MODE`` from the environment, and ``cron_run`` to
-    ``tools.cron_run_scope.current_cron_job()``.
+    A cheap pre-filter, not the verdict: it rules out the exits that are somebody
+    else's business, and ``record_missing_terminal_call`` then asks the board
+    whether the card is actually still ``running``. Deliberately says nothing
+    about the transcript — see the docstring for what that cost.
 
-    Every uncertain answer is ``False``. This function decides whether to write a
-    failure to a live board, so anything it cannot prove is a leak is not one.
+    ``goal_mode`` defaults to reading ``HERMES_KANBAN_GOAL_MODE`` from the
+    environment, ``cron_run`` to ``tools.cron_run_scope.current_cron_job()``, and
+    ``delegated_child`` to ``agent.delegation_context.is_delegated_child_context()``.
+
+    Every uncertain answer is ``False``.
     """
     if not task_id:
         return False
@@ -227,6 +274,12 @@ def should_record_missing_terminal(
         # Interrupts are the caller's business, ``failed`` turns already exit
         # nonzero, and the iteration-budget path records its own failure
         # immediately above this check.
+        return False
+    if delegated_child is None:
+        delegated_child = _is_delegated_child()
+    if delegated_child:
+        # task_id here is the PARENT's card, inherited through the shared
+        # process. The child owns no card and must not touch that one.
         return False
     if cron_run is None:
         cron_run = _in_cron_run()
@@ -236,14 +289,7 @@ def should_record_missing_terminal(
         return False
     if goal_mode is None:
         goal_mode = os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
-    if goal_mode:
-        return False
-    try:
-        if session_called_terminal(messages):
-            return False
-    except Exception:
-        return False
-    return True
+    return not goal_mode
 
 
 def task_is_still_running(conn, task_id: str) -> bool:

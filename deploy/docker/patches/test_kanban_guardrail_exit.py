@@ -9,10 +9,14 @@ touching the board.
 """
 
 import ast
+import importlib
 import sqlite3
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from apply_kanban_guardrail_exit import (
     FINALIZER_ANCHOR,
@@ -131,19 +135,14 @@ class GuardrailHaltNudgeTest(unittest.TestCase):
         self.assertEqual(seen["attempts"], 1)
 
 
-TERMINAL_CALLED = lambda messages: True  # noqa: E731
-TERMINAL_MISSING = lambda messages: False  # noqa: E731
-
-
 def leaked(**overrides):
     kwargs = dict(
         task_id="t_d3efabef",
         interrupted=False,
         failed=False,
         iteration_limit_fallback=False,
-        messages=[],
-        session_called_terminal=TERMINAL_MISSING,
         goal_mode=False,
+        delegated_child=False,
     )
     kwargs.update(overrides)
     return should_record_missing_terminal(**kwargs)
@@ -153,8 +152,24 @@ class ShouldRecordTest(unittest.TestCase):
     def test_the_incident_shape_is_a_leak(self):
         self.assertTrue(leaked())
 
-    def test_a_terminal_call_is_not_a_leak(self):
-        self.assertFalse(leaked(session_called_terminal=TERMINAL_CALLED))
+    def test_the_transcript_is_not_consulted(self):
+        """A terminal tool call in `messages` must not suppress the check.
+
+        It used to. A REJECTED kanban_complete still lands as a tool message
+        named kanban_complete, and session_called_kanban_terminal matches on the
+        name alone, so one refusal from kanban_result_required silenced this
+        backstop for the rest of the run and the card leaked. The board says
+        whether the card moved; the transcript only says what was attempted.
+        """
+        self.assertTrue(leaked())
+        with self.assertRaises(TypeError):
+            should_record_missing_terminal(
+                task_id="t_d3efabef",
+                interrupted=False,
+                failed=False,
+                iteration_limit_fallback=False,
+                session_called_terminal=lambda messages: True,
+            )
 
     def test_a_non_worker_is_never_touched(self):
         self.assertFalse(leaked(task_id=None))
@@ -194,13 +209,78 @@ class ShouldRecordTest(unittest.TestCase):
     def test_an_interrupt_is_the_callers_business(self):
         self.assertFalse(leaked(interrupted=True))
 
-    def test_an_unanswerable_transcript_check_is_not_a_leak(self):
-        """Anything this cannot prove is a leak is not one — it writes to a board."""
 
-        def boom(messages):
-            raise RuntimeError("no")
+class DelegatedChildExclusionTest(unittest.TestCase):
+    """A delegate_task child inherits its parent's card and owns none of its own.
 
-        self.assertFalse(leaked(session_called_terminal=boom))
+    The child runs ``run_conversation`` in the parent's process, so it reaches
+    ``finalize_turn`` with the parent's ``HERMES_KANBAN_TASK`` set. Recording
+    there charges the PARENT a ``timed_out`` and releases its claim mid-run —
+    twice, if it delegates twice — after which the parent completes a card it no
+    longer holds. Upstream draws the same line: ``_reject_delegated_child_mutation``
+    refuses every board mutation from a child for exactly this reason.
+    """
+
+    def test_a_delegated_child_is_not_a_leak(self):
+        self.assertFalse(leaked(delegated_child=True))
+
+    def test_an_explicit_false_still_leaks(self):
+        self.assertTrue(leaked(delegated_child=False))
+
+    def test_it_defaults_to_the_real_delegation_context(self):
+        """None must reach ``agent.delegation_context``, not silently pass.
+
+        The parameter exists for the tests; the runtime never passes it, so a
+        default that did not consult the real module would leave the fix inert
+        in the only place it matters.
+        """
+        module = importlib.import_module("kanban_guardrail_exit")
+        fake = types.ModuleType("agent.delegation_context")
+        fake.is_delegated_child_context = lambda: True
+        agent_pkg = types.ModuleType("agent")
+        agent_pkg.delegation_context = fake
+        with mock.patch.dict(
+            sys.modules,
+            {"agent": agent_pkg, "agent.delegation_context": fake},
+        ):
+            self.assertTrue(module._is_delegated_child())
+            self.assertFalse(
+                module.should_record_missing_terminal(
+                    task_id="t_d3efabef",
+                    interrupted=False,
+                    failed=False,
+                    iteration_limit_fallback=False,
+                    goal_mode=False,
+                    cron_run=False,
+                )
+            )
+
+    def test_a_host_without_hermes_is_not_a_delegated_child(self):
+        """The import fails outside the image; that is not evidence of a child.
+
+        Answering True there would disable the backstop everywhere the module is
+        importable but Hermes is not — including these tests.
+        """
+        module = importlib.import_module("kanban_guardrail_exit")
+        with mock.patch.dict(sys.modules, {"agent.delegation_context": None}):
+            self.assertFalse(module._is_delegated_child())
+
+    def test_a_raising_reader_withholds_the_write(self):
+        """Uncertainty must not charge a failure to a card someone is working."""
+        module = importlib.import_module("kanban_guardrail_exit")
+
+        def boom():
+            raise RuntimeError("no delegation context")
+
+        fake = types.ModuleType("agent.delegation_context")
+        fake.is_delegated_child_context = boom
+        agent_pkg = types.ModuleType("agent")
+        agent_pkg.delegation_context = fake
+        with mock.patch.dict(
+            sys.modules,
+            {"agent": agent_pkg, "agent.delegation_context": fake},
+        ):
+            self.assertTrue(module._is_delegated_child())
 
 
 class CronRunExclusionTest(unittest.TestCase):
