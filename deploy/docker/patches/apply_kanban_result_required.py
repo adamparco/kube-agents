@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """Wire tools/kanban_result_required.py into the Hermes source tree.
 
-Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Two anchored edits:
-the completion gate, and an import/schema-fixup block placed immediately before
+Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Two edits: the
+completion gate, and an import/schema-fixup block placed immediately before
 ``kanban_complete`` is registered.
 
 The schema wording is NOT edited textually — ``apply_schema`` rewrites the live
 ``KANBAN_COMPLETE_SCHEMA`` dict at import time. Placing the call before
 ``registry.register`` rather than at end-of-file means the registry cannot
 capture the pre-patch wording even if it copies the dict it is handed.
+
+The gate is a literal anchor because the text being replaced *is* the edit. The
+registration is not: it is only an insertion point, and the four-line slice that
+used to name it (``registry.register(``, then ``name=``, ``toolset=``,
+``schema=``, because ``registry.register(\\n    name=`` recurs for every kanban
+tool) was pure layout. ``find_call`` asks for the statement that registers
+``kanban_complete`` instead, which is the same requirement stated in a way an
+upstream reformat cannot break, and ``expect`` keeps the ``schema=`` assertion
+the old anchor's fourth line was really there for.
 
 Why the change is needed is documented in the module docstring of
 ``deploy/docker/patches/kanban_result_required.py``. Usage::
@@ -18,32 +27,24 @@ Why the change is needed is documented in the module docstring of
 
 from __future__ import annotations
 
-import ast
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import patchlib  # noqa: E402
 from kanban_result_required import NEW_GATE, OLD_GATE  # noqa: E402
 
 RELATIVE = "tools/kanban_tools.py"
 
-# The registration block. Anchored on all four leading lines because
-# ``registry.register(\n    name=`` recurs for every kanban tool, and the
-# ``schema=KANBAN_COMPLETE_SCHEMA`` line is what makes this one the right
-# insertion point.
-REGISTER_ANCHOR = (
-    'registry.register(\n'
-    '    name="kanban_complete",\n'
-    '    toolset="kanban",\n'
-    '    schema=KANBAN_COMPLETE_SCHEMA,\n'
-)
+#: The tool whose registration the fixup has to precede.
+REGISTERED_TOOL = "kanban_complete"
 
 # Imported at module scope so ``apply_schema`` runs while the module is still
 # importing — before any tool call and before the registry hands the schema to a
 # model. ``_require_result`` and ``_blank_to_none`` are resolved later, when a
 # worker actually completes.
-REGISTER_PATCHED = (
+REGISTER_PREAMBLE = (
     "# kube-agents patch: see tools/kanban_result_required.py\n"
     "from tools.kanban_result_required import (\n"
     "    apply_schema as _apply_result_schema,\n"
@@ -53,38 +54,27 @@ REGISTER_PATCHED = (
     "\n"
     "_apply_result_schema(KANBAN_COMPLETE_SCHEMA)\n"
     "\n"
-) + REGISTER_ANCHOR
+)
 
 
 def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
-    path = root / RELATIVE
-    if not path.is_file():
-        raise SystemExit(f"kanban_result_required patch: {path} does not exist")
-    source = path.read_text()
+    patch = patchlib.Patch(root, RELATIVE, prefix="kanban_result_required")
 
-    for label, anchor in (("gate", OLD_GATE), ("registration", REGISTER_ANCHOR)):
-        found = source.count(anchor)
-        if found != 1:
-            raise SystemExit(
-                f"kanban_result_required patch: {RELATIVE}: expected 1 "
-                f"occurrence of the {label} anchor, found {found}. Upstream "
-                f"Hermes changed — re-derive the anchor before bumping the "
-                f"base image.\n--- anchor ---\n{anchor}"
-            )
+    patch.substitute(OLD_GATE, NEW_GATE, label="gate")
 
-    source = source.replace(OLD_GATE, NEW_GATE)
-    source = source.replace(REGISTER_ANCHOR, REGISTER_PATCHED)
+    site = patch.find_call(
+        "registry.register",
+        label=f"{REGISTERED_TOOL} registration",
+        name=REGISTERED_TOOL,
+    )
+    # The schema constant is not decoration here: `_apply_result_schema` is
+    # inserted to rewrite this exact dict, and a registration that had been
+    # rewired to a different one would leave the fixup editing nothing.
+    site.expect(toolset="kanban", schema=patchlib.Ident("KANBAN_COMPLETE_SCHEMA"))
+    patch.insert(site.start, REGISTER_PREAMBLE)
 
-    try:
-        ast.parse(source)
-    except SyntaxError as e:
-        raise SystemExit(
-            f"kanban_result_required patch: {RELATIVE} no longer parses after "
-            f"patching: {e}"
-        )
-    path.write_text(source)
-    print(f"kanban_result_required patch: {RELATIVE} (2 anchors)")
+    patch.commit("1 anchor + 1 registration")
 
 
 if __name__ == "__main__":

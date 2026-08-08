@@ -21,6 +21,13 @@ what it answers, and the gate has two answers to get right:
    the only place the import the gate actually performs is exercised. Upstream's
    own two gates are measured alongside it: all three must agree that a child is
    neither a worker nor an orchestrator.
+3. **The shared predicate is the shipped one, and it still takes its polarity
+   from the caller.** ``tools/kanban_ownership.py`` answers this question for
+   ``hermes_cli/kanban_guardrail_exit.py`` too, with the opposite ``on_unknown``.
+   Checked here that the import resolved to the file in the image rather than a
+   stray top-level copy, that a raising reader really does produce two different
+   answers, and that an *absent* module produces ``False`` either way — the two
+   failure modes have to stay distinct.
 
 The last section drives the whole assembly path, ``model_tools`` through
 ``tools/registry.py``, because that is the only check that proves a schema
@@ -160,6 +167,59 @@ check(
     "the delegation context hands the worker its tools back on the way out",
     check_kanban_worker_mode() is True,
 )
+
+# The predicate lives in tools/kanban_ownership.py, shared with
+# hermes_cli/kanban_guardrail_exit.py, which asks the same question with the
+# opposite ``on_unknown``. Two things can go wrong that the booleans above do
+# not see: the shared file never landed and a stray top-level copy answered
+# instead, or the polarity argument stopped being honoured and both callers
+# silently converged on one answer.
+ownership = sys.modules.get("tools.kanban_ownership")
+check(
+    "the gate reads tools/kanban_ownership.py",
+    ownership is not None
+    and Path(ownership.__file__).resolve()
+    == (HERMES / "tools" / "kanban_ownership.py").resolve(),
+    f"resolved to {getattr(ownership, '__file__', None)!r}",
+)
+
+if ownership is not None:
+    import agent.delegation_context as _delegation  # noqa: E402
+
+    def _boom() -> bool:
+        raise RuntimeError("delegation context unreadable")
+
+    _real_reader = _delegation.is_delegated_child_context
+    _delegation.is_delegated_child_context = _boom
+    try:
+        check(
+            "a reader that raises is uncertainty, and the caller picks the answer",
+            ownership.is_delegated_child(on_unknown=True) is True
+            and ownership.is_delegated_child(on_unknown=False) is False,
+            "on_unknown stopped being honoured — the two callers need opposite "
+            "answers here and would now share one",
+        )
+        check(
+            "this gate keeps its tools when the reader raises",
+            check_kanban_worker_mode() is True,
+            "a worker with no kanban_complete cannot end its run: it exits rc=0 "
+            "and the reaper stamps a protocol_violation",
+        )
+    finally:
+        _delegation.is_delegated_child_context = _real_reader
+
+    # A None entry in sys.modules is how the interpreter reports "not there",
+    # which is the other failure mode and must NOT consult on_unknown.
+    sys.modules["agent.delegation_context"] = None
+    try:
+        check(
+            "an absent module is a structural fact, not uncertainty",
+            ownership.is_delegated_child(on_unknown=True) is False,
+            "on_unknown must cover a reader that raises, not one that is not "
+            "there — otherwise both callers flip on any host without Hermes",
+        )
+    finally:
+        sys.modules["agent.delegation_context"] = _delegation
 
 
 # --- 4. The schemas really disappear ----------------------------------------

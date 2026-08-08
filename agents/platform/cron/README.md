@@ -63,16 +63,29 @@ is a second copy of `expr` that can rot silently. Keep the two identical.
 Deleting an entry only ends this image's ability to hold the job off: the
 volume's copy goes on firing. The sequence is therefore:
 
-1. Ship the entry with `enabled: false`. That is what actually stops it, and it
-   is why the trailing disabled entries in `jobs.json` are kept as tombstones
-   rather than deleted.
-2. Delete the id only once no live volume can still be carrying an enabled copy.
+1. Ship the entry with `enabled: false`. That is what actually stops it.
+2. Delete the id only once no live volume can still be carrying an enabled copy
+   — and name it in `--cron-retire` in the same release, or the volume keeps a
+   disabled entry no later image can reach.
+
+Step 2 is not optional bookkeeping. A deleted entry the volume still holds is
+invisible to every future image: the merge is silent about it, so nothing can
+re-enable it, disable it, or remove it, and `cronjob(action='list')` reports it
+forever. That is why this roster has no tombstones left — the five retired
+watchdogs (`blueprint-sync`, `policy-propagation`,
+`global-capacity-orchestrator`, `standardization-validator`,
+`lifecycle-deprecation-manager`) were deleted here *and* named in
+`--cron-retire` on the platform force-sync.
 
 `retire_cron_jobs` (`--cron-retire` in `deploy/shared/docker-entrypoint.sh`) is
-the escape hatch for the case that cannot cover — an id that has to stop firing
-in one release, as when the seven governance jobs moved back here from the Chat
-Agent's roster. It deletes the named ids outright, and the entrypoint names them
-explicitly.
+also the escape hatch for the case step 1 cannot cover — an id that has to stop
+firing in one release, as when the seven governance jobs moved back here from
+the Chat Agent's roster. It deletes the named ids outright, and the entrypoint
+names them explicitly.
+
+Their SOPs under `../governance/` are deliberately left in place: an SOP is
+inert without a job to run it, and keeping them makes reviving a watchdog a
+roster edit rather than an archaeology exercise.
 
 ## Hard-coded line numbers in prompts
 

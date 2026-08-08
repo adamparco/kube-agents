@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
 """Wire tools/kanban_worker_tools.py into the Hermes source tree.
 
-Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Eight anchored
-string replacements in one file — an import plus one ``check_fn`` per
-worker-only tool — with the same guarantee as the other patches here: every
-anchor must be found exactly once, the file must still parse, and anything else
-fails the build loudly rather than shipping a half-patched image.
+Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Eight edits in one
+file — an import plus one ``check_fn`` per worker-only tool — with the same
+guarantee as the other patches here: every edit site must be found exactly once,
+the file must still parse, and anything else fails the build loudly rather than
+shipping a half-patched image.
+
+**Located by AST, not by literal anchors.** Every site here is a node with a
+name: the ``registry.register`` call that registers ``kanban_complete``, the
+``def`` the import has to land after. This applier used to spell each of those
+out as an exact slice of upstream source — five lines per tool, seven tools —
+which meant the registration block was the single largest concentration of
+literal anchors in the tree, and reformatting it (or adding one keyword
+argument, or reordering two) would have broken the build on eight of them at
+once. Eight anchors became one locator apiece and none of them care about
+layout.
+
+What the anchors *were* doing besides finding the call is preserved:
+``expect()`` re-asserts the toolset, schema and handler that the five-line slice
+used to pin, so a tool upstream has rewired underneath us still fails the build
+instead of being silently re-gated. See ``patchlib.CallSite.expect``.
 
 Why the change is needed is documented in the module docstring of
 ``deploy/docker/patches/kanban_worker_tools.py``. Usage::
@@ -15,27 +30,23 @@ Why the change is needed is documented in the module docstring of
 
 from __future__ import annotations
 
-import ast
 import sys
 from pathlib import Path
 
+import patchlib
 from kanban_worker_tools import WORKER_ONLY_TOOLS
 
 RELATIVE = "tools/kanban_tools.py"
 
-# The tail of `_check_kanban_orchestrator_mode`. `_check_kanban_mode` ends with
-# `return True` above the same final line, so this two-line sequence is unique.
-#
-# The import has to land here rather than being appended to the end of the file
-# the way the kanban_handoff_clip patch does. `check_fn=` is evaluated at import
-# time, several hundred lines above the end of the module, so a trailing import
-# would raise NameError before it ever ran.
-IMPORT_ANCHOR = (
-    "        return False\n"
-    "    return _profile_has_kanban_toolset()\n"
-)
+# The import lands after this function rather than at the end of the file the
+# way the kanban_notifier patch does. `check_fn=` is evaluated at import time,
+# several hundred lines above the end of the module, so a trailing import would
+# raise NameError before it ever ran. `_check_kanban_orchestrator_mode` is the
+# last definition above the registration block that this patch has a reason to
+# name — it is the gate `check_kanban_worker_mode` mirrors.
+IMPORT_AFTER = "_check_kanban_orchestrator_mode"
 
-IMPORT_PATCHED = IMPORT_ANCHOR + (
+IMPORT_BLOCK = (
     "\n\n"
     "# kube-agents patch: see tools/kanban_worker_tools.py\n"
     "from tools.kanban_worker_tools import (\n"
@@ -43,8 +54,14 @@ IMPORT_PATCHED = IMPORT_ANCHOR + (
     ")\n"
 )
 
-# Handler name per tool, so the anchor pins the whole registration block rather
-# than a bare `check_fn=` line that appears a dozen times.
+#: The gate upstream ships on every one of these tools, and the one this patch
+#: swaps it for. Asserting the old value is what makes a second run fail.
+UPSTREAM_CHECK_FN = "_check_kanban_mode"
+WORKER_CHECK_FN = "_check_kanban_worker_mode"
+
+# Handler name per tool. Once part of the anchor text; now an expectation, so
+# that a renamed handler fails with "sets handler=X where Y was expected"
+# rather than disappearing into a "found 0".
 HANDLERS = {
     "kanban_complete": "_handle_complete",
     "kanban_block": "_handle_block",
@@ -56,19 +73,18 @@ HANDLERS = {
 }
 
 
-def _registration(tool: str, check_fn: str) -> str:
-    """Render the anchored slice of a ``registry.register`` call."""
-    return (
-        f'    name="{tool}",\n'
-        '    toolset="kanban",\n'
-        f"    schema={tool.upper()}_SCHEMA,\n"
-        f"    handler={HANDLERS[tool]},\n"
-        f"    check_fn={check_fn},\n"
-    )
+def registration_expectations(tool: str) -> dict:
+    """The arguments a worker-only ``registry.register`` call must still pass."""
+    return {
+        "toolset": "kanban",
+        "schema": patchlib.Ident(f"{tool.upper()}_SCHEMA"),
+        "handler": patchlib.Ident(HANDLERS[tool]),
+        "check_fn": patchlib.Ident(UPSTREAM_CHECK_FN),
+    }
 
 
-def build_patches() -> tuple:
-    """Return ``(anchor, replacement, expected_count)`` triples."""
+def check_handler_mapping() -> None:
+    """Refuse to run if this applier and kanban_worker_tools.py have drifted."""
     missing = set(WORKER_ONLY_TOOLS) - set(HANDLERS)
     if missing:
         raise SystemExit(
@@ -76,44 +92,25 @@ def build_patches() -> tuple:
             f"{', '.join(sorted(missing))} — kanban_worker_tools.py and this "
             "applier have drifted apart."
         )
-    edits = [(IMPORT_ANCHOR, IMPORT_PATCHED, 1)]
-    for tool in WORKER_ONLY_TOOLS:
-        edits.append(
-            (
-                _registration(tool, "_check_kanban_mode"),
-                _registration(tool, "_check_kanban_worker_mode"),
-                1,
-            )
-        )
-    return tuple(edits)
 
 
 def apply(root: Path) -> None:
-    """Apply every patch under ``root``, or raise SystemExit with the reason."""
-    path = root / RELATIVE
-    if not path.is_file():
-        raise SystemExit(f"kanban_worker_tools patch: {path} does not exist")
-    source = path.read_text()
-    edits = build_patches()
-    for anchor, replacement, expected in edits:
-        found = source.count(anchor)
-        if found != expected:
-            raise SystemExit(
-                f"kanban_worker_tools patch: {RELATIVE}: expected {expected} "
-                f"occurrence(s) of anchor, found {found}. Upstream Hermes "
-                f"changed — re-derive the anchor before bumping the base "
-                f"image.\n--- anchor ---\n{anchor}"
-            )
-        source = source.replace(anchor, replacement)
-    try:
-        ast.parse(source)
-    except SyntaxError as e:
-        raise SystemExit(
-            f"kanban_worker_tools patch: {RELATIVE} no longer parses after "
-            f"patching: {e}"
+    """Apply every edit under ``root``, or raise SystemExit with the reason."""
+    check_handler_mapping()
+    patch = patchlib.Patch(root, RELATIVE, prefix="kanban_worker_tools")
+
+    gate = patch.find_def(IMPORT_AFTER, label="worker-gate import site")
+    patch.insert(gate.after, IMPORT_BLOCK)
+
+    for tool in WORKER_ONLY_TOOLS:
+        site = patch.find_call(
+            "registry.register", label=f"{tool} registration", name=tool
         )
-    path.write_text(source)
-    print(f"kanban_worker_tools patch: {RELATIVE} ({len(edits)} anchors)")
+        site.expect(**registration_expectations(tool))
+        start, end = site.keyword_span("check_fn")
+        patch.splice(start, end, WORKER_CHECK_FN)
+
+    patch.commit(f"1 import + {len(WORKER_ONLY_TOOLS)} registrations")
 
 
 if __name__ == "__main__":

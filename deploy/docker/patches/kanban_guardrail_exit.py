@@ -141,6 +141,11 @@ from __future__ import annotations
 
 import os
 
+try:  # In the image, /opt/hermes is on sys.path.
+    from tools.kanban_ownership import in_cron_run, is_delegated_child
+except ImportError:  # Local unittest discovery: the patches dir is top-level.
+    from kanban_ownership import in_cron_run, is_delegated_child
+
 # Mirrors ``agent.kanban_stop._DEFAULT_MAX_ATTEMPTS``. Duplicated rather than
 # imported so this module stays importable on a host without Hermes, which is
 # what lets the tests run outside the image.
@@ -189,63 +194,6 @@ def missing_terminal_error(turn_exit_reason) -> str:
     )
 
 
-#: The marker ``tools/cron_run_scope.py`` holds for the duration of a dispatched
-#: run, as a context variable and an environment variable both. Named here only
-#: for the fallback below; ``current_cron_job`` is the reader that matters.
-CRON_RUN_ENV = "HERMES_KANBAN_CRON_RUN"
-
-
-def _in_cron_run() -> bool:
-    """Whether this turn is a cron job borrowing a worker's environment.
-
-    Delegates to ``cron_run_scope.current_cron_job`` rather than reading the
-    environment, and that is the point: the marker lives in a context variable
-    scoped to the thread ``run_job`` submitted the run on, so under
-    ``dispatch_in_gateway`` a second worker running concurrently with somebody
-    else's dispatch does not read it as its own. ``cron_run_scope`` used to write
-    an ``os.environ`` half as well, which is process-wide and did exactly that;
-    see that module's docstring for why it no longer does.
-
-    Reading the env var directly is the fallback for a host where neither module
-    resolves — the tests, mostly, since ``cron_run_scope`` is a sibling there.
-
-    Answers ``True`` if the reader raises. Every uncertain answer in this module
-    means "do not write to the board", and this is the same rule stated from the
-    other side.
-    """
-    try:  # In the image, /opt/hermes is on sys.path.
-        from tools.cron_run_scope import current_cron_job
-    except Exception:
-        try:  # Local unittest discovery: the patches dir is top-level.
-            from cron_run_scope import current_cron_job
-        except Exception:
-            return bool(os.environ.get(CRON_RUN_ENV))
-    try:
-        return bool(current_cron_job())
-    except Exception:
-        return True
-
-
-def _is_delegated_child() -> bool:
-    """Whether this turn is a ``delegate_task`` child sharing its parent's process.
-
-    Mirrors ``tools/kanban_tools.py``'s ``_is_delegated_child_context``, injected
-    the same way ``_in_cron_run`` is so this module stays importable outside the
-    image. Upstream's copy answers ``False`` when the import fails, because there
-    a wrong answer only over-refuses a tool call. Here it answers ``True``: a
-    wrong answer the other way charges a failure to a card that is still being
-    worked, which is the one outcome this module must never produce.
-    """
-    try:
-        from agent.delegation_context import is_delegated_child_context
-    except Exception:
-        return False
-    try:
-        return bool(is_delegated_child_context())
-    except Exception:
-        return True
-
-
 def should_record_missing_terminal(
     *,
     task_id,
@@ -264,10 +212,15 @@ def should_record_missing_terminal(
     about the transcript — see the docstring for what that cost.
 
     ``goal_mode`` defaults to reading ``HERMES_KANBAN_GOAL_MODE`` from the
-    environment, ``cron_run`` to ``tools.cron_run_scope.current_cron_job()``, and
-    ``delegated_child`` to ``agent.delegation_context.is_delegated_child_context()``.
+    environment; ``cron_run`` and ``delegated_child`` default to the predicates
+    in ``tools/kanban_ownership.py``, which read
+    ``tools.cron_run_scope.current_cron_job()`` and
+    ``agent.delegation_context.is_delegated_child_context()`` respectively.
 
-    Every uncertain answer is ``False``.
+    Every uncertain answer is ``False`` — this function's verdict never writes to
+    a board it cannot justify. Both ownership predicates are asked with
+    ``on_unknown=True`` for exactly that reason: they name the contexts that must
+    *not* record, so an unreadable one has to answer "somebody else's card".
     """
     if not task_id:
         return False
@@ -277,13 +230,17 @@ def should_record_missing_terminal(
         # immediately above this check.
         return False
     if delegated_child is None:
-        delegated_child = _is_delegated_child()
+        # on_unknown=True: a reader that raises must not let this charge a
+        # ``timed_out`` to a parent's card and release its claim mid-run.
+        delegated_child = is_delegated_child(on_unknown=True)
     if delegated_child:
         # task_id here is the PARENT's card, inherited through the shared
         # process. The child owns no card and must not touch that one.
         return False
     if cron_run is None:
-        cron_run = _in_cron_run()
+        # on_unknown=True, same rule from the other side: the dispatcher is still
+        # blocked on this run, and a wrong "not cron" releases its claim.
+        cron_run = in_cron_run(on_unknown=True)
     if cron_run:
         # task_id here is the DISPATCHER's card, inherited: this run has none of
         # its own and may not terminate that one. See the docstring.

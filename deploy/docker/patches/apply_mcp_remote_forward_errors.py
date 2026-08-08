@@ -50,7 +50,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import patchlib
+
 RELATIVE = "src/lib/utils.ts"
+
+# The only non-Hermes target in this directory, so the standard "bump the base
+# image" advice is the wrong advice: what moves this anchor is the mcp-remote
+# pin, not a Hermes release.
+PIN_NOTE = "mcp-remote changed — re-derive the anchor before advancing the pin."
 
 INDENT = " " * 4
 
@@ -90,25 +97,23 @@ BUILD_MARKER = "Failed to forward message to remote server"
 
 def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
-    path = root / RELATIVE
-    if not path.is_file():
-        raise SystemExit(f"mcp_remote_forward_errors patch: {path} does not exist")
-    source = path.read_text()
-    found = source.count(ANCHOR)
-    if found != 1:
-        raise SystemExit(
-            f"mcp_remote_forward_errors patch: {RELATIVE}: expected 1 occurrence "
-            f"of anchor, found {found}. mcp-remote changed — re-derive the anchor "
-            f"before advancing the pin.\n--- anchor ---\n{ANCHOR}"
-        )
-    if BUILD_MARKER in source:
+    patch = patchlib.Patch(
+        root, RELATIVE, prefix="mcp_remote_forward_errors", note=PIN_NOTE
+    )
+    # Not patchlib.refuse_if_patched: the marker being present is more likely to
+    # mean upstream merged PR #308 than that this ran twice, and the two have
+    # different answers — drop the patch, versus fix the build step. The check
+    # has to precede the substitution either way, because the replacement text
+    # is where the marker comes from.
+    if BUILD_MARKER in patch.source:
         raise SystemExit(
             f"mcp_remote_forward_errors patch: {RELATIVE} already contains "
             f"{BUILD_MARKER!r}. Upstream may have merged PR #308 — drop this "
             f"patch rather than applying it twice."
         )
-    path.write_text(source.replace(ANCHOR, PATCHED))
-    print(f"mcp_remote_forward_errors patch: {RELATIVE} (1 anchor)")
+    patch.substitute(ANCHOR, PATCHED)
+    # TypeScript: there is no ast.parse gate to run, `npm run build` is it.
+    patch.commit("1 anchor", parse=False)
 
 
 if __name__ == "__main__":

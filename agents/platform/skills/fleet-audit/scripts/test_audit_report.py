@@ -1678,15 +1678,21 @@ class TestAuditCatalogue(unittest.TestCase):
                 "twice",
             )
 
-    def test_retired_ids_stay_as_disabled_tombstones(self):
-        """A retired id is switched off, not deleted.
+    def test_a_tombstone_is_switched_off_explicitly_and_carries_no_skills(self):
+        """A retired id spends a release switched off before it is deleted.
 
         `merge_cron_store` adds and overwrites but never prunes, so deleting an
         entry only ends the image's ability to hold it off — the volume's copy
-        goes on firing. Shipping it `enabled: false` is what actually stops it;
-        the id is safe to drop only once every live volume has merged that
-        disabled form. (`retire_cron_jobs` is the escape hatch for the case
-        this cannot cover, and the entrypoint names those ids explicitly.)
+        goes on firing. Shipping it `enabled: false` is what actually stops it,
+        and the id is safe to drop only once every live volume has merged that
+        disabled form.
+
+        This roster currently has no tombstones: the last five were deleted and
+        named in `--cron-retire`, which is the pairing the test below enforces.
+        The shape check stays because the next retirement will reintroduce one
+        for a release, and both halves of it are easy to get wrong — `enabled`
+        defaults to *true* in the scheduler, so an entry that merely drops the
+        key still fires.
         """
         tombstones = {
             job_id: job
@@ -1706,6 +1712,87 @@ class TestAuditCatalogue(unittest.TestCase):
                     job.get("skills"),
                     f"platform roster[{job_id}] is a tombstone but still "
                     f"declares skills; a re-enabled copy would run them",
+                )
+
+    def test_retired_ids_are_gone_from_the_roster_they_are_retired_from(self):
+        """`--cron-retire` and the roster must not disagree about an id.
+
+        `retire_cron_jobs` runs *after* the merge and deletes the named ids
+        outright, so an id the image both ships and retires is scaffolded onto
+        the volume and then removed again on every single boot. The roster
+        would read as though the job runs, `cronjob(action='list')` would say
+        it does not, and nothing would report the contradiction.
+
+        The two lists are asymmetric on purpose and the test has to respect
+        that. The platform force-sync retires the five watchdogs deleted from
+        *this* roster. The default-profile merge retires the seven governance
+        ids, which are alive here and dead only over there — so it is checked
+        against the Chat Agent's roster instead.
+        """
+        entrypoint = (
+            Path(__file__).resolve().parents[5]
+            / "deploy"
+            / "shared"
+            / "docker-entrypoint.sh"
+        )
+        if not entrypoint.is_file():  # not shipped alongside the skill at runtime
+            self.skipTest(f"{entrypoint} not present")
+        text = entrypoint.read_text(encoding="utf-8")
+
+        # One scaffold call is a backslash-continued block. Slicing on the
+        # blocks rather than grepping the file is what keeps the platform call's
+        # retire list from being matched against the default call's --name.
+        blocks = []
+        for chunk in text.split('"$SCAFFOLD"')[1:]:
+            lines = []
+            for line in chunk.splitlines():
+                lines.append(line)
+                if not line.rstrip().endswith("\\"):
+                    break
+            blocks.append("\n".join(lines))
+        self.assertTrue(blocks, "no profile_scaffold.py invocations in the entrypoint")
+
+        retired = {}
+        for block in blocks:
+            listed = re.search(r'--cron-retire\s+"([^"]*)"', block)
+            if not listed:
+                continue
+            named = re.search(r"--name\s+(\S+)", block)
+            profile = named.group(1) if named else "default"
+            retired.setdefault(profile, set()).update(listed.group(1).split())
+        self.assertEqual(
+            {"default", "platform"},
+            set(retired),
+            "the entrypoint's --cron-retire lists no longer cover both "
+            "profiles; a retirement on the missing one would strand the ids "
+            "it deleted on every live volume",
+        )
+
+        rosters = {
+            "platform": Path(__file__).resolve().parents[4]
+            / "platform"
+            / "cron"
+            / "jobs.json",
+            "default": Path(__file__).resolve().parents[4]
+            / "chat"
+            / "defaults"
+            / "cron"
+            / "jobs.json",
+        }
+        for profile, jobs_file in rosters.items():
+            if not jobs_file.is_file():  # not shipped alongside the skill
+                continue
+            shipped = {
+                job["id"]
+                for job in json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
+            }
+            with self.subTest(profile=profile):
+                self.assertEqual(
+                    set(),
+                    shipped & retired[profile],
+                    f"the {profile} roster ships these ids and the entrypoint "
+                    f"retires them from that same profile; each boot would "
+                    f"scaffold them and then delete them again",
                 )
 
     def test_every_stream_has_a_watchdog_and_every_watchdog_a_stream(self):

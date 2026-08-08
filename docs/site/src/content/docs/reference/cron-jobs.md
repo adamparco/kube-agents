@@ -13,7 +13,7 @@ Two files define the scheduled jobs, one per profile, and which one an entry bel
 
 ## The shipping jobs
 
-Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) and [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json). The Platform Agent's roster also carries disabled tombstones of retired ids, which are omitted here; see [The retired jobs](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs).
+Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) and [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json). Retired ids are omitted: an id on its way out ships switched off for a release before it is deleted, and a disabled entry on the Platform Agent's roster is left out of this table rather than listed as a job an operator could reach. See [The retired jobs](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs).
 
 <!-- BEGIN GENERATED: cron-jobs -->
 <!-- Regenerate with: make docs-generate -- do not edit by hand. -->

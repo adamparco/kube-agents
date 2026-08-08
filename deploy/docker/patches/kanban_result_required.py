@@ -4,8 +4,8 @@ Installed into the image at ``/opt/hermes/tools/kanban_result_required.py`` and
 wired into ``tools/kanban_tools.py`` by
 ``deploy/docker/patches/apply_kanban_result_required.py``.
 
-The companion patch ``gateway/kanban_result_delivery.py`` posts ``result`` into
-the chat thread. This one makes sure there is something in it to post.
+The companion patch ``gateway/kanban_notifier.py`` posts ``result`` into the
+chat thread. This one makes sure there is something in it to post.
 
 Why
 ---

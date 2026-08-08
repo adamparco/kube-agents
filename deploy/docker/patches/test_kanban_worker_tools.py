@@ -13,7 +13,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from apply_kanban_worker_tools import HANDLERS, RELATIVE, apply, build_patches
+from apply_kanban_worker_tools import (
+    HANDLERS,
+    IMPORT_AFTER,
+    RELATIVE,
+    UPSTREAM_CHECK_FN,
+    apply,
+    check_handler_mapping,
+)
 from kanban_worker_tools import WORKER_ONLY_TOOLS, check_kanban_worker_mode
 
 # Tools an orchestrator profile keeps — the surface agents/chat/SOUL.md §1.5
@@ -106,8 +113,10 @@ class CheckWorkerModeTest(unittest.TestCase):
 def with_delegation_context(reader):
     """Patch a fake ``agent.delegation_context`` whose reader is *reader*.
 
-    The module imports it lazily inside ``_is_delegated_child``, so a fake in
-    ``sys.modules`` is enough to exercise the branch on a host with no Hermes.
+    ``kanban_ownership`` imports it lazily per call, so a fake in ``sys.modules``
+    is enough to exercise the branch on a host with no Hermes. The polarities
+    themselves live in test_kanban_ownership.py; what is asserted here is that
+    this gate asks for the right one.
     """
     fake = types.ModuleType("agent.delegation_context")
     fake.is_delegated_child_context = reader
@@ -149,7 +158,7 @@ class DelegatedChildTest(unittest.TestCase):
         """
         module = importlib.import_module("kanban_worker_tools")
         with with_delegation_context(lambda: True):
-            self.assertTrue(module._is_delegated_child())
+            self.assertTrue(module.is_delegated_child(on_unknown=False))
 
     def test_a_host_without_hermes_is_not_a_delegated_child(self):
         """The import fails outside the image; that is not evidence of a child.
@@ -160,17 +169,19 @@ class DelegatedChildTest(unittest.TestCase):
         """
         module = importlib.import_module("kanban_worker_tools")
         with mock.patch.dict(sys.modules, {"agent.delegation_context": None}):
-            self.assertFalse(module._is_delegated_child())
+            self.assertFalse(module.is_delegated_child(on_unknown=False))
             with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_c31a1f00"}):
                 self.assertTrue(check_kanban_worker_mode())
 
     def test_a_raising_reader_leaves_the_worker_its_tools(self):
         """Uncertainty must not strand a card.
 
-        The opposite of ``kanban_guardrail_exit._is_delegated_child``, which
-        answers True here because a wrong answer there writes to the board. This
-        gate only chooses which schemas ship, and
-        ``_reject_delegated_child_mutation`` still refuses a child's mutations.
+        This gate asks ``kanban_ownership.is_delegated_child`` with
+        ``on_unknown=False``, the opposite of what
+        ``kanban_guardrail_exit.should_record_missing_terminal`` asks for, whose
+        wrong answer writes to the board. This one only chooses which schemas
+        ship, and ``_reject_delegated_child_mutation`` still refuses a child's
+        mutations.
         """
         module = importlib.import_module("kanban_worker_tools")
 
@@ -178,7 +189,7 @@ class DelegatedChildTest(unittest.TestCase):
             raise RuntimeError("no delegation context")
 
         with with_delegation_context(boom):
-            self.assertFalse(module._is_delegated_child())
+            self.assertFalse(module.is_delegated_child(on_unknown=False))
             with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_c31a1f00"}):
                 self.assertTrue(check_kanban_worker_mode())
 
@@ -220,14 +231,24 @@ class ApplyTest(unittest.TestCase):
     def test_the_patched_module_still_parses(self):
         ast.parse(patch_tree(upstream_source()))
 
-    def test_a_drifted_anchor_fails_loudly(self):
-        drifted = upstream_source().replace(
-            registration("kanban_complete", "_check_kanban_mode"),
-            registration("kanban_complete", "_check_kanban_mode", handler="_handle_finish"),
+    def test_reformatting_the_registration_no_longer_breaks_the_build(self):
+        """The point of locating by AST: layout is not the contract.
+
+        The five-line slice this applier used to anchor on would have found
+        nothing here, and eight anchors would have failed at once over
+        whitespace that changes no behaviour.
+        """
+        reflowed = upstream_source().replace(
+            '    name="kanban_complete",\n    toolset="kanban",\n',
+            '    name="kanban_complete",\n\n    # a comment upstream added\n'
+            '    toolset="kanban",\n',
         )
-        with self.assertRaises(SystemExit) as ctx:
-            patch_tree(drifted)
-        self.assertIn("found 0", str(ctx.exception))
+        patched = patch_tree(reflowed)
+        self.assertIn("check_fn=_check_kanban_worker_mode", patched)
+        self.assertEqual(
+            patched.count("check_fn=_check_kanban_worker_mode"),
+            len(WORKER_ONLY_TOOLS),
+        )
 
     def test_applying_twice_fails_rather_than_silently_no_opping(self):
         root = Path(tempfile.mkdtemp())
@@ -235,8 +256,11 @@ class ApplyTest(unittest.TestCase):
         target.parent.mkdir(parents=True)
         target.write_text(upstream_source())
         apply(root)
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(SystemExit) as ctx:
             apply(root)
+        # The second run gets as far as the registration and finds the gate
+        # already swapped, which is the loud version of "already patched".
+        self.assertIn(f"where {UPSTREAM_CHECK_FN} was expected", str(ctx.exception))
 
     def test_a_missing_file_fails_loudly(self):
         with self.assertRaises(SystemExit) as ctx:
@@ -245,8 +269,93 @@ class ApplyTest(unittest.TestCase):
 
     def test_every_worker_only_tool_has_a_handler_mapping(self):
         self.assertEqual(set(WORKER_ONLY_TOOLS) - set(HANDLERS), set())
-        # One import edit plus one per tool.
-        self.assertEqual(len(build_patches()), len(WORKER_ONLY_TOOLS) + 1)
+        check_handler_mapping()
+
+
+class LocatorFailureTest(unittest.TestCase):
+    """An AST locator that matched the wrong node would be worse than an anchor.
+
+    A literal anchor fails loudly by construction — the text is either there or
+    it is not. A locator has to be *made* to fail loudly, so each way upstream
+    could move a registration out from under this patch gets a test.
+    """
+
+    def assert_refuses(self, source, *expected):
+        with self.assertRaises(SystemExit) as ctx:
+            patch_tree(source)
+        for fragment in expected:
+            self.assertIn(fragment, str(ctx.exception))
+        return str(ctx.exception)
+
+    def test_an_absent_registration_fails_loudly(self):
+        source = upstream_source().replace(
+            registration("kanban_link", "_check_kanban_mode"), ""
+        )
+        self.assert_refuses(source, "kanban_link registration", "found 0")
+
+    def test_a_duplicated_registration_fails_loudly(self):
+        """Two calls registering the same tool: which one is the patch for?"""
+        source = upstream_source() + registration("kanban_link", "_check_kanban_mode")
+        self.assert_refuses(source, "kanban_link registration", "found 2")
+
+    def test_a_renamed_tool_fails_loudly(self):
+        source = upstream_source().replace('name="kanban_attach"', 'name="kanban_file"')
+        self.assert_refuses(source, "kanban_attach registration", "found 0")
+
+    def test_a_renamed_handler_fails_loudly(self):
+        """Found the call, but it is no longer wired to what we expected."""
+        source = upstream_source().replace(
+            registration("kanban_complete", "_check_kanban_mode"),
+            registration("kanban_complete", "_check_kanban_mode", handler="_handle_finish"),
+        )
+        self.assert_refuses(
+            source, "kanban_complete registration", "_handle_finish", "_handle_complete"
+        )
+
+    def test_a_renamed_gate_fails_loudly(self):
+        """The check_fn upstream ships is asserted, not merely overwritten."""
+        source = upstream_source().replace(
+            registration("kanban_block", "_check_kanban_mode"),
+            registration("kanban_block", "_check_kanban_task_mode"),
+        )
+        self.assert_refuses(
+            source, "kanban_block registration", "_check_kanban_task_mode"
+        )
+
+    def test_a_registration_moved_out_of_module_scope_fails_loudly(self):
+        """Wrapped in a `def register_all()`, the call is no longer ours to find."""
+        source = upstream_source().replace(
+            registration("kanban_heartbeat", "_check_kanban_mode"),
+            "\n\ndef _register_late():\n"
+            + "\n".join(
+                "    " + line
+                for line in registration(
+                    "kanban_heartbeat", "_check_kanban_mode"
+                ).strip("\n").split("\n")
+            )
+            + "\n",
+        )
+        self.assert_refuses(source, "kanban_heartbeat registration", "found 0")
+
+    def test_an_absent_import_site_fails_loudly(self):
+        source = upstream_source().replace(f"def {IMPORT_AFTER}()", "def _check_other()")
+        self.assert_refuses(source, "worker-gate import site", "found 0")
+
+    def test_a_duplicated_import_site_fails_loudly(self):
+        source = upstream_source() + (
+            f"\n\ndef {IMPORT_AFTER}() -> bool:\n    return False\n"
+        )
+        self.assert_refuses(source, "worker-gate import site", "found 2")
+
+    def test_nothing_is_written_when_a_locator_refuses(self):
+        root = Path(tempfile.mkdtemp())
+        target = root / RELATIVE
+        target.parent.mkdir(parents=True)
+        source = upstream_source().replace('name="kanban_attach"', 'name="kanban_file"')
+        target.write_text(source)
+        with self.assertRaises(SystemExit):
+            apply(root)
+        self.assertEqual(target.read_text(), source, "a refused run must not write")
 
 
 if __name__ == "__main__":

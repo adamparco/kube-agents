@@ -21,7 +21,7 @@ the 2026-08-07 live run (12:58):
   explicit ``parents=[...]`` graph edges (``_inherit_notify_subs``). A
   worker's own card is deliberately not a graph parent of the work it fans
   out (``parents=[<itself>]`` is the self-parenting deadlock the
-  ``kanban_dependency_repair`` patch exists to untangle), so the chain from
+  ``kanban_scheduling`` patch exists to untangle), so the chain from
   the user's thread to the fan-out is severed at the first worker.
 
 Result: the synthesizer's answer sat undelivered for 91.3s until the user

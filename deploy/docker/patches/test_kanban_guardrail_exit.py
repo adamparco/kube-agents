@@ -243,7 +243,7 @@ class DelegatedChildExclusionTest(unittest.TestCase):
             sys.modules,
             {"agent": agent_pkg, "agent.delegation_context": fake},
         ):
-            self.assertTrue(module._is_delegated_child())
+            self.assertTrue(module.is_delegated_child(on_unknown=True))
             self.assertFalse(
                 module.should_record_missing_terminal(
                     task_id="t_d3efabef",
@@ -256,17 +256,23 @@ class DelegatedChildExclusionTest(unittest.TestCase):
             )
 
     def test_a_host_without_hermes_is_not_a_delegated_child(self):
-        """The import fails outside the image; that is not evidence of a child.
+        """An absent module is a structural fact, not uncertainty.
 
-        Answering True there would disable the backstop everywhere the module is
-        importable but Hermes is not — including these tests.
+        ``on_unknown`` covers a reader that raises; it deliberately does not
+        cover a reader that is not there. Answering True for an absent module
+        would disable the backstop everywhere this code is importable but Hermes
+        is not — including these tests.
         """
         module = importlib.import_module("kanban_guardrail_exit")
         with mock.patch.dict(sys.modules, {"agent.delegation_context": None}):
-            self.assertFalse(module._is_delegated_child())
+            self.assertFalse(module.is_delegated_child(on_unknown=True))
 
     def test_a_raising_reader_withholds_the_write(self):
-        """Uncertainty must not charge a failure to a card someone is working."""
+        """Uncertainty must not charge a failure to a card someone is working.
+
+        This is the ``on_unknown=True`` half of the asymmetry: the same reader,
+        raising the same way, leaves ``kanban_worker_tools`` answering False.
+        """
         module = importlib.import_module("kanban_guardrail_exit")
 
         def boom():
@@ -280,7 +286,8 @@ class DelegatedChildExclusionTest(unittest.TestCase):
             sys.modules,
             {"agent": agent_pkg, "agent.delegation_context": fake},
         ):
-            self.assertTrue(module._is_delegated_child())
+            self.assertTrue(module.is_delegated_child(on_unknown=True))
+            self.assertFalse(leaked(delegated_child=None, cron_run=False))
 
 
 class CronRunExclusionTest(unittest.TestCase):
@@ -331,8 +338,9 @@ class CronRunExclusionTest(unittest.TestCase):
     def test_an_unreadable_marker_withholds_the_write(self):
         # Same rule as the transcript check above, stated from the other side:
         # this function writes to a live board, so it does nothing it cannot
-        # justify. _in_cron_run re-imports per call, so replacing the module
-        # attribute is enough.
+        # justify — hence in_cron_run(on_unknown=True). kanban_ownership
+        # re-imports the reader per call, so replacing the module attribute is
+        # enough.
         import cron_run_scope
 
         def boom(environ=None):
@@ -347,7 +355,7 @@ class CronRunExclusionTest(unittest.TestCase):
         self.assertTrue(leaked(cron_run=None))
 
     def test_the_nudge_is_deliberately_left_alone(self):
-        # The exclusion is scoped to the board write. _in_cron_run can only
+        # The exclusion is scoped to the board write. in_cron_run can only
         # over-report — the env half of the marker is process-wide, so a worker
         # running alongside somebody else's dispatch reads it as its own — and
         # silencing the nudge on that worker would undo the fix. Wasting two

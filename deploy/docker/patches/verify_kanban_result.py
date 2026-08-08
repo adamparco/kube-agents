@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""Build gate for the kanban result capture/delivery patches.
+"""Build gate for the kanban result capture patch.
 
-Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after both appliers.
-The appliers only prove their anchors matched; this exercises the patched code
-in the image the way the notifier and a worker actually reach it.
+Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
+``apply_kanban_result_required.py``. The applier only proves its anchors
+matched; this exercises the patched code in the image the way a worker actually
+reaches it.
 
 It is deliberately behavioural rather than textual. The regression that
 motivated the whole change was not a failed edit — it was a field the model was
-told not to use, so the checks that matter are "does a worker get refused when
-it drops the answer" and "does the answer reach the message". Both are asserted
-against the live, patched modules.
+told not to use, so the check that matters is "does a worker get refused when it
+drops the answer".
+
+The other half of that question — "does the answer then reach the message" —
+belongs to ``gateway/kanban_notifier.py`` and is gated by
+``verify_kanban_notifier.py``, which runs earlier in the build. What stays here
+is the seam between the two: the incident replay below drives a real refusal
+through the real gate and then hands what the gate stored to the real delivery
+path, which is the only assertion in either file that neither patch can make on
+its own.
 
 Usage::
 
@@ -119,91 +127,15 @@ check(
     "a whitespace-only summary still wedges the card however good the result is",
 )
 
-# --- 3. Delivery ------------------------------------------------------------
-print("result delivery:")
-import gateway.kanban_watchers as watchers  # noqa: E402
-from gateway.kanban_handoff_clip import DEFAULT_LIMIT, clip_handoff  # noqa: E402
-from gateway.kanban_result_delivery import RESULT_LIMIT, result_block  # noqa: E402
-
-check(
-    "the notifier resolved the delivery import",
-    hasattr(watchers, "_kanban_handoff_with_result"),
-    "the trailer import did not execute",
-)
-check(
-    "the completion message's tail is built by the patch",
-    "handoff = _kanban_handoff_with_result(handoff, task)"
-    in open("gateway/kanban_watchers.py").read(),
-    "an appending hook cannot drop the clip the notifier already built",
-)
+# --- 3. The incident, replayed ----------------------------------------------
+# The seam between the two patches, and the only thing here that needs both:
+# what the gate stores on the retry is what the notifier has to deliver. Every
+# other delivery assertion lives in verify_kanban_notifier.py.
+print("2026-08-07 incident replay:")
+from gateway.kanban_notifier import result_block  # noqa: E402
 
 catalogue = "\n".join(f"{i}. cron-job-{i} — 0 {i} * * *" for i in range(1, 10))
-block = result_block("Cataloged all 9 cron jobs.", catalogue)
-check("a multi-line result survives whole", block.count("\n") >= 9)
-check("the last line is delivered", "cron-job-9" in block)
-check(
-    "a result already shown in the status line is not repeated",
-    result_block(catalogue, catalogue) == "",
-)
-check("an empty result adds nothing", result_block("status", None) == "")
 
-huge = " ".join(f"token{i}" for i in range(20000))
-clipped = result_block("status", huge)
-check(
-    "a runaway result is clipped and says so",
-    len(clipped) <= RESULT_LIMIT + 200 and "clipped" in clipped.lower(),
-)
-check(
-    "clipping never severs a URL",
-    "https://" not in result_block("s", huge + " https://example.invalid/issues/27", limit=200),
-)
-check(
-    "a dead task row leaves the status line the notifier already built",
-    watchers._kanban_handoff_with_result("\nstatus", None) == "\nstatus",
-)
-
-# The branch that has no event summary: kanban_watchers.py builds the status
-# line out of a clip of task.result, so the message used to carry the opening
-# of the report and then the report. On the 60-line catalogue below, jobs 1 to
-# 19 arrived twice.
-long_catalogue = "\n".join(
-    f"{i}. cron-job-{i} — schedule `0 {i} * * *` — enabled" for i in range(1, 61)
-)
-
-
-class _ClippedTask:
-    result = long_catalogue
-
-
-check(
-    "the fixture is over the status line's budget",
-    len(long_catalogue) > DEFAULT_LIMIT,
-)
-no_summary_tail = watchers._kanban_handoff_with_result(
-    "\n" + clip_handoff(long_catalogue), _ClippedTask()
-)
-check(
-    "an over-budget report is delivered once rather than clipped and repeated",
-    no_summary_tail.count("1. cron-job-1 ") == 1,
-    "the clipped status line was kept above the full report",
-)
-check(
-    "the report the reader gets is the whole one",
-    "60. cron-job-60" in no_summary_tail,
-)
-check(
-    "no clip marker is left promising text that is already there",
-    "[…]" not in no_summary_tail,
-)
-check(
-    "a status line that is not the report is kept",
-    "Cataloged all 9" in watchers._kanban_handoff_with_result(
-        "\nCataloged all 9 cron jobs.", _ClippedTask()
-    ),
-)
-
-# --- 4. The incident, replayed ---------------------------------------------
-print("2026-08-07 incident replay:")
 krr._refused_at.clear()
 incident_summary = (
     "Successfully inspected and cataloged all 9 active platform-agent-level and "
@@ -213,11 +145,6 @@ incident_summary = (
 err, _ = krr.require_result("t_8d1cf5cf", incident_summary, None)
 check("the completion that lost the catalogue is refused", err is not None)
 _, stored = krr.require_result("t_8d1cf5cf", incident_summary, catalogue)
-
-
-class _Task:
-    result = catalogue
-
 
 delivered = result_block("\n" + incident_summary, stored)
 check("the retry's catalogue reaches the message", "cron-job-1" in delivered)

@@ -508,6 +508,19 @@ fi
 # Gated on profile.yaml, not on the directory: a bare mount point is not a profile, and
 # dressing one in a persona and a config makes it indistinguishable from a real profile at
 # the next start — which is how a half-built profile used to become permanent.
+#
+# `--cron-retire` finishes a retirement the two-release rule started. The five
+# ids named here shipped `enabled: false` for several releases and are now gone
+# from the image's roster; none could produce a finding on a stock install
+# anyway (see the retired-watchdog note in
+# docs/site/src/content/docs/concepts/autonomous-watchdogs.md). Dropping the
+# shipped entries alone would stop there: merge_cron_store keeps every volume
+# job the image is silent about, so each PVC would carry five disabled entries
+# no image could ever reach again, and `cronjob(action='list')` would go on
+# showing them. Retiring the ids is what makes the deletion reach the volume.
+#
+# This list shrinks to nothing once no live volume can still be carrying the
+# entries. Until then, removing a name from it silently strands that id.
 if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLATE" ] && [ -f "$SCAFFOLD" ]; then
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$SCAFFOLD" \
@@ -515,6 +528,7 @@ if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLA
         --template "$PLATFORM_TEMPLATE" \
         --plugins /opt/defaults/plugins \
         --items "config.yaml SOUL.md AGENTS.md CAPABILITIES.md cron skills governance" \
+        --cron-retire "blueprint-sync policy-propagation global-capacity-orchestrator standardization-validator lifecycle-deprecation-manager" \
         >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
 CLUSTER_TEMPLATE="/opt/cluster-template"

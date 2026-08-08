@@ -379,6 +379,21 @@ check(
     "a delegate_task child is not a leak", leaks(delegated_child=True) is False
 )
 
+# Both defaults come from tools/kanban_ownership.py, shared with
+# tools/kanban_worker_tools.py, which asks the same two questions with
+# on_unknown=False. verify_kanban_worker_tools.py proves the polarity argument
+# is honoured; what has to be true here is that this module reached the shipped
+# copy at all rather than falling through to a top-level sibling that happens to
+# be importable.
+_ownership = sys.modules.get("tools.kanban_ownership")
+check(
+    "the exclusions read tools/kanban_ownership.py",
+    _ownership is not None
+    and Path(_ownership.__file__).resolve()
+    == (HERMES / "tools" / "kanban_ownership.py").resolve(),
+    f"resolved to {getattr(_ownership, '__file__', None)!r}",
+)
+
 # Same argument as the cron scope above, against the module the runtime really
 # reads. A child runs in the parent's process with the parent's
 # HERMES_KANBAN_TASK still set, so a default that did not consult this would

@@ -143,7 +143,7 @@ kanban:
   dispatch_interval_seconds: 5
   # Which terminal events wake this agent for a follow-up turn. Upstream wakes
   # on all five and offers no way to say otherwise; the image patches that key
-  # in (deploy/docker/patches/kanban_wake_kinds.py).
+  # in (deploy/docker/patches/kanban_notifier.py).
   #
   # `completed` is deliberately absent. The notifier has already delivered the
   # worker's own status line and its full `result` to the thread by the time it

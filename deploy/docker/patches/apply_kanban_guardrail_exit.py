@@ -22,9 +22,10 @@ See the module docstring in kanban_guardrail_exit.py for the incident.
 
 from __future__ import annotations
 
-import ast
 import sys
 from pathlib import Path
+
+import patchlib
 
 LOOP_RELATIVE = "agent/conversation_loop.py"
 FINALIZER_RELATIVE = "agent/turn_finalizer.py"
@@ -185,24 +186,10 @@ EDITS = (
 
 def apply(root: Path) -> None:
     for relative, label, anchor, patched, marker in EDITS:
-        path = root / relative
-        source = path.read_text()
-        if marker in source:
-            raise SystemExit(
-                f"guardrail-exit patch: {relative} already carries the {label} "
-                f"insert ({marker!r}). Refusing to apply it twice."
-            )
-        count = source.count(anchor)
-        if count != 1:
-            raise SystemExit(
-                f"guardrail-exit patch: expected 1 occurrence of the {label} "
-                f"anchor in {relative}, found {count}.\n"
-                f"--- anchor ---\n{anchor}"
-            )
-        source = source.replace(anchor, patched)
-        ast.parse(source)
-        path.write_text(source)
-        print(f"guardrail-exit patch: {relative} ({label})")
+        patch = patchlib.Patch(root, relative, prefix="guardrail-exit")
+        patch.refuse_if_patched(marker)
+        patch.substitute(anchor, patched, label=label)
+        patch.commit(label)
 
 
 if __name__ == "__main__":

@@ -86,8 +86,10 @@ guards ``_handle_complete``, ``_handle_block``, ``_handle_heartbeat``,
 ``_handle_link``, ``_handle_attach`` and ``_handle_attach_url`` before they touch
 the board — and the seventh, ``_handle_attachments``, is a read whose default
 task id ``_default_task_id`` already withholds from a child. So this gate is the
-layer under two working layers, which is what makes the failure defaults in
-``_is_delegated_child`` the way round they are.
+layer under two working layers, which is what buys it the freedom to answer
+``on_unknown=False`` below, where ``hermes_cli/kanban_guardrail_exit.py`` — which
+has no layer under it — answers ``True`` from the same predicate. Both readings
+come from ``tools/kanban_ownership.py``, which carries the full argument.
 
 One caveat travels with the short-circuit. The answer is a ContextVar, while
 ``tools/registry.py`` caches ``check_fn`` results for 30 seconds keyed on
@@ -99,7 +101,10 @@ way to reach that cache write is the path ``delegate_tool.py`` already closes.
 
 from __future__ import annotations
 
-import os
+try:  # In the image, /opt/hermes is on sys.path.
+    from tools.kanban_ownership import is_delegated_child, is_dispatcher_worker
+except ImportError:  # Local unittest discovery: the patches dir is top-level.
+    from kanban_ownership import is_delegated_child, is_dispatcher_worker
 
 #: Tools registered upstream with ``_check_kanban_mode`` that only make sense
 #: inside a dispatcher-spawned run. Kept here as documentation and as the
@@ -115,35 +120,6 @@ WORKER_ONLY_TOOLS = (
 )
 
 
-def _is_delegated_child() -> bool:
-    """Whether this gate is being evaluated for a ``delegate_task`` child.
-
-    Mirrors ``tools/kanban_tools.py``'s ``_is_delegated_child_context`` down to
-    swallowing every failure into ``False``, and deliberately does *not* mirror
-    ``kanban_guardrail_exit._is_delegated_child``, which answers ``True`` when
-    the reader raises. The asymmetry is the point. There an uncertain answer
-    charges a ``timed_out`` to a card someone is still working and releases its
-    claim underneath them, so uncertainty has to mean "keep off the board".
-
-    Here the two wrong answers are not comparable either. Wrongly saying "child"
-    hides ``kanban_complete`` and ``kanban_block`` from a real dispatcher worker,
-    which strands the card: a worker with no terminal tool cannot end its run, so
-    it exits rc=0, the reaper stamps a ``protocol_violation`` and the card burns
-    another attempt — and an import that fails does so for every worker in the
-    image, not for one card. Wrongly saying "not a child" restores exactly
-    today's behaviour, which costs ~2,510 tokens of schema and at most a refused
-    tool call, because ``_reject_delegated_child_mutation`` still stands between
-    a child and every board mutation. Uncertainty therefore means "not a child",
-    and only a positive answer from the real module closes the gate.
-    """
-    try:
-        from agent.delegation_context import is_delegated_child_context
-
-        return bool(is_delegated_child_context())
-    except Exception:
-        return False
-
-
 def check_kanban_worker_mode() -> bool:
     """True only inside a dispatcher-spawned kanban run.
 
@@ -154,6 +130,10 @@ def check_kanban_worker_mode() -> bool:
     work, and routing work is precisely the case these tools must stay hidden
     for.
     """
-    if _is_delegated_child():
+    # on_unknown=False: this gate only chooses which schemas ship, and
+    # _reject_delegated_child_mutation still refuses a child's board writes, so
+    # an unreadable delegation context must not cost a real worker its terminal
+    # tools. tools/kanban_ownership.py argues both polarities.
+    if is_delegated_child(on_unknown=False):
         return False
-    return bool(os.environ.get("HERMES_KANBAN_TASK"))
+    return is_dispatcher_worker()

@@ -649,7 +649,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			MaxInProgress int `json:"max_in_progress,omitempty"`
 			// Terminal event kinds that wake the card's creator for a follow-up
 			// turn. Read by the image patch in
-			// deploy/docker/patches/kanban_wake_kinds.py; upstream Hermes
+			// deploy/docker/patches/kanban_notifier.py; upstream Hermes
 			// hardcodes the set and ignores this key. omitempty so an unset
 			// value leaves upstream behaviour rather than emitting an empty
 			// list, which the patch reads as "never wake".
@@ -792,7 +792,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	cfg.Kanban.DispatchIntervalSeconds = 5
 	// Which terminal events wake the front door for a follow-up turn. Upstream
 	// wakes on all five and hardcodes the set; the image patches the key in
-	// (deploy/docker/patches/kanban_wake_kinds.py).
+	// (deploy/docker/patches/kanban_notifier.py).
 	//
 	// `completed` is deliberately absent. By the time the notifier wakes anyone
 	// it has already sent the worker's own status line and its full `result` to

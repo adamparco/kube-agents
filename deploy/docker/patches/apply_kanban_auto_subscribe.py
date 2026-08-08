@@ -21,9 +21,10 @@ Why the change is needed is documented in the module docstring of
 
 from __future__ import annotations
 
-import ast
 import sys
 from pathlib import Path
+
+import patchlib
 
 RELATIVE = "tools/kanban_tools.py"
 
@@ -54,35 +55,14 @@ TRAILER = (
 
 def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
-    path = root / RELATIVE
-    if not path.is_file():
-        raise SystemExit(f"kanban_auto_subscribe patch: {path} does not exist")
-    source = path.read_text()
+    patch = patchlib.Patch(root, RELATIVE, prefix="kanban_auto_subscribe")
     # The patched text keeps the anchor (the hook is appended after it), so
     # anchor-counting alone cannot catch a re-run. Refuse explicitly rather
     # than stack a second hook call and a second trailer import.
-    if "_kanban_inherit_worker_subs(conn, new_tid)" in source:
-        raise SystemExit(
-            f"kanban_auto_subscribe patch: {RELATIVE} is already patched"
-        )
-    found = source.count(ANCHOR)
-    if found != 1:
-        raise SystemExit(
-            f"kanban_auto_subscribe patch: {RELATIVE}: expected 1 occurrence "
-            f"of anchor, found {found}. Upstream Hermes changed — re-derive "
-            f"the anchor before bumping the base image.\n"
-            f"--- anchor ---\n{ANCHOR}"
-        )
-    source = source.replace(ANCHOR, PATCHED) + TRAILER
-    try:
-        ast.parse(source)
-    except SyntaxError as e:
-        raise SystemExit(
-            f"kanban_auto_subscribe patch: {RELATIVE} no longer parses after "
-            f"patching: {e}"
-        )
-    path.write_text(source)
-    print(f"kanban_auto_subscribe patch: {RELATIVE} (1 anchor)")
+    patch.refuse_if_patched("_kanban_inherit_worker_subs(conn, new_tid)")
+    patch.substitute(ANCHOR, PATCHED)
+    patch.append(TRAILER)
+    patch.commit("1 anchor")
 
 
 if __name__ == "__main__":

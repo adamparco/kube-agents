@@ -185,10 +185,12 @@ def gen_cron_jobs() -> str:
         jobs = data["jobs"] if isinstance(data, dict) and "jobs" in data else data
         for job in jobs:
             # A disabled entry on the Platform Agent's roster is a tombstone —
-            # an id an earlier release shipped, kept only because the start-up
-            # merge never prunes (see `retire_cron_jobs` in
-            # `profile_scaffold.py`). Listing them would document five jobs
-            # that cannot run as though an operator could still reach them.
+            # an id on its way out, shipped switched off for a release because
+            # the start-up merge never prunes, then deleted and named in
+            # `--cron-retire` (see `retire_cron_jobs` in `profile_scaffold.py`).
+            # The roster carries none today; the filter stays because listing
+            # the next one would document a job that cannot run as though an
+            # operator could still reach it.
             if profile == "Platform Agent" and not job.get("enabled"):
                 continue
             # An interval job has no `expr` — the roster carries `minutes` and a

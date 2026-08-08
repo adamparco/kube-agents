@@ -3372,7 +3372,7 @@ func TestRenderConfigYAMLMaxInProgressFromTuning(t *testing.T) {
 // tokens, measured on t_c31a1f00). The failure kinds deliver a bare status line
 // and do need a decision, so they must stay.
 //
-// The key is only honoured because deploy/docker/patches/kanban_wake_kinds.py
+// The key is only honoured because deploy/docker/patches/kanban_notifier.py
 // patches it in — upstream Hermes hardcodes the set. If that patch is ever
 // dropped, this config becomes inert rather than wrong, but the pairing is why
 // both sides are asserted.

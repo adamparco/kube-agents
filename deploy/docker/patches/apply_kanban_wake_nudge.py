@@ -36,9 +36,10 @@ Why the change is needed is documented in the module docstring of
 
 from __future__ import annotations
 
-import ast
 import sys
 from pathlib import Path
+
+import patchlib
 
 DB_RELATIVE = "hermes_cli/kanban_db.py"
 WATCHERS_RELATIVE = "gateway/kanban_watchers.py"
@@ -209,30 +210,11 @@ FILES = (
 def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
     for relative, edits, trailer in FILES:
-        path = root / relative
-        if not path.is_file():
-            raise SystemExit(f"kanban_wake_nudge patch: {path} does not exist")
-        source = path.read_text()
+        patch = patchlib.Patch(root, relative, prefix="kanban_wake_nudge")
         for label, anchor, patched in edits:
-            count = source.count(anchor)
-            if count != 1:
-                raise SystemExit(
-                    f"kanban_wake_nudge patch: expected 1 occurrence of the "
-                    f"{label} anchor in {relative}, found {count}. Upstream "
-                    f"Hermes changed — re-derive the anchor before bumping "
-                    f"the base image.\n--- anchor ---\n{anchor}"
-                )
-            source = source.replace(anchor, patched)
-        source += trailer
-        try:
-            ast.parse(source)
-        except SyntaxError as e:
-            raise SystemExit(
-                f"kanban_wake_nudge patch: {relative} no longer parses after "
-                f"patching: {e}"
-            )
-        path.write_text(source)
-        print(f"kanban_wake_nudge patch: {relative} ({len(edits)} anchors)")
+            patch.substitute(anchor, patched, label=label)
+        patch.append(trailer)
+        patch.commit(f"{len(edits)} anchors")
 
 
 if __name__ == "__main__":
