@@ -5,7 +5,7 @@ REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core
 
 BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write test-python validate docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write test-python test-python-deps validate docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -62,8 +62,8 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # Unit tests for every Python helper outside k8s-operator/, which has its own
 # target. Mostly stdlib-only -- the skill helpers shell out to gh/kubectl
 # rather than importing SDKs -- but the agent scripts do import a few third
-# party packages; CI installs those (.github/workflows/python-tests.yml) and
-# a local run needs them on the path too.
+# party packages, listed in requirements-test.txt and installed by
+# `make test-python-deps`. CI installs the same file.
 #
 # The wildcards are what keep this honest: a new skill's tests are picked up
 # without editing this file. Six globs rather than one because the tests do
@@ -86,16 +86,62 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard scripts/test_*.py)))
 
+# The same packages as `import` names rather than distribution names, because
+# that is what the preflight below can actually test for: python-dotenv imports
+# as `dotenv` and pyyaml as `yaml`.
+PYTHON_TEST_IMPORTS := fastapi mcp dotenv yaml
+
+test-python-deps: ## Install the third-party imports `make test-python` needs.
+	@python3 -m pip install -r requirements-test.txt
+
 test-python: ## Run the Python unit tests outside k8s-operator/.
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
 		echo "Error: no test_*.py files found under agents/, deploy/docker or scripts/."; \
 		echo "Either the tests moved or the globs are stale -- failing rather than reporting success."; \
 		exit 1; \
 	fi
-	@set -e; for dir in $(PYTHON_TEST_DIRS); do \
+# Named up front rather than left to surface as an ImportError inside one
+# directory's discovery, where a missing package reads like a broken test. This
+# is a warning and not a hard stop because the two failures are independent: a
+# machine that cannot install `mcp` can still run every other directory, and
+# refusing to start would throw away that signal to report something the
+# developer already knows. The exit status below still fails, so CI cannot go
+# green on a suite whose modules never imported.
+	@missing=""; \
+	for mod in $(PYTHON_TEST_IMPORTS); do \
+		python3 -c "import $$mod" >/dev/null 2>&1 || missing="$$missing $$mod"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "Warning: missing third-party imports:$$missing"; \
+		echo "         The agent scripts import these at module scope, so the test"; \
+		echo "         modules that import those scripts will fail to load."; \
+		echo "         Install them with:  make test-python-deps"; \
+		echo; \
+	fi
+# Every directory runs even after one fails, and the failures are named again at
+# the end. This loop was `set -e` over a plain `for`, which stopped at the first
+# failing directory -- and since the list is sorted, agents/platform/scripts
+# failing meant deploy/docker/patches (the largest suite in the repository, 599
+# tests) never ran at all, while the output still ended in a familiar-looking
+# failure. A red run that hides four green directories is survivable; one that
+# hides an untested directory is not.
+	@failed=""; \
+	for dir in $(PYTHON_TEST_DIRS); do \
 		echo "==> $$dir"; \
-		(cd $$dir && python3 -m unittest discover -p "test_*.py"); \
-	done
+		(cd $$dir && python3 -m unittest discover -p "test_*.py") || failed="$$failed $$dir"; \
+	done; \
+	missing=""; \
+	for mod in $(PYTHON_TEST_IMPORTS); do \
+		python3 -c "import $$mod" >/dev/null 2>&1 || missing="$$missing $$mod"; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		echo; \
+		echo "Failing test directories:$$failed"; \
+		if [ -n "$$missing" ]; then \
+			echo "Missing third-party imports:$$missing -- run: make test-python-deps"; \
+		fi; \
+		exit 1; \
+	fi
 
 # Documentation tables that mirror a machine-readable source (cron jobs, the
 # skill catalogue, the provisioning steps) are generated rather than hand-kept.
