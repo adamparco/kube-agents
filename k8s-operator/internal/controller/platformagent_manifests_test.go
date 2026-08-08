@@ -2922,13 +2922,14 @@ func TestRenderConfigYAMLExcludesTargetedPlugins(t *testing.T) {
 	}
 }
 
-// The default profile's plugins.enabled must name only plugins that are on disk for
-// THAT profile. Hermes resolves the list against the profile's own plugins/ directory,
-// so a name that is in the image but not in agents/chat/defaults/plugins (plus the
-// hermes_otel the Dockerfile installs into /opt/defaults) resolves to nothing.
-// incident_context is the specific one: it is a built-in — DefaultBuiltInPlugins exists
-// to stop an AgentPlugin shadowing it — but it is COPYed from agents/platform/plugins
-// and reaches the platform profile alone.
+// The default profile's plugins.enabled must name every plugin that acts on chat
+// ingress, and only plugins that resolve for it. Hermes resolves the list against the
+// bundled directory (/opt/hermes/plugins, scanned for every HERMES_HOME) and then the
+// profile's own plugins/, so agents/chat/defaults/plugins, the hermes_otel the Dockerfile
+// installs into /opt/defaults, and the bundled incident_context all count.
+// incident_context is the one worth pinning: the pod runs a single gateway, homed at this
+// profile, so dropping it here silences its pre_gateway_dispatch hook fleet-wide rather
+// than moving it to the platform specialist.
 func TestRenderConfigYAMLEnablesOnlyPluginsTheDefaultProfileHas(t *testing.T) {
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
@@ -2946,14 +2947,15 @@ func TestRenderConfigYAMLEnablesOnlyPluginsTheDefaultProfileHas(t *testing.T) {
 		"session_store",
 		"session_otel_bridge",
 		"tool_call_audit",
+		"incident_context",
 		"bootstrap_onboarding",
 		"legacy_slash_commands",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("default profile plugins.enabled = %v, want %v", got, want)
 	}
-	// Guards the pair above from drifting back together: incident_context must stay in
-	// the shadow-protection roster even though it is not enabled here.
+	// incident_context must also stay in the shadow-protection roster, which is a
+	// separate guarantee from being enabled above.
 	if !IsBuiltInPlugin("incident_context") {
 		t.Errorf("incident_context must remain a built-in so an AgentPlugin cannot shadow it")
 	}

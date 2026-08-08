@@ -214,8 +214,9 @@ func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMa
 // DefaultBuiltInPlugins defines the built-in plugins pre-installed in the Hermes container
 // image. This is the roster an AgentPlugin may not shadow (see IsBuiltInPlugin) — being in
 // the image anywhere is enough to make a same-named AgentPlugin a collision. It is NOT the
-// list to enable on a profile: `incident_context` is COPYed to /opt/hermes/plugins from
-// agents/platform/plugins and reaches the platform profile only.
+// list to enable on a profile: shadow protection and per-profile enablement answer
+// different questions, and a plugin added here for the first must not silently switch
+// itself on at the front door.
 var DefaultBuiltInPlugins = []string{
 	"hermes_otel",
 	"session_store",
@@ -225,21 +226,23 @@ var DefaultBuiltInPlugins = []string{
 	"bootstrap_onboarding",
 }
 
-// defaultProfilePlugins is what is actually installed under the DEFAULT profile's plugin
-// directory: agents/chat/defaults/plugins/ (bootstrap_onboarding, legacy_slash_commands,
-// session_otel_bridge, session_store, tool_call_audit) plus hermes_otel, which the
-// Dockerfile installs into /opt/defaults separately.
+// defaultProfilePlugins is what the DEFAULT profile enables. Every name here resolves for
+// it: agents/chat/defaults/plugins/ supplies bootstrap_onboarding, session_otel_bridge,
+// session_store and tool_call_audit, the Dockerfile installs hermes_otel into /opt/defaults,
+// and incident_context is COPYed to /opt/hermes/plugins — the BUNDLED directory, which
+// hermes_cli/plugins.py scans for every HERMES_HOME, not just the platform profile's.
 //
-// Kept apart from DefaultBuiltInPlugins deliberately. Enabling a plugin that is not on
-// disk for the profile is not a no-op — Hermes resolves plugins.enabled against that
-// profile's plugins/ directory — and rendering `incident_context` here named one the Chat
-// Agent has never had. Keep in sync with agents/chat/config.yaml's plugins.enabled, which
-// is the same list built at image build time.
+// It coincides with DefaultBuiltInPlugins today and is still kept apart, because the two
+// lists answer different questions: that one is the shadow-protection roster, this one is
+// enablement. A future built-in added for shadow protection alone must not turn itself on
+// at the front door. Keep in sync with agents/chat/config.yaml's plugins.enabled, which is
+// the same list built at image build time.
 var defaultProfilePlugins = []string{
 	"hermes_otel",
 	"session_store",
 	"session_otel_bridge",
 	"tool_call_audit",
+	"incident_context",
 	"bootstrap_onboarding",
 }
 
@@ -830,17 +833,23 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	// The plugins installed under the default profile, plus legacy_slash_commands. That
-	// one rides on the default profile because it hooks pre_gateway_dispatch on inbound
-	// chat messages so a typed "/hermes sethome" reaches the gateway command dispatcher
+	// The plugins the default profile enables, plus legacy_slash_commands. That one rides
+	// on the default profile because it hooks pre_gateway_dispatch on inbound chat
+	// messages so a typed "/hermes sethome" reaches the gateway command dispatcher
 	// instead of drawing an unknown-command reply — chat ingress lands here, not on the
 	// platform specialist. It is not in defaultProfilePlugins because that list is
 	// ordered to mirror agents/chat/config.yaml, where it also comes last.
 	//
+	// incident_context must be in the list for the same reason: it hooks
+	// pre_gateway_dispatch on a human's reply in a Slack or Google Chat incident thread,
+	// and the pod runs one gateway, homed at the default profile. Enabling it on the
+	// platform profile alone leaves the hook with no ingress to see. It sorts ahead of
+	// legacy_slash_commands here, which is safe either way: it returns early on a leading
+	// "/" so the slash-command unwrap still sees the raw text.
+	//
 	// Built from defaultProfilePlugins, NOT DefaultBuiltInPlugins: the latter is the
-	// image-wide roster an AgentPlugin may not shadow, and it includes incident_context,
-	// which ships to the platform profile alone. Rendering that name here enabled a
-	// plugin the Chat Agent does not have on disk.
+	// image-wide roster an AgentPlugin may not shadow. The two coincide today, and
+	// conflating them would enable the next shadow-protected built-in by accident.
 	cfg.Plugins.Enabled = append(slices.Clone(defaultProfilePlugins), "legacy_slash_commands")
 	cfg.Display.Platforms = map[string]map[string]any{}
 	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the

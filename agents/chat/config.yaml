@@ -216,17 +216,21 @@ memory:
 # Both act on a human typing at the front door, so they go where those messages
 # land — this profile.
 #
-# Not a rule about the hook: the Platform Agent runs its own gateway for incident
-# threads and enables `incident_context`, which is pre_gateway_dispatch too (see
-# agents/platform/config.yaml). What decides the profile is whose ingress the
-# plugin is reacting to. Where two of them do share a profile they also share a
-# turn, and the first to rewrite decides what the second sees — the reason
-# `incident_context` steps aside for a leading `/`.
+# `incident_context` belongs here for the same reason, even though it is COPYed
+# from agents/platform/plugins: the pod runs one gateway and it is homed at this
+# profile, so a reply typed in a Slack or Google Chat incident thread arrives
+# here. Enabling it on the platform profile alone leaves its pre_gateway_dispatch
+# hook with nothing to hook. It resolves from /opt/hermes/plugins, the bundled
+# directory Hermes scans for every profile, not from this profile's plugins/.
+# Two pre_gateway_dispatch plugins on one profile also share a turn, and the
+# first to rewrite decides what the second sees — the reason `incident_context`
+# steps aside for a leading `/`, leaving the slash-command unwrap the raw text.
 plugins:
   enabled:
     - hermes_otel
     - session_store
     - session_otel_bridge
     - tool_call_audit
+    - incident_context
     - bootstrap_onboarding
     - legacy_slash_commands
