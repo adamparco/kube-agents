@@ -222,18 +222,60 @@ def merge_cron_store(
     return merged
 
 
+def retire_cron_jobs(store: object, retire_ids: tuple[str, ...]) -> object:
+    """Delete the named ids from a cron store outright.
+
+    `merge_cron_store` can only ever *hold a job off* — it has no way to tell an
+    operator's own job from one this release dropped, so it keeps every entry the
+    image is silent about. That is the right default, and it is also why retiring
+    a watchdog normally takes two releases: ship `enabled: false`, wait for every
+    live volume to merge it, then delete the entry.
+
+    This is the escape hatch for the case that rule cannot cover: an id that has
+    to stop firing on volumes that already have it *enabled*, in one release,
+    because something else has taken over its work. Deleting the shipped entry
+    alone would strand the volume's copy at `enabled: true` — still firing, and
+    now with the image unable to reach it. That is how the same audit ends up
+    running twice: once from the roster it moved to, once from the copy nobody
+    can turn off.
+
+    Naming an id here asserts the image owns it. An operator's job that happens
+    to share the name goes with it, which is why the entrypoint's list is
+    hand-maintained and short rather than derived from what the image stopped
+    shipping.
+    """
+    if not retire_ids or not isinstance(store, dict):
+        return store
+    jobs = store.get("jobs")
+    if not isinstance(jobs, list):
+        return store
+    doomed = set(retire_ids)
+    kept = [
+        j for j in jobs if not (isinstance(j, dict) and str(j.get("id", "")) in doomed)
+    ]
+    if len(kept) == len(jobs):
+        return store
+    return {**store, "jobs": kept}
+
+
 def _merge_after_overlay(
     home: Path,
     template_dir: Path,
     names: tuple[str, ...],
     prior: dict[str, object],
     cron_job_ids: tuple[str, ...] | None = None,
+    cron_retire_ids: tuple[str, ...] = (),
 ) -> None:
     """Restore the merged form of every MERGE_PATHS entry the copy just replaced.
 
     Done after the copy rather than instead of it: the copy is what creates the
     file on a first scaffold, and re-deriving the merge from contents read
     *before* the copy keeps this a pure add-on to the existing behaviour.
+
+    The retire pass runs last, on the merged result, because the ids it deletes
+    are by definition ones the image no longer ships — `merge_cron_store` will
+    have carried the volume's copies through untouched, which is exactly what
+    has to be undone.
     """
     for relative, previous in prior.items():
         parts = relative.split("/")
@@ -242,7 +284,10 @@ def _merge_after_overlay(
         source = template_dir.joinpath(*parts)
         if not source.is_file():
             continue
-        merged = merge_cron_store(read_json(source), previous, cron_job_ids)
+        merged = retire_cron_jobs(
+            merge_cron_store(read_json(source), previous, cron_job_ids),
+            cron_retire_ids,
+        )
         destination = home.joinpath(*parts)
         try:
             # Temp file and os.replace, not a plain write: a torn jobs.json is
@@ -264,6 +309,7 @@ def overlay_template(
     plugins_dir: Path | None = None,
     items: tuple[str, ...] | None = None,
     cron_job_ids: tuple[str, ...] | None = None,
+    cron_retire_ids: tuple[str, ...] = (),
 ) -> None:
     """Copy a baked template onto a profile home (overwrites).
 
@@ -274,7 +320,8 @@ def overlay_template(
     Everything named in `MERGE_PATHS` is the exception: it is read first,
     overwritten with the rest, and then rewritten as a merge of the two. See
     `merge_cron_store` for why a file can be both image-owned and runtime state,
-    and what `cron_job_ids` narrows that merge to.
+    and what `cron_job_ids` narrows that merge to; `cron_retire_ids` names the
+    ids to delete from the volume outright (see `retire_cron_jobs`).
     """
     if not template_dir.is_dir():
         raise SystemExit(f"ERROR: template dir not found: {template_dir}")
@@ -293,7 +340,7 @@ def overlay_template(
             shutil.copytree(src, dest, dirs_exist_ok=True)
         else:
             shutil.copy2(src, dest)
-    _merge_after_overlay(home, template_dir, names, prior, cron_job_ids)
+    _merge_after_overlay(home, template_dir, names, prior, cron_job_ids, cron_retire_ids)
     if plugins_dir and plugins_dir.is_dir():
         try:
             shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)
@@ -341,6 +388,14 @@ def main() -> None:
             "default merges every job the image ships (see merge_cron_store)."
         ),
     )
+    ap.add_argument(
+        "--cron-retire",
+        default="",
+        help=(
+            "Space-separated cron job ids to delete from the volume's roster outright, "
+            "for jobs this release moved elsewhere (see retire_cron_jobs)."
+        ),
+    )
     args = ap.parse_args()
 
     if args.home:
@@ -356,6 +411,7 @@ def main() -> None:
         Path(args.plugins) if args.plugins else None,
         tuple(args.items.split()) or None,
         tuple(args.cron_jobs.split()) or None,
+        tuple(args.cron_retire.split()),
     )
     print(str(home))
 

@@ -49,34 +49,31 @@ Each stream's cron job id **is** its audit id, so an operator asking for a run o
 for one command per stream:
 
 ```
-HERMES_HOME=/opt/data /opt/hermes/.venv/bin/python3 /opt/data/scripts/platform_cron_dispatch.py compliance-audit
-python3 /opt/data/scripts/kanban_notify_propagate.py --to <task-id>
+HERMES_HOME=/opt/data/profiles/platform /opt/hermes/.venv/bin/hermes cron run compliance-audit
 ```
 
-`cronjob` is not the route: every cron job lives in the Chat Agent profile's roster, because that
-profile owns the only ticking gateway, and this profile's own roster holds nothing but disabled
-tombstones of the jobs that moved there. The first command is
-the same code path the 06:20 tick runs — it reads that roster and files one card carrying the
-stream's prompt verbatim, naming the SOP and the line range its checks live in. The second copies
-your card's chat subscription onto it, so the person who asked hears back; a scheduled card is meant
-to complete silently, one a person asked for is not.
+Every stream's cron job lives in this profile's own roster, ticked once a minute by the Chat Agent's
+`profile-cron-tick`. `hermes cron run` marks the job due rather than running it here; the next tick
+picks it up within a minute and runs it through the identical path the 06:20 tick uses, with the
+stream's prompt verbatim, its `skills` preloaded, and this profile's `max_turns`.
 
-**Do not run the audit yourself in the session that received the request.** The filed card gets its
-own session and its own turn budget. A session that improvises the audit instead has neither — and
+`cronjob(action='run')` is not the route: it executes the job synchronously inside the session that
+calls it, which is the re-enactment the next paragraph exists to prevent.
+
+**Do not run the audit yourself in the session that received the request.** A triggered run gets its
+own process and its own turn budget. A session that improvises the audit instead has neither — and
 when the request is "run all six", it has one turn budget for work the schedule spreads across six
 runs and two days. That is not a hypothetical failure mode: on 2026-08-03 a single worker asked to
 run all five streams issued zero `kubectl` commands, hand-typed five empty findings documents, and
 published a fleet-wide all-clear.
 
-The dispatch script logs `filed <task-id> to run <audit-id>` to stderr; that id is what the second
-command needs. If it instead reports a card still in flight, nothing was filed — that stream is
-already running, and a second card would run the same audit concurrently with itself and write the
-same ledger issue twice. Say so and stop.
+The scheduler holds a per-job lock for the length of a run, so a stream already in flight is not
+started a second time and cannot write its ledger issue twice. `cronjob(action='runs')` shows what
+is running and what each attempt did.
 
-**Each card reports on itself. Your own card gets a roll-up, not a copy.** Complete it with one line
-per stream — the stream, the card id, and nothing else. The reports arrive on the cards that do the
-work; repeating them here sends the same content twice. Your own kanban card is yours to close, and
-the cards you filed cannot close it for you.
+**Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
+stream — the stream, and that it is queued for the next tick. The reports arrive through each run's
+own `deliver` setting; repeating them here sends the same content twice.
 
 ## The two-command lifecycle
 

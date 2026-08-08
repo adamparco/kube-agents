@@ -17,12 +17,15 @@ resolver. They sat at ``state: scheduled`` with a ``next_run_at`` in the past,
 ``enabled: true``, and no error anywhere; the only runs any of them ever had
 came from an agent calling ``cronjob(action='run')`` by hand.
 
-Those seven have since moved to the Chat Agent's roster and reach the Platform
-Agent as kanban cards (``platform_cron_dispatch.py``); their platform-side
-copies stay as ``enabled: false`` tombstones exactly because of this script —
-once the store ticks, an enabled copy would fire alongside the card. What still
-needs a ticker here is anything an operator schedules on a named profile's own
-store.
+Those seven ran for a while from the Chat Agent's roster instead, each one a
+``no_agent`` script that filed a kanban card for the Platform Agent to pick up.
+That indirection bought a ticker at the cost of the scheduler's per-job knobs —
+a card is not a cron run, so ``skills``, ``model`` and ``deliver`` stopped
+reaching the thing that ran — and it split every watchdog across three files: an
+entry on one roster, a wrapper script, and a tombstone on the other. This script
+removes the reason for all of it, so the seven are back on the Platform Agent's
+own roster and the dispatch layer is gone. What else needs a ticker here is
+anything an operator schedules on a named profile's own store.
 
 This script is the ticker those profiles never had. It runs as a ``no_agent``
 job on the one store that does tick, and each minute runs ``hermes cron tick``

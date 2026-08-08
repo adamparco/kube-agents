@@ -144,4 +144,4 @@ The chat-ingress plugins — `session_store` (durable session state) and `sessio
 
 - [`agents/platform/SOUL.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/SOUL.md) — persona / system prompt.
 - [`agents/platform/AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/AGENTS.md) — workspace runtime instructions.
-- [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) — cron watchdog definitions, on the Chat Agent because it owns the only ticking gateway. See [Cron jobs reference](/kube-agents/reference/cron-jobs/).
+- [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json) — cron watchdog definitions. Advanced by `profile-cron-tick` on the Chat Agent's roster, which owns the only ticking gateway. See [Cron jobs reference](/kube-agents/reference/cron-jobs/).

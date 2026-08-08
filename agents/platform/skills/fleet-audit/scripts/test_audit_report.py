@@ -1470,25 +1470,28 @@ class TestSchemeMigration(HarnessTestCase):
 
 
 class TestAuditCatalogue(unittest.TestCase):
-    def cron_jobs(self):
+    def cron_jobs(self, include_disabled=False):
         """The cron catalogue keyed by id, or a skip when it is not shipped.
 
-        The Chat Agent's roster, not this profile's: cron ticking is a property
-        of a running gateway and only the `default` profile has one, so every
-        governance job lives there and reaches this agent as a kanban card.
+        This profile's own roster. Cron ticking is a property of a running
+        gateway and only the `default` profile has one, but `profile-cron-tick`
+        runs `hermes cron tick` against every named profile with work due — so a
+        governance job fires here, with this profile's persona, toolsets and
+        `skills`, rather than arriving as a card filed from over there.
+
+        Disabled entries are excluded unless asked for: the roster carries
+        tombstones of retired ids, and a caller checking what the fleet runs
+        must not pick those up.
         """
         jobs_file = (
-            Path(__file__).resolve().parents[4]
-            / "chat"
-            / "defaults"
-            / "cron"
-            / "jobs.json"
+            Path(__file__).resolve().parents[4] / "platform" / "cron" / "jobs.json"
         )
         if not jobs_file.is_file():  # not shipped alongside the skill at runtime
             self.skipTest(f"{jobs_file} not present")
         jobs = {
             job["id"]: job
             for job in json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
+            if include_disabled or job.get("enabled") is True
         }
         # Callers index this by audit id. The set equality has its own test, but
         # unittest orders alphabetically and two callers sort ahead of it, so a
@@ -1506,86 +1509,119 @@ class TestAuditCatalogue(unittest.TestCase):
         return sop_dir
 
     def governance_jobs(self):
-        """The relocated governance jobs on the Chat Agent's roster, keyed by id.
+        """The live governance jobs on this profile's roster, keyed by id.
 
-        A `dispatch_<id>.py` script is what marks one: the other entries on
-        that roster — `profile-cron-tick`, the reconcile sweep and the two
-        onboarding jobs — do work of their own rather than filing a card.
+        An enabled entry is what marks one. The rest of the roster is
+        tombstones — ids an earlier release shipped and this one has switched
+        off, kept because `merge_cron_store` never prunes.
         """
         return {
             job_id: job
-            for job_id, job in self.cron_jobs().items()
-            if str(job.get("script", "")).startswith("dispatch_")
+            for job_id, job in self.cron_jobs(include_disabled=True).items()
+            if job.get("enabled") is True
         }
 
     def platform_roster(self):
-        """This profile's own cron store, or a skip when it is not shipped."""
-        jobs_file = (
-            Path(__file__).resolve().parents[4] / "platform" / "cron" / "jobs.json"
-        )
-        if not jobs_file.is_file():  # not shipped alongside the skill at runtime
-            self.skipTest(f"{jobs_file} not present")
-        return {
-            job["id"]: job
-            for job in json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
-        }
+        """This profile's whole cron store, tombstones included."""
+        return self.cron_jobs(include_disabled=True)
 
     def test_every_watchdog_declares_all_delivery(self):
-        """A governance tick that stops filing cards has to be audible.
+        """A watchdog whose run fails has to be audible.
 
-        The tick is a `no_agent` subprocess, and on success it prints nothing
-        and is delivered as a silent run — so `deliver` only ever decides what
-        happens on failure. `"all"` sends that failure to the Chat Agent's
-        configured target, which exists because that profile is the chat front
-        door; `"local"` resolves to no target and drops it, leaving a bridge
-        that has stopped filing cards indistinguishable from a fleet with
+        `"all"` sends the outcome to the configured target; `"local"` resolves
+        to no target at all (`scheduler.py:_deliver_result`), so a run that
+        failed would be built into a message and then dropped — leaving a
+        watchdog that has stopped working indistinguishable from a fleet with
         nothing to report.
 
         The audit's own findings do not travel this leg — Tier 1 is the ledger
-        issue — so this is not a route for reports, only for the failure of
-        the thing that files them.
+        issue — so this is not the route for reports, only for the failure of
+        the thing that produces them.
         """
         watchdogs = self.governance_jobs()
         self.assertTrue(
             watchdogs,
-            "no dispatch_<id>.py entries on the Chat Agent's roster; either the "
-            "governance jobs moved again or the marker changed",
+            "no enabled entries on the platform roster; either the governance "
+            "jobs moved again or every one of them got switched off",
         )
         for job_id, job in sorted(watchdogs.items()):
             with self.subTest(job=job_id):
                 self.assertEqual(
                     job.get("deliver"),
                     "all",
-                    f"chat roster[{job_id}] declares "
-                    f"deliver={job.get('deliver')!r}; a tick that failed to "
-                    f"file its card would then resolve to no delivery target "
-                    f"and vanish",
+                    f"platform roster[{job_id}] declares "
+                    f"deliver={job.get('deliver')!r}; a failed run would then "
+                    f"resolve to no delivery target and vanish",
                 )
 
-    def test_platform_roster_ships_only_disabled_tombstones(self):
-        """An entry left enabled here runs its audit twice.
+    def test_the_governance_jobs_are_enabled_on_this_roster(self):
+        """This roster is the live schedule, not a set of tombstones.
 
-        This roster is not inert: `profile-cron-tick` runs `hermes cron tick`
-        against every named profile with work due, so an enabled entry fires
-        here *and* arrives as a card from the Chat Agent's dispatch script.
-        The entries are kept rather than deleted because
-        `profile_scaffold.merge_cron_store` adds and overwrites but never
-        prunes — shipping them disabled is what switches off the enabled copies
-        an upgraded volume was given by an earlier release.
+        `profile-cron-tick` runs `hermes cron tick` against every named profile
+        with work due, so an enabled entry here fires with this profile's
+        persona, toolsets and `skills`. That is the whole point of the jobs
+        living here: a kanban card filed from the Chat Agent's roster is not a
+        cron run, so `skills`, `model` and `deliver` never reached it.
+
+        The Chat Agent's roster must not carry them at the same time — two
+        rosters both firing is the same audit running against itself.
         """
-        roster = self.platform_roster()
-        self.assertTrue(
-            roster,
-            "the tombstones are load-bearing: emptying this roster stops the "
-            "start-up merge disabling the enabled copies on upgraded volumes",
+        live = self.governance_jobs()
+        self.assertEqual(
+            set(audit_report.AUDITS) | {"github-issue-resolver"},
+            set(live),
+            "the platform roster's enabled entries are not the governance set; "
+            "a stream switched off here simply stops running",
         )
-        for job_id, job in sorted(roster.items()):
+
+        chat_roster = (
+            Path(__file__).resolve().parents[4]
+            / "chat"
+            / "defaults"
+            / "cron"
+            / "jobs.json"
+        )
+        if chat_roster.is_file():
+            chat_ids = {
+                job["id"]
+                for job in json.loads(chat_roster.read_text(encoding="utf-8"))["jobs"]
+            }
+            self.assertEqual(
+                set(),
+                chat_ids & set(live),
+                "these ids are on both rosters; each one would run twice per "
+                "schedule, concurrently with itself, writing its ledger issue "
+                "twice",
+            )
+
+    def test_retired_ids_stay_as_disabled_tombstones(self):
+        """A retired id is switched off, not deleted.
+
+        `merge_cron_store` adds and overwrites but never prunes, so deleting an
+        entry only ends the image's ability to hold it off — the volume's copy
+        goes on firing. Shipping it `enabled: false` is what actually stops it;
+        the id is safe to drop only once every live volume has merged that
+        disabled form. (`retire_cron_jobs` is the escape hatch for the case
+        this cannot cover, and the entrypoint names those ids explicitly.)
+        """
+        tombstones = {
+            job_id: job
+            for job_id, job in self.platform_roster().items()
+            if job.get("enabled") is not True
+        }
+        for job_id, job in sorted(tombstones.items()):
             with self.subTest(job=job_id):
                 self.assertIs(
                     job.get("enabled"),
                     False,
-                    f"platform roster[{job_id}] is enabled; it would run in "
-                    f"duplicate with the card the Chat Agent files",
+                    f"platform roster[{job_id}] is neither enabled nor "
+                    f"explicitly disabled; `enabled` defaults to true in the "
+                    f"scheduler, so this entry would fire",
+                )
+                self.assertFalse(
+                    job.get("skills"),
+                    f"platform roster[{job_id}] is a tombstone but still "
+                    f"declares skills; a re-enabled copy would run them",
                 )
 
     def test_every_stream_has_a_watchdog_and_every_watchdog_a_stream(self):
@@ -7175,20 +7211,29 @@ class TestDispatchAndHandover(unittest.TestCase):
             end += 1
         return "\n".join(lines[start:end])
 
-    def test_a_scheduled_card_must_still_be_closed_out(self):
-        bullet = self.bullet("A governance job arrives as a card")
-        self.assertIn("kanban_complete", bullet)
+    def test_a_scheduled_job_runs_on_the_platform_roster(self):
+        """The schedule lives on this profile, not on the Chat Agent's.
 
-    def test_an_on_demand_run_files_a_card_and_makes_it_speak(self):
-        """On demand, two commands or the report lands nowhere.
-
-        The dispatch script files the card; without `kanban_notify_propagate`
-        no subscription is copied onto it, so the worker's summary — the
-        report, ledger URL and all — completes into silence.
+        `profile-cron-tick` gives the platform store a ticker, so a governance
+        job is a cron run here rather than a card filed from over there. The
+        bullet has to name the roster the agent can actually inspect, or an
+        agent looking for its own schedule goes reading the wrong file.
         """
-        bullet = self.bullet("file its card, do not re-enact it")
-        self.assertIn("platform_cron_dispatch.py", bullet)
-        self.assertIn("kanban_notify_propagate.py", bullet)
+        bullet = self.bullet("A governance job arrives as a cron run")
+        self.assertIn("/opt/data/profiles/platform/cron/jobs.json", bullet)
+        self.assertIn("profile-cron-tick", bullet)
+
+    def test_an_on_demand_run_triggers_the_schedule_rather_than_re_enacting_it(self):
+        """On demand means trigger the job, never run the audit inline.
+
+        `hermes cron run` marks the job due and the next tick runs it in its
+        own process; `cronjob(action='run')` executes it inside the calling
+        session, which is the one turn budget five audits used to share.
+        """
+        bullet = self.bullet("trigger the schedule, do not re-enact it")
+        self.assertIn("hermes cron run", bullet)
+        self.assertIn("HERMES_HOME=/opt/data/profiles/platform", bullet)
+        self.assertIn("cronjob(action='run')", bullet)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
         section = self.read("SOUL.md").split("## 1.")[0]

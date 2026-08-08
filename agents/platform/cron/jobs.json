@@ -1,31 +1,27 @@
 {
   "_comment": [
-    "The seven shipped governance watchdogs no longer run from this roster.",
-    "Their schedules, prompts and skills live in agents/chat/defaults/cron/",
-    "jobs.json as `no_agent` dispatch entries: each runs agents/chat/scripts/",
-    "dispatch_<id>.py on the Chat Agent's ticker, which files a kanban card",
-    "assigned to this profile, and a Platform Agent worker does the audit.",
-    "Every entry below is a tombstone, shipped `enabled: false` on purpose —",
-    "do not re-enable one here, or it will run in duplicate with the cards",
-    "the Chat Agent files.",
-    "",
-    "Unlike upstream, this roster is NOT inert. The gateway's own ticker only",
-    "ever ticks the Chat Agent's store, but that store carries",
+    "The governance watchdogs run from this roster, as cron runs on this",
+    "profile. Unlike upstream, this roster is NOT inert: the gateway's own",
+    "ticker only ever ticks the Chat Agent's store, but that store carries",
     "`profile-cron-tick`, which runs `hermes cron tick` against every named",
     "profile with work due (see 'What fires the schedule' in",
     "docs/site/src/content/docs/concepts/autonomous-watchdogs.md). An enabled",
-    "entry here therefore fires, with this profile's persona and toolsets.",
-    "That is also why the tombstones exist: profile_scaffold.merge_cron_store",
-    "adds and overwrites but never prunes, so an upgraded volume keeps the",
-    "enabled copies an earlier release gave it, and with the store now",
-    "ticking those copies would fire alongside the dispatch cards. Shipping",
-    "the entries disabled flips `enabled` off on every volume at start-up; an",
-    "id is safe to delete only once every live cluster has merged this",
-    "disabled form.",
+    "entry here therefore fires in its own process, with this profile's",
+    "persona, toolsets, `skills`, `model` and `max_turns`.",
     "",
-    "ai-security-audit postdates the relocation and was briefly the one live",
-    "entry here; it now takes the same dispatch route as the other six, so",
-    "its copy is a tombstone too.",
+    "Do not add any of these ids to agents/chat/defaults/cron/jobs.json as",
+    "well. Two rosters both carrying one is that audit running twice per",
+    "schedule, concurrently with itself, writing its ledger issue twice.",
+    "",
+    "The trailing `enabled: false` entries are tombstones — ids an earlier",
+    "release shipped and this one has retired. They are kept because",
+    "profile_scaffold.merge_cron_store adds and overwrites but never prunes,",
+    "so deleting an entry only ends this image's ability to hold it off: the",
+    "volume's copy goes on firing. Shipping it disabled is what stops it, and",
+    "an id is safe to delete only once every live volume has merged that",
+    "disabled form. (`retire_cron_jobs` is the escape hatch for the case that",
+    "cannot cover — an id that has to stop firing in one release — and the",
+    "entrypoint names those ids explicitly.)",
     "",
     "Hermes ignores every top-level key but `jobs` when it loads the store,",
     "so this note is inert."
@@ -40,8 +36,10 @@
         "display": "20 6 * * *"
       },
       "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 406 lines of it, before you run anything. Its eleven checks are section 2, lines 102-314, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
-      "skills": ["fleet-audit"],
-      "enabled": false,
+      "skills": [
+        "fleet-audit"
+      ],
+      "enabled": true,
       "deliver": "all"
     },
     {
@@ -53,8 +51,10 @@
         "display": "50 6 * * *"
       },
       "prompt": "Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your profile home — all 282 lines of it, before you run anything. Its eleven checks are section 3, lines 86-215, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
-      "skills": ["fleet-audit"],
-      "enabled": false,
+      "skills": [
+        "fleet-audit"
+      ],
+      "enabled": true,
       "deliver": "all"
     },
     {
@@ -66,8 +66,10 @@
         "display": "20 7 * * 1"
       },
       "prompt": "Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrator_sop.md' in your profile home — all 283 lines of it, before you run anything. Its ten checks are section 3, lines 114-218, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. This audit is read-only: never upgrade a cluster.",
-      "skills": ["fleet-audit"],
-      "enabled": false,
+      "skills": [
+        "fleet-audit"
+      ],
+      "enabled": true,
       "deliver": "all"
     },
     {
@@ -79,8 +81,10 @@
         "display": "50 7 * * 1"
       },
       "prompt": "Run the weekly fleet waste audit. Read the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your profile home — all 261 lines of it, before you run anything. Its ten checks are section 3, lines 87-193, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. Report findings in resource units only — you have no pricing data.",
-      "skills": ["fleet-audit"],
-      "enabled": false,
+      "skills": [
+        "fleet-audit"
+      ],
+      "enabled": true,
       "deliver": "all"
     },
     {
@@ -92,8 +96,10 @@
         "display": "20 8 * * 1"
       },
       "prompt": "Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' in your profile home — all 264 lines of it, before you run anything. Its nineteen facets are section 4, lines 90-195, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. The baseline is derived from the live fleet itself — never from an external blueprint.",
-      "skills": ["fleet-audit"],
-      "enabled": false,
+      "skills": [
+        "fleet-audit"
+      ],
+      "enabled": true,
       "deliver": "all"
     },
     {
@@ -105,8 +111,10 @@
         "display": "50 8 * * *"
       },
       "prompt": "Run the daily AI workload security audit. Read the SOP at 'governance/ai_security_audit_sop.md' in your profile home — all 314 lines of it, before you run anything. Its six checks are section 3, lines 128-245, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 defines which workloads count as AI workloads; on a cluster running none the six checks still ran and matched nothing, so record all six in checks_run with the collection command — never leave checks_run empty, which the validator rejects. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
-      "skills": ["fleet-audit"],
-      "enabled": false,
+      "skills": [
+        "fleet-audit"
+      ],
+      "enabled": true,
       "deliver": "all"
     },
     {
@@ -118,9 +126,71 @@
         "display": "*/30 * * * *"
       },
       "prompt": "Run the github-issue-resolver skill to poll, triage, investigate, and resolve unaddressed open issues on our target repository strictly according to the skill's safety red lines, scope constraints, and turn completion checklist.",
-      "skills": ["github-issue-resolver"],
-      "enabled": false,
+      "skills": [
+        "github-issue-resolver"
+      ],
+      "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "blueprint-sync",
+      "name": "Blueprint Sync",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 9 * * *",
+        "display": "0 9 * * *"
+      },
+      "prompt": "Execute GKE blueprint alignment audit. Read 'governance/blueprint_sync_sop.md' in your profile home and perform the daily GKE cluster compliance checks against the master blueprints.",
+      "skills": [],
+      "enabled": false
+    },
+    {
+      "id": "policy-propagation",
+      "name": "Policy Propagation",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 * * * *",
+        "display": "0 * * * *"
+      },
+      "prompt": "Propagate updated operational policies. Read 'governance/policy_propagation_sop.md' in your profile home and inspect the latest security policies and resource configs across all clusters directly.",
+      "skills": [],
+      "enabled": false
+    },
+    {
+      "id": "global-capacity-orchestrator",
+      "name": "Global Capacity Orchestrator",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 * * * *",
+        "display": "0 * * * *"
+      },
+      "prompt": "Execute cross-cluster capacity optimization. Read 'governance/global_capacity_orchestrator_sop.md' in your profile home to analyze fleet-wide regional demand and inspect cluster capacity pools directly.",
+      "skills": [],
+      "enabled": false
+    },
+    {
+      "id": "standardization-validator",
+      "name": "Standardization Validator",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 10 * * 0",
+        "display": "0 10 * * 0"
+      },
+      "prompt": "Run weekly structural GKE alignment audit. Read 'governance/standardization_validator_sop.md' in your profile home to perform deep-diff analysis between GKE live states and global standards.",
+      "skills": [],
+      "enabled": false
+    },
+    {
+      "id": "lifecycle-deprecation-manager",
+      "name": "Lifecycle / Deprecation Manager",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 9 1 * *",
+        "display": "0 9 1 * *"
+      },
+      "prompt": "Execute monthly toolchain lifecycle audit. Read 'governance/lifecycle_deprecation_manager_sop.md' in your profile home to track K8s version deprecations and proactively notify development teams.",
+      "skills": [],
+      "enabled": false
     }
   ]
 }

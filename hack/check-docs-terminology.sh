@@ -294,11 +294,17 @@ cap_guard \
 # watchdog rather than quoting it will fail this check even though nothing has
 # drifted. Quote the prompt verbatim from the manifest, or describe it in words
 # that avoid the idiom.
-CRON_JOBS=agents/chat/defaults/cron/jobs.json
-if [ ! -f "$CRON_JOBS" ]; then
-  echo "ERROR: ${CRON_JOBS} not found; the cron-prompt guard cannot run." >&2
-  exit 1
-fi
+#
+# Both rosters are ground truth. The governance prompts live on the Platform
+# Agent's; the Chat Agent's is checked too so a job that moves between them
+# does not turn every quotation stale on the way.
+CRON_JOBS="agents/platform/cron/jobs.json agents/chat/defaults/cron/jobs.json"
+for JOBS_FILE in $CRON_JOBS; do
+  if [ ! -f "$JOBS_FILE" ]; then
+    echo "ERROR: ${JOBS_FILE} not found; the cron-prompt guard cannot run." >&2
+    exit 1
+  fi
+done
 
 PROMPT_HITS=$(mktemp)
 trap 'rm -f "$FILE_LIST" "$PROMPT_HITS"' EXIT
@@ -310,7 +316,8 @@ STALE_PROMPTS=""
 while IFS= read -r HIT; do
   [ -n "$HIT" ] || continue
   QUOTED=$(printf '%s\n' "$HIT" | grep -oE 'Read the SOP at .*so a read that stops early' || true)
-  if [ -z "$QUOTED" ] || ! grep -qF "$QUOTED" "$CRON_JOBS"; then
+  # shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
+  if [ -z "$QUOTED" ] || ! grep -qF "$QUOTED" $CRON_JOBS; then
     STALE_PROMPTS="${STALE_PROMPTS}${HIT}
 "
   fi

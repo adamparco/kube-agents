@@ -377,38 +377,35 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # merge_cron_store). `--home` overlays the default profile in place, because that
 # profile IS $TARGET_DIR and has no entry under profiles/ to name.
 #
-# `--cron-jobs` names the ids this merge may force, and the list is load-bearing
-# in both directions — what it leaves out and what it names.
-#
-# What it leaves out: two of the jobs in this roster DELETE THEMSELVES. Once the
+# `--cron-jobs` names the ids this merge may force. What it leaves out is
+# load-bearing: two of the jobs in this roster DELETE THEMSELVES. Once the
 # onboarding report is delivered, bootstrap_delivery.py calls remove_job on the
 # scan/delivery pair, and an unfiltered merge would put both back on the next
 # restart — polling once a minute forever to no-op on a marker.
 #
-# What it names, beyond the ticker: the seven `dispatch_*.py` governance entries.
-# Nothing removes those at runtime — each one only files a kanban card for the
-# Platform Agent (agents/chat/scripts/platform_cron_dispatch.py) — so the image
-# owns their definitions on a live volume, which is the whole test for belonging
-# here. Leaving them off is not a smaller change, it is the relocation reaching
-# fresh installs only: step 2.6 merges the platform profile's roster UNFILTERED,
-# so the `enabled: false` tombstones it now ships DO land and switch off the
-# copies an upgraded volume has been firing through `profile-cron-tick`. If this
-# list stopped at the ticker, the default profile's roster would never learn
-# about the dispatch entries that replaced them, and all seven watchdogs — five
-# fleet audits, the AI workload security audit, the issue resolver — would stop
-# running on every already-provisioned cluster, with nothing failing and nothing
-# logged. That is the worst shape this can fail in: an audit that never runs
-# reads exactly like an audit that found nothing wrong.
+# `--cron-retire` deletes the seven governance ids from this roster outright.
+# They ran here only while the platform profile's store had no ticker; now that
+# `profile-cron-tick` gives it one, they are back on the Platform Agent's own
+# roster where the scheduler can reach their `skills`, `model` and `max_turns`
+# (see profile_cron_tick.py). Dropping the shipped entries is not enough on its
+# own: merge_cron_store keeps every volume job the image is silent about, so an
+# upgraded PVC would go on firing its enabled copies here while step 2.6 fires
+# the re-enabled originals over there — every audit running twice, against
+# itself. Retiring the ids is what makes the move a move rather than a fork.
 #
-# Add an id here only when the image genuinely owns that job's definition on a
-# live volume.
+# This list shrinks to nothing once no live volume can still be carrying the
+# entries; until then removing a name from it silently restores the double-fire.
+#
+# Add an id to --cron-jobs only when the image genuinely owns that job's
+# definition on a live volume.
 if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$SCAFFOLD" \
         --home "$TARGET_DIR" \
         --template /opt/defaults \
         --items "cron" \
-        --cron-jobs "profile-cron-tick compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit github-issue-resolver" \
+        --cron-jobs "profile-cron-tick" \
+        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit github-issue-resolver" \
         >/dev/null || echo "WARN: default-profile cron merge failed; jobs added by this image will not run" >&2
 fi
 
