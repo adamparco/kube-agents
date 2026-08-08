@@ -409,9 +409,29 @@ class ShippedRosterTest(unittest.TestCase):
         self.assertTrue(entry.get("no_agent"), "the ticker is a plain subprocess; it must not prompt the model")
         self.assertEqual(
             entry.get("schedule"),
-            {"kind": "cron", "expr": "* * * * *", "display": "every 1m"},
+            {"kind": "cron", "expr": "* * * * *", "display": "* * * * *"},
             "the granularity of every named profile's cron is this expression",
         )
+
+    def test_display_mirrors_expr_on_every_job(self):
+        """`display` is a hand-written second copy of `expr` and nothing reconciles them.
+
+        For `kind: "cron"` the runtime itself sets `display` to the raw
+        expression (`"display": schedule` in `cron/jobs.py`); `every {minutes}m`
+        is the form it generates for `kind: "interval"`. Three jobs here carried
+        `"every 1m"` -- the interval wording on a cron job -- which was true of
+        `* * * * *` by luck and would have kept reading as "every minute" after
+        the expression changed. Nothing in the scheduler or in
+        `scripts/generate_docs.py` reads `display` for a cron job, so the drift
+        is invisible until a human trusts it.
+        """
+        drifted = [
+            (j.get("id"), j["schedule"].get("expr"), j["schedule"].get("display"))
+            for j in self.jobs
+            if j.get("schedule", {}).get("kind") == "cron"
+            and j["schedule"].get("display") != j["schedule"].get("expr")
+        ]
+        self.assertEqual(drifted, [], "display must be a verbatim copy of expr")
 
     def test_no_job_on_this_roster_uses_an_interval_schedule(self):
         """An `interval` schedule fires at half its configured rate on this image.

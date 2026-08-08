@@ -86,14 +86,20 @@ Deliberately NOT checked:
   event-keyed and config-derived. They arrive through (2) or not at all.
 
 Not scheduled, on purpose. This ships as an operator/diagnostic tool rather
-than a cron job because nothing here would carry its output to a human. Every
-job on both shipped rosters declares ``deliver: local``, which
-``cron/scheduler.py`` resolves to no target at all — a scheduled run would put
-these lines in the execution ledger and stop. A health check whose output goes
-somewhere nobody reads is worse than none, because it reads as coverage. The
-script is written to the ``no_agent`` contract anyway (stdout is the whole
-message, silence means healthy, exit status is always 0), so registering it is
-a one-line roster addition the day there is a channel to send it to.
+than a cron job because the roster it belongs on would not carry its output to
+a human. It reads the board at ``$HERMES_HOME/kanban.db``, which is the Chat
+Agent's — so the Chat Agent's roster
+(``agents/chat/defaults/cron/jobs.json``) is where it would go, and all four
+jobs there declare ``deliver: local``, which
+``cron/scheduler.py::_resolve_delivery_targets`` resolves to an empty target
+list. A scheduled run would put these lines in the execution ledger and stop.
+The Platform Agent's roster is the one whose jobs declare ``deliver: "all"``,
+but that profile has its own cron store and no board to check. A health check
+whose output goes somewhere nobody reads is worse than none, because it reads
+as coverage. The script is written to the ``no_agent`` contract anyway (stdout
+is the whole message, silence means healthy, exit status is always 0), so
+registering it is a one-line roster addition the day there is a channel to
+send it to.
 
 Run on demand:  HERMES_HOME=/opt/data python3 kanban_board_health.py
 """

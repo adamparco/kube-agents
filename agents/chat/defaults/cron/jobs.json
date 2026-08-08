@@ -6,12 +6,11 @@
       "schedule": {
         "kind": "cron",
         "expr": "* * * * *",
-        "display": "every 1m"
+        "display": "* * * * *"
       },
       "prompt": "",
       "no_agent": true,
       "script": "profile_cron_tick.py",
-      "skills": [],
       "enabled": true,
       "deliver": "local"
     },
@@ -35,12 +34,11 @@
       "schedule": {
         "kind": "cron",
         "expr": "* * * * *",
-        "display": "every 1m"
+        "display": "* * * * *"
       },
       "prompt": "",
       "no_agent": true,
       "script": "bootstrap_scan_gate.py",
-      "skills": [],
       "enabled": true,
       "deliver": "local"
     },
@@ -50,12 +48,11 @@
       "schedule": {
         "kind": "cron",
         "expr": "* * * * *",
-        "display": "every 1m"
+        "display": "* * * * *"
       },
       "prompt": "",
       "no_agent": true,
       "script": "bootstrap_delivery.py",
-      "skills": [],
       "enabled": true,
       "deliver": "local"
     }
