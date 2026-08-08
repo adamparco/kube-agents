@@ -203,6 +203,86 @@ class ShouldRecordTest(unittest.TestCase):
         self.assertFalse(leaked(session_called_terminal=boom))
 
 
+class CronRunExclusionTest(unittest.TestCase):
+    """A dispatched cron run has no card of its own, so it cannot leak one.
+
+    ``cronjob(action='run')`` executes in-process inside the dispatching worker
+    and inherits ``HERMES_KANBAN_TASK`` — cron_run_scope leaves it set on purpose,
+    to keep the dispatcher's claim heart-beating through a long audit. That id is
+    the caller's card, and the run is barred from terminating it. Charging the
+    caller a ``timed_out`` for that would release its claim while it is still
+    blocked on the run.
+    """
+
+    def test_a_cron_run_is_not_a_leak(self):
+        self.assertFalse(leaked(cron_run=True))
+
+    def test_an_explicit_false_still_leaks(self):
+        # The caller can overrule the ambient marker; nothing does today, but
+        # the parameter is what makes the rest of these tests hermetic.
+        self.assertTrue(leaked(cron_run=False))
+
+    def test_it_defaults_to_the_real_cron_run_scope(self):
+        from cron_run_scope import cron_run_scope
+
+        self.assertTrue(leaked(cron_run=None))
+        with cron_run_scope("fleet-audit"):
+            self.assertFalse(leaked(cron_run=None))
+        self.assertTrue(leaked(cron_run=None))
+
+    def test_a_forked_run_is_recognised_from_the_environment_alone(self):
+        # cron_run_scope sets a context variable AND an env var; a cron agent
+        # that shells out to `hermes kanban …` inherits only the second.
+        import os
+
+        prior = os.environ.get("HERMES_KANBAN_CRON_RUN")
+        try:
+            os.environ["HERMES_KANBAN_CRON_RUN"] = "fleet-audit"
+            self.assertFalse(leaked(cron_run=None))
+        finally:
+            os.environ.pop("HERMES_KANBAN_CRON_RUN", None)
+            if prior is not None:
+                os.environ["HERMES_KANBAN_CRON_RUN"] = prior
+        self.assertTrue(leaked(cron_run=None))
+
+    def test_an_unreadable_marker_withholds_the_write(self):
+        # Same rule as the transcript check above, stated from the other side:
+        # this function writes to a live board, so it does nothing it cannot
+        # justify. _in_cron_run re-imports per call, so replacing the module
+        # attribute is enough.
+        import cron_run_scope
+
+        def boom(environ=None):
+            raise RuntimeError("no")
+
+        original = cron_run_scope.current_cron_job
+        cron_run_scope.current_cron_job = boom
+        try:
+            self.assertFalse(leaked(cron_run=None))
+        finally:
+            cron_run_scope.current_cron_job = original
+        self.assertTrue(leaked(cron_run=None))
+
+    def test_the_nudge_is_deliberately_left_alone(self):
+        # The exclusion is scoped to the board write. _in_cron_run can only
+        # over-report — the env half of the marker is process-wide, so a worker
+        # running alongside somebody else's dispatch reads it as its own — and
+        # silencing the nudge on that worker would undo the fix. Wasting two
+        # turns on a cron run that gets refused is the cheaper error.
+        from cron_run_scope import cron_run_scope
+
+        with cron_run_scope("fleet-audit"):
+            self.assertIn(
+                "do not try again",
+                guardrail_halt_nudge(
+                    nudge_returning(STOCK_NUDGE),
+                    messages=[],
+                    attempts=0,
+                    decision=Decision(),
+                ),
+            )
+
+
 class TaskIsStillRunningTest(unittest.TestCase):
     def test_running_is_running(self):
         self.assertTrue(task_is_still_running(board([("t1", "running")]), "t1"))

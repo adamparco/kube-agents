@@ -27,9 +27,13 @@ and still be useless:
 4. **The board write lands.** ``record_missing_terminal_call`` is driven against
    a real kanban database through the real ``_record_task_failure``: claim
    released, run closed, failure counted, exit reason legible in the event. Plus
-   the two cases that must *not* write — a card the board no longer shows as
+   the three cases that must *not* write — a card the board no longer shows as
    ``running`` (compaction can drop a terminal tool call out of ``messages``,
-   the board cannot) and a goal-mode worker between turns.
+   the board cannot), a goal-mode worker between turns, and a dispatched cron
+   run, which is holding its *caller's* task id. The cron case is checked
+   against the real ``tools.cron_run_scope``: the unit tests can only reach that
+   module as a top-level sibling, so this is the only place the import the
+   exclusion actually defaults to is exercised.
 
 The per-turn ``max_web_searches`` ceiling that triggered all this is a config
 change, not a patch, and is gated where the template is built — see the
@@ -345,6 +349,28 @@ check(
     "the exclusion only works if it defaults to the real env var",
 )
 del os.environ["HERMES_KANBAN_GOAL_MODE"]
+
+check("a dispatched cron run is not a leak", leaks(cron_run=True) is False)
+
+# The unit tests can only reach cron_run_scope as a top-level sibling. In the
+# image it is tools.cron_run_scope, and that import is the one that decides
+# whether the exclusion defaults on at all — get it wrong and _in_cron_run
+# silently degrades to the process-wide env var, losing the per-thread
+# precision that makes it safe under dispatch_in_gateway.
+from tools.cron_run_scope import cron_run_scope  # noqa: E402
+
+with cron_run_scope("verify-fleet-audit"):
+    check(
+        "the exclusion defaults to tools.cron_run_scope's context variable",
+        leaks() is False,
+        "a cron run would charge its caller a timed_out and release the claim "
+        "the caller is still blocked on",
+    )
+check(
+    "and the scope hands the marker back on the way out",
+    leaks() is True,
+    "a leaked marker disables the backstop for every worker after it",
+)
 
 
 # --- 4. The board write lands -----------------------------------------------

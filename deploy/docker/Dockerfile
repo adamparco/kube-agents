@@ -343,7 +343,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_breaker_counter.py /opt/herm
 #     unexplained protocol violation becomes a counted `timed_out` whose error
 #     text names the exit reason. Goal-mode workers are excluded: they call
 #     `finalize_turn` once per turn, so recording on turn 1 of N would release
-#     the claim underneath the loop.
+#     the claim underneath the loop. Dispatched cron runs are excluded for the
+#     same reason from the other end: cron_run_scope (above) leaves
+#     HERMES_KANBAN_TASK pointing at the DISPATCHER's card so its claim keeps
+#     heart-beating, and the run may not terminate that card -- so recording
+#     would charge a caller that is still blocked on the run.
 #
 # The anchors prove only that the text landed. verify_kanban_guardrail_exit.py
 # additionally parses the patched loop to prove the nudge is reachable, ahead of
