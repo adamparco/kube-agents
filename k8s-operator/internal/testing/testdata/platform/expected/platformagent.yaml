@@ -396,6 +396,8 @@ data:
         typing_status_text: Kage is thinking…
       slack:
         enabled: false
+        extra:
+          rich_blocks: true
     plugins:
       enabled:
       - hermes_otel
@@ -580,7 +582,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: e08c19a5f39b7a79ee3cbd56ca9ff91fa66edaf06855804ae12768932a6a0a1b
+        kubeagents.x-k8s.io/config-hash: 8807e4079fce04abd9d6ca595c2f5a1480c2d7a8738ba2238a7d5f560390b689
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9

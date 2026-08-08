@@ -1374,6 +1374,45 @@ func TestBuildConfigMapSlackEnabled(t *testing.T) {
 	}
 }
 
+// The rendered config.yaml is subPath-mounted OVER $HERMES_HOME/config.yaml, so it —
+// not the image's agents/chat/config.yaml — is what the Slack adapter reads on a
+// deployed agent. Without `extra.rich_blocks` here, every fleet report reaches Slack
+// as flat mrkdwn with its tables as literal `|---|` rows.
+func TestBuildConfigMapSlackRichBlocks(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		integration *agentv1alpha1.PlatformAgentIntegrationSpec
+	}{
+		{"slack enabled", &agentv1alpha1.PlatformAgentIntegrationSpec{
+			Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
+		}},
+		// Inert but still rendered, so no path that enables Slack can miss it.
+		{"no integration", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec:       agentv1alpha1.PlatformAgentSpec{Integration: tc.integration},
+			}
+
+			var cfg struct {
+				Platforms struct {
+					Slack struct {
+						Extra map[string]any `json:"extra"`
+					} `json:"slack"`
+				} `json:"platforms"`
+			}
+			raw := defaultProfileYAML(t, buildConfigMap(agent, nil))
+			if err := k8syaml.Unmarshal([]byte(raw), &cfg); err != nil {
+				t.Fatalf("the default profile overlay is not parseable: %v\n%s", err, raw)
+			}
+			if got := cfg.Platforms.Slack.Extra["rich_blocks"]; got != true {
+				t.Errorf("platforms.slack.extra.rich_blocks = %v, want true; got:\n%s", got, raw)
+			}
+		})
+	}
+}
+
 func TestBuildFluentBitConfigMap(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
