@@ -178,8 +178,17 @@ comment the harness posts to do the thing, never into a body:
 The ledger body is regenerated from scratch on every run, so a marker written there is erased by the
 next morning's edit and the "exactly once" guarantee lasts one day. A comment is append-only: the
 harness can add to the thread but never rewrites what is already in it, including its own earlier
-replies. So the readers scan the comment thread, and — for a pull request, where a human might have
-pasted one — the body as well, before concluding an action is still owed.
+replies. So the readers scan the comment thread before concluding an action is still owed.
+
+**And they count only the comments this harness wrote.** Every one of these markers suppresses
+something, and the value each is keyed on — a finding id, a pull-request number — is printed on the
+public ledger, so there is nothing to guess. A reader that believed any comment let anyone post
+`<!-- audit-persists:<id> -->` on a merged remediation PR and permanently mute "this fix merged and
+the finding still reproduces", leaving no trace but the comment itself. Each read is therefore
+gated on `viewerDidAuthor`, GitHub's answer to "did the caller write this", with the `[bot]` login
+suffix as the fallback for a comment struct that arrived without it. The pull-request _body_ is not
+read at all: the harness never writes a marker into one, so a body match could only have come from
+whoever can edit the body, which on a remediation branch includes its author.
 
 Keying the `/remediate` markers on the **comment node id**, not the finding id, is what lets a later
 `/remediate` for the same finding be answered again: the second comment is a different comment, and
@@ -787,16 +796,19 @@ while a pull request now exists that did not before.
 `silent_ok` is the **scheduled** verdict. It answers "would a channel want this?", and it has no way
 to know a person is waiting: `finish` sees a findings document, not the provenance of the run. So
 the second half of the rule lives with the agent and cannot be moved into the harness — **an
-on-demand run is never silent.** A run dispatched from a kanban card or straight from chat reports
-its outcome and its ledger URL whatever `silent_ok` says. Two places say so: every SOP's close
-section, and the Platform Agent's `AGENTS.md`, which additionally requires the session that fields
-the request to file the run its own card and subscribe that card to the thread
-(`kanban_notify_propagate.py`) — because the card's `result` is what reaches Slack, and the worker's
-own transcript reaches nothing.
+on-demand run is never silent.** A run a person asked for — a kanban card naming the stream, or a
+request straight from chat — reports its outcome and its ledger URL whatever `silent_ok` says, and
+every SOP's close section says so. The Platform Agent's `AGENTS.md` adds the one case the rule
+cannot reach: "run the `<x>` cron job now" is answered with `hermes cron run <job-id>`, which marks
+the job due for the next `profile-cron-tick` instead of re-enacting the audit in the session that
+fielded the request. That run takes the same execute → save → deliver → mark path as a scheduled
+one and has no way to know a person asked, so `silent_ok` judges it like any other scheduled run;
+the session that triggered it says only that the job is queued and leaves the report to the run.
 
 On a scheduled run there is no channel on the other side of that verdict today, and the mechanism
-says so: a scheduled audit arrives as a kanban card filed by the Chat Agent's ticker, and that card
-carries no chat subscription for the worker's completion to follow. The Platform
+says so: a scheduled audit is a cron run on the Platform Agent's own roster
+(`agents/platform/cron/jobs.json`, ticked by `profile-cron-tick`), executed in a process of its own
+with no kanban card behind it and so no completion for a chat subscription to follow. The Platform
 Agent profile holds no chat destination either — it ships no `platforms:` section, and a privileged
 fleet-management profile should not acquire one — so a scheduled run's report reaches humans through
 the Tier 1 ledger and nowhere else. `silent_ok` still earns its keep on the dispatched path, where a
@@ -1058,10 +1070,12 @@ things.
 **Silence cases** (§7.5): `silent_ok` is `true` on a quiet clean run and a quiet `UPDATED` run, and
 `false` whenever the run reported a new finding, a resolved finding, a coverage gap, or a
 remediation PR opened or closed — asserted on both `finish` branches, since each prints its own
-JSON. Three prose tests pin the handover the flag cannot cover on its own: the `AGENTS.md` cron
-bullet names both `kanban_complete` and `[SILENT]`, `SOUL.md` requires the artifact URL in the card
-summary before its first numbered section, and every one of the six SOPs contains both `silent_ok`
-and "on-demand".
+JSON. Four prose tests pin the handover the flag cannot cover on its own: the `AGENTS.md`
+governance-job bullet names the Platform Agent's own roster
+(`/opt/data/profiles/platform/cron/jobs.json`) and `profile-cron-tick`, the on-demand bullet names
+`hermes cron run` and `cronjob(action='run')` so that "run it now" stays a trigger rather than a
+re-enactment, `SOUL.md` requires the artifact URL in the card summary before its first numbered
+section, and every SOP in `audit_report.AUDITS` contains both `silent_ok` and "on-demand".
 
 **Workspace cases.** Exactly **one** of these runs real git against a real bare origin rather than
 the recorded runner, and it is the one whose defect is invisible to a mock: `ensure_workspace`

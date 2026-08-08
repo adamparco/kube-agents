@@ -1256,6 +1256,64 @@ class TestDerivedFindingId(unittest.TestCase):
         self.assertLessEqual(len(fid), audit_report.MAX_FINDING_ID)
         audit_report.validate_finding_id(fid, "derived")
 
+    def test_a_residual_collision_costs_a_row_not_the_whole_document(self):
+        """A blue/green cluster and a tenant namespace exhaust the budget.
+
+        Longest-first trimming narrows the collision window rather than
+        closing it: with all three trimmable segments long, these two ran out
+        of allowance while still inside the shared `checkout-frontend-` prefix
+        and shortened to one string. The duplicate-identity check then raised
+        `ValidationError`, so `finish` exited 2 and a fleet with real findings
+        published *nothing* — over two rows that are genuinely different
+        Deployments. A digest of the full derived id keeps them apart; the
+        ceiling still holds and both ids still validate.
+        """
+        cluster = "prod-us-east-1-primary-failover-blue"
+        namespace = "ml-platform-inference-serving-tenant-acme-financial-services-prod"
+        objects = (
+            "Deployment/checkout-frontend-experience-gateway-canary-api",
+            "Deployment/checkout-frontend-experience-gateway-canary-web",
+        )
+        # What the old shortener did, reproduced here so the fixture keeps
+        # proving something after `_shorten_id` changes again.
+        trimmed = set()
+        for obj in objects:
+            parts = audit_report.derive_finding_id(
+                {
+                    "check": "netpol-missing",
+                    "cluster": cluster,
+                    "namespace": namespace,
+                    "object": obj,
+                }
+            ).split(".")
+            while len(".".join(parts)) > audit_report.MAX_FINDING_ID:
+                longest = max(
+                    range(1, audit_report.ID_SEGMENTS),
+                    key=lambda i: (len(parts[i]), i),
+                )
+                if len(parts[longest]) <= 1:
+                    break
+                parts[longest] = parts[longest][:-1].rstrip("-")
+            trimmed.add(".".join(parts))
+        self.assertEqual(
+            len(trimmed), 1, "fixture no longer collides on trimming alone"
+        )
+
+        findings = [
+            make_finding(fid=f"f{i}", cluster=cluster, namespace=namespace, obj=obj)
+            for i, obj in enumerate(objects)
+        ]
+        doc = make_doc(findings=findings)
+        doc["scope"]["clusters"][0]["name"] = cluster
+        got = audit_report.validate_findings(doc, AUDIT)
+
+        ids = [f["id"] for f in got["findings"]]
+        self.assertEqual(len(set(ids)), 2, ids)
+        for fid in ids:
+            with self.subTest(fid=fid):
+                self.assertLessEqual(len(fid), audit_report.MAX_FINDING_ID)
+                audit_report.validate_finding_id(fid, "derived")
+
     def test_shortening_is_stable(self):
         long = {
             "check": "control-plane-authorized-networks",
@@ -1552,6 +1610,32 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"platform roster[{job_id}] declares "
                     f"deliver={job.get('deliver')!r}; a failed run would then "
                     f"resolve to no delivery target and vanish",
+                )
+
+    def test_schedule_display_is_a_verbatim_copy_of_the_expression(self):
+        """`display` is a second, hand-written copy of `expr` that nothing reconciles.
+
+        For `kind: "cron"` the runtime sets `display` to the raw expression
+        (`"display": schedule` in `cron/jobs.py`); the `every {minutes}m` wording
+        is what it generates for `kind: "interval"`. Nothing validates one
+        against the other, and `scripts/generate_docs.py` builds the published
+        cron table from `expr` and its own cadence map — it reads `display` only
+        for interval jobs, which neither roster has. So a stale `display` is
+        invisible to every check and to the docs, and wrong only to the human
+        reading the file. The Chat Agent's roster had carried `"every 1m"` on
+        three cron jobs for exactly that reason.
+        """
+        for job_id, job in sorted(self.platform_roster().items()):
+            schedule = job.get("schedule", {})
+            if schedule.get("kind") != "cron":
+                continue
+            with self.subTest(job=job_id):
+                self.assertEqual(
+                    schedule.get("display"),
+                    schedule.get("expr"),
+                    f"platform roster[{job_id}] displays "
+                    f"{schedule.get('display')!r} for expression "
+                    f"{schedule.get('expr')!r}",
                 )
 
     def test_the_governance_jobs_are_enabled_on_this_roster(self):
@@ -3781,6 +3865,23 @@ def comment(
     }
 
 
+def harness_comment(body, node_id="IC_9"):
+    """A comment this harness wrote — the only place a marker counts.
+
+    Idempotency markers are suppressions and every read of one is author-
+    checked (`marker_from_harness`), so a fixture that leaves authorship off is
+    a fixture asserting that a *forged* marker works.
+    """
+    return {
+        "id": node_id,
+        "body": body,
+        "author": {"login": "kube-agents-bot[bot]"},
+        "authorAssociation": "NONE",
+        "createdAt": "2026-07-01T00:00:00Z",
+        "viewerDidAuthor": True,
+    }
+
+
 class TestRemediateCommands(BaseTestCase):
     def setUp(self):
         super().setUp()
@@ -4522,17 +4623,33 @@ class TestMergedButPersists(HarnessTestCase):
         self.assertIn("8", comment)
         self.assertEqual(self.harness.gh_calls("pr", "reopen"), [])
 
-    def test_silent_when_the_marker_is_already_in_the_pr_body(self):
+    def test_a_marker_in_the_pr_body_proves_nothing(self):
+        # The harness writes this marker into a comment it posts and never into
+        # a body, so a body carrying one was put there by whoever can edit the
+        # body. Trusting it silenced "your merged fix did not take" for good.
         self.merged["body"] = f"merged\n{audit_report.persists_marker('a')}\n"
         self.harness.replies = {"--json comments": json.dumps({"comments": []})}
         self.run_it({"a": self.merged})
-        self.assertEqual(self.harness.gh_calls("pr", "comment"), [])
+        self.assertEqual(len(self.harness.gh_calls("pr", "comment")), 1)
 
     def test_silent_when_the_marker_is_already_in_a_pr_comment(self):
-        prior = {"body": f"said it\n{audit_report.persists_marker('a')}\n"}
+        prior = harness_comment(f"said it\n{audit_report.persists_marker('a')}\n")
         self.harness.replies = {"--json comments": json.dumps({"comments": [prior]})}
         self.run_it({"a": self.merged})
         self.assertEqual(self.harness.gh_calls("pr", "comment"), [])
+
+    def test_anyone_elses_comment_cannot_forge_the_marker(self):
+        # The id is printed on the public ledger, so there is nothing to guess:
+        # a single comment would otherwise mute the notice that a merged
+        # security fix did not hold, permanently and with no trace.
+        forged = comment(
+            f"already looked at this\n{audit_report.persists_marker('a')}\n",
+            login="drive-by",
+            association="NONE",
+        )
+        self.harness.replies = {"--json comments": json.dumps({"comments": [forged]})}
+        self.run_it({"a": self.merged})
+        self.assertEqual(len(self.harness.gh_calls("pr", "comment")), 1)
 
     def test_an_open_pr_is_not_the_persists_case(self):
         self.run_it({"a": pr(8, "platform-agent/fix-x")})
@@ -4552,15 +4669,29 @@ class TestReplyToRefusals(HarnessTestCase):
         self.assertEqual(len(self.harness.gh_calls("issue", "comment")), 1)
 
     def test_silent_when_that_comment_was_already_answered(self):
-        answered = [{"body": f"earlier\n{audit_report.refused_marker('IC_1')}\n"}]
+        answered = [harness_comment(f"earlier\n{audit_report.refused_marker('IC_1')}\n")]
         audit_report.reply_to_refusals("acme/fleet", 42, [self.refusal()], answered, NOW)
         self.assertEqual(self.harness.gh_calls("issue", "comment"), [])
 
     def test_a_different_comment_still_gets_its_own_reply(self):
-        answered = [{"body": f"earlier\n{audit_report.refused_marker('IC_1')}\n"}]
+        answered = [harness_comment(f"earlier\n{audit_report.refused_marker('IC_1')}\n")]
         audit_report.reply_to_refusals(
             "acme/fleet", 42, [self.refusal("IC_2")], answered, NOW
         )
+        self.assertEqual(len(self.harness.gh_calls("issue", "comment")), 1)
+
+    def test_the_refused_requester_cannot_answer_their_own_refusal(self):
+        # The refusal names why the command was declined. Quoting the marker
+        # back would suppress that explanation and leave the requester
+        # believing an unauthorised `/remediate` had been accepted.
+        answered = [
+            comment(
+                f"earlier\n{audit_report.refused_marker('IC_1')}\n",
+                login="drive-by",
+                association="NONE",
+            )
+        ]
+        audit_report.reply_to_refusals("acme/fleet", 42, [self.refusal()], answered, NOW)
         self.assertEqual(len(self.harness.gh_calls("issue", "comment")), 1)
 
 
@@ -4709,8 +4840,8 @@ class TestRemediateOnACleanRun(HarnessTestCase):
     def test_the_answer_is_said_once_when_the_ledger_stays_open(self):
         # Over a coverage gap the issue survives, so the marker is what stops a
         # second answer tomorrow morning, and the morning after.
-        prior = self.comment(
-            body=f"answered\n{audit_report.acked_marker('IC_1')}\n", cid="IC_2"
+        prior = harness_comment(
+            f"answered\n{audit_report.acked_marker('IC_1')}\n", node_id="IC_2"
         )
         self.harness.replies = self.replies([self.comment(), prior])
         doc = make_doc(findings=[])
@@ -4723,6 +4854,24 @@ class TestRemediateOnACleanRun(HarnessTestCase):
             [b for b in bodies if audit_report.acked_marker("IC_1") in b], []
         )
         self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+
+    def test_someone_else_claiming_to_have_answered_does_not_count(self):
+        # The requester's own id is in the command they just posted, so quoting
+        # it back is free. If that silenced the answer, "never silence a
+        # request" would have a hole anyone could open on purpose.
+        forged = self.comment(
+            body=f"answered\n{audit_report.acked_marker('IC_1')}\n", cid="IC_2"
+        )
+        self.harness.replies = self.replies([self.comment(), forged])
+        doc = make_doc(findings=[])
+        doc["scope"]["skipped"] = [{"cluster": "prod-eu", "reason": "unreachable"}]
+
+        self.assertEqual(self.run_finish(doc), 0)
+
+        bodies = self.harness.bodies_for("issue", "comment")
+        self.assertEqual(
+            len([b for b in bodies if audit_report.acked_marker("IC_1") in b]), 1
+        )
 
     def test_a_gap_answer_does_not_promise_a_closure_that_is_not_happening(self):
         self.harness.replies = self.replies([self.comment()])
@@ -4769,11 +4918,25 @@ class TestUnansweredRemediateComments(unittest.TestCase):
             with self.subTest(marker=marker.__name__):
                 thread = [
                     self.comment("/remediate a"),
-                    self.comment(marker("IC_1"), cid="IC_2"),
+                    harness_comment(marker("IC_1"), node_id="IC_2"),
                 ]
                 self.assertEqual(
                     audit_report.unanswered_remediate_comments(thread), []
                 )
+
+    def test_a_marker_from_anyone_else_leaves_the_request_unanswered(self):
+        # The requester's own comment id is right there in the thread, so a
+        # marker is trivially forgeable — and forging one makes the command
+        # vanish silently, which is the one outcome this path exists to rule
+        # out.
+        for marker in (audit_report.acked_marker, audit_report.refused_marker):
+            with self.subTest(marker=marker.__name__):
+                thread = [
+                    self.comment("/remediate a"),
+                    self.comment(marker("IC_1"), cid="IC_2"),
+                ]
+                got = audit_report.unanswered_remediate_comments(thread)
+                self.assertEqual([r["comment_id"] for r in got], ["IC_1"])
 
 
 class TestRemediateSubcommand(HarnessTestCase):
@@ -5290,6 +5453,54 @@ class TestRedaction(unittest.TestCase):
         )
         self.assertIn("name: payments-db", out)
 
+    def test_a_credential_field_partway_along_a_line_is_blanked(self):
+        """The anchored pattern only ever looked at column zero.
+
+        Nothing about a container spec puts credentials at the start of a line.
+        `args:` is a flow sequence, `masterAuth` is a nested object, and an
+        `env` pair rendered as JSON is one line — so every one of these reached
+        the ledger issue verbatim, which is a published secret.
+        """
+        for line, secret, keep in (
+            (
+                '        args: ["--model=llama-3", "--api-key=Tr0ub4dor3xK9"]',
+                "Tr0ub4dor3xK9",
+                "--model=llama-3",
+            ),
+            (
+                "  command: [serve, --registry-password=hunter2seven, --port=8080]",
+                "hunter2seven",
+                "--port=8080",
+            ),
+            (
+                '  env: {"MODEL_REGISTRY_TOKEN":"gLpAtNotARealTokenHere"}',
+                "gLpAtNotARealTokenHere",
+                "MODEL_REGISTRY_TOKEN",
+            ),
+            (
+                "masterAuth: {clusterCaCertificate: LS0tLS1CRUdJTk5PVFJFQUw=}",
+                "LS0tLS1CRUdJTk5PVFJFQUw=",
+                "masterAuth:",
+            ),
+        ):
+            with self.subTest(line=line):
+                out = self.assertRedacted(line, secret)
+                self.assertIn(keep, out)
+
+    def test_a_credential_word_inside_an_ordinary_word_is_not_a_field(self):
+        # Unanchoring the key pattern is what makes over-redaction possible, so
+        # the boundary has to hold: `keystore`, `tokenizer` and a URL path
+        # segment are not credential fields and blanking them would destroy the
+        # evidence the finding is made of.
+        for benign in (
+            "  tokenizer_config: /models/llama-3/tokenizer.json",
+            "image: gcr.io/acme/api-keystore:v1.4.2",
+            "- --metrics-url=http://collector.monitoring:9090/api/keys",
+            "note: the passwordless service account is the intended shape",
+        ):
+            with self.subTest(benign=benign):
+                self.assertEqual(audit_report.redact_secrets(benign), benign)
+
     def test_a_private_key_body_goes_but_the_header_stays(self):
         out = self.assertRedacted(
             "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----",
@@ -5297,6 +5508,36 @@ class TestRedaction(unittest.TestCase):
         )
         self.assertIn("-----BEGIN RSA PRIVATE KEY-----", out)
         self.assertIn("-----END RSA PRIVATE KEY-----", out)
+
+    def test_a_pem_inside_a_secret_does_not_release_the_rest_of_the_block(self):
+        """A `kubectl get secret -o yaml` of a TLS secret is exactly this.
+
+        The PEM redactor ran first and wrote its replacement at column zero,
+        which outdented past the `data:` payload and ended the block scan
+        early. Everything after the certificate — the registry auth, the CA,
+        whatever else the Secret holds — was then published verbatim.
+        """
+        excerpt = (
+            "kind: Secret\n"
+            "data:\n"
+            "  tls.key: |\n"
+            "    -----BEGIN PRIVATE KEY-----\n"
+            "    MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEA\n"
+            "    -----END PRIVATE KEY-----\n"
+            "  .dockerconfigjson: eyJhdXRocyI6eyJnY3IuaW8iOnt9fX0=\n"
+            "  ca.crt: LS0tLS1CRUdJTk5PVFJFQUxDQQ==\n"
+            "  license-blob: bm90LWEtcmVhbC1saWNlbnNl\n"
+        )
+        out = self.assertRedacted(excerpt, "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj")
+        for payload in (
+            "eyJhdXRocyI6eyJnY3IuaW8iOnt9fX0=",
+            "LS0tLS1CRUdJTk5PVFJFQUxDQQ==",
+            "bm90LWEtcmVhbC1saWNlbnNl",
+        ):
+            self.assertNotIn(payload, out)
+        # Structure survives: the reader still sees which entries were hidden.
+        self.assertIn("  .dockerconfigjson:", out)
+        self.assertIn("kind: Secret", out)
 
     def test_self_identifying_tokens_go_wherever_they_appear(self):
         for secret in (
@@ -6518,19 +6759,33 @@ class TestStaleCloseLabelling(HarnessTestCase):
         # here means an earlier run commented and then failed to close, and
         # short-circuiting on it leaves the pull request open forever while the
         # ledger and the run summary both claim it closed.
-        marked = pr(
+        prior = harness_comment(audit_report.stale_closed_marker(8))
+        self.harness.replies = {"--json comments": json.dumps({"comments": [prior]})}
+        self.assertEqual(
+            self.close_it([self.stale_pr()]), ["https://github.com/acme/fleet/pull/8"]
+        )
+        self.assertEqual(len(self.harness.gh_calls("pr", "close")), 1)
+        self.assertEqual(self.harness.gh_calls("pr", "comment"), [])
+        self.assertIn("retrying the close", self.err)
+
+    def test_the_marker_is_only_believed_from_this_harness(self):
+        # The harness only ever writes this marker into a comment it posts, so
+        # one in the body was typed by whoever can edit the body — and the
+        # author of a remediation branch can. Believing either would drop the
+        # notice explaining why their pull request is about to be closed.
+        in_body = pr(
             8,
             "platform-agent/fix-x-old",
             body=audit_report.delta_block(["gone"])
             + "\n"
             + audit_report.stale_closed_marker(8),
         )
-        self.assertEqual(
-            self.close_it([marked]), ["https://github.com/acme/fleet/pull/8"]
+        forged = comment(
+            audit_report.stale_closed_marker(8), login="drive-by", association="NONE"
         )
-        self.assertEqual(len(self.harness.gh_calls("pr", "close")), 1)
-        self.assertEqual(self.harness.gh_calls("pr", "comment"), [])
-        self.assertIn("retrying the close", self.err)
+        self.harness.replies = {"--json comments": json.dumps({"comments": [forged]})}
+        self.close_it([in_body])
+        self.assertEqual(len(self.harness.gh_calls("pr", "comment")), 1)
 
     def test_a_live_finding_keeps_its_pull_request_open(self):
         self.assertEqual(self.close_it([self.stale_pr()], current_ids={"gone"}), [])
@@ -6676,11 +6931,22 @@ class TestAcknowledgements(HarnessTestCase):
         self.assertEqual(len(comments), 1)
 
     def test_the_same_request_is_never_answered_twice(self):
-        answered = [{"body": f"earlier\n{audit_report.acked_marker('IC_1')}\n"}]
+        answered = [harness_comment(f"earlier\n{audit_report.acked_marker('IC_1')}\n")]
         audit_report.ack_remediate_requests(
             "acme/fleet", 42, {"IC_1": ["netpol"]}, {}, answered, NOW
         )
         self.assertEqual(self.harness.gh_calls("issue", "comment"), [])
+
+    def test_someone_elses_ack_marker_does_not_answer_for_the_harness(self):
+        # The requester would otherwise be able to suppress their own
+        # acknowledgement, and anyone else could suppress theirs.
+        forged = comment(
+            f"looks handled\n{audit_report.acked_marker('IC_1')}\n", node_id="IC_2"
+        )
+        audit_report.ack_remediate_requests(
+            "acme/fleet", 42, {"IC_1": ["netpol"]}, {}, [forged], NOW
+        )
+        self.assertEqual(len(self.harness.gh_calls("issue", "comment")), 1)
 
     def test_the_answer_names_the_outcome_of_each_target(self):
         body = audit_report.render_ack_comment(

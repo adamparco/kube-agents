@@ -353,7 +353,12 @@ field, and publishes nothing:
   The derived id still has to satisfy `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with no `..` run and
   no `.lock` suffix, and is shortened to fit: the id is the join key of the ledger's hidden delta
   block and of the `audit-persists:<id>` marker — both line-anchored regexes a space or a newline
-  would break — and an operator types it by hand in `/remediate <id>`.
+  would break — and an operator types it by hand in `/remediate <id>`. An id that had to be
+  shortened ends in `-<six hex characters>`, a digest of the id it was shortened from, because
+  trimming alone lands two long objects in one long-named namespace on the same string and the
+  duplicate-identity refusal above would then reject the whole document over two findings that are
+  genuinely different. The digest is a function of that finding's four fields and nothing else, so
+  it is the same next week.
 
 - `severity` is one of `critical`, `major`, `minor`.
 - `namespace` may be empty for cluster-scoped objects.
