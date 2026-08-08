@@ -53,11 +53,24 @@ dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image 
 status: ## Show the working tree status.
 	git status
 
+# Prefer an installed `prettier` over `npx prettier`, falling back to npx where
+# there is none (CI, which runs `npm install prettier` first). npx re-resolves
+# the package against the npm registry on every invocation, so on a machine
+# whose registry is an authenticated mirror these targets failed with an auth
+# error even though prettier was installed and on PATH -- which is how the
+# formatting check came to be skipped by hand rather than run.
+#
+# Install it with `brew install prettier` or `npm install -g prettier`. Match
+# the major version CI resolves (prettier.yml installs the latest 3.x);
+# formatting differs across majors, so a mismatch shows up as a check that
+# passes locally and fails in CI.
+PRETTIER := $(shell command -v prettier 2>/dev/null || echo npx prettier)
+
 prettier-check: ## Check Markdown/YAML formatting (CI runs this).
-	npx prettier --check "**/*.md" "**/*.yaml" "**/*.yml"
+	$(PRETTIER) --check "**/*.md" "**/*.yaml" "**/*.yml"
 
 prettier-write: ## Reformat all Markdown/YAML in place.
-	npx prettier --write "**/*.md" "**/*.yaml" "**/*.yml"
+	$(PRETTIER) --write "**/*.md" "**/*.yaml" "**/*.yml"
 
 # Unit tests for every Python helper outside k8s-operator/, which has its own
 # target. Mostly stdlib-only -- the skill helpers shell out to gh/kubectl

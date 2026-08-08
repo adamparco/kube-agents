@@ -74,7 +74,7 @@ re-enable it, disable it, or remove it, and `cronjob(action='list')` reports it
 forever. That is why this roster has no tombstones left — the five retired
 watchdogs (`blueprint-sync`, `policy-propagation`,
 `global-capacity-orchestrator`, `standardization-validator`,
-`lifecycle-deprecation-manager`) were deleted here *and* named in
+`lifecycle-deprecation-manager`) were deleted here _and_ named in
 `--cron-retire` on the platform force-sync.
 
 `retire_cron_jobs` (`--cron-retire` in `deploy/shared/docker-entrypoint.sh`) is
