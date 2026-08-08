@@ -9,17 +9,19 @@ The Platform Agent's runtime wiring is declared in [`agents/platform/config.yaml
 
 The pod's other profiles have their own configs. The Chat Agent's deliberately minimal [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml): a `router` MCP server for specialist discovery, toolsets pinned to `mcp-router` + `kanban` + the `memory` gate on every surface (including the real `google_chat` ingress key), the chat-side plugins (`session_store`, `session_otel_bridge`, `tool_call_audit`, the first-run `bootstrap_onboarding` hook, and `legacy_slash_commands`, which unwraps a typed `/hermes <subcommand>` into the real gateway command — see its [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/legacy_slash_commands/README.md)), the `multiuser_memory` provider for per-user memory writes (see [`memory`](#memory) below for why it lives on this profile only), and no file or cloud tools. Note that on an operator-deployed pod the repository file is not the whole story: the operator renders a config of its own into the `<agent>-config` ConfigMap and the entrypoint merges it into `/opt/data/config.yaml` at startup, so the two files are unioned and the operator wins any key they disagree on. `agents/chat/config.yaml` must be kept in sync with it — a list entry removed from one and left in the other survives the merge — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile). The Platform Agent's own `config.yaml` has no such caveat: it is image-owned and force-synced from the baked template on every start. The per-cluster Cluster Agents are stamped from the read-only [`agents/cluster/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/config.yaml) template — see [Cluster Agents](/kube-agents/concepts/cluster-agents/). This page annotates the Platform Agent's file; the other two are self-documenting by design.
 
-## Full file
+## Shape of the file
+
+Every key the file sets, with its comments elided — the file itself is the canonical copy and
+carries the rationale for each value:
 
 ```yaml
-# MCP Servers configuration.
 mcp_servers:
   platform_control:
     command: "/opt/hermes/.venv/bin/python3"
     args:
-      - "/opt/data/scripts/platform_mcp_server.py"
+      - "${HERMES_HOME}/scripts/platform_mcp_server.py"
+    lazy: true
     connect_timeout: 120
-    # 5-minute timeout to support long GKE reasoning chains
     timeout: 300
     env:
       KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
@@ -29,13 +31,12 @@ mcp_servers:
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
       SESSION_KV_DB_PATH: "${SESSION_KV_DB_PATH}"
-  # Bounded deliberately: a remote MCP call that fails can hang for the full
-  # default deadline. See the comment in the source file for the mechanism.
   gke:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://container.googleapis.com/mcp"
+    lazy: true
     connect_timeout: 30
     timeout: 60
 

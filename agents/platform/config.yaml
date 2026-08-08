@@ -14,8 +14,17 @@ mcp_servers:
   # that one run and warms the cache for the rest.
   platform_control:
     command: "/opt/hermes/.venv/bin/python3"
+    # ${HERMES_HOME}, not /opt/data: the shared scripts directory is
+    # $HERMES_HOME/scripts (docker-entrypoint.sh copies /opt/defaults/scripts
+    # there), and HERMES_HOME is PLATFORM_AGENT_HOME when the CR sets
+    # spec.harness.hermes.agentHome. Hardcoding /opt/data made this argv point
+    # at a file that does not exist under a custom home, so platform_control
+    # died at startup and the Platform Agent lost every platform_* tool. Same
+    # bug, same fix as the router entry in agents/chat/config.yaml.
+    # tools/mcp_tool.py `_interpolate_env_vars` expands it, the same expansion
+    # the `env` block below already relies on.
     args:
-      - "/opt/data/scripts/platform_mcp_server.py"
+      - "${HERMES_HOME}/scripts/platform_mcp_server.py"
     lazy: true
     connect_timeout: 120
     # 5-minute timeout to support long GKE reasoning chains
@@ -86,12 +95,11 @@ toolsets:
 # clock ran out. 250 is roughly triple the observed near-miss.
 #
 # This belongs here rather than in the operator's generated root config because
-# an audit only ever runs as a kanban worker, and a worker is spawned with
-# HERMES_HOME pinned to the profile — so it reads *this* config.yaml, not the
-# root one. Scoping it here leaves the Chat Agent and the per-cluster Cluster
-# Agents on the default 90, where nothing has ever approached the ceiling. The
-# cron entries that file those cards are `no_agent` scripts and prompt no model,
-# so there is nowhere else this budget could be set.
+# both ways an audit can start read *this* file and not the root one: a cron run
+# on this profile's own roster (agents/platform/cron/jobs.json) is executed with
+# the profile active, and a kanban worker is spawned with HERMES_HOME pinned to
+# the profile. Scoping it here leaves the Chat Agent and the per-cluster Cluster
+# Agents on the default 90, where nothing has ever approached the ceiling.
 agent:
   max_turns: 250
 
