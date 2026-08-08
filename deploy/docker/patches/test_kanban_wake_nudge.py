@@ -5,6 +5,7 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 
 import ast
 import asyncio
+import logging
 import os
 import sqlite3
 import tempfile
@@ -28,6 +29,9 @@ from kanban_wake_nudge import (
     wait_interval,
     wake_path,
 )
+import kanban_wake_nudge
+
+LOGGER_NAME = kanban_wake_nudge.logger.name
 
 
 def tmp_db_path():
@@ -145,9 +149,46 @@ class WakeMonitorTest(unittest.TestCase):
         def resolver():
             raise RuntimeError("board root unreadable")
 
-        monitor = WakeMonitor(resolver)
+        with self.assertLogs(LOGGER_NAME, level=logging.WARNING):
+            monitor = WakeMonitor(resolver)
         self.assertFalse(monitor.changed())
         self.assertFalse(monitor.changed())
+
+    def test_a_monitor_born_inert_says_why(self):
+        # The one failure here worth a log line. A resolver that raises leaves
+        # this monitor dead for the lifetime of the watcher loop that built it,
+        # so wait_interval silently becomes the 5s sleep it replaced and the
+        # only symptom is the per-hop latency the patch removed. Without this
+        # line an operator sees the old numbers and no cause.
+        def resolver():
+            raise RuntimeError("HERMES_KANBAN_DB points at a missing volume")
+
+        with self.assertLogs(LOGGER_NAME, level=logging.WARNING) as captured:
+            WakeMonitor(resolver)
+        joined = "\n".join(captured.output)
+        self.assertIn("missing volume", joined, "the cause must survive")
+        self.assertIn("polling", joined, "the consequence must be stated")
+
+    def test_a_working_monitor_logs_nothing(self):
+        # Both watcher loops build one at startup; a warning on the healthy
+        # path would be noise on every gateway boot.
+        logging.getLogger(LOGGER_NAME).warning("probe")
+        with self.assertLogs(LOGGER_NAME, level=logging.WARNING) as captured:
+            logging.getLogger(LOGGER_NAME).warning("probe")
+            WakeMonitor(tmp_db_path())
+        self.assertEqual(len(captured.output), 1)
+
+    def test_an_unstattable_wake_file_stays_silent(self):
+        # Deliberately unlike the constructor: _stat runs once per 0.25s slice
+        # in both loops, so logging a missing wake file would cost eight lines
+        # a second forever. An absent file simply reads as quiet.
+        logging.getLogger(LOGGER_NAME).warning("probe")
+        monitor = WakeMonitor(tmp_db_path())
+        with self.assertLogs(LOGGER_NAME, level=logging.WARNING) as captured:
+            logging.getLogger(LOGGER_NAME).warning("probe")
+            for _ in range(10):
+                monitor.changed()
+        self.assertEqual(len(captured.output), 1)
 
 
 def run(coro):

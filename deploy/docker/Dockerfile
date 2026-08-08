@@ -148,22 +148,27 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_tick_lock_scope.py /opt/hermes
 # read kanban.wake_on_events, defaulting to the upstream tuple. The narrowing is
 # scoped to push-capable adapters: where the notifier skips its own send(), the
 # wake is the delivery rather than a duplicate of it.
+#
+# The anchor proves only that the text landed, and every way this patch can go
+# wrong is silent: it fails towards upstream, so a moved hermes_cli.config, a
+# moved gateway.wake, or a DEFAULT_WAKE_KINDS whitelist that fell behind the
+# notifier all look exactly like an operator who never set the key.
+# verify_kanban_wake_kinds.py therefore drives the patched runtime — the real
+# config loader, the real APIServerAdapter (the non-push adapter the carve-out
+# exists for), and the notifier's own list of describable kinds — rather than
+# hand-rolled stand-ins.
 # See the module docstring in deploy/docker/patches/kanban_wake_kinds.py.
 COPY deploy/docker/patches/kanban_wake_kinds.py /opt/hermes/gateway/kanban_wake_kinds.py
-COPY deploy/docker/patches/apply_kanban_wake_kinds.py /tmp/apply_kanban_wake_kinds.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_wake_kinds.py /opt/hermes && \
+# Applier and verifier share one COPY into a directory: this stage is the base
+# for `credential-proxy`, which has already hit Docker's layer-depth ceiling
+# once (build f9f1747c, 2026-08-07), so patches here do not each buy a layer.
+COPY deploy/docker/patches/apply_kanban_wake_kinds.py \
+     deploy/docker/patches/verify_kanban_wake_kinds.py \
+     /tmp/wake-kinds/
+RUN /opt/hermes/.venv/bin/python3 /tmp/wake-kinds/apply_kanban_wake_kinds.py /opt/hermes && \
     grep -q '_wake_kinds = _wake_kinds_for(d\["events"\], adapter=adapter)' /opt/hermes/gateway/kanban_watchers.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
-from gateway.kanban_wake_kinds import DEFAULT_WAKE_KINDS, resolve_wake_kinds, wake_kinds_for; \
-exit(1) if resolve_wake_kinds(lambda: {}) != DEFAULT_WAKE_KINDS else None; \
-exit(1) if resolve_wake_kinds(lambda: {'kanban': {'wake_on_events': ['crashed']}}) != ('crashed',) else None; \
-ev = type('E', (), {'kind': 'completed'})(); \
-cfg = lambda: {'kanban': {'wake_on_events': ['crashed']}}; \
-push = type('A', (), {'supports_async_delivery': True})(); \
-nopush = type('A', (), {'supports_async_delivery': False})(); \
-exit(1) if wake_kinds_for([ev], cfg, adapter=push) != set() else None; \
-exit(1) if wake_kinds_for([ev], cfg, adapter=nopush) != {'completed'} else None" && \
-    rm /tmp/apply_kanban_wake_kinds.py
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/wake-kinds/verify_kanban_wake_kinds.py && \
+    rm -rf /tmp/wake-kinds
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
 # every lifecycle tool with _check_kanban_mode, which is true for any profile
@@ -171,21 +176,25 @@ exit(1) if wake_kinds_for([ev], cfg, adapter=nopush) != {'completed'} else None"
 # kanban_complete/block/heartbeat/link/attach* on every call despite SOUL.md
 # §1.5 forbidding it from calling them. Hermes has no per-tool denylist, so the
 # 10,041 characters (~2,510 tokens) of schema cannot be dropped by config.
+#
+# The gate is also closed for a delegate_task child, which runs in its parent's
+# own process and inherits its HERMES_KANBAN_TASK: upstream's two kanban gates
+# both draw that line, and a gate that read the env var alone was the only one
+# in the file that called a child a worker. The grep proves the anchors landed;
+# verify_kanban_worker_tools.py proves the gate answers correctly against the
+# real agent.delegation_context and that the schemas actually disappear.
 # See the module docstring in deploy/docker/patches/kanban_worker_tools.py.
 COPY deploy/docker/patches/kanban_worker_tools.py /opt/hermes/tools/kanban_worker_tools.py
 # Also staged next to the applier: it imports WORKER_ONLY_TOOLS, and only the
 # script's own directory is on sys.path.
 COPY deploy/docker/patches/kanban_worker_tools.py /tmp/kanban_worker_tools.py
 COPY deploy/docker/patches/apply_kanban_worker_tools.py /tmp/apply_kanban_worker_tools.py
+COPY deploy/docker/patches/verify_kanban_worker_tools.py /tmp/verify_kanban_worker_tools.py
 RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_worker_tools.py /opt/hermes && \
     test "$(grep -c 'check_fn=_check_kanban_worker_mode' /opt/hermes/tools/kanban_tools.py)" = "7" && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
-import os; \
-from tools.kanban_worker_tools import check_kanban_worker_mode; \
-exit(1) if check_kanban_worker_mode() else None; \
-os.environ['HERMES_KANBAN_TASK'] = 't_probe'; \
-exit(1) if not check_kanban_worker_mode() else None" && \
-    rm /tmp/apply_kanban_worker_tools.py /tmp/kanban_worker_tools.py
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_worker_tools.py && \
+    rm /tmp/apply_kanban_worker_tools.py /tmp/kanban_worker_tools.py \
+       /tmp/verify_kanban_worker_tools.py
 
 # Hotfix: make a card's answer reach the person who asked for it. On 2026-08-07
 # a user asked which cron jobs were enabled; three cards ran, all closed `done`,
@@ -202,11 +211,18 @@ exit(1) if not check_kanban_worker_mode() else None" && \
 # competing for the same lines. Both are deterministic -- neither tries to
 # classify a card as "asked for information", because every card has an answer.
 #   * kanban_result_required: rewrites the schema wording and requires `result`.
-#     Refuses ONCE per task, then accepts and promotes `summary`, so the gate
-#     can never wedge a card shut.
-#   * kanban_result_delivery: appends `result` to the completion message the
+#     Refuses a card once, remembers that refusal for NUDGE_TTL_SECONDS (15
+#     minutes, the dispatcher's claim TTL), and lets the retry through --
+#     promoting `summary` into `result` -- so the gate can never wedge a card
+#     shut. The memory expires rather than lasting for the process's life: a
+#     refusal older than the claim belongs to a run that is already gone, and
+#     the fresh worker now holding that card has not been nudged yet.
+#   * kanban_result_delivery: puts `result` into the completion message the
 #     notifier already builds -- one send, inheriting the existing failure
-#     counter, cursor rewind, and subscription-drop machinery.
+#     counter, cursor rewind, and subscription-drop machinery. It owns the
+#     whole handoff rather than appending to it, because in the branch with no
+#     event summary the handoff is itself a 1200-character clip of `result`,
+#     and appending sent the opening of a report and then the report.
 # See the module docstrings in deploy/docker/patches/kanban_result_*.py.
 COPY deploy/docker/patches/kanban_result_required.py /opt/hermes/tools/kanban_result_required.py
 COPY deploy/docker/patches/kanban_result_delivery.py /opt/hermes/gateway/kanban_result_delivery.py
@@ -220,7 +236,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_result_required.py /opt/herm
     /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_result_delivery.py /opt/hermes && \
     grep -q "_result_err, result = _require_result(tid, summary, result)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "_apply_result_schema(KANBAN_COMPLETE_SCHEMA)" /opt/hermes/tools/kanban_tools.py && \
-    grep -q "handoff += _kanban_result_block(handoff, task)" /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q "handoff = _kanban_handoff_with_result(handoff, task)" /opt/hermes/gateway/kanban_watchers.py && \
     ! grep -q "provide at least one of: summary (preferred), result" /opt/hermes/tools/kanban_tools.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_result.py && \
     rm /tmp/apply_kanban_result_required.py /tmp/apply_kanban_result_delivery.py \
@@ -236,10 +252,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_result_required.py /opt/herm
 #     loop breaker, so the parent respawned a full agent run every few seconds.
 #     One worker escaped by shelling out to sqlite3 and closing three cards
 #     `done` with a fabricated 27-character result. kanban_dependency_repair
-#     inverts the mis-directed edges at the block point, under two guards: the
-#     block must be provably unsatisfiable (no unsettled parents of its own),
-#     and inverting must actually free the child (this card is its last
-#     unfinished parent). Real fan-ins and real pipelines are untouched.
+#     inverts the mis-directed edges at the block point, but only for children
+#     the blocking card fanned out after it started running and is the last
+#     unfinished parent of. A pipeline successor someone else planned predates
+#     the card's first `claimed` event, so real pipelines and fan-ins are
+#     untouched.
 #
 #   * Claim tokens outlive the process that made them. `_claimer_id()` is
 #     `hostname:pid`, and under Kubernetes hostname is the pod name --
@@ -250,9 +267,19 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_result_required.py /opt/herm
 #     so six independent crashes read as one systemic fault, which drops
 #     failure_limit to 1 -- every one of them gave up on its first failure.
 #     kanban_claim_fencing narrows the liveness check to this exact process
-#     life, hands back cards whose owner is provably gone (closing the 900s
-#     dark window a rollout otherwise costs), and keeps the PID in the
-#     fingerprint.
+#     life and hands back cards whose owner is provably gone, closing the 900s
+#     dark window a rollout otherwise costs. The fence is what keeps a
+#     predecessor's workers out of the fingerprint bucket, so
+#     `_error_fingerprint` itself is left alone -- every message on that path
+#     is pid-prefixed, and dropping the substitution gives each worker its own
+#     bucket, which the systemic heuristic can then never fill.
+#
+#     A handed-back card is charged one failure against the dispatcher's own
+#     retry budget. Free reclaims were a closed loop: a card that kills the
+#     gateway is reclaimed by the replacement process, dispatched, and kills it
+#     again, with nothing counting. The charge runs outside the fingerprint
+#     pass, so a rollout releasing every in-flight card at once still cannot
+#     collapse into one systemic verdict.
 #
 # Both are emergent scheduling behaviour rather than a bad string, so the
 # anchors alone prove nothing: verify_kanban_scheduling.py replays both
@@ -312,10 +339,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_dependency_repair.py /opt/he
 # revertible again, above 3 and protocol trips follow.
 #
 # Ordered after kanban_claim_fencing on purpose. That patch edits
-# `detect_crashed_workers` and `_error_fingerprint`; this one edits only
-# `_record_task_failure`, so the anchors do not overlap, but the fingerprint fix
-# is what made the systemic arm rare, and reading them in this order is how the
-# story makes sense.
+# `detect_crashed_workers`; this one edits only `_record_task_failure`, so the
+# anchors do not overlap. The order still matters for reading: the fence is what
+# decides which cards reach the breaker at all, and the reclaim charge it adds is
+# a caller of the very function this patch rewrites.
 # See the module docstring in
 # deploy/docker/patches/apply_kanban_breaker_counter.py.
 COPY deploy/docker/patches/apply_kanban_breaker_counter.py /tmp/apply_kanban_breaker_counter.py

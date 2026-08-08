@@ -66,29 +66,70 @@ a spin loop. No agent cooperation is required and no card is left stranded.
 
 When it is allowed to fire
 --------------------------
-``block_task`` never records *what* a card is waiting for, so "invert every
-unsettled successor" would rewrite healthy pipelines: a researcher card that
-fans out to a synthesizer and then blocks for some unrelated reason would have
-its whole downstream turned around. Two guards keep this to the broken shape,
-and the in-image gate (``verify_kanban_scheduling.py``) exercises both against
-the real engine — the second guard exists because the first version of this
-patch failed that gate by inverting a legitimate fan-in.
+``kanban_block`` takes ``reason`` and ``kind`` and nothing else, so
+``block_task`` never records *what* a card is waiting for and the shape of the
+graph is the only evidence there is. "Invert every unsettled successor" reads
+that evidence wrong — it rewrites healthy pipelines, which is the bug this
+module shipped with and which the last section describes.
 
-1. **The blocking card must have no unsettled parents of its own.** With one,
-   ``recompute_ready`` has something real to hold it on and the block means what
-   it says — hands off. With none, the block is provably a no-op: the card is
-   re-promoted on the very next tick, which is the spin loop we measured. Only
-   then is there anything to repair.
+What separates the two shapes is *when the edge appeared*. A pipeline's
+successor was created by whoever planned the pipeline, before the card that now
+blocks had ever been claimed. The deadlocking children were created by this
+card, out of a ``kanban_create`` that named it in ``parents``, after it started
+running. So an edge is inverted only when the child's ``created`` event is newer
+than the blocking card's first ``claimed`` event. ``create_task`` writes the one
+and ``claim_task`` / ``reclaim_task`` the other, and ``task_events.id`` is a
+single ``AUTOINCREMENT`` sequence for the whole board, so the comparison is an
+exact ordering. The obvious alternative — ``tasks.created_at`` against
+``tasks.started_at`` — is whole seconds, and a planner laying out a pipeline in
+the same second the dispatcher claims its first card is indistinguishable from
+the deadlock by those.
 
-2. **Inverting must actually free the child.** An edge is inverted only if this
-   card is the *last* unfinished parent gating that child. A synthesizer waiting
-   on two researchers is not unblocked by releasing one of them, so turning that
-   edge around would restructure the graph and change nothing — it is left
-   alone. This is what keeps real fan-ins intact.
+The watermark is the *first* claim, the same instant ``claim_task``'s
+``started_at = COALESCE(started_at, ?)`` records, not the current run's. A
+worker that fans out three cards and is then killed leaves them exactly as
+deadlocked as one that blocks; when the card is re-claimed and blocks for real,
+those three still need releasing.
+
+A card with no ``claimed`` event has no window at all, the comparison is NULL
+and nothing is repaired. That is the right answer for a card someone forced into
+``running`` with raw SQL.
+
+The second condition is that inverting must actually free the child: the edge is
+turned around only if this card is the *last* unfinished parent gating it. A
+child created with two parents is not released by releasing one of them, so
+turning that edge around would restructure the graph and change nothing. It also
+holds the repair to the flat fan-out we have actually observed, the one shape
+where no inversion can change the answer the cycle probe gives for the next
+child in the batch.
 
 An edge is also left alone if inverting it would create a cycle (the child
 already reaches this card by some other path). Deadlock is preferable to a
 corrupt graph, and the caller still gets told about it.
+
+The in-image gate (``verify_kanban_scheduling.py``) drives all of this against
+the real engine rather than a mock, because every one of these conditions is
+about scheduling behaviour that the schema alone does not show.
+
+The guard that did not work
+---------------------------
+Until this was measured the first condition was "the blocking card must have no
+unsettled parents of its own", on the theory that a card with a live
+prerequisite is waiting on *that* and means its block literally. It never
+discriminated anything. ``claim_task`` refuses to move a card to ``running``
+while any parent is unsettled and ``recompute_ready`` only promotes
+``todo -> ready`` once every parent is ``done`` or ``archived``, so every card
+``block_task`` will accept has settled parents by construction. Replayed against
+the engine on a throwaway board, an ordinary pipeline stage (``A`` done, ``B``
+claimed, ``B -> C``) and the ``t_ab112f5b`` deadlock both reported no unsettled
+parents — and the guard duly let the pipeline through, inverting ``B -> C`` into
+``C -> B`` so ``C`` was dispatched ahead of the stage it exists to follow. A
+two-input fan-in went the same way the moment one of its inputs finished.
+
+The only shape that makes the predicate true is ``link_tasks`` attaching a new
+parent to an already-running card, and there the card's fan-out children are
+still genuinely deadlocked — so suppressing the repair was wrong in that case
+too. The guard is deleted rather than repaired.
 """
 
 from __future__ import annotations
@@ -120,32 +161,27 @@ def _reaches(conn, start: str, target: str) -> bool:
     return False
 
 
-def has_unsettled_parents(conn, task_id: str) -> bool:
-    """Whether ``recompute_ready`` has anything real to hold this card on.
-
-    The predicate is ``claim_task``'s, verbatim. False means a dependency block
-    on this card cannot hold: it will be re-promoted on the next tick.
-    """
-    row = conn.execute(
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        f"WHERE l.child_id = ? AND p.status NOT IN {SETTLED} LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    return row is not None
-
-
 def find_deadlocked_children(conn, task_id: str) -> list[str]:
-    """Unsettled children that ``task_id`` alone is still gating.
+    """Unsettled cards ``task_id`` fanned out after it started and alone gates.
 
-    Children with another unfinished parent are excluded: inverting those would
-    not free them, so it would be a graph rewrite with no benefit. See guard 2
-    in the module docstring.
+    Two conditions beyond "is an unsettled child", both explained at length in
+    the module docstring. The run window — the child's ``created`` event is
+    newer than this card's first ``claimed`` event — is what tells a card this
+    one fanned out apart from a pipeline successor somebody else planned. The
+    ``NOT EXISTS`` is what stops the repair rewriting an edge whose inversion
+    would free nothing. Either subquery returning NULL makes the comparison NULL
+    and drops the row, which is the conservative answer for a card that reached
+    ``running`` without ever being claimed.
     """
     rows = conn.execute(
         "SELECT l.child_id FROM task_links l "
         "JOIN tasks c ON c.id = l.child_id "
         f"WHERE l.parent_id = ? AND c.status NOT IN {SETTLED} "
+        "  AND (SELECT MIN(birth.id) FROM task_events birth "
+        "        WHERE birth.task_id = l.child_id AND birth.kind = 'created') "
+        "      > (SELECT MIN(started.id) FROM task_events started "
+        "          WHERE started.task_id = l.parent_id "
+        "            AND started.kind = 'claimed') "
         "  AND NOT EXISTS ("
         "        SELECT 1 FROM task_links o "
         "        JOIN tasks op ON op.id = o.parent_id "
@@ -166,12 +202,11 @@ def repair_inverted_dependencies(conn, task_id: str, reason: str = "") -> list[s
     to repair — the common case — in which case it returns ``[]`` and writes
     nothing. Must be called inside an open write transaction; it does not open
     one of its own.
-    """
-    if has_unsettled_parents(conn, task_id):
-        # The block will hold on its own. Whatever this card's successors are,
-        # they are not what it is waiting for. See guard 1 in the docstring.
-        return []
 
+    Calling it twice is a no-op the second time: the first pass turned every
+    edge it touched around, so the card has no outgoing edges left for
+    ``find_deadlocked_children`` to find.
+    """
     children = find_deadlocked_children(conn, task_id)
     if not children:
         return []

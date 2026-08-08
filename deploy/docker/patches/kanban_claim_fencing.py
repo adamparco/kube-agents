@@ -57,28 +57,27 @@ adoption, so an ordinary rollout costs a full 15 minutes of dark cards. Measured
 on the same day: five cards claimed at 03:59:04, pod deleted at 04:00:11,
 reclaimed at 04:14:24 — exactly one TTL after the last heartbeat.
 
-The three fixes
----------------
+The two fixes
+-------------
 1. **Adjudicate only your own claims.** ``claim_is_self`` compares the whole
    token, not the host half, so a previous life's PIDs are never probed. A
    colliding PID in a recycled namespace can no longer be mistaken for a live
    worker, and a dead one can no longer be reported as a crash.
 
-2. **Release dead foreign claims immediately.** ``release_dead_foreign_claims``
-   sweeps ``running`` cards whose claim belongs to someone else *and* whose
-   recorded worker PID is not alive, and puts them back in ``todo`` for the
-   dispatcher to pick up. This is what removes the 900-second dark window after
-   a rollout or a crash.
+2. **Release dead foreign claims immediately, and charge them.**
+   ``release_dead_foreign_claims`` sweeps ``running`` cards whose claim belongs
+   to someone else *and* whose recorded worker PID is not alive, and puts them
+   back in ``ready`` for the dispatcher to pick up. This is what removes the
+   900-second dark window after a rollout or a crash.
+   ``charge_reclaimed_cards`` then spends one unit of each card's ordinary retry
+   budget on the release.
 
-   The liveness test is what makes this safe in every caller, not just the
+   The liveness test is what makes the sweep safe in every caller, not just the
    gateway. A CLI invocation has its own ``_claimer_id()`` and would otherwise
    consider the live gateway's claims foreign — but the gateway's workers have
    live PIDs, so they are left strictly alone. Where a PID does collide with an
    unrelated live process the card simply falls back to the existing TTL, which
    is the behaviour we already have today.
-
-   Cards released this way are ``reclaimed``, not ``crashed``: an infrastructure
-   event is not the card's fault and must not spend its retry budget.
 
    The sweep honours the same launch-window grace period the per-row loop below
    it applies, for the same reason and from the same source
@@ -87,12 +86,74 @@ The three fixes
    a divergence with no justification behind it, since a card claimed seconds
    ago by any process is a card whose worker may not be on ``/proc`` yet.
 
-3. **Keep the PID in the fingerprint.** ``pid 1044 not alive`` and
-   ``pid 1045 not alive`` are two workers, not one systemic fault. Leaving the
-   PID in place means the systemic heuristic no longer fires on them and each
-   card keeps its normal ``failure_limit`` of 2. Strictly more forgiving than
-   the current behaviour, and it only affects PID-bearing messages, which are
-   per-worker by construction.
+Why the release is charged, and why it goes back to ``ready``
+-------------------------------------------------------------
+The first version of this module released the card for free — ``todo``, no
+failure recorded — on the reasoning that an infrastructure event is not the
+card's fault and must not spend its retry budget. That reasoning conflated two
+different questions. Whose claim it was says nothing about whether the *run*
+failed, and the sweep's own precondition is that the worker process is provably
+dead with no result written. That is a failed run by the same definition
+``detect_crashed_workers`` uses one loop later for a worker of our own.
+
+Left uncharged it is also an unbounded loop, which is the concrete failure this
+paragraph exists for. A card whose work kills the dispatcher — an OOM, the
+2026-08-07 SIGBUS — is reclaimed by the replacement process, dispatched again,
+kills it again. Nothing counts, so nothing ever stops it: replayed against a
+real board through the shipped engine, six cycles of claim → reclaim → promote
+left ``consecutive_failures`` at 0 every single time. The card burns a worker
+slot and takes the gateway down with it for as long as the pod keeps coming
+back.
+
+``todo`` was half of why the breaker could not see it. ``recompute_ready``
+applies its failure-limit guard (#35072) only to ``blocked`` rows; a ``todo``
+row is promoted unconditionally, so even a card carrying an exhausted counter
+walks straight back to ``ready``. ``ready`` is also what upstream's own crash
+path releases to, and what ``_record_task_failure(release_claim=False)``
+requires — its trip branch is gated on ``status IN ('ready', 'running')``.
+
+Charging goes through ``_record_task_failure`` with no ``failure_limit``
+argument, so the threshold is the one the dispatcher already resolves for every
+other failure: per-task ``max_retries``, else ``kanban.failure_limit``, else
+``DEFAULT_FAILURE_LIMIT``. No second budget, no new column. A poison card lands
+in ``blocked`` with a ``gave_up`` event after the second reclaim and waits for a
+human, exactly as a card whose worker crashes twice does. The price is that a
+rollout mid-flight costs each in-flight card one retry, and two rollouts across
+one card's life park it; ``hermes kanban unblock`` is the way out, and a card
+that has survived two full rollouts without ever finishing is worth a look
+anyway.
+
+Why the PID stays in the fingerprint after all
+----------------------------------------------
+This patch used to make a third edit: it replaced upstream's
+``re.sub(r'\\bpid \\d+\\b', 'pid N', ...)`` in ``_error_fingerprint`` with a bare
+``error_text[:80]``, so that ``pid 1044 not alive`` and ``pid 1045 not alive``
+would count as two failures rather than one systemic fault. That edit has been
+reverted, because ``_error_fingerprint`` is reachable from exactly two call
+sites — both inside ``detect_crashed_workers``, both over the ``crash_details``
+error texts — and every message that path can produce is PID-prefixed::
+
+    f"pid {pid} exited with code {code}"
+    f"pid {pid} killed by signal {code}"
+    f"pid {pid} not alive"
+
+With the PID left in, no two concurrent workers can ever share a fingerprint, so
+``_fp_counts`` never reaches the ``>= 3`` the systemic heuristic tests and
+``is_systemic`` is dead code. Driving the shipped engine with four of its own
+workers all OOM-killed in one tick (``exited with code 137``, distinct PIDs)
+produced four fingerprints and an empty ``auto_blocked``: the detector that is
+supposed to stop a board where everything is failing the same way could not
+fire at all.
+
+The edit was aimed at a cause that fix 1 had already removed. The six
+fingerprints of 2026-08-07 existed only because the successor adjudicated its
+predecessor's workers; with ``claim_is_self`` in place those cards never enter
+``crash_details``, they go through the sweep instead. What is left in that
+bucket after the fence is a burst of *our own* workers dying the same way in a
+single tick, which is what the heuristic was built for. Reclaims are charged in
+their own loop and never join the fingerprint pass, so a rollout that hands back
+six cards at once still cannot collapse into one systemic verdict — the property
+this module was written to protect.
 """
 
 from __future__ import annotations
@@ -117,7 +178,7 @@ def claim_is_self(lock: str | None, claimer_id: str) -> bool:
 def release_dead_foreign_claims(
     conn, claimer_id: str, pid_alive, grace_seconds=None
 ) -> list[str]:
-    """Return ``running`` cards whose owner is gone to ``todo``.
+    """Return ``running`` cards whose owner is gone to ``ready``.
 
     A card qualifies when all four hold:
 
@@ -131,7 +192,9 @@ def release_dead_foreign_claims(
     the grace check, which is what the tests want and what a caller with no
     ``started_at`` column can live with.
 
-    Must be called inside an open write transaction. Returns the released ids.
+    Must be called inside an open write transaction. Returns the released ids,
+    which the caller owes to ``charge_reclaimed_cards`` once that transaction
+    has closed.
     """
     rows = conn.execute(
         "SELECT id, worker_pid, claim_lock, current_run_id, started_at FROM tasks "
@@ -155,7 +218,7 @@ def release_dead_foreign_claims(
             if started_at is not None:
                 if grace is None:
                     grace = grace_seconds()
-                if time.time() - started_at < grace:
+                if now - started_at < grace:
                     # Too new to adjudicate: the worker may not be on /proc yet.
                     # Same test, same source as the per-row loop in
                     # ``detect_crashed_workers``.
@@ -166,8 +229,12 @@ def release_dead_foreign_claims(
             # running it.
             continue
 
+        # ``ready``, not ``todo``: ``recompute_ready`` promotes a ``todo`` row
+        # without consulting its failure counter, which is how a card that kills
+        # the dispatcher used to escape the breaker forever. It is also the
+        # status ``_record_task_failure`` needs to see to trip.
         conn.execute(
-            "UPDATE tasks SET status = 'todo', claim_lock = NULL, "
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
             "WHERE id = ?",
             (row["id"],),
@@ -201,3 +268,38 @@ def release_dead_foreign_claims(
         )
         released.append(row["id"])
     return released
+
+
+def charge_reclaimed_cards(conn, task_ids, record_failure) -> list[str]:
+    """Spend one retry on each card the sweep handed back. Returns those parked.
+
+    ``record_failure`` is ``_record_task_failure``, injected for the same reason
+    ``pid_alive`` is. It is called the way the crash path calls it — the card is
+    already back at ``ready`` with its run closed, so no claim to release and no
+    run to end — and with no ``failure_limit``, so the threshold is the one the
+    dispatcher resolves for every other failure kind rather than a second budget
+    invented here.
+
+    Must be called OUTSIDE the transaction the sweep ran in:
+    ``_record_task_failure`` opens its own ``write_txn`` and ``write_txn`` does
+    not nest.
+
+    Deliberately a separate loop from the ``crash_details`` pass rather than an
+    extra entry in it. Every card released by one rollout carries the same
+    ``RECLAIM_ERROR`` text, so folding them into ``_fp_counts`` would make any
+    three of them look systemic, drop ``failure_limit`` to 1 and abandon the lot
+    on their first reclaim — the 2026-08-07 outcome, reached by a new route.
+    """
+    tripped: list[str] = []
+    for task_id in task_ids:
+        if record_failure(
+            conn,
+            task_id,
+            error=RECLAIM_ERROR,
+            outcome=EVENT_KIND,
+            release_claim=False,
+            end_run=False,
+            event_payload_extra={"reason": "owner_process_gone", "fenced": True},
+        ):
+            tripped.append(task_id)
+    return tripped

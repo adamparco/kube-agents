@@ -4,8 +4,11 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 """
 
 import ast
+import importlib
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -98,6 +101,95 @@ class CheckWorkerModeTest(unittest.TestCase):
         # trims WORKER_ONLY_TOOLS, the prose and the schema set diverge again.
         for tool in ("kanban_complete", "kanban_block", "kanban_heartbeat", "kanban_link"):
             self.assertIn(tool, WORKER_ONLY_TOOLS)
+
+
+def with_delegation_context(reader):
+    """Patch a fake ``agent.delegation_context`` whose reader is *reader*.
+
+    The module imports it lazily inside ``_is_delegated_child``, so a fake in
+    ``sys.modules`` is enough to exercise the branch on a host with no Hermes.
+    """
+    fake = types.ModuleType("agent.delegation_context")
+    fake.is_delegated_child_context = reader
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.delegation_context = fake
+    return mock.patch.dict(
+        sys.modules, {"agent": agent_pkg, "agent.delegation_context": fake}
+    )
+
+
+class DelegatedChildTest(unittest.TestCase):
+    """A delegate_task child inherits ``HERMES_KANBAN_TASK`` and owns no card.
+
+    The child runs ``run_conversation`` in the parent's own process, so the env
+    var this gate keys off is the parent's and proves nothing about the child.
+    Upstream's own two gates, ``_check_kanban_mode`` and
+    ``_check_kanban_orchestrator_mode``, both open with the same short-circuit;
+    without it this was the only kanban gate in the file that said *True* for a
+    child, which would have offered it the seven worker-only tools and none of
+    the five an orchestrator keeps.
+    """
+
+    def test_a_delegated_child_is_not_a_worker(self):
+        with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_c31a1f00"}):
+            with with_delegation_context(lambda: True):
+                self.assertFalse(check_kanban_worker_mode())
+
+    def test_the_parent_worker_still_keeps_its_tools(self):
+        with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_c31a1f00"}):
+            with with_delegation_context(lambda: False):
+                self.assertTrue(check_kanban_worker_mode())
+
+    def test_it_consults_the_real_delegation_context(self):
+        """The gate takes no argument, so the module import is the only seam.
+
+        ``check_fn`` is called with no arguments by ``tools/registry.py``, which
+        means a short-circuit that did not reach ``agent.delegation_context``
+        itself would be inert in the only place it matters.
+        """
+        module = importlib.import_module("kanban_worker_tools")
+        with with_delegation_context(lambda: True):
+            self.assertTrue(module._is_delegated_child())
+
+    def test_a_host_without_hermes_is_not_a_delegated_child(self):
+        """The import fails outside the image; that is not evidence of a child.
+
+        Answering True there would hide ``kanban_complete`` and ``kanban_block``
+        from every dispatcher-spawned worker in the image at once, and a worker
+        with no terminal tool cannot end its run.
+        """
+        module = importlib.import_module("kanban_worker_tools")
+        with mock.patch.dict(sys.modules, {"agent.delegation_context": None}):
+            self.assertFalse(module._is_delegated_child())
+            with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_c31a1f00"}):
+                self.assertTrue(check_kanban_worker_mode())
+
+    def test_a_raising_reader_leaves_the_worker_its_tools(self):
+        """Uncertainty must not strand a card.
+
+        The opposite of ``kanban_guardrail_exit._is_delegated_child``, which
+        answers True here because a wrong answer there writes to the board. This
+        gate only chooses which schemas ship, and
+        ``_reject_delegated_child_mutation`` still refuses a child's mutations.
+        """
+        module = importlib.import_module("kanban_worker_tools")
+
+        def boom():
+            raise RuntimeError("no delegation context")
+
+        with with_delegation_context(boom):
+            self.assertFalse(module._is_delegated_child())
+            with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_c31a1f00"}):
+                self.assertTrue(check_kanban_worker_mode())
+
+    def test_a_child_of_an_orchestrator_is_not_a_worker_either(self):
+        # No HERMES_KANBAN_TASK at all: the Chat Agent delegating to a
+        # specialist. The gate was already False here; the short-circuit must
+        # not have turned it into a way in.
+        env = {k: v for k, v in os.environ.items() if k != "HERMES_KANBAN_TASK"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with with_delegation_context(lambda: True):
+                self.assertFalse(check_kanban_worker_mode())
 
 
 class ApplyTest(unittest.TestCase):

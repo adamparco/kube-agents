@@ -41,7 +41,19 @@ TRAILER = (
 
 def apply(root: Path) -> None:
     path = root / RELATIVE
+    if not path.is_file():
+        raise SystemExit(f"dependency-repair patch: {path} does not exist")
     source = path.read_text()
+
+    # PATCHED keeps the anchor (the call is inserted above it), so the anchor
+    # still occurs exactly once in an already-patched file and the count check
+    # below waves a re-run straight through. Left to itself a second pass exits
+    # 0 having stacked a second call and a second trailer import — verified by
+    # replaying it against the running gateway's kanban_db.py. Refuse
+    # explicitly, the way apply_kanban_auto_subscribe.py does for the same
+    # reason.
+    if "_kanban_repair_inverted_deps(conn, task_id, reason)" in source:
+        raise SystemExit(f"dependency-repair patch: {RELATIVE} is already patched")
 
     count = source.count(ANCHOR)
     if count != 1:

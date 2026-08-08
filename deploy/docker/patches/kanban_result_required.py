@@ -57,26 +57,92 @@ required to carry one.
 
 Never wedging the card
 ----------------------
-A gate that can refuse forever is a worse bug than the one it fixes, so the
-refusal fires **once per task**. The first content-free completion is rejected
-with an instruction; a second one is accepted, promoting ``summary`` into
-``result`` so the card still closes and still carries the best text available.
-One nudge is what a model needs to correct a tool call, and the card is
-guaranteed to reach ``done`` either way.
+A gate that can refuse forever is a worse bug than the one it fixes, so a
+refusal is never repeated back to back. The first content-free completion is
+rejected with an instruction; the retry is accepted even when it is content-free
+again, promoting ``summary`` into ``result`` so the card still carries the best
+text available. One nudge is what a model needs to correct a tool call, and the
+card reaches ``done`` on its second attempt either way.
 
-Scope: the gate lives in the ``kanban_complete`` tool handler, which is reached
-only by a worker's own tool call. The CLI and the scheduler write through
-``kb.complete_task`` directly and are unaffected, so no cron run and no human
-can be blocked by it.
+Remembering the refusal, and forgetting it
+------------------------------------------
+"The retry" only means anything if the handler remembers refusing this card, and
+that memory has to expire. It first did not: ``_nudged`` was a module-level
+``set`` that only ever grew, so a task id in it meant "accept this completion,
+whatever it contains" for the life of the process.
+
+On the worker path that was harmless by accident. ``dispatch_in_gateway`` moves
+the *dispatcher loop* into the gateway, not the worker —
+``gateway/kanban_watchers.py``'s ``_kanban_dispatcher_watcher`` calls
+``kanban_db.dispatch_once`` with no ``spawn_fn``, so ``_default_spawn`` still
+``subprocess.Popen``s ``hermes -p <profile> chat -q "work kanban task t_…"``.
+One process per dispatch means the set holds one id and dies with the attempt
+that created it.
+
+It was not harmless in the gateway. ``toolsets: [kanban]`` is set on the
+``platform`` profile and on the pod's root config, and
+``_enforce_worker_task_ownership`` deliberately exempts a caller with no
+``HERMES_KANBAN_TASK`` in its environment, because an orchestrator "sometimes
+legitimately close[s] out child tasks". So a gateway session can complete any
+card from a process that lives as long as the pod, and the first content-free
+completion of a card spent that card's nudge permanently: every later attempt,
+including one made hours afterwards on a card that had been reopened and
+retried, was accepted in silence. That is the 2026-08-07 incident, reintroduced
+by the code written to fix it.
+
+The memory is therefore ``_refused_at``, task id to ``time.monotonic()``, read
+by popping: a refusal older than ``NUDGE_TTL_SECONDS`` belongs to a different
+attempt and the new attempt gets its own nudge. Expiry does not reopen the
+wedge, because any caller that retries promptly — the only kind that ever
+completes anything — is still inside the window on its second call.
+
+Blank is empty, all the way down
+--------------------------------
+``result="   "`` used to reach the board. The gate reads it as empty, but the
+promotion branch then handed the whitespace back as the value to store, and the
+two lines quoted above run inside ``complete_task``'s ``write_txn``. ``"   "`` is
+truthy, ``"   ".strip().splitlines()`` is ``[]``, and ``[0]`` raises
+``IndexError`` with the ``UPDATE … SET status = 'done'`` already executed. The
+transaction rolls back, the handler's blanket ``except Exception`` turns the
+failure into ``kanban_complete: list index out of range``, and the card is still
+``running`` — with its nudge already spent, so the identical retry takes the
+identical path. That card never closes and its worker is never told why.
+
+The expression reads ``summary`` first, so a blank ``summary`` wedges a card the
+same way however good its ``result`` is; upstream's ``if not (summary or
+result)`` never caught that either. Both fields are folded to ``None`` by
+:func:`blank_to_none` before they leave here — ``None`` is the value
+``complete_task`` is written to handle, and a field holding only whitespace is
+not carrying anything anyway.
+
+Scope: the gate lives in the ``kanban_complete`` tool handler. The CLI and the
+scheduler write through ``kb.complete_task`` directly and are unaffected, so no
+cron run and no human at a shell can be blocked by it. Every caller that does go
+through the handler — a dispatched worker closing its own card, an orchestrator
+gateway session closing somebody else's — is gated, which is why the refusal
+memory has to be correct for a process that outlives a single card.
 """
 
 from __future__ import annotations
 
-# Task ids already refused once. Keyed by id rather than a bare flag because a
-# worker process is nominally one task, but nothing in the tool contract
-# promises that, and a shared process must not spend task B's only nudge on
-# task A.
-_nudged: set[str] = set()
+import time
+
+#: How long a refusal stays on file. A model corrects a rejected tool call in its
+#: next assistant turn, seconds later, so a content-free completion arriving
+#: after this long is a fresh attempt at the card and has earned its own nudge.
+#: 15 minutes is ``DEFAULT_CLAIM_TTL_SECONDS`` in ``hermes_cli/kanban_db.py``,
+#: the soonest an abandoned claim can be handed to another worker, which makes it
+#: the shortest window that cannot straddle two attempts on the worker path.
+NUDGE_TTL_SECONDS = 15 * 60
+
+#: Cards refused once and not yet completed, against the ``time.monotonic()``
+#: reading taken at the refusal. Keyed by task id rather than held as a bare flag
+#: because a worker process is nominally one card, but nothing in the tool
+#: contract promises that and a shared process must not spend card B's nudge on
+#: card A. Entries are popped by the completion that answers them and go stale on
+#: their own; the only ones that linger belong to a caller that walked away, a
+#: handful of floats in a gateway that runs for weeks.
+_refused_at: dict[str, float] = {}
 
 MISSING_RESULT_ERROR = (
     "result is required and was empty. `result` is what the person who asked "
@@ -87,6 +153,21 @@ MISSING_RESULT_ERROR = (
     "in a file, or in a comment — none of those reach the user. Keep `summary` "
     "as the one-line status header."
 )
+
+
+def blank_to_none(value: object) -> object:
+    """``None`` unless ``value`` carries printable text, otherwise ``value``.
+
+    A field holding only whitespace carries nothing, but it is truthy, which is
+    how ``"   "`` slips past an emptiness check and into the
+    ``.strip().splitlines()[0]`` in ``complete_task`` that raises ``IndexError``
+    on it. Values with content come back untouched: ``kanban_complete`` has
+    already run them through ``redact_sensitive_text`` and this is not the place
+    to trim what that produced.
+    """
+    if value is None or not str(value).strip():
+        return None
+    return value
 
 
 def require_result(
@@ -100,24 +181,30 @@ def require_result(
     completion may proceed; otherwise it is the text to hand back to the worker
     and the completion must not be written.
 
-    A non-empty ``result`` always passes — there is no length or quality floor,
-    because a card whose honest answer is one line must be able to close. An
-    empty one is refused the first time and, on the second attempt for the same
-    task, accepted with ``summary`` promoted into ``result`` so the card cannot
-    be wedged shut by a worker that will not fill the field in.
+    A ``result`` with content always passes — there is no length or quality
+    floor, because a card whose honest answer is one line must be able to close.
+    A blank one is refused, and the retry is accepted with ``summary`` promoted
+    into ``result`` so a worker that will not fill the field in cannot wedge the
+    card shut. ``result_to_store`` is never a blank string; see
+    :func:`blank_to_none` for what that would cost.
     """
-    if result is not None and str(result).strip():
-        return None, result
-
+    summary = blank_to_none(summary)
+    result = blank_to_none(result)
     key = str(task_id)
-    if key not in _nudged:
-        _nudged.add(key)
-        return MISSING_RESULT_ERROR, result
+    # Popped rather than read. Whether the refusal is being answered or has gone
+    # stale, this call ends it, and popping is what keeps the mapping to the
+    # cards actually awaiting a retry.
+    refused_at = _refused_at.pop(key, None)
 
-    # Second attempt: take what we can get rather than hold the card open.
-    # ``summary`` may itself be empty, in which case the card closes with an
-    # empty result exactly as upstream would have allowed.
-    return None, summary if (summary is not None and str(summary).strip()) else result
+    if result is not None:
+        return None, result
+    if refused_at is not None and time.monotonic() - refused_at <= NUDGE_TTL_SECONDS:
+        # The retry, and it is empty again. Take what we can get rather than
+        # hold the card open. ``summary`` may be ``None`` too, in which case the
+        # card closes with no result exactly as upstream would have allowed.
+        return None, summary
+    _refused_at[key] = time.monotonic()
+    return MISSING_RESULT_ERROR, None
 
 
 # --- Schema wording ---------------------------------------------------------
@@ -193,8 +280,15 @@ OLD_GATE = (
     "        )\n"
 )
 
+# ``summary`` is folded separately because ``require_result`` only owns
+# ``result``: the handler passes its own ``summary`` local straight on to
+# ``kb.complete_task``, and a blank one raises ``IndexError`` there whatever the
+# result holds. Rebinding it here rather than widening the gate's return keeps
+# the ``_require_result(tid, summary, result)`` call verbatim, which is the
+# string the Dockerfile greps for.
 NEW_GATE = (
     "    # kube-agents patch: see tools/kanban_result_required.py\n"
+    "    summary = _blank_to_none(summary)\n"
     "    _result_err, result = _require_result(tid, summary, result)\n"
     "    if _result_err:\n"
     "        return tool_error(_result_err)\n"
@@ -208,22 +302,19 @@ def _swap(schema: dict, path: tuple[str, ...], old: str, new: str) -> None:
     documents ``created_cards`` and ``artifacts`` and is left alone — can have
     its opening paragraph swapped without restating the rest.
     """
+    missing = KeyError(
+        f"kanban_result_required: {'.'.join(path)} missing from the "
+        f"kanban_complete schema. Upstream Hermes changed — re-derive the "
+        f"schema patch before bumping the base image."
+    )
     node: object = schema
     for key in path[:-1]:
         if not isinstance(node, dict) or key not in node:
-            raise KeyError(
-                f"kanban_result_required: {'.'.join(path)} missing from the "
-                f"kanban_complete schema. Upstream Hermes changed — re-derive "
-                f"the schema patch before bumping the base image."
-            )
+            raise missing
         node = node[key]
     leaf = path[-1]
     if not isinstance(node, dict) or leaf not in node:
-        raise KeyError(
-            f"kanban_result_required: {'.'.join(path)} missing from the "
-            f"kanban_complete schema. Upstream Hermes changed — re-derive the "
-            f"schema patch before bumping the base image."
-        )
+        raise missing
     current = node[leaf]
     if not isinstance(current, str) or old not in current:
         raise ValueError(

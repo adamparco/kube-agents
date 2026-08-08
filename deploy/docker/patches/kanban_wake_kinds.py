@@ -60,20 +60,64 @@ DEFAULT_WAKE_KINDS: Tuple[str, ...] = (
 
 CONFIG_KEY = "wake_on_events"
 
+#: Reasons :func:`_load_kanban_config` has already reported this process.
+#: The notifier reaches it on every delivery, so a config that is permanently
+#: unreadable would otherwise warn every five seconds for the life of the
+#: gateway; one line per distinct cause is enough to explain the behaviour.
+#: Tests clear it between cases.
+_warned_config: set = set()
+
+
+def _warn_config_once(cause: str, message: str, *args: object) -> None:
+    if cause in _warned_config:
+        return
+    _warned_config.add(cause)
+    logger.warning(message, *args)
+
 
 def _load_kanban_config(load_config: Optional[Callable[[], object]]) -> Optional[dict]:
-    """Return the ``kanban`` config subtree, or None if it cannot be read."""
+    """Return the ``kanban`` config subtree, or None if it cannot be read.
+
+    Returning None sends :func:`resolve_wake_kinds` back to
+    :data:`DEFAULT_WAKE_KINDS`, which is the safe answer but an invisible one:
+    it is byte-for-byte what an operator who never set ``kanban.wake_on_events``
+    gets, so a loader that has genuinely broken presents as a key that was
+    never configured, and the redundant turn comes back with nothing in the
+    logs. Each failure therefore says so once before degrading.
+    """
     if load_config is None:
         try:
             from hermes_cli.config import load_config as _lc
-        except Exception:
+        except Exception as exc:
+            _warn_config_once(
+                "import",
+                "kanban notifier: hermes_cli.config is not importable (%s); "
+                "kanban.%s cannot be read and the upstream wake set applies to "
+                "every card",
+                exc,
+                CONFIG_KEY,
+            )
             return None
         load_config = _lc
     try:
         cfg = load_config()
-    except Exception:
+    except Exception as exc:
+        _warn_config_once(
+            "read",
+            "kanban notifier: reading the Hermes config failed (%s); "
+            "kanban.%s is being ignored and the upstream wake set applies",
+            exc,
+            CONFIG_KEY,
+        )
         return None
     if not isinstance(cfg, dict):
+        _warn_config_once(
+            "shape",
+            "kanban notifier: load_config() returned %s rather than a mapping; "
+            "kanban.%s is being ignored and the upstream wake set applies",
+            type(cfg).__name__,
+            CONFIG_KEY,
+        )
         return None
     kcfg = cfg.get("kanban", {})
     return kcfg if isinstance(kcfg, dict) else {}
@@ -89,9 +133,11 @@ def resolve_wake_kinds(
     requiring a restart. The config read is cheap: ``load_config()`` is
     mtime-cached upstream.
 
-    Fails **towards upstream behaviour**. A missing key, an unreadable config,
-    or a value of the wrong shape all yield :data:`DEFAULT_WAKE_KINDS` — a
-    transient read error must not silently stop waking an agent on a crash.
+    Fails **towards upstream behaviour**, loudly. A missing key, an unreadable
+    config, or a value of the wrong shape all yield :data:`DEFAULT_WAKE_KINDS`
+    — a transient read error must not stop waking an agent on a crash — but
+    every case except the missing key logs its reason first, so a degraded
+    read is distinguishable from a key nobody set.
     Only an explicit, well-formed value narrows the set; an explicit empty list
     disables the wake entirely, which is a deliberate choice a user can make.
     """
@@ -153,6 +199,11 @@ def _adapter_can_push(adapter: object) -> bool:
     try:
         from gateway.wake import adapter_supports_push
     except Exception:
+        # Silent on purpose: outside the image this import is *expected* to
+        # fail, so warning here would fire on every host-side unit test while
+        # saying nothing about the deployed gateway. That the real module is
+        # reachable in the image is asserted by verify_kanban_wake_kinds.py,
+        # which drives this against the actual APIServerAdapter.
         return bool(getattr(adapter, "supports_async_delivery", True))
     try:
         return bool(adapter_supports_push(adapter))

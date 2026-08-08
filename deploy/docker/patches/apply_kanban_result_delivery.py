@@ -34,9 +34,13 @@ ANCHOR = (
     f"{INDENT})\n"
 )
 
+# Assignment, not ``+=``. In the branch that has no event summary the notifier
+# has already put a 1200-character clip of ``task.result`` into ``handoff``,
+# and the report is about to be printed in full underneath it; only something
+# that owns the whole tail can drop that clip. See the module docstring.
 PATCHED = (
     f"{INDENT}# kube-agents patch: see gateway/kanban_result_delivery.py\n"
-    f"{INDENT}handoff += _kanban_result_block(handoff, task)\n"
+    f"{INDENT}handoff = _kanban_handoff_with_result(handoff, task)\n"
 ) + ANCHOR
 
 # Appended rather than inserted: the name is resolved when the notifier loop
@@ -45,7 +49,7 @@ PATCHED = (
 TRAILER = (
     "\n\n# kube-agents patch: see gateway/kanban_result_delivery.py\n"
     "from gateway.kanban_result_delivery import "
-    "result_block_for_task as _kanban_result_block\n"
+    "handoff_with_result as _kanban_handoff_with_result\n"
 )
 
 
@@ -55,6 +59,13 @@ def apply(root: Path) -> None:
     if not path.is_file():
         raise SystemExit(f"kanban_result_delivery patch: {path} does not exist")
     source = path.read_text()
+    # The patched text keeps the anchor (the hook is prepended to it), so
+    # anchor-counting alone cannot catch a re-run. Refuse explicitly rather
+    # than stack a second hook call and a second trailer import.
+    if "_kanban_handoff_with_result(handoff, task)" in source:
+        raise SystemExit(
+            f"kanban_result_delivery patch: {RELATIVE} is already patched"
+        )
     found = source.count(ANCHOR)
     if found != 1:
         raise SystemExit(

@@ -10,7 +10,12 @@ import unittest
 from pathlib import Path
 
 from apply_kanban_wake_kinds import ANCHOR, RELATIVE, apply
-from kanban_wake_kinds import DEFAULT_WAKE_KINDS, resolve_wake_kinds, wake_kinds_for
+from kanban_wake_kinds import (
+    DEFAULT_WAKE_KINDS,
+    _warned_config,
+    resolve_wake_kinds,
+    wake_kinds_for,
+)
 
 # What agents/chat/config.yaml sets: wake the front door when a card fails,
 # never when it succeeds — the notifier has already delivered that summary.
@@ -36,6 +41,11 @@ class Event:
 
 
 class ResolveWakeKindsTest(unittest.TestCase):
+    def setUp(self):
+        # The degraded-read warnings are one-shot per process; without this
+        # the first test to trip one hides it from every test after it.
+        _warned_config.clear()
+
     def test_unset_key_keeps_upstream_behaviour(self):
         self.assertEqual(resolve_wake_kinds(loader({})), DEFAULT_WAKE_KINDS)
         self.assertEqual(resolve_wake_kinds(loader()), DEFAULT_WAKE_KINDS)
@@ -77,8 +87,39 @@ class ResolveWakeKindsTest(unittest.TestCase):
     def test_an_unreadable_config_still_wakes_on_failures(self):
         # Failing closed here would mean a crashed card silently never
         # escalating, which is worse than an extra turn on a healthy one.
-        self.assertEqual(resolve_wake_kinds(loader(raises=True)), DEFAULT_WAKE_KINDS)
-        self.assertEqual(resolve_wake_kinds(loader(not_a_dict=True)), DEFAULT_WAKE_KINDS)
+        with self.assertLogs("gateway.run", level=logging.WARNING):
+            self.assertEqual(resolve_wake_kinds(loader(raises=True)), DEFAULT_WAKE_KINDS)
+        _warned_config.clear()
+        with self.assertLogs("gateway.run", level=logging.WARNING):
+            self.assertEqual(resolve_wake_kinds(loader(not_a_dict=True)), DEFAULT_WAKE_KINDS)
+
+    def test_a_degraded_read_says_so_instead_of_looking_like_an_unset_key(self):
+        # The failure this catches is silence, not breakage: falling back to
+        # DEFAULT_WAKE_KINDS is byte-for-byte what an operator who never set
+        # the key gets, so an unreadable config would present as "the narrowing
+        # was never configured" while the redundant turn quietly came back.
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            resolve_wake_kinds(loader(raises=True))
+        joined = "\n".join(captured.output)
+        self.assertIn("config unreadable", joined, "the cause must survive")
+        self.assertIn("wake_on_events", joined, "the affected key must be named")
+
+    def test_the_degraded_read_warning_does_not_repeat_every_delivery(self):
+        # The notifier polls every 5s per subscription; an unconditional
+        # warning here would be the loudest line in the gateway log.
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            for _ in range(20):
+                resolve_wake_kinds(loader(raises=True))
+        self.assertEqual(len(captured.output), 1)
+
+    def test_an_unset_key_is_not_a_warning(self):
+        # The overwhelmingly common case. Warning on it would train operators
+        # to ignore the line that matters.
+        logging.getLogger("gateway.run").warning("probe")
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            logging.getLogger("gateway.run").warning("probe")
+            resolve_wake_kinds(loader({}))
+        self.assertEqual(len(captured.output), 1)
 
     def test_default_set_matches_the_upstream_tuple(self):
         # If a base-image bump adds a terminal kind, this test is the reminder

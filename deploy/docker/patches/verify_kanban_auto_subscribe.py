@@ -59,6 +59,34 @@ def subs(task_id):
     ).fetchall()
 
 
+def head(task_id):
+    return conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()[0]
+
+
+# The kinds gateway/kanban_watchers.py claims for a subscriber; anything the
+# cursor is left behind is a message that lands in the user's chat thread.
+TERMINAL_KINDS = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out",
+    "status", "archived", "unblocked", "block_loop_detected",
+)
+
+
+def would_replay(task_id):
+    """The events the notifier's next tick would post for ``task_id``."""
+    _, events = K.unseen_events_for_sub(
+        conn,
+        task_id=task_id,
+        platform="slack",
+        chat_id="C0PLATFORM",
+        thread_id="1723033132.001",
+        kinds=TERMINAL_KINDS,
+    )
+    return [e.kind for e in events]
+
+
 def tool_create(**args):
     out = json.loads(kt._handle_create({"assignee": "platform", **args}))
     if not out.get("ok"):
@@ -110,9 +138,14 @@ if rows:
         and row["notifier_profile"] == "default",
     )
     check(
-        "the child's cursor starts fresh",
-        row["last_event_id"] == 0,
-        f"last_event_id={row['last_event_id']}",
+        "the child's cursor starts caught up with its own history",
+        row["last_event_id"] == head(sleeper["task_id"]),
+        f"last_event_id={row['last_event_id']}, head={head(sleeper['task_id'])}",
+    )
+    check(
+        "so the notifier's next tick has nothing to replay",
+        would_replay(sleeper["task_id"]) == [],
+        f"would post {would_replay(sleeper['task_id'])}",
     )
 
 # A child that ALSO names the subscribed card as a graph parent hits both
@@ -139,6 +172,38 @@ unsubscribed = K.create_task(conn, title="cron-born card", assignee="platform")
 os.environ["HERMES_KANBAN_TASK"] = unsubscribed
 orphan = tool_create(title="child of an unsubscribed card")
 check("an unsubscribed parent propagates nothing", len(subs(orphan["task_id"])) == 0)
+
+# --- The card an idempotent create hands back --------------------------------
+# create_task answers a repeat idempotency_key by returning the id of the
+# EXISTING card, before it opens write_txn. The tool handler cannot tell the
+# difference, so this patch's hook can land on a card with a full history —
+# and a cursor of 0 would post all of it into the user's thread.
+print("idempotent re-create of a finished card:")
+finished = K.create_task(
+    conn, title="nightly cost report", assignee="platform",
+    idempotency_key="nightly-cost-report",
+)
+# _append_event is the helper every kernel status/blocked/completed path calls;
+# the gate only needs the history to be there, not the runs that produced it.
+with K.write_txn(conn):
+    for kind in ("status", "blocked", "unblocked", "completed"):
+        K._append_event(conn, finished, kind, None)
+
+os.environ["HERMES_KANBAN_TASK"] = coordinator
+again = tool_create(
+    title="nightly cost report", idempotency_key="nightly-cost-report"
+)
+check(
+    "the repeat create returns the existing card",
+    again["task_id"] == finished,
+    f"got {again['task_id']}, expected {finished}",
+)
+check("that card is subscribed to the worker's thread", len(subs(finished)) == 1)
+check(
+    "and its closed history is NOT replayed into the thread",
+    would_replay(finished) == [],
+    f"would post {would_replay(finished)}",
+)
 
 # --- Non-worker creates are untouched -----------------------------------------
 print("non-worker creates:")

@@ -7,10 +7,16 @@ and kept its pod name, so the replacement dispatcher adjudicated its
 predecessor's worker PIDs — every one of them belonging to a process it never
 spawned — and abandoned six cards. Every test here is written in that vocabulary
 — OLD is the process life that died, NEW is the one that came up.
+
+The end-to-end consequences of charging a reclaim (a poison card reaching
+``blocked``, the breaker's own threshold being the one that decides) belong to
+verify_kanban_scheduling.py, which drives the real engine inside the image.
+What is pinned here is the contract this module offers it.
 """
 
 import ast
 import json
+import re
 import sqlite3
 import tempfile
 import time
@@ -18,14 +24,15 @@ import unittest
 from pathlib import Path
 
 from apply_kanban_claim_fencing import (
+    CHARGE_ANCHOR,
     FENCE_ANCHOR,
-    FP_ANCHOR,
     RELATIVE,
     apply,
 )
 from kanban_claim_fencing import (
     EVENT_KIND,
     RECLAIM_ERROR,
+    charge_reclaimed_cards,
     claim_is_self,
     release_dead_foreign_claims,
 )
@@ -34,6 +41,23 @@ POD = "platform-agent-gateway-75b5f6ddf6-7dkd7"
 OLD = f"{POD}:4"  # the dispatcher that took the bus error
 NEW = f"{POD}:9"  # the one that replaced it, same pod name
 OTHER_POD = "platform-agent-gateway-595bbd777f-5vlzk:7"
+
+# The fingerprint as ``hermes_cli/kanban_db.py`` ships it, and as this patch
+# deliberately leaves it. Mirrored rather than imported because kanban_db only
+# exists inside the image.
+UPSTREAM_FINGERPRINT_SOURCE = (
+    "def _error_fingerprint(error_text):\n"
+    "    fp = re.sub(r'\\bpid \\d+\\b', 'pid N', error_text[:80])\n"
+    "    fp = re.sub(r'\\b\\d{10,}\\b', '<TS>', fp)\n"
+    "    return fp.lower().strip()\n"
+)
+
+
+def upstream_fingerprint(error_text):
+    fp = re.sub(r"\bpid \d+\b", "pid N", error_text[:80])
+    fp = re.sub(r"\b\d{10,}\b", "<TS>", fp)
+    return fp.lower().strip()
+
 
 SCHEMA = """
 CREATE TABLE tasks (
@@ -133,14 +157,27 @@ class ReleaseDeadForeignClaimsTest(unittest.TestCase):
         self.assertEqual(release_dead_foreign_claims(conn, NEW, DEAD), ["t1", "t2"])
         for tid in ("t1", "t2"):
             row = task(conn, tid)
-            self.assertEqual(row["status"], "todo")
+            self.assertEqual(row["status"], "ready")
             self.assertIsNone(row["claim_lock"])
             self.assertIsNone(row["claim_expires"])
             self.assertIsNone(row["worker_pid"])
             self.assertIsNone(row["current_run_id"])
 
+    def test_the_card_comes_back_ready_not_todo(self):
+        """``todo`` is how a card used to walk past the breaker.
+
+        ``recompute_ready`` applies its failure-limit guard only to ``blocked``
+        rows and promotes ``todo`` unconditionally, and
+        ``_record_task_failure``'s trip branch is gated on
+        ``status IN ('ready', 'running')`` — so a reclaim that lands in ``todo``
+        can be neither stopped nor even counted.
+        """
+        conn = board([("t1", "running", 1044, OLD)])
+        release_dead_foreign_claims(conn, NEW, DEAD)
+        self.assertEqual(task(conn, "t1")["status"], "ready")
+
     def test_release_is_reclaimed_not_crashed(self):
-        """An infrastructure event must not spend the card's retry budget."""
+        """The run outcome names the infrastructure event, not a worker fault."""
         conn = board([("t1", "running", 1044, OLD)])
         release_dead_foreign_claims(conn, NEW, DEAD)
         run = run_row(conn, "t1")
@@ -265,55 +302,115 @@ class ReleaseDeadForeignClaimsTest(unittest.TestCase):
         self.assertEqual(row["ended_at"], 123)
 
 
+class ChargeReclaimedCardsTest(unittest.TestCase):
+    """``_record_task_failure`` lives in kanban_db, so record what it is handed."""
+
+    def setUp(self):
+        self.calls = []
+
+    def recorder(self, trips=()):
+        def record_failure(conn, task_id, **kwargs):
+            self.calls.append((task_id, kwargs))
+            return task_id in trips
+
+        return record_failure
+
+    def test_every_released_card_is_charged_one_failure(self):
+        parked = charge_reclaimed_cards(None, ["t1", "t2"], self.recorder())
+        self.assertEqual(parked, [])
+        self.assertEqual([tid for tid, _ in self.calls], ["t1", "t2"])
+
+    def test_the_cards_the_breaker_parked_are_returned(self):
+        """``dispatch_once`` reports these as auto-blocked, so a human hears."""
+        parked = charge_reclaimed_cards(
+            None, ["t1", "t2", "t3"], self.recorder(trips={"t2"})
+        )
+        self.assertEqual(parked, ["t2"])
+
+    def test_nothing_released_means_nothing_charged(self):
+        self.assertEqual(charge_reclaimed_cards(None, [], self.recorder()), [])
+        self.assertEqual(self.calls, [])
+
+    def test_the_charge_uses_the_dispatchers_own_threshold(self):
+        """No second retry budget: no ``failure_limit``, no ``force_trip``.
+
+        ``_record_task_failure`` then resolves per-task ``max_retries``, else
+        ``kanban.failure_limit``, else ``DEFAULT_FAILURE_LIMIT`` — the same
+        ladder every other failure kind is judged on.
+        """
+        charge_reclaimed_cards(None, ["t1"], self.recorder())
+        _, kwargs = self.calls[0]
+        self.assertNotIn("failure_limit", kwargs)
+        self.assertNotIn("force_trip", kwargs)
+
+    def test_the_charge_neither_releases_a_claim_nor_ends_a_run(self):
+        """The sweep already did both, inside its own transaction."""
+        charge_reclaimed_cards(None, ["t1"], self.recorder())
+        _, kwargs = self.calls[0]
+        self.assertFalse(kwargs["release_claim"])
+        self.assertFalse(kwargs["end_run"])
+
+    def test_the_gave_up_event_says_why_the_card_was_parked(self):
+        charge_reclaimed_cards(None, ["t1"], self.recorder(trips={"t1"}))
+        _, kwargs = self.calls[0]
+        self.assertEqual(kwargs["error"], RECLAIM_ERROR)
+        self.assertEqual(kwargs["outcome"], EVENT_KIND)
+        self.assertEqual(
+            kwargs["event_payload_extra"],
+            {"reason": "owner_process_gone", "fenced": True},
+        )
+
+
 class FingerprintTest(unittest.TestCase):
-    """The fingerprint change lives in kanban_db.py, so assert on the patched text."""
+    """Why ``_error_fingerprint`` is left exactly as upstream ships it."""
 
-    def test_patched_fingerprint_keeps_distinct_pids_distinct(self):
-        import re
+    def test_normalising_the_pid_is_what_makes_a_burst_detectable(self):
+        """Every message on this path is PID-prefixed, so the sub is load-bearing.
 
-        def upstream(text):
-            fp = re.sub(r"\bpid \d+\b", "pid N", text[:80])
-            fp = re.sub(r"\b\d{10,}\b", "<TS>", fp)
-            return fp.lower().strip()
+        ``detect_crashed_workers`` builds all three of these itself. Without the
+        substitution no two concurrent workers can share a bucket, ``_fp_counts``
+        never reaches the ``>= 3`` the systemic heuristic tests, and the
+        detector is dead code.
+        """
+        for template in (
+            "pid {} not alive",
+            "pid {} exited with code 137",
+            "pid {} killed by signal 9",
+        ):
+            messages = [template.format(p) for p in (1044, 1045, 1046, 1047)]
+            with self.subTest(template=template):
+                self.assertEqual(
+                    len({upstream_fingerprint(m) for m in messages}),
+                    1,
+                    "four workers felled by one event must land in one bucket",
+                )
+                self.assertEqual(
+                    len({m[:80] for m in messages}),
+                    4,
+                    "and the unnormalised text is what used to split them",
+                )
 
-        def patched(text):
-            fp = text[:80]
-            fp = re.sub(r"\b\d{10,}\b", "<TS>", fp)
-            return fp.lower().strip()
-
-        crashes = [f"pid {p} not alive" for p in (1044, 1045, 1046, 1047, 1048, 1049)]
-        self.assertEqual(
-            len({upstream(c) for c in crashes}),
-            1,
-            "upstream collapses six workers into one systemic fingerprint",
+    def test_distinct_faults_still_keep_their_own_buckets(self):
+        self.assertNotEqual(
+            upstream_fingerprint("pid 1044 exited with code 137"),
+            upstream_fingerprint("pid 1044 killed by signal 9"),
         )
+
+    def test_timestamp_normalisation_is_untouched(self):
         self.assertEqual(
-            len({patched(c) for c in crashes}),
-            6,
-            "each worker must count as its own failure",
+            upstream_fingerprint("failed at 1754539230"),
+            upstream_fingerprint("failed at 1754539999"),
         )
 
-    def test_genuinely_systemic_errors_still_group(self):
-        import re
+    def test_a_reclaim_never_reaches_the_fingerprint_at_all(self):
+        """Six identical reclaim texts would otherwise read as one systemic fault.
 
-        def patched(text):
-            fp = text[:80]
-            fp = re.sub(r"\b\d{10,}\b", "<TS>", fp)
-            return fp.lower().strip()
-
-        same = ["model provider returned 503"] * 4
-        self.assertEqual(len({patched(c) for c in same}), 1)
-
-    def test_timestamp_normalisation_is_preserved(self):
-        import re
-
-        def patched(text):
-            fp = text[:80]
-            fp = re.sub(r"\b\d{10,}\b", "<TS>", fp)
-            return fp.lower().strip()
-
+        ``charge_reclaimed_cards`` runs its own loop precisely so that a rollout
+        handing back every in-flight card cannot collapse into ``failure_limit=1``
+        and abandon the lot — the 2026-08-07 outcome by another route.
+        """
         self.assertEqual(
-            patched("failed at 1754539230"), patched("failed at 1754539999")
+            len({upstream_fingerprint(RECLAIM_ERROR) for _ in range(6)}), 1
         )
 
 
@@ -331,10 +428,12 @@ class ApplierTest(unittest.TestCase):
             "def detect_crashed_workers(conn):\n"
             "    with write_txn(conn):\n"
             + FENCE_ANCHOR
-            + "            pass\n\n"
-            "def _error_fingerprint(error_text):\n"
-            + FP_ANCHOR
-            + "    return fp\n"
+            + "            pass\n"
+            "    auto_blocked = []\n"
+            + CHARGE_ANCHOR
+            + "    detect_crashed_workers._last_auto_blocked = auto_blocked\n"
+            "    return crashed\n\n"
+            + UPSTREAM_FINGERPRINT_SOURCE
         )
 
     def test_applies_both_edits_and_stays_parseable(self):
@@ -342,22 +441,32 @@ class ApplierTest(unittest.TestCase):
         apply(root)
         out = target.read_text()
         self.assertIn(
-            "_kanban_release_dead_foreign_claims(\n"
+            "_kanban_reclaimed = _kanban_release_dead_foreign_claims(\n"
             "            conn, _kanban_claimer, _pid_alive, "
             "_resolve_crash_grace_seconds\n        )",
             out,
         )
         self.assertIn("_kanban_claim_is_self(lock, _kanban_claimer)", out)
-        self.assertIn("fp = error_text[:80]", out)
+        self.assertIn(
+            "_kanban_charge_reclaimed_cards(\n"
+            "            conn, _kanban_reclaimed, _record_task_failure\n        )",
+            out,
+        )
         self.assertIn("from hermes_cli.kanban_claim_fencing import", out)
         ast.parse(out)
 
     def test_host_prefix_comparison_is_gone_from_the_crash_reaper(self):
         root, target = self._tree(self._pristine())
         apply(root)
+        self.assertNotIn("lock.startswith(host_prefix)", target.read_text())
+
+    def test_the_fingerprint_is_left_exactly_as_upstream_wrote_it(self):
+        """The regression this file used to carry, pinned so it cannot return."""
+        root, target = self._tree(self._pristine())
+        apply(root)
         out = target.read_text()
-        self.assertNotIn("lock.startswith(host_prefix)", out)
-        self.assertNotIn("re.sub(r'\\bpid \\d+\\b'", out)
+        self.assertIn(UPSTREAM_FINGERPRINT_SOURCE, out)
+        self.assertNotIn("fp = error_text[:80]", out)
 
     def test_sweep_runs_before_the_rows_are_read(self):
         root, target = self._tree(self._pristine())
@@ -368,18 +477,29 @@ class ApplierTest(unittest.TestCase):
             out.index('"SELECT id, worker_pid, claim_lock, started_at FROM tasks "'),
         )
 
+    def test_the_charge_runs_after_the_sweeps_transaction_has_closed(self):
+        """``_record_task_failure`` opens its own txn, and ``write_txn`` cannot nest."""
+        root, target = self._tree(self._pristine())
+        apply(root)
+        out = target.read_text()
+        charge = out.index("_kanban_charge_reclaimed_cards")
+        self.assertLess(out.index("with write_txn(conn):"), charge)
+        self.assertLess(charge, out.index("_last_auto_blocked"))
+        # Nothing the charge does may sit at the transaction's indentation.
+        self.assertIn("\n    auto_blocked.extend(\n", out)
+
     def test_missing_fence_anchor_fails_the_build(self):
-        root, _ = self._tree("import re\n" + FP_ANCHOR)
+        root, _ = self._tree("import re\n" + CHARGE_ANCHOR)
         with self.assertRaises(SystemExit):
             apply(root)
 
-    def test_missing_fingerprint_anchor_fails_the_build(self):
+    def test_missing_charge_anchor_fails_the_build(self):
         root, _ = self._tree("import re\n" + FENCE_ANCHOR)
         with self.assertRaises(SystemExit):
             apply(root)
 
     def test_partial_apply_does_not_write(self):
-        """The fence anchor matches, the fingerprint one does not: leave the file be."""
+        """The fence anchor matches, the charge one does not: leave the file be."""
         body = "import re\n" + FENCE_ANCHOR
         root, target = self._tree(body)
         with self.assertRaises(SystemExit):
@@ -387,7 +507,9 @@ class ApplierTest(unittest.TestCase):
         self.assertEqual(target.read_text(), body)
 
     def test_duplicate_anchor_fails_the_build(self):
-        root, _ = self._tree("import re\n" + FENCE_ANCHOR + FENCE_ANCHOR + FP_ANCHOR)
+        root, _ = self._tree(
+            "import re\n" + FENCE_ANCHOR + FENCE_ANCHOR + CHARGE_ANCHOR
+        )
         with self.assertRaises(SystemExit):
             apply(root)
 

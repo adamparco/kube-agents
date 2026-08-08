@@ -41,11 +41,13 @@ REGISTER_ANCHOR = (
 
 # Imported at module scope so ``apply_schema`` runs while the module is still
 # importing — before any tool call and before the registry hands the schema to a
-# model. ``_require_result`` is resolved later, when a worker actually completes.
+# model. ``_require_result`` and ``_blank_to_none`` are resolved later, when a
+# worker actually completes.
 REGISTER_PATCHED = (
     "# kube-agents patch: see tools/kanban_result_required.py\n"
     "from tools.kanban_result_required import (\n"
     "    apply_schema as _apply_result_schema,\n"
+    "    blank_to_none as _blank_to_none,\n"
     "    require_result as _require_result,\n"
     ")\n"
     "\n"

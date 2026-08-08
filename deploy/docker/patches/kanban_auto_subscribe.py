@@ -45,9 +45,32 @@ Same contract as the manual script it automates: the copied column set is
 ``platform, chat_id, thread_id, user_id, notifier_profile`` (also exactly
 what upstream ``_inherit_notify_subs`` copies), ``INSERT OR IGNORE`` on the
 subscription primary key makes it idempotent — the script remains in place
-as a manual/back-fill tool and double-writes are harmless — ``last_event_id``
-resets to 0 (a fresh card has no terminal events to replay; the notifier
-claims only terminal kinds), and ``created_at`` is re-stamped.
+as a manual/back-fill tool and double-writes are harmless — and
+``created_at`` is re-stamped.
+
+The cursor starts caught up
+---------------------------
+``last_event_id`` is seeded at the child's current ``MAX(task_events.id)``
+rather than at 0, because a subscriber wants the events that happen after it
+subscribes and nothing before. Both upstream seeding paths in
+``hermes_cli/kanban_db.py`` already do this and each records the bug that
+taught them to: ``add_notify_sub`` snaps to the head because a cursor of 0
+on an already-active task made the notifier replay every historical terminal
+event on its next tick, a boot-time burst of 100+ messages (issue #29905),
+and ``_inherit_notify_subs`` does it so ``link_tasks(parent,
+existing_child)`` does not replay the child's pre-link history.
+
+This patch needs it for a third reason, and the reason is not theoretical.
+``kanban_create`` accepts an ``idempotency_key``, and ``create_task`` answers
+a repeat key by returning the id of the *existing* card — before it opens
+``write_txn``, without creating anything. The ``new_tid`` this patch hooks is
+therefore not always a new card: a worker that re-issues an idempotent create
+gets back a card that may have run, blocked and completed days earlier.
+Seeded at 0, the row written below made the notifier's very next tick post
+that entire history into the user's chat thread — the status transition, the
+block, and the completion line for work nobody had just asked about. Seeded
+at the head, the same worker gets exactly what it wanted: this card's future
+events, in the thread that asked for them.
 
 Fail-soft throughout: any exception is logged and swallowed. A notification
 bookkeeping failure must never fail the ``kanban_create`` the worker is
@@ -65,9 +88,10 @@ from typing import Union
 logger = logging.getLogger(__name__)
 
 #: The subscription columns copied parent -> child. ``task_id`` is rewritten,
-#: ``created_at`` re-stamped, ``last_event_id`` reset to 0. Matches both the
-#: manual propagate script and upstream ``_inherit_notify_subs`` so a schema
-#: drift shows up here as a clear error instead of a silently wrong copy.
+#: ``created_at`` re-stamped, ``last_event_id`` seeded at the child's own
+#: head. Matches both the manual propagate script and upstream
+#: ``_inherit_notify_subs`` so a schema drift shows up here as a clear error
+#: instead of a silently wrong copy.
 COPY_COLUMNS = ("platform", "chat_id", "thread_id", "user_id", "notifier_profile")
 
 #: The env var the dispatcher pins into every worker it spawns: the id of the
@@ -91,6 +115,10 @@ def inherit_subscriptions(
     manual script documents: the notifier unsubscribes only when a task turns
     terminal, so a row for a card that does not exist would be scanned on
     every notifier tick for the life of the board.
+
+    The row is seeded at the child's current event head, so an already-active
+    child — the card an idempotent ``kanban_create`` hands back — does not
+    replay its history into the thread. See the module docstring.
     """
     try:
         if not child_task_id or not parent_task_id:
@@ -106,8 +134,15 @@ def inherit_subscriptions(
         else:
             conn = conn_or_db_path
         try:
+            # One statement answers both questions this function has to ask
+            # about the child: is it on the board at all, and where does its
+            # event history already end. A row means it exists; the value is
+            # the cursor to start the subscriber at.
             row = conn.execute(
-                "SELECT 1 FROM tasks WHERE id = ?", (child_task_id,)
+                "SELECT COALESCE("
+                "    (SELECT MAX(id) FROM task_events WHERE task_id = ?), 0"
+                ") FROM tasks WHERE id = ?",
+                (child_task_id, child_task_id),
             ).fetchone()
             if row is None:
                 logger.warning(
@@ -116,16 +151,17 @@ def inherit_subscriptions(
                     child_task_id,
                 )
                 return 0
+            head = int(row[0])
             cols = ", ".join(COPY_COLUMNS)
             cur = conn.execute(
                 f"""
                 INSERT OR IGNORE INTO kanban_notify_subs
                     (task_id, {cols}, created_at, last_event_id)
-                SELECT ?, {cols}, ?, 0
+                SELECT ?, {cols}, ?, ?
                   FROM kanban_notify_subs
                  WHERE task_id = ?
                 """,
-                (child_task_id, int(time.time()), parent_task_id),
+                (child_task_id, int(time.time()), head, parent_task_id),
             )
             written = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
             # kanban_db connections run autocommit with explicit BEGIN
@@ -136,8 +172,8 @@ def inherit_subscriptions(
             if written:
                 logger.info(
                     "kanban_auto_subscribe: %s inherited %d subscription "
-                    "row(s) from %s",
-                    child_task_id, written, parent_task_id,
+                    "row(s) from %s, watching from event %d",
+                    child_task_id, written, parent_task_id, head,
                 )
             return written
         finally:
@@ -157,12 +193,13 @@ def maybe_inherit_worker_subscriptions(conn, child_task_id: str) -> int:
     The single call the patched ``kanban_create`` handler makes. A process
     with no ``HERMES_KANBAN_TASK`` (chat session, CLI, cron) is left exactly
     as upstream — ``_maybe_auto_subscribe`` and ``_inherit_notify_subs``
-    already cover those paths. Never raises.
+    already cover those paths.
+
+    Never raises, but the guarantee lives one level down: reading an env var
+    cannot fail, and every statement that can — the board reads and the
+    insert — is inside :func:`inherit_subscriptions`'s own catch-all.
     """
-    try:
-        parent = (os.environ.get(WORKER_TASK_ENV) or "").strip()
-    except Exception:
-        return 0
+    parent = (os.environ.get(WORKER_TASK_ENV) or "").strip()
     if not parent or parent == child_task_id:
         return 0
     return inherit_subscriptions(conn, child_task_id, parent)

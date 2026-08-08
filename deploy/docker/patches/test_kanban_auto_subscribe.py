@@ -37,7 +37,22 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT);
+CREATE TABLE IF NOT EXISTS task_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    TEXT NOT NULL,
+    run_id     INTEGER,
+    kind       TEXT NOT NULL,
+    payload    TEXT,
+    created_at INTEGER NOT NULL
+);
 """
+
+# The kinds gateway/kanban_watchers.py claims for a subscriber. A cursor left
+# behind any of these is a message the user receives.
+TERMINAL_KINDS = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out",
+    "status", "archived", "unblocked", "block_loop_detected",
+)
 
 PARENT = "t_b9659077"  # the coordinator card from the 2026-08-07 incident
 CHILD = "t_f54bd6b5"   # the synthesizer whose answer sat undelivered 91.3s
@@ -70,6 +85,37 @@ def child_rows(conn):
     ).fetchall()
 
 
+def add_events(conn, task_id, *kinds):
+    """Give a card some history, the way hermes_cli.kanban_db._append_event does."""
+    conn.executemany(
+        "INSERT INTO task_events (task_id, kind, payload, created_at)"
+        " VALUES (?, ?, NULL, 0)",
+        [(task_id, k) for k in kinds],
+    )
+    conn.commit()
+
+
+def would_replay(conn, task_id):
+    """The events the notifier's next tick would post, given the stored cursor.
+
+    The query gateway/kanban_watchers.py runs through
+    hermes_cli.kanban_db.unseen_events_for_sub: the subscription's own kinds
+    filter applied to everything past its cursor.
+    """
+    marks = ",".join("?" * len(TERMINAL_KINDS))
+    return [
+        r[0]
+        for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ?"
+            f" AND kind IN ({marks})"
+            "   AND id > (SELECT last_event_id FROM kanban_notify_subs"
+            "              WHERE task_id = ?)"
+            " ORDER BY id",
+            (task_id, *TERMINAL_KINDS, task_id),
+        ).fetchall()
+    ]
+
+
 class InheritSubscriptionsTest(unittest.TestCase):
     def test_the_child_gets_the_parents_subscription(self):
         conn = board()
@@ -84,13 +130,52 @@ class InheritSubscriptionsTest(unittest.TestCase):
         self.assertEqual(row["user_id"], "U1")
         self.assertEqual(row["notifier_profile"], "default")
 
-    def test_last_event_id_resets_and_created_at_is_restamped(self):
+    def test_created_at_is_restamped(self):
         conn = board()
         subscribe(conn, PARENT)
         inherit_subscriptions(conn, CHILD, PARENT)
-        row = child_rows(conn)[0]
-        self.assertEqual(row["last_event_id"], 0, "the child's own events start fresh")
-        self.assertGreater(row["created_at"], 1000)
+        self.assertGreater(child_rows(conn)[0]["created_at"], 1000)
+
+    def test_a_child_with_no_history_starts_at_zero(self):
+        conn = board()
+        subscribe(conn, PARENT)
+        inherit_subscriptions(conn, CHILD, PARENT)
+        self.assertEqual(child_rows(conn)[0]["last_event_id"], 0)
+
+    def test_the_cursor_starts_at_the_childs_own_head_not_the_parents(self):
+        # The cursor is scoped to the child's task_id, so the parent's much
+        # longer history must not move it.
+        conn = board()
+        subscribe(conn, PARENT)
+        add_events(conn, PARENT, "created", "status", "completed")
+        add_events(conn, CHILD, "created")
+        child_head = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?", (CHILD,)
+        ).fetchone()[0]
+        inherit_subscriptions(conn, CHILD, PARENT)
+        self.assertEqual(child_rows(conn)[0]["last_event_id"], child_head)
+
+    def test_a_card_handed_back_by_an_idempotent_create_replays_nothing(self):
+        # kanban_create takes an idempotency_key, and create_task answers a
+        # repeat key by returning the id of the existing card. A worker that
+        # re-issues one gets back a card that already ran, blocked and
+        # completed; seeded at 0 this row made the notifier's next tick post
+        # that whole history into the user's thread.
+        conn = board()
+        subscribe(conn, PARENT)
+        add_events(conn, CHILD, "created", "status", "blocked", "unblocked", "completed")
+        inherit_subscriptions(conn, CHILD, PARENT)
+        self.assertEqual(would_replay(conn, CHILD), [])
+
+    def test_events_written_after_the_subscription_are_still_delivered(self):
+        # Catching the cursor up must not make the subscription inert: the
+        # card's own future is the entire reason the row exists.
+        conn = board()
+        subscribe(conn, PARENT)
+        add_events(conn, CHILD, "created", "status")
+        inherit_subscriptions(conn, CHILD, PARENT)
+        add_events(conn, CHILD, "completed")
+        self.assertEqual(would_replay(conn, CHILD), ["completed"])
 
     def test_only_the_documented_columns_are_copied(self):
         # chat_type / delivery_metadata stay NULL — the same set upstream's

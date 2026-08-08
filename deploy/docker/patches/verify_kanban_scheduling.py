@@ -55,6 +55,13 @@ def status(conn, tid):
     return row["status"] if row else None
 
 
+def failures(conn, tid):
+    row = conn.execute(
+        "SELECT consecutive_failures FROM tasks WHERE id = ?", (tid,)
+    ).fetchone()
+    return int(row["consecutive_failures"] or 0) if row else None
+
+
 def kinds(conn, tid):
     return [
         r["kind"]
@@ -117,9 +124,10 @@ check(
     f"parent stuck in {status(conn, parent)!r}",
 )
 
-# Guard 2: a real fan-in must survive one of its inputs blocking. Releasing a
-# is pointless while b is still unfinished, so the pipeline is left intact.
-# (The first version of this patch failed exactly here, inverting a -> sink.)
+# A real fan-in must survive one of its inputs blocking. The sink was planned
+# before a was ever claimed, so it is nobody's fan-out, and releasing a would be
+# pointless anyway while b is unfinished. (The first version of this patch
+# failed exactly here, inverting a -> sink.)
 conn = fresh()
 a = new_card(conn, "researcher a")
 b = new_card(conn, "researcher b")
@@ -143,19 +151,29 @@ check(
     "the pipeline was turned around",
 )
 
-# Guard 1: a card with a genuine unfinished prerequisite is waiting on that,
-# not on its own successors. Its downstream must not be rewritten.
+# An ordinary pipeline stage that blocks for a reason of its own. This is the
+# scenario the patch shipped broken: by the time `mid` runs its prerequisite is
+# `done`, so the parent-set test that used to guard the repair could not tell it
+# apart from the t_ab112f5b deadlock and inverted mid -> tail, dispatching the
+# final stage ahead of the middle one. Driven through claim_task rather than a
+# raw UPDATE precisely because that is what makes the parents settled.
 conn = fresh()
 upstream = new_card(conn, "prerequisite")
 mid = new_card(conn, "middle stage", parents=[upstream])
 tail = new_card(conn, "final stage", parents=[mid])
-conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (mid,))
+conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (upstream,))
 conn.commit()
-K.block_task(conn, mid, reason="waiting on the prerequisite", kind="dependency")
+K.recompute_ready(conn)
 check(
-    "a block that can hold is left alone",
+    "the middle stage claims once its prerequisite is done",
+    K.claim_task(conn, mid) is not None,
+    f"mid stuck in {status(conn, mid)!r}",
+)
+K.block_task(conn, mid, reason="waiting on an external approval", kind="dependency")
+check(
+    "a pipeline stage that blocks is left alone",
     "dependency_repaired" not in kinds(conn, mid),
-    "the repair rewrote a pipeline whose wait was already enforceable",
+    "the repair rewrote a pipeline it had no hand in creating",
 )
 check(
     "the pipeline keeps its direction",
@@ -163,6 +181,12 @@ check(
         "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?", (mid, tail)
     ).fetchone()
     is not None,
+)
+K.recompute_ready(conn)
+check(
+    "the final stage still waits its turn",
+    K.claim_task(conn, tail) is None,
+    "the successor was dispatched ahead of the stage it follows",
 )
 
 # --- B. Claim fencing across a container restart ----------------------------
@@ -198,15 +222,84 @@ check(
 )
 check(
     "the card is handed back rather than left for the 900s TTL",
-    status(conn, orphan) in ("todo", "ready"),
+    status(conn, orphan) == "ready",
     f"left in {status(conn, orphan)!r}",
 )
 events = kinds(conn, orphan)
 check("the release is recorded as reclaimed", "reclaimed" in events)
 check(
-    "the card keeps its retry budget",
+    "one gateway crash costs the card one retry, not the card",
     "gave_up" not in events and "crashed" not in events,
     f"events: {events}",
+)
+check(
+    "and that retry is actually spent",
+    failures(conn, orphan) == 1,
+    f"consecutive_failures is {failures(conn, orphan)}, so nothing bounds a reclaim loop",
+)
+
+
+def reclaim_cycle(conn, tid, cycle):
+    """One turn of claim -> the dispatcher dies -> the successor sweeps."""
+    K.claim_task(conn, tid, claimer=f"{pod}:{900 + cycle}")
+    conn.execute(
+        "UPDATE tasks SET worker_pid = ?, started_at = 1 WHERE id = ?", (DEAD_PID, tid)
+    )
+    conn.commit()
+    K.detect_crashed_workers(conn)
+    K.recompute_ready(conn)
+
+
+# A card that kills the dispatcher gets reclaimed by whatever comes up next.
+# Uncharged that is a closed loop — claim, restart, reclaim, promote, forever —
+# so the breaker has to be on this path, at its own threshold.
+conn = fresh()
+poison = new_card(conn, "card whose work takes the gateway down with it")
+K.recompute_ready(conn)
+for cycle in range(K.DEFAULT_FAILURE_LIMIT + 2):
+    if status(conn, poison) == "blocked":
+        break
+    reclaim_cycle(conn, poison, cycle)
+check(
+    "a card that keeps killing its dispatcher is parked instead of cycling",
+    status(conn, poison) == "blocked",
+    f"still {status(conn, poison)!r} with {failures(conn, poison)} failures after "
+    f"{K.DEFAULT_FAILURE_LIMIT + 2} reclaims",
+)
+check(
+    "the breaker used its own budget rather than a second one",
+    failures(conn, poison) >= K.DEFAULT_FAILURE_LIMIT,
+    f"parked at {failures(conn, poison)} of {K.DEFAULT_FAILURE_LIMIT}",
+)
+check("parking the poison card is announced", "gave_up" in kinds(conn, poison))
+check(
+    "a parked card stays parked",
+    K.claim_task(conn, poison) is None,
+    "recompute_ready promoted a card the breaker had given up on",
+)
+
+# The founding property of this patch: one infrastructure event must never
+# abandon every card that happened to be in flight. Six identical reclaim
+# messages must not read as one systemic fault.
+conn = fresh()
+fleet = [new_card(conn, f"card {n} in flight during the rollout") for n in range(6)]
+K.recompute_ready(conn)
+for n, tid in enumerate(fleet):
+    K.claim_task(conn, tid, claimer=f"{pod}:{800 + n}")
+    conn.execute(
+        "UPDATE tasks SET worker_pid = ?, started_at = 1 WHERE id = ?", (DEAD_PID, tid)
+    )
+conn.commit()
+K.detect_crashed_workers(conn)
+check(
+    "a rollout hands every in-flight card back at once",
+    all(status(conn, t) == "ready" for t in fleet),
+    f"statuses: {[status(conn, t) for t in fleet]}",
+)
+check(
+    "and abandons none of them",
+    all(failures(conn, t) == 1 for t in fleet),
+    f"failures: {[failures(conn, t) for t in fleet]}",
 )
 
 # Our own dead worker must still be adjudicated — the fence narrows the check,
@@ -243,17 +336,65 @@ check(
     "the sweep reclaimed a card from a process that is still running it",
 )
 
-# --- C. Per-worker crashes must not look systemic ---------------------------
+# --- C. A burst of identical crashes must still look systemic ---------------
+#
+# ``_error_fingerprint`` is reachable from exactly two call sites, both inside
+# ``detect_crashed_workers``, and every message that path builds carries a pid.
+# So the ``pid N`` substitution is not cosmetic: without it no two concurrent
+# workers can share a bucket, ``_fp_counts`` never reaches 3, and the heuristic
+# that halts a board where everything is failing the same way is dead code.
+# This patch leaves the substitution alone — the fence above is what keeps a
+# predecessor's workers out of the bucket in the first place.
 print("failure fingerprints:")
-prints = {K._error_fingerprint(f"pid {p} not alive") for p in range(1044, 1050)}
+for template in ("pid {} not alive", "pid {} exited with code 137"):
+    prints = {K._error_fingerprint(template.format(p)) for p in range(1044, 1050)}
+    check(
+        f"six workers felled by one event share a fingerprint ({template})",
+        len(prints) == 1,
+        f"split into {len(prints)} — the systemic heuristic can never reach 3",
+    )
 check(
-    "six dead workers produce six fingerprints",
-    len(prints) == 6,
-    f"collapsed to {len(prints)} — failure_limit would drop to 1",
+    "distinct faults keep distinct fingerprints",
+    K._error_fingerprint("pid 1044 exited with code 137")
+    != K._error_fingerprint("pid 1044 killed by signal 9"),
 )
+
+# And the detector it feeds must actually fire, through the real engine.
+DEAD_PIDS = [DEAD_PID - n for n in range(4)]
+check("the probe pids really are dead", not any(K._pid_alive(p) for p in DEAD_PIDS))
+
+conn = fresh()
+burst = [new_card(conn, f"card {n} whose worker was OOM-killed") for n in range(4)]
+K.recompute_ready(conn)
+for tid, p in zip(burst, DEAD_PIDS):
+    K.claim_task(conn, tid)
+    conn.execute(
+        "UPDATE tasks SET worker_pid = ?, started_at = 1 WHERE id = ?", (p, tid)
+    )
+conn.commit()
+K.detect_crashed_workers(conn)
 check(
-    "a genuinely repeated error still groups",
-    len({K._error_fingerprint("provider returned 503") for _ in range(4)}) == 1,
+    "four of our own workers dying the same way in one tick reads as systemic",
+    all(status(conn, t) == "blocked" for t in burst),
+    f"statuses: {[status(conn, t) for t in burst]} — is_systemic never fired",
+)
+
+# Below the heuristic's threshold nothing is systemic: two crashes are two
+# crashes, and each card keeps the rest of its budget.
+conn = fresh()
+pair = [new_card(conn, f"card {n} whose worker died alone") for n in range(2)]
+K.recompute_ready(conn)
+for tid, p in zip(pair, DEAD_PIDS):
+    K.claim_task(conn, tid)
+    conn.execute(
+        "UPDATE tasks SET worker_pid = ?, started_at = 1 WHERE id = ?", (p, tid)
+    )
+conn.commit()
+K.detect_crashed_workers(conn)
+check(
+    "two crashes in a tick are just two crashes",
+    all(status(conn, t) == "ready" for t in pair),
+    f"statuses: {[status(conn, t) for t in pair]} — the heuristic fired below 3",
 )
 
 print()

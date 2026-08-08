@@ -21,14 +21,44 @@ that does exactly what the schema now asks (status line in ``summary``, the
 deliverable in ``result``) would still send a chat message announcing a
 catalogue it never shows.
 
-This module supplies the missing text. It is **appended to the completion
-message the notifier already builds**, rather than sent as a second message,
-and that is deliberate: the existing send site is wrapped in the notifier's
-failure counter, cursor rewind, and subscription-drop logic
+This module supplies the missing text. It goes into **the completion message
+the notifier already builds**, rather than a second message, and that is
+deliberate: the existing send site is wrapped in the notifier's failure
+counter, cursor rewind, and subscription-drop logic
 (``gateway/kanban_watchers.py``). One message inherits all of it. A follow-up
 ``adapter.send()`` would sit outside that machinery, after the cursor has
 advanced, and would need its own — a second failure path guarding the payload
 that matters most.
+
+The notifier's own clip gives way
+---------------------------------
+:func:`handoff_with_result` replaces the notifier's ``handoff`` rather than
+appending to it, and it has to. Where the completion event carries no
+``summary``, ``kanban_watchers.py`` builds the status line out of the very
+field this module exists to deliver::
+
+    elif task and task.result:
+        r = _clip_handoff(task.result)
+        handoff = f"\n{r}"
+
+``delivered`` is then a 1200-character clip of ``result``, so asking whether
+``result`` already appears inside it — the containment test
+:func:`result_block` does — is asking whether a report fits inside its own
+prefix. Under ``kanban_handoff_clip.DEFAULT_LIMIT`` it does, and the block
+correctly stays empty. Over it, it never does: the message went out carrying
+the first 1200 characters of the report, the ``[…]`` marker, a blank line,
+and then the same report over again from the top. Measured on a 60-line cron
+catalogue, jobs 1 to 19 arrived twice. Every result long enough to need this
+module at all was delivered doubled, because ``RESULT_LIMIT`` is 30000
+precisely for reports that outgrow a status line.
+
+Appending cannot fix that — only the caller of the clip can decide the clip
+was a mistake — so the hook returns the finished tail instead. When the status
+line is merely a clipped prefix of the report, it is dropped and the report is
+sent once, whole. That branch got *more* reachable, not less, when
+``tools/kanban_result_required.py`` began folding a whitespace-only
+``summary`` to ``None`` to stop ``complete_task`` indexing line zero of a
+blank string and wedging the card.
 
 Length is safe on both platforms this harness ships to. The notifier calls
 ``adapter.send()`` directly, and ``send()`` chunks: the Slack adapter declares
@@ -42,9 +72,9 @@ rather than to fit a single message.
 from __future__ import annotations
 
 try:  # in-image: both modules live in the gateway package
-    from gateway.kanban_handoff_clip import clip_handoff
+    from gateway.kanban_handoff_clip import ELLIPSIS, clip_handoff
 except ImportError:  # host-side unit tests: siblings in deploy/docker/patches
-    from kanban_handoff_clip import clip_handoff
+    from kanban_handoff_clip import ELLIPSIS, clip_handoff
 
 #: How much of ``result`` reaches chat. The status line's own budget is 1200
 #: (``kanban_handoff_clip.DEFAULT_LIMIT``) because it is a status line; this is
@@ -89,8 +119,6 @@ def result_block(
     if not body:
         return ""
     normalised = _normalise(body)
-    if not normalised:
-        return ""
     if delivered and normalised in _normalise(str(delivered)):
         return ""
     clipped = clip_handoff(body, limit)
@@ -99,16 +127,44 @@ def result_block(
     return SEPARATOR + clipped
 
 
-def result_block_for_task(delivered: object, task: object) -> str:
-    """``result_block`` against a task row, tolerating a missing or odd row.
+def _is_clipped_prefix_of(delivered: str, body: str) -> bool:
+    """Whether ``delivered`` is just the opening of ``body``, possibly clipped.
 
-    The notifier holds ``task`` as whatever ``_kb.get_task`` returned, which is
-    ``None`` for a row that vanished between the claim and the send. Called on
-    the delivery path, so it fails to the empty string rather than raising: a
-    completion notification that loses its report is bad, one that raises and
-    rewinds the cursor forever is worse.
+    Written as a prefix test rather than an equality test against
+    ``clip_handoff(body)`` so it still holds if the notifier's status line is
+    built some other way. Upstream's own version of that line was a raw
+    ``lines[0][:160]`` slice before the ``kanban_handoff_clip`` edit replaced
+    it, and either shape is the same fact about the message: the reader has
+    seen this text already, and is about to see all of it.
     """
+    head = _normalise(delivered)
+    marker = _normalise(ELLIPSIS)
+    if marker and head.endswith(marker):
+        head = head[: -len(marker)].rstrip()
+    return bool(head) and _normalise(body).startswith(head)
+
+
+def handoff_with_result(delivered: object, task: object) -> str:
+    """Return the completion message's whole tail: status line and report.
+
+    Replaces the notifier's ``handoff`` — see the module docstring for why
+    appending to it cannot work. ``delivered`` is what the notifier built,
+    ``task`` is whatever ``_kb.get_task`` returned, which is ``None`` for a row
+    that vanished between the claim and the send.
+
+    Fails to ``delivered`` unchanged rather than raising. This runs on the
+    delivery path: a completion notification that loses its report is bad, one
+    that raises, rewinds the cursor and re-sends forever is worse, and one that
+    drops the status line it already had is worse again.
+    """
+    text = "" if delivered is None else str(delivered)
     try:
-        return result_block(delivered, getattr(task, "result", None))
+        result = getattr(task, "result", None)
+        block = result_block(text, result)
+        if not block:
+            return text
+        if _is_clipped_prefix_of(text, str(result).strip()):
+            return block
+        return text + block
     except Exception:  # pragma: no cover - defensive
-        return ""
+        return text

@@ -59,6 +59,15 @@ read-only filesystem must not fail the board write it rides on);
 The mtime is bumped with an explicit ``time.time_ns()`` value so two nudges
 inside one coarse filesystem-timestamp tick still compare unequal.
 
+Exactly one of those degradations is logged, and the split is deliberate:
+:meth:`WakeMonitor.__init__` runs once per watcher loop, and a resolver that
+raises there leaves the loop polling at the full interval for the lifetime of
+the gateway — a permanent, total loss of the acceleration whose only symptom
+is the per-hop latency this patch was written to remove. Everything else here
+runs either on the tail of every board write or once per 0.25s slice, where a
+log line per occurrence would be a log storm and the loss is one nudge, so
+those stay silent.
+
 Multi-board note: each watcher monitors the wake file of the board DB that
 ``kanban_db_path()`` resolves for it (the ``HERMES_KANBAN_DB`` pin on the
 cluster, which is also what the dispatcher injects into every worker).
@@ -69,9 +78,12 @@ as upstream.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from typing import Callable, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 #: Longest a watcher dozes between wake-file checks. The reaction ceiling for
 #: a nudge, and the cost ceiling for an idle board: one stat() per slice.
@@ -120,6 +132,13 @@ def record_wake(db_path: Union[str, "os.PathLike[str]"]) -> bool:
             os.utime(path, ns=(now_ns, now_ns))
         return True
     except Exception:
+        # Silent on purpose, and the purpose is not tidiness: this runs on the
+        # tail of every committed board write in every worker process, so a
+        # board directory that is read-only or full would emit a line per card
+        # rather than the one degradation an operator needs to see. The caller
+        # gets False, the loss is a single nudge, and the write it rides on has
+        # already committed. WakeMonitor's constructor is where a permanent
+        # failure of this mechanism does get reported.
         return False
 
 
@@ -144,6 +163,9 @@ def record_wake_for_conn(conn) -> bool:
                 return False
         return False
     except Exception:
+        # Same write-path reasoning as record_wake: silent by design, because
+        # this is reached from inside kanban_db's producers on every create,
+        # complete, and unblock.
         return False
 
 
@@ -153,6 +175,9 @@ class WakeMonitor:
     ``db_path`` may be the path itself or a zero-arg callable returning it
     (the watchers pass ``kanban_db.kanban_db_path`` uncalled, so a resolver
     error degrades this monitor instead of killing the watcher coroutine).
+    That degradation is logged, because it is permanent: the constructor runs
+    once, where the watcher loop starts, so a monitor born inert stays inert
+    and the loop polls at the full interval until the gateway restarts.
 
     ``changed()`` is edge-triggered: True exactly once per observed mtime
     move, so a burst of nudges between two polls costs one early scan, not
@@ -170,7 +195,19 @@ class WakeMonitor:
             resolved = db_path() if callable(db_path) else db_path
             if resolved is not None:
                 self._path = wake_path(resolved)
-        except Exception:
+        except Exception as exc:
+            # The one degradation in this module worth a log line. Swallowing
+            # it keeps the watcher coroutine alive, which is right, but an
+            # inert monitor makes `wait_interval` identical to the fixed sleep
+            # it replaced — so the gateway silently goes back to paying the
+            # 2.5s-average claim and notify delays measured on 2026-08-07, and
+            # nothing anywhere says why. Named at WARNING so the cause is one
+            # grep away from the symptom.
+            logger.warning(
+                "kanban wake nudge: could not resolve the board path (%s); "
+                "this watcher falls back to plain interval polling",
+                exc,
+            )
             self._path = None
         self._last = self._stat()
 
@@ -179,9 +216,12 @@ class WakeMonitor:
             return None
         try:
             return os.stat(self._path).st_mtime_ns
-        except OSError:
-            return None
         except Exception:
+            # Unlike the constructor, deliberately silent: this is called once
+            # per 0.25s slice in both watcher loops, so logging a missing or
+            # unreadable wake file would cost eight lines a second forever. A
+            # file that cannot be statted reads as "quiet", which is precisely
+            # the upstream poll.
             return None
 
     def changed(self) -> bool:
@@ -227,6 +267,12 @@ async def wait_interval(
             if monitor is not None and monitor.changed():
                 return True
         except Exception:
+            # Same per-slice reasoning as WakeMonitor._stat, and the same
+            # outcome: a monitor that raises is read as "no nudge ever" and
+            # this wait becomes the fixed sleep it replaced. A monitor
+            # constructed by the patched watchers cannot reach here — its own
+            # _stat swallows everything — so this only catches a caller that
+            # passed something other than a WakeMonitor.
             pass
         remaining = deadline - time.monotonic()
         if remaining <= 0:

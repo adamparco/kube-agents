@@ -4,18 +4,22 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 """
 
 import copy
+import time
 import unittest
 
 import kanban_result_required as krr
 from kanban_result_required import (
     MISSING_RESULT_ERROR,
+    NEW_GATE,
     NEW_RESULT_DESCRIPTION,
     NEW_SUMMARY_DESCRIPTION,
     NEW_TOOL_DESCRIPTION,
+    NUDGE_TTL_SECONDS,
     OLD_RESULT_DESCRIPTION,
     OLD_SUMMARY_DESCRIPTION,
     OLD_TOOL_DESCRIPTION,
     apply_schema,
+    blank_to_none,
     require_result,
 )
 
@@ -28,6 +32,17 @@ INCIDENT_SUMMARY = (
     "active configurations."
 )
 INCIDENT_RESULT = "\n".join(f"{i}. cron-job-{i} — schedule 0 {i} * * *" for i in range(1, 10))
+
+
+def _ev_summary(summary, result):
+    """``complete_task``'s event-summary expression, copied from upstream.
+
+    ``hermes_cli/kanban_db.py`` runs this inside ``write_txn`` after the UPDATE
+    to ``done``, so anything it raises rolls the completion back and reaches the
+    worker as ``kanban_complete: list index out of range``.
+    """
+    ev_summary = (summary if summary is not None else result) or ""
+    return ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
 
 
 def _schema():
@@ -49,8 +64,12 @@ def _schema():
 
 class RequireResultTest(unittest.TestCase):
     def setUp(self):
-        krr._nudged.clear()
-        self.addCleanup(krr._nudged.clear)
+        krr._refused_at.clear()
+        self.addCleanup(krr._refused_at.clear)
+
+    def _expire(self, task_id):
+        """Age the outstanding refusal for ``task_id`` past NUDGE_TTL_SECONDS."""
+        krr._refused_at[str(task_id)] = time.monotonic() - NUDGE_TTL_SECONDS - 1
 
     def test_a_result_passes_through_untouched(self):
         err, out = require_result("t_1", INCIDENT_SUMMARY, INCIDENT_RESULT)
@@ -110,6 +129,83 @@ class RequireResultTest(unittest.TestCase):
         # str(1) == "1" — the same key, correctly.
         err, _ = require_result("1", "s", None)
         self.assertIsNone(err)
+
+    def test_a_completed_card_leaves_no_refusal_behind(self):
+        # The mapping is the cards still awaiting a retry, not a ledger of every
+        # card ever refused. A gateway session completes cards for the life of
+        # the pod, so a ledger there is both a leak and a disabled gate.
+        require_result("t_1", INCIDENT_SUMMARY, None)
+        require_result("t_1", INCIDENT_SUMMARY, INCIDENT_RESULT)
+        self.assertEqual(krr._refused_at, {})
+
+    def test_a_card_reopened_after_a_refusal_is_nudged_again(self):
+        # The 2026-08-07 regression: an orchestrator refused t_1, the card was
+        # reopened and retried, and the second content-free completion was
+        # accepted in silence because the process still remembered the refusal.
+        require_result("t_1", INCIDENT_SUMMARY, None)
+        require_result("t_1", INCIDENT_SUMMARY, INCIDENT_RESULT)
+        err, _ = require_result("t_1", INCIDENT_SUMMARY, None)
+        self.assertEqual(err, MISSING_RESULT_ERROR)
+
+    def test_a_stale_refusal_belongs_to_a_different_attempt(self):
+        # A refusal nobody came back for within NUDGE_TTL_SECONDS is not the
+        # first half of this completion, so this completion gets its own nudge.
+        require_result("t_1", INCIDENT_SUMMARY, None)
+        self._expire("t_1")
+        err, _ = require_result("t_1", INCIDENT_SUMMARY, None)
+        self.assertEqual(err, MISSING_RESULT_ERROR)
+
+    def test_expiry_delays_the_close_by_one_call_and_no_more(self):
+        # Expiry must not reintroduce the wedge. A caller that retries promptly
+        # is inside the window on its next call, so the card still closes.
+        require_result("t_1", INCIDENT_SUMMARY, None)
+        self._expire("t_1")
+        require_result("t_1", INCIDENT_SUMMARY, None)
+        err, out = require_result("t_1", INCIDENT_SUMMARY, None)
+        self.assertIsNone(err)
+        self.assertEqual(out, INCIDENT_SUMMARY)
+
+    def test_a_whitespace_only_result_is_never_stored(self):
+        # It survived the gate as the promoted value and raised IndexError in
+        # complete_task's write_txn, rolling the completion back — with the
+        # nudge already spent, so the identical retry failed identically.
+        require_result("t_1", None, "   \n\t ")
+        err, out = require_result("t_1", None, "   \n\t ")
+        self.assertIsNone(err)
+        self.assertIsNone(out)
+        self.assertEqual(_ev_summary(None, out), "")
+
+    def test_a_whitespace_only_summary_is_never_promoted(self):
+        require_result("t_1", " \n ", None)
+        err, out = require_result("t_1", " \n ", None)
+        self.assertIsNone(err)
+        self.assertIsNone(out)
+
+    def test_upstream_would_have_raised_on_the_value_the_gate_now_folds(self):
+        # Guards the premise: if complete_task ever stops indexing line zero of
+        # a stripped string, this fails and blank_to_none can be reconsidered.
+        with self.assertRaises(IndexError):
+            _ev_summary(None, "   \n\t ")
+        with self.assertRaises(IndexError):
+            _ev_summary(" ", INCIDENT_RESULT)
+
+
+class BlankToNoneTest(unittest.TestCase):
+    def test_content_is_returned_byte_for_byte(self):
+        # kanban_complete has already redacted these; trimming them here would
+        # silently edit what redact_sensitive_text produced.
+        for value in (INCIDENT_RESULT, " leading and trailing ", "x"):
+            self.assertEqual(blank_to_none(value), value)
+
+    def test_every_shape_of_empty_becomes_none(self):
+        for value in (None, "", "   ", "\n", "\t \r\n"):
+            self.assertIsNone(blank_to_none(value))
+
+    def test_the_gate_folds_the_summary_the_handler_passes_on(self):
+        # require_result only owns `result`; the handler's own `summary` local
+        # goes straight to kb.complete_task, so the gate has to fold it too.
+        self.assertIn("summary = _blank_to_none(summary)", NEW_GATE)
+        self.assertIn("_require_result(tid, summary, result)", NEW_GATE)
 
 
 class ApplySchemaTest(unittest.TestCase):
