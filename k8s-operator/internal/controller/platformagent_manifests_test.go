@@ -761,6 +761,13 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["API_SERVER_HOST"].Value != "127.0.0.1" {
 		t.Errorf("expected API_SERVER_HOST 127.0.0.1, got %s", envMap["API_SERVER_HOST"].Value)
 	}
+	// Must equal the model renderConfigYAML pins, not merely be non-empty: a
+	// session created without an explicit model persists this string and sends
+	// it upstream, so anything LiteLLM does not serve 400s the session's first
+	// turn. See the env var's comment in platformagent_manifests.go.
+	if envMap["API_SERVER_MODEL_NAME"].Value != "model-default" {
+		t.Errorf("expected API_SERVER_MODEL_NAME model-default, got %s", envMap["API_SERVER_MODEL_NAME"].Value)
+	}
 	if envMap["SESSION_KV_DB_PATH"].Value != "/var/lib/kube-agents/session/session_kv.db" {
 		t.Errorf("expected SESSION_KV_DB_PATH /var/lib/kube-agents/session/session_kv.db, got %s", envMap["SESSION_KV_DB_PATH"].Value)
 	}

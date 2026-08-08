@@ -122,7 +122,12 @@ def call_agent(
     url = f"{protocol}://{clean_host}/v1/chat/completions"
 
     payload = {
-        "model": "hermes-agent",
+        # The name the target's API server advertises on /v1/models, which the
+        # operator pins to the LiteLLM model via API_SERVER_MODEL_NAME. Matching
+        # it means "use the profile's configured default"; any other string is a
+        # real per-request model once `direct_model_requests` is on, and LiteLLM
+        # serves nothing else.
+        "model": "model-default",
         "messages": [{"role": "user", "content": query}]
     }
     payload_bytes = json.dumps(payload).encode("utf-8")

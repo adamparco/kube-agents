@@ -1316,6 +1316,29 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Value: "cluster-internal-trusted",
 		},
 		{
+			// The name the agent API server advertises on /v1/models, pinned to the
+			// real LiteLLM model above rather than left to Hermes' fallback.
+			//
+			// This is not cosmetic. `POST /api/sessions` persists the advertised name
+			// into the session row's `model` column whenever the caller does not name
+			// one (api_server.py `_handle_create_session`: `body.get("model") or
+			// self._model_name`), and a session-persisted model outranks the config
+			// model when the turn is built. So the label is not a label — it becomes
+			// the model string sent upstream.
+			//
+			// Unpinned, `_resolve_model_name` takes the active profile name, or
+			// "hermes-agent" for the `default` profile it skips by name. LiteLLM
+			// serves neither, so every session created without an explicit model —
+			// which is every Kubernetes-event triage session, since
+			// scripts/session_kv_server.py posts only an id and a title — died with
+			// `400 Invalid model name passed in model=hermes-agent` on its first turn.
+			//
+			// Process-level, so it corrects the `platform` profile too: that one
+			// resolves to its own profile name, equally unserved.
+			Name:  "API_SERVER_MODEL_NAME",
+			Value: "model-default",
+		},
+		{
 			Name:  "SESSION_KV_DB_PATH",
 			Value: sessionKVDBPath,
 		},

@@ -608,6 +608,8 @@ spec:
               value: 127.0.0.1
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
+            - name: API_SERVER_MODEL_NAME
+              value: model-default
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
             - name: OTEL_SERVICE_NAME
