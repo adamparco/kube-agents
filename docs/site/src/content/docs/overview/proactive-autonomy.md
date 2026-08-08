@@ -1,9 +1,9 @@
 ---
 title: Proactive autonomy
-description: The background watchdogs that make kube-agents more than a chatbot — audit, remediate, PR, alert.
+description: The background watchdogs that make kube-agents more than a chatbot — audit, remediate, PR.
 ---
 
-Most agent products are reactive: you ask, they answer. `kube-agents` is designed to _also_ act on its own. Cron-scheduled jobs, defined in [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json) ([how they fire](/kube-agents/concepts/autonomous-watchdogs/#how-a-watchdog-fires)), point the Platform Agent at governance SOPs on a rolling schedule. Findings become a standing report issue on your GitOps repo, proposed pull requests against it, and proactive Chat messages.
+Most agent products are reactive: you ask, they answer. `kube-agents` is designed to _also_ act on its own. Cron-scheduled jobs, defined in [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json) ([how they fire](/kube-agents/concepts/autonomous-watchdogs/#how-a-watchdog-fires)), point the Platform Agent at governance SOPs on a rolling schedule. Findings become a standing report issue on your GitOps repo and, where the fix is mergeable, proposed pull requests against it.
 
 ## The hands-free loop
 
@@ -11,10 +11,11 @@ Most agent products are reactive: you ask, they answer. `kube-agents` is designe
 Cron tick  →  Governance SOP  →  Platform Agent investigates  →  fleet-audit / submit-suggestion
                                                               →  Minty mints GitHub token
                                                               →  Ledger issue or pull request opened
-                                                              →  Proactive Chat alert
 ```
 
-Every step is real code shipping in the repo. The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/governance); the [`submit-suggestion`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion) skill wraps the git flow; [Minty](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github) brokers short-lived tokens; the Chat integration is Google Chat by default with Slack as an opt-in.
+Every step is real code shipping in the repo. The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/governance); the [`submit-suggestion`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion) skill wraps the git flow; [Minty](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github) brokers short-lived tokens.
+
+The loop ends at the repo, not in chat. A watchdog's findings reach you as the ledger issue and the pull requests linked to it; the report itself is never posted to a chat channel, and there is nothing to read there that the issue does not already say. The unprompted messages the harness _does_ send come from elsewhere: a cluster event posted to the in-pod triage endpoint, and the first-run inventory report ([ChatOps → Proactive alerts](/kube-agents/concepts/chatops/#proactive-alerts-both-channels)).
 
 ## What runs on its own
 

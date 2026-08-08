@@ -37,21 +37,21 @@ only renders its kubeconfig bootstrap (the `gcloud container clusters get-creden
 the agent a usable kubectl context) when it has the complete triple; with one missing, every
 `kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
-| Field                                    | Type   | Purpose                                                                              |
-| ---------------------------------------- | ------ | ------------------------------------------------------------------------------------ |
-| `clusterName`                            | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies. |
-| `location`                               | string | Cloud region (e.g. `us-central1-a`).                                                 |
-| `projectId`                              | string | GCP Project ID of the cluster. Required.                                             |
-| `hermes.dashboardEnabled`                | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                |
-| `hermes.pluginsDebug`                    | bool   | Enable plugin-level debug logging. Default `false`.                                  |
-| `hermes.agentHome`                       | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                             |
-| `hermes.apiServerSecretRef.name` + `key` | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                       |
-| `memory.memoryEnabled`                   | bool   | Toggle framework memory persistence. Default `false`.                                |
-| `memory.provider`                        | string | Memory provider implementation. Default `multiuser_memory`.                          |
-| `memory.userProfileEnabled`              | bool   | Toggle per-user memory profiling. Default `false`.                                   |
-| `tuning.<persona>.apiMaxRetries`         | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                |
-| `tuning.<persona>.maxTurns`              | int    | Iterations allowed in a single turn. Unset = Hermes default `90`.                    |
-| `tuning.maxInProgress`                   | int    | Board-wide cap on concurrent kanban workers. Unset = uncapped (upstream).            |
+| Field                                    | Type   | Purpose                                                                                          |
+| ---------------------------------------- | ------ | ------------------------------------------------------------------------------------------------ |
+| `clusterName`                            | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.             |
+| `location`                               | string | Cloud region (e.g. `us-central1-a`).                                                             |
+| `projectId`                              | string | GCP Project ID of the cluster. Required.                                                         |
+| `hermes.dashboardEnabled`                | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                            |
+| `hermes.pluginsDebug`                    | bool   | Enable plugin-level debug logging. Default `false`.                                              |
+| `hermes.agentHome`                       | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                         |
+| `hermes.apiServerSecretRef.name` + `key` | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                                   |
+| `memory.memoryEnabled`                   | bool   | Toggle framework memory persistence. Default `false`.                                            |
+| `memory.provider`                        | string | Memory provider implementation. Default `multiuser_memory`.                                      |
+| `memory.userProfileEnabled`              | bool   | Toggle per-user memory profiling. Default `false`.                                               |
+| `tuning.<persona>.apiMaxRetries`         | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                            |
+| `tuning.<persona>.maxTurns`              | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below). |
+| `tuning.maxInProgress`                   | int    | Board-wide cap on concurrent kanban workers. Unset = uncapped (upstream).                        |
 
 ### `spec.harness.tuning`
 
@@ -59,10 +59,16 @@ Execution limits per agent persona, where `<persona>` is one of `default` (the C
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
 `maxInProgress`.
 
-**Everything here is opt-in.** Unset means Hermes' own defaults apply — 3 retries, 90 iterations,
-uncapped dispatch. The operator pins nothing of its own, and the agent image ships no overrides:
-what a fleet needs depends on its model quota and on what its agents actually do, so a deployment
-doing short interactive work should not inherit limits raised for long-running batch work.
+**Everything here is opt-in.** The operator pins nothing of its own: what a fleet needs depends on
+its model quota and on what its agents actually do, so a deployment doing short interactive work
+should not inherit limits raised for long-running batch work. Unset therefore means whatever the
+profile's own `config.yaml` carries, and the `default` and `cluster` configs set no execution limit
+of their own — Hermes' defaults apply there, 3 retries, 90 iterations, uncapped dispatch. The
+`platform` profile is the exception: the image ships `agent.max_turns: 250` in
+`agents/platform/config.yaml` because the fleet audits outgrow 90, and
+[Config reference](/kube-agents/reference/config/#agent) is canonical for why. Setting
+`tuning.platform.maxTurns` here still wins — the overlay is merged after the image force-sync — and
+removing it restores the image's value rather than Hermes'.
 
 ```yaml
 spec:

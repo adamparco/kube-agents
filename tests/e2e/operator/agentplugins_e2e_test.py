@@ -650,7 +650,7 @@ def step5_verify_plugin_logs_and_config(unique_str: str) -> None:
     # copied the image's config over the mount on every start — and no test noticed,
     # because they all stopped at the ConfigMap.
     live = agent_exec_until(
-        f"grep -q {unique_str} {AGENT_HOME}/config.yaml && echo MERGED || echo NOT-MERGED",
+        f"grep -q {unique_str} {AGENT_HOME}/config.yaml && echo MERGED || echo ABSENT",
         "MERGED",
     )
     assert "MERGED" in live, (
@@ -1057,7 +1057,10 @@ def agent_exec_until(script: str, expect: str, timeout_sec: int = 150) -> str:
     as a flaky product rather than a flaky test.
 
     Every probe must print a token for both outcomes, so "not yet" and "the exec broke"
-    stay distinguishable.
+    stay distinguishable. The two tokens must not be substrings of one another: this
+    polls on `expect in out`, so a negative token spelled `NOT-<expect>` matches on the
+    first attempt, returns the failure output as a success, and satisfies the caller's
+    `assert expect in out` as well — the probe and its assertion both go blind.
     """
     deadline = time.time() + timeout_sec
     out = ""
@@ -1180,7 +1183,7 @@ spec:
         probe = agent_exec_until(
             f"test -f {profile_dir}/profile.yaml && test -d {profile_dir}/skills "
             f"&& test -d {profile_dir}/plugins/{TARGETED_PLUGIN_CR_NAME} "
-            f"&& echo INSTALLED || echo NOT-INSTALLED",
+            f"&& echo INSTALLED || echo INCOMPLETE",
             "INSTALLED",
         )
         assert "INSTALLED" in probe, (

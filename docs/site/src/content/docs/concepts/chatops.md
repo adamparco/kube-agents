@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Chat is the harness's primary interface — for both requests from humans and proactive alerts from cron watchdogs. The channels shipping today are **Google Chat** (the reference channel, fully wired and E2E tested; enable with `GOOGLE_CHAT_ENABLED=true` during provisioning) and **Slack** (enable with `SLACK_ENABLED=true` during provisioning). Both are opt-in and default to disabled.
+Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel, fully wired and E2E tested; enable with `GOOGLE_CHAT_ENABLED=true` during provisioning) and **Slack** (enable with `SLACK_ENABLED=true` during provisioning). Both are opt-in and default to disabled.
 
 Both channels terminate at the **Chat Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It discovers which specialists exist (via its `router` MCP tool `list_agents`), and delegates the request to the right one as a card on the shared **kanban board** (`kanban_create`). Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Chat Agent handles the hand-off and anything that blocks or fails. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
@@ -62,18 +62,18 @@ Until you do, a typed `/hermes <subcommand>` arrives as an ordinary channel mess
 
 ### Home channel
 
-`SLACK_HOME_CHANNEL` designates the channel proactive watchdog alerts land in when no user thread is involved. Set it to a monitoring/oncall channel your team already watches.
+`SLACK_HOME_CHANNEL` designates the channel an unprompted message lands in when no user thread is involved. Set it to a monitoring/oncall channel your team already watches.
 
 It is optional at provisioning time: leave the prompt empty and set it later from Slack by running `/sethome` (or `/hermes sethome`) in the channel you want. That writes the value into the **Chat Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
 
 ## Proactive alerts (both channels)
 
-The harness doesn't only reply to messages. When a cron watchdog finds something worth surfacing (a security patch is available, a PR was opened, a cluster is drifting from blueprint), the alert posts to the configured Chat channel unprompted:
+The harness doesn't only reply to messages. A cluster event posted to the in-pod triage endpoint (`inject_message` in [`agents/platform/scripts/session_kv_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/session_kv_server.py)) opens a thread unprompted: it posts the alert first, then runs the triage turn in the thread that alert created. The first-run inventory report arrives the same way, into the thread `bootstrap_onboarding` bound. Where an unprompted message lands:
 
 - **Google Chat**: to the space that owns the interaction, or the space set via `GOOGLE_CHAT_HOME_CHANNEL`.
 - **Slack**: to `SLACK_HOME_CHANNEL`.
 
-See [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) for what triggers these alerts and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
+A governance watchdog's findings are not on this path. An audit publishes to its ledger issue and to the remediation pull requests that link back to it, so the report to read is the issue rather than a channel message — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 
 ## First-run onboarding
 
