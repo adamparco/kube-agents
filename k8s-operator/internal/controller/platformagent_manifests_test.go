@@ -136,12 +136,18 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "mcp-router") {
 		t.Errorf("expected default profile to expose the router MCP, got:\n%s", yamlContent)
 	}
-	// The router script path must track AgentHome. The entrypoint copies
-	// /opt/defaults (carrying scripts/) into $PLATFORM_AGENT_HOME, which the
-	// operator sets from this same AgentHome — so under a custom home the script
-	// is not at /opt/data and a hardcoded path leaves the router MCP dead.
-	if !strings.Contains(yamlContent, "/custom/home/scripts/router_server.py") {
-		t.Errorf("expected router script resolved under AgentHome, got:\n%s", yamlContent)
+	// The router script path must still track AgentHome — the entrypoint copies
+	// /opt/defaults (carrying scripts/) into $PLATFORM_AGENT_HOME, which the operator
+	// sets from this same AgentHome, so under a custom home the script is not at
+	// /opt/data — but it must do so at RUNTIME, via the placeholder the entrypoint
+	// and mcp_tool.py resolve. Baking the resolved path in here is what made this
+	// list disagree with agents/chat/config.yaml, and the startup merge unions
+	// `args` into a two-word command line whose first word does not exist.
+	if !strings.Contains(yamlContent, "${HERMES_HOME}/scripts/router_server.py") {
+		t.Errorf("expected router script left as a ${HERMES_HOME} placeholder, got:\n%s", yamlContent)
+	}
+	if strings.Contains(yamlContent, "/custom/home/scripts/router_server.py") {
+		t.Errorf("router script path must not be resolved at render time, got:\n%s", yamlContent)
 	}
 	if strings.Contains(yamlContent, "/opt/data/scripts/router_server.py") {
 		t.Errorf("router script path must not be hardcoded to /opt/data, got:\n%s", yamlContent)
@@ -3047,39 +3053,58 @@ func TestRenderConfigYAMLListsMatchChatConfig(t *testing.T) {
 		t.Fatalf("unmarshaling %s: %v", path, err)
 	}
 
-	// No CR overrides: only the lists this render always emits are in play. Ones it
-	// emits solely because of spec.harness.tuning are the CR's business, not the
-	// image's, and are covered by the tuning tests.
-	var rendered map[string]any
-	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &rendered); err != nil {
-		t.Fatalf("unmarshaling rendered YAML: %v", err)
+	// Both homes, because a render that interpolates AgentHome into a list agrees with
+	// the image at the default and diverges everywhere else. mcp_servers.router.args did
+	// exactly that, and the single default-home case here said nothing about it.
+	custom := newTestPlatformAgent()
+	custom.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		Hermes: &agentv1alpha1.HermesSpec{AgentHome: "/var/lib/kage"},
 	}
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+	}{
+		{"default agentHome", newTestPlatformAgent()},
+		{"custom agentHome", custom},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// No tuning overrides: only the lists this render always emits are in play.
+			// Ones it emits solely because of spec.harness.tuning are the CR's business,
+			// not the image's, and are covered by the tuning tests.
+			var rendered map[string]any
+			if err := yaml.Unmarshal([]byte(renderConfigYAML(tc.agent, nil)), &rendered); err != nil {
+				t.Fatalf("unmarshaling rendered YAML: %v", err)
+			}
 
-	listPaths := sortedListPaths(rendered)
-	if len(listPaths) == 0 {
-		t.Fatalf("no lists found in the rendered config — the walk is broken, not the render")
-	}
-	compared := 0
-	for _, at := range listPaths {
-		want, ok := lookup(image, at)
-		if !ok {
-			// The image says nothing about it, so there is nothing to union with.
-			continue
-		}
-		wantList, ok := want.([]any)
-		if !ok {
-			t.Errorf("%s is a list in the render but %T in %s", strings.Join(at, "."), want, path)
-			continue
-		}
-		compared++
-		if a, b := sortedStrings(t, listAt(t, rendered, at)), sortedStrings(t, wantList); !slices.Equal(a, b) {
-			t.Errorf("%s differs between the render and agents/chat/config.yaml:\n  rendered: %v\n  image:    %v\n"+
-				"the startup merge unions these, so the image's extras survive whatever this render omits",
-				strings.Join(at, "."), a, b)
-		}
-	}
-	if compared == 0 {
-		t.Errorf("no list was compared against %s — a rename would make this test vacuous", path)
+			listPaths := sortedListPaths(rendered)
+			if len(listPaths) == 0 {
+				t.Fatalf("no lists found in the rendered config — the walk is broken, not the render")
+			}
+			compared := 0
+			for _, at := range listPaths {
+				want, ok := lookup(image, at)
+				if !ok {
+					// The image says nothing about it, so there is nothing to union with.
+					continue
+				}
+				wantList, ok := want.([]any)
+				if !ok {
+					t.Errorf("%s is a list in the render but %T in %s", strings.Join(at, "."), want, path)
+					continue
+				}
+				compared++
+				if a, b := sortedStrings(t, listAt(t, rendered, at)), sortedStrings(t, wantList); !slices.Equal(a, b) {
+					t.Errorf("%s differs between the render and agents/chat/config.yaml:\n  rendered: %v\n  image:    %v\n"+
+						"the startup merge unions these, so the image's extras survive whatever this render omits. "+
+						"For an `args` list that is worse than a survival: it is a command line, so the union "+
+						"concatenates and the process runs the first entry.",
+						strings.Join(at, "."), a, b)
+				}
+			}
+			if compared == 0 {
+				t.Errorf("no list was compared against %s — a rename would make this test vacuous", path)
+			}
+		})
 	}
 }
 

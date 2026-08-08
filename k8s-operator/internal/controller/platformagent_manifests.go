@@ -719,13 +719,32 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	cfg.MCPServers = map[string]any{
 		"router": map[string]any{
 			"command": "/opt/hermes/.venv/bin/python3",
-			// Resolved against cwd, not hardcoded to /opt/data: the entrypoint copies
-			// /opt/defaults (which carries scripts/) into $PLATFORM_AGENT_HOME, and the
-			// operator sets that env from the same AgentHome that produced cwd. With a
-			// custom AgentHome the script is never at /opt/data/scripts, so a literal
-			// path would leave the router MCP dead and the Chat Agent unable to
-			// discover any specialist to delegate to.
-			"args": []string{path.Join(cwd, "scripts/router_server.py")},
+			// Left as a placeholder rather than joined against cwd, and this is NOT
+			// cosmetic. Unlike every other profile, the default profile's config.yaml
+			// is not this render — it is agents/chat/config.yaml MERGED with this one
+			// (default_profile_config.py), and profile_overlay.merge unions lists.
+			// `args` is a command line, so a union is a concatenation: the moment the
+			// two declarations disagree the router is invoked with two script paths
+			// and python3 runs the FIRST one. path.Join(cwd, …) disagrees for exactly
+			// the case it was added to serve — a custom AgentHome, where the image's
+			// literal /opt/data/scripts/router_server.py sorts first and does not
+			// exist, because the entrypoint copied /opt/defaults into the custom home
+			// instead. The router MCP then dies at startup and the Chat Agent has no
+			// specialist roster to delegate against.
+			//
+			// ${HERMES_HOME} keeps both sides byte-identical so the union collapses to
+			// one entry for any AgentHome, and each side is independently correct —
+			// which the image's copy has to be anyway, since the entrypoint seeds a
+			// fresh PVC from it before this render is merged in. The entrypoint
+			// exports HERMES_HOME=${PLATFORM_AGENT_HOME:-/opt/data} on line 5, the
+			// operator sets PLATFORM_AGENT_HOME from the same AgentHome that produced
+			// cwd, and tools/mcp_tool.py `_interpolate_env_vars` resolves ${VAR}
+			// recursively through `args` — the sibling `env` below already relies on
+			// exactly that.
+			//
+			// TestRenderConfigYAMLListsMatchChatConfig compares every rendered list
+			// against the image's, under a custom AgentHome as well as the default.
+			"args": []string{"${HERMES_HOME}/scripts/router_server.py"},
 			"env": map[string]string{
 				"HERMES_HOME": "${HERMES_HOME}",
 			},

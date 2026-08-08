@@ -244,5 +244,39 @@ class RebuildTest(unittest.TestCase):
         self.assertNotIn("monitoring", read(self.baseline))
 
 
+class ArgvUnionTest(unittest.TestCase):
+    """`args` is the one list the image and the operator must not merely agree about.
+
+    Every other list here is a set — plugins, toolsets, disabled_toolsets — where a
+    union is the intended behaviour and a stray extra entry is at worst inert. A
+    command line is a sequence: union two differing declarations and you get two argv
+    words, and the process runs the first. The router MCP would then start against a
+    path that does not exist and the Chat Agent would have no specialist roster.
+    """
+
+    CHAT_CONFIG = pathlib.Path(__file__).resolve().parents[1] / "agents" / "chat" / "config.yaml"
+
+    def test_differing_args_concatenate_rather_than_replace(self):
+        # The mechanism, stated once so the guard below has a reason attached.
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        image, overlay = tmp / "image.yaml", tmp / "overlay.yaml"
+        write(image, {"mcp_servers": {"router": {"args": ["/opt/data/scripts/router_server.py"]}}})
+        write(overlay, {"mcp_servers": {"router": {"args": ["/var/lib/kage/scripts/router_server.py"]}}})
+        baseline = dpc.build_baseline(image, [overlay])
+        self.assertEqual(
+            baseline["mcp_servers"]["router"]["args"],
+            ["/opt/data/scripts/router_server.py", "/var/lib/kage/scripts/router_server.py"],
+        )
+
+    def test_the_image_declares_the_router_script_home_independently(self):
+        # So the operator's declaration can be byte-identical at ANY agentHome and the
+        # union above collapses to one entry. renderConfigYAML holds the other half;
+        # the operator's TestRenderConfigYAMLListsMatchChatConfig compares the two,
+        # under a custom agentHome as well as the default.
+        args = yaml.safe_load(self.CHAT_CONFIG.read_text())["mcp_servers"]["router"]["args"]
+        self.assertEqual(args, ["${HERMES_HOME}/scripts/router_server.py"])
+
+
 if __name__ == "__main__":
     unittest.main()

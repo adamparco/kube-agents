@@ -61,11 +61,27 @@ model:
   api_key: none
 
 # MCP Servers configuration. Routing/relay surface only.
+#
+# `args` must stay BYTE-IDENTICAL to renderConfigYAML's, which is why it is a
+# ${HERMES_HOME} placeholder and not a path. Lists are unioned by the merge (see
+# the header), and a command line is the one kind of list a union corrupts
+# rather than extends: two differing entries become two argv words, and python3
+# runs the first. Hardcoding /opt/data made them differ under a custom
+# spec.harness.hermes.agentHome, where /opt/data/scripts/router_server.py does
+# not exist — the entrypoint copies /opt/defaults into the custom home — so the
+# router MCP died at startup and the Chat Agent had no roster to delegate
+# against.
+#
+# The placeholder is also what makes THIS file correct on its own, which it has
+# to be: the entrypoint seeds a fresh PVC straight from it, before the operator's
+# overlay is merged. HERMES_HOME is exported by docker-entrypoint.sh line 5 and
+# resolved in `args` by tools/mcp_tool.py `_interpolate_env_vars`, the same
+# expansion the `env` block below already depends on.
 mcp_servers:
   router:
     command: "/opt/hermes/.venv/bin/python3"
     args:
-      - "/opt/data/scripts/router_server.py"
+      - "${HERMES_HOME}/scripts/router_server.py"
     env:
       HERMES_HOME: "${HERMES_HOME}"
 
