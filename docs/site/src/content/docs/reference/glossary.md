@@ -13,7 +13,7 @@ This page is the canonical glossary for humans. The agents carry their own trimm
 
 ### Chat Agent
 
-The conversational front door shipped in `agents/chat/` — the `default` [Hermes profile](#hermes-profile), and the only profile that receives chat ingress (Google Chat / Slack). It discovers the available specialists via its `router` MCP tool (`list_agents`), delegates each request as a [kanban card](#kanban-task-delegation), and relays progress and results back into the thread. It holds no infrastructure tools of its own: the front door can route, not mutate.
+The conversational front door shipped in `agents/chat/` — the `default` [Hermes profile](#hermes-profile), and the only profile that receives chat ingress (Google Chat / Slack). It discovers the available specialists via its `router` MCP tool (`list_agents`), and delegates each request as a [kanban card](#kanban-task-delegation). Progress and results reach the thread on their own: the gateway posts each card's completion verbatim without waking the front door, which is woken only when a card blocks or fails. It holds no infrastructure tools of its own: the front door can route, not mutate.
 
 ### Platform Agent
 
