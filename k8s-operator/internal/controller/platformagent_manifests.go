@@ -609,6 +609,25 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
+// slackHomeChannel is one `platforms.<adapter>.home_channel` mapping as Hermes
+// serialises it — the subset of gateway/config.py's HomeChannel dataclass the
+// operator has anything to say about.
+//
+// A struct rather than a map so `platform` cannot be forgotten: HomeChannel.from_dict
+// reads it with no default and raises KeyError without it, which the gateway's config
+// loader does not catch. The dataclass's remaining fields (thread_id, user_id,
+// scope_id) are runtime provenance recorded by whichever adapter observed the
+// conversation, so they are the runtime's to write and never the operator's; they are
+// left off here rather than rendered empty, so the three-way merge treats them as
+// runtime-only state and preserves them.
+type slackHomeChannel struct {
+	Platform string `json:"platform"`
+	ChatID   string `json:"chat_id"`
+	// Display name only. Omitted when the CR does not set one, which leaves
+	// HomeChannel.from_dict's own "Home" default in place.
+	Name string `json:"name,omitempty"`
+}
+
 // renderConfigYAML builds the default (Chat Agent) profile's config overlay.
 //
 // It is emitted as `profile-default.overlay.yaml`, the same ConfigMap key shape every
@@ -717,6 +736,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			} `json:"google_chat"`
 			Slack struct {
 				Enabled bool `json:"enabled"`
+				// The logical home, in the shape gateway/config.py round-trips
+				// through HomeChannel.to_dict / .from_dict. See where it is set
+				// for why the operator writes it to config.yaml at all, given
+				// that it already puts SLACK_HOME_CHANNEL on the container.
+				HomeChannel *slackHomeChannel `json:"home_channel,omitempty"`
 				// Adapter presentation knobs, passed through to the Slack plugin
 				// untouched. Carries `rich_blocks` — see the note where it is set.
 				Extra map[string]any `json:"extra,omitempty"`
@@ -1008,8 +1032,47 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			}
 			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 		}
-		if slack := agent.Spec.Integration.Slack; slack != nil && slack.Enabled != nil {
-			cfg.Platforms.Slack.Enabled = *slack.Enabled
+		if slack := agent.Spec.Integration.Slack; slack != nil {
+			if slack.Enabled != nil {
+				cfg.Platforms.Slack.Enabled = *slack.Enabled
+			}
+			// The home channel has to reach config.yaml and not just the container
+			// environment, because the one consumer that cannot read the environment
+			// is the one that needs it most. `SLACK_HOME_CHANNEL` sits on Hermes'
+			// provider-env blocklist (tools/environments/local.py), so
+			// build_subprocess_env strips it from every `no_agent` child — including
+			// agents/chat/scripts/profile_cron_tick.py, which spawns the per-profile
+			// `hermes cron tick`. That script's home_target_env() reads this key back
+			// off the root profile's config.yaml precisely because the variable is
+			// already gone; without it, every `deliver=all` job on a named profile
+			// records "no delivery target resolved for deliver=all" and posts nowhere.
+			// Dropping the var from the blocklist is not the cheaper alternative: both
+			// entry points in env_passthrough.py refuse to re-allow anything on that
+			// list, the config-driven one by name (GHSA-rhgp-j443-p4rf).
+			//
+			// `platform` is load-bearing, not decoration. PlatformConfig.from_dict
+			// hands this mapping to HomeChannel.from_dict, which reads
+			// data["platform"] with no default, and GatewayConfig.from_dict only
+			// catches ValueError — so a mapping carrying chat_id alone raises KeyError
+			// and takes the entire gateway config load down with it. chat_id alone is
+			// also all the cron ticker reads, which is what makes the omission an easy
+			// one to make and an expensive one to find.
+			//
+			// Rendered only when the field is set, and independently of `enabled` (the
+			// same reasoning as extra.rich_blocks above). Leaving the key out entirely
+			// is what keeps a `/sethome` value alive as runtime-only state across
+			// restarts — undeclared by either baseline, so deploy/shared/
+			// default_profile_config.py carries the live file's own copy across. Once
+			// the CR declares it, that same merge makes the CR a baseline: `/sethome`
+			// still wins locally until the CR field itself changes, and then the CR
+			// re-asserts.
+			if slack.HomeChannel != "" {
+				cfg.Platforms.Slack.HomeChannel = &slackHomeChannel{
+					Platform: "slack",
+					ChatID:   slack.HomeChannel,
+					Name:     slack.HomeChannelName,
+				}
+			}
 		}
 	}
 

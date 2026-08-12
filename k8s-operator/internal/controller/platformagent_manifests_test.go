@@ -1593,6 +1593,110 @@ func TestBuildConfigMapSlackRichBlocks(t *testing.T) {
 	}
 }
 
+// `deliver=all` on a named profile resolves its Slack target by reading
+// platforms.slack.home_channel back out of the root profile's config.yaml, because
+// SLACK_HOME_CHANNEL is on Hermes' provider-env blocklist and the cron ticker's child
+// never inherits it (agents/chat/scripts/profile_cron_tick.py, home_target_env). Putting
+// the value on the container is therefore not enough on its own; it has to be in this
+// file too, or every scheduled job on a named profile posts nowhere.
+func TestBuildConfigMapSlackHomeChannel(t *testing.T) {
+	type homeChannel struct {
+		Platform string `json:"platform"`
+		ChatID   string `json:"chat_id"`
+		Name     string `json:"name"`
+	}
+
+	for _, tc := range []struct {
+		name       string
+		slack      *agentv1alpha1.SlackSpec
+		wantChatID string // "" means the key must not be rendered at all
+		wantName   string
+	}{
+		{
+			name:       "home channel and display name",
+			slack:      &agentv1alpha1.SlackSpec{Enabled: ptr.To(true), HomeChannel: "C0FLEET", HomeChannelName: "#fleet-ops"},
+			wantChatID: "C0FLEET",
+			wantName:   "#fleet-ops",
+		},
+		{
+			// No name to render: HomeChannel.from_dict supplies its own "Home".
+			name:       "home channel without a display name",
+			slack:      &agentv1alpha1.SlackSpec{Enabled: ptr.To(true), HomeChannel: "C0FLEET"},
+			wantChatID: "C0FLEET",
+		},
+		{
+			// Inert while Slack is off, but rendered anyway so that whichever path
+			// ends up turning Slack on cannot miss it — as with extra.rich_blocks.
+			name:       "rendered even while slack is disabled",
+			slack:      &agentv1alpha1.SlackSpec{Enabled: ptr.To(false), HomeChannel: "C0FLEET"},
+			wantChatID: "C0FLEET",
+		},
+		{
+			// `enabled` unset used to gate the whole block, so the home channel of a
+			// CR that only sets homeChannel was silently dropped.
+			name:       "rendered with enabled unset",
+			slack:      &agentv1alpha1.SlackSpec{HomeChannel: "C0FLEET"},
+			wantChatID: "C0FLEET",
+		},
+		{
+			// The key must be absent, not empty. An undeclared key is what lets a
+			// `/sethome` value survive as runtime-only state across restarts; see
+			// deploy/shared/default_profile_config.py.
+			name:  "omitted entirely when unset",
+			slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{Slack: tc.slack},
+				},
+			}
+
+			var cfg struct {
+				Platforms struct {
+					Slack struct {
+						HomeChannel *homeChannel `json:"home_channel"`
+					} `json:"slack"`
+				} `json:"platforms"`
+			}
+			raw := defaultProfileYAML(t, buildConfigMap(agent, nil))
+			if err := k8syaml.Unmarshal([]byte(raw), &cfg); err != nil {
+				t.Fatalf("the default profile overlay is not parseable: %v\n%s", err, raw)
+			}
+			got := cfg.Platforms.Slack.HomeChannel
+
+			if tc.wantChatID == "" {
+				if got != nil {
+					t.Errorf("platforms.slack.home_channel = %+v, want it absent; got:\n%s", got, raw)
+				}
+				if strings.Contains(raw, "home_channel") {
+					t.Errorf("home_channel must not be rendered at all when unset; got:\n%s", raw)
+				}
+				return
+			}
+
+			if got == nil {
+				t.Fatalf("platforms.slack.home_channel is absent, want chat_id %q; got:\n%s", tc.wantChatID, raw)
+			}
+			if got.ChatID != tc.wantChatID {
+				t.Errorf("home_channel.chat_id = %q, want %q", got.ChatID, tc.wantChatID)
+			}
+			if got.Name != tc.wantName {
+				t.Errorf("home_channel.name = %q, want %q", got.Name, tc.wantName)
+			}
+			// Not cosmetic: HomeChannel.from_dict reads data["platform"] with no
+			// default and GatewayConfig.from_dict catches only ValueError, so a
+			// mapping without this key raises KeyError and fails the whole config
+			// load — for a value the cron ticker never even reads.
+			if got.Platform != "slack" {
+				t.Errorf("home_channel.platform = %q, want \"slack\"; without it HomeChannel.from_dict raises KeyError", got.Platform)
+			}
+		})
+	}
+}
+
 func TestBuildFluentBitConfigMap(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
