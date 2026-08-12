@@ -305,6 +305,10 @@ Three of the rendered rows are easy to misread, and two of them were wrong in an
 - **`pr-open` is not refreshed.** The draft said "refresh the PR body if the evidence changed",
   which would have the harness force-push over a reviewer's own commits every morning. An open
   remediation PR is left alone; the ledger links it, and the diff is whatever a human last made it.
+  Its **labels** are the single exception, re-asserted on every run: they are the harness's own
+  index of what it still owns rather than anything a reviewer authored, and a stripped `agent:audit`
+  or a `severity:` frozen at what the group used to be loses the pull request from the views triage
+  works from. Labels only — no push, no rewritten body — so the promise above still holds.
 - **`refused` is a human decision, not a rejected command.** It is what a finding looks like when
   someone closed its fix without merging — a considered "no" the harness must not overrule by
   re-proposing the same fix tomorrow. (A refused `/remediate` is a _reply_, not a finding state;
