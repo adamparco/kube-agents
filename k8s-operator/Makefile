@@ -148,6 +148,17 @@ endef
 .PHONY: deploy-litellm
 deploy-litellm: kustomize ## Deploy LiteLLM integration.
 	@$(LITELLM_RENDER) | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
+# The configMapGenerator hash cannot stand in for a config change here. kustomize
+# hashes config.yaml before envsubst runs, so every model served by one provider
+# renders the same ConfigMap name — switching gemini-3.5-flash to
+# gemini-3.1-flash-lite rewrites the ConfigMap's contents and leaves the
+# Deployment spec untouched. Nothing then rolls the pods, and config.yaml is a
+# subPath mount, which the kubelet never updates in place, so LiteLLM keeps
+# serving the old model until someone restarts it by hand. Restart explicitly.
+# (The Helm path has no equivalent hole: its checksum/config annotation is
+# computed from the substituted values.)
+	@kubectl rollout restart deployment/litellm -n $${NAMESPACE:-kubeagents-system}
+	@kubectl rollout status deployment/litellm -n $${NAMESPACE:-kubeagents-system} --timeout=300s
 
 .PHONY: undeploy-litellm
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
