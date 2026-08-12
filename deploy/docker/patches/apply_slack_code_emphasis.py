@@ -75,6 +75,34 @@ landing there is restored to its original backticked source instead. That also
 repairs ``[`code`](url)``, which upstream shredded into three elements because
 the code split ran before the link scan.
 
+Handing the emphasis scan one continuous string also un-hides a second defect,
+which the split had been suppressing by accident. ``_ITALIC_RE`` has no
+intra-word rule — it rejects a delimiter only when it sits next to whitespace or
+another ``*``/``_`` — so a bare ``_`` inside a snake_case token opens emphasis.
+While each gap was scanned alone a lone underscore usually had nothing to pair
+with; across a mask, the ``_`` in ``t_549d081c`` pairs with the one in
+``machine_type``, italicising everything between them, swallowing the code chip,
+and *deleting* both delimiters. That is a worse failure than the one being fixed
+here: literal asterisks are ugly but lossless, whereas this silently corrupts the
+card IDs and machine types these reports exist to carry. ``_BOLD_RE``'s ``__``
+alternative has the same shape.
+
+So intra-word runs of underscores are masked too, as ``\\x01``, and restored when
+the element is emitted. Masking is used rather than tightening ``_ITALIC_RE`` and
+``_BOLD_RE`` directly because guarding only their ``_`` alternatives means
+splitting each into separately-anchored branches, which renumbers the capture
+group ``_walk_emphasis`` reads as ``m.group(1)``. The guard incidentally repairs
+the same-gap case (two snake_case tokens with no span between them), which
+upstream mangles today.
+
+Deliberately asymmetric: intra-word ``*`` is *not* masked. CommonMark forbids
+intra-word ``_`` emphasis and permits intra-word ``*``, upstream already
+italicises ``cp a*b c*d`` with no code span involved, and masking ``*`` here
+would break legitimate ``a**b**c``. So ``*`` keeps pairing across a masked span,
+which makes the code-span case agree with the no-span case, and the two-wildcard
+selector ``app=*,tier=*`` still loses its stars in both — pinned in
+``test_slack_code_emphasis.py`` so the asymmetry is on the record.
+
 Upstream: not reported. The renderer is Hermes-internal and this directory is
 the repository's normal route for a Hermes fix.
 
@@ -119,6 +147,20 @@ STRIKE_PATCHED = STRIKE + (
     "# message, and the digits between the delimiters are neither whitespace nor\n"
     "# `*`/`_`, so _ITALIC_RE's lookarounds still pair around a masked span.\n"
     '_CODE_SENTINEL_RE = re.compile(r"\\x00(\\d+)\\x00")\n'
+    "# kube-agents patch: an underscore *inside* a word is not emphasis. Upstream\n"
+    "# has no intra-word rule — a delimiter is rejected only next to whitespace or\n"
+    "# another `*`/`_` — which was survivable only because splitting on code kept\n"
+    "# each `_` in a scan of its own. Once the run is continuous the `_` in\n"
+    "# `t_549d081c` pairs with the one in `machine_type` across the span, eating\n"
+    "# both delimiters and italicising everything between. Masking these too is\n"
+    "# what keeps the emphasis scan from ever seeing them.\n"
+    '# `[^\\W_]` is "alphanumeric": plain `\\w` would match `_` itself, so in\n'
+    "# `__bold__` the inner underscore of each pair would be masked and real bold\n"
+    "# would degrade to italic. Doubling the backslash is just as wrong —\n"
+    "# `[^\\\\W_]` is the three-character set {backslash, W, _}, which excludes\n"
+    "# almost nothing, so `_ital_ x` loses its closing delimiter and stops\n"
+    "# emphasising at all.\n"
+    '_INTRAWORD_US_RE = re.compile(r"(?<=[^\\W_])_+(?=[^\\W_])")\n'
 )
 
 # ---------------------------------------------------------------------------
@@ -153,7 +195,9 @@ TOKENIZER_PATCHED = '''\
     def _append(s: str, style: Optional[Dict[str, bool]] = None) -> None:
         if not s:
             return
-        el: Dict[str, Any] = {"type": "text", "text": s}
+        # Masked intra-word underscores come back here: they were hidden from
+        # the emphasis scan, not removed from the message.
+        el: Dict[str, Any] = {"type": "text", "text": s.replace("\\x01", "_")}
         if style:
             el["style"] = style
         elements.append(el)
@@ -183,7 +227,10 @@ TOKENIZER_PATCHED = '''\
     # reached Slack as literal asterisks; card t_549d081c posted
     # "**`adam-new-cluster`** (us-east4) -> …" into a user's thread that way.
     # Masking keeps a span opaque — no markdown is interpreted inside it — while
-    # leaving links and emphasis one continuous string to match across.
+    # leaving links and emphasis one continuous string to match across. That
+    # continuity is also why intra-word underscores have to be masked: the split
+    # used to keep the `_` in `t_549d081c` away from the one in `machine_type`,
+    # and without a guard they would now pair across the span between them.
     codes: List[str] = []
 
     def _mask_code(s: str) -> str:
@@ -191,18 +238,28 @@ TOKENIZER_PATCHED = '''\
             codes.append(m.group(1))
             return f"\\x00{len(codes) - 1}\\x00"
 
-        # A NUL already in the text would make a sentinel ambiguous. It cannot
-        # occur in a Slack message, so dropping it costs nothing.
-        return _INLINE_CODE_RE.sub(take, s.replace("\\x00", ""))
+        # A NUL or SOH already in the text would make a sentinel ambiguous.
+        # Neither can occur in a Slack message, so dropping them costs nothing.
+        masked = _INLINE_CODE_RE.sub(
+            take, s.replace("\\x00", "").replace("\\x01", "")
+        )
+        # Code spans are held aside by now, so this only sees prose — mask the
+        # underscores that merely punctuate an identifier, before the emphasis
+        # scan gets a chance to pair them across the span between them.
+        return _INTRAWORD_US_RE.sub(lambda m: "\\x01" * len(m.group(0)), masked)
 
     def _unmask(s: str) -> str:
         """Restore masked spans to their original backticked source.
 
         For the one place a code element cannot go: a Slack ``link`` carries
         flat ``text``/``url`` strings with no child elements, so the backticks
-        come back rather than the span being dropped.
+        come back rather than the span being dropped. Masked underscores are
+        restored here too — a URL such as ``https://example.com/a_b`` reaches
+        this function with its underscore hidden.
         """
-        return _CODE_SENTINEL_RE.sub(lambda m: f"`{codes[int(m.group(1))]}`", s)
+        return _CODE_SENTINEL_RE.sub(
+            lambda m: f"`{codes[int(m.group(1))]}`", s
+        ).replace("\\x01", "_")
 
     def walk(s: str, style: Dict[str, bool]) -> None:
         _walk_links(_mask_code(s), style)

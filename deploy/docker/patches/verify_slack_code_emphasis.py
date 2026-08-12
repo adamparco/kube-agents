@@ -121,6 +121,87 @@ def main(root: Path) -> None:
             f"markdown inside a code span is no longer opaque: {opaque!r}"
         )
 
+    # 5) Identifier underscores either side of a span must not pair. Masking
+    #    hands the emphasis scan one continuous string, and _ITALIC_RE has no
+    #    intra-word rule, so without the guard the `_` in `t_549d081c` pairs
+    #    with the one in `machine_type` and both are deleted. That corrupts an
+    #    identifier silently, which is worse than the defect fixed above, so it
+    #    stops the build rather than shipping.
+    ident = _text_elements(
+        block_kit.render_blocks(
+            "- Card t_549d081c: cluster `c` needs machine_type e2"
+        )
+    )
+    rendered = "".join(e.get("text", "") for e in ident)
+    if rendered != "Card t_549d081c: cluster c needs machine_type e2":
+        raise _fail(
+            "intra-word underscores are pairing across a masked code span — "
+            f"identifiers are being corrupted. Got: {rendered!r}"
+        )
+    if any((e.get("style") or {}).get("italic") for e in ident):
+        raise _fail(f"spurious italic across a code span: {ident!r}")
+
+    # 6) The guard is intra-word only — genuinely delimited underscore emphasis
+    #    still has to work. `\W` here rather than `\w` is the whole point: `_`
+    #    is a word character, so a `\w`-based guard degrades `__bold__` to
+    #    italic, which this catches.
+    #
+    #    Every case carries trailing text after the closing delimiter, and that
+    #    is not decoration. A guard whose lookahead is wrong cannot fire at the
+    #    end of a string, because there is no following character to inspect —
+    #    so `- _i_` passes under a broken guard and proves nothing. An earlier
+    #    revision of this patch emitted `[^\\W_]` (the set {backslash, W, _})
+    #    instead of `[^\W_]`, masked the closing delimiter of every `_i_ x` in
+    #    the fleet's output, and sailed through the end-of-string form of this
+    #    very check. Keep the trailing text.
+    for source, expected_style in (
+        ("- __b__ trailing", "bold"),
+        ("- _i_ trailing", "italic"),
+        ("- a __b__ trailing", "bold"),
+        ("- a _i_ trailing", "italic"),
+    ):
+        got = _text_elements(block_kit.render_blocks(source))
+        styled = [e for e in got if (e.get("style") or {}).get(expected_style)]
+        if len(styled) != 1:
+            raise _fail(
+                f"{source!r} should render exactly one {expected_style} "
+                f"element, got {got!r}"
+            )
+        if not any("trailing" in e.get("text", "") for e in got):
+            raise _fail(f"{source!r} lost its trailing text: {got!r}")
+
+    # 7) The everyday content of a report — a path, a URL, a wildcard — must
+    #    come back exactly as typed. These carry no markup at all, so any
+    #    difference is a character the renderer ate, and an identifier a reader
+    #    would copy out of Slack and fail to find.
+    for plain in (
+        "/var/log/kube_agents/agent.log and /var/log/kube_agents/err.log",
+        "https://example.com/foo_bar?x=1&y=2#sec_3",
+        "export KUBE_AGENTS_HOME=/opt/hermes",
+        "kubectl get pods -n * -o wide",
+        "e2-standard-8 and n2_standard_16",
+    ):
+        got = _text_elements(block_kit.render_blocks(f"- {plain}"))
+        joined = "".join(e.get("text", "") for e in got)
+        if joined != plain:
+            raise _fail(
+                f"plain text was altered by the renderer: {plain!r} -> {joined!r}"
+            )
+        if any(e.get("style") for e in got):
+            raise _fail(f"plain text picked up a style: {got!r}")
+
+    # 8) No sentinel may survive into a rendered element. An escaped \x00/\x01
+    #    is invisible in a diff and in most terminals, and only shows up as a
+    #    mangled glyph in the thread itself.
+    leaked = _text_elements(
+        block_kit.render_blocks(
+            "- Card t_549d081c `chip` machine_type and [a_b](https://ex.com/c_d)"
+        )
+    )
+    for element in leaked:
+        if "\x00" in element.get("text", "") or "\x01" in element.get("text", ""):
+            raise _fail(f"a sentinel escaped into the output: {element!r}")
+
     print("slack_code_emphasis verify: ok")
 
 
