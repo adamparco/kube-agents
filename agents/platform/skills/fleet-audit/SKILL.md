@@ -505,7 +505,7 @@ there. Either the remediation was incomplete or something outside this repositor
 ## Remediation pull requests
 
 A pull request is opened for a finding only when its remediation is a `manifest` — there is nothing
-to put in a diff otherwise. Two paths lead there:
+to put in a diff otherwise. Three paths lead there:
 
 - **Auto-promotion.** A finding that is `critical`, is a `manifest`, and has no live pull request on
   its branch is promoted automatically by `finish` — **at most five per run**. The surplus is named
@@ -514,6 +514,10 @@ to put in a diff otherwise. Two paths lead there:
   closed or merged (those are not).
 - **`/remediate <finding-id>`**, or `/remediate all`, commented on the ledger by someone with write
   access to the repository. This path is uncapped: a human asked for that one by name.
+- **A direct ask.** A collaborator asking the agent, in the agent's own task, to fix a named
+  finding; the agent answers with the `remediate` subcommand. Uncapped for the same reason as
+  `/remediate` — and distinct from a comment read on the ledger, which is the harness's to answer
+  (`start` reports the ones that passed its gates as `pending_remediation_requests`).
 
 Every `/remediate` gets exactly one answer, and the answer is never silence:
 
