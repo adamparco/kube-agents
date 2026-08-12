@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+spec:
+  template:
+    spec:
+      serviceAccountName: ${LITELLM_KSA_NAME}
+      containers:
+        - name: litellm-container
+          # LiteLLM reads these as the fallback for any model whose
+          # litellm_params omit them; the generated config sets both explicitly,
+          # so these exist to make the pod's Vertex target visible in
+          # `kubectl describe` without decoding the ConfigMap.
+          env:
+            - name: VERTEXAI_PROJECT
+              value: ${VERTEX_PROJECT}
+            - name: VERTEXAI_LOCATION
+              value: ${VERTEX_LOCATION}

@@ -58,11 +58,31 @@ litellm:
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
-  # gemini, anthropic, openai (chatgpt needs the kustomize overlay and is
-  # rejected). The provider's API key must exist in the credentials Secret.
+  # gemini, anthropic, vertex_ai, openai (chatgpt needs the kustomize overlay
+  # and is rejected). Every provider but vertex_ai reads its API key from the
+  # credentials Secret; vertex_ai uses Workload Identity and needs no key.
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
   modelDefaultName: ""
+  # Only read when modelProvider is vertex_ai. project/location/serviceAccount
+  # have no defaults on purpose: guessing the project would bill predictions to
+  # the wrong place and fail only at runtime, as a 403.
+  #
+  # Anthropic model IDs on Vertex carry no date suffix — claude-sonnet-4-6, not
+  # claude-sonnet-4-6-20260219; only dated snapshots use the @ form
+  # (claude-opus-4-5@20251101). location may be "global" (recommended — the
+  # broadest model availability), a multi-region, or a single region; regional
+  # endpoints return 429 for models with no capacity there.
+  #
+  # serviceAccount is the GSA email the KSA below impersonates. It needs
+  # roles/aiplatform.user on `project`, and a roles/iam.workloadIdentityUser
+  # binding for serviceAccount:<cluster-project>.svc.id.goog[<ns>/<ksaName>].
+  # provision_04_gcp_iam.sh does all three for the script-driven install.
+  vertex:
+    project: ""
+    location: global
+    serviceAccount: ""
+    ksaName: kubeagents-litellm
   image:
     repository: ghcr.io/berriai/litellm
     tag: v1.92.0

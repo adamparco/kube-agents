@@ -23,6 +23,10 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var_platform_agent_permission_set
+# Asked here, ahead of provision_09, because vertex_ai is the one provider whose
+# choice has IAM consequences: it authenticates with Workload Identity instead of
+# an API key, so LiteLLM needs a GSA before it can be deployed.
+init_var_model_provider
 
 
 if [ -z "${GITHUB_ORG:-}" ]; then
@@ -292,11 +296,78 @@ execute_github_minter_iam() {
   execute_agent_iam "GitHub Token Minter" "${GITHUB_MINTER_KSA_NAME}" "${GITHUB_MINTER_GSA_NAME}"
 }
 
+# Configure LiteLLM Vertex AI IAM
+#
+# Only vertex_ai needs this. The other providers authenticate with an API key
+# read from platform-agent-secrets, so their LiteLLM pod stays on the namespace
+# default service account with no GCP identity at all.
+#
+# VERTEX_PROJECT is intentionally allowed to differ from PROJECT_ID — serving
+# models from a shared project while the cluster lives elsewhere is the common
+# arrangement — so the aiplatform grant is made against VERTEX_PROJECT while the
+# GSA and its Workload Identity binding stay in PROJECT_ID with the cluster.
+litellm_vertex_gsa_email() {
+  echo "${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+}
+
+verify_litellm_vertex_iam() {
+  [ "${MODEL_PROVIDER:-}" = "vertex_ai" ] || return 0
+
+  local gsa_email wi_member
+  gsa_email="$(litellm_vertex_gsa_email)"
+  wi_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${LITELLM_KSA_NAME}]"
+
+  gcloud iam service-accounts describe "${gsa_email}" --project="${PROJECT_ID}" >/dev/null 2>&1 || return 1
+
+  gcloud iam service-accounts get-iam-policy "${gsa_email}" --project="${PROJECT_ID}" --format="json" 2>/dev/null \
+    | grep -F -q "${wi_member}" || return 1
+
+  gcloud projects get-iam-policy "${VERTEX_PROJECT}" \
+      --flatten="bindings[].members" \
+      --filter="bindings.members:serviceAccount:${gsa_email}" \
+      --format="value(bindings.role)" 2>/dev/null \
+    | grep -Fxq "roles/aiplatform.user" || return 1
+
+  gcloud services list --enabled --project="${VERTEX_PROJECT}" --format="value(config.name)" 2>/dev/null \
+    | grep -Fxq "aiplatform.googleapis.com" || return 1
+}
+
+execute_litellm_vertex_iam() {
+  [ "${MODEL_PROVIDER:-}" = "vertex_ai" ] || return 0
+
+  local gsa_email
+  gsa_email="$(litellm_vertex_gsa_email)"
+
+  gcloud services enable aiplatform.googleapis.com --project="${VERTEX_PROJECT}" || return 1
+
+  if ! gcloud iam service-accounts describe "${gsa_email}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    print_info "Creating GSA ${LITELLM_GSA_NAME} for the LiteLLM gateway..."
+    gcloud iam service-accounts create "${LITELLM_GSA_NAME}" \
+        --display-name="LiteLLM Vertex AI GSA" \
+        --project="${PROJECT_ID}" || return 1
+    sleep 15
+  fi
+
+  print_info "Granting roles/aiplatform.user on ${VERTEX_PROJECT} to ${LITELLM_GSA_NAME}..."
+  gcloud projects add-iam-policy-binding "${VERTEX_PROJECT}" \
+      --member="serviceAccount:${gsa_email}" \
+      --role="roles/aiplatform.user" \
+      --quiet >/dev/null || return 1
+
+  print_info "Binding KSA ${NAMESPACE}/${LITELLM_KSA_NAME} to ${LITELLM_GSA_NAME}..."
+  gcloud iam service-accounts add-iam-policy-binding "${gsa_email}" \
+      --member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${LITELLM_KSA_NAME}]" \
+      --role="roles/iam.workloadIdentityUser" \
+      --project="${PROJECT_ID}" \
+      --quiet >/dev/null || return 1
+}
+
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Enable APIs" verify_apis execute_apis 10
 run_step "2. Ensure GKE Workload Identity Pool" verify_cluster_workload_pool execute_cluster_workload_pool 10
 run_step "3. Migrate Node Pools to the GKE Metadata Server" verify_node_pool_metadata execute_node_pool_metadata 5
 run_step "4. Configure Platform Agent Workload Identity & GCP IAM" verify_platform_agent execute_platform_agent 5
 run_step "5. Configure GitHub Token Minter Workload Identity" verify_github_minter_iam execute_github_minter_iam 5
+run_step "6. Configure LiteLLM Vertex AI Workload Identity" verify_litellm_vertex_iam execute_litellm_vertex_iam 5
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Controller & Agent GCP Permissions Configured Successfully!  <<<${C_RESET}"

@@ -4,12 +4,38 @@
 {{- fail "litellm.modelProvider 'chatgpt' is not supported by the chart: it needs the OAuth-token PVC from the kustomize overlay (k8s-operator/config/integrations/litellm/overlays/chatgpt). Use the provisioning-script path for chatgpt mode." }}
 {{- end }}
 {{- /* Per-provider default model names mirror k8s-operator/scripts/common.sh. */}}
-{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-sonnet-4-5-20250929" "openai" "gpt-5.4" }}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-sonnet-4-5-20250929" "vertex_ai" "claude-sonnet-4-6" "openai" "gpt-5.4" }}
 {{- if not (hasKey $defaultModels $provider) }}
-{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai — a typo here would otherwise fail only at runtime" $provider) }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, vertex_ai, openai — a typo here would otherwise fail only at runtime" $provider) }}
 {{- end }}
 {{- $model := .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
 {{- $callbacks := ternary `["otel", "prometheus"]` `["prometheus"]` .Values.litellm.otel }}
+{{- /*
+  vertex_ai authenticates with Workload Identity rather than an API key, so it
+  is the one provider that needs a service account of its own. Both values are
+  required rather than defaulted: guessing the project would bill predictions to
+  the wrong place, and the failure would surface only as a runtime 403.
+*/}}
+{{- $vertex := eq $provider "vertex_ai" }}
+{{- $vertexProject := "" }}
+{{- $vertexLocation := "" }}
+{{- $vertexSA := "" }}
+{{- if $vertex }}
+{{- $vertexProject = required "litellm.vertex.project is required when litellm.modelProvider is vertex_ai" .Values.litellm.vertex.project }}
+{{- $vertexLocation = required "litellm.vertex.location is required when litellm.modelProvider is vertex_ai" .Values.litellm.vertex.location }}
+{{- $vertexSA = required "litellm.vertex.serviceAccount is required when litellm.modelProvider is vertex_ai — the GSA email the LiteLLM KSA impersonates" .Values.litellm.vertex.serviceAccount }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.litellm.vertex.ksaName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+  annotations:
+    iam.gke.io/gcp-service-account: {{ $vertexSA | quote }}
+---
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -24,6 +50,10 @@ data:
       - model_name: model-default
         litellm_params:
           model: {{ printf "%s/%s" $provider $model }}
+          {{- if $vertex }}
+          vertex_project: {{ $vertexProject }}
+          vertex_location: {{ $vertexLocation }}
+          {{- end }}
     litellm_settings:
       callbacks: {{ $callbacks }}
 ---
@@ -51,8 +81,11 @@ spec:
         app: litellm
       annotations:
         # Roll the pods when the rendered LiteLLM config changes.
-        checksum/config: {{ printf "%s/%s/%s" $provider $model $callbacks | sha256sum }}
+        checksum/config: {{ printf "%s/%s/%s/%s/%s" $provider $model $callbacks $vertexProject $vertexLocation | sha256sum }}
     spec:
+      {{- if $vertex }}
+      serviceAccountName: {{ .Values.litellm.vertex.ksaName }}
+      {{- end }}
       containers:
         - name: litellm-container
           image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag }}"
@@ -79,6 +112,15 @@ spec:
                   name: {{ .Values.platformAgent.credentials.secretName | quote }}
                   key: OPENAI_API_KEY
                   optional: true
+            {{- if $vertex }}
+            # LiteLLM's fallback for any model whose litellm_params omit them.
+            # The rendered config sets both explicitly; these make the pod's
+            # Vertex target visible in `kubectl describe`.
+            - name: VERTEXAI_PROJECT
+              value: {{ $vertexProject | quote }}
+            - name: VERTEXAI_LOCATION
+              value: {{ $vertexLocation | quote }}
+            {{- end }}
             {{- if .Values.litellm.otel }}
             - name: LITELLM_OTEL_V2
               value: "true"

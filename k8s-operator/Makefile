@@ -121,21 +121,37 @@ deploy: kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/c
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 
+# MODEL_PROVIDER picks both the overlay and the set of placeholders it uses, and
+# deploy/undeploy render identically — only the kubectl verb differs — so the
+# choice lives here once. The envsubst allowlist is spelled out because a bare
+# envsubst would expand every $VAR in the rendered manifests, including ones
+# that belong to the container at runtime.
+define LITELLM_RENDER
+	case "$$MODEL_PROVIDER" in \
+	chatgpt) \
+		overlay=config/integrations/litellm/overlays/chatgpt; \
+		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' ;; \
+	vertex_ai) \
+		overlay=config/integrations/litellm/overlays/vertex; \
+		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$PROJECT_ID $$VERTEX_PROJECT $$VERTEX_LOCATION $$LITELLM_KSA_NAME $$LITELLM_GSA_NAME'; \
+		for v in PROJECT_ID VERTEX_PROJECT VERTEX_LOCATION LITELLM_KSA_NAME LITELLM_GSA_NAME; do \
+			eval "val=\$$$$v"; \
+			[ -n "$$val" ] || { echo "MODEL_PROVIDER=vertex_ai requires $$v to be set and exported" >&2; exit 1; }; \
+		done ;; \
+	*) \
+		overlay=config/integrations/litellm/base; \
+		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' ;; \
+	esac; \
+	$(KUSTOMIZE) build "$$overlay" | envsubst "$$vars"
+endef
+
 .PHONY: deploy-litellm
 deploy-litellm: kustomize ## Deploy LiteLLM integration.
-	@if [ "$$MODEL_PROVIDER" = "chatgpt" ]; then \
-		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
-	else \
-		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
-	fi
+	@$(LITELLM_RENDER) | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: undeploy-litellm
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
-	@if [ "$$MODEL_PROVIDER" = "chatgpt" ]; then \
-		$(KUSTOMIZE) build config/integrations/litellm/overlays/chatgpt | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
-	else \
-		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
-	fi
+	@$(LITELLM_RENDER) | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: deploy-inference-replay
 deploy-inference-replay: kustomize ## Deploy Inference Replay proxy integration.

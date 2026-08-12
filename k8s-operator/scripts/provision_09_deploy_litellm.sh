@@ -56,6 +56,10 @@ verify_litellm() {
 execute_litellm() {
   print_info "Deploying LiteLLM Gateway into GKE..."
   export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME
+  # Only the vertex overlay reads these; exporting them unconditionally keeps
+  # the branch out of the recipe, and envsubst never sees them for the other
+  # providers because their allowlist does not name them.
+  export PROJECT_ID VERTEX_PROJECT VERTEX_LOCATION LITELLM_KSA_NAME LITELLM_GSA_NAME
   make -C "${OPERATOR_DIR}" deploy-litellm || return 1
 }
 

@@ -43,12 +43,13 @@ Two things have to name that alias, not one. The profile config covers Chat, whi
 
 The two substituted values come from provisioning (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, cached in `vars.sh`). Supported providers and their shipping defaults:
 
-| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                  |
-| ------------------ | ---------------------------- | -------------------------------------- |
-| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                 |
-| `anthropic`        | `claude-sonnet-4-5-20250929` | Uses `ANTHROPIC_API_KEY`.              |
-| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                 |
-| `chatgpt`          | `gpt-5.4`                    | Personal ChatGPT subscription (OAuth). |
+| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                      |
+| ------------------ | ---------------------------- | ------------------------------------------ |
+| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                     |
+| `anthropic`        | `claude-sonnet-4-5-20250929` | Uses `ANTHROPIC_API_KEY`.                  |
+| `vertex_ai`        | `claude-sonnet-4-6`          | Anthropic models on Vertex AI. No API key. |
+| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                     |
+| `chatgpt`          | `gpt-5.4`                    | Personal ChatGPT subscription (OAuth).     |
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
@@ -61,6 +62,37 @@ cd k8s-operator/scripts && ./provision_09_deploy_litellm.sh
 ```
 
 This rewrites the LiteLLM `ConfigMap` and rolls the gateway; the agent picks up the new model on its next request without any change to its own config.
+
+### Anthropic models on Vertex AI
+
+`vertex_ai` is the one provider that does not read an API key. It authenticates with Workload
+Identity, so the LiteLLM pod runs under a service account of its own — `kubeagents-litellm`,
+annotated onto a GSA holding `roles/aiplatform.user`. `provision_04_gcp_iam.sh` creates the GSA,
+grants the role, and adds the Workload Identity binding; the deployment step renders the
+[`vertex` overlay](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/litellm/overlays/vertex)
+instead of the base.
+
+The Vertex project is a separate variable from `PROJECT_ID` because serving models from a shared
+project while the cluster lives elsewhere is the usual arrangement:
+
+```bash
+export MODEL_PROVIDER=vertex_ai
+export MODEL_DEFAULT_NAME=claude-sonnet-4-6
+export VERTEX_PROJECT=my-vertex-project   # may differ from PROJECT_ID
+export VERTEX_LOCATION=global
+cd k8s-operator/scripts && ./provision_04_gcp_iam.sh && ./provision_09_deploy_litellm.sh
+```
+
+Two details are easy to get wrong. Anthropic model IDs on Vertex carry **no** date suffix —
+`claude-sonnet-4-6`, not `claude-sonnet-4-6-20260219`; only dated snapshots use the `@` form, as in
+`claude-opus-4-5@20251101`. And `VERTEX_LOCATION=global` is the recommended default because it has
+the broadest model availability: a regional endpoint returns `429` for a model with no capacity in
+that region even though the same call succeeds on `global`.
+
+Not every Claude feature is available through Vertex — web fetch, code execution, the Files and
+Batches APIs, and automatic prompt caching are not, and web search is limited to the basic variant.
+Prompt caching, extended thinking, structured outputs, token counting, and the 1M context window
+all work.
 
 ## vLLM (local models)
 

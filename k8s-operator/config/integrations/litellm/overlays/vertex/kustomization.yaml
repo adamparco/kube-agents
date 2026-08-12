@@ -1,0 +1,26 @@
+resources:
+  - ../../base
+  - serviceaccount.yaml
+
+patches:
+  - path: deployment-patch.yaml
+
+# Replaces the base's generated config so the model entries carry
+# vertex_project/vertex_location. The generator keeps the name hashed, so a
+# change to either value rolls the pods on the next apply.
+configMapGenerator:
+  - name: litellm-config
+    behavior: replace
+    files:
+      - config.yaml
+
+# Repeated from the base so serviceaccount.yaml, which the base cannot see, is
+# labelled too.
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/name: litellm
+      app.kubernetes.io/instance: litellm
+      app.kubernetes.io/part-of: kube-agents
+      app.kubernetes.io/managed-by: kustomize
