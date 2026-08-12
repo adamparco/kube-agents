@@ -73,6 +73,40 @@ jobs:
             exit 1
           fi
 
+      # The LiteLLM overlays are rendered by `kustomize build | envsubst` with a
+      # hand-maintained variable allowlist per provider. A placeholder added to a
+      # manifest but not to its allowlist survives into the cluster as the
+      # literal string "${VAR}" — which `kubectl apply` accepts, so it fails as
+      # confusing runtime behaviour rather than a failed deploy. Nothing else
+      # catches it: no test builds these overlays, and the deploy targets need a
+      # live cluster. This renders through the same LITELLM_RENDER the deploy
+      # target uses, so it cannot drift from what actually ships.
+      - name: Verify LiteLLM overlays render cleanly
+        if: steps.filter.outputs.operator == 'true'
+        env:
+          NAMESPACE: kubeagents-system
+          PROJECT_ID: ci-project
+          VERTEX_PROJECT: ci-vertex-project
+          VERTEX_LOCATION: global
+          LITELLM_KSA_NAME: kubeagents-litellm
+          LITELLM_GSA_NAME: kubeagents-litellm-gsa
+        run: |
+          make -s -C k8s-operator kustomize >/dev/null 2>&1 || true
+          fail=0
+          for provider in gemini anthropic chatgpt vertex_ai; do
+            if ! out=$(MODEL_PROVIDER="$provider" MODEL_DEFAULT_NAME=ci-model \
+                       make -s -C k8s-operator print-litellm-manifests); then
+              echo "::error::MODEL_PROVIDER=$provider failed to render."
+              fail=1
+              continue
+            fi
+            if printf '%s\n' "$out" | grep -n '\${'; then
+              echo "::error::MODEL_PROVIDER=$provider left unsubstituted placeholders (listed above). Add the variable to that provider's envsubst allowlist in k8s-operator/Makefile."
+              fail=1
+            fi
+          done
+          exit $fail
+
       - name: Run Tests
         if: steps.filter.outputs.operator == 'true'
         run: make -C k8s-operator test

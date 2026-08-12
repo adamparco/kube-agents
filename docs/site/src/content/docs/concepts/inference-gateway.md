@@ -72,6 +72,13 @@ grants the role, and adds the Workload Identity binding; the deployment step ren
 [`vertex` overlay](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/litellm/overlays/vertex)
 instead of the base.
 
+Know what that grant covers before pointing this at a shared project. `roles/aiplatform.user` is
+project-wide and unconditioned: it lets anything that can impersonate the GSA call **every** Vertex
+model and endpoint in `VERTEX_PROJECT`, not just the Anthropic model you configured. That is the
+standard grant and the scripts do not narrow it — if the blast radius matters to you, give the
+gateway its own Vertex project, or replace the role with a custom one limited to
+`aiplatform.endpoints.predict`.
+
 The Vertex project is a separate variable from `PROJECT_ID` because serving models from a shared
 project while the cluster lives elsewhere is the usual arrangement:
 

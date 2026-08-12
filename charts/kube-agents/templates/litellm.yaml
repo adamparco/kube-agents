@@ -20,14 +20,23 @@
 {{- $vertexProject := "" }}
 {{- $vertexLocation := "" }}
 {{- $vertexSA := "" }}
+{{- $vertexKSA := "" }}
 {{- if $vertex }}
 {{- $vertexProject = required "litellm.vertex.project is required when litellm.modelProvider is vertex_ai" .Values.litellm.vertex.project }}
 {{- $vertexLocation = required "litellm.vertex.location is required when litellm.modelProvider is vertex_ai" .Values.litellm.vertex.location }}
 {{- $vertexSA = required "litellm.vertex.serviceAccount is required when litellm.modelProvider is vertex_ai — the GSA email the LiteLLM KSA impersonates" .Values.litellm.vertex.serviceAccount }}
+{{- /*
+  ksaName is guarded too, even though it ships with a default. Emptying it
+  renders `name:` on the ServiceAccount — rejected at apply time — and, worse,
+  an empty serviceAccountName on the Deployment, which is NOT an error: the pod
+  silently runs as the namespace default SA, has no Workload Identity binding,
+  and every completion fails as a runtime 403.
+*/}}
+{{- $vertexKSA = required "litellm.vertex.ksaName is required when litellm.modelProvider is vertex_ai — an empty value drops the pod onto the default service account, which has no Vertex access" .Values.litellm.vertex.ksaName }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: {{ .Values.litellm.vertex.ksaName }}
+  name: {{ $vertexKSA }}
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: litellm
@@ -84,7 +93,7 @@ spec:
         checksum/config: {{ printf "%s/%s/%s/%s/%s" $provider $model $callbacks $vertexProject $vertexLocation | sha256sum }}
     spec:
       {{- if $vertex }}
-      serviceAccountName: {{ .Values.litellm.vertex.ksaName }}
+      serviceAccountName: {{ $vertexKSA }}
       {{- end }}
       containers:
         - name: litellm-container

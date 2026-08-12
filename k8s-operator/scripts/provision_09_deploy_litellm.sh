@@ -53,7 +53,24 @@ verify_litellm() {
   # Always return false to ensure that Kustomize builds and configs are applied idempotently on every run
   return 1
 }
+# vertex_ai is the one provider whose gateway can come up perfectly and still
+# serve nothing. Without the GSA and Workload Identity binding from
+# provision_04_gcp_iam.sh the pods still start, still pass their probes, and
+# still report a successful rollout — every completion then fails as a 403 that
+# surfaces only in the agent's logs. The CI redeploy workflow runs this step
+# without provision_04, so the check is here rather than left to the operator.
+preflight_vertex_iam() {
+  [ "${MODEL_PROVIDER:-}" = "vertex_ai" ] || return 0
+  local gsa_email="${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  if ! gcloud iam service-accounts describe "${gsa_email}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    print_error "MODEL_PROVIDER=vertex_ai but the LiteLLM GSA ${gsa_email} does not exist."
+    print_error "Run provision_04_gcp_iam.sh first — it creates the GSA, grants roles/aiplatform.user on VERTEX_PROJECT, and binds Workload Identity."
+    return 1
+  fi
+}
+
 execute_litellm() {
+  preflight_vertex_iam || return 1
   print_info "Deploying LiteLLM Gateway into GKE..."
   export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME
   # Only the vertex overlay reads these; exporting them unconditionally keeps
