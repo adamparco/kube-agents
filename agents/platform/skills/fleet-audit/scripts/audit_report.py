@@ -5394,7 +5394,8 @@ def _remediation_outcomes(
         elif fid in plan.already_open:
             outcomes[fid] = (
                 f"a pull request is already open — {url or 'see the table above'}; "
-                "it was left untouched rather than force-pushed over"
+                "its labels were re-asserted and its diff left untouched rather "
+                "than force-pushed over"
             )
         elif fid in plan.superseded:
             outcomes[fid] = (

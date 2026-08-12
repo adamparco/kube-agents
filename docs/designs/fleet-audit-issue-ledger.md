@@ -285,7 +285,7 @@ The ledger renders each finding in exactly one state. Transitions are computed p
 | State                | Condition                                             | Rendered as                           | Action taken                                            |
 | -------------------- | ----------------------------------------------------- | ------------------------------------- | ------------------------------------------------------- |
 | `open`               | reproduces; no PR on its branch                       | `open`                                | none, unless it qualifies for auto-promotion            |
-| `pr-open`            | reproduces; branch has an open PR                     | `fix proposed` + link                 | **nothing** — the PR is left exactly as it is           |
+| `pr-open`            | reproduces; branch has an open PR                     | `fix proposed` + link                 | **labels re-asserted** — the PR itself is untouched     |
 | `pr-merged-persists` | reproduces; branch PR is merged                       | `⚠ fix merged, still reproduces`      | comment once on the merged PR; never reopen it          |
 | `refused`            | reproduces; branch PR closed unmerged by a **person** | `fix refused` + link                  | none — the close stands until someone says `/remediate` |
 | `withdrawn`          | reproduces; branch PR closed unmerged by the harness  | `fix withdrawn, awaiting re-proposal` | eligible for promotion again, exactly as if it had none |
