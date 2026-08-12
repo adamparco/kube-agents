@@ -29,6 +29,7 @@ from unittest.mock import patch
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import gitops_pr  # noqa: E402
 import gitops_workspace  # noqa: E402
 
 SUBJECT = (
@@ -108,7 +109,8 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
         # `gh pr create` needs a GitHub. Record the call instead.
         self.gh_calls = []
-        self.patch_attr(submit_suggestion, "subprocess", _GhStub(self))
+        self.harness = _GhStub(self)
+        self.patch_attr(submit_suggestion, "subprocess", self.harness)
 
     def seed_origin(self) -> Path:
         origin = self.tmp_path / "origin.git"
@@ -288,8 +290,13 @@ class TestSubmit(SubmitSuggestionTestCase):
 
         self.assertEqual(url, "https://github.com/acme/fleet/pull/1")
         self.assertIn("platform-agent/fix-netpol", self.origin_branches())
-        self.assertEqual(len(self.gh_calls), 1)
-        argv, cwd = self.gh_calls[0]
+        # One *write*. The routing check's reads are counted separately, in
+        # TestAuditRoutingGuard; what matters here is that submitting opens
+        # exactly one pull request.
+        writes = [c for c in self.gh_calls if c[0][1:3] != ["issue", "list"]]
+        writes = [c for c in writes if c[0][1:3] != ["pr", "list"]]
+        self.assertEqual(len(writes), 1)
+        argv, cwd = writes[0]
         self.assertEqual(argv[:3], ["gh", "pr", "create"])
         self.assertEqual(cwd, payload["workspace"])
         self.assertIn("--repo", argv)
@@ -384,7 +391,11 @@ class TestSubmit(SubmitSuggestionTestCase):
         second = self.submit(again["branch"], again["workspace"], title="round two")
 
         self.assertEqual(second, first)
-        verbs = [argv[1:3] for argv, _ in self.gh_calls]
+        # Read-only lookups dropped: the routing check runs before each push
+        # and has its own tests. The shape being pinned is create → create
+        # (refused) → edit → view.
+        reads = (["issue", "list"], ["pr", "list"])
+        verbs = [argv[1:3] for argv, _ in self.gh_calls if argv[1:3] not in reads]
         self.assertEqual(
             verbs,
             [["pr", "create"], ["pr", "create"], ["pr", "edit"], ["pr", "view"]],
@@ -525,6 +536,255 @@ class TestArgvCompatibility(unittest.TestCase):
                 self.assertEqual(submit_suggestion.normalise_argv(argv), argv)
 
 
+# --------------------------------------------------------------------------- #
+# The block fleet-audit writes and this skill reads
+# --------------------------------------------------------------------------- #
+
+
+class TestPathsBlock(unittest.TestCase):
+    def test_round_trips(self):
+        paths = ["b/two.yaml", "a/one.yaml"]
+        block = gitops_pr.render_paths_block(paths)
+        self.assertEqual(gitops_pr.parse_paths_block(block), sorted(paths))
+
+    def test_an_empty_claim_is_not_the_same_as_no_block(self):
+        # The distinction the whole check rests on. A ledger that records no
+        # paths says the file is free; a ledger written before this block
+        # existed says nothing at all, and answering "free" for the second
+        # waves through every submission on a repository that has not had an
+        # audit run since the upgrade.
+        self.assertEqual(gitops_pr.parse_paths_block(gitops_pr.render_paths_block([])), [])
+        self.assertIsNone(gitops_pr.parse_paths_block("no block here"))
+        self.assertIsNone(gitops_pr.parse_paths_block(""))
+        self.assertIsNone(gitops_pr.parse_paths_block(None))
+
+    def test_a_malformed_block_reads_as_absent_rather_than_empty(self):
+        for body in (
+            "<!-- audit-paths: [not json -->",
+            "<!-- audit-paths: {} -->",
+            "<!-- audit-paths: -->",
+        ):
+            with self.subTest(body=body):
+                self.assertIsNone(gitops_pr.parse_paths_block(body))
+
+    def test_the_last_block_wins(self):
+        # Evidence quoted into a body can contain an older block. The footer is
+        # written last, so the last one is the run's own.
+        body = (
+            gitops_pr.render_paths_block(["old.yaml"])
+            + "\n\n"
+            + gitops_pr.render_paths_block(["new.yaml"])
+        )
+        self.assertEqual(gitops_pr.parse_paths_block(body), ["new.yaml"])
+
+    def test_the_block_is_capped(self):
+        many = [f"clusters/c/{i:04d}.yaml" for i in range(500)]
+        self.assertEqual(
+            len(gitops_pr.parse_paths_block(gitops_pr.render_paths_block(many))),
+            gitops_pr.PATHS_BLOCK_LIMIT,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Routing: a suggestion may not duplicate work a live audit owns
+# --------------------------------------------------------------------------- #
+
+
+class TestAuditRoutingGuard(SubmitSuggestionTestCase):
+    """The five duplicate pull requests this exists to stop.
+
+    A workload's findings on ledger #28 produced five near-duplicate pull
+    requests through this skill, none of them labelled, none deduplicated
+    against each other, and none ever closed. The check keys on the files the
+    branch changes rather than on what the body says about issue #28, because
+    two of those five buried the reference mid-sentence and one carried no
+    reference at all.
+    """
+
+    PATH = "clusters/prod/netpol.yaml"
+
+    def setUp(self):
+        super().setUp()
+        self.logged = []
+        self.patch_attr(submit_suggestion, "log", self.logged.append)
+
+    def claim_by_ledger(self, *paths):
+        self.harness.audit_issues = [
+            {"number": 28, "body": gitops_pr.render_paths_block(paths or [self.PATH])}
+        ]
+
+    def claim_by_pr(self, number=34, *paths):
+        self.harness.remediation_prs = [
+            {
+                "number": number,
+                "files": [{"path": p} for p in (paths or (self.PATH,))],
+            }
+        ]
+
+    def run_submit(self, branch="platform-agent/harden-netpol"):
+        prepared = self.prepare(branch=branch)
+        workspace = prepared["workspace"]
+        self.commit(workspace, self.PATH)
+        return self.submit(branch, workspace, lease=prepared["lease"])
+
+    def test_a_file_a_live_ledger_claims_is_refused(self):
+        self.claim_by_ledger()
+        with self.assertRaises(PermissionError) as caught:
+            self.run_submit()
+        self.assertIn(self.PATH, str(caught.exception))
+        self.assertIn("ledger issue #28", str(caught.exception))
+
+    def test_the_refusal_names_the_remediation_pr_to_push_to_instead(self):
+        # The most useful answer available: the audit already has a branch for
+        # this file, so the fix belongs on it rather than nowhere.
+        self.claim_by_pr(34)
+        with self.assertRaises(PermissionError) as caught:
+            self.run_submit()
+        self.assertIn("remediation pull request #34", str(caught.exception))
+
+    def test_a_pull_request_beats_a_ledger_when_both_claim_the_file(self):
+        self.claim_by_ledger()
+        self.claim_by_pr(34)
+        with self.assertRaises(PermissionError) as caught:
+            self.run_submit()
+        self.assertIn("remediation pull request #34", str(caught.exception))
+        self.assertNotIn("ledger issue #28", str(caught.exception))
+
+    def test_nothing_is_pushed_when_the_submission_is_refused(self):
+        # A refusal after the push leaves a branch on the remote with no pull
+        # request pointing at it and nothing that will ever clean it up, and
+        # the correctly-routed retry then has to force over it.
+        self.claim_by_ledger()
+        with self.assertRaises(PermissionError):
+            self.run_submit()
+        self.assertNotIn("platform-agent/harden-netpol", self.origin_branches())
+        self.assertEqual(self.harness.open_prs, {})
+
+    def test_a_body_that_never_mentions_the_issue_is_still_refused(self):
+        # Pull request 48 in the reference installation. A check that read the
+        # prose found nothing to object to and let it through.
+        self.claim_by_ledger()
+        prepared = self.prepare(branch="platform-agent/harden-netpol")
+        self.commit(prepared["workspace"], self.PATH)
+        with self.assertRaises(PermissionError):
+            self.submit(
+                "platform-agent/harden-netpol",
+                prepared["workspace"],
+                lease=prepared["lease"],
+                title="feat(compliance): make bad-app-cron-test pod compliant",
+                body="Deploy the workload without privileged containers.",
+            )
+
+    def test_an_unclaimed_file_submits_normally(self):
+        self.claim_by_ledger("clusters/prod/something-else.yaml")
+        url = self.run_submit()
+        self.assertTrue(url.startswith("https://github.com/acme/fleet/pull/"))
+
+    def test_no_open_audits_submits_normally(self):
+        url = self.run_submit()
+        self.assertTrue(url.startswith("https://github.com/acme/fleet/pull/"))
+
+    def test_a_ledger_with_no_paths_block_claims_nothing_it_cannot_prove(self):
+        # Written by a version that predates the block. Refusing everything
+        # against such a repository would be the wrong direction to fail: the
+        # skill is the sanctioned path, and a check that cannot see is not
+        # evidence of a duplicate.
+        self.harness.audit_issues = [{"number": 28, "body": "no block here"}]
+        url = self.run_submit()
+        self.assertTrue(url.startswith("https://github.com/acme/fleet/pull/"))
+
+    def test_pushing_to_the_audits_own_pull_request_is_allowed(self):
+        # SKILL.md Step 5: addressing review feedback on an existing pull
+        # request re-submits onto its head branch. On a remediation pull
+        # request every file it touches is claimed by definition, so a check
+        # that did not recognise the audit's own work would make its pull
+        # requests the only ones in the repository nobody could revise.
+        branch = "platform-agent/fix-compliance-audit-netpol-abc1234567"
+        self.claim_by_ledger()
+        prepared = self.prepare(branch=branch)
+        self.commit(prepared["workspace"], self.PATH)
+        self.harness.open_prs[branch] = "https://github.com/acme/fleet/pull/34"
+        self.harness.pr_labels[branch] = ["agent:audit", "audit:remediation"]
+        url = self.submit(branch, prepared["workspace"], lease=prepared["lease"])
+        self.assertEqual(url, "https://github.com/acme/fleet/pull/34")
+
+    def test_an_ordinary_open_pull_request_does_not_earn_the_exemption(self):
+        # Only `audit:remediation` does. Otherwise the way past the check is to
+        # open the pull request first and resubmit.
+        branch = "platform-agent/harden-netpol"
+        self.claim_by_ledger()
+        prepared = self.prepare(branch=branch)
+        self.commit(prepared["workspace"], self.PATH)
+        self.harness.open_prs[branch] = "https://github.com/acme/fleet/pull/9"
+        self.harness.pr_labels[branch] = ["enhancement"]
+        with self.assertRaises(PermissionError):
+            self.submit(branch, prepared["workspace"], lease=prepared["lease"])
+
+    def test_an_unreachable_github_fails_open_and_says_so(self):
+        # A routing correction, not a security boundary — the credential proxy
+        # is that. Stopping every GitOps write in the pod because GitHub is
+        # down trades one duplicate pull request for no pull requests at all.
+        self.claim_by_ledger()
+        self.harness.audit_lookup_fails = True
+        url = self.run_submit()
+        self.assertTrue(url.startswith("https://github.com/acme/fleet/pull/"))
+        self.assertTrue(
+            any("could not read the open audits" in m for m in self.logged),
+            self.logged,
+        )
+
+    def test_the_lookups_run_inside_the_leased_workspace(self):
+        # `gh` is a shim that POSTs its argv and cwd to the credential sidecar,
+        # which refuses a call made outside a lease it recognises.
+        self.claim_by_ledger("clusters/prod/something-else.yaml")
+        prepared = self.prepare(branch="platform-agent/harden-netpol")
+        self.commit(prepared["workspace"], self.PATH)
+        self.submit(
+            "platform-agent/harden-netpol",
+            prepared["workspace"],
+            lease=prepared["lease"],
+        )
+        lookups = [
+            (argv, cwd)
+            for argv, cwd in self.gh_calls
+            if argv[1:3] in (["issue", "list"], ["pr", "list"])
+        ]
+        self.assertTrue(lookups)
+        for argv, cwd in lookups:
+            self.assertEqual(cwd, prepared["workspace"], argv)
+
+
+class TestChangedPaths(SubmitSuggestionTestCase):
+    def test_only_this_branch_s_own_changes_are_reported(self):
+        # Three-dot, not two. A commit that lands on main while the agent is
+        # working is not this branch's doing, and attributing it would refuse
+        # the submission over a file somebody else touched that afternoon.
+        prepared = self.prepare(branch="platform-agent/harden-netpol")
+        workspace = prepared["workspace"]
+        self.commit(workspace, "clusters/prod/netpol.yaml")
+
+        moved_on = self.tmp_path / "other"
+        subprocess.run(
+            ["git", "clone", "--quiet", str(self.origin), str(moved_on)],
+            check=True, capture_output=True,
+        )
+        (moved_on / "unrelated.yaml").write_text("x\n", encoding="utf-8")
+        for argv in (
+            ["config", "user.email", "t@example.com"],
+            ["config", "user.name", "T"],
+            ["add", "unrelated.yaml"],
+            ["commit", "--quiet", "-m", "unrelated"],
+            ["push", "--quiet", "origin", "main"],
+        ):
+            git(argv, moved_on)
+        git(["fetch", "--quiet", "origin"], workspace)
+
+        self.assertEqual(
+            submit_suggestion.changed_paths("main", workspace),
+            ["clusters/prod/netpol.yaml"],
+        )
+
+
 class _GhStub:
     """Stand in for the `subprocess` module inside submit_suggestion.
 
@@ -543,6 +803,17 @@ class _GhStub:
         self._test = test
         self.open_prs: dict[str, str] = {}
         self.titles: dict[str, str] = {}
+        # Labels on the open pull request for a branch, for the routing check's
+        # "is this fleet-audit's own pull request?" question.
+        self.pr_labels: dict[str, list[str]] = {}
+        # What `gh pr list --label audit:remediation` answers: the audit's open
+        # remediation pull requests and the files each one changes.
+        self.remediation_prs: list[dict] = []
+        # What `gh issue list --label agent:audit` answers: the open ledgers.
+        self.audit_issues: list[dict] = []
+        # Set to make every list call fail, standing in for an outage or an
+        # expired token.
+        self.audit_lookup_fails = False
 
     def __getattr__(self, name):
         return getattr(subprocess, name)
@@ -559,7 +830,16 @@ class _GhStub:
             return self._edit(argv)
         if verb == ["pr", "view"]:
             return self._view(argv)
+        if verb == ["pr", "list"]:
+            return self._list(argv, self.remediation_prs)
+        if verb == ["issue", "list"]:
+            return self._list(argv, self.audit_issues)
         return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def _list(self, argv, rows):
+        if self.audit_lookup_fails:
+            return subprocess.CompletedProcess(argv, 1, "", "HTTP 401\n")
+        return subprocess.CompletedProcess(argv, 0, json.dumps(rows), "")
 
     def _create(self, argv):
         branch = argv[argv.index("--head") + 1]
@@ -586,6 +866,12 @@ class _GhStub:
         branch = argv[3]
         if branch not in self.open_prs:
             return subprocess.CompletedProcess(argv, 1, "", "no pull requests found\n")
+        if "labels,state" in argv:
+            payload = {
+                "state": "OPEN",
+                "labels": [{"name": n} for n in self.pr_labels.get(branch, [])],
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
         return subprocess.CompletedProcess(argv, 0, self.open_prs[branch] + "\n", "")
 
 

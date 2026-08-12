@@ -49,6 +49,11 @@ sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
+# Not lazy, unlike the sandbox import above: the ledger footer cannot be
+# rendered without it, so a missing module has to fail at start rather than
+# half-way through a run that has already published.
+import gitops_pr  # noqa: E402
+
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
@@ -3352,8 +3357,21 @@ def _render_findings(
 
 
 def _render_footer(
-    audit_id: str, generated_at: datetime, rendered_ids: list[str]
+    audit_id: str,
+    generated_at: datetime,
+    rendered_ids: list[str],
+    claimed_paths: list[str] | None = None,
 ) -> list[str]:
+    """The ledger's trailer: provenance, the id block, and the path block.
+
+    `claimed_paths` is every file this audit's live findings would rewrite, and
+    unlike `rendered_ids` it is *not* limited to what fitted in the body. A
+    finding dropped for space is still live, still un-fixed, and still the
+    thing a hand-rolled pull request would duplicate — the block exists to be
+    read by `submit-suggestion`, not by a human scrolling the issue, so the
+    body budget is the wrong thing to trim it against. `render_paths_block`
+    caps it independently.
+    """
     return [
         "",
         "---",
@@ -3363,6 +3381,7 @@ def _render_footer(
         "live fleet; every one carries the exact command it was derived from.",
         "",
         delta_block(rendered_ids),
+        gitops_pr.render_paths_block(claimed_paths or []),
         "",
     ]
 
@@ -3525,10 +3544,19 @@ def render_issue_body(
     fixed += _render_scope(clusters, skipped, generated_at, audit_id)
     withheld_section = _render_withheld(list(withheld or []), findings)
 
+    # Every file the live findings claim, for the footer's path block. Taken
+    # from all of `findings` rather than the rendered subset — see
+    # `_render_footer` — which is also why it is charged in full here instead
+    # of per-finding: it does not shrink when the body drops a finding, so a
+    # budget that assumed it would is a body that overruns.
+    claimed_paths = group_paths(findings)
+
     # Measure the footer with an empty delta block: each finding is separately
     # charged for its own id slot inside select_rendered_findings.
     overhead = len("\n".join(fixed + withheld_section))
-    overhead += len("\n".join(_render_footer(audit_id, generated_at, [])))
+    overhead += len(
+        "\n".join(_render_footer(audit_id, generated_at, [], claimed_paths))
+    )
     overhead += len("\n".join(["", "## Findings", "", ""])) + 400  # section chrome
     if states:
         # The state index is one row per rendered finding, capped, and is not
@@ -3545,7 +3573,7 @@ def render_issue_body(
     omitted_ids = {str(f.get("id", "")) for f in omitted}
     rendered_ids = [fid for fid in finding_ids(findings) if fid not in omitted_ids]
 
-    footer = _render_footer(audit_id, generated_at, rendered_ids)
+    footer = _render_footer(audit_id, generated_at, rendered_ids, claimed_paths)
     # Whatever the findings did not need. The evidence appendix is the last
     # claim on the budget, never a competitor for it — a run with 400 findings
     # publishes the findings and drops the appendix, not the reverse.

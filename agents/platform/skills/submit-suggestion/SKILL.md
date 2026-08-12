@@ -15,6 +15,36 @@ This skill equips the Platform Agent to propose declarative file updates, GKE in
 
 _Crucially, you are strictly forbidden from executing direct, manual mutations. All changes must flow through this secure PR suggestion skill._
 
+## When Not to Use — fixing a fleet-audit finding
+
+**A fix for something a fleet audit found does not come through this skill.** It belongs to
+`fleet-audit`, which owns every pull request answering one of its findings:
+
+```bash
+./skills/fleet-audit/scripts/audit_report.py remediate \
+  --audit <audit-id> --findings-file <findings_path> --finding <finding-id>
+```
+
+That path names the branch after the files the fix touches, so a later run refreshes the pull
+request that exists instead of opening another; applies the `agent:audit`, `audit:<audit-id>`,
+`audit:remediation` and `severity:<level>` labels; embeds a `<!-- finding:<id> -->` marker per
+finding; and closes the pull request again when the finding stops reproducing. A suggestion opened
+here has none of that — nothing dedupes it and nothing ever closes it. One workload's findings once
+produced five near-duplicate unlabelled pull requests this way, each invisible to the audit that
+would have collapsed them into one.
+
+`submit` enforces this by looking at **the files your branch changes**, not at what your description
+says. Before it pushes, it asks GitHub which files the open audits already claim — every open
+`audit:remediation` pull request's diff, plus the paths recorded on every open `agent:audit` ledger
+issue — and refuses if yours overlaps, naming what owns each file. Your commits stay in the
+workspace; nothing is pushed.
+
+Two things it does **not** refuse: pushing to the audit's own remediation branch, which is how you
+address review feedback on one of its pull requests (Step 5 below), and touching any file no live
+finding claims. And since the check reads the diff, rewording the description does not change the
+answer — if a file is claimed, submit the fix through `remediate`, or onto the branch of the
+remediation pull request the refusal names.
+
 ## Execution Instructions
 
 Follow these steps to make, commit, and submit your GitOps suggestions asynchronously:

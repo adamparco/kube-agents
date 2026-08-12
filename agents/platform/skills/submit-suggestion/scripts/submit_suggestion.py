@@ -31,6 +31,7 @@ sys.path.append("/opt/data/scripts")
 # The same directory in a source checkout, where nothing is staged into /opt.
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
+import gitops_pr
 import gitops_workspace
 from github_token_refresh import refresh_git_credentials, log
 
@@ -127,6 +128,114 @@ def remote_branch_exists(branch: str, workspace) -> bool:
     return res.returncode == 0
 
 
+def changed_paths(base: str, workspace: str) -> list[str]:
+    """Repository paths the checked-out branch changes relative to the base.
+
+    `HEAD` rather than a branch name because `handle_submit` has already
+    refused a workspace sitting on a different branch than the one being
+    submitted, so the two cannot disagree here — and reading HEAD keeps this
+    honest if that ever stops being true.
+
+    Three dots, not two: `origin/base...HEAD` diffs against the merge base, so
+    commits that landed on the base while the agent was working are not
+    reported as this branch's doing. With two dots every submission made
+    against a busy repository would look like it rewrote whatever else merged
+    that afternoon, and the check below would refuse on someone else's file.
+    """
+    res = git(
+        ["diff", "--name-only", f"origin/{base}...HEAD"], workspace, check=False
+    )
+    if res.returncode != 0:
+        # Nothing here is worth failing a submission over — but an empty list
+        # is also what "this branch changes nothing" looks like, and the caller
+        # waves that through. Say which one happened.
+        log(
+            f"could not diff against origin/{base} "
+            f"({(res.stderr or '').strip() or 'no output'}); proceeding without "
+            "checking whether this change duplicates a fleet audit's work"
+        )
+        return []
+    return [line.strip() for line in (res.stdout or "").splitlines() if line.strip()]
+
+
+def assert_not_audit_remediation(
+    branch: str, base: str, repo: str, workspace: str
+) -> None:
+    """Refuse a submission that duplicates work a live fleet audit owns.
+
+    `fleet-audit` keys its pull requests on the files a finding group fixes, so
+    a rerun refreshes the one that exists rather than opening another; it
+    labels them; and it closes them again when the finding stops reproducing. A
+    suggestion opened against the same file has none of that — nothing dedupes
+    it and nothing ever closes it. In the reference installation one workload's
+    findings produced five near-duplicate pull requests this way, each
+    invisible to the audit that would have collapsed them into one.
+
+    The signal is the *diff*, deliberately. Matching "resolves #28" in the body
+    was tried first and caught two of those five: one referenced no issue and
+    two buried the reference mid-sentence. It also pointed the incentive the
+    wrong way, since dropping the reference was then the cheapest way past the
+    check. Which files a commit touches is not editorial, and it is the same
+    thing `fleet-audit` keys on, so the two agree by construction.
+
+    Not refused, because neither is a duplicate: pushing to the audit's *own*
+    pull request — the documented way to address review feedback on one — and
+    touching a file no live finding claims.
+    """
+    # Cheapest question first: the diff is local and free, and a submission
+    # that changes nothing cannot duplicate anything.
+    paths = changed_paths(base, workspace)
+    if not paths:
+        return
+
+    # `subprocess.run` handed over rather than left to the module's own import,
+    # so every call goes through this file's seam — the one the tests patch and
+    # the one a future logging wrapper would.
+    claims = gitops_pr.audit_claims(repo, workspace, subprocess.run)
+    if claims is None:
+        # Fail open, and say so. This is a routing correction, not a security
+        # boundary — the credential proxy is that — and stopping every GitOps
+        # write in the pod because GitHub is unreachable would trade one
+        # duplicate pull request for no pull requests at all.
+        log(
+            "could not read the open audits from GitHub; proceeding without "
+            "checking whether this change duplicates a remediation they own"
+        )
+        return
+
+    collisions = [(path, claims[path]) for path in paths if path in claims]
+    if not collisions:
+        return
+
+    # Only now worth a round trip: on a remediation branch every file collides
+    # by definition, so this question is only interesting once one has. Asking
+    # it up front would spend a call on every ordinary submission to answer
+    # "no" — and the common case is an ordinary submission.
+    labels = gitops_pr.branch_labels(repo, branch, workspace, subprocess.run)
+    if labels and gitops_pr.AUDIT_REMEDIATION_LABEL in labels:
+        # fleet-audit opened this pull request; this is Step 5 updating it, not
+        # a second one racing it.
+        return
+
+    owned = "\n".join(f"    {path}  — claimed by {claim}" for path, claim in collisions)
+    raise PermissionError(
+        "this change rewrites files a live fleet audit already owns:\n\n"
+        f"{owned}\n\n"
+        "Remediation for an audit finding is opened by the audit, not by "
+        "submit-suggestion:\n\n"
+        "    ./skills/fleet-audit/scripts/audit_report.py remediate \\\n"
+        "        --audit <audit-id> --findings-file <findings_path> \\\n"
+        "        --finding <finding-id>\n\n"
+        "That path names the branch after the files the fix touches, so a "
+        "rerun refreshes the pull request that exists instead of opening "
+        "another; it applies the audit labels; and it closes the pull request "
+        "again when the finding stops reproducing. If a remediation pull "
+        "request is named above, the fix belongs on *its* branch — `prepare "
+        "--branch <its head branch>` and submit there. Your commits are still "
+        "in the workspace; nothing has been pushed."
+    )
+
+
 def handle_submit(args) -> int:
     branch = check_branch(args.branch)
     workspace = args.workspace or os.getcwd()
@@ -163,8 +272,17 @@ def handle_submit(args) -> int:
     repo = args.repo or gitops_workspace.resolve_repo()
     refresh_git_credentials(repo)
 
-    push_branch(branch, workspace)
+    # Base resolution moved above the push because the routing check diffs
+    # against it. It is a read either way.
     base = gitops_workspace.resolve_base_branch(workspace, _runner)
+
+    # Before the push, and after the credential refresh because the check reads
+    # GitHub. A refusal that has already pushed leaves a branch on the remote
+    # with no pull request pointing at it and no run that will ever clean it
+    # up, and the correctly-routed retry then has to force over it.
+    assert_not_audit_remediation(branch, base, repo, workspace)
+
+    push_branch(branch, workspace)
     pr_url = create_pull_request(branch, args.title, args.body, workspace, repo, base)
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
 

@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import audit_report  # noqa: E402
+import gitops_pr  # noqa: E402
 import gitops_workspace  # noqa: E402
 
 AUDIT = "compliance-audit"
@@ -633,8 +634,17 @@ class TestRenderBody(unittest.TestCase):
         )
         # The stamp is part of the footer, not a separate emission: a body that
         # ended at the ids would be unjoinable a run later.
+        self.assertIn(audit_report.delta_block(["no-network-policy"]), body)
+        # And the path block closes it. `submit-suggestion` reads this to tell
+        # whether a file it is about to open a pull request against is already
+        # claimed by a live finding, so a footer that stops at the ids leaves
+        # every unpromoted finding invisible to the routing check.
         self.assertTrue(
-            body.rstrip().endswith(audit_report.delta_block(["no-network-policy"])),
+            body.rstrip().endswith(
+                gitops_pr.render_paths_block(
+                    ["clusters/prod-us-east/payments-netpol.yaml"]
+                )
+            ),
             body[-300:],
         )
 
