@@ -214,22 +214,46 @@ def _rotate(log_path: Path) -> None:
         pass  # logging must never be the reason a tick does not happen
 
 
-# Home-target routing keys, per platform: (chat id, thread id).
+# Home-target routing keys, per platform: (chat id, thread id, CR fallback).
 #
 # ``deliver=all`` resolves through ``cron/scheduler.py``'s
 # ``_get_home_target_chat_id``, which reads ``os.getenv`` and nothing else — it
 # never consults ``config.yaml``. So the child needs these in its environment
 # or it has nowhere to post.
 #
-# Slack-only because the entry criterion is "the platform's home-channel var is
-# on the provider-env blocklist", not "the harness supports the platform". Of
-# the platforms shipped here, ``tools/environments/local.py`` blocks Slack's
-# (and Telegram's, Discord's and Signal's); ``GOOGLE_CHAT_HOME_CHANNEL`` is
-# absent from that list, so it survives ``build_subprocess_env`` and the child
-# inherits it with nothing to restore. Add a platform here when its var joins
-# the blocklist, not when the platform is enabled.
+# The entry criterion is "the platform's home-channel var is on the
+# provider-env blocklist", not "the harness supports the platform". Both
+# platforms shipped here qualify. An earlier revision of this comment claimed
+# ``GOOGLE_CHAT_HOME_CHANNEL`` was exempt because a grep of
+# ``tools/environments/local.py`` finds no such literal — but the blocklist is
+# *derived* before the literals are added: ``_build_provider_env_blocklist()``
+# sweeps every registry var whose category is ``messaging``, and
+# ``GOOGLE_CHAT_HOME_CHANNEL`` is registered with exactly that category. Verify
+# membership by importing ``_HERMES_PROVIDER_ENV_BLOCKLIST`` and testing ``in``,
+# never by grepping the source.
+#
+# The third element is the fallback: an alias of the same value that the
+# operator sets on the container (`platformagent_manifests.go`) precisely
+# because Hermes has never heard of the name, so no blocklist entry can match
+# it and it survives ``build_subprocess_env`` into this ticker. It is read only
+# when ``config.yaml`` has no ``home_channel`` for the platform — the file
+# `/sethome` writes stays authoritative, and the alias covers the install
+# where `/sethome` has never run and only the PlatformAgent CR knows the home.
+#
+# The thread slot is ``None`` for Google Chat because no
+# ``GOOGLE_CHAT_HOME_CHANNEL_THREAD_ID`` exists anywhere in Hermes — there is
+# nothing inherited to clear.
 HOME_TARGET_ENV_KEYS = {
-    "slack": ("SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_THREAD_ID"),
+    "slack": (
+        "SLACK_HOME_CHANNEL",
+        "SLACK_HOME_CHANNEL_THREAD_ID",
+        "KUBEAGENTS_SLACK_HOME_CHANNEL",
+    ),
+    "google_chat": (
+        "GOOGLE_CHAT_HOME_CHANNEL",
+        None,
+        "KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL",
+    ),
 }
 
 
@@ -249,10 +273,11 @@ def _mapping(value: object) -> dict:
 def home_target_env(root_home: Path) -> dict[str, str]:
     """The home-target variables a cron child cannot inherit, re-read from disk.
 
-    ``SLACK_HOME_CHANNEL`` sits on Hermes' provider-env blocklist
-    (``tools/environments/local.py``), so ``build_subprocess_env`` strips it
-    from every ``no_agent`` script's environment — including this ticker's.
-    The value is therefore already gone by the time we spawn, and passing
+    ``SLACK_HOME_CHANNEL`` and ``GOOGLE_CHAT_HOME_CHANNEL`` both sit on
+    Hermes' provider-env blocklist (``tools/environments/local.py``), so
+    ``build_subprocess_env`` strips them from every ``no_agent`` script's
+    environment — including this ticker's.
+    The values are therefore already gone by the time we spawn, and passing
     ``os.environ`` through re-exports the hole: the child resolves
     ``deliver=all`` to nothing and every job on a named profile records "no
     delivery target resolved for deliver=all" while posting nowhere.
@@ -262,9 +287,22 @@ def home_target_env(root_home: Path) -> dict[str, str]:
     ``/sethome`` writes — rather than from the environment it was scrubbed
     from. A channel id is routing metadata, not a credential: it is on that
     blocklist because Hermes manages it as config, alongside
-    ``SLACK_ALLOWED_USERS``. Restoring these two keys here leaves the blocklist
+    ``SLACK_ALLOWED_USERS``. Restoring these keys here leaves the blocklist
     intact for everything it exists to protect — the tokens, the relay secret,
     the provider API keys.
+
+    When the file has no home for a platform, fall back to the operator's
+    ``KUBEAGENTS_*`` alias of the CR's ``homeChannel`` field. The fallback is
+    deliberately NOT written into ``config.yaml`` by the operator: the default
+    profile's config is rebuilt by a three-way merge
+    (``deploy/shared/default_profile_config.py``) that negotiates
+    ``home_channel`` per *leaf*, and a CR-declared ``chat_id`` there would
+    graft itself onto whatever ``name``/``thread_id``/``user_id`` a previous
+    `/sethome` recorded, silently re-point an existing home on the first boot
+    after an upgrade, and delete the runtime's value outright when the CR
+    field is later cleared. An env alias has none of those failure modes, and
+    the precedence lands where it should: the user's `/sethome`, when one has
+    ever happened, beats the CR's provisioning-time default.
 
     Both keys move together on purpose. ``SLACK_HOME_CHANNEL_THREAD_ID`` is
     *not* on the blocklist and does survive the spawn, so restoring only the
@@ -286,23 +324,27 @@ def home_target_env(root_home: Path) -> dict[str, str]:
         config = yaml.safe_load((root_home / "config.yaml").read_text()) or {}
     except Exception:
         # Never the reason a tick does not happen: a job with an explicit
-        # target still delivers, and `deliver=all` degrades to today's
-        # behaviour rather than to a crash.
-        return {}
+        # target still delivers. An unreadable file only forfeits the
+        # `/sethome` read — the CR alias below does not live in the file, so
+        # it still resolves.
+        config = {}
 
     platforms = _mapping(config).get("platforms")
     restored: dict[str, str] = {}
-    for platform, (chat_key, thread_key) in HOME_TARGET_ENV_KEYS.items():
+    for platform, (chat_key, thread_key, fallback_key) in HOME_TARGET_ENV_KEYS.items():
         home = _mapping(_mapping(platforms).get(platform)).get("home_channel")
         home = _mapping(home)
-        chat_id = home.get("chat_id")
+        chat_id = str(home.get("chat_id") or "").strip()
+        if not chat_id:
+            chat_id = os.environ.get(fallback_key, "").strip()
         if not chat_id:
             continue
-        restored[chat_key] = str(chat_id)
+        restored[chat_key] = chat_id
         # Empty means "unset it in the child", not "leave it alone" — see the
         # docstring: a thread id from a previous home outlives the re-home,
         # and a cron brief posts flat regardless of the one on file.
-        restored[thread_key] = ""
+        if thread_key:
+            restored[thread_key] = ""
     return restored
 
 

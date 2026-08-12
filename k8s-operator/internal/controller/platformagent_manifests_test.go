@@ -1533,6 +1533,12 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	if envMap["SLACK_HOME_CHANNEL"].Value != "C999" {
 		t.Errorf("expected SLACK_HOME_CHANNEL C999, got %s", envMap["SLACK_HOME_CHANNEL"].Value)
 	}
+	// The un-blocklistable alias the cron ticker falls back to; must carry the
+	// same value, or `deliver=all` on a named profile resolves a different home
+	// than every other consumer.
+	if envMap["KUBEAGENTS_SLACK_HOME_CHANNEL"].Value != "C999" {
+		t.Errorf("expected KUBEAGENTS_SLACK_HOME_CHANNEL C999, got %s", envMap["KUBEAGENTS_SLACK_HOME_CHANNEL"].Value)
+	}
 	if envMap["SLACK_HOME_CHANNEL_NAME"].Value != "general" {
 		t.Errorf("expected SLACK_HOME_CHANNEL_NAME general, got %s", envMap["SLACK_HOME_CHANNEL_NAME"].Value)
 	}
@@ -1546,6 +1552,91 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	}
 	if proxyEnv["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || proxyEnv["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Key != "app-token-key" {
 		t.Errorf("expected proxy SLACK_APP_TOKEN custom-slack-secret/app-token-key, got %v", proxyEnv["SLACK_APP_TOKEN"].ValueFrom)
+	}
+}
+
+// The KUBEAGENTS_* home-channel aliases exist for one consumer: the cron
+// ticker's home_target_env (agents/chat/scripts/profile_cron_tick.py). The
+// canonical vars are on Hermes' provider-env blocklist and never reach it, so
+// `deliver=all` on a named profile resolves through the alias when `/sethome`
+// has never written a home to config.yaml. Three properties matter: the alias
+// mirrors the CR value, it is never rendered empty (a blank would read as a
+// home), and it stays inside the platform's `enabled` gate — a restored home
+// for an adapter that is not running turns the scheduler's quiet no-target
+// skip into a RuntimeError in every cron child.
+func TestBuildDeploymentHomeChannelAliases(t *testing.T) {
+	gchatOn := func(home string) *agentv1alpha1.GoogleChatSpec {
+		return &agentv1alpha1.GoogleChatSpec{
+			Enabled:          ptr.To(true),
+			ProjectID:        "proj",
+			TopicName:        "topic",
+			SubscriptionName: "sub",
+			HomeChannel:      home,
+		}
+	}
+	for _, tc := range []struct {
+		name        string
+		integration *agentv1alpha1.PlatformAgentIntegrationSpec
+		want        map[string]string // alias name -> value; "" means must be absent
+	}{
+		{
+			name: "both aliases mirror the CR",
+			integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: gchatOn("spaces/AAA"),
+				Slack:      &agentv1alpha1.SlackSpec{Enabled: ptr.To(true), HomeChannel: "C999"},
+			},
+			want: map[string]string{
+				"KUBEAGENTS_SLACK_HOME_CHANNEL":       "C999",
+				"KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL": "spaces/AAA",
+			},
+		},
+		{
+			// GOOGLE_CHAT_HOME_CHANNEL itself is rendered even when empty;
+			// the alias must not be, or the ticker's fallback would restore
+			// an empty home.
+			name: "no alias for an empty home channel",
+			integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: gchatOn(""),
+				Slack:      &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
+			},
+			want: map[string]string{
+				"KUBEAGENTS_SLACK_HOME_CHANNEL":       "",
+				"KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL": "",
+			},
+		},
+		{
+			name: "no alias while the platform is disabled",
+			integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(false), HomeChannel: "C999"},
+			},
+			want: map[string]string{
+				"KUBEAGENTS_SLACK_HOME_CHANNEL": "",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+				Spec:       agentv1alpha1.PlatformAgentSpec{Integration: tc.integration},
+			}
+			dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
+			envMap := make(map[string]corev1.EnvVar)
+			for _, env := range dep.Spec.Template.Spec.Containers[0].Env {
+				envMap[env.Name] = env
+			}
+			for name, value := range tc.want {
+				got, present := envMap[name]
+				if value == "" {
+					if present {
+						t.Errorf("%s must be absent, got %q", name, got.Value)
+					}
+					continue
+				}
+				if !present || got.Value != value {
+					t.Errorf("%s = %q (present=%v), want %q", name, got.Value, present, value)
+				}
+			}
+		})
 	}
 }
 
