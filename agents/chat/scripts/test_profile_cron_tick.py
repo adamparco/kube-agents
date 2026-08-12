@@ -26,6 +26,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -610,6 +611,14 @@ class HomeTargetEnvTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.home = Path(self._tmp.name)
+        # Isolate from the machine's environment: the CR-alias fallback reads
+        # os.environ, and a developer pod (or a test runner inside one) can
+        # legitimately carry these variables.
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for _, _, fallback_key in pct.HOME_TARGET_ENV_KEYS.values():
+            os.environ.pop(fallback_key, None)
 
     def write_config(self, mapping):
         (self.home / "config.yaml").write_text(yaml.safe_dump(mapping), encoding="utf-8")
@@ -716,6 +725,71 @@ class HomeTargetEnvTest(unittest.TestCase):
         # the junk sibling it exists to cover.
         restored = pct.home_target_env(self.home)
         self.assertEqual("C123", restored.get("SLACK_HOME_CHANNEL"))
+
+    def test_a_google_chat_home_is_recovered_without_inventing_a_thread_key(self):
+        # GOOGLE_CHAT_HOME_CHANNEL is blocklisted the same way Slack's var is
+        # (category-derived, so a grep for the literal finds nothing). No
+        # thread variable exists for the platform, so none may be emitted:
+        # spawn_tick treats an empty value as "drop the key", and a key Hermes
+        # never defined must not appear in the child either way.
+        self.write_config(
+            {
+                "platforms": {
+                    "google_chat": {"home_channel": {"chat_id": "spaces/AAA"}}
+                }
+            }
+        )
+        self.assertEqual(
+            pct.home_target_env(self.home),
+            {"GOOGLE_CHAT_HOME_CHANNEL": "spaces/AAA"},
+        )
+
+    def test_the_cr_alias_covers_an_install_where_sethome_never_ran(self):
+        # The operator sets KUBEAGENTS_* aliases of the CR's homeChannel on
+        # the container; unlike the real names they are not blocklisted, so
+        # they survive into this ticker. A fresh install has a config.yaml
+        # with no home_channel at all — the alias is the only source.
+        self.write_config({"platforms": {"slack": {"enabled": True}}})
+        os.environ["KUBEAGENTS_SLACK_HOME_CHANNEL"] = "C0FROMCR"
+        os.environ["KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/FROMCR"
+        self.assertEqual(
+            pct.home_target_env(self.home),
+            {
+                "SLACK_HOME_CHANNEL": "C0FROMCR",
+                "SLACK_HOME_CHANNEL_THREAD_ID": "",
+                "GOOGLE_CHAT_HOME_CHANNEL": "spaces/FROMCR",
+            },
+        )
+
+    def test_sethome_beats_the_cr_alias(self):
+        # config.yaml is what /sethome writes last; the alias is the CR's
+        # provisioning-time default. The user's later choice wins — the same
+        # precedence spawn_tick applies between home_env and the inherited
+        # environment.
+        self.write_config(
+            {"platforms": {"slack": {"home_channel": {"chat_id": "C0USERPICK"}}}}
+        )
+        os.environ["KUBEAGENTS_SLACK_HOME_CHANNEL"] = "C0FROMCR"
+        self.assertEqual(
+            "C0USERPICK", pct.home_target_env(self.home).get("SLACK_HOME_CHANNEL")
+        )
+
+    def test_the_alias_survives_a_missing_or_corrupt_config(self):
+        # The alias does not live in the file, so an unreadable file forfeits
+        # only the /sethome read. Both failure shapes must resolve the same.
+        os.environ["KUBEAGENTS_SLACK_HOME_CHANNEL"] = "C0FROMCR"
+        expected = {"SLACK_HOME_CHANNEL": "C0FROMCR", "SLACK_HOME_CHANNEL_THREAD_ID": ""}
+        self.assertEqual(pct.home_target_env(self.home), expected)  # no file
+        (self.home / "config.yaml").write_text("platforms: [oh: no\n", encoding="utf-8")
+        self.assertEqual(pct.home_target_env(self.home), expected)  # bad parse
+
+    def test_a_blank_alias_is_not_a_home(self):
+        # An operator that renders the variable empty must not produce an
+        # empty SLACK_HOME_CHANNEL in the child — an empty value would
+        # overwrite an inherited one while satisfying no truthiness check.
+        self.write_config({"platforms": {"slack": {}}})
+        os.environ["KUBEAGENTS_SLACK_HOME_CHANNEL"] = "   "
+        self.assertEqual(pct.home_target_env(self.home), {})
 
 
 if __name__ == "__main__":
