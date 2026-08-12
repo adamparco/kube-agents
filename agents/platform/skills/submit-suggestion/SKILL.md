@@ -1,6 +1,6 @@
 ---
 name: submit-suggestion
-description: Propose declarative configuration updates securely by committing file changes and submitting GitHub Pull Requests (PRs) for SRE review.
+description: Propose declarative configuration updates securely by committing file changes and submitting GitHub Pull Requests (PRs) for SRE review. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
 ---
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
@@ -14,6 +14,28 @@ This skill equips the Platform Agent to propose declarative file updates, GKE in
 - **Governance Policy Syncs:** Triggered when compliance playbooks or settings require updates.
 
 _Crucially, you are strictly forbidden from executing direct, manual mutations. All changes must flow through this secure PR suggestion skill._
+
+## When NOT to Use
+
+- **Fixing a fleet-audit finding.** The bullets above match audit fixes too — a
+  security patch, a policy update — which is exactly why this warning exists. If
+  the change addresses a finding from a fleet audit (it has a finding id, or a
+  `[audit]` ledger issue describes it), the **fleet-audit** skill opens that
+  pull request itself:
+
+  ```bash
+  ./skills/fleet-audit/scripts/audit_report.py remediate \
+    --audit <audit-id> --findings-file <findings_path> --finding <finding-id>
+  ```
+
+  That path derives the branch name from the files the fix touches, so a rerun
+  refreshes the existing PR instead of opening a new one; it applies the audit
+  labels, links the ledger, and closes the PR when the finding stops
+  reproducing. A PR opened through _this_ skill gets none of that — nothing
+  dedupes it and nothing ever closes it, which is how one workload's findings
+  once became five near-duplicate PRs. See `skills/fleet-audit/SKILL.md` for
+  the full flow; maintainers can request the same fix by commenting
+  `/remediate <finding-id>` on the ledger issue.
 
 ## Execution Instructions
 

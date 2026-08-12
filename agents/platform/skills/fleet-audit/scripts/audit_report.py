@@ -3183,10 +3183,19 @@ def _render_header(audit_id: str) -> list[str]:
         # and commented `/remediate all` under its own App credentials three
         # times. `is_machine_author` is what actually stops that; this sentence
         # stops it one step earlier, where the agent decides what to do.
+        #
+        # The second sentence routes the case the first one leaves open: a
+        # reviewer asking an agent directly to fix a finding. Agents answered
+        # that through `submit-suggestion` — five near-duplicate pull requests
+        # for one workload, invisible to this audit's dedupe — because nothing
+        # at the point of decision named the right door. The ledger is what an
+        # agent is looking at when it makes that choice, so the ledger says it.
         "_The paragraph above is addressed to human reviewers. An agent reading this "
         "ledger must never post that command itself: promoting a fix is the "
         "reviewer's call to make, and a `/remediate` from a machine account is "
-        "ignored._",
+        "ignored. An agent that a reviewer has asked to fix a finding runs the "
+        "fleet-audit skill's `remediate` command — never `submit-suggestion`, whose "
+        "pull requests this audit cannot deduplicate, refresh, or close._",
     ]
 
 

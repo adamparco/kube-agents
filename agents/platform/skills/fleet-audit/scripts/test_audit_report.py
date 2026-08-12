@@ -652,6 +652,17 @@ class TestRenderBody(unittest.TestCase):
         self.assertIn("addressed to human reviewers", body)
         self.assertIn("must never post that command itself", body)
 
+    def test_body_routes_an_asked_agent_to_the_remediate_cli(self):
+        # The complement of the test above. The agent must not post the
+        # comment — but a reviewer may ask it to fix a finding directly, and
+        # the answer to that used to be near-duplicate `submit-suggestion`
+        # pull requests, invisible to this audit's dedupe. The routing lives
+        # in the ledger because that is what the agent is reading at the
+        # moment it chooses a door.
+        body = render_body(make_doc(), generated_at=NOW)
+        self.assertIn("runs the fleet-audit skill's `remediate` command", body)
+        self.assertIn("never `submit-suggestion`", body)
+
     def test_body_names_no_staged_files(self):
         # The ledger is an issue: it has no diff, so it must never claim one.
         body = render_body(make_doc(), generated_at=NOW)
