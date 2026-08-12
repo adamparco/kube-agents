@@ -4403,6 +4403,15 @@ class TestOpenRemediationPr(HarnessTestCase):
         self.err = err.getvalue()
         return result
 
+    def flag_values(self, flag):
+        """Every value passed under `flag` across the run's `gh pr edit` calls."""
+        return {
+            arg
+            for call in self.harness.gh_calls("pr", "edit")
+            for i, arg in enumerate(call)
+            if i and call[i - 1] == flag
+        }
+
     def test_branch_commit_push_then_create_in_that_order(self):
         self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/8\n"}
         url = self.open_it()
@@ -4475,6 +4484,51 @@ class TestOpenRemediationPr(HarnessTestCase):
         edit = self.harness.gh_calls("pr", "edit")[0]
         self.assertIn("8", edit)
         self.assertIn("--body-file", edit)
+
+    def test_refreshing_an_open_pr_re_applies_its_labels(self):
+        # Pull requests 34, 35 and 36 in the reference installation were
+        # labelled at creation and stripped by a reviewer, and no later run
+        # ever put them back — the refresh rewrote title and body only. A pull
+        # request the audit still owns has to keep saying so.
+        self.open_it(existing=pr(8, self.branch))
+        self.assertEqual(
+            self.flag_values("--add-label"),
+            {"agent:audit", f"audit:{AUDIT}", "audit:remediation", "severity:critical"},
+        )
+
+    def test_a_refresh_moves_the_severity_label_rather_than_adding_one(self):
+        # Severity is recomputed from the group every run. Leaving the old one
+        # on means a finding that escalated still sorts as what it used to be.
+        self.open_it(existing=pr(8, self.branch))
+        self.assertEqual(
+            self.flag_values("--remove-label"), {"severity:major", "severity:minor"}
+        )
+
+    def test_the_body_edit_survives_a_label_failure(self):
+        # A repository whose labels someone deleted by hand must not abort the
+        # remediation half of the run. The label sync is a separate,
+        # non-checking call for exactly this.
+        self.harness.failures = {"--add-label agent:audit": 1}
+        url = self.open_it(existing=pr(8, self.branch))
+        self.assertEqual(url, "https://github.com/acme/fleet/pull/8")
+
+    def test_a_label_failure_is_logged_rather_than_swallowed(self):
+        # All six labels move in one `gh` call, so one unresolvable name
+        # applies none of them. Swallowing that leaves a refresh that did
+        # nothing looking exactly like a refresh with nothing to do — which is
+        # how the gap this function closes survived unnoticed in the first
+        # place.
+        self.harness.failures = {"--add-label agent:audit": 1}
+        self.open_it(existing=pr(8, self.branch))
+        self.assertIn("could not re-apply the audit labels", self.err)
+        self.assertIn("simulated failure", self.err)
+
+    def test_a_newly_created_pr_is_not_double_labelled(self):
+        # `gh pr create --label` already carries them; a second round-trip per
+        # pull request would buy nothing.
+        self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/8\n"}
+        self.open_it()
+        self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
 
     def test_a_closed_pr_on_the_branch_is_replaced_not_reopened(self):
         self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/9\n"}

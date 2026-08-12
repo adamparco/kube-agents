@@ -55,7 +55,7 @@ Unless the run could not see the whole fleet. A cluster that was skipped, or one
 
 ### Tier 2 — remediation pull requests
 
-A finding whose remediation is a manifest can be promoted into its own pull request on `platform-agent/fix-<audit-id>-<slug>-<digest>`, based on `main`, carrying only that finding's manifest and linked back to the ledger with `Part of #<issue>`. It takes the ledger's labels plus `audit:remediation`. Findings whose `remediation.path` values overlap share a single PR, since separate branches touching the same file would conflict on merge.
+A finding whose remediation is a manifest can be promoted into its own pull request on `platform-agent/fix-<audit-id>-<slug>-<digest>`, based on `main`, carrying only that finding's manifest and linked back to the ledger with `Part of #<issue>`. It takes the ledger's labels plus `audit:remediation`, and it takes them again on every run that refreshes it — so a `severity:` that escalates between runs is reflected rather than frozen at whatever the PR opened with, and labels stripped during triage come back rather than leaving a PR the audit still owns invisible to `agent:audit`. Findings whose `remediation.path` values overlap share a single PR, since separate branches touching the same file would conflict on merge.
 
 The branch name is the only join key between a finding and its PR — nothing is stored outside GitHub — so the digest is taken over the group's sorted set of remediation **paths**, not over its finding ids. Ids are regenerated on every run; the files a fix touches are what actually persists.
 

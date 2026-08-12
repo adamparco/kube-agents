@@ -4487,6 +4487,65 @@ def snapshot_paths(root: Path, paths: list[str]) -> dict[str, bytes]:
     }
 
 
+def sync_remediation_labels(
+    repo: str, number: str, audit_id: str, highest: str
+) -> None:
+    """Re-assert the four labels on a remediation pull request being refreshed.
+
+    `gh pr create` carries the labels for a *new* pull request and nothing
+    carried them for an existing one: the refresh rewrote the title and the
+    body and left the labels wherever they had drifted to. They drift two ways.
+
+    A reviewer strips them while triaging — which is exactly what happened to
+    pull requests 34, 35 and 36 in the reference installation, and no later run
+    put them back, so three pull requests the audit still owned stopped
+    appearing under `agent:audit` for good. And `severity:` is recomputed from
+    the findings the group currently holds, so a finding that escalates from
+    minor to critical otherwise keeps the label it was opened with — the one
+    field triage sorts on, silently stale.
+
+    A second call rather than more flags on `open_remediation_pr`'s own
+    `gh pr edit`, and `check=False`, because a label is worth less than the body
+    it would otherwise take down with it: on a repository whose labels someone
+    deleted by hand, folding these into the first call would abort the entire
+    remediation half of the run. The `--remove-label` for the two severities
+    that do not apply resolves even when the pull request never carried them —
+    `ensure_labels` creates all three at the top of every path that reaches
+    here, and `gh` only objects to a label the *repository* does not have.
+
+    One `gh` call sets all six, so a single unresolvable name applies *none* of
+    them. That is the right trade against a partly-labelled pull request, but it
+    is only safe if it is audible: a silent no-op here looks exactly like a
+    refresh that had nothing to change, and the labelling gap this function
+    exists to close went unnoticed for months for want of a line in the log.
+    """
+    args = [
+        "pr",
+        "edit",
+        number,
+        "-R",
+        repo,
+        "--add-label",
+        "agent:audit",
+        "--add-label",
+        f"audit:{audit_id}",
+        "--add-label",
+        "audit:remediation",
+        "--add-label",
+        f"severity:{highest}",
+    ]
+    for severity in SEVERITIES:
+        if severity != highest:
+            args += ["--remove-label", f"severity:{severity}"]
+    res = gh(args, check=False)
+    if res.returncode != 0:
+        log(
+            f"#{number}: could not re-apply the audit labels "
+            f"(gh exited {res.returncode}): "
+            f"{(res.stderr or res.stdout or '').strip() or 'no output'}"
+        )
+
+
 def open_remediation_pr(
     repo: str,
     audit_id: str,
@@ -4557,11 +4616,12 @@ def open_remediation_pr(
     )
     try:
         if existing and str(existing.get("state", "")).upper() == "OPEN":
+            number = str(existing["number"])
             gh(
                 [
                     "pr",
                     "edit",
-                    str(existing["number"]),
+                    number,
                     "-R",
                     repo,
                     "--title",
@@ -4570,6 +4630,7 @@ def open_remediation_pr(
                     body_file,
                 ]
             )
+            sync_remediation_labels(repo, number, audit_id, highest)
             return str(existing.get("url") or "")
         res = gh(
             [
