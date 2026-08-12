@@ -135,7 +135,7 @@ def branch_labels(repo: str, branch: str, cwd: str, runner=subprocess.run):
     return {str(label.get("name", "")) for label in labels}
 
 
-def audit_claims(repo: str, cwd: str, runner=subprocess.run):
+def audit_claims(repo: str, cwd: str, runner=subprocess.run, warn=None):
     """Which files a live fleet audit already owns, and what owns them.
 
     Two sources, because neither alone is enough. Open remediation pull
@@ -148,6 +148,14 @@ def audit_claims(repo: str, cwd: str, runner=subprocess.run):
     Returns `{path: claim}` where `claim` is a short human-readable reference,
     or `None` if GitHub could not be reached at all — callers must not read
     that as "no claims".
+
+    `warn` is called once per source that did not answer while the other did.
+    That case returns a real dictionary which is nonetheless *narrower* than
+    the truth, and it is the quiet failure: `None` makes the caller say GitHub
+    was unreachable, but a half-answered lookup looks exactly like a repository
+    with fewer open audits and would wave through the submission this exists to
+    catch. Still fails open — a routing correction must not become an outage —
+    but never silently.
     """
     prs = _gh_json(
         [
@@ -171,6 +179,20 @@ def audit_claims(repo: str, cwd: str, runner=subprocess.run):
     )
     if prs is None and issues is None:
         return None
+
+    if warn is not None:
+        if prs is None:
+            warn(
+                "could not list the open remediation pull requests; checking "
+                "this change against the audit ledgers only, so a file claimed "
+                "solely by an open remediation pull request will not be seen"
+            )
+        if issues is None:
+            warn(
+                "could not list the open audit ledger issues; checking this "
+                "change against the open remediation pull requests only, so a "
+                "file claimed solely by a ledger will not be seen"
+            )
 
     claims: dict[str, str] = {}
     # Issues first so that a path claimed by both is reported as the pull

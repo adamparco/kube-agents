@@ -191,7 +191,7 @@ def assert_not_audit_remediation(
     # `subprocess.run` handed over rather than left to the module's own import,
     # so every call goes through this file's seam — the one the tests patch and
     # the one a future logging wrapper would.
-    claims = gitops_pr.audit_claims(repo, workspace, subprocess.run)
+    claims = gitops_pr.audit_claims(repo, workspace, subprocess.run, log)
     if claims is None:
         # Fail open, and say so. This is a routing correction, not a security
         # boundary — the credential proxy is that — and stopping every GitOps

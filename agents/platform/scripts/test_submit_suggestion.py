@@ -733,6 +733,35 @@ class TestAuditRoutingGuard(SubmitSuggestionTestCase):
             self.logged,
         )
 
+    def test_a_half_answered_lookup_still_says_what_it_could_not_see(self):
+        # The quiet failure. `None` from both sources makes the caller announce
+        # that GitHub was unreachable, but one source answering and the other
+        # not returns a real dictionary that is merely *narrower* than the
+        # truth — indistinguishable, without this, from a repository that has
+        # no open ledgers. Fails open like the rest, and says which half it is
+        # missing rather than reporting a clean bill of health it cannot give.
+        self.claim_by_ledger()
+        self.harness.issue_lookup_fails = True
+        url = self.run_submit()
+        self.assertTrue(url.startswith("https://github.com/acme/fleet/pull/"))
+        self.assertTrue(
+            any("could not list the open audit ledger issues" in m for m in self.logged),
+            self.logged,
+        )
+
+    def test_the_surviving_half_of_a_lookup_still_refuses(self):
+        # Degraded, not disabled: losing the pull request source must not also
+        # cost the ledger's claim on the same file.
+        self.claim_by_ledger()
+        self.harness.pr_lookup_fails = True
+        with self.assertRaises(PermissionError) as caught:
+            self.run_submit()
+        self.assertIn("ledger issue #28", str(caught.exception))
+        self.assertTrue(
+            any("could not list the open remediation" in m for m in self.logged),
+            self.logged,
+        )
+
     def test_the_lookups_run_inside_the_leased_workspace(self):
         # `gh` is a shim that POSTs its argv and cwd to the credential sidecar,
         # which refuses a call made outside a lease it recognises.
@@ -814,6 +843,11 @@ class _GhStub:
         # Set to make every list call fail, standing in for an outage or an
         # expired token.
         self.audit_lookup_fails = False
+        # Or fail just one of the two sources: a label the App cannot read, a
+        # search index lagging, one call caught by a rate limit the other
+        # missed. The half-answered case is the one that fails quietly.
+        self.pr_lookup_fails = False
+        self.issue_lookup_fails = False
 
     def __getattr__(self, name):
         return getattr(subprocess, name)
@@ -831,13 +865,13 @@ class _GhStub:
         if verb == ["pr", "view"]:
             return self._view(argv)
         if verb == ["pr", "list"]:
-            return self._list(argv, self.remediation_prs)
+            return self._list(argv, self.remediation_prs, self.pr_lookup_fails)
         if verb == ["issue", "list"]:
-            return self._list(argv, self.audit_issues)
+            return self._list(argv, self.audit_issues, self.issue_lookup_fails)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    def _list(self, argv, rows):
-        if self.audit_lookup_fails:
+    def _list(self, argv, rows, fails=False):
+        if self.audit_lookup_fails or fails:
             return subprocess.CompletedProcess(argv, 1, "", "HTTP 401\n")
         return subprocess.CompletedProcess(argv, 0, json.dumps(rows), "")
 
