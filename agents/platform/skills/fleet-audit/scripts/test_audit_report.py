@@ -4583,6 +4583,48 @@ class TestOpenRefreshIsUnreachable(BaseTestCase):
         self.assertEqual(plan.promote, [])
 
 
+class TestLabelDescriptions(HarnessTestCase):
+    """Every label `ensure_labels` creates has to be creatable.
+
+    GitHub caps a label description at 100 characters and answers `422` past
+    it. `gh label create` runs with `check=False`, so the failure is silent and
+    the label simply never exists — which for `audit:stale-closed` means every
+    harness close reads as a human rejection and no finding is re-proposed.
+    """
+
+    LIMIT = 100
+
+    def descriptions(self, audit_id):
+        # Sliced rather than reset: the recorder accumulates across the whole
+        # test and this helper is called once per audit stream.
+        before = len(self.harness.calls)
+        audit_report.ensure_labels("acme/fleet", audit_id)
+        calls = [
+            call
+            for call in self.harness.calls[before:]
+            if call[:3] == ["gh", "label", "create"]
+        ]
+        self.assertTrue(calls, "ensure_labels created no labels")
+        return {call[3]: call[call.index("--description") + 1] for call in calls}
+
+    def test_label_descriptions_fit_github_s_limit(self):
+        # Every stream, not just one: the per-audit description interpolates
+        # `audit_name`, so a future audit with a long title breaks only its own.
+        over = {
+            (audit_id, name): len(text)
+            for audit_id in audit_report.AUDITS
+            for name, text in self.descriptions(audit_id).items()
+            if len(text) > self.LIMIT
+        }
+        self.assertEqual(over, {}, f"descriptions over {self.LIMIT} characters")
+
+    def test_the_stale_closed_label_is_among_them(self):
+        # The guard above is only worth having while this label is in scope.
+        self.assertIn(
+            audit_report.STALE_CLOSED_LABEL, self.descriptions(AUDIT)
+        )
+
+
 class TestSyncOpenRemediationLabels(HarnessTestCase):
     """Labels are re-asserted from the path that actually sees open PRs."""
 

@@ -4154,7 +4154,14 @@ def ensure_labels(repo: str, audit_id: str) -> None:
             # quiet day.
             STALE_CLOSED_LABEL,
             "C5DEF5",
-            "Closed by the audit because the finding stopped reproducing; re-opened as a fresh pull request if it returns",
+            # Keep this under GitHub's 100-character description limit. It was
+            # 108 for as long as this label existed, so `gh label create`
+            # returned HTTP 422 on every run, the label never came into being,
+            # and — because the close path runs `check=False` — every harness
+            # close landed unlabelled. That is the exact failure the comment
+            # above warns about, live the whole time. `test_label_descriptions
+            # _fit_github_s_limit` now fails before a reviewer has to notice.
+            "Closed by the audit because the finding stopped reproducing; re-opened fresh if it returns",
         ),
         ("severity:critical", "B60205", "Highest audit finding severity: critical"),
         ("severity:major", "D93F0B", "Highest audit finding severity: major"),
