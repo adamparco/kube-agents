@@ -16,6 +16,15 @@ spec:
     metadata:
       labels:
         app: litellm
+      annotations:
+        # Checksum of config.yaml *after* envsubst, stamped by `make
+        # deploy-litellm`. kustomize hashes config.yaml before envsubst runs, so
+        # the generated ConfigMap name is identical for every model one provider
+        # serves — this annotation is the only thing that changes the Deployment
+        # spec when the model does, and so the only thing that rolls the pods.
+        # Mirrors the chart's checksum/config. See the Makefile for the full
+        # rationale.
+        checksum/config: "${LITELLM_CONFIG_CHECKSUM}"
     spec:
       containers:
         - name: litellm-container

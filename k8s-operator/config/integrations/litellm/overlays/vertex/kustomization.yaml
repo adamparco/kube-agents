@@ -6,8 +6,12 @@ patches:
   - path: deployment-patch.yaml
 
 # Replaces the base's generated config so the model entries carry
-# vertex_project/vertex_location. The generator keeps the name hashed, so a
-# change to either value rolls the pods on the next apply.
+# vertex_project/vertex_location.
+#
+# The generated name stays hashed, but do not read anything into that: kustomize
+# hashes this file before envsubst substitutes it, so the hash is the same for
+# every VERTEX_PROJECT and every model. What rolls the pods is the
+# checksum/config annotation the Makefile stamps into the pod template.
 configMapGenerator:
   - name: litellm-config
     behavior: replace

@@ -126,43 +126,70 @@ undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.
 # choice lives here once. The envsubst allowlist is spelled out because a bare
 # envsubst would expand every $VAR in the rendered manifests, including ones
 # that belong to the container at runtime.
+#
+# LITELLM_CONFIG_CHECKSUM closes a hole the configMapGenerator hash cannot:
+# kustomize hashes config.yaml BEFORE envsubst runs, so every model one provider
+# serves renders the same ConfigMap name. Switching gemini-3.5-flash to
+# gemini-3.1-flash-lite rewrites the ConfigMap's contents and leaves the
+# Deployment spec byte-identical, so nothing rolls the pods — and config.yaml is
+# a subPath mount, which the kubelet never updates in place, so LiteLLM keeps
+# serving the old model until someone restarts it by hand. Hashing the
+# SUBSTITUTED config into a pod-template annotation is what the chart already
+# does, and it rolls the pods only when the config really changed. An
+# unconditional `kubectl rollout restart` would also work, but it would take the
+# chatgpt overlay — one replica, strategy: Recreate — down on every deploy.
+#
+# Deliberately no required-variable checks here. undeploy renders only to name
+# the objects it deletes, where an unsubstituted ${VERTEX_PROJECT} inside an
+# annotation is irrelevant; a guard on this path would abort a teardown that
+# teardown_09_deploy_litellm.sh reports as successful anyway, because it wraps
+# the call in `|| true`. Validation belongs to deploy-litellm alone.
 define LITELLM_RENDER
 	case "$$MODEL_PROVIDER" in \
 	chatgpt) \
 		overlay=config/integrations/litellm/overlays/chatgpt; \
-		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' ;; \
+		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$LITELLM_CONFIG_CHECKSUM' ;; \
 	vertex_ai) \
 		overlay=config/integrations/litellm/overlays/vertex; \
-		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$PROJECT_ID $$VERTEX_PROJECT $$VERTEX_LOCATION $$LITELLM_KSA_NAME $$LITELLM_GSA_NAME'; \
+		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$PROJECT_ID $$VERTEX_PROJECT $$VERTEX_LOCATION $$LITELLM_KSA_NAME $$LITELLM_GSA_NAME $$LITELLM_CONFIG_CHECKSUM' ;; \
+	*) \
+		overlay=config/integrations/litellm/base; \
+		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$LITELLM_CONFIG_CHECKSUM' ;; \
+	esac; \
+	cfg="$$overlay/config.yaml"; \
+	[ -f "$$cfg" ] || cfg=config/integrations/litellm/base/config.yaml; \
+	if command -v sha256sum >/dev/null 2>&1; then sum=sha256sum; else sum="shasum -a 256"; fi; \
+	LITELLM_CONFIG_CHECKSUM="$$(envsubst "$$vars" < "$$cfg" | $$sum | cut -c1-16)"; \
+	export LITELLM_CONFIG_CHECKSUM; \
+	$(KUSTOMIZE) build "$$overlay" | envsubst "$$vars"
+endef
+
+# Only deploy validates. Every one of these is a placeholder in the vertex
+# overlay, and envsubst turns an unset variable into an empty string rather than
+# an error — an empty vertex_project reaches the cluster and fails later as a
+# runtime 403, which is far harder to read than this message.
+define LITELLM_REQUIRE_VERTEX_VARS
+	if [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
 		for v in PROJECT_ID VERTEX_PROJECT VERTEX_LOCATION LITELLM_KSA_NAME LITELLM_GSA_NAME; do \
 			eval "val=\$$$$v"; \
 			[ -n "$$val" ] || { echo "MODEL_PROVIDER=vertex_ai requires $$v to be set and exported" >&2; exit 1; }; \
-		done ;; \
-	*) \
-		overlay=config/integrations/litellm/base; \
-		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' ;; \
-	esac; \
-	$(KUSTOMIZE) build "$$overlay" | envsubst "$$vars"
+		done; \
+	fi
 endef
 
 .PHONY: deploy-litellm
 deploy-litellm: kustomize ## Deploy LiteLLM integration.
+	@$(LITELLM_REQUIRE_VERTEX_VARS)
 	@$(LITELLM_RENDER) | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
-# The configMapGenerator hash cannot stand in for a config change here. kustomize
-# hashes config.yaml before envsubst runs, so every model served by one provider
-# renders the same ConfigMap name — switching gemini-3.5-flash to
-# gemini-3.1-flash-lite rewrites the ConfigMap's contents and leaves the
-# Deployment spec untouched. Nothing then rolls the pods, and config.yaml is a
-# subPath mount, which the kubelet never updates in place, so LiteLLM keeps
-# serving the old model until someone restarts it by hand. Restart explicitly.
-# (The Helm path has no equivalent hole: its checksum/config annotation is
-# computed from the substituted values.)
-	@kubectl rollout restart deployment/litellm -n $${NAMESPACE:-kubeagents-system}
 	@kubectl rollout status deployment/litellm -n $${NAMESPACE:-kubeagents-system} --timeout=300s
 
 .PHONY: undeploy-litellm
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
 	@$(LITELLM_RENDER) | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
+
+.PHONY: print-litellm-manifests
+print-litellm-manifests: kustomize ## Print the LiteLLM manifests for the current MODEL_PROVIDER without applying them.
+	@$(LITELLM_RENDER)
 
 .PHONY: deploy-inference-replay
 deploy-inference-replay: kustomize ## Deploy Inference Replay proxy integration.
