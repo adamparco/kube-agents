@@ -221,16 +221,29 @@ def _rotate(log_path: Path) -> None:
 # never consults ``config.yaml``. So the child needs these in its environment
 # or it has nowhere to post.
 #
-# The entry criterion is "the platform's home-channel var is on the
-# provider-env blocklist", not "the harness supports the platform". Both
-# platforms shipped here qualify. An earlier revision of this comment claimed
-# ``GOOGLE_CHAT_HOME_CHANNEL`` was exempt because a grep of
-# ``tools/environments/local.py`` finds no such literal — but the blocklist is
-# *derived* before the literals are added: ``_build_provider_env_blocklist()``
-# sweeps every registry var whose category is ``messaging``, and
-# ``GOOGLE_CHAT_HOME_CHANNEL`` is registered with exactly that category. Verify
-# membership by importing ``_HERMES_PROVIDER_ENV_BLOCKLIST`` and testing ``in``,
-# never by grepping the source.
+# The entry criterion is twofold: the platform's home-channel var is on the
+# provider-env blocklist, AND the cron child can actually deliver once the
+# target resolves. Both legs have to be checked the hard way.
+#
+# The blocklist leg by ``in``, never by grepping the source: an earlier
+# revision of this comment claimed ``GOOGLE_CHAT_HOME_CHANNEL`` was exempt
+# because ``tools/environments/local.py`` contains no such literal — but the
+# blocklist is *derived* before the literals are added:
+# ``_build_provider_env_blocklist()`` sweeps every registry var whose category
+# is ``messaging``, and ``GOOGLE_CHAT_HOME_CHANNEL`` is registered with
+# exactly that category. It is stripped just like Slack's.
+#
+# The delivery leg is why Google Chat is nevertheless NOT in this dict. A cron
+# child has no live adapters, so delivery falls to the platform registry's
+# ``standalone_sender_fn``. Slack's is rewired over the credential relay by
+# slack_relay_patch.py; Google Chat's relay patch hooks only the in-gateway
+# adapter, so the child would fall to the stock standalone sender, which POSTs
+# directly to chat.googleapis.com with service-account credentials the child
+# cannot hold (the SA var is itself blocklisted, and the pod's ADC has only
+# Pub/Sub roles). Restoring the var would therefore convert today's quiet
+# "no delivery target resolved" into a per-run delivery error while still
+# posting nothing. Add the entry when (and only when) the standalone sender
+# exists — google_chat_relay_patch.py is the place to grow one.
 #
 # The third element is the fallback: an alias of the same value that the
 # operator sets on the container (`platformagent_manifests.go`) precisely
@@ -239,20 +252,11 @@ def _rotate(log_path: Path) -> None:
 # when ``config.yaml`` has no ``home_channel`` for the platform — the file
 # `/sethome` writes stays authoritative, and the alias covers the install
 # where `/sethome` has never run and only the PlatformAgent CR knows the home.
-#
-# The thread slot is ``None`` for Google Chat because no
-# ``GOOGLE_CHAT_HOME_CHANNEL_THREAD_ID`` exists anywhere in Hermes — there is
-# nothing inherited to clear.
 HOME_TARGET_ENV_KEYS = {
     "slack": (
         "SLACK_HOME_CHANNEL",
         "SLACK_HOME_CHANNEL_THREAD_ID",
         "KUBEAGENTS_SLACK_HOME_CHANNEL",
-    ),
-    "google_chat": (
-        "GOOGLE_CHAT_HOME_CHANNEL",
-        None,
-        "KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL",
     ),
 }
 

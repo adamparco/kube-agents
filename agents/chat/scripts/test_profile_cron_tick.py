@@ -619,6 +619,9 @@ class HomeTargetEnvTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         for _, _, fallback_key in pct.HOME_TARGET_ENV_KEYS.values():
             os.environ.pop(fallback_key, None)
+        # Not in the dict on purpose (see its comment), but tests set it to
+        # prove it is ignored — so a developer pod's copy must not leak in.
+        os.environ.pop("KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL", None)
 
     def write_config(self, mapping):
         (self.home / "config.yaml").write_text(yaml.safe_dump(mapping), encoding="utf-8")
@@ -726,12 +729,14 @@ class HomeTargetEnvTest(unittest.TestCase):
         restored = pct.home_target_env(self.home)
         self.assertEqual("C123", restored.get("SLACK_HOME_CHANNEL"))
 
-    def test_a_google_chat_home_is_recovered_without_inventing_a_thread_key(self):
+    def test_a_google_chat_home_is_deliberately_not_restored(self):
         # GOOGLE_CHAT_HOME_CHANNEL is blocklisted the same way Slack's var is
-        # (category-derived, so a grep for the literal finds nothing). No
-        # thread variable exists for the platform, so none may be emitted:
-        # spawn_tick treats an empty value as "drop the key", and a key Hermes
-        # never defined must not appear in the child either way.
+        # (category-derived, so a grep for the literal finds nothing) — but a
+        # cron child has no working Google Chat standalone sender, so a
+        # restored target would only trade a quiet "no delivery target
+        # resolved" for a per-run delivery error. The dict's comment owns the
+        # full reasoning; this test pins the decision so an entry cannot be
+        # added without meeting the delivery criterion on purpose.
         self.write_config(
             {
                 "platforms": {
@@ -739,25 +744,24 @@ class HomeTargetEnvTest(unittest.TestCase):
                 }
             }
         )
-        self.assertEqual(
-            pct.home_target_env(self.home),
-            {"GOOGLE_CHAT_HOME_CHANNEL": "spaces/AAA"},
-        )
+        self.assertEqual(pct.home_target_env(self.home), {})
 
     def test_the_cr_alias_covers_an_install_where_sethome_never_ran(self):
-        # The operator sets KUBEAGENTS_* aliases of the CR's homeChannel on
-        # the container; unlike the real names they are not blocklisted, so
-        # they survive into this ticker. A fresh install has a config.yaml
-        # with no home_channel at all — the alias is the only source.
+        # The operator sets the KUBEAGENTS_* alias of the CR's homeChannel on
+        # the container; unlike the real name it is not blocklisted, so it
+        # survives into this ticker. A fresh install has a config.yaml with
+        # no home_channel at all — the alias is the only source.
         self.write_config({"platforms": {"slack": {"enabled": True}}})
         os.environ["KUBEAGENTS_SLACK_HOME_CHANNEL"] = "C0FROMCR"
+        # Set but ignored: google_chat has no HOME_TARGET_ENV_KEYS entry (see
+        # the restoration-vs-delivery note there), so even a live alias for it
+        # must restore nothing.
         os.environ["KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/FROMCR"
         self.assertEqual(
             pct.home_target_env(self.home),
             {
                 "SLACK_HOME_CHANNEL": "C0FROMCR",
                 "SLACK_HOME_CHANNEL_THREAD_ID": "",
-                "GOOGLE_CHAT_HOME_CHANNEL": "spaces/FROMCR",
             },
         )
 

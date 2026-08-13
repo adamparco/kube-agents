@@ -1555,15 +1555,18 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	}
 }
 
-// The KUBEAGENTS_* home-channel aliases exist for one consumer: the cron
+// The KUBEAGENTS_SLACK_HOME_CHANNEL alias exists for one consumer: the cron
 // ticker's home_target_env (agents/chat/scripts/profile_cron_tick.py). The
-// canonical vars are on Hermes' provider-env blocklist and never reach it, so
+// canonical var is on Hermes' provider-env blocklist and never reaches it, so
 // `deliver=all` on a named profile resolves through the alias when `/sethome`
-// has never written a home to config.yaml. Three properties matter: the alias
+// has never written a home to config.yaml. Four properties matter: the alias
 // mirrors the CR value, it is never rendered empty (a blank would read as a
-// home), and it stays inside the platform's `enabled` gate — a restored home
-// for an adapter that is not running turns the scheduler's quiet no-target
-// skip into a RuntimeError in every cron child.
+// home), it stays inside the platform's `enabled` gate (a restored home for
+// an adapter that is not running only manufactures per-target
+// delivery_errors), and Google Chat gets NO alias — its cron child has no
+// working standalone sender, so the ticker deliberately restores nothing for
+// it; see HOME_TARGET_ENV_KEYS in the ticker for the criterion an entry must
+// meet.
 func TestBuildDeploymentHomeChannelAliases(t *testing.T) {
 	gchatOn := func(home string) *agentv1alpha1.GoogleChatSpec {
 		return &agentv1alpha1.GoogleChatSpec{
@@ -1580,20 +1583,20 @@ func TestBuildDeploymentHomeChannelAliases(t *testing.T) {
 		want        map[string]string // alias name -> value; "" means must be absent
 	}{
 		{
-			name: "both aliases mirror the CR",
+			// Google Chat's home reaches the container as the canonical var
+			// only — no alias, even with a home set, until the ticker gains a
+			// google_chat entry (delivery criterion, documented there).
+			name: "slack alias mirrors the CR, google chat gets none",
 			integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
 				GoogleChat: gchatOn("spaces/AAA"),
 				Slack:      &agentv1alpha1.SlackSpec{Enabled: ptr.To(true), HomeChannel: "C999"},
 			},
 			want: map[string]string{
 				"KUBEAGENTS_SLACK_HOME_CHANNEL":       "C999",
-				"KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL": "spaces/AAA",
+				"KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL": "",
 			},
 		},
 		{
-			// GOOGLE_CHAT_HOME_CHANNEL itself is rendered even when empty;
-			// the alias must not be, or the ticker's fallback would restore
-			// an empty home.
 			name: "no alias for an empty home channel",
 			integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
 				GoogleChat: gchatOn(""),

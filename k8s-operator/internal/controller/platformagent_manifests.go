@@ -1529,23 +1529,16 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 					Value: gchat.HomeChannel,
 				},
 			}...)
-			// The KUBEAGENTS_* alias exists for exactly one consumer: the
-			// per-profile cron ticker (agents/chat/scripts/profile_cron_tick.py,
-			// home_target_env). GOOGLE_CHAT_HOME_CHANNEL is on Hermes'
-			// provider-env blocklist — derived, not literal: it is registered
-			// with category `messaging`, which _build_provider_env_blocklist()
-			// sweeps — so build_subprocess_env strips it from the ticker before
-			// the ticker can pass it on, and every `deliver=all` job on a named
-			// profile posts nowhere. Hermes has never heard of the alias name,
-			// so no blocklist entry can match it. Only set when non-empty: the
-			// ticker treats a blank as no home, and rendering it empty would
-			// only invite something to inherit it.
-			if gchat.HomeChannel != "" {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL",
-					Value: gchat.HomeChannel,
-				})
-			}
+			// No KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL alias here, deliberately,
+			// even though GOOGLE_CHAT_HOME_CHANNEL is provider-env-blocklisted
+			// exactly like Slack's (derived, not literal: category `messaging`
+			// in the registry sweep). The cron ticker's home_target_env — the
+			// alias's only consumer — restores nothing for Google Chat because
+			// a cron child has no working standalone sender for it; the full
+			// reasoning lives on HOME_TARGET_ENV_KEYS in
+			// agents/chat/scripts/profile_cron_tick.py. An alias with no reader
+			// would be dead weight pretending to be plumbing. Add it in
+			// lockstep with that dict entry.
 			allowAll := len(gchat.AllowedUsers) == 0
 			if len(gchat.AllowedUsers) == 1 && gchat.AllowedUsers[0] == "" {
 				allowAll = true
@@ -1579,13 +1572,18 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 					Name:  "SLACK_HOME_CHANNEL",
 					Value: slack.HomeChannel,
 				})
-				// Same contract as KUBEAGENTS_GOOGLE_CHAT_HOME_CHANNEL above:
-				// an un-blocklistable alias for the cron ticker, which cannot
-				// inherit SLACK_HOME_CHANNEL through build_subprocess_env. The
-				// alias rides inside this `enabled` gate on purpose — a
-				// restored Slack home on an install whose Slack adapter is off
-				// turns `deliver=all`'s quiet no-target skip into a RuntimeError
-				// in every cron child.
+				// An un-blocklistable alias of the same value, for exactly one
+				// consumer: the per-profile cron ticker
+				// (agents/chat/scripts/profile_cron_tick.py, home_target_env).
+				// SLACK_HOME_CHANNEL is on Hermes' provider-env blocklist, so
+				// build_subprocess_env strips it from the ticker before the
+				// ticker can pass it on, and every `deliver=all` job on a
+				// named profile posts nowhere. Hermes has never heard of the
+				// alias name, so no blocklist entry can match it. It rides
+				// inside this `enabled` gate on purpose: a restored home for
+				// an adapter that is not running would resolve targets whose
+				// every delivery lands in delivery_errors ("platform not
+				// configured/enabled") — noise where today there is silence.
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "KUBEAGENTS_SLACK_HOME_CHANNEL",
 					Value: slack.HomeChannel,

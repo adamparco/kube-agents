@@ -74,6 +74,17 @@ It is optional at provisioning time: leave the prompt empty and set it later fro
 
 A scheduled brief posts flat in that channel, never inside a thread. `/sethome` also records whichever thread it happened to be typed in, and threading every scheduled report under one ageing thread leaves only the first one visible — so cron delivery drops the thread deliberately. A job that wants its output in a thread names an explicit `deliver=` target instead.
 
+For scheduled jobs on a specialist profile (the fleet watchdogs), the two sources
+compose rather than compete: a `/sethome` recorded in the Chat Agent's config is
+authoritative, and `spec.integration.slack.homeChannel` on the PlatformAgent is
+the fallback for an install where nobody has run `/sethome` yet. Editing the CR
+field therefore moves scheduled Slack delivery only until the first `/sethome`;
+after that, re-pointing means running `/sethome` again. (Hermes strips
+`SLACK_HOME_CHANNEL` itself from cron subprocesses as part of its credential
+scrubbing, which is why the fallback travels under an operator-owned alias —
+the mechanics live with `HOME_TARGET_ENV_KEYS` in
+[`agents/chat/scripts/profile_cron_tick.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/profile_cron_tick.py).)
+
 ## Proactive alerts (both channels)
 
 The harness doesn't only reply to messages. A cluster event posted to the in-pod triage endpoint (`inject_message` in [`agents/platform/scripts/session_kv_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/session_kv_server.py)) opens a thread unprompted: it posts the alert first, then runs the triage turn in the thread that alert created. The first-run inventory report arrives the same way, into the thread `bootstrap_onboarding` bound. Where an unprompted message lands:
