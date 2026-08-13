@@ -358,7 +358,8 @@ class ApplyTest(PatchedFixture, unittest.TestCase):
         The split tokenizer kept ``` `foo`_prod ``` inert because the ``_`` sat
         alone in its gap. With one continuous string the sentinel is what sits
         next to that underscore, and treating it as anything but a word
-        character re-opens the pairing hole one character away from the span.
+        character re-opens the pairing hole one character away from the span —
+        from either side, and from between two spans.
         """
         self.assertEqual(
             self.render("`foo`_prod and `bar`_dev"),
@@ -367,6 +368,55 @@ class ApplyTest(PatchedFixture, unittest.TestCase):
                 ("_prod and ", None, "text"),
                 ("bar", {"code": True}, "text"),
                 ("_dev", None, "text"),
+            ],
+        )
+        self.assertEqual(
+            self.render("a_`b` and c_`d`"),
+            [
+                ("a_", None, "text"),
+                ("b", {"code": True}, "text"),
+                (" and c_", None, "text"),
+                ("d", {"code": True}, "text"),
+            ],
+        )
+        self.assertEqual(
+            self.render("value_`x` is _important_"),
+            [
+                ("value_", None, "text"),
+                ("x", {"code": True}, "text"),
+                (" is ", None, "text"),
+                ("important", {"italic": True}, "text"),
+            ],
+        )
+
+    def test_kubernetes_reason_codes_in_parens_and_quotes_stay_styled(self):
+        """The report idiom that stresses every bucket at once.
+
+        ``(_CrashLoopBackOff_)`` opens against ``(`` and closes against ``)``;
+        both delimiters are punctuation-adjacent, so any neighbour-rule guard
+        masks one half and strands the other. The pairing guard keeps the pair
+        and the styling — identical to upstream, which renders these fine.
+        """
+        self.assertEqual(
+            self.render(
+                "checkout (_CrashLoopBackOff_) and payments (_OOMKilled_)"
+            ),
+            [
+                ("checkout (", None, "text"),
+                ("CrashLoopBackOff", {"italic": True}, "text"),
+                (") and payments (", None, "text"),
+                ("OOMKilled", {"italic": True}, "text"),
+                (")", None, "text"),
+            ],
+        )
+        self.assertEqual(
+            self.render("(__URGENT__) node `gke-prod-pool-8xk2` NotReady"),
+            [
+                ("(", None, "text"),
+                ("URGENT", {"bold": True}, "text"),
+                (") node ", None, "text"),
+                ("gke-prod-pool-8xk2", {"code": True}, "text"),
+                (" NotReady", None, "text"),
             ],
         )
 
