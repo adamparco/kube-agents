@@ -190,7 +190,30 @@ def main(root: Path) -> None:
         if any(e.get("style") for e in got):
             raise _fail(f"plain text picked up a style: {got!r}")
 
-    # 8) No sentinel may survive into a rendered element. An escaped \x00/\x01
+    # 8) Underscores glued to punctuation or to a code span must not pair
+    #    either (review finding #2: the first guard only masked alphanumeric-
+    #    flanked runs, so `/tmp/_a` could pair with `/tmp/_b` across a span) —
+    #    while emphasis whose delimiters touch punctuation must keep working
+    #    (the failure mode of both neighbour-rule guards: mask one half of
+    #    `"_i_"` and the stranded half pairs with the next stranded half).
+    for source in ("- /tmp/_a and `x` and /tmp/_b", "- `c`_prod and `d`_dev"):
+        got = _text_elements(block_kit.render_blocks(source))
+        joined = "".join(e.get("text", "") for e in got)
+        if "_" not in joined or any(
+            (e.get("style") or {}).get("italic") for e in got
+        ):
+            raise _fail(
+                f"edge-adjacent underscores paired across a span: {source!r} "
+                f"-> {got!r}"
+            )
+    quoted = _text_elements(block_kit.render_blocks('- "_i_" and "_j_" trailing'))
+    italics = [e for e in quoted if (e.get("style") or {}).get("italic")]
+    if [e.get("text") for e in italics] != ["i", "j"]:
+        raise _fail(
+            f"quoted emphasis broke — a guard is stranding delimiters: {quoted!r}"
+        )
+
+    # 9) No sentinel may survive into a rendered element. An escaped \x00/\x01
     #    is invisible in a diff and in most terminals, and only shows up as a
     #    mangled glyph in the thread itself.
     leaked = _text_elements(

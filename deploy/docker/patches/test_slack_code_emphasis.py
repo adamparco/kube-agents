@@ -158,6 +158,26 @@ class UpstreamBugTest(unittest.TestCase):
         )
         self.assertEqual(got, "Card t549d081c needs machinetype e2")
 
+    def test_upstream_keeps_edge_adjacent_underscores_apart(self):
+        """The baseline for review finding #2 on PR #666.
+
+        An underscore glued to punctuation or a code span is inert upstream
+        only because the split hands it a gap of its own. These are the lines
+        the pair-aware guard has to keep rendering as typed once the run is
+        continuous.
+        """
+        _, path = build()
+        mod = load(path, "block_kit_upstream_edges")
+        for text in [
+            "emoji 🚀_x and `y` and 🎉_z",
+            "/tmp/_a and `x` and /tmp/_b",
+        ]:
+            with self.subTest(text=text):
+                joined = "".join(
+                    t for t, _, _ in flatten(mod._inline_elements(text))
+                )
+                self.assertEqual(joined, text.replace("`", ""))
+
 
 class PatchedFixture:
     """Patch a fresh fixture per test and render real text through the result."""
@@ -293,11 +313,11 @@ class ApplyTest(PatchedFixture, unittest.TestCase):
         )
 
     def test_delimited_underscore_emphasis_still_works(self):
-        """The guard is intra-word only, so real ``_``/``__`` still emphasise.
+        """The guard masks only unpaired runs, so real ``_``/``__`` emphasise.
 
-        This is what forces ``[^\\W_]`` rather than ``\\w`` in the guard: ``_``
-        is itself a word character, so ``\\w`` matches the *inner* underscore of
-        each ``__`` pair and degrades real bold to italic.
+        The trailing text is part of the assertion: a guard broken in the
+        lookahead direction cannot fire at end-of-string, so ``_ital_`` alone
+        would pass under a guard that breaks every mid-sentence italic.
         """
         for text, expected in [
             ("_ital_ x", [("ital", {"italic": True}, "text"),
@@ -307,6 +327,102 @@ class ApplyTest(PatchedFixture, unittest.TestCase):
         ]:
             with self.subTest(text=text):
                 self.assertEqual(self.render(text), expected)
+
+    def test_edge_adjacent_underscores_do_not_pair_across_a_code_span(self):
+        """Underscores glued to punctuation, emoji, or a span must not pair.
+
+        Review finding #2 on PR #666: the first guard masked only
+        alphanumeric-flanked runs, so a ``_`` whose neighbour was an emoji, a
+        ``/``, a ``.``, or the code sentinel itself reached the emphasis scan
+        unmasked — and two such underscores anywhere in the run paired across
+        the span, deleting both. Upstream's split kept each in a scan of its
+        own, so every one of these lines renders as typed today; each would be
+        a regression introduced by the continuity fix.
+        """
+        for text in [
+            "emoji 🚀_x and `y` and 🎉_z",
+            "/tmp/_a and `x` and /tmp/_b",
+            "foo._bar and `x` and baz._qux",
+        ]:
+            with self.subTest(text=text):
+                got = self.render(text)
+                joined = "".join(t for t, _, _ in got)
+                self.assertEqual(joined, text.replace("`", ""))
+                self.assertFalse(
+                    [s for _, s, _ in got if s and s.get("italic")], got
+                )
+
+    def test_an_underscore_glued_to_a_code_span_stays_inert(self):
+        """``\x00`` counts as a word character in the guard's classifier.
+
+        The split tokenizer kept ``` `foo`_prod ``` inert because the ``_`` sat
+        alone in its gap. With one continuous string the sentinel is what sits
+        next to that underscore, and treating it as anything but a word
+        character re-opens the pairing hole one character away from the span.
+        """
+        self.assertEqual(
+            self.render("`foo`_prod and `bar`_dev"),
+            [
+                ("foo", {"code": True}, "text"),
+                ("_prod and ", None, "text"),
+                ("bar", {"code": True}, "text"),
+                ("_dev", None, "text"),
+            ],
+        )
+
+    def test_quoted_and_punctuated_emphasis_still_works(self):
+        """Emphasis whose delimiters touch punctuation keeps its styling.
+
+        This corpus is what killed both neighbour-rule guards. A rule that
+        masks a quote-adjacent opener strands the closer of ``"_a_"``, and two
+        stranded closers pair with each other — ``"_a_" and "_b_"`` came out
+        as ``"_a`` + italic(``" and "_b``) + ``"``, deleting two underscores.
+        The mirror-image rule strands the opener of ``_bar_.`` instead. The
+        pair-aware guard keeps both halves or masks both halves.
+        """
+        for text, expected in [
+            ('"_a_" and "_b_"',
+             [('"', None, "text"), ("a", {"italic": True}, "text"),
+              ('" and "', None, "text"), ("b", {"italic": True}, "text"),
+              ('"', None, "text")]),
+            ('say "__bold__" now',
+             [('say "', None, "text"), ("bold", {"bold": True}, "text"),
+              ('" now', None, "text")]),
+            ("_bar_. end",
+             [("bar", {"italic": True}, "text"), (". end", None, "text")]),
+            ("say _bar_, then",
+             [("say ", None, "text"), ("bar", {"italic": True}, "text"),
+              (", then", None, "text")]),
+            ("(_bar_) parens",
+             [("(", None, "text"), ("bar", {"italic": True}, "text"),
+              (") parens", None, "text")]),
+            ("__bold__. end",
+             [("bold", {"bold": True}, "text"), (". end", None, "text")]),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(self.render(text), expected)
+
+    def test_a_stranded_delimiter_is_masked_not_left_to_pair(self):
+        """A run with no partner is masked, wherever its neighbours put it.
+
+        ``config_`` is a valid closer shape to ``_ITALIC_RE``; once ``_bar_``
+        pairs, nothing is left to open against it, and an unmasked leftover
+        would let some later opener reach across the sentence. Masked, it
+        renders as the literal underscore the author typed.
+        """
+        self.assertEqual(
+            self.render("say _bar_. and config_ y"),
+            [
+                ("say ", None, "text"),
+                ("bar", {"italic": True}, "text"),
+                (". and config_ y", None, "text"),
+            ],
+        )
+        # Both-stranded shapes render verbatim rather than pairing with each
+        # other; upstream deletes the underscores in each of these.
+        for text in ["x_(y and z_) w", 'a_" then "_b']:
+            with self.subTest(text=text):
+                self.assertEqual(self.render(text), [(text, None, "text")])
 
     def test_an_underscore_in_a_link_url_is_restored(self):
         """A masked underscore must not be dropped from a link's flat url."""
@@ -583,8 +699,13 @@ class RealWorldTextTest(PatchedFixture, unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.render(text), expected)
 
-    def test_an_emoji_is_not_a_word_character(self):
-        """So ``🚀_x`` keeps its underscore by the unpaired rule, not the guard."""
+    def test_an_emoji_adjacent_underscore_is_masked_as_unpaired(self):
+        """``🚀_x`` classifies as an opener, finds no closer, and is masked.
+
+        With a closer elsewhere in the line it would pair and delete — that
+        case is pinned in ``test_edge_adjacent_underscores_do_not_pair_across_
+        a_code_span``. Alone, the mask restores it verbatim.
+        """
         self.assertEqual(
             self.render("emoji 🚀_x and `y`"),
             [("emoji 🚀_x and ", None, "text"), ("y", {"code": True}, "text")],

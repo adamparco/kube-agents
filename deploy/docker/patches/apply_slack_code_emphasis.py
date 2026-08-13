@@ -87,13 +87,33 @@ here: literal asterisks are ugly but lossless, whereas this silently corrupts th
 card IDs and machine types these reports exist to carry. ``_BOLD_RE``'s ``__``
 alternative has the same shape.
 
-So intra-word runs of underscores are masked too, as ``\\x01``, and restored when
-the element is emitted. Masking is used rather than tightening ``_ITALIC_RE`` and
-``_BOLD_RE`` directly because guarding only their ``_`` alternatives means
-splitting each into separately-anchored branches, which renumbers the capture
-group ``_walk_emphasis`` reads as ``m.group(1)``. The guard incidentally repairs
-the same-gap case (two snake_case tokens with no span between them), which
-upstream mangles today.
+So underscore runs that cannot be one half of a real emphasis pair are masked
+too, as ``\\x01``, and restored when the element is emitted. Masking is used
+rather than tightening ``_ITALIC_RE`` and ``_BOLD_RE`` directly because guarding
+only their ``_`` alternatives means splitting each into separately-anchored
+branches, which renumbers the capture group ``_walk_emphasis`` reads as
+``m.group(1)``. The guard incidentally repairs the same-gap case (two snake_case
+tokens with no span between them), which upstream mangles today.
+
+Which runs to mask is decided by pairing them, not by looking at either run's
+neighbours alone — that distinction is load-bearing, and review of two earlier
+revisions proved it the hard way. A neighbour rule that masks only
+alphanumeric-flanked runs leaves ``🚀_x``/``/tmp/_a``-shaped runs free to pair
+across the message (review finding #2). Widening either side of the rule then
+masks one half of legitimate emphasis and leaves the other half stranded — and
+a stranded delimiter does not render harmlessly, it pairs with the *next*
+stranded delimiter: mask the quote-adjacent openers in ``"_a_" and "_b_"`` and
+the two orphaned closers italicise ``" and "``, deleting characters that both
+upstream and the narrower guard rendered fine. Every one-sided mask just moves
+the corruption to a different shape of text.
+
+``_mask_underscores`` therefore classifies each run — can it open, can it
+close, per CommonMark-style flanking (``_`` never opens or closes against an
+alphanumeric on both sides) — pairs openers with closers on a stack, and masks
+every run left unpaired. Two invariants fall out. Masked runs are restored
+verbatim on emit, so a wrong *mask* decision shows a literal underscore and
+never deletes; and every surviving run sits in a plausible open→close pair, so
+the emphasis regexes downstream cannot be handed a stranded delimiter.
 
 Deliberately asymmetric: intra-word ``*`` is *not* masked. CommonMark forbids
 intra-word ``_`` emphasis and permits intra-word ``*``, upstream already
@@ -147,20 +167,18 @@ STRIKE_PATCHED = STRIKE + (
     "# message, and the digits between the delimiters are neither whitespace nor\n"
     "# `*`/`_`, so _ITALIC_RE's lookarounds still pair around a masked span.\n"
     '_CODE_SENTINEL_RE = re.compile(r"\\x00(\\d+)\\x00")\n'
-    "# kube-agents patch: an underscore *inside* a word is not emphasis. Upstream\n"
-    "# has no intra-word rule — a delimiter is rejected only next to whitespace or\n"
-    "# another `*`/`_` — which was survivable only because splitting on code kept\n"
-    "# each `_` in a scan of its own. Once the run is continuous the `_` in\n"
-    "# `t_549d081c` pairs with the one in `machine_type` across the span, eating\n"
-    "# both delimiters and italicising everything between. Masking these too is\n"
-    "# what keeps the emphasis scan from ever seeing them.\n"
-    '# `[^\\W_]` is "alphanumeric": plain `\\w` would match `_` itself, so in\n'
-    "# `__bold__` the inner underscore of each pair would be masked and real bold\n"
-    "# would degrade to italic. Doubling the backslash is just as wrong —\n"
-    "# `[^\\\\W_]` is the three-character set {backslash, W, _}, which excludes\n"
-    "# almost nothing, so `_ital_ x` loses its closing delimiter and stops\n"
-    "# emphasising at all.\n"
-    '_INTRAWORD_US_RE = re.compile(r"(?<=[^\\W_])_+(?=[^\\W_])")\n'
+    "# kube-agents patch: every underscore run in the masked text, handed to\n"
+    "# _mask_underscores below. Upstream's emphasis regexes have no intra-word\n"
+    "# rule — a delimiter is rejected only next to whitespace or another `*`/`_`\n"
+    "# — which was survivable only because splitting on code kept each stray `_`\n"
+    "# in a scan of its own. Once the run is continuous, the `_` in `t_549d081c`\n"
+    "# pairs with the one in `machine_type` across the span, eating both\n"
+    "# delimiters and italicising everything between. Which runs get masked is\n"
+    "# decided by pairing them (see _mask_underscores), not by a neighbour\n"
+    "# regex: two earlier neighbour rules each traded one corruption for\n"
+    "# another, because masking one half of a legitimate pair strands the other\n"
+    "# half, and stranded delimiters pair with each other.\n"
+    '_US_RUN_RE = re.compile(r"_+")\n'
 )
 
 # ---------------------------------------------------------------------------
@@ -195,8 +213,8 @@ TOKENIZER_PATCHED = '''\
     def _append(s: str, style: Optional[Dict[str, bool]] = None) -> None:
         if not s:
             return
-        # Masked intra-word underscores come back here: they were hidden from
-        # the emphasis scan, not removed from the message.
+        # Masked underscores come back here: they were hidden from the
+        # emphasis scan, not removed from the message.
         el: Dict[str, Any] = {"type": "text", "text": s.replace("\\x01", "_")}
         if style:
             el["style"] = style
@@ -228,7 +246,7 @@ TOKENIZER_PATCHED = '''\
     # "**`adam-new-cluster`** (us-east4) -> …" into a user's thread that way.
     # Masking keeps a span opaque — no markdown is interpreted inside it — while
     # leaving links and emphasis one continuous string to match across. That
-    # continuity is also why intra-word underscores have to be masked: the split
+    # continuity is also why stray underscores have to be masked: the split
     # used to keep the `_` in `t_549d081c` away from the one in `machine_type`,
     # and without a guard they would now pair across the span between them.
     codes: List[str] = []
@@ -244,9 +262,68 @@ TOKENIZER_PATCHED = '''\
             take, s.replace("\\x00", "").replace("\\x01", "")
         )
         # Code spans are held aside by now, so this only sees prose — mask the
-        # underscores that merely punctuate an identifier, before the emphasis
-        # scan gets a chance to pair them across the span between them.
-        return _INTRAWORD_US_RE.sub(lambda m: "\\x01" * len(m.group(0)), masked)
+        # underscores that cannot be real emphasis, before the emphasis scan
+        # gets a chance to pair them across the span between them.
+        return _mask_underscores(masked)
+
+    def _mask_underscores(s: str) -> str:
+        """Mask every underscore run that is not one half of a plausible pair.
+
+        The emphasis regexes will pair ANY surviving opener-shaped run with ANY
+        surviving closer-shaped run, however far apart, deleting both — so the
+        only safe rule is one that reasons about pairs. A run is classified by
+        CommonMark-style flanking (an underscore never opens or closes emphasis
+        against an alphanumeric on both sides — that is the interior of
+        ``t_549d081c``), openers pair with closers on a stack, and whatever is
+        left unpaired is masked. Neighbour-only rules were tried and each one
+        traded a corruption for a corruption: masking one half of the
+        legitimate pair in ``"_a_" and "_b_"`` leaves two stranded closers that
+        italicise ``" and "`` and eat both underscores.
+
+        Masking is lossless — the SOH placeholder is restored to ``_`` on emit
+        and in ``_unmask`` — so a wrong decision here shows a literal
+        underscore, never a corrupted identifier. A code-span sentinel counts
+        as a word character: the split tokenizer kept the underscore in
+        ``[code]_prod`` inert, and word status is what keeps it that way now.
+        """
+        def _bucket(c: str) -> str:
+            if not c or c.isspace():
+                return "space"
+            if c.isalnum() or c == "\\x00":
+                return "word"
+            return "punct"
+
+        runs = list(_US_RUN_RE.finditer(s))
+        if not runs:
+            return s
+        keep = [False] * len(runs)
+        stack: List[int] = []
+        for i, m in enumerate(runs):
+            prev = _bucket(s[m.start() - 1] if m.start() else "")
+            nxt = _bucket(s[m.end()] if m.end() < len(s) else "")
+            # CommonMark flanking, reduced to the three buckets: a run can
+            # open when attached to the start of a word (left-flanking, and
+            # not right-flanking unless punctuation precedes), close when
+            # attached to the end of one. Word-interior runs are neither.
+            left_flank = nxt != "space" and (nxt != "punct" or prev != "word")
+            right_flank = prev != "space" and (prev != "punct" or nxt != "word")
+            can_open = left_flank and (not right_flank or prev == "punct")
+            can_close = right_flank and (not left_flank or nxt == "punct")
+            if can_close and stack:
+                keep[stack.pop()] = True
+                keep[i] = True
+            elif can_open:
+                stack.append(i)
+        parts: List[str] = []
+        pos = 0
+        for i, m in enumerate(runs):
+            if keep[i]:
+                continue
+            parts.append(s[pos:m.start()])
+            parts.append("\\x01" * (m.end() - m.start()))
+            pos = m.end()
+        parts.append(s[pos:])
+        return "".join(parts)
 
     def _unmask(s: str) -> str:
         """Restore masked spans to their original backticked source.
