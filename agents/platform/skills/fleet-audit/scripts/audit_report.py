@@ -5427,11 +5427,19 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # Routed through the same gate as every other promotion, so an explicit
     # request cannot force-push over a pull request someone is reviewing.
     #
-    # The request time is *now*: this is a person typing the command, not a
-    # months-old comment being re-read on a cron. That makes it later than any
-    # close already on the record, which is exactly the escape hatch
-    # `pr_closed_by_harness` documents — a human who changed their mind gets
-    # their pull request back, and only a human can reach this path.
+    # The request time is *now* only under --override-human-close. It used to
+    # be unconditional, on the reasoning that only a person typing at a
+    # terminal could reach this path — and a person asking now is later than
+    # any close on the record, which is exactly the escape hatch a human who
+    # changed their mind is owed. That reasoning held only while a person was
+    # the sole caller: the skills now route a reviewer's direct ask here
+    # through the agent, which has no way to tie the ask to a GitHub identity,
+    # and an unconditional `now` would let any such ask silently overrule a
+    # close a human meant. So by default a human close stands — the finding is
+    # reported as superseded — and the write-gated `/remediate` comment keeps
+    # its monopoly on revival: `finish` honours one with the comment's own
+    # timestamp. The flag restores the terminal case, for the person who could
+    # have written that comment themselves.
     #
     # `auto_promote=False` because this command opens what was named and nothing
     # else. The cron's sweep would otherwise ride along on it, so
@@ -5442,7 +5450,11 @@ def handle_remediate(args: argparse.Namespace) -> None:
         findings,
         pr_by_finding,
         requested,
-        requested_at={fid: now.isoformat() for fid in requested},
+        requested_at=(
+            {fid: now.isoformat() for fid in requested}
+            if args.override_human_close
+            else {}
+        ),
         auto_promote=False,
     )
     for fid in plan.already_open:
@@ -5450,6 +5462,15 @@ def handle_remediate(args: argparse.Namespace) -> None:
         log(
             f"{fid} already has an open remediation pull request "
             f"({pr.get('url') or '#' + str(pr.get('number', '?'))}); not replacing it."
+        )
+    for fid in plan.superseded:
+        pr = pr_by_finding.get(fid) or {}
+        log(
+            f"{fid}: a human closed its pull request "
+            f"({pr.get('url') or '#' + str(pr.get('number', '?'))}), and that "
+            "close stands. Revival is a `/remediate` comment on the ledger "
+            "from someone with write access, written after the close — or "
+            "--override-human-close from the person at the terminal."
         )
     opened = _open_promoted_prs(
         repo,
@@ -5467,6 +5488,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
                 "status": "REMEDIATED",
                 "prs_opened": opened,
                 "already_open": plan.already_open,
+                "superseded": plan.superseded,
                 "refused": refused,
             }
         )
@@ -5999,6 +6021,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Ledger issue to link with 'Part of #N'. Looked up when omitted.",
+    )
+    remediate_parser.add_argument(
+        "--override-human-close",
+        action="store_true",
+        help=(
+            "Also re-propose a finding whose pull request a human closed. "
+            "Without it that close stands and the finding is reported as "
+            "superseded. For the person at the terminal who could have "
+            "written the /remediate comment themselves; an agent relaying an "
+            "ask it cannot tie to a GitHub identity never passes it."
+        ),
     )
     remediate_parser.add_argument(
         "--dry-run",

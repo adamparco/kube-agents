@@ -5104,9 +5104,59 @@ class TestRemediateSubcommand(HarnessTestCase):
                 "status": "REMEDIATED",
                 "prs_opened": ["https://github.com/acme/fleet/pull/8"],
                 "already_open": [],
+                "superseded": [],
                 "refused": [],
             },
         )
+
+    def human_closed_pr_reply(self, doc):
+        """A pull request on this finding's own branch, closed by a person."""
+        branch = audit_report.group_branch_for(AUDIT, doc["findings"])
+        return json.dumps(
+            [
+                {
+                    **pr(8, branch, state="CLOSED"),
+                    "closedAt": "2026-07-15T00:00:00Z",
+                    "labels": [],
+                }
+            ]
+        )
+
+    def test_a_human_close_stands_without_the_override_flag(self):
+        # `requested_at` used to be an unconditional `now`, on the assumption
+        # that only a person typing at a terminal could reach this command.
+        # The skills now route a reviewer's direct ask here through the agent,
+        # which cannot tie the ask to a GitHub identity — so by default the
+        # close wins, and revival stays with the write-gated `/remediate`
+        # comment `finish` honours on the comment's own timestamp.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc()
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "pr list": self.human_closed_pr_reply(doc),
+        }
+        rc = self.run_remediate(doc, [derived_id()])
+        self.assertEqual(rc, 0)
+        report = self.stdout_json()
+        self.assertEqual(report["prs_opened"], [])
+        self.assertEqual(report["superseded"], [derived_id()])
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertIn("close stands", self.err)
+        self.assertIn("/remediate", self.err)
+
+    def test_the_override_flag_restores_the_terminal_escape_hatch(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc()
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "pr list": self.human_closed_pr_reply(doc),
+            "pr create": "https://github.com/acme/fleet/pull/9\n",
+        }
+        rc = self.run_remediate(doc, [derived_id()], ["--override-human-close"])
+        self.assertEqual(rc, 0)
+        report = self.stdout_json()
+        self.assertEqual(report["prs_opened"], ["https://github.com/acme/fleet/pull/9"])
+        self.assertEqual(report["superseded"], [])
 
     def test_one_unwritten_manifest_does_not_sink_the_whole_batch(self):
         # `/remediate all` expands to every id in the document. Answering a

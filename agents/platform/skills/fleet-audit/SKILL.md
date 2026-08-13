@@ -517,7 +517,10 @@ to put in a diff otherwise. Three paths lead there:
 - **A direct ask.** A collaborator asking the agent, in the agent's own task, to fix a named
   finding; the agent answers with the `remediate` subcommand. Uncapped for the same reason as
   `/remediate` — and distinct from a comment read on the ledger, which is the harness's to answer
-  (`start` reports the ones that passed its gates as `pending_remediation_requests`).
+  (`start` reports the ones that passed its gates as `pending_remediation_requests`). Fresh pull
+  requests only: a finding whose pull request a human closed is reported as `superseded`, never
+  re-proposed — a direct ask carries no GitHub identity, so the after-the-close escape hatch
+  above stays with the write-gated comment.
 
 Every `/remediate` gets exactly one answer, and the answer is never silence:
 
@@ -565,9 +568,15 @@ one `--finding` produces one pull request (or one, shared, for the group that pa
 five more for critical findings the requester never mentioned and cannot tell apart from the one they
 did. Auto-promotion happens in `finish`, where the whole fleet is being reported on anyway.
 
-It prints one JSON line — `status`, `prs_opened`, `already_open`, and `refused`:
+It prints one JSON line — `status`, `prs_opened`, `already_open`, `superseded`, and `refused`:
 
-- `{"status":"REMEDIATED","prs_opened":["…"],"already_open":["cluster-old"],"refused":["ns-quota"]}`
+- `{"status":"REMEDIATED","prs_opened":["…"],"already_open":["cluster-old"],"superseded":[],"refused":["ns-quota"]}`
+
+`superseded` names targets whose pull request a human closed: that close stands, and the
+subcommand does not re-propose them. Revival belongs to the write-gated `/remediate` comment
+(§ above, honoured by `finish` on the comment's own timestamp) — or to `--override-human-close`,
+which exists for the person at the terminal who could have written that comment themselves. An
+agent relaying an ask it cannot tie to a GitHub identity never passes that flag.
 
 `refused` names the targets whose remediation is not a readable file inside the clone — either the
 audit promised a manifest and never wrote it, or the path does not resolve inside the repository at
