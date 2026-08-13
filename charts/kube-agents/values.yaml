@@ -71,11 +71,9 @@ litellm:
   # ksaName are defaulted below, but setting either to "" is still rejected at
   # render time rather than shipped (see templates/litellm.yaml).
   #
-  # Anthropic model IDs on Vertex carry no date suffix — claude-sonnet-4-6, not
-  # claude-sonnet-4-6-20260219; only dated snapshots use the @ form
-  # (claude-opus-4-5@20251101). location may be "global" (recommended — the
-  # broadest model availability), a multi-region, or a single region; regional
-  # endpoints return 429 for models with no capacity there.
+  # Model-ID form and location guidance (why "global" is the default, the
+  # no-date-suffix rule) live on the docs site's inference-gateway page,
+  # which is canonical for them; do not restate the details here.
   #
   # serviceAccount is the GSA email the KSA below impersonates. That GSA must
   # exist, hold roles/aiplatform.user on `project`, and carry a

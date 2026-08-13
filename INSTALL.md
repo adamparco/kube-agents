@@ -59,7 +59,7 @@ _(Alternatively via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.co
 - **Provisioning Sources**: Puts the provisioning scripts on disk (this checkout, or a clone at the requested revision) and verifies they match the image ref _before_ the interview starts.
 - **GKE Cluster Setup**: Provisions the supported GKE Standard topology or connects to an existing cluster.
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
-- **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials.
+- **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials — or, for Anthropic on Vertex AI, a Vertex project and location instead of any credential (Workload Identity, no API key).
 - **Automated Pipeline Execution**: Writes `k8s-operator/scripts/vars.sh` and launches `make gcp-provision`.
 
 The installer performs no GCP operation of its own — it configures and then delegates to the
@@ -109,7 +109,7 @@ The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous *
 
 - **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), operational playbooks (`governance/`) that the scheduled governance jobs point at, their schedules (`cron/jobs.json`), and reusable skills (`skills/`).
 - **Kubernetes Operator (`k8s-operator`)**: A Kubebuilder-powered Go operator that manages Custom Resource Definitions (`PlatformAgent`) and reconciles cluster lifecycle state.
-- **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, OpenAI, Anthropic) and enterprise messaging bridges (Google Chat, Slack).
+- **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, OpenAI, Anthropic — by API key or via Vertex AI) and enterprise messaging bridges (Google Chat, Slack).
 
 ---
 
@@ -171,7 +171,7 @@ make gcp-provision
 - **Private Container Registry**: If your GKE clusters cannot pull from `ghcr.io`, mirror the `kube-agents` container images into your private registry (e.g. Artifact Registry `us-docker.pkg.dev/my-project/kube-agents`) and set `REGISTRY_PREFIX="us-docker.pkg.dev/my-project/kube-agents"` in `scripts/vars.sh` or pass `--registry-prefix="us-docker.pkg.dev/my-project/kube-agents"` to `install.sh`. See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the full image list.
 
 > [!NOTE]
-> Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first.
+> Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first. The model and Vertex AI variables are the exception: exporting one before a run overrides the saved value — see [Changing the model or the provider after a first run](k8s-operator/scripts/README.md#changing-the-model-or-the-provider-after-a-first-run).
 
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
   ```bash
@@ -382,6 +382,8 @@ To optionally deploy the LiteLLM Gateway or GitHub Token Minter:
 export MODEL_PROVIDER=gemini
 export MODEL_DEFAULT_NAME=gemini-3.5-flash
 make deploy-litellm
+# MODEL_PROVIDER=vertex_ai needs five more exports and pre-existing IAM — see
+# k8s-operator/README.md#deploying-litellm-integration before using it here.
 
 # Deploy GitHub Integration (requires pre-configured github-app-credentials secret and env vars)
 export PROJECT_ID="your-gcp-project-id"

@@ -12,7 +12,7 @@ This skill provides step-by-step instructions for AI Agents to non-interactively
 It is a front-end, not a second provisioner. It collects configuration, writes
 `k8s-operator/scripts/vars.sh`, and then runs `make gcp-provision` — the pipeline in
 [`k8s-operator/scripts/`](../../../k8s-operator/scripts/README.md) does every GCP and GKE
-operation. The installer sources `k8s-operator/scripts/common.sh` before its first prompt, so its
+operation. The installer sources `k8s-operator/scripts/common.sh` before the interview, so its
 defaults and accepted values are the ones defined there; that file is where a default changes.
 
 Order of operations: resolve the image/source ref → check CLI prerequisites → put the provisioning

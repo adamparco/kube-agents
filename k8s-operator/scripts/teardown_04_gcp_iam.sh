@@ -3,7 +3,10 @@
 # 🧹 Step 4: Teardown Controller & Agent GCP Workload Identity & GCP IAM
 # ==============================================================================
 # Idempotent script to remove cluster management and Workload Identity bindings
-# from the Controller manager and all Agent GSAs, and delete the GSAs.
+# from the Controller manager and all Agent GSAs, and delete the GSAs. Also
+# removes the LiteLLM gateway's roles/aiplatform.user grant from VERTEX_PROJECT
+# — possibly a second project — unless SKIP_VERTEX_IAM_SETUP leaves that IAM to
+# its external owner.
 # ==============================================================================
 
 set -euo pipefail

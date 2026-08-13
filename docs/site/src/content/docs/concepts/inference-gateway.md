@@ -69,8 +69,10 @@ That deploys a fresh LiteLLM `ConfigMap` and rolls the gateway onto it; the agen
 
 ### Anthropic models on Vertex AI
 
-`vertex_ai` is the one provider that does not read an API key. It authenticates with Workload
-Identity, so the LiteLLM pod runs under a service account of its own — `kubeagents-litellm`,
+`vertex_ai` is the one provider whose gateway authenticates with Workload Identity — the others
+read an API key from `platform-agent-secrets`, or, for `chatgpt`, a device-flow token the pod
+keeps on its own PVC. Workload Identity means the LiteLLM pod runs under a service account of its
+own — `kubeagents-litellm`,
 annotated onto a GSA holding `roles/aiplatform.user`. `provision_04_gcp_iam.sh` creates the GSA,
 grants the role, and adds the Workload Identity binding; the deployment step renders the
 [`vertex` overlay](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/litellm/overlays/vertex)

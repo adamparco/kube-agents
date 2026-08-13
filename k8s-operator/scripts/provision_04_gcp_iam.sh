@@ -3,7 +3,10 @@
 # 🤖 Step 4: Controller & Agent GCP Workload Identity & GCP IAM Permissions
 # ==============================================================================
 # Idempotent script for granting GKE cluster management and Workload Identity
-# permissions to the Operator Controller Manager and Agent GSAs.
+# permissions to the Operator Controller Manager and Agent GSAs. For
+# MODEL_PROVIDER=vertex_ai it also creates the LiteLLM gateway's GSA and grants
+# it roles/aiplatform.user on VERTEX_PROJECT — a second project, when the
+# models are served from one the cluster does not own.
 # ==============================================================================
 
 set -e

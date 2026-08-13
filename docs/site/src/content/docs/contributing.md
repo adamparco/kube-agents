@@ -59,7 +59,7 @@ Before pushing, run the checks CI enforces:
 - **Operator compile + test** (if you touched `k8s-operator/`):
 
   ```bash
-  make -C k8s-operator test   # runs manifests, generate, fmt, vet, then go test — this is what the Operator Tests CI job runs
+  make -C k8s-operator test   # runs manifests, generate, fmt, vet, then go test — the test step of the Operator Tests CI job (the job also gates committed-manifest byte-equality and LiteLLM overlay rendering)
   ```
 
 - **Docs build** (if you touched `docs/site/`):
