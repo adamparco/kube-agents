@@ -556,7 +556,10 @@ answers itself never stops.
 All of these are guarded by a hidden marker carrying the triggering comment's node id, so a standing
 `/remediate` in the thread is answered once rather than every morning forever.
 
-Run the requested targets through the subcommand, which takes `--finding` once per id:
+A `/remediate` read on the ledger is never run through the subcommand — `finish` answers those on
+the comment's own timestamp, which is what lets a fresh post-close command revive a finding the
+subcommand would report as `superseded`. Run a direct ask's targets through it, `--finding` once
+per id:
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py remediate --audit <audit-id> \
