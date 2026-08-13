@@ -60,6 +60,11 @@ PARAM_CLUSTER_NAME="${CLUSTER_NAME:-}"
 # Left empty on purpose: resolved from common.sh's DEFAULT_* once the
 # provisioning helpers are sourced, so no default is spelled twice.
 PARAM_MODEL_PROVIDER="${MODEL_PROVIDER:-}"
+# vertex_ai only. Left empty so resolve_shared_defaults can fill the location
+# from common.sh's DEFAULT_VERTEX_LOCATION; the project has no default at all,
+# by design — see the vertex prompt in the model-provider step.
+PARAM_VERTEX_PROJECT="${VERTEX_PROJECT:-}"
+PARAM_VERTEX_LOCATION="${VERTEX_LOCATION:-}"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
@@ -91,11 +96,19 @@ Flags for AI Agents & Automation:
                                 DEFAULT_REGION, currently us-central1)
   --cluster-name=NAME           GKE Cluster Name (default: DEFAULT_CLUSTER_NAME,
                                 currently platform-agent-host)
-  --model-provider=PROVIDER     Model provider: gemini | anthropic | chatgpt | openai
+  --model-provider=PROVIDER     Model provider: gemini | anthropic | vertex_ai | chatgpt | openai
                                 (default: gemini)
+  --vertex-project=ID           GCP Project serving the Vertex AI models. Required with
+                                --model-provider=vertex_ai in non-interactive mode; it is
+                                not assumed to be --project-id, because serving from a
+                                shared project is the common arrangement
+  --vertex-location=LOCATION    Vertex AI location: global, a multi-region, or a region
+                                (default: k8s-operator/scripts/common.sh
+                                DEFAULT_VERTEX_LOCATION, currently global)
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
-  --anthropic-api-key=KEY       Anthropic API Key
+  --anthropic-api-key=KEY       Anthropic API Key (not used by vertex_ai, which
+                                authenticates with Workload Identity)
   --gitops-org=ORG              GitHub Org/Username for GitOps repo
   --gitops-repo=REPO            GitOps IaC Repository Name (default: gke-fleet-iac)
   --permission-set=SET          Agent GCP IAM permission set: read-only | gke-admin | custom
@@ -123,6 +136,8 @@ parse_args() {
       --region=*) PARAM_REGION="${1#*=}"; shift ;;
       --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
+      --vertex-project=*) PARAM_VERTEX_PROJECT="${1#*=}"; shift ;;
+      --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
       --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
       --openai-api-key=*) PARAM_OPENAI_API_KEY="${1#*=}"; shift ;;
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
@@ -387,6 +402,7 @@ source_provisioning_helpers() {
 # sourcing, so a flag or environment variable still wins over the shared default.
 resolve_shared_defaults() {
   PARAM_MODEL_PROVIDER="${PARAM_MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
+  PARAM_VERTEX_LOCATION="${PARAM_VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
   PARAM_REGISTRY_PREFIX="${PARAM_REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
 }
 
@@ -747,6 +763,8 @@ run_menu_system() {
   local region="${REGION:-$DEFAULT_REGION}"
   local model_provider="${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   local model_default_name="${MODEL_DEFAULT_NAME:-$(default_model_for_provider "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}")}"
+  local vertex_project="${VERTEX_PROJECT:-}"
+  local vertex_location="${VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
   local gemini_api_key="${GEMINI_API_KEY:-}"
   local openai_api_key="${OPENAI_API_KEY:-}"
   local anthropic_api_key="${ANTHROPIC_API_KEY:-}"
@@ -830,6 +848,7 @@ run_menu_system() {
           "Google Gemini ($(default_model_for_provider gemini))" \
           "OpenAI ($(default_model_for_provider openai))" \
           "Anthropic ($(default_model_for_provider anthropic))" \
+          "Anthropic on Vertex AI ($(default_model_for_provider vertex_ai))" \
           m_opt
         case "$m_opt" in
           1)
@@ -846,6 +865,18 @@ run_menu_system() {
             model_provider="anthropic"
             model_default_name="$(default_model_for_provider anthropic)"
             prompt_read "Anthropic API Key" anthropic_api_key "$anthropic_api_key" true
+            ;;
+          4)
+            # Switching an existing install onto Vertex needs more than this
+            # panel does: the GSA, its Workload Identity binding, and
+            # roles/aiplatform.user come from provision_04_gcp_iam.sh, and
+            # option 6 below only re-applies the Platform Agent CR. Say so
+            # rather than leaving a gateway that starts and then 403s.
+            model_provider="vertex_ai"
+            model_default_name="$(default_model_for_provider vertex_ai)"
+            prompt_read "GCP Project ID serving the Vertex AI models" vertex_project "${vertex_project:-$project_id}"
+            prompt_read "Vertex AI Location (global, a multi-region, or a region)" vertex_location "$vertex_location"
+            print_warning "Vertex AI needs IAM this panel does not create. Run 'cd k8s-operator && make gcp-provision-04-iam' and then 'make gcp-provision-09-litellm' after saving."
             ;;
         esac
         ;;
@@ -893,6 +924,8 @@ run_menu_system() {
         save_var KMS_LOCATION "$(derive_kms_location "$region")"
         save_var MODEL_PROVIDER "$model_provider"
         save_var MODEL_DEFAULT_NAME "$model_default_name"
+        save_var VERTEX_PROJECT "$vertex_project"
+        save_var VERTEX_LOCATION "$vertex_location"
         save_secret_var GEMINI_API_KEY "$gemini_api_key"
         save_secret_var OPENAI_API_KEY "$openai_api_key"
         save_secret_var ANTHROPIC_API_KEY "$anthropic_api_key"
@@ -1185,11 +1218,15 @@ main() {
   print_step "7. AI Model Provider Credentials"
   local model_provider="$PARAM_MODEL_PROVIDER"
   if ! is_valid_model_provider "$model_provider"; then
-    print_error "Unsupported model provider '$model_provider'. Use gemini, anthropic, chatgpt, or openai."
+    print_error "Unsupported model provider '$model_provider'. Use gemini, anthropic, vertex_ai, chatgpt, or openai."
     exit 1
   fi
   local model_default_name=""
   model_default_name="$(default_model_for_provider "$model_provider")"
+  local vertex_project="$PARAM_VERTEX_PROJECT"
+  # Never empty: resolve_shared_defaults has already backfilled it from
+  # common.sh's DEFAULT_VERTEX_LOCATION.
+  local vertex_location="$PARAM_VERTEX_LOCATION"
 
   local detected_gemini_key="${PARAM_GEMINI_API_KEY:-${GEMINI_API_KEY:-}}"
   if [ -z "$detected_gemini_key" ]; then
@@ -1205,6 +1242,7 @@ main() {
       "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
       "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
       "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
+      "Anthropic on Vertex AI ($(default_model_for_provider vertex_ai) / Workload Identity, no API key)" \
       model_choice
 
     case "$model_choice" in
@@ -1227,6 +1265,12 @@ main() {
         model_default_name="$(default_model_for_provider anthropic)"
         prompt_read "Anthropic API Key" anthropic_api_key "${ANTHROPIC_API_KEY:-}" true
         ;;
+      4)
+        model_provider="vertex_ai"
+        model_default_name="$(default_model_for_provider vertex_ai)"
+        prompt_read "GCP Project ID serving the Vertex AI models" vertex_project "$project_id"
+        prompt_read "Vertex AI Location (global, a multi-region, or a region)" vertex_location "$vertex_location"
+        ;;
     esac
   fi
 
@@ -1239,6 +1283,21 @@ main() {
       ;;
     anthropic)
       [ -n "$anthropic_api_key" ] || print_warning "No Anthropic API key was provided; the agent will require a credential update before model calls can succeed."
+      ;;
+    vertex_ai)
+      # No API key to check: the gateway impersonates a GSA that
+      # provision_04_gcp_iam.sh creates and grants roles/aiplatform.user on
+      # VERTEX_PROJECT. The project is required rather than defaulted to
+      # --project-id, because serving from a shared project while the cluster
+      # lives in its own is the common arrangement and the wrong choice fails
+      # only later, as a 403 from a gateway whose pods look perfectly healthy.
+      # The interactive path above offers this project as the prompt default,
+      # so only an unattended run can reach here empty.
+      if [ -z "$vertex_project" ]; then
+        print_error "--model-provider=vertex_ai requires --vertex-project=ID (the GCP project serving the Vertex AI models)."
+        exit 1
+      fi
+      print_info "Vertex AI target: ${C_BOLD}${vertex_project}${C_RESET} / ${C_BOLD}${vertex_location}${C_RESET} (Workload Identity; no API key is stored)."
       ;;
   esac
 
@@ -1407,6 +1466,14 @@ main() {
   write_state_var "$vars_file" GVISOR_POOL_NAME "gvisor-pool"
   write_state_var "$vars_file" MODEL_PROVIDER "$model_provider"
   write_state_var "$vars_file" MODEL_DEFAULT_NAME "$model_default_name"
+  # Written for every provider, like the API keys above, and read only by
+  # vertex_ai. Recording the answer here is what keeps the pipeline from asking
+  # again: the installer runs `make gcp-provision ARGS="-y"`, so NO_CONFIRM=1
+  # makes init_var_vertex_ai non-interactive in provision_04 and provision_09,
+  # and a value already in vars.sh is the only thing that stops it deciding for
+  # itself which project the predictions come from.
+  write_state_var "$vars_file" VERTEX_PROJECT "$vertex_project"
+  write_state_var "$vars_file" VERTEX_LOCATION "$vertex_location"
   write_state_var "$vars_file" GEMINI_API_KEY "$gemini_api_key"
   write_state_var "$vars_file" OPENAI_API_KEY "$openai_api_key"
   write_state_var "$vars_file" ANTHROPIC_API_KEY "$anthropic_api_key"
@@ -1457,6 +1524,9 @@ main() {
   echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE Standard)"
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
+  if [ "$model_provider" = "vertex_ai" ]; then
+    echo -e "  • ${C_CYAN}Vertex AI Target:${C_RESET} ${C_BOLD}${vertex_project}${C_RESET} (${vertex_location})"
+  fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   if [ -n "$github_org" ] && [ -n "$github_repo" ]; then
     echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
@@ -1491,6 +1561,20 @@ main() {
   local provisioning_log
   provisioning_log="/tmp/kube-agents-provision-$(date -u +%Y%m%dT%H%M%SZ).log"
   print_info "Provisioning output is also being saved to: ${C_BOLD}${provisioning_log}${C_RESET}"
+  # Hand the four model values down as exports, not just through vars.sh.
+  # load_state sources vars.sh after the environment, so a saved value normally
+  # wins — except for these four, where reapply_exported_var deliberately lets
+  # an exported value override the file so `MODEL_PROVIDER=vertex_ai make
+  # gcp-provision` works on an install already provisioned for gemini. That
+  # override reads the environment this installer inherited, which is the
+  # operator's shell: a stale `export MODEL_PROVIDER` left over from an earlier
+  # run would beat the --model-provider flag we just resolved and wrote, and the
+  # pipeline would provision a provider the confirmation panel never showed.
+  # Exporting the resolved answers makes the environment agree with the file.
+  export MODEL_PROVIDER="$model_provider"
+  export MODEL_DEFAULT_NAME="$model_default_name"
+  export VERTEX_PROJECT="$vertex_project"
+  export VERTEX_LOCATION="$vertex_location"
   if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
     IMAGE_TAG="$image_tag" make gcp-provision ARGS="-y" </dev/null 2>&1 | tee "$provisioning_log"
   else

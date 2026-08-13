@@ -91,20 +91,63 @@ jobs:
           LITELLM_KSA_NAME: kubeagents-litellm
           LITELLM_GSA_NAME: kubeagents-litellm-gsa
         run: |
+          # Load-bearing warm-up, not a stray line: the renders below are captured
+          # into a shell variable, and the first `make` to need kustomize prints
+          # "Downloading ..." to stdout, which would land in the middle of the
+          # manifest stream. `|| true` keeps a transient download failure from
+          # being reported here as a render failure — print-litellm-manifests
+          # declares kustomize as a prerequisite, so a real one still fails inside
+          # the captured make.
           make -s -C k8s-operator kustomize >/dev/null 2>&1 || true
+
           fail=0
-          for provider in gemini anthropic chatgpt vertex_ai; do
+          for provider in gemini anthropic chatgpt openai vertex_ai; do
             if ! out=$(MODEL_PROVIDER="$provider" MODEL_DEFAULT_NAME=ci-model \
                        make -s -C k8s-operator print-litellm-manifests); then
               echo "::error::MODEL_PROVIDER=$provider failed to render."
               fail=1
               continue
             fi
-            if printf '%s\n' "$out" | grep -n '\${'; then
+            # Both spellings of a placeholder: ${VAR} and the bare $VAR, which
+            # envsubst leaves alone just as silently. No rendered manifest holds a
+            # legitimate dollar sign in any provider today, and envsubst has no
+            # escape syntax ($$VAR expands, it does not quote), so a manifest that
+            # ever needs a literal one has to teach this gate about it.
+            if printf '%s\n' "$out" | grep -nE '\$\{|\$[A-Za-z_]'; then
               echo "::error::MODEL_PROVIDER=$provider left unsubstituted placeholders (listed above). Add the variable to that provider's envsubst allowlist in k8s-operator/Makefile."
               fail=1
             fi
+            # Psych rather than PyYAML: the runner image ships Ruby and does not
+            # ship PyYAML, so parsing costs no install step. parse_stream reads
+            # every document without constructing objects, which is all that is
+            # being asked here.
+            if ! printf '%s\n' "$out" | ruby -ryaml -e 'Psych.parse_stream(STDIN.read)'; then
+              echo "::error::MODEL_PROVIDER=$provider rendered a stream that is not valid YAML."
+              fail=1
+            fi
           done
+
+          # The vertex variables are guarded on deploy-litellm only — undeploy and
+          # this print target render deliberately unguarded — so empty values stay
+          # reachable. They must not yield a stream kubectl cannot read: before
+          # the interpolated values were given fallbacks, an empty LITELLM_GSA_NAME
+          # rendered the service-account annotation as a plain scalar opening with
+          # `@`, a reserved YAML indicator that makes the whole document
+          # unparseable rather than merely wrong. Refusing to render is a fine
+          # answer and so is rendering something that still parses; emitting
+          # broken YAML is not.
+          if empty_out=$(PROJECT_ID= VERTEX_PROJECT= VERTEX_LOCATION= \
+                         LITELLM_KSA_NAME= LITELLM_GSA_NAME= \
+                         MODEL_PROVIDER=vertex_ai MODEL_DEFAULT_NAME=ci-model \
+                         make -s -C k8s-operator print-litellm-manifests); then
+            if ! printf '%s\n' "$empty_out" | ruby -ryaml -e 'Psych.parse_stream(STDIN.read)'; then
+              echo "::error::The vertex overlay renders unparseable YAML when its variables are empty. Quote or default the values it interpolates."
+              fail=1
+            fi
+          else
+            echo "vertex_ai refuses to render with empty variables — a loud failure, which is an acceptable answer here."
+          fi
+
           exit $fail
 
       - name: Run Tests

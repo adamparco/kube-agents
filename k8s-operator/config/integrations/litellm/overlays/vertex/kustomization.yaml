@@ -8,15 +8,18 @@ patches:
 # Replaces the base's generated config so the model entries carry
 # vertex_project/vertex_location.
 #
-# The generated name stays hashed, but do not read anything into that: kustomize
-# hashes this file before envsubst substitutes it, so the hash is the same for
-# every VERTEX_PROJECT and every model. What rolls the pods is the
-# checksum/config annotation the Makefile stamps into the pod template.
+# `behavior: replace` matches on the name, so this entry has to repeat the
+# base's content-addressed name and its disabled suffix hash verbatim; see
+# ../../base/kustomization.yaml for why the name is built that way. The
+# checksum the Makefile computes is taken over *this* file when the provider is
+# vertex_ai, so VERTEX_PROJECT and VERTEX_LOCATION move the name too.
 configMapGenerator:
-  - name: litellm-config
+  - name: litellm-config-${LITELLM_CONFIG_CHECKSUM}
     behavior: replace
     files:
       - config.yaml
+    options:
+      disableNameSuffixHash: true
 
 # Repeated from the base so serviceaccount.yaml, which the base cannot see, is
 # labelled too.

@@ -62,18 +62,36 @@ variable "image_tag" {
 }
 
 variable "model_provider" {
-  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, or openai — chatgpt needs the kustomize overlay and is rejected by the chart). Set the matching *_api_key variable."
+  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, or vertex_ai — chatgpt needs the kustomize overlay and is rejected by the chart). Set the matching *_api_key variable, except for vertex_ai: it reaches Anthropic's models through Vertex AI with Workload Identity and takes vertex_project and vertex_service_account instead of a key."
   type        = string
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "anthropic", "openai"], var.model_provider)
-    error_message = "model_provider must be one of gemini, anthropic, or openai."
+    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai"], var.model_provider)
+    error_message = "model_provider must be one of gemini, anthropic, openai, or vertex_ai."
   }
 }
 
 variable "model_default_name" {
   description = "Model name behind model-default. Empty selects the chart's per-provider default (which mirrors the provisioning scripts)."
+  type        = string
+  default     = ""
+}
+
+variable "vertex_project" {
+  description = "GCP project the Vertex AI predictions are served from and billed to. Required when model_provider is vertex_ai and ignored otherwise. Deliberately not defaulted to project_id: serving from a shared project while the cluster lives in its own is the common arrangement, and guessing wrong fails only at runtime, as a 403."
+  type        = string
+  default     = ""
+}
+
+variable "vertex_location" {
+  description = "Vertex AI endpoint the gateway calls: \"global\", a multi-region, or a single region. \"global\" has the broadest model availability, and regional endpoints return 429 for models with no capacity there. Only used when model_provider is vertex_ai."
+  type        = string
+  default     = "global"
+}
+
+variable "vertex_service_account" {
+  description = "Email of the GSA the LiteLLM pod impersonates to call Vertex AI. Required when model_provider is vertex_ai and ignored otherwise. This composition does not create it — unlike the agent's own identity, which the kube-agents-iam module provisions. It needs roles/aiplatform.user on vertex_project and a roles/iam.workloadIdentityUser binding for serviceAccount:<project_id>.svc.id.goog[<namespace>/kubeagents-litellm], the KSA the chart creates and annotates (litellm.vertex.ksaName)."
   type        = string
   default     = ""
 }

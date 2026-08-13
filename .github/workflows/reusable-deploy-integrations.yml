@@ -104,6 +104,11 @@ jobs:
           CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
           MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+          # Only consulted when MODEL_PROVIDER is vertex_ai, but passed on every
+          # run for the same reason as the LiteLLM job below: init_var_model_provider
+          # asks for both, and a CI checkout has no vars.sh to answer from.
+          VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
+          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
           # Allow deployments on pre-existing CI evaluation / environment clusters
           # created without Cloud KMS CMEK encryption until they are upgraded.
           ALLOW_UNENCRYPTED_SECRETS: ${{ vars.ALLOW_UNENCRYPTED_SECRETS || 'true' }}
@@ -163,6 +168,18 @@ jobs:
           CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
           MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+          # vertex_ai renders both of these into the gateway's config, and a CI
+          # checkout has no vars.sh, so whatever this job leaves unset is decided
+          # by common.sh rather than by the environment's own configuration.
+          # Passing them through — rather than validating them here — keeps the
+          # rules in one place; an unset repository variable arrives as the empty
+          # string and common.sh decides what that means. Getting VERTEX_PROJECT
+          # wrong is not a cosmetic drift: this job rewrites the gateway config,
+          # the ConfigMap's name carries that config's checksum, so the pods roll
+          # onto the wrong project and every completion 403s while the rollout
+          # check below still goes green.
+          VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
+          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
         run: |
           echo "Redeploying LiteLLM gateway via provision_09"
           cd k8s-operator

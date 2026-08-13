@@ -16,15 +16,6 @@ spec:
     metadata:
       labels:
         app: litellm
-      annotations:
-        # Checksum of config.yaml *after* envsubst, stamped by `make
-        # deploy-litellm`. kustomize hashes config.yaml before envsubst runs, so
-        # the generated ConfigMap name is identical for every model one provider
-        # serves — this annotation is the only thing that changes the Deployment
-        # spec when the model does, and so the only thing that rolls the pods.
-        # Mirrors the chart's checksum/config. See the Makefile for the full
-        # rationale.
-        checksum/config: "${LITELLM_CONFIG_CHECKSUM}"
     spec:
       containers:
         - name: litellm-container
@@ -100,4 +91,10 @@ spec:
       volumes:
         - name: config-volume
           configMap:
-            name: litellm-config
+            # Content-addressed, and spelled out rather than left to kustomize's
+            # nameReference rewriting, which matches on the generator's declared
+            # name: see kustomization.yaml. A new model means a new ConfigMap
+            # name, which changes this pod template and rolls the pods — the
+            # only thing that makes a model change take effect, because
+            # config.yaml is a subPath mount the kubelet never updates in place.
+            name: litellm-config-${LITELLM_CONFIG_CHECKSUM}

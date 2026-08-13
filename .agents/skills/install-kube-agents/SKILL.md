@@ -108,7 +108,9 @@ here. Run `./install.sh --help` for the authoritative list.
 | `--image-tag=TAG`             | SemVer release tag or full 40-character commit SHA              | Checkout `HEAD`; required via `curl \| bash` |
 | `--registry-prefix=PATH`      | Container registry path without a URL scheme                    | `common.sh` `DEFAULT_REGISTRY_PREFIX`        |
 | `--allow-unverified-source`   | Provision from a dirty or mismatched checkout                   | `false`                                      |
-| `--model-provider=NAME`       | `gemini` \| `anthropic` \| `chatgpt` \| `openai`                | `common.sh` `DEFAULT_MODEL_PROVIDER`         |
+| `--model-provider=NAME`       | `gemini` \| `anthropic` \| `vertex_ai` \| `chatgpt` \| `openai` | `common.sh` `DEFAULT_MODEL_PROVIDER`         |
+| `--vertex-project=ID`         | GCP project serving the Vertex AI models                        | _unset_ (required with `vertex_ai`)          |
+| `--vertex-location=LOCATION`  | Vertex AI location: `global`, a multi-region, or a region       | `common.sh` `DEFAULT_VERTEX_LOCATION`        |
 | `--gemini-api-key=KEY`        | Gemini API key                                                  | Looked up in Secret Manager                  |
 | `--openai-api-key=KEY`        | OpenAI API key                                                  | _unset_                                      |
 | `--anthropic-api-key=KEY`     | Anthropic API key                                               | _unset_                                      |

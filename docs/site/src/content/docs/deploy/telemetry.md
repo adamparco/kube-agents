@@ -93,6 +93,18 @@ The namespace is read off the endpoint host when it names an in-cluster Service 
 
 The kustomize LiteLLM base stays on the managed collector; `k8s-operator/config/integrations/litellm/overlays/custom-otel/` is a copy-and-edit overlay that moves the exporter env and the egress `namespaceSelector` together. The vLLM manifests under `examples/` still carry the managed endpoint literally — edit `--otlp-traces-endpoint` there if you redirect the rest.
 
+`kustomize build` on that overlay emits a **template, not a manifest.** The LiteLLM base carries `envsubst` placeholders — the model name in `config.yaml`, and `${LITELLM_CONFIG_CHECKSUM}` in the generated ConfigMap's name — so its build output has to be substituted before `kubectl apply` will take it. `make deploy-litellm` does the whole pipeline, but it picks the overlay from `MODEL_PROVIDER` and has no way to select this one, so a copied `custom-otel` is rendered by hand:
+
+```bash
+cd k8s-operator
+export NAMESPACE=kubeagents-system MODEL_PROVIDER=gemini MODEL_DEFAULT_NAME=gemini-3-flash
+vars='$NAMESPACE $MODEL_PROVIDER $MODEL_DEFAULT_NAME $LITELLM_CONFIG_CHECKSUM'
+export LITELLM_CONFIG_CHECKSUM="sha256-$(envsubst "$vars" < config/integrations/litellm/base/config.yaml | sha256sum | cut -c1-16)"
+kustomize build config/integrations/litellm/overlays/custom-otel | envsubst "$vars" | kubectl apply -n "$NAMESPACE" -f -
+```
+
+`LITELLM_RENDER` in [`k8s-operator/Makefile`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/Makefile) is canonical for that pipeline; the recipe above is the base-provider case of it, unrolled — on macOS substitute `shasum -a 256` for `sha256sum`, as the Makefile does. Skipping the substitution used to produce a gateway that applied cleanly and then served a model literally named `${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}`; since the ConfigMap became content-addressed it fails at `kubectl apply` instead, because `litellm-config-${LITELLM_CONFIG_CHECKSUM}` is not a legal object name.
+
 ## Cloud Logging
 
 Container `stdout`/`stderr` is ingested automatically by the GKE log agent. Pod, namespace, and cluster labels are attached; you can query per-pod in [Logs Explorer](https://console.cloud.google.com/logs/query).

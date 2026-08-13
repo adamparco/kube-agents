@@ -31,6 +31,11 @@ same cluster, service accounts, and IAM bindings.
   composed from your variables. `model_provider` selects which provider
   LiteLLM routes `model-default` to (set the matching `*_api_key` variable);
   `model_default_name` overrides the per-provider default model.
+  `model_provider = "vertex_ai"` takes no API key and instead needs
+  `vertex_project`, `vertex_location`, and `vertex_service_account` — a
+  plan-time precondition rejects the apply if any is empty. This composition does
+  **not** create that GSA or its bindings, the one identity here you supply
+  yourself; see [Serving from Vertex AI](#serving-from-vertex-ai) below.
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
@@ -93,6 +98,40 @@ from memory. `project_roles = []` grants nothing and leaves IAM to you (the
 agent fails every GCP call until an equivalent set exists). Deliberately no
 admin list is pre-staged in `terraform.tfvars.example` — widening access
 should be an explicit, reviewed choice.
+
+### Serving from Vertex AI
+
+`model_provider = "vertex_ai"` swaps the gateway's API key for Workload
+Identity, so three variables replace the one `*_api_key`:
+
+```hcl
+model_provider         = "vertex_ai"
+vertex_project         = "my-shared-serving-project"  # where predictions are billed
+vertex_location        = "global"                     # or a region/multi-region
+vertex_service_account = "kubeagents-litellm-gsa@my-gcp-project.iam.gserviceaccount.com"
+model_default_name     = "claude-opus-4-8"            # optional
+```
+
+`vertex_project` is deliberately not defaulted to `project_id`: serving from a
+shared project while the cluster lives in its own is the common arrangement,
+and guessing wrong fails only at runtime, as a 403. `vertex_location = "global"`
+has the broadest model availability — a regional endpoint returns 429 for
+models with no capacity there.
+
+`vertex_service_account` is the one identity in this composition you create
+yourself. The agent's own GSA comes from the
+[`kube-agents-iam`](../../modules/kube-agents-iam) module; the gateway's does
+not, because on a shared serving project it usually belongs to whoever owns
+that project. It needs:
+
+- `roles/aiplatform.user` on `vertex_project`, and
+- a `roles/iam.workloadIdentityUser` binding for
+  `serviceAccount:<project_id>.svc.id.goog[<namespace>/kubeagents-litellm]`,
+  the KSA the chart creates and annotates.
+
+Get either wrong and the pods start, pass their probes, and return 403 on
+every completion. A plan-time precondition catches the three empty variables;
+it cannot check the bindings.
 
 ### Google Chat and GitHub integrations
 

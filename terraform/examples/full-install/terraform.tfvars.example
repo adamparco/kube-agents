@@ -41,6 +41,17 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # model_provider     = "gemini"
 # model_default_name = ""
 
+# Serving from Vertex AI instead: no API key, Workload Identity in its place.
+# All three are required when model_provider = "vertex_ai" and a plan-time
+# precondition rejects the apply if any is empty. vertex_service_account is
+# the one identity this composition does not create — it needs
+# roles/aiplatform.user on vertex_project and a roles/iam.workloadIdentityUser
+# binding for the kubeagents-litellm KSA. See the README.
+# model_provider         = "vertex_ai"
+# vertex_project         = "my-shared-serving-project"
+# vertex_location        = "global"
+# vertex_service_account = "kubeagents-litellm-gsa@my-gcp-project.iam.gserviceaccount.com"
+
 
 # Optional GitHub token minter backend (GSA + KMS signing key).
 # enable_github_minter = true

@@ -12,9 +12,14 @@
 {{- $callbacks := ternary `["otel", "prometheus"]` `["prometheus"]` .Values.litellm.otel }}
 {{- /*
   vertex_ai authenticates with Workload Identity rather than an API key, so it
-  is the one provider that needs a service account of its own. Both values are
-  required rather than defaulted: guessing the project would bill predictions to
-  the wrong place, and the failure would surface only as a runtime 403.
+  is the one provider that needs a service account of its own. Four values are
+  read and all four are `required`, but for two different reasons. project and
+  serviceAccount ship no default at all, because neither can be guessed:
+  the wrong project bills predictions to someone else, the wrong GSA has no
+  Vertex access, and both failures surface only as a runtime 403. location and
+  ksaName DO have defaults (values.yaml) — their guard exists to reject an
+  explicit empty override, which a default cannot prevent; see the note on
+  ksaName below for what that costs.
 */}}
 {{- $vertex := eq $provider "vertex_ai" }}
 {{- $vertexProject := "" }}
@@ -36,13 +41,19 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: {{ $vertexKSA }}
+  name: {{ $vertexKSA | quote }}
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: litellm
     {{- include "kube-agents.labels" . | nindent 4 }}
   annotations:
     iam.gke.io/gcp-service-account: {{ $vertexSA | quote }}
+# This account exists only to carry the Workload Identity annotation above.
+# LiteLLM never calls the Kubernetes API, so it has no use for a projected
+# API-server token — matching the GitHub minter's KSA
+# (k8s-operator/config/integrations/github/serviceaccount.yaml.template) and
+# the rule in .agents/skills/review-security-k8s-service-accounts.
+automountServiceAccountToken: false
 ---
 {{- end }}
 apiVersion: v1
@@ -60,8 +71,13 @@ data:
         litellm_params:
           model: {{ printf "%s/%s" $provider $model }}
           {{- if $vertex }}
-          vertex_project: {{ $vertexProject }}
-          vertex_location: {{ $vertexLocation }}
+          {{- /* Quoted because a project NUMBER is legitimate input here and
+                 would otherwise reach LiteLLM as a YAML integer, while the
+                 VERTEXAI_PROJECT env var below — same value, same render —
+                 stays a string. A bare `#` comment on this line would land
+                 inside the rendered config.yaml; this one does not. */}}
+          vertex_project: {{ $vertexProject | quote }}
+          vertex_location: {{ $vertexLocation | quote }}
           {{- end }}
     litellm_settings:
       callbacks: {{ $callbacks }}
@@ -89,11 +105,29 @@ spec:
       labels:
         app: litellm
       annotations:
-        # Roll the pods when the rendered LiteLLM config changes.
-        checksum/config: {{ printf "%s/%s/%s/%s/%s" $provider $model $callbacks $vertexProject $vertexLocation | sha256sum }}
+        # Roll the pods when anything they read changes. Every value that
+        # reaches the ConfigMap or the pod's identity has to be in this tuple,
+        # including the two service accounts: without them, repointing
+        # litellm.vertex.serviceAccount at a GSA that actually holds
+        # roles/aiplatform.user changes exactly one line in the whole release
+        # (the KSA's iam.gke.io/gcp-service-account annotation), the upgrade
+        # reports success, and the running pods are never restarted.
+        #
+        # The delimiter is a newline rather than "/": a slash is legal in a
+        # model ID and is rejected in a project or a location by nothing here,
+        # so ("p/us", "east5") and ("p", "us/east5") used to hash alike.
+        # Nothing that can sensibly appear in a model ID, project, location,
+        # GSA email or KSA name contains a newline.
+        #
+        # Quoted and prefixed because annotations are map[string]string: a bare
+        # hex digest that happens to be all decimal digits parses as a YAML
+        # integer, and the apiserver rejects the Deployment rather than coerce
+        # it. Either half alone would do; together they also make the value
+        # self-describing in `kubectl describe`.
+        checksum/config: {{ printf "sha256-%s" (printf "%s\n%s\n%s\n%s\n%s\n%s\n%s" $provider $model $callbacks $vertexProject $vertexLocation $vertexSA $vertexKSA | sha256sum) | quote }}
     spec:
       {{- if $vertex }}
-      serviceAccountName: {{ $vertexKSA }}
+      serviceAccountName: {{ $vertexKSA | quote }}
       {{- end }}
       containers:
         - name: litellm-container

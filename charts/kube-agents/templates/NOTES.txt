@@ -11,8 +11,29 @@ into kubeagents-system, or override the agent's model endpoint.
 {{- if .Values.platformAgent.enabled }}
 
 Before the agent pod can start, the Secret "{{ .Values.platformAgent.credentials.secretName }}"
-must exist in {{ .Release.Namespace }} with an API_SERVER_KEY entry plus your
-model-provider key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY).
+must exist in {{ .Release.Namespace }} with an API_SERVER_KEY entry.
+{{- /*
+  The model-provider key is read by the LiteLLM gateway, never by the agent, and
+  vertex_ai has no key at all — printing the old unconditional
+  "ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY" told a vertex_ai
+  installer to add a key that does not exist. Naming the one key that matters is
+  also more useful than listing three.
+*/}}
+{{- if .Values.litellm.enabled }}
+{{- if eq .Values.litellm.modelProvider "vertex_ai" }}
+The LiteLLM gateway needs no model-provider key: vertex_ai authenticates to
+Vertex AI with Workload Identity, through the "{{ .Values.litellm.vertex.ksaName }}"
+service account this release created. The GSA it names
+({{ .Values.litellm.vertex.serviceAccount }}) must already exist and hold
+roles/aiplatform.user on {{ .Values.litellm.vertex.project }} — see the chart README.
+{{- else }}
+The LiteLLM gateway reads its model-provider key from the same Secret:
+{{ upper .Values.litellm.modelProvider }}_API_KEY, for litellm.modelProvider={{ .Values.litellm.modelProvider }}.
+{{- end }}
+{{- else }}
+litellm.enabled=false, so no gateway is installed here; the model-provider key
+belongs wherever the gateway you run reads it from.
+{{- end }}
 {{- if .Values.platformAgent.credentials.create }}
 This release created it from platformAgent.credentials.data, generating
 SESSION_KV_API_KEY and SESSION_KV_SALT (preserved across upgrades).

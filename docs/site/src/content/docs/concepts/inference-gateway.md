@@ -53,7 +53,7 @@ The two substituted values come from provisioning (`MODEL_PROVIDER` and `MODEL_D
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
-To change the default, set the variables and re-run the LiteLLM step (or `make deploy-litellm`):
+To change the default, export the variables and re-run the LiteLLM step:
 
 ```bash
 export MODEL_PROVIDER=gemini
@@ -61,7 +61,11 @@ export MODEL_DEFAULT_NAME=gemini-3.5-flash
 cd k8s-operator/scripts && ./provision_09_deploy_litellm.sh
 ```
 
-This rewrites the LiteLLM `ConfigMap` and rolls the gateway; the agent picks up the new model on its next request without any change to its own config.
+Exporting is what makes this work on a cluster that has already been provisioned. Provisioning caches every answer it took in `k8s-operator/scripts/vars.sh` and re-uses it on later runs, so both variables above already hold whatever the first run chose. The model and Vertex variables are the deliberate exception to saved-state-wins: an explicit export beats the cached value, the step warns you that it is overriding it, and it re-saves the new value so the later steps agree. What you leave unset keeps its cached value — except that exporting `MODEL_PROVIDER` on its own moves `MODEL_DEFAULT_NAME` to the new provider's default rather than carrying the old provider's model name across.
+
+That deploys a fresh LiteLLM `ConfigMap` and rolls the gateway onto it; the agent picks up the new model on its next request without any change to its own config.
+
+`make deploy-litellm` applies the same manifests, but it is not an equivalent shortcut. It does not read `vars.sh`, so everything the step would have supplied has to be exported by hand — for `vertex_ai` that is five variables beyond the model pair, and the target refuses to run without them — and it skips the preflight that catches a missing GSA or Workload Identity binding before the pods come up green and 403 on every completion. See [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md#deploying-litellm-integration) for that path.
 
 ### Anthropic models on Vertex AI
 
@@ -77,7 +81,9 @@ project-wide and unconditioned: it lets anything that can impersonate the GSA ca
 model and endpoint in `VERTEX_PROJECT`, not just the Anthropic model you configured. That is the
 standard grant and the scripts do not narrow it — if the blast radius matters to you, give the
 gateway its own Vertex project, or replace the role with a custom one limited to
-`aiplatform.endpoints.predict`.
+`aiplatform.endpoints.predict`. Uninstalling hands it back: because this is the one grant the
+install writes outside `PROJECT_ID`, `teardown_04_gcp_iam.sh` removes it from `VERTEX_PROJECT`
+explicitly, along with the Workload Identity binding and the GSA.
 
 The Vertex project is a separate variable from `PROJECT_ID` because serving models from a shared
 project while the cluster lives elsewhere is the usual arrangement:
@@ -89,6 +95,21 @@ export VERTEX_PROJECT=my-vertex-project   # may differ from PROJECT_ID
 export VERTEX_LOCATION=global
 cd k8s-operator/scripts && ./provision_04_gcp_iam.sh && ./provision_09_deploy_litellm.sh
 ```
+
+The override rule above is what makes this recipe bite on an install that already ran. The two
+Vertex variables are new to it, but the model pair is not: `MODEL_PROVIDER` and
+`MODEL_DEFAULT_NAME` still hold what the Gemini install saved, and the exports here are what beats
+them. Leave `MODEL_PROVIDER` to `vars.sh` and the IAM step skips the Vertex work while the deploy
+step redeploys the old provider — both reporting success.
+
+If the serving project's IAM is managed outside this pipeline — the common case when you may call
+Vertex in a shared project but cannot set its IAM policy — set `SKIP_VERTEX_IAM_SETUP=true`. The
+IAM step then leaves the GSA, the Workload Identity binding, the grant, and the API enablement
+exactly as they are, and the deploy step stops pre-flighting them: all four have to be in place
+already, or the gateway comes up healthy and 403s. The flag holds on the way out too — teardown
+leaves the same four standing rather than deleting a service account it did not create and
+dropping a binding in a project this install may not be entitled to edit. Keep it exported for the
+teardown if it was set for the install.
 
 Two details are easy to get wrong. Anthropic model IDs on Vertex carry **no** date suffix —
 `claude-sonnet-4-6`, not `claude-sonnet-4-6-20260219`; only dated snapshots use the `@` form, as in

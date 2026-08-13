@@ -21,9 +21,11 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
 - A Secret with the agent's credentials in the release namespace (name from
   `platformAgent.credentials.secretName`, default `platform-agent-secrets`),
   holding `API_SERVER_KEY` plus your model-provider key (`ANTHROPIC_API_KEY`,
-  `GEMINI_API_KEY`, or `OPENAI_API_KEY`) and optional `SLACK_BOT_TOKEN` /
-  `SLACK_APP_TOKEN`. For dev installs the chart can create it from values
-  (`platformAgent.credentials.create=true` + `platformAgent.credentials.data`).
+  `GEMINI_API_KEY`, or `OPENAI_API_KEY` — the LiteLLM gateway reads it, the
+  agent never does, and `litellm.modelProvider=vertex_ai` needs none of them)
+  and optional `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN`. For dev installs the
+  chart can create it from values (`platformAgent.credentials.create=true` +
+  `platformAgent.credentials.data`).
 
   Two further keys are read from the same Secret but generated rather than
   asked for, since no value an operator could choose is better than a random
@@ -83,14 +85,65 @@ The agent's baked default model endpoint is
 `http://litellm.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base`. `litellm.modelProvider`
-(gemini/anthropic/openai) picks which provider `model-default` routes to — the
-matching API key must be in the credentials Secret; `litellm.modelDefaultName`
-overrides the per-provider default model. `chatgpt` mode is rejected (it needs
-the OAuth-token PVC from the kustomize overlay). Set `litellm.enabled=false`
-only if you operate your own gateway at that address. LLM-call telemetry is
-opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
-collector, since without one the otel callback aborts every LLM request on DNS
-failure.
+(gemini/anthropic/vertex_ai/openai) picks which provider `model-default` routes
+to; `litellm.modelDefaultName` overrides the per-provider default model. Every
+provider except `vertex_ai` reads its API key from the credentials Secret —
+`vertex_ai` authenticates with Workload Identity and needs no key (see below).
+`chatgpt` mode is rejected (it needs the OAuth-token PVC from the kustomize
+overlay). Set `litellm.enabled=false` only if you operate your own gateway at
+that address. LLM-call telemetry is opt-in (`litellm.otel=true`) — enable it
+only on clusters that run a reachable collector, since without one the otel
+callback aborts every LLM request on DNS failure.
+
+#### Anthropic models on Vertex AI (`litellm.modelProvider=vertex_ai`)
+
+| Value                           | Default              | Meaning                                                                                        |
+| ------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------- |
+| `litellm.vertex.project`        | _(required)_         | GCP project the predictions are billed to. May differ from `platformAgent.harness.projectId`.  |
+| `litellm.vertex.location`       | `global`             | Vertex endpoint: `global`, a multi-region, or a region.                                        |
+| `litellm.vertex.serviceAccount` | _(required)_         | GSA email the gateway's KSA impersonates.                                                      |
+| `litellm.vertex.ksaName`        | `kubeagents-litellm` | Kubernetes ServiceAccount the LiteLLM pod runs as. The chart creates it and annotates the GSA. |
+
+The chart renders the KSA and the annotation; it creates **nothing** on the GCP
+side, and neither does `terraform/modules/kube-agents-iam`. A Helm install must
+therefore do all four of these out of band before `helm install`.
+`<CLUSTER_PROJECT>` is the project holding the cluster
+(`platformAgent.harness.projectId`); `<VERTEX_PROJECT>` is
+`litellm.vertex.project`, which may be the same project or another one. The
+last binding names the release namespace and `litellm.vertex.ksaName` — change
+both if you install elsewhere or rename the KSA, or the pod's token maps to no
+GSA and every completion 403s:
+
+```bash
+gcloud services enable aiplatform.googleapis.com --project <VERTEX_PROJECT>
+
+gcloud iam service-accounts create kubeagents-litellm-gsa \
+  --project <CLUSTER_PROJECT>
+
+gcloud projects add-iam-policy-binding <VERTEX_PROJECT> \
+  --member "serviceAccount:kubeagents-litellm-gsa@<CLUSTER_PROJECT>.iam.gserviceaccount.com" \
+  --role roles/aiplatform.user
+
+gcloud iam service-accounts add-iam-policy-binding \
+  kubeagents-litellm-gsa@<CLUSTER_PROJECT>.iam.gserviceaccount.com \
+  --project <CLUSTER_PROJECT> \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:<CLUSTER_PROJECT>.svc.id.goog[kubeagents-system/kubeagents-litellm]"
+```
+
+Then install with:
+
+```bash
+  --set litellm.modelProvider=vertex_ai \
+  --set litellm.vertex.project=<VERTEX_PROJECT> \
+  --set litellm.vertex.serviceAccount=kubeagents-litellm-gsa@<CLUSTER_PROJECT>.iam.gserviceaccount.com
+```
+
+The script-driven install path does the same four steps in
+`provision_04_gcp_iam.sh`. [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#anthropic-models-on-vertex-ai)
+is canonical for the rest: the form of Anthropic model IDs on Vertex, why
+`global` is the recommended location, how wide `roles/aiplatform.user` really
+is, and which Claude features Vertex does not carry.
 
 ### Telemetry
 

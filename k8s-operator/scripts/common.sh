@@ -320,6 +320,112 @@ init_var_vertex_ai() {
   fi
 }
 
+# ─── LiteLLM Vertex AI Workload Identity ──────────────────────────────────────
+# Three separate objects have to line up before a vertex_ai gateway can serve a
+# single token: the GSA, the Workload Identity binding that lets the LiteLLM KSA
+# impersonate it, and roles/aiplatform.user on VERTEX_PROJECT. Any one of them
+# missing produces the same symptom — pods that start, pass their probes, and
+# then 403 on every completion — so provision_04 (deciding whether it has work
+# to do) and provision_09 (refusing to deploy into a broken install) check the
+# same things here instead of each keeping a partial copy of them.
+litellm_vertex_gsa_email() {
+  echo "${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+}
+
+# gcloud exits non-zero for NOT_FOUND and for PERMISSION_DENIED alike, and the
+# difference lives only in the message text. It is worth telling apart: "the GSA
+# does not exist" sends the operator to provision_04, while "you may not read
+# it" is about the caller's own credentials and provision_04 would not fix it.
+# A CI deploy service account with no IAM read permissions is exactly the second
+# case. The match is textual and therefore best-effort; when it is wrong it
+# errs toward "could not tell", which is reported as a warning, not a verdict.
+gcloud_error_is_denied() {
+  case "$1" in
+    *PERMISSION_DENIED*|*"does not have permission"*|*"Permission denied"*|*"insufficient authentication scopes"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Set by verify_litellm_vertex_iam_state to explain a non-zero return.
+LITELLM_VERTEX_IAM_REASON=""
+
+# Returns:
+#   0 — the GSA, the Workload Identity binding, the aiplatform.user grant and
+#       the Vertex API were all seen
+#   1 — the GSA or its Workload Identity binding is missing. Both live in
+#       PROJECT_ID and cannot be inherited, so this is a fact, and provision_04
+#       is what fixes it.
+#   2 — a check could not run (the caller lacks the read permission). Nothing
+#       is proven either way.
+#   3 — the aiplatform.user grant or the API enablement could not be confirmed.
+#       Read the comment on that check before treating this as a failure.
+verify_litellm_vertex_iam_state() {
+  LITELLM_VERTEX_IAM_REASON=""
+  local gsa_email out wi_member
+  gsa_email="$(litellm_vertex_gsa_email)"
+  wi_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${LITELLM_KSA_NAME}]"
+
+  if ! out="$(gcloud iam service-accounts describe "${gsa_email}" --project="${PROJECT_ID}" 2>&1)"; then
+    if gcloud_error_is_denied "$out"; then
+      LITELLM_VERTEX_IAM_REASON="the LiteLLM GSA ${gsa_email} could not be read: $(printf '%s\n' "$out" | head -n 1)"
+      return 2
+    fi
+    LITELLM_VERTEX_IAM_REASON="the LiteLLM GSA ${gsa_email} does not exist"
+    return 1
+  fi
+
+  if ! out="$(gcloud iam service-accounts get-iam-policy "${gsa_email}" --project="${PROJECT_ID}" --format="json" 2>&1)"; then
+    LITELLM_VERTEX_IAM_REASON="the IAM policy of ${gsa_email} could not be read: $(printf '%s\n' "$out" | head -n 1)"
+    return 2
+  fi
+  if ! printf '%s\n' "$out" | grep -F -q "${wi_member}"; then
+    LITELLM_VERTEX_IAM_REASON="${gsa_email} has no Workload Identity binding for ${wi_member}"
+    return 1
+  fi
+
+  # Only *direct* project-level bindings are visible here. A grant inherited
+  # from a folder or an organization, or held through a group the GSA belongs
+  # to, is real and invisible to this query, so a working install can land on
+  # code 3. Reading the effective policy instead would mean the Policy
+  # Troubleshooter API plus permissions on the ancestors, which an installer
+  # given access to somebody else's serving project does not have. The cost of
+  # the false negative is bounded: provision_04 re-applies an idempotent binding
+  # and never reports "Already completed", and provision_09 warns rather than
+  # refusing to deploy. SKIP_VERTEX_IAM_SETUP=true silences both.
+  if ! out="$(gcloud projects get-iam-policy "${VERTEX_PROJECT}" \
+      --flatten="bindings[].members" \
+      --filter="bindings.members:serviceAccount:${gsa_email}" \
+      --format="value(bindings.role)" 2>&1)"; then
+    LITELLM_VERTEX_IAM_REASON="the IAM policy of the Vertex project ${VERTEX_PROJECT} could not be read: $(printf '%s\n' "$out" | head -n 1)"
+    return 2
+  fi
+  if ! printf '%s\n' "$out" | grep -Fxq "roles/aiplatform.user"; then
+    LITELLM_VERTEX_IAM_REASON="${gsa_email} holds no direct roles/aiplatform.user binding on ${VERTEX_PROJECT}"
+    return 3
+  fi
+
+  if ! out="$(gcloud services list --enabled --project="${VERTEX_PROJECT}" --format="value(config.name)" 2>&1)"; then
+    LITELLM_VERTEX_IAM_REASON="the enabled services of ${VERTEX_PROJECT} could not be listed: $(printf '%s\n' "$out" | head -n 1)"
+    return 2
+  fi
+  if ! printf '%s\n' "$out" | grep -Fxq "aiplatform.googleapis.com"; then
+    LITELLM_VERTEX_IAM_REASON="aiplatform.googleapis.com is not enabled on ${VERTEX_PROJECT}"
+    return 3
+  fi
+
+  return 0
+}
+
+# Escape hatch for an install whose Vertex IAM is managed outside this pipeline
+# — the case that motivates it is a shared serving project where the installer
+# may call Vertex but holds neither resourcemanager.projects.setIamPolicy nor
+# serviceusage.services.enable on it. provision_04 then leaves the IAM alone and
+# provision_09 deploys without pre-flighting it, in the same shape as
+# SKIP_GITHUB_ORG_CHECK.
+skip_vertex_iam_setup() {
+  is_truthy "${SKIP_VERTEX_IAM_SETUP:-false}"
+}
+
 init_var_platform_agent_permission_set() {
   init_var "PLATFORM_AGENT_PERMISSION_SET" "read-only" "Enter Platform Agent Permission Set (read-only, gke-admin, custom)"
 
@@ -362,8 +468,50 @@ init_var_image_tag() {
   fi
 }
 
+# The knobs an operator is documented to change on an existing install by
+# exporting them and re-running a step (the site's concepts/inference-gateway
+# page spells that recipe out for both the model and the provider). Every other
+# saved variable keeps the saved-state-wins rule; these four cannot, because
+# load_state sources vars.sh *after* the environment. An `export
+# MODEL_PROVIDER=gemini` written by the first install therefore lands on top of
+# the vertex_ai the operator just exported, and init_var never re-prompts a
+# value that is already non-empty — so the pipeline redeployed the old provider
+# and reported success.
+MODEL_STATE_VARS="MODEL_PROVIDER MODEL_DEFAULT_NAME VERTEX_PROJECT VERTEX_LOCATION"
+
+# Re-apply one variable the caller exported before vars.sh was sourced over the
+# top of it. "$env_val" is what the environment said; the variable itself now
+# holds whatever vars.sh set, if anything. The winning value is always written
+# back — as init_var_registry_prefix does for an exported prefix — because
+# init_var saves only what it prompted for, so a value that came from the
+# environment would otherwise never reach vars.sh and the next script in the
+# pipeline, which sees only the file, would prompt for it or default it.
+reapply_exported_var() {
+  local var_name=$1
+  local env_val=$2
+  local saved_val="${!var_name:-}"
+
+  [ -z "$env_val" ] && return 0
+
+  # Already in agreement: leave the file alone. save_var rewrites vars.sh by
+  # deleting the line and appending it, so writing an unchanged value would
+  # reorder the file on every provisioning run and turn a no-op into a diff.
+  [ "$env_val" = "$saved_val" ] && return 0
+
+  if [ -n "$saved_val" ]; then
+    print_warning "Overriding saved ${var_name}='${saved_val}' with the exported '${env_val}'. ${VARS_FILE} is being updated to match; unset the export to go back to the saved value."
+  fi
+  save_var "$var_name" "$env_val"
+}
+
 load_state() {
   local env_registry_prefix="${REGISTRY_PREFIX:-}"
+  local env_model_name="${MODEL_DEFAULT_NAME:-}"
+  local state_var
+  local -a env_model_state=()
+  for state_var in $MODEL_STATE_VARS; do
+    env_model_state+=("${!state_var:-}")
+  done
   if [ -f "$VARS_FILE" ]; then
     chmod 600 "$VARS_FILE" 2>/dev/null || true
     source "$VARS_FILE"
@@ -383,6 +531,24 @@ load_state() {
     && [ "$env_registry_prefix" != "$REGISTRY_PREFIX" ]; then
     print_warning "Ignoring exported REGISTRY_PREFIX='${env_registry_prefix}': the saved value '${REGISTRY_PREFIX}' from ${VARS_FILE} wins. Edit ${VARS_FILE} (REGISTRY_PREFIX and the saved *_IMAGE values) to change registries."
   fi
+  # The model knobs go the other way round: an explicit export wins over vars.sh.
+  local saved_model_provider="${MODEL_PROVIDER:-}"
+  local saved_model_name="${MODEL_DEFAULT_NAME:-}"
+  local i=0
+  for state_var in $MODEL_STATE_VARS; do
+    reapply_exported_var "$state_var" "${env_model_state[$i]}"
+    i=$((i + 1))
+  done
+  # Switching provider without naming a model leaves the old provider's model
+  # behind, and "vertex_ai/gemini-3.5-flash" is a 404 at the gateway rather than
+  # anything the pipeline can see. Fall back to the new provider's default. A
+  # provider that did not change keeps whatever model was chosen for it, and an
+  # exported MODEL_DEFAULT_NAME has already won above.
+  if [ -n "$saved_model_provider" ] && [ -n "$saved_model_name" ] && [ -z "$env_model_name" ] \
+    && [ "$saved_model_provider" != "${MODEL_PROVIDER:-}" ]; then
+    print_warning "MODEL_DEFAULT_NAME='${saved_model_name}' was saved for MODEL_PROVIDER='${saved_model_provider}'; using '$(default_model_for_provider "${MODEL_PROVIDER}")' for '${MODEL_PROVIDER}'. Export MODEL_DEFAULT_NAME to choose a different model."
+    save_var "MODEL_DEFAULT_NAME" "$(default_model_for_provider "${MODEL_PROVIDER}")"
+  fi
   init_var_image_tag
   init_var_registry_prefix
   export NAMESPACE="kubeagents-system"
@@ -397,10 +563,26 @@ load_state() {
   export LITELLM_GSA_NAME="$DEFAULT_LITELLM_GSA_NAME"
 }
 
+# MODEL_PROVIDER decides which LiteLLM overlay teardown_09 renders to name the
+# objects it deletes, and MODEL_DEFAULT_NAME is substituted into it. Neither is
+# guaranteed to be in vars.sh — the file may be missing entirely, or predate the
+# variable — and `export MODEL_PROVIDER` on an unset name does not put it in the
+# child environment at all, so `make undeploy-litellm` would silently fall
+# through to the base overlay and leave the vertex ServiceAccount (annotated
+# with a live GSA) and the vertex ConfigMap behind. Default them here, in both
+# branches, the way the KSA/GSA names are defaulted.
+ensure_teardown_model_state() {
+  export MODEL_PROVIDER="${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
+  export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-$(default_model_for_provider "$MODEL_PROVIDER")}"
+  export VERTEX_PROJECT="${VERTEX_PROJECT:-}"
+  export VERTEX_LOCATION="${VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
+}
+
 ensure_teardown_state() {
   if [ -f "$VARS_FILE" ]; then
     chmod 600 "$VARS_FILE" 2>/dev/null || true
     source "$VARS_FILE"
+    ensure_teardown_model_state
     export GKE_DB_KMS_KEYRING="${GKE_DB_KMS_KEYRING:-}"
     export GKE_DB_KMS_KEY="${GKE_DB_KMS_KEY:-}"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
@@ -449,6 +631,7 @@ ensure_teardown_state() {
       export CLUSTER_NAME="${INPUT_CLUSTER_NAME:-$CLUSTER_NAME}"
     fi
     export NAMESPACE="kubeagents-system"
+    ensure_teardown_model_state
     export GKE_DB_KMS_KEYRING="${GKE_DB_KMS_KEYRING:-}"
     export GKE_DB_KMS_KEY="${GKE_DB_KMS_KEY:-}"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"

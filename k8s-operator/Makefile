@@ -122,28 +122,67 @@ undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.
 	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 
 # MODEL_PROVIDER picks both the overlay and the set of placeholders it uses, and
-# deploy/undeploy render identically — only the kubectl verb differs — so the
-# choice lives here once. The envsubst allowlist is spelled out because a bare
-# envsubst would expand every $VAR in the rendered manifests, including ones
-# that belong to the container at runtime.
+# deploy and undeploy pipe the same render into kubectl, differing only in the
+# verb, so the choice lives here once. The envsubst allowlist is spelled out
+# because a bare envsubst would also expand any $VAR a manifest means to hand
+# the container verbatim.
 #
-# LITELLM_CONFIG_CHECKSUM closes a hole the configMapGenerator hash cannot:
-# kustomize hashes config.yaml BEFORE envsubst runs, so every model one provider
-# serves renders the same ConfigMap name. Switching gemini-3.5-flash to
-# gemini-3.1-flash-lite rewrites the ConfigMap's contents and leaves the
-# Deployment spec byte-identical, so nothing rolls the pods — and config.yaml is
-# a subPath mount, which the kubelet never updates in place, so LiteLLM keeps
-# serving the old model until someone restarts it by hand. Hashing the
-# SUBSTITUTED config into a pod-template annotation is what the chart already
-# does, and it rolls the pods only when the config really changed. An
-# unconditional `kubectl rollout restart` would also work, but it would take the
-# chatgpt overlay — one replica, strategy: Recreate — down on every deploy.
+# LITELLM_CONFIG_CHECKSUM content-addresses the generated ConfigMap, closing a
+# hole the configMapGenerator hash cannot: kustomize hashes config.yaml BEFORE
+# envsubst runs, so every model one provider serves renders the same ConfigMap
+# name. Switching gemini-3.5-flash to gemini-3.1-flash-lite rewrites that
+# ConfigMap's contents and leaves the Deployment spec byte-identical, so nothing
+# rolls the pods — and config.yaml is a subPath mount, which the kubelet never
+# updates in place, so LiteLLM keeps serving the old model until someone
+# restarts it by hand. Naming the ConfigMap after the SUBSTITUTED config moves
+# the Deployment's volume reference along with the contents: the pods roll when
+# the config really changed and only then, and the superseded ConfigMap stays
+# behind, so a `kubectl rollout undo` still finds the config the pod template it
+# restores asks for. An unconditional `kubectl rollout restart` would also roll,
+# but it would take the chatgpt overlay — one replica, strategy: Recreate — down
+# on every deploy. The cost of content-addressing is that superseded ConfigMaps
+# accumulate: normal for kustomize, but worth knowing that undeploy-litellm
+# names only the ConfigMap the variables it is called with hash to, so earlier
+# generations — and the live one, if those variables have drifted since the
+# deploy — outlive the teardown.
 #
-# Deliberately no required-variable checks here. undeploy renders only to name
-# the objects it deletes, where an unsubstituted ${VERTEX_PROJECT} inside an
-# annotation is irrelevant; a guard on this path would abort a teardown that
-# teardown_09_deploy_litellm.sh reports as successful anyway, because it wraps
-# the call in `|| true`. Validation belongs to deploy-litellm alone.
+# The sha256- prefix keeps the value clear of YAML's integer syntax. Inside a
+# resource name a bare digest is harmless, but the prefix costs nothing and the
+# hazard is real in any other scalar position: 16 hex characters come out all
+# decimal digits about one render in 1800, which YAML then reads as an int —
+# enough for the apiserver to reject a Deployment, whose annotations are
+# map[string]string. It also names the algorithm in `kubectl get configmap`.
+#
+# The same hazard reaches every operator-supplied value that lands in a scalar
+# on its own, which is why the vertex_ai branch exports three of them
+# pre-quoted. Writing the quotes in the manifest does not work: kustomize
+# re-serialises what it parses and quotes only what needs quoting to round-trip,
+# so `value: "$${VERTEX_PROJECT}"` comes back out of `kustomize build` bare and
+# envsubst then drops the raw value into an unquoted scalar. (Contrast
+# `value: "true"` in the base Deployment, whose quotes survive precisely because
+# YAML would otherwise read it as a boolean.) Substituting a value that already
+# carries its quotes is the one place in the pipeline that can still decide the
+# node's type. It matters most for VERTEX_PROJECT: a GCP project *number* is a
+# legitimate Vertex identifier and is all digits, and it renders into
+# EnvVar.Value — a Go string — so the apiserver rejects the whole Deployment
+# after the earlier documents in the stream have already applied. Only variables
+# that occupy a complete scalar can be treated this way; MODEL_DEFAULT_NAME, for
+# one, cannot, because it also appears mid-string in `$${MODEL_PROVIDER}/...`.
+#
+# The vertex_ai branch defaults rather than requires. undeploy renders only to
+# name the objects it deletes and teardown_09_deploy_litellm.sh calls it with
+# `|| true`, so a hard check here would abort a teardown that reports success
+# anyway — but empty is not harmless either: LITELLM_KSA_NAME is the
+# ServiceAccount's metadata.name, and an empty PROJECT_ID or LITELLM_GSA_NAME
+# leaves the GSA email starting with '@', a reserved YAML indicator: the
+# ServiceAccount is the first document the vertex overlay emits, so the parse
+# dies there and `kubectl delete -f -` never reaches any of the six objects.
+# Defaults keep the stream parseable and the delete aimed at the right names.
+# deploy never reaches them: LITELLM_REQUIRE_VERTEX_VARS has already refused an
+# empty value by the time this runs. The KSA default repeats
+# DEFAULT_LITELLM_KSA_NAME from scripts/common.sh — the name every install that
+# did not override it actually created — so keep the two in step; the other two
+# defaults reach only annotation values, which no deletion looks at.
 define LITELLM_RENDER
 	case "$$MODEL_PROVIDER" in \
 	chatgpt) \
@@ -151,7 +190,13 @@ define LITELLM_RENDER
 		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$LITELLM_CONFIG_CHECKSUM' ;; \
 	vertex_ai) \
 		overlay=config/integrations/litellm/overlays/vertex; \
-		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$PROJECT_ID $$VERTEX_PROJECT $$VERTEX_LOCATION $$LITELLM_KSA_NAME $$LITELLM_GSA_NAME $$LITELLM_CONFIG_CHECKSUM' ;; \
+		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$PROJECT_ID $$VERTEX_PROJECT $$VERTEX_LOCATION $$LITELLM_KSA_NAME $$LITELLM_GSA_NAME $$LITELLM_CONFIG_CHECKSUM'; \
+		export LITELLM_KSA_NAME="$${LITELLM_KSA_NAME:-kubeagents-litellm}"; \
+		export PROJECT_ID="$${PROJECT_ID:-unset}"; \
+		export LITELLM_GSA_NAME="$${LITELLM_GSA_NAME:-unset}"; \
+		export VERTEX_PROJECT="\"$${VERTEX_PROJECT}\""; \
+		export VERTEX_LOCATION="\"$${VERTEX_LOCATION}\""; \
+		export LITELLM_KSA_NAME="\"$${LITELLM_KSA_NAME}\"" ;; \
 	*) \
 		overlay=config/integrations/litellm/base; \
 		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$LITELLM_CONFIG_CHECKSUM' ;; \
@@ -159,15 +204,17 @@ define LITELLM_RENDER
 	cfg="$$overlay/config.yaml"; \
 	[ -f "$$cfg" ] || cfg=config/integrations/litellm/base/config.yaml; \
 	if command -v sha256sum >/dev/null 2>&1; then sum=sha256sum; else sum="shasum -a 256"; fi; \
-	LITELLM_CONFIG_CHECKSUM="$$(envsubst "$$vars" < "$$cfg" | $$sum | cut -c1-16)"; \
+	LITELLM_CONFIG_CHECKSUM="sha256-$$(envsubst "$$vars" < "$$cfg" | $$sum | cut -c1-16)"; \
 	export LITELLM_CONFIG_CHECKSUM; \
 	$(KUSTOMIZE) build "$$overlay" | envsubst "$$vars"
 endef
 
 # Only deploy validates. Every one of these is a placeholder in the vertex
 # overlay, and envsubst turns an unset variable into an empty string rather than
-# an error — an empty vertex_project reaches the cluster and fails later as a
-# runtime 403, which is far harder to read than this message.
+# an error — an empty vertex_project sails through `kubectl apply` and surfaces
+# only when a completion fails inside the pod, which is far harder to read than
+# this message. LITELLM_RENDER's defaults for three of them are for the undeploy
+# path and are unreachable from here: this check runs first and refuses empty.
 define LITELLM_REQUIRE_VERTEX_VARS
 	if [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
 		for v in PROJECT_ID VERTEX_PROJECT VERTEX_LOCATION LITELLM_KSA_NAME LITELLM_GSA_NAME; do \
@@ -177,11 +224,32 @@ define LITELLM_REQUIRE_VERTEX_VARS
 	fi
 endef
 
+# Advisory, and skipped entirely for chatgpt. A gate that can fail here is a
+# deadlock for the ChatGPT device flow: provision.sh prints the login code only
+# after this target returns, and run_step (scripts/common.sh) exits 1 the moment
+# make does, so a timed-out gate aborts provision.sh at step 09 and the code is
+# never printed — for the one provider whose gateway needs a human to finish a
+# login before it can serve traffic. get_chatgpt_auth_info does its own
+# `rollout status --timeout=60s || true` before scraping those logs, so a
+# pending chatgpt rollout is already expected there. For the other providers the
+# wait is worth its feedback during an interactive provision, but it stays
+# non-fatal: applying is this target's contract, as it is for `make deploy`, and
+# the gate that is allowed to fail a deployment is CI's, which prints describe
+# output, pod states, and logs (.github/workflows/reusable-deploy-integrations.yml).
+define LITELLM_WAIT_FOR_ROLLOUT
+	if [ "$$MODEL_PROVIDER" = "chatgpt" ]; then \
+		echo "MODEL_PROVIDER=chatgpt: skipping the rollout wait so the device-flow login code is not held up."; \
+	else \
+		kubectl rollout status deployment/litellm -n $${NAMESPACE:-kubeagents-system} --timeout=180s \
+			|| echo "WARNING: deployment/litellm has not finished rolling out. The manifests were applied; inspect 'kubectl describe deployment/litellm -n $${NAMESPACE:-kubeagents-system}' and the pod logs." >&2; \
+	fi
+endef
+
 .PHONY: deploy-litellm
 deploy-litellm: kustomize ## Deploy LiteLLM integration.
 	@$(LITELLM_REQUIRE_VERTEX_VARS)
 	@$(LITELLM_RENDER) | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
-	@kubectl rollout status deployment/litellm -n $${NAMESPACE:-kubeagents-system} --timeout=300s
+	@$(LITELLM_WAIT_FOR_ROLLOUT)
 
 .PHONY: undeploy-litellm
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.

@@ -25,19 +25,42 @@ When any script is run:
 read them through `init_var`, and the repository-root `install.sh` sources the same file rather than
 keeping its own copies:
 
-| Symbol                                  | What it fixes                                                        |
-| --------------------------------------- | -------------------------------------------------------------------- |
-| `DEFAULT_CLUSTER_NAME`                  | GKE cluster name (`platform-agent-host`)                             |
-| `DEFAULT_REGION`                        | GCP region (`us-central1`)                                           |
-| `DEFAULT_MODEL_PROVIDER`                | Model provider (`gemini`)                                            |
-| `DEFAULT_REGISTRY_PREFIX`               | Container registry prefix                                            |
-| `default_model_for_provider <provider>` | The default model for a provider                                     |
-| `is_valid_model_provider <provider>`    | Accepted providers: `gemini`, `anthropic`, `chatgpt`, `openai`       |
-| `is_valid_permission_set <set>`         | Accepted GCP IAM permission sets: `read-only`, `gke-admin`, `custom` |
-| `derive_kms_location <region>`          | Region for Cloud KMS (strips a zone suffix)                          |
+| Symbol                                  | What it fixes                                                               |
+| --------------------------------------- | --------------------------------------------------------------------------- |
+| `DEFAULT_CLUSTER_NAME`                  | GKE cluster name (`platform-agent-host`)                                    |
+| `DEFAULT_REGION`                        | GCP region (`us-central1`)                                                  |
+| `DEFAULT_MODEL_PROVIDER`                | Model provider (`gemini`)                                                   |
+| `DEFAULT_VERTEX_LOCATION`               | Vertex AI location used by `vertex_ai` (`global`)                           |
+| `DEFAULT_LITELLM_KSA_NAME`              | LiteLLM gateway Kubernetes SA (`kubeagents-litellm`)                        |
+| `DEFAULT_LITELLM_GSA_NAME`              | LiteLLM gateway Google SA (`kubeagents-litellm-gsa`)                        |
+| `DEFAULT_REGISTRY_PREFIX`               | Container registry prefix                                                   |
+| `default_model_for_provider <provider>` | The default model for a provider                                            |
+| `is_valid_model_provider <provider>`    | Accepted providers: `gemini`, `anthropic`, `vertex_ai`, `chatgpt`, `openai` |
+| `is_valid_permission_set <set>`         | Accepted GCP IAM permission sets: `read-only`, `gke-admin`, `custom`        |
+| `derive_kms_location <region>`          | Region for Cloud KMS (strips a zone suffix)                                 |
 
 Change a default here and both the pipeline and the installer follow. Do **not** restate these
 values in `install.sh`, in a chart, or in prose — link to this table instead.
+
+### Changing the model or the provider after a first run
+
+`MODEL_PROVIDER`, `MODEL_DEFAULT_NAME`, `VERTEX_PROJECT`, and `VERTEX_LOCATION` are the exception to
+the note above. `load_state` sources `vars.sh` **after** the environment, so a saved value normally
+lands on top of an exported one; for these four the export wins instead, the step warns that it is
+overriding what was saved, and the winning value is written back to `vars.sh` so the later steps
+agree with it. Exporting `MODEL_PROVIDER` on its own also moves `MODEL_DEFAULT_NAME` to the new
+provider's default, because carrying the old provider's model across produces a string like
+`vertex_ai/gemini-3.5-flash` that only fails at the gateway; export `MODEL_DEFAULT_NAME` as well to
+pin a different model. Everything else still follows the saved-state-wins rule.
+
+The rule is the provisioning pipeline's, and only the provisioning pipeline's. `install.sh` exports
+the four values it resolved before it runs `make gcp-provision`, so the answer you gave the
+installer — or its `--model-provider` flag — is the one the pipeline uses even when a stale export
+is still sitting in the shell that launched it. Teardown goes the other way: `ensure_teardown_state`
+sources `vars.sh` and then `ensure_teardown_model_state` only fills in what the file did not set, so
+an export can supply a value that was never saved but can never replace one that was. That is the
+behaviour you want from a teardown, whose job is to name the objects the last provision actually
+created. The override warning names both values, so the provisioning log says which one was used.
 
 ### How `install.sh` relates to these scripts
 
@@ -83,6 +106,36 @@ GitHub organization; steps 04 and 10 look it up and refuse to continue for a per
 name that does not exist, because the Minter can only resolve installations under `/orgs/{org}/`
 (`SKIP_GITHUB_ORG_CHECK=true` bypasses that check). See
 [`config/integrations/github/README.md`](../config/integrations/github/README.md).
+
+### `MODEL_PROVIDER=vertex_ai` adds IAM to the LiteLLM steps
+
+`vertex_ai` is the only provider whose gateway authenticates to the model backend with Workload
+Identity rather than a key, so it is the only one for which these scripts give LiteLLM a GCP
+identity. `VERTEX_PROJECT` may differ from `PROJECT_ID`, and the split matters for what gets
+cleaned up:
+
+| Step          | What it does for `vertex_ai`                                                                                                                                                                                                                                                                                                                                                      |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 04            | Enables `aiplatform.googleapis.com` on `VERTEX_PROJECT` if it is not already on, creates the LiteLLM GSA in `PROJECT_ID`, grants it `roles/aiplatform.user` on `VERTEX_PROJECT`, and binds `roles/iam.workloadIdentityUser` for the gateway's KSA. Prints why it skipped for any other provider.                                                                                  |
+| 09            | Re-checks the GSA and that binding before deploying. A missing GSA or binding fails the step; a grant it could not confirm is a warning and the deploy continues.                                                                                                                                                                                                                 |
+| `teardown_04` | Removes the `roles/aiplatform.user` binding from `VERTEX_PROJECT` — the one grant this pipeline writes outside `PROJECT_ID`, so nothing else would — then the Workload Identity binding and the GSA, as it does for the other Agent GSAs. Not gated on `MODEL_PROVIDER`: an install switched back to `gemini` still has all three. Skipped in full under `SKIP_VERTEX_IAM_SETUP`. |
+
+Step 04 chooses no provider of its own on a non-interactive run: with `MODEL_PROVIDER` unset it
+skips the LiteLLM step and says so, leaving the question to step 07. Export `MODEL_PROVIDER` (and
+`VERTEX_PROJECT`) before running 04 to get the IAM in one pass.
+
+`teardown_09` renders the same overlay to learn the names it has to delete, which is why
+`ensure_teardown_state` defaults the model variables rather than leaving them unset: rendered
+against the wrong provider, the delete names objects that were never created and leaves the real
+ones in the namespace.
+
+`SKIP_VERTEX_IAM_SETUP=true` is honoured by three scripts: step 04 creates nothing, step 09 stops
+pre-flighting the GSA and its binding, and `teardown_04` leaves the GSA, its Workload Identity
+binding, and the Vertex grant standing. Nothing is created, changed, or removed while it is set,
+which is the whole point when those objects belong to someone else. When to reach for it, and what
+has to be in place instead, is on the site's
+[inference gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md) — the
+canonical home for that; keep this paragraph to which scripts honour the flag.
 
 ---
 

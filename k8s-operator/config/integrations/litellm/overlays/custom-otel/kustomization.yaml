@@ -7,6 +7,12 @@
 #
 # BOTH patches matter. The env var alone points the exporter at a collector the
 # NetworkPolicy still refuses to let it reach, which fails as silence rather than an error.
+#
+# "Build it" means build it AND substitute it: the base carries envsubst placeholders,
+# including ${LITELLM_CONFIG_CHECKSUM} in the generated ConfigMap's name, so a bare
+# `kustomize build` here emits a template that kubectl apply rejects. `make deploy-litellm`
+# runs the whole pipeline but selects its overlay from MODEL_PROVIDER and cannot be pointed
+# at this one, so render it by hand — the Telemetry page has the command.
 resources:
   - ../../base
 

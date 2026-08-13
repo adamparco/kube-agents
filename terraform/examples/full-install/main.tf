@@ -116,10 +116,24 @@ resource "helm_release" "kube_agents" {
         tag = var.image_tag
       }
     }
-    litellm = {
-      modelProvider    = var.model_provider
-      modelDefaultName = var.model_default_name
-    }
+    litellm = merge(
+      {
+        modelProvider    = var.model_provider
+        modelDefaultName = var.model_default_name
+      },
+      # Only vertex_ai reads this block, and the chart's `required` rejects an
+      # empty project, location, or serviceAccount — so send it only when it is
+      # the selected provider rather than always sending empty strings.
+      # ksaName is left to the chart's default, which is the KSA name the
+      # Workload Identity binding in provision_04_gcp_iam.sh already uses.
+      var.model_provider == "vertex_ai" ? {
+        vertex = {
+          project        = var.vertex_project
+          location       = var.vertex_location
+          serviceAccount = var.vertex_service_account
+        }
+      } : {}
+    )
     platformAgent = {
       harness = {
         clusterName = module.gke_cluster.cluster_name
@@ -160,4 +174,17 @@ resource "helm_release" "kube_agents" {
   })]
 
   depends_on = [module.gke_cluster]
+
+  # A `variable` validation block cannot read another variable on the Terraform
+  # this composition supports (providers.tf pins ~> 1.5; cross-variable
+  # validation arrived in 1.9), so the cross-field rule lives here. A
+  # precondition is evaluated at plan time, which is the point: without it the
+  # chart's own `required` raises the same objection from inside `helm install`,
+  # after the cluster, the IAM module, and the KMS keys have already been built.
+  lifecycle {
+    precondition {
+      condition     = var.model_provider != "vertex_ai" || (var.vertex_project != "" && var.vertex_location != "" && var.vertex_service_account != "")
+      error_message = "model_provider = \"vertex_ai\" requires vertex_project, vertex_location, and vertex_service_account. The gateway authenticates to Vertex AI with Workload Identity rather than an API key, and none of the three can be guessed from the cluster's own project."
+    }
+  }
 }

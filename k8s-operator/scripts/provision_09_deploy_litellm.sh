@@ -57,16 +57,39 @@ verify_litellm() {
 # serve nothing. Without the GSA and Workload Identity binding from
 # provision_04_gcp_iam.sh the pods still start, still pass their probes, and
 # still report a successful rollout — every completion then fails as a 403 that
-# surfaces only in the agent's logs. The CI redeploy workflow runs this step
-# without provision_04, so the check is here rather than left to the operator.
+# surfaces only in the agent's logs. The CI redeploy workflow
+# (.github/workflows/reusable-deploy-integrations.yml) runs steps 07 and 09 but
+# not 04, so the check is here rather than left to the operator.
+#
+# Only a missing GSA or a missing Workload Identity binding blocks the deploy.
+# Both are facts about objects in PROJECT_ID. Everything else the check can
+# report — an aiplatform grant that may be inherited, a policy this caller may
+# not read — is a warning, because main's step 09 made no gcloud IAM call at
+# all and a deploy service account without iam.serviceAccounts.get must not
+# start failing on a permission this step never used to need.
 preflight_vertex_iam() {
   [ "${MODEL_PROVIDER:-}" = "vertex_ai" ] || return 0
-  local gsa_email="${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-  if ! gcloud iam service-accounts describe "${gsa_email}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
-    print_error "MODEL_PROVIDER=vertex_ai but the LiteLLM GSA ${gsa_email} does not exist."
-    print_error "Run provision_04_gcp_iam.sh first — it creates the GSA, grants roles/aiplatform.user on VERTEX_PROJECT, and binds Workload Identity."
-    return 1
+  if skip_vertex_iam_setup; then
+    print_warning "SKIP_VERTEX_IAM_SETUP=true; deploying without checking the gateway's Workload Identity setup."
+    return 0
   fi
+
+  local state=0
+  verify_litellm_vertex_iam_state || state=$?
+  case "$state" in
+    0) return 0 ;;
+    1)
+      print_error "MODEL_PROVIDER=vertex_ai but ${LITELLM_VERTEX_IAM_REASON}."
+      print_error "Run provision_04_gcp_iam.sh first — it creates the GSA, grants roles/aiplatform.user on VERTEX_PROJECT, and binds Workload Identity."
+      print_error "Set SKIP_VERTEX_IAM_SETUP=true if this install's Vertex IAM is managed outside the pipeline."
+      return 1
+      ;;
+    *)
+      print_warning "Could not confirm the gateway's Vertex AI access: ${LITELLM_VERTEX_IAM_REASON}."
+      print_warning "Deploying anyway. If completions come back 403, run provision_04_gcp_iam.sh or check that grant by hand."
+      return 0
+      ;;
+  esac
 }
 
 execute_litellm() {

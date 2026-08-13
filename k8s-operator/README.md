@@ -43,7 +43,7 @@ Or execute the master script directly from the scripts folder:
 The master [provision.sh](scripts/provision.sh) script orchestrates modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
 
 > [!NOTE]
-> Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first.
+> Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first. The model and Vertex AI variables are the exception: exporting one before a run overrides the saved value, warns that it is doing so, and updates `scripts/vars.sh` to match.
 
 ```mermaid
 graph TD
@@ -283,13 +283,22 @@ LiteLLM gateway can be deployed to the Kubernetes cluster using the `kustomize` 
 
 ### Prerequisites
 
-To successfully deploy LiteLLM, you must have:
+`MODEL_PROVIDER` selects which Kustomize overlay is rendered, and each overlay expects a different set of variables. `make deploy-litellm` renders the manifests with `envsubst` and does not source [`scripts/common.sh`](scripts/common.sh) or `scripts/vars.sh` the way the provisioning scripts do, so the saved answers from a previous provisioning run do not reach it — assume every variable below has to be exported. The Makefile's own two defaults are `NAMESPACE`, which falls back to `kubeagents-system`, and the `vertex_ai` placeholders that keep an `undeploy` render parseable; the latter are unreachable from `deploy-litellm`, which refuses an empty value first.
 
-1. The `platform-agent-secrets` Secret created in your destination namespace (containing `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`).
+For the API-key providers (`gemini`, `anthropic`, `openai`) you need:
+
+1. The `platform-agent-secrets` Secret created in your destination namespace (containing `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`). The Deployment mounts all three with `optional: true`, so a missing key does not stop the pods from starting — it surfaces as a failure on the first completion.
+
+For `vertex_ai` there is no API key. It reaches Vertex AI with Workload Identity, which means:
+
+1. `PROJECT_ID`, `VERTEX_PROJECT`, `VERTEX_LOCATION`, `LITELLM_KSA_NAME`, and `LITELLM_GSA_NAME` must all be exported. `deploy-litellm` checks these and exits 1 rather than substituting an empty string into the ServiceAccount annotation or the model entries.
+2. The GSA and its Workload Identity binding must already exist — [`scripts/provision_04_gcp_iam.sh`](scripts/provision_04_gcp_iam.sh) creates the GSA, grants `roles/aiplatform.user` on `VERTEX_PROJECT`, and binds the KSA to it. This target does **not** check: without them the pods start, pass their probes, and return 403 on every completion.
+
+`chatgpt` needs neither a Secret nor GCP IAM — it keeps an OAuth token on a PVC and is finished by a device-flow login once the pod is up; see [`examples/litellm-chatgpt-subscription/`](../examples/litellm-chatgpt-subscription/README.md).
 
 ### Step-by-Step Deployment
 
-Run the `make deploy-litellm` target, passing the required environment variables:
+Run the `make deploy-litellm` target, passing the required environment variables. It applies into `${NAMESPACE:-kubeagents-system}`.
 
 ```bash
 # 1. Define model provider and default model name:
@@ -298,6 +307,28 @@ export MODEL_DEFAULT_NAME=gemini-3.5-flash
 
 # 2. Deploy LiteLLM:
 make deploy-litellm
+```
+
+For `vertex_ai`, the KSA/GSA names are the same defaults the provisioning scripts use (see [`scripts/common.sh`](scripts/common.sh)), and `VERTEX_PROJECT` may name a different project from the one holding the cluster:
+
+```bash
+# 1. Define the model and the Vertex AI parameters:
+export MODEL_PROVIDER=vertex_ai
+export MODEL_DEFAULT_NAME=claude-sonnet-4-6
+export PROJECT_ID=your-gcp-project-id
+export VERTEX_PROJECT=project-serving-the-model
+export VERTEX_LOCATION=global
+export LITELLM_KSA_NAME=kubeagents-litellm
+export LITELLM_GSA_NAME=kubeagents-litellm-gsa
+
+# 2. Deploy LiteLLM:
+make deploy-litellm
+```
+
+To render the manifests for the current `MODEL_PROVIDER` and read them instead of applying them:
+
+```bash
+make print-litellm-manifests
 ```
 
 To uninstall/remove the LiteLLM integration:

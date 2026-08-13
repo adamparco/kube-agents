@@ -4,6 +4,21 @@ metadata:
   name: litellm
 spec:
   template:
+    metadata:
+      annotations:
+        # The GSA this pod borrows through Workload Identity, mirrored from the
+        # ServiceAccount's iam.gke.io/gcp-service-account. Recorded here because
+        # nothing else in the pod template names it: re-rendering with a
+        # different PROJECT_ID or LITELLM_GSA_NAME rewrites only the
+        # ServiceAccount annotation, leaving the Deployment byte-identical, so
+        # nothing rolls. The running pods can then go on minting tokens for the
+        # old GSA — the GKE metadata server caches the KSA->GSA mapping it
+        # resolved for them — and a redeploy that looks clean quietly serves the
+        # old identity. Mirroring the email into the pod template makes the
+        # identity part of what a change rolls. It is a record, not a switch: the
+        # binding itself is the ServiceAccount annotation plus the IAM policy
+        # provision_04_gcp_iam.sh writes.
+        kubeagents.x-k8s.io/vertex-gsa: ${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
     spec:
       serviceAccountName: ${LITELLM_KSA_NAME}
       containers:

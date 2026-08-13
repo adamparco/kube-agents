@@ -4,10 +4,24 @@ resources:
   - podmonitoring.yaml
   - networkpolicy.yaml
 
+# The ConfigMap is content-addressed on ${LITELLM_CONFIG_CHECKSUM}, a checksum
+# of config.yaml *after* envsubst that `make deploy-litellm` computes and
+# exports (see the Makefile for the full rationale). kustomize's own name
+# suffix cannot do this job: it hashes config.yaml BEFORE envsubst runs, so
+# every model a provider serves yields the same name while the ConfigMap's
+# contents change underneath it. Disabling the suffix hash therefore loses
+# nothing — it only ever contributed a constant.
+#
+# deployment.yaml's volume reference repeats this name verbatim, and must keep
+# doing so: kustomize's nameReference transformer matches on the name as
+# declared here, so a volume still pointing at plain `litellm-config` is left
+# untouched and the pod mounts a ConfigMap that does not exist.
 configMapGenerator:
-  - name: litellm-config
+  - name: litellm-config-${LITELLM_CONFIG_CHECKSUM}
     files:
       - config.yaml
+    options:
+      disableNameSuffixHash: true
 
 # See config/default/kustomization.yaml for why includeSelectors stays false.
 labels:

@@ -64,9 +64,12 @@ litellm:
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
   modelDefaultName: ""
-  # Only read when modelProvider is vertex_ai. project/location/serviceAccount
-  # have no defaults on purpose: guessing the project would bill predictions to
-  # the wrong place and fail only at runtime, as a 403.
+  # Only read when modelProvider is vertex_ai. project and serviceAccount have
+  # no defaults on purpose — the project because guessing it would bill
+  # predictions to someone else, the GSA because no email can be guessed at
+  # all, and both mistakes surface only at runtime, as a 403. location and
+  # ksaName are defaulted below, but setting either to "" is still rejected at
+  # render time rather than shipped (see templates/litellm.yaml).
   #
   # Anthropic model IDs on Vertex carry no date suffix — claude-sonnet-4-6, not
   # claude-sonnet-4-6-20260219; only dated snapshots use the @ form
@@ -74,10 +77,13 @@ litellm:
   # broadest model availability), a multi-region, or a single region; regional
   # endpoints return 429 for models with no capacity there.
   #
-  # serviceAccount is the GSA email the KSA below impersonates. It needs
-  # roles/aiplatform.user on `project`, and a roles/iam.workloadIdentityUser
-  # binding for serviceAccount:<cluster-project>.svc.id.goog[<ns>/<ksaName>].
-  # provision_04_gcp_iam.sh does all three for the script-driven install.
+  # serviceAccount is the GSA email the KSA below impersonates. That GSA must
+  # exist, hold roles/aiplatform.user on `project`, and carry a
+  # roles/iam.workloadIdentityUser binding for
+  # serviceAccount:<cluster-project>.svc.id.goog[<ns>/<ksaName>]; `project`
+  # must also have aiplatform.googleapis.com enabled. The chart creates none of
+  # those four — a Helm install does them out of band (chart README);
+  # provision_04_gcp_iam.sh does them for the script-driven install.
   vertex:
     project: ""
     location: global
@@ -128,9 +134,10 @@ platformAgent:
     serviceAccountAnnotations: {}
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
-    # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /
-    # OPENAI_API_KEY) and optional SLACK_BOT_TOKEN / SLACK_APP_TOKEN. It must
-    # exist in the release namespace before the agent pod can start.
+    # model-provider key(s) the LiteLLM gateway reads (ANTHROPIC_API_KEY /
+    # GEMINI_API_KEY / OPENAI_API_KEY; none for vertex_ai, which uses Workload
+    # Identity) and optional SLACK_BOT_TOKEN / SLACK_APP_TOKEN. It must exist
+    # in the release namespace before the agent pod can start.
     secretName: platform-agent-secrets
     # Convenience for dev installs: create the Secret from `data` below.
     # Prefer a pre-created Secret (external secret management) in production.
