@@ -5,7 +5,7 @@
 # Idempotent script for granting GKE cluster management and Workload Identity
 # permissions to the Operator Controller Manager and Agent GSAs. For
 # MODEL_PROVIDER=vertex_ai it also creates the LiteLLM gateway's GSA and grants
-# it roles/aiplatform.user on VERTEX_PROJECT — a second project, when the
+# it roles/aiplatform.user on VERTEX_PROJECT_ID — a second project, when the
 # models are served from one the cluster does not own.
 # ==============================================================================
 
@@ -291,6 +291,50 @@ execute_platform_agent() {
 }
 
 
+# Step 5: Configure LiteLLM Vertex AI IAM
+# Only the GSA side belongs here; the KSA comes from the vertex_ai overlay in step
+# 9, and a Workload Identity binding may name a KSA that does not exist yet.
+verify_litellm_vertex_iam() {
+  if [ "${MODEL_PROVIDER:-}" != "vertex_ai" ]; then
+    print_info "Model provider is '${MODEL_PROVIDER:-unset}', not 'vertex_ai'. Skipping LiteLLM Vertex IAM setup."
+    return 0
+  fi
+  local vertex_project="${VERTEX_PROJECT_ID:-$PROJECT_ID}"
+  local gsa_email="${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+  gcloud services list --enabled --project="${vertex_project}" --format="value(config.name)" 2>/dev/null \
+    | grep -q 'aiplatform.googleapis.com' || return 1
+
+  # No roles passed: the model-serving grant lands on the Vertex project, which
+  # is not necessarily this one, so it is checked separately below.
+  verify_agent_iam "${LITELLM_KSA_NAME}" "${LITELLM_GSA_NAME}" || return 1
+
+  gcloud projects get-iam-policy "${vertex_project}" \
+      --flatten="bindings[].members" \
+      --filter="bindings.members:serviceAccount:${gsa_email}" \
+      --format="value(bindings.role)" 2>/dev/null \
+    | grep -Fxq "roles/aiplatform.user"
+}
+execute_litellm_vertex_iam() {
+  if [ "${MODEL_PROVIDER:-}" != "vertex_ai" ]; then
+    return 0
+  fi
+  local vertex_project="${VERTEX_PROJECT_ID:-$PROJECT_ID}"
+  local gsa_email="${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+  print_info "Enabling Vertex AI API on ${vertex_project}..."
+  gcloud services enable aiplatform.googleapis.com --project="${vertex_project}" || return 1
+
+  execute_agent_iam "LiteLLM Vertex" "${LITELLM_KSA_NAME}" "${LITELLM_GSA_NAME}" || return 1
+
+  print_info "Granting roles/aiplatform.user to ${LITELLM_GSA_NAME} on ${vertex_project}..."
+  gcloud projects add-iam-policy-binding "${vertex_project}" \
+      --member="serviceAccount:${gsa_email}" \
+      --role="roles/aiplatform.user" \
+      --quiet >/dev/null || return 1
+}
+
+
 # Step 6: Configure GitHub Token Minter IAM
 verify_github_minter_iam() {
   if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_REPO:-}" ] || [ -z "${GITHUB_APP_ID:-}" ]; then
@@ -316,9 +360,9 @@ execute_github_minter_iam() {
 # gated at the call site rather than short-circuited inside verify, which
 # run_step would report as "Already completed" for work that never ran.
 #
-# VERTEX_PROJECT is intentionally allowed to differ from PROJECT_ID — serving
+# VERTEX_PROJECT_ID is intentionally allowed to differ from PROJECT_ID — serving
 # models from a shared project while the cluster lives elsewhere is the common
-# arrangement — so the aiplatform grant is made against VERTEX_PROJECT while the
+# arrangement — so the aiplatform grant is made against VERTEX_PROJECT_ID while the
 # GSA and its Workload Identity binding stay in PROJECT_ID with the cluster.
 # The three checks themselves live in common.sh, because provision_09 pre-flights
 # the same ones before it deploys.
@@ -338,12 +382,12 @@ execute_litellm_vertex_iam() {
   # project even when the service is already on, and an installer handed access
   # to somebody else's serving project will not have it. Look first, so the
   # permission is only required when something actually has to change.
-  if out="$(gcloud services list --enabled --project="${VERTEX_PROJECT}" --format="value(config.name)" 2>/dev/null)" \
+  if out="$(gcloud services list --enabled --project="${VERTEX_PROJECT_ID}" --format="value(config.name)" 2>/dev/null)" \
     && printf '%s\n' "$out" | grep -Fxq "aiplatform.googleapis.com"; then
-    print_info "aiplatform.googleapis.com is already enabled on ${VERTEX_PROJECT}."
-  elif ! gcloud services enable aiplatform.googleapis.com --project="${VERTEX_PROJECT}"; then
-    print_error "Could not enable aiplatform.googleapis.com on ${VERTEX_PROJECT} (that needs serviceusage.services.enable there)."
-    print_error "Ask an owner of ${VERTEX_PROJECT} to enable it, or set SKIP_VERTEX_IAM_SETUP=true if that project's APIs and IAM are managed outside this pipeline."
+    print_info "aiplatform.googleapis.com is already enabled on ${VERTEX_PROJECT_ID}."
+  elif ! gcloud services enable aiplatform.googleapis.com --project="${VERTEX_PROJECT_ID}"; then
+    print_error "Could not enable aiplatform.googleapis.com on ${VERTEX_PROJECT_ID} (that needs serviceusage.services.enable there)."
+    print_error "Ask an owner of ${VERTEX_PROJECT_ID} to enable it, or set SKIP_VERTEX_IAM_SETUP=true if that project's APIs and IAM are managed outside this pipeline."
     return 1
   fi
 
@@ -355,12 +399,12 @@ execute_litellm_vertex_iam() {
     sleep 15
   fi
 
-  print_info "Granting roles/aiplatform.user on ${VERTEX_PROJECT} to ${LITELLM_GSA_NAME}..."
-  if ! gcloud projects add-iam-policy-binding "${VERTEX_PROJECT}" \
+  print_info "Granting roles/aiplatform.user on ${VERTEX_PROJECT_ID} to ${LITELLM_GSA_NAME}..."
+  if ! gcloud projects add-iam-policy-binding "${VERTEX_PROJECT_ID}" \
       --member="serviceAccount:${gsa_email}" \
       --role="roles/aiplatform.user" \
       --quiet >/dev/null; then
-    print_error "Could not grant roles/aiplatform.user on ${VERTEX_PROJECT} (that needs resourcemanager.projects.setIamPolicy there)."
+    print_error "Could not grant roles/aiplatform.user on ${VERTEX_PROJECT_ID} (that needs resourcemanager.projects.setIamPolicy there)."
     print_error "If the GSA already holds the role through a group or an inherited policy — which this step cannot see — set SKIP_VERTEX_IAM_SETUP=true to leave the Vertex IAM alone."
     return 1
   fi
@@ -385,7 +429,7 @@ if [ "${MODEL_PROVIDER:-}" != "vertex_ai" ]; then
   print_step "$LITELLM_VERTEX_STEP"
   if [ -z "${MODEL_PROVIDER:-}" ]; then
     print_info "Skipped: no model provider has been chosen yet, and a non-interactive run of this step does not choose one — step 07 asks."
-    print_info "For a Workload Identity gateway, export MODEL_PROVIDER=vertex_ai (with VERTEX_PROJECT) and re-run this step before step 09."
+    print_info "For a Workload Identity gateway, export MODEL_PROVIDER=vertex_ai (with VERTEX_PROJECT_ID) and re-run this step before step 09."
   else
     print_info "Skipped: MODEL_PROVIDER='${MODEL_PROVIDER}'. vertex_ai is the only provider whose gateway authenticates to the model backend with Workload Identity; the others use an API key or a device-flow login and need no GCP identity."
   fi

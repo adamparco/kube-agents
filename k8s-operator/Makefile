@@ -157,12 +157,12 @@ undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.
 # on its own, which is why the vertex_ai branch exports three of them
 # pre-quoted. Writing the quotes in the manifest does not work: kustomize
 # re-serialises what it parses and quotes only what needs quoting to round-trip,
-# so `value: "$${VERTEX_PROJECT}"` comes back out of `kustomize build` bare and
+# so `value: "$${VERTEX_PROJECT_ID}"` comes back out of `kustomize build` bare and
 # envsubst then drops the raw value into an unquoted scalar. (Contrast
 # `value: "true"` in the base Deployment, whose quotes survive precisely because
 # YAML would otherwise read it as a boolean.) Substituting a value that already
 # carries its quotes is the one place in the pipeline that can still decide the
-# node's type. It matters most for VERTEX_PROJECT: a GCP project *number* is a
+# node's type. It matters most for VERTEX_PROJECT_ID: a GCP project *number* is a
 # legitimate Vertex identifier and is all digits, and it renders into
 # EnvVar.Value — a Go string — so the apiserver rejects the whole Deployment
 # after the earlier documents in the stream have already applied. Only variables
@@ -189,12 +189,12 @@ define LITELLM_RENDER
 		overlay=config/integrations/litellm/overlays/chatgpt; \
 		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$LITELLM_CONFIG_CHECKSUM' ;; \
 	vertex_ai) \
-		overlay=config/integrations/litellm/overlays/vertex; \
-		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$PROJECT_ID $$VERTEX_PROJECT $$VERTEX_LOCATION $$LITELLM_KSA_NAME $$LITELLM_GSA_NAME $$LITELLM_CONFIG_CHECKSUM'; \
+		overlay=config/integrations/litellm/overlays/vertex_ai; \
+		vars='$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$PROJECT_ID $$VERTEX_PROJECT_ID $$VERTEX_LOCATION $$LITELLM_KSA_NAME $$LITELLM_GSA_NAME $$LITELLM_CONFIG_CHECKSUM'; \
 		export LITELLM_KSA_NAME="$${LITELLM_KSA_NAME:-kubeagents-litellm}"; \
 		export PROJECT_ID="$${PROJECT_ID:-unset}"; \
 		export LITELLM_GSA_NAME="$${LITELLM_GSA_NAME:-unset}"; \
-		export VERTEX_PROJECT="\"$${VERTEX_PROJECT}\""; \
+		export VERTEX_PROJECT_ID="\"$${VERTEX_PROJECT_ID}\""; \
 		export VERTEX_LOCATION="\"$${VERTEX_LOCATION}\""; \
 		export LITELLM_KSA_NAME="\"$${LITELLM_KSA_NAME}\"" ;; \
 	*) \
@@ -217,7 +217,7 @@ endef
 # path and are unreachable from here: this check runs first and refuses empty.
 define LITELLM_REQUIRE_VERTEX_VARS
 	if [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
-		for v in PROJECT_ID VERTEX_PROJECT VERTEX_LOCATION LITELLM_KSA_NAME LITELLM_GSA_NAME; do \
+		for v in PROJECT_ID VERTEX_PROJECT_ID VERTEX_LOCATION LITELLM_KSA_NAME LITELLM_GSA_NAME; do \
 			eval "val=\$$$$v"; \
 			[ -n "$$val" ] || { echo "MODEL_PROVIDER=vertex_ai requires $$v to be set and exported" >&2; exit 1; }; \
 		done; \
@@ -258,6 +258,14 @@ undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
 .PHONY: print-litellm-manifests
 print-litellm-manifests: kustomize ## Print the LiteLLM manifests for the current MODEL_PROVIDER without applying them.
 	@$(LITELLM_RENDER)
+
+.PHONY: deploy-hindsight
+deploy-hindsight: kustomize ## Deploy the Hindsight memory store.
+	$(KUSTOMIZE) build config/integrations/hindsight | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
+
+.PHONY: undeploy-hindsight
+undeploy-hindsight: kustomize ## Undeploy the Hindsight memory store (keeps its PVC).
+	$(KUSTOMIZE) build config/integrations/hindsight | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: deploy-inference-replay
 deploy-inference-replay: kustomize ## Deploy Inference Replay proxy integration.
@@ -408,15 +416,25 @@ gcp-provision-12-gke-backup-plan: ## Step 12: Provision GKE Backup Plan for disa
 	@chmod +x scripts/*.sh
 	@./scripts/provision_12_gke_backup_plan.sh $(ARGS)
 
-.PHONY: gcp-provision-13-verify-rollout
-gcp-provision-13-verify-rollout: ## Step 13: Verify the PlatformAgent Deployment rollout.
+.PHONY: gcp-provision-13-hindsight
+gcp-provision-13-hindsight: ## Step 13: Deploy Hindsight memory store.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_13_verify_agent_rollout.sh $(ARGS)
+	@./scripts/provision_13_deploy_hindsight.sh $(ARGS)
+
+.PHONY: gcp-provision-14-verify-rollout
+gcp-provision-14-verify-rollout: ## Step 14: Verify the PlatformAgent Deployment rollout.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_14_verify_agent_rollout.sh $(ARGS)
 
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
+
+.PHONY: gcp-teardown-13-hindsight
+gcp-teardown-13-hindsight: ## Teardown Step 13: Undeploy Hindsight memory store.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_13_deploy_hindsight.sh $(ARGS)
 
 .PHONY: gcp-teardown-12-gke-backup-plan
 gcp-teardown-12-gke-backup-plan: ## Teardown Step 12: Delete GKE Backup Plan and snapshots.

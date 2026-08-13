@@ -137,8 +137,13 @@ The exposed ports:
 - `config/webhook/` — admission webhook config (validating + mutating).
 - `config/manager/` — Deployment for the controller manager.
 - `config/integrations/github/` — Minty deployment.
-- `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `NetworkPolicy` and `PodMonitoring`), with three overlays: `chatgpt` and `vertex`, which `MODEL_PROVIDER` selects in place of the base, and `custom-otel`, a copy-and-edit overlay for a collector other than the managed one ([Telemetry](/kube-agents/deploy/telemetry/) is canonical for it). Like the github and inference-replay subtrees, its `kustomize build` output is a template rather than a manifest — `envsubst` placeholders that the `make deploy-*` targets substitute. What is unique to litellm is that a placeholder sits in the generated ConfigMap's _name_, so an unsubstituted apply is rejected outright instead of deploying literal `${…}` strings. `make deploy-litellm` does the substitution; building an overlay by hand needs the pipeline on the Telemetry page.
+- `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `NetworkPolicy` and `PodMonitoring`), with three overlays: `chatgpt` and `vertex_ai`, which `MODEL_PROVIDER` selects in place of the base, and `custom-otel`, a copy-and-edit overlay for a collector other than the managed one ([Telemetry](/kube-agents/deploy/telemetry/) is canonical for it). Uniquely among the integration subtrees, an `envsubst` placeholder sits in the generated ConfigMap's _name_, so an unsubstituted apply is rejected outright instead of deploying literal `${…}` strings; building an overlay by hand needs the pipeline on the Telemetry page.
 - `config/integrations/inference-replay/` — replay proxy Deployment, Service, and PVC.
+- `config/integrations/hindsight/` — the Chat Agent's memory store: API Deployment, Postgres/pgvector StatefulSet, and their Service, `NetworkPolicy`, and `PodMonitoring`.
+
+Each is built and applied on its own; there is no aggregate kustomization over
+`config/integrations/`, because all but Hindsight need `envsubst` over the built
+output before it can be applied.
 
 Deploy these via `make deploy-*` from `k8s-operator/`:
 
@@ -147,4 +152,5 @@ make deploy                     # operator
 make deploy-litellm             # inference gateway
 make deploy-github              # Minty
 make deploy-inference-replay    # replay proxy
+make deploy-hindsight           # memory store
 ```

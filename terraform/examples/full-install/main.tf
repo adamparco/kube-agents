@@ -13,6 +13,11 @@ locals {
     "gsuiteaddons.googleapis.com",
   ] : []
 
+  use_vertex      = var.model_provider == "vertex_ai"
+  vertex_project  = var.vertex_project_id != "" ? var.vertex_project_id : var.project_id
+  vertex_location = var.vertex_location != "" ? var.vertex_location : var.location
+  litellm_ksa     = "kubeagents-litellm"
+
   required_apis = toset(concat(local.base_apis, local.chat_apis))
 
   # Only non-empty credential keys end up in the Secret, so an unset optional
@@ -83,6 +88,43 @@ module "kube_agents_iam" {
   depends_on = [google_project_service.required]
 }
 
+# ─── Vertex AI gateway identity (model_provider = "vertex_ai") ────────────────
+# Vertex has no API key: the LiteLLM gateway calls it as this GSA through
+# Workload Identity. The GSA lives in project_id; the aiplatform.user grant and
+# the API enablement go to the serving project, which may be a different one.
+resource "google_project_service" "vertex_ai" {
+  count = local.use_vertex ? 1 : 0
+
+  project            = local.vertex_project
+  service            = "aiplatform.googleapis.com"
+  disable_on_destroy = false
+}
+
+module "litellm_vertex_iam" {
+  source = "../../modules/kube-agents-iam"
+  count  = local.use_vertex ? 1 : 0
+
+  project_id         = var.project_id
+  service_account_id = "kubeagents-litellm-gsa"
+  display_name       = "Kube-Agents LiteLLM Vertex AI Service Account"
+  namespace          = var.namespace
+  ksa_name           = local.litellm_ksa
+  # Granted below instead, so a cross-project vertex_project_id works.
+  project_roles = []
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_member" "litellm_vertex_user" {
+  count = local.use_vertex ? 1 : 0
+
+  project = local.vertex_project
+  role    = "roles/aiplatform.user"
+  member  = "serviceAccount:${module.litellm_vertex_iam[0].service_account_email}"
+
+  depends_on = [google_project_service.vertex_ai]
+}
+
 module "chat_pubsub" {
   source = "../../modules/chat-pubsub"
   count  = var.enable_google_chat ? 1 : 0
@@ -121,16 +163,14 @@ resource "helm_release" "kube_agents" {
         modelProvider    = var.model_provider
         modelDefaultName = var.model_default_name
       },
-      # Only vertex_ai reads this block, and the chart's `required` rejects an
-      # empty project, location, or serviceAccount — so send it only when it is
-      # the selected provider rather than always sending empty strings.
-      # ksaName is left to the chart's default, which is the KSA name the
-      # Workload Identity binding in provision_04_gcp_iam.sh already uses.
-      var.model_provider == "vertex_ai" ? {
+      local.use_vertex ? {
         vertex = {
-          project        = var.vertex_project
-          location       = var.vertex_location
-          serviceAccount = var.vertex_service_account
+          serviceAccountName = local.litellm_ksa
+          serviceAccountAnnotations = {
+            "iam.gke.io/gcp-service-account" = module.litellm_vertex_iam[0].service_account_email
+          }
+          projectId = local.vertex_project
+          location  = local.vertex_location
         }
       } : {}
     )
@@ -173,18 +213,7 @@ resource "helm_release" "kube_agents" {
     }
   })]
 
-  depends_on = [module.gke_cluster]
-
-  # A `variable` validation block cannot read another variable on the Terraform
-  # this composition supports (providers.tf pins ~> 1.5; cross-variable
-  # validation arrived in 1.9), so the cross-field rule lives here. A
-  # precondition is evaluated at plan time, which is the point: without it the
-  # chart's own `required` raises the same objection from inside `helm install`,
-  # after the cluster, the IAM module, and the KMS keys have already been built.
-  lifecycle {
-    precondition {
-      condition     = var.model_provider != "vertex_ai" || (var.vertex_project != "" && var.vertex_location != "" && var.vertex_service_account != "")
-      error_message = "model_provider = \"vertex_ai\" requires vertex_project, vertex_location, and vertex_service_account. The gateway authenticates to Vertex AI with Workload Identity rather than an API key, and none of the three can be guessed from the cluster's own project."
-    }
-  }
+  # The Vertex entries are no-ops when model_provider is not "vertex_ai"; without
+  # them the gateway can be serving before its API and role grant land.
+  depends_on = [module.gke_cluster, google_project_service.vertex_ai, google_project_iam_member.litellm_vertex_user]
 }

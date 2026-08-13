@@ -80,7 +80,7 @@ preflight_vertex_iam() {
     0) return 0 ;;
     1)
       print_error "MODEL_PROVIDER=vertex_ai but ${LITELLM_VERTEX_IAM_REASON}."
-      print_error "Run provision_04_gcp_iam.sh first — it creates the GSA, grants roles/aiplatform.user on VERTEX_PROJECT, and binds Workload Identity."
+      print_error "Run provision_04_gcp_iam.sh first — it creates the GSA, grants roles/aiplatform.user on VERTEX_PROJECT_ID, and binds Workload Identity."
       print_error "Set SKIP_VERTEX_IAM_SETUP=true if this install's Vertex IAM is managed outside the pipeline."
       return 1
       ;;
@@ -96,10 +96,13 @@ execute_litellm() {
   preflight_vertex_iam || return 1
   print_info "Deploying LiteLLM Gateway into GKE..."
   export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME
-  # Only the vertex overlay reads these; exporting them unconditionally keeps
+  # Only the vertex_ai overlay reads these; exporting them unconditionally keeps
   # the branch out of the recipe, and envsubst never sees them for the other
-  # providers because their allowlist does not name them.
-  export PROJECT_ID VERTEX_PROJECT VERTEX_LOCATION LITELLM_KSA_NAME LITELLM_GSA_NAME
+  # providers because their allowlist does not name them. No fallback defaults
+  # here: init_var_vertex_ai has already settled both Vertex values, and the
+  # make target's LITELLM_REQUIRE_VERTEX_VARS refuses an empty one loudly
+  # rather than silently substituting the cluster's own project or region.
+  export PROJECT_ID VERTEX_PROJECT_ID VERTEX_LOCATION LITELLM_KSA_NAME LITELLM_GSA_NAME
   make -C "${OPERATOR_DIR}" deploy-litellm || return 1
 }
 

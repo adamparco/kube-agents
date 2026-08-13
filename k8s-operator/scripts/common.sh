@@ -13,6 +13,11 @@ fi
 # load_state then creates empty — silently blanking IMAGE_TAG and AGENT_IMAGE.
 VARS_FILE="${VARS_FILE:-${SCRIPT_DIR}/vars.sh}"
 
+# Minimum tool versions. Sourced from the helper's own directory rather than
+# SCRIPT_DIR, which callers under scripts/dev/ override to point at themselves.
+# shellcheck source=k8s-operator/scripts/min_versions.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/min_versions.sh"
+
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 # Empty unless stdout is a terminal and NO_COLOR is unset. This pipeline's output
 # is routinely redirected — install.sh tees it to a log, CI captures it — and
@@ -201,20 +206,20 @@ DEFAULT_REGION="us-central1"
 DEFAULT_MODEL_PROVIDER="gemini"
 
 # Model provider → the model the pipeline defaults to for that provider.
-# vertex_ai serves Anthropic's models through Vertex AI, where current-generation
-# model IDs carry no date suffix; only dated snapshots use the `@` form
-# (claude-opus-4-5@20251101).
+# vertex_ai deliberately falls through to the Gemini default: first-party
+# Gemini needs no Model Garden entitlement, so a fresh vertex_ai install works
+# before any console step. Anthropic-on-Vertex model IDs are documented on the
+# site's inference-gateway page.
 default_model_for_provider() {
   case "${1:-}" in
     chatgpt | openai) echo "gpt-5.4" ;;
     anthropic) echo "claude-sonnet-4-5-20250929" ;;
-    vertex_ai) echo "claude-sonnet-4-6" ;;
     *) echo "gemini-3.5-flash" ;;
   esac
 }
 
 is_valid_model_provider() {
-  [[ "${1:-}" =~ ^(gemini|anthropic|vertex_ai|chatgpt|openai)$ ]]
+  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|chatgpt|openai)$ ]]
 }
 
 # Vertex AI defaults. The `global` endpoint is the recommended default: it has
@@ -289,11 +294,11 @@ init_var_kms_location() {
 }
 
 init_var_model_provider() {
-  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, anthropic, vertex_ai, chatgpt, openai)"
+  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, vertex_ai, anthropic, chatgpt, openai)"
 
   MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   if ! is_valid_model_provider "$MODEL_PROVIDER"; then
-    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, anthropic, vertex_ai, chatgpt, openai."
+    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, vertex_ai, anthropic, chatgpt, openai."
     exit 1
   fi
 
@@ -306,16 +311,19 @@ init_var_model_provider() {
   return 0
 }
 
-# vertex_ai reaches Vertex with Workload Identity rather than an API key, so it
-# needs a project to bill the prediction to and a location to call. The Vertex
-# project is deliberately its own variable: serving the model from a shared
-# project other than the one holding the cluster is the common case.
+# Vertex has no API key; it needs a billing project and a serving location.
+# The project is deliberately its own variable: serving the model from a shared
+# project other than the one holding the cluster is the common case. The
+# location defaults to "global", not the cluster's region — the global endpoint
+# has the broadest model availability, and a regional endpoint returns 429 for
+# partner models with no capacity there (Model Garden serves each partner model
+# from its own subset of locations).
 init_var_vertex_ai() {
-  init_var "VERTEX_PROJECT" "${PROJECT_ID:-}" "Enter GCP Project ID serving Vertex AI models"
+  init_var "VERTEX_PROJECT_ID" "${PROJECT_ID:-}" "Enter Vertex AI Project ID"
   init_var "VERTEX_LOCATION" "$DEFAULT_VERTEX_LOCATION" "Enter Vertex AI Location (global, a multi-region, or a region)"
 
-  if [[ -z "${VERTEX_PROJECT}" ]]; then
-    print_error "MODEL_PROVIDER=vertex_ai requires VERTEX_PROJECT."
+  if [[ -z "${VERTEX_PROJECT_ID}" ]]; then
+    print_error "MODEL_PROVIDER=vertex_ai requires VERTEX_PROJECT_ID."
     exit 1
   fi
 }
@@ -323,7 +331,7 @@ init_var_vertex_ai() {
 # ─── LiteLLM Vertex AI Workload Identity ──────────────────────────────────────
 # Three separate objects have to line up before a vertex_ai gateway can serve a
 # single token: the GSA, the Workload Identity binding that lets the LiteLLM KSA
-# impersonate it, and roles/aiplatform.user on VERTEX_PROJECT. Any one of them
+# impersonate it, and roles/aiplatform.user on VERTEX_PROJECT_ID. Any one of them
 # missing produces the same symptom — pods that start, pass their probes, and
 # then 403 on every completion — so provision_04 (deciding whether it has work
 # to do) and provision_09 (refusing to deploy into a broken install) check the
@@ -392,24 +400,24 @@ verify_litellm_vertex_iam_state() {
   # the false negative is bounded: provision_04 re-applies an idempotent binding
   # and never reports "Already completed", and provision_09 warns rather than
   # refusing to deploy. SKIP_VERTEX_IAM_SETUP=true silences both.
-  if ! out="$(gcloud projects get-iam-policy "${VERTEX_PROJECT}" \
+  if ! out="$(gcloud projects get-iam-policy "${VERTEX_PROJECT_ID}" \
       --flatten="bindings[].members" \
       --filter="bindings.members:serviceAccount:${gsa_email}" \
       --format="value(bindings.role)" 2>&1)"; then
-    LITELLM_VERTEX_IAM_REASON="the IAM policy of the Vertex project ${VERTEX_PROJECT} could not be read: $(printf '%s\n' "$out" | head -n 1)"
+    LITELLM_VERTEX_IAM_REASON="the IAM policy of the Vertex project ${VERTEX_PROJECT_ID} could not be read: $(printf '%s\n' "$out" | head -n 1)"
     return 2
   fi
   if ! printf '%s\n' "$out" | grep -Fxq "roles/aiplatform.user"; then
-    LITELLM_VERTEX_IAM_REASON="${gsa_email} holds no direct roles/aiplatform.user binding on ${VERTEX_PROJECT}"
+    LITELLM_VERTEX_IAM_REASON="${gsa_email} holds no direct roles/aiplatform.user binding on ${VERTEX_PROJECT_ID}"
     return 3
   fi
 
-  if ! out="$(gcloud services list --enabled --project="${VERTEX_PROJECT}" --format="value(config.name)" 2>&1)"; then
-    LITELLM_VERTEX_IAM_REASON="the enabled services of ${VERTEX_PROJECT} could not be listed: $(printf '%s\n' "$out" | head -n 1)"
+  if ! out="$(gcloud services list --enabled --project="${VERTEX_PROJECT_ID}" --format="value(config.name)" 2>&1)"; then
+    LITELLM_VERTEX_IAM_REASON="the enabled services of ${VERTEX_PROJECT_ID} could not be listed: $(printf '%s\n' "$out" | head -n 1)"
     return 2
   fi
   if ! printf '%s\n' "$out" | grep -Fxq "aiplatform.googleapis.com"; then
-    LITELLM_VERTEX_IAM_REASON="aiplatform.googleapis.com is not enabled on ${VERTEX_PROJECT}"
+    LITELLM_VERTEX_IAM_REASON="aiplatform.googleapis.com is not enabled on ${VERTEX_PROJECT_ID}"
     return 3
   fi
 
@@ -444,6 +452,68 @@ init_var_platform_agent_permission_set() {
   fi
 }
 
+# ─── Memory Provider ──────────────────────────────────────────────────────────
+# The accepted values for MEMORY_PROVIDER.
+#
+# Two of these ship in this repo, and the difference between them is the whole
+# choice: `kube_agents_memory` wraps the upstream `hindsight` plugin and needs an
+# API server and a Postgres database in the cluster, while `multiuser_memory`
+# keeps a per-user Markdown file inside the pod and needs nothing at all. The
+# rest are the external plugins Hermes ships — see `memory.provider` in its
+# hermes_cli/config.py.
+#
+# `multiuser_memory` is the default because it is what this repo shipped before
+# `kube_agents_memory` existed: re-running provisioning against an install that
+# never chose a provider must not silently grow it a Postgres database.
+#
+# `none` is this installer's spelling of "no external provider — keep Hermes'
+# built-in store". Hermes itself spells that as the empty string, but an empty
+# string cannot survive the trip through the CR: an absent field takes the CRD
+# default, and the operator only overrides a non-empty one. So the choice is
+# carried as `none` and the operator translates it back to "" when it renders
+# config.yaml.
+MEMORY_PROVIDER_CHOICES="none kube_agents_memory multiuser_memory hindsight mem0 openviking holographic retaindb byterover"
+
+init_var_memory_provider() {
+  init_var "MEMORY_PROVIDER" "multiuser_memory" \
+    "Enter agent memory provider (${MEMORY_PROVIDER_CHOICES// /, })"
+
+  MEMORY_PROVIDER=$(echo "$MEMORY_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+
+  # Someone answering the prompt with a bare Enter after clearing the default
+  # means "no memory", which is `none` here.
+  if [ -z "$MEMORY_PROVIDER" ]; then
+    MEMORY_PROVIDER="none"
+  fi
+
+  local choice valid=1
+  for choice in $MEMORY_PROVIDER_CHOICES; do
+    if [ "$MEMORY_PROVIDER" = "$choice" ]; then
+      valid=0
+      break
+    fi
+  done
+  if [ "$valid" -ne 0 ]; then
+    print_error "Invalid agent memory provider '$MEMORY_PROVIDER'. Must be one of: ${MEMORY_PROVIDER_CHOICES// /, }."
+    exit 1
+  fi
+
+  # Persist the normalised value so the migration and the lower-casing stick,
+  # and so the later steps that read vars.sh see what this step decided.
+  save_var "MEMORY_PROVIDER" "$MEMORY_PROVIDER"
+}
+
+# True when the selected provider is backed by the in-cluster Hindsight service.
+# `kube_agents_memory` wraps the upstream `hindsight` plugin, so both talk to the
+# same API server and both need step 13 to have run; nothing else does.
+memory_provider_uses_hindsight() {
+  local provider
+  provider=$(echo "${1:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  case "$provider" in
+    kube_agents_memory | hindsight) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 is_non_interactive() {
   [ ! -t 0 ] || [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline
@@ -477,7 +547,7 @@ init_var_image_tag() {
 # the vertex_ai the operator just exported, and init_var never re-prompts a
 # value that is already non-empty — so the pipeline redeployed the old provider
 # and reported success.
-MODEL_STATE_VARS="MODEL_PROVIDER MODEL_DEFAULT_NAME VERTEX_PROJECT VERTEX_LOCATION"
+MODEL_STATE_VARS="MODEL_PROVIDER MODEL_DEFAULT_NAME VERTEX_PROJECT_ID VERTEX_LOCATION"
 
 # Re-apply one variable the caller exported before vars.sh was sourced over the
 # top of it. "$env_val" is what the environment said; the variable itself now
@@ -583,7 +653,7 @@ load_state() {
 ensure_teardown_model_state() {
   export MODEL_PROVIDER="${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-$(default_model_for_provider "$MODEL_PROVIDER")}"
-  export VERTEX_PROJECT="${VERTEX_PROJECT:-}"
+  export VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-}"
   export VERTEX_LOCATION="${VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
 }
 

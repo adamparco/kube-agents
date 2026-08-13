@@ -4,7 +4,7 @@
 # ==============================================================================
 # Idempotent script to remove cluster management and Workload Identity bindings
 # from the Controller manager and all Agent GSAs, and delete the GSAs. Also
-# removes the LiteLLM gateway's roles/aiplatform.user grant from VERTEX_PROJECT
+# removes the LiteLLM gateway's roles/aiplatform.user grant from VERTEX_PROJECT_ID
 # — possibly a second project — unless SKIP_VERTEX_IAM_SETUP leaves that IAM to
 # its external owner.
 # ==============================================================================
@@ -23,7 +23,7 @@ ensure_teardown_state
 # ─── Confirmation Prompt ──────────────────────────────────────────────────────
 # The prompt has to list what this run will actually touch, and PROJECT_ID is
 # not the whole answer: the LiteLLM gateway's roles/aiplatform.user binding
-# lives on VERTEX_PROJECT, which for the shared-serving-project arrangement this
+# lives on VERTEX_PROJECT_ID, which for the shared-serving-project arrangement this
 # feature exists for is a project the install does not own. Naming it is the
 # only warning an operator gets before the policy there is edited. Conversely,
 # SKIP_VERTEX_IAM_SETUP removes the whole LiteLLM arm below, so under that flag
@@ -37,9 +37,9 @@ confirm_items=(
 if ! skip_vertex_iam_setup; then
   confirm_message="This will remove GSA permissions, Workload Identity bindings, and delete GSAs for the Controller, Platform Agent, and LiteLLM gateway."
   confirm_items+=("LiteLLM GSA:$LITELLM_GSA_NAME")
-  if [ -n "${VERTEX_PROJECT:-}" ] && [ "${VERTEX_PROJECT}" != "${PROJECT_ID}" ]; then
-    confirm_message="${confirm_message} It also removes the LiteLLM gateway's roles/aiplatform.user binding from a SECOND project, ${VERTEX_PROJECT}."
-    confirm_items+=("Vertex Project:$VERTEX_PROJECT")
+  if [ -n "${VERTEX_PROJECT_ID:-}" ] && [ "${VERTEX_PROJECT_ID}" != "${PROJECT_ID}" ]; then
+    confirm_message="${confirm_message} It also removes the LiteLLM gateway's roles/aiplatform.user binding from a SECOND project, ${VERTEX_PROJECT_ID}."
+    confirm_items+=("Vertex Project:$VERTEX_PROJECT_ID")
   fi
 fi
 confirm_action "$confirm_message" "${confirm_items[@]}"
@@ -105,7 +105,7 @@ cleanup_agent_iam() {
 }
 
 # The LiteLLM gateway's grant is the one binding this pipeline makes outside
-# PROJECT_ID: provision_04 grants roles/aiplatform.user on VERTEX_PROJECT, which
+# PROJECT_ID: provision_04 grants roles/aiplatform.user on VERTEX_PROJECT_ID, which
 # on a shared serving project is a project this install does not own and will
 # not be deleting. cleanup_agent_iam only ever touches PROJECT_ID, so the
 # cross-project binding has to be removed here — and before the GSA is deleted,
@@ -113,36 +113,36 @@ cleanup_agent_iam() {
 cleanup_litellm_vertex_grant() {
   local gsa_email="${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
-  # An empty VERTEX_PROJECT means one of two different things: a gemini install
+  # An empty VERTEX_PROJECT_ID means one of two different things: a gemini install
   # that never had this grant, or a teardown running without a vars.sh to read
   # the project out of (ensure_teardown_state leaves it empty in that branch).
   # The GSA tells them apart — only a vertex_ai install created it — and in the
   # second case the grant is on a project this teardown can no longer name, so
   # say so rather than returning a silent success.
-  if [ -z "${VERTEX_PROJECT:-}" ]; then
+  if [ -z "${VERTEX_PROJECT_ID:-}" ]; then
     if [ "${DRY_RUN:-0}" -eq 0 ] &&
        gcloud iam service-accounts describe "${gsa_email}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
-      print_warning "VERTEX_PROJECT is unknown but ${gsa_email} exists. If its roles/aiplatform.user grant is on a different project, remove it by hand — this teardown cannot name that project."
+      print_warning "VERTEX_PROJECT_ID is unknown but ${gsa_email} exists. If its roles/aiplatform.user grant is on a different project, remove it by hand — this teardown cannot name that project."
     fi
     return 0
   fi
 
   # Same project: cleanup_agent_iam's own role loop removes it.
-  [ "${VERTEX_PROJECT}" != "${PROJECT_ID}" ] || return 0
+  [ "${VERTEX_PROJECT_ID}" != "${PROJECT_ID}" ] || return 0
 
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
-    echo -e "  ${C_GREEN}[DRY-RUN] Would remove roles/aiplatform.user for ${LITELLM_GSA_NAME} on Vertex project ${VERTEX_PROJECT}.${C_RESET}"
+    echo -e "  ${C_GREEN}[DRY-RUN] Would remove roles/aiplatform.user for ${LITELLM_GSA_NAME} on Vertex project ${VERTEX_PROJECT_ID}.${C_RESET}"
     return 0
   fi
 
-  echo -e "  ${C_CYAN}ℹ Removing roles/aiplatform.user for ${LITELLM_GSA_NAME} on Vertex project ${VERTEX_PROJECT}...${C_RESET}"
+  echo -e "  ${C_CYAN}ℹ Removing roles/aiplatform.user for ${LITELLM_GSA_NAME} on Vertex project ${VERTEX_PROJECT_ID}...${C_RESET}"
   local err
-  if err="$(gcloud projects remove-iam-policy-binding "${VERTEX_PROJECT}" \
+  if err="$(gcloud projects remove-iam-policy-binding "${VERTEX_PROJECT_ID}" \
       --member="serviceAccount:${gsa_email}" \
       --role="roles/aiplatform.user" \
       --condition=None \
       --quiet 2>&1 >/dev/null)"; then
-    echo -e "  ${C_GREEN}✓ Vertex AI grant on '${VERTEX_PROJECT}' removed.${C_RESET}"
+    echo -e "  ${C_GREEN}✓ Vertex AI grant on '${VERTEX_PROJECT_ID}' removed.${C_RESET}"
     return 0
   fi
 
@@ -152,10 +152,10 @@ cleanup_litellm_vertex_grant() {
   # does not own, which is worth saying out loud. Neither fails the teardown.
   case "$err" in
     *"not found"*|*NOT_FOUND*)
-      echo -e "  ${C_GREEN}✓ No roles/aiplatform.user binding for ${gsa_email} on '${VERTEX_PROJECT}'.${C_RESET}"
+      echo -e "  ${C_GREEN}✓ No roles/aiplatform.user binding for ${gsa_email} on '${VERTEX_PROJECT_ID}'.${C_RESET}"
       ;;
     *)
-      echo -e "  ${C_YELLOW}⚠ Could not remove roles/aiplatform.user for ${gsa_email} on '${VERTEX_PROJECT}': $(printf '%s\n' "$err" | head -n 1)${C_RESET}"
+      echo -e "  ${C_YELLOW}⚠ Could not remove roles/aiplatform.user for ${gsa_email} on '${VERTEX_PROJECT_ID}': $(printf '%s\n' "$err" | head -n 1)${C_RESET}"
       echo -e "  ${C_YELLOW}⚠ Remove that binding by hand; it outlives this install.${C_RESET}"
       ;;
   esac

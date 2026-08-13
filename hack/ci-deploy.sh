@@ -37,10 +37,9 @@ export IMAGE_TAG="${TAG}"
 
 export MODEL_PROVIDER="gemini"
 export MODEL_DEFAULT_NAME="gemini-3.1-pro-preview"
-# Allow deployments on pre-existing CI evaluation clusters (e.g. in kube-agents-evals)
-# that were created without Cloud KMS etcd database encryption (CMEK), while keeping
-# strict CMEK enforcement enabled by default for production installations.
-export ALLOW_UNENCRYPTED_SECRETS="${ALLOW_UNENCRYPTED_SECRETS:-true}"
+# Default to enforcing CMEK database encryption on CI evaluation clusters.
+# Set ALLOW_UNENCRYPTED_SECRETS=true to bypass CMEK checks on unencrypted test clusters.
+export ALLOW_UNENCRYPTED_SECRETS="${ALLOW_UNENCRYPTED_SECRETS:-false}"
 
 export KSA_NAME="kubeagents-platform-agent"
 export GSA_NAME="kubeagents-platform-gsa"
@@ -107,7 +106,7 @@ echo "✓ Provisioning scripts finished in $((SECONDS - STEP_START))s"
 # diagnostics), so this stays a single copy rather than a hand-rolled twin.
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying platform-agent rollout ==="
-./k8s-operator/scripts/provision_13_verify_agent_rollout.sh --non-interactive
+./k8s-operator/scripts/provision_14_verify_agent_rollout.sh --non-interactive
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 
 # ─── 7. Agent API Connectivity Verification ──────────────────────────────────

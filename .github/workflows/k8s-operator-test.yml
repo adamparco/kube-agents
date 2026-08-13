@@ -86,7 +86,7 @@ jobs:
         env:
           NAMESPACE: kubeagents-system
           PROJECT_ID: ci-project
-          VERTEX_PROJECT: ci-vertex-project
+          VERTEX_PROJECT_ID: ci-vertex-project
           VERTEX_LOCATION: global
           LITELLM_KSA_NAME: kubeagents-litellm
           LITELLM_GSA_NAME: kubeagents-litellm-gsa
@@ -136,7 +136,7 @@ jobs:
           # unparseable rather than merely wrong. Refusing to render is a fine
           # answer and so is rendering something that still parses; emitting
           # broken YAML is not.
-          if empty_out=$(PROJECT_ID= VERTEX_PROJECT= VERTEX_LOCATION= \
+          if empty_out=$(PROJECT_ID= VERTEX_PROJECT_ID= VERTEX_LOCATION= \
                          LITELLM_KSA_NAME= LITELLM_GSA_NAME= \
                          MODEL_PROVIDER=vertex_ai MODEL_DEFAULT_NAME=ci-model \
                          make -s -C k8s-operator print-litellm-manifests); then

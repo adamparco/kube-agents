@@ -60,10 +60,7 @@ PARAM_CLUSTER_NAME="${CLUSTER_NAME:-}"
 # Left empty on purpose: resolved from common.sh's DEFAULT_* once the
 # provisioning helpers are sourced, so no default is spelled twice.
 PARAM_MODEL_PROVIDER="${MODEL_PROVIDER:-}"
-# vertex_ai only. Left empty so resolve_shared_defaults can fill the location
-# from common.sh's DEFAULT_VERTEX_LOCATION; the project has no default at all,
-# by design — see the vertex prompt in the model-provider step.
-PARAM_VERTEX_PROJECT="${VERTEX_PROJECT:-}"
+PARAM_VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-}"
 PARAM_VERTEX_LOCATION="${VERTEX_LOCATION:-}"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
@@ -74,6 +71,7 @@ PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
 PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-false}"
 PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-false}"
+PARAM_MEMORY="${MEMORY:-file}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
 PARAM_ALLOW_UNVERIFIED_SOURCE="${ALLOW_UNVERIFIED_SOURCE:-false}"
 # "<repo_dir>@<ref>" already checked by verify_local_source_ref, so the pre-flight
@@ -96,19 +94,13 @@ Flags for AI Agents & Automation:
                                 DEFAULT_REGION, currently us-central1)
   --cluster-name=NAME           GKE Cluster Name (default: DEFAULT_CLUSTER_NAME,
                                 currently platform-agent-host)
-  --model-provider=PROVIDER     Model provider: gemini | anthropic | vertex_ai | chatgpt | openai
+  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | chatgpt | openai
                                 (default: gemini)
-  --vertex-project=ID           GCP Project serving the Vertex AI models. Required with
-                                --model-provider=vertex_ai in non-interactive mode; it is
-                                not assumed to be --project-id, because serving from a
-                                shared project is the common arrangement
-  --vertex-location=LOCATION    Vertex AI location: global, a multi-region, or a region
-                                (default: k8s-operator/scripts/common.sh
-                                DEFAULT_VERTEX_LOCATION, currently global)
+  --vertex-project-id=ID        GCP project serving Vertex AI models (default: --project-id)
+  --vertex-location=REGION      Vertex AI serving location (default: --region)
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
-  --anthropic-api-key=KEY       Anthropic API Key (not used by vertex_ai, which
-                                authenticates with Workload Identity)
+  --anthropic-api-key=KEY       Anthropic API Key
   --gitops-org=ORG              GitHub Org/Username for GitOps repo
   --gitops-repo=REPO            GitOps IaC Repository Name (default: gke-fleet-iac)
   --permission-set=SET          Agent GCP IAM permission set: read-only | gke-admin | custom
@@ -116,6 +108,22 @@ Flags for AI Agents & Automation:
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
   --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
   --enable-web-ui=true|false    Enable Hermes Web UI port 9119 dashboard (default: false)
+  --memory=MODE                 Long-term agent memory: file | hindsight | off
+                                (default: file)
+                                  file      SMALL / PERSONAL deployments, and the default —
+                                            it is what every install got before the searchable
+                                            store existed, so an upgrade that says nothing
+                                            keeps the store it already has. Per-user Markdown
+                                            files inside the pod (multiuser_memory). No extra
+                                            services, but the whole store is loaded into the
+                                            model's context every turn, so it stops scaling
+                                            once there is more than a few pages of it.
+                                  hindsight ENTERPRISE deployments. Searchable, ranked recall
+                                            that stays affordable as the store grows
+                                            (kube_agents_memory). Deploys the Hindsight API
+                                            and a Postgres database into the cluster.
+                                  off       nothing is retained between sessions. No memory
+                                            provider, and no database to run.
   --image-tag=TAG               Validated immutable release tag or full commit SHA
                                 (default: this checkout's HEAD; required via curl | bash)
   --registry-prefix=PATH        Container registry path without a URL scheme
@@ -136,7 +144,7 @@ parse_args() {
       --region=*) PARAM_REGION="${1#*=}"; shift ;;
       --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
-      --vertex-project=*) PARAM_VERTEX_PROJECT="${1#*=}"; shift ;;
+      --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
       --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
       --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
       --openai-api-key=*) PARAM_OPENAI_API_KEY="${1#*=}"; shift ;;
@@ -148,6 +156,7 @@ parse_args() {
       --gvisor=*) PARAM_ENABLE_GVISOR="${1#*=}"; shift ;;
       --enable-web-ui=*|--enable-webui=*|--webui=*) PARAM_ENABLE_WEBUI="${1#*=}"; shift ;;
       --enable-web-ui|--enable-webui|--webui) PARAM_ENABLE_WEBUI="true"; shift ;;
+      --memory=*) PARAM_MEMORY="${1#*=}"; shift ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --registry-prefix=*) PARAM_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --allow-unverified-source|--allow-dirty) PARAM_ALLOW_UNVERIFIED_SOURCE="true"; shift ;;
@@ -211,6 +220,22 @@ define_print_helpers() {
   print_error() { echo -e "  ${C_RED}✗ $1${C_RESET}"; }
 }
 define_print_helpers
+
+# Minimum tool versions, shared with the provisioning scripts so the numbers
+# live in exactly one place. This installer is also downloaded and run on its
+# own, before any checkout exists, so the source is guarded: in that case the
+# workspace step clones the repository and provision_01 enforces the same
+# minimum a few steps later.
+_min_versions="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/k8s-operator/scripts/min_versions.sh"
+if [ -r "$_min_versions" ]; then
+  # CI runs shellcheck without -x, so the source= hint alone still raises
+  # SC1091 for a file it was not handed as input.
+  # shellcheck source=k8s-operator/scripts/min_versions.sh disable=SC1091
+  source "$_min_versions"
+else
+  require_min_gcloud_version() { return 0; }
+fi
+unset _min_versions
 
 validate_immutable_ref() {
   local ref="${1:-}"
@@ -402,7 +427,6 @@ source_provisioning_helpers() {
 # sourcing, so a flag or environment variable still wins over the shared default.
 resolve_shared_defaults() {
   PARAM_MODEL_PROVIDER="${PARAM_MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
-  PARAM_VERTEX_LOCATION="${PARAM_VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
   PARAM_REGISTRY_PREFIX="${PARAM_REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
 }
 
@@ -714,6 +738,7 @@ write_json_report() {
   "model_provider": "$(json_escape "${model_provider:-}")",
   "permission_set": "$(json_escape "${permission_set:-}")",
   "gvisor_enabled": ${enable_gvisor:-false},
+  "memory_mode": "$(json_escape "${memory_mode:-file}")",
   "gitops_repo": "$(json_escape "$report_gitops_repo")",
   "vars_file": "$(json_escape "${vars_file:-}")",
   "timestamp": "$(json_escape "$timestamp")"
@@ -763,8 +788,8 @@ run_menu_system() {
   local region="${REGION:-$DEFAULT_REGION}"
   local model_provider="${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   local model_default_name="${MODEL_DEFAULT_NAME:-$(default_model_for_provider "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}")}"
-  local vertex_project="${VERTEX_PROJECT:-}"
-  local vertex_location="${VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
+  local vertex_project_id="${VERTEX_PROJECT_ID:-$project_id}"
+  local vertex_location="${VERTEX_LOCATION:-$region}"
   local gemini_api_key="${GEMINI_API_KEY:-}"
   local openai_api_key="${OPENAI_API_KEY:-}"
   local anthropic_api_key="${ANTHROPIC_API_KEY:-}"
@@ -796,7 +821,7 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-$DEFAULT_REGION})"
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} $([ "$enable_webui" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
     echo -e "  • ${C_CYAN}Chat Integrations:${C_RESET} Google Chat: $([ "$google_chat_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF"), Slack: $([ "$slack_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF")"
-    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
+    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
 
@@ -846,9 +871,9 @@ run_menu_system() {
         local m_opt=""
         prompt_menu "Select AI Model Provider:" \
           "Google Gemini ($(default_model_for_provider gemini))" \
+          "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
           "OpenAI ($(default_model_for_provider openai))" \
           "Anthropic ($(default_model_for_provider anthropic))" \
-          "Anthropic on Vertex AI ($(default_model_for_provider vertex_ai))" \
           m_opt
         case "$m_opt" in
           1)
@@ -857,26 +882,21 @@ run_menu_system() {
             prompt_read "Gemini API Key" gemini_api_key "$gemini_api_key" true
             ;;
           2)
+            model_provider="vertex_ai"
+            prompt_read "Vertex AI Project ID" vertex_project_id "$vertex_project_id"
+            prompt_read "Vertex AI Location" vertex_location "$vertex_location"
+            prompt_read "Vertex Model ID (publisher model, e.g. gemini-3.5-flash)" model_default_name "${model_default_name:-$(default_model_for_provider vertex_ai)}"
+            print_info "Vertex also needs 'make gcp-provision-04-iam' and 'make gcp-provision-09-litellm' re-run: Save & Apply only redeploys the agent."
+            ;;
+          3)
             model_provider="openai"
             model_default_name="$(default_model_for_provider openai)"
             prompt_read "OpenAI API Key" openai_api_key "$openai_api_key" true
             ;;
-          3)
+          4)
             model_provider="anthropic"
             model_default_name="$(default_model_for_provider anthropic)"
             prompt_read "Anthropic API Key" anthropic_api_key "$anthropic_api_key" true
-            ;;
-          4)
-            # Switching an existing install onto Vertex needs more than this
-            # panel does: the GSA, its Workload Identity binding, and
-            # roles/aiplatform.user come from provision_04_gcp_iam.sh, and
-            # option 6 below only re-applies the Platform Agent CR. Say so
-            # rather than leaving a gateway that starts and then 403s.
-            model_provider="vertex_ai"
-            model_default_name="$(default_model_for_provider vertex_ai)"
-            prompt_read "GCP Project ID serving the Vertex AI models" vertex_project "${vertex_project:-$project_id}"
-            prompt_read "Vertex AI Location (global, a multi-region, or a region)" vertex_location "$vertex_location"
-            print_warning "Vertex AI needs IAM this panel does not create. Run 'cd k8s-operator && make gcp-provision-04-iam' and then 'make gcp-provision-09-litellm' after saving."
             ;;
         esac
         ;;
@@ -924,7 +944,7 @@ run_menu_system() {
         save_var KMS_LOCATION "$(derive_kms_location "$region")"
         save_var MODEL_PROVIDER "$model_provider"
         save_var MODEL_DEFAULT_NAME "$model_default_name"
-        save_var VERTEX_PROJECT "$vertex_project"
+        save_var VERTEX_PROJECT_ID "$vertex_project_id"
         save_var VERTEX_LOCATION "$vertex_location"
         save_secret_var GEMINI_API_KEY "$gemini_api_key"
         save_secret_var OPENAI_API_KEY "$openai_api_key"
@@ -1013,6 +1033,7 @@ main() {
       auto_install_tool "$tool"
     fi
   done
+  require_min_gcloud_version || exit 1
 
   # 3. Provisioning Sources & Shared Defaults
   print_step "2. Setting up Workspace Repository"
@@ -1218,15 +1239,16 @@ main() {
   print_step "7. AI Model Provider Credentials"
   local model_provider="$PARAM_MODEL_PROVIDER"
   if ! is_valid_model_provider "$model_provider"; then
-    print_error "Unsupported model provider '$model_provider'. Use gemini, anthropic, vertex_ai, chatgpt, or openai."
+    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, chatgpt, or openai."
     exit 1
   fi
   local model_default_name=""
   model_default_name="$(default_model_for_provider "$model_provider")"
-  local vertex_project="$PARAM_VERTEX_PROJECT"
-  # Never empty: resolve_shared_defaults has already backfilled it from
-  # common.sh's DEFAULT_VERTEX_LOCATION.
-  local vertex_location="$PARAM_VERTEX_LOCATION"
+
+  # Vertex authenticates with Workload Identity rather than an API key, so these
+  # two are the only credentials it needs and both default to the install target.
+  local vertex_project_id="${PARAM_VERTEX_PROJECT_ID:-$project_id}"
+  local vertex_location="${PARAM_VERTEX_LOCATION:-$region}"
 
   local detected_gemini_key="${PARAM_GEMINI_API_KEY:-${GEMINI_API_KEY:-}}"
   if [ -z "$detected_gemini_key" ]; then
@@ -1240,9 +1262,9 @@ main() {
     local model_choice=""
     prompt_menu "Select Model Provider for the Platform Agent:" \
       "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
+      "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
       "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
       "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
-      "Anthropic on Vertex AI ($(default_model_for_provider vertex_ai) / Workload Identity, no API key)" \
       model_choice
 
     case "$model_choice" in
@@ -1256,20 +1278,20 @@ main() {
         prompt_read "Gemini API Key" gemini_api_key "$detected_key" true
         ;;
       2)
+        model_provider="vertex_ai"
+        prompt_read "Vertex AI Project ID" vertex_project_id "$vertex_project_id"
+        prompt_read "Vertex AI Location" vertex_location "$vertex_location"
+        prompt_read "Vertex Model ID (publisher model, e.g. gemini-3.5-flash)" model_default_name "$(default_model_for_provider vertex_ai)"
+        ;;
+      3)
         model_provider="openai"
         model_default_name="$(default_model_for_provider openai)"
         prompt_read "OpenAI API Key" openai_api_key "${OPENAI_API_KEY:-}" true
         ;;
-      3)
+      4)
         model_provider="anthropic"
         model_default_name="$(default_model_for_provider anthropic)"
         prompt_read "Anthropic API Key" anthropic_api_key "${ANTHROPIC_API_KEY:-}" true
-        ;;
-      4)
-        model_provider="vertex_ai"
-        model_default_name="$(default_model_for_provider vertex_ai)"
-        prompt_read "GCP Project ID serving the Vertex AI models" vertex_project "$project_id"
-        prompt_read "Vertex AI Location (global, a multi-region, or a region)" vertex_location "$vertex_location"
         ;;
     esac
   fi
@@ -1278,26 +1300,15 @@ main() {
     gemini)
       [ -n "$gemini_api_key" ] || print_warning "No Gemini API key was provided; the agent will require a credential update before model calls can succeed."
       ;;
+    vertex_ai)
+      print_info "Vertex AI needs no API key: LiteLLM authenticates as ${LITELLM_GSA_NAME:-kubeagents-litellm-gsa}@${project_id}.iam.gserviceaccount.com via Workload Identity."
+      print_info "Serving ${model_default_name} from projects/${vertex_project_id}/locations/${vertex_location}."
+      ;;
     chatgpt | openai)
       [ -n "$openai_api_key" ] || print_warning "No OpenAI API key was provided; the agent will require a credential update before model calls can succeed."
       ;;
     anthropic)
       [ -n "$anthropic_api_key" ] || print_warning "No Anthropic API key was provided; the agent will require a credential update before model calls can succeed."
-      ;;
-    vertex_ai)
-      # No API key to check: the gateway impersonates a GSA that
-      # provision_04_gcp_iam.sh creates and grants roles/aiplatform.user on
-      # VERTEX_PROJECT. The project is required rather than defaulted to
-      # --project-id, because serving from a shared project while the cluster
-      # lives in its own is the common arrangement and the wrong choice fails
-      # only later, as a 403 from a gateway whose pods look perfectly healthy.
-      # The interactive path above offers this project as the prompt default,
-      # so only an unattended run can reach here empty.
-      if [ -z "$vertex_project" ]; then
-        print_error "--model-provider=vertex_ai requires --vertex-project=ID (the GCP project serving the Vertex AI models)."
-        exit 1
-      fi
-      print_info "Vertex AI target: ${C_BOLD}${vertex_project}${C_RESET} / ${C_BOLD}${vertex_location}${C_RESET} (Workload Identity; no API key is stored)."
       ;;
   esac
 
@@ -1387,6 +1398,21 @@ main() {
     print_error "--enable-web-ui must be either true or false."
     exit 1
   fi
+  # An agent that forgets every conversation is the worse default, so memory is
+  # on unless it is turned off. The choice decides two things: whether the
+  # harness keeps memory at all, and — when it does — whether that costs an
+  # extra API server and Postgres database in the cluster. Nothing downstream
+  # infers one from the other, so both are recorded.
+  #
+  # `file` is the default because it is what every install got before the
+  # searchable store existed: an upgrade that says nothing about memory keeps
+  # the store it already has, and no install grows a Postgres database it never
+  # asked for. Enterprise deployments opt in with --memory=hindsight.
+  local memory_mode="${PARAM_MEMORY:-file}"
+  if [[ ! "$memory_mode" =~ ^(off|file|hindsight)$ ]]; then
+    print_error "--memory must be one of: off, file, hindsight."
+    exit 1
+  fi
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # These are GCP IAM role bundles for the agent's GSA, nothing else. Kubernetes
     # RBAC stays read-only in every set, and the GitOps pull-request path works in
@@ -1434,7 +1460,62 @@ main() {
     if [ "$webui_choice" = "2" ]; then
       PARAM_ENABLE_WEBUI="true"
     fi
+
+    # The two stores differ in what they cost to run and in how far they scale,
+    # and the label says which so the choice can be made without reading a design
+    # doc: the file store adds no services but is loaded into the model's context
+    # whole on every turn, so it is bounded by the window; Hindsight retrieves only
+    # what a question needs, at the price of an API server and a database.
+    #
+    # The file store is listed first because prompt_menu's default answer is
+    # always option 1, and this is the one an install should get for saying
+    # nothing — it is what installs got before the searchable store existed, and
+    # it is the only option that adds no services to the cluster.
+    local memory_choice=""
+    prompt_menu "Should the agent remember things between conversations?" \
+      "Files on the agent's own disk (Default) - For small or personal deployments. Per-user Markdown, no extra services to run, does not scale past a few pages" \
+      "Searchable store - For enterprise deployments. Ranked recall that scales, deploys Hindsight (API + Postgres) into the cluster" \
+      "No - Nothing is retained once a session ends" \
+      memory_choice
+
+    # Every branch assigns, rather than letting option 1 fall through to
+    # --memory=: an answer given at the prompt is the more recent instruction of
+    # the two, and the permission-set and gVisor prompts above already work this way.
+    case "$memory_choice" in
+      1) memory_mode="file" ;;
+      2) memory_mode="hindsight" ;;
+      3) memory_mode="off" ;;
+    esac
   fi
+
+  # MEMORY_PROVIDER carries the whole choice — including "no memory at all",
+  # which is what `none` means. Everything downstream reads it and nothing else:
+  # provisioning step 13 deploys Hindsight only for a Hindsight-backed provider,
+  # the specialist overlay blanks anything that cannot be made read-only, and the
+  # entrypoint gates the one-way file import the same way.
+  #
+  # MEMORY_ENABLED is a different switch and stays false. It turns on Hermes'
+  # *built-in* MEMORY.md/USER.md, which has no per-user scoping and would sit
+  # alongside whichever provider is chosen — two competing stores in front of one
+  # agent. Every provider here replaces it rather than supplementing it. Nothing
+  # about memory keys off this flag, so an upgrade cannot read a false left in an
+  # old vars.sh as "this install wanted no memory".
+  #
+  # `none` rather than an empty string: the choice has to survive the trip
+  # through the CR, and an absent provider takes the CRD default. The operator
+  # translates `none` back to Hermes' own spelling — see MEMORY_PROVIDER_CHOICES
+  # in k8s-operator/scripts/common.sh.
+  #
+  # `multiuser_memory` is the default provider everywhere it is named with no
+  # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
+  # and `file` is what an install that says nothing about memory gets — the same
+  # store those installs already had before the searchable one existed.
+  local memory_enabled="false"
+  local memory_provider="multiuser_memory"
+  case "$memory_mode" in
+    hindsight) memory_provider="kube_agents_memory" ;;
+    off) memory_provider="none" ;;
+  esac
 
   print_step "10. Generating Configuration State (k8s-operator/scripts/vars.sh)"
   local vars_file="${repo_dir}/k8s-operator/scripts/vars.sh"
@@ -1466,13 +1547,7 @@ main() {
   write_state_var "$vars_file" GVISOR_POOL_NAME "gvisor-pool"
   write_state_var "$vars_file" MODEL_PROVIDER "$model_provider"
   write_state_var "$vars_file" MODEL_DEFAULT_NAME "$model_default_name"
-  # Written for every provider, like the API keys above, and read only by
-  # vertex_ai. Recording the answer here is what keeps the pipeline from asking
-  # again: the installer runs `make gcp-provision ARGS="-y"`, so NO_CONFIRM=1
-  # makes init_var_vertex_ai non-interactive in provision_04 and provision_09,
-  # and a value already in vars.sh is the only thing that stops it deciding for
-  # itself which project the predictions come from.
-  write_state_var "$vars_file" VERTEX_PROJECT "$vertex_project"
+  write_state_var "$vars_file" VERTEX_PROJECT_ID "$vertex_project_id"
   write_state_var "$vars_file" VERTEX_LOCATION "$vertex_location"
   write_state_var "$vars_file" GEMINI_API_KEY "$gemini_api_key"
   write_state_var "$vars_file" OPENAI_API_KEY "$openai_api_key"
@@ -1498,8 +1573,8 @@ main() {
   write_state_var "$vars_file" KMS_KEYRING "$kms_keyring"
   write_state_var "$vars_file" KMS_KEY "$kms_key"
   write_state_var "$vars_file" GITHUB_PEM_PATH "$github_pem_path"
-  write_state_var "$vars_file" MEMORY_ENABLED "false"
-  write_state_var "$vars_file" MEMORY_PROVIDER "multiuser_memory"
+  write_state_var "$vars_file" MEMORY_ENABLED "$memory_enabled"
+  write_state_var "$vars_file" MEMORY_PROVIDER "$memory_provider"
   write_state_var "$vars_file" USER_PROFILE_ENABLED "false"
   write_state_var "$vars_file" HERMES_DASHBOARD_ENABLED "${PARAM_ENABLE_WEBUI:-false}"
   write_state_var "$vars_file" REGISTRY_PREFIX "$registry_prefix"
@@ -1525,9 +1600,10 @@ main() {
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
-    echo -e "  • ${C_CYAN}Vertex AI Target:${C_RESET} ${C_BOLD}${vertex_project}${C_RESET} (${vertex_location})"
+    echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
+  echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"
   if [ -n "$github_org" ] && [ -n "$github_repo" ]; then
     echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
   fi
@@ -1562,18 +1638,16 @@ main() {
   provisioning_log="/tmp/kube-agents-provision-$(date -u +%Y%m%dT%H%M%SZ).log"
   print_info "Provisioning output is also being saved to: ${C_BOLD}${provisioning_log}${C_RESET}"
   # Hand the four model values down as exports, not just through vars.sh.
-  # load_state sources vars.sh after the environment, so a saved value normally
-  # wins — except for these four, where reapply_exported_var deliberately lets
-  # an exported value override the file so `MODEL_PROVIDER=vertex_ai make
-  # gcp-provision` works on an install already provisioned for gemini. That
-  # override reads the environment this installer inherited, which is the
-  # operator's shell: a stale `export MODEL_PROVIDER` left over from an earlier
-  # run would beat the --model-provider flag we just resolved and wrote, and the
-  # pipeline would provision a provider the confirmation panel never showed.
-  # Exporting the resolved answers makes the environment agree with the file.
+  # load_state lets an exported model variable override the saved one (so a
+  # provisioned install can switch providers), and that override reads the
+  # environment this installer inherited — the operator's shell. A stale
+  # `export MODEL_PROVIDER` left over from an earlier run would beat the
+  # --model-provider flag we just resolved and wrote, and the pipeline would
+  # provision a provider the confirmation panel never showed. Exporting the
+  # resolved answers makes the environment agree with the file.
   export MODEL_PROVIDER="$model_provider"
   export MODEL_DEFAULT_NAME="$model_default_name"
-  export VERTEX_PROJECT="$vertex_project"
+  export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
     IMAGE_TAG="$image_tag" make gcp-provision ARGS="-y" </dev/null 2>&1 | tee "$provisioning_log"

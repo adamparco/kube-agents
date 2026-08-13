@@ -58,35 +58,23 @@ litellm:
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
-  # gemini, anthropic, vertex_ai, openai (chatgpt needs the kustomize overlay
-  # and is rejected). Every provider but vertex_ai reads its API key from the
-  # credentials Secret; vertex_ai uses Workload Identity and needs no key.
+  # gemini, anthropic, openai, vertex_ai (chatgpt needs the kustomize overlay and
+  # is rejected). The provider's API key must exist in the credentials Secret —
+  # except vertex_ai, which authenticates with Workload Identity instead.
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
   modelDefaultName: ""
-  # Only read when modelProvider is vertex_ai. project and serviceAccount have
-  # no defaults on purpose — the project because guessing it would bill
-  # predictions to someone else, the GSA because no email can be guessed at
-  # all, and both mistakes surface only at runtime, as a 403. location and
-  # ksaName are defaulted below, but setting either to "" is still rejected at
-  # render time rather than shipped (see templates/litellm.yaml).
-  #
-  # Model-ID form and location guidance (why "global" is the default, the
-  # no-date-suffix rule) live on the docs site's inference-gateway page,
-  # which is canonical for them; do not restate the details here.
-  #
-  # serviceAccount is the GSA email the KSA below impersonates. That GSA must
-  # exist, hold roles/aiplatform.user on `project`, and carry a
-  # roles/iam.workloadIdentityUser binding for
-  # serviceAccount:<cluster-project>.svc.id.goog[<ns>/<ksaName>]; `project`
-  # must also have aiplatform.googleapis.com enabled. The chart creates none of
-  # those four — a Helm install does them out of band (chart README);
-  # provision_04_gcp_iam.sh does them for the script-driven install.
+  # modelProvider: vertex_ai only. The gateway calls
+  # projects/<projectId>/locations/<location> as a GSA reached through Workload
+  # Identity, so the chart always creates this KSA — no operator reconciles it.
   vertex:
-    project: ""
-    location: global
-    serviceAccount: ""
-    ksaName: kubeagents-litellm
+    serviceAccountName: kubeagents-litellm
+    #   iam.gke.io/gcp-service-account: <GSA>@<project>.iam.gserviceaccount.com
+    serviceAccountAnnotations: {}
+    # Empty defaults to platformAgent.harness.projectId / .location; location
+    # must be a region (or "global"), so override it on a zonal cluster.
+    projectId: ""
+    location: ""
   image:
     repository: ghcr.io/berriai/litellm
     tag: v1.92.0
@@ -132,10 +120,9 @@ platformAgent:
     serviceAccountAnnotations: {}
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
-    # model-provider key(s) the LiteLLM gateway reads (ANTHROPIC_API_KEY /
-    # GEMINI_API_KEY / OPENAI_API_KEY; none for vertex_ai, which uses Workload
-    # Identity) and optional SLACK_BOT_TOKEN / SLACK_APP_TOKEN. It must exist
-    # in the release namespace before the agent pod can start.
+    # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /
+    # OPENAI_API_KEY) and optional SLACK_BOT_TOKEN / SLACK_APP_TOKEN. It must
+    # exist in the release namespace before the agent pod can start.
     secretName: platform-agent-secrets
     # Convenience for dev installs: create the Secret from `data` below.
     # Prefer a pre-created Secret (external secret management) in production.
