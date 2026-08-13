@@ -626,6 +626,24 @@ class RealWorldTextTest(PatchedFixture, unittest.TestCase):
 
     # -- asterisks as wildcards ----------------------------------------------
 
+    def test_an_underscore_between_wildcards_keeps_the_stars(self):
+        """``*_*`` is a shell glob, and the underscore is what protects it.
+
+        Every emphasis lookaround rejects a delimiter next to ``*``/``_``, so
+        upstream renders ``*_*`` verbatim — *because* the underscore is
+        visible. A guard that masks that underscore hides it from the
+        lookarounds and the two stars pair, eating both. So a run touching a
+        star is never masked: it is inert to the regexes exactly as it stands.
+        """
+        for text in [
+            "ls *_*.yaml matched 3 files",
+            "a_ax mid *_*y",
+            "-l 'app=*_*' selector",
+            "match_* and *_suffix",
+        ]:
+            with self.subTest(text=text):
+                self.assertPlain(text)
+
     def test_a_lone_wildcard_is_not_emphasis(self):
         """Shell and selector wildcards, which sit next to whitespace or alone.
 

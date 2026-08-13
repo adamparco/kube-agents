@@ -180,6 +180,9 @@ def main(root: Path) -> None:
         "export KUBE_AGENTS_HOME=/opt/hermes",
         "kubectl get pods -n * -o wide",
         "e2-standard-8 and n2_standard_16",
+        # `*_*` stays whole only while the underscore is visible to the
+        # emphasis lookarounds — a guard that masks it lets the stars pair.
+        "ls *_*.yaml and match_* files",
     ):
         got = _text_elements(block_kit.render_blocks(f"- {plain}"))
         joined = "".join(e.get("text", "") for e in got)

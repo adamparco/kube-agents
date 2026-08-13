@@ -299,8 +299,19 @@ TOKENIZER_PATCHED = '''\
         keep = [False] * len(runs)
         stack: List[int] = []
         for i, m in enumerate(runs):
-            prev = _bucket(s[m.start() - 1] if m.start() else "")
-            nxt = _bucket(s[m.end()] if m.end() < len(s) else "")
+            prev_c = s[m.start() - 1] if m.start() else ""
+            next_c = s[m.end()] if m.end() < len(s) else ""
+            # A run touching `*` is already inert: every emphasis lookaround
+            # rejects a delimiter next to `*`/`_`, on either side. Masking it
+            # would HIDE the underscore from those lookarounds and un-block
+            # the neighbouring asterisks — `*_*` is a shell glob, and eating
+            # its stars is the corruption this guard exists to prevent. Kept
+            # verbatim it blocks them exactly as it does upstream.
+            if prev_c == "*" or next_c == "*":
+                keep[i] = True
+                continue
+            prev = _bucket(prev_c)
+            nxt = _bucket(next_c)
             # CommonMark flanking, reduced to the three buckets: a run can
             # open when attached to the start of a word (left-flanking, and
             # not right-flanking unless punctuation precedes), close when
