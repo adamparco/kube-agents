@@ -293,8 +293,15 @@ const agentIcon = `${base}/agent-icon.png`;
   /* --- transcript --- */
   .ka-chat__scroll {
     max-height: 30rem;
+    /* Deliberately left to chain (no `overscroll-behavior: contain`).
+       Playback parks the panel at its scroll end, so a reader who has
+       just watched the replay is already against the stop; containing
+       the overscroll there swallows the gesture and the page reads as
+       frozen until the pointer is moved off the panel. On a phone the
+       panel is 92% of the viewport width, so "off the panel" is a 17px
+       strip. Measured over CDP: four wheel ticks on the panel moved the
+       page 0px contained and 360px chaining. */
     overflow-y: auto;
-    overscroll-behavior: contain;
     padding: 1rem 1.1rem 1.25rem;
     scrollbar-width: thin;
     scrollbar-color: #2090af80 transparent;
