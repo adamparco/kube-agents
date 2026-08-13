@@ -493,12 +493,21 @@ reapply_exported_var() {
 
   [ -z "$env_val" ] && return 0
 
-  # Already in agreement: leave the file alone. save_var rewrites vars.sh by
-  # deleting the line and appending it, so writing an unchanged value would
-  # reorder the file on every provisioning run and turn a no-op into a diff.
-  [ "$env_val" = "$saved_val" ] && return 0
+  # Already persisted with the same value: leave the file alone. save_var
+  # rewrites vars.sh by deleting the line and appending it, so writing an
+  # unchanged value would reorder the file on every provisioning run. The grep
+  # is load-bearing: on a vars.sh with no entry for this variable, sourcing the
+  # file leaves the export untouched, so saved_val is the export echoing back —
+  # equal by construction. Returning early on equality alone would mean the
+  # value never reaches the file, and the next run without the export would
+  # prompt for it or default it, which is exactly what this function exists to
+  # prevent.
+  if [ "$env_val" = "$saved_val" ] \
+    && grep -Eq "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" 2>/dev/null; then
+    return 0
+  fi
 
-  if [ -n "$saved_val" ]; then
+  if [ -n "$saved_val" ] && [ "$env_val" != "$saved_val" ]; then
     print_warning "Overriding saved ${var_name}='${saved_val}' with the exported '${env_val}'. ${VARS_FILE} is being updated to match; unset the export to go back to the saved value."
   fi
   save_var "$var_name" "$env_val"
