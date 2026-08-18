@@ -583,6 +583,13 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-worker-tools/apply_kanban_worker_t
 #     it could lose a complete report but could not guarantee a well-formed one
 #     -- the retry skipped the check and stored the same ugly copy. What is left
 #     is a two-level log on the delivery path. See that module's docstring.
+#     Since 2026-08-17 the stanza is chosen per delivery platform: the text
+#     shipped platform-blind and told every card that Google Chat drops its
+#     tables, including the ones going to Slack, whose Block Kit renderer draws
+#     a pipe table as a native table block. `current_platform()` reads the same
+#     HERMES_SESSION_PLATFORM the completion notification is routed by, so the
+#     brief matches the destination; no chat session means no platform means the
+#     conservative text, unchanged byte-for-byte from before the split.
 # Getting that answer into the chat message is the other half of the fix and
 # belongs to the kanban_notifier patch above; verify_kanban_result.py still owns
 # the seam, replaying a real refusal through the real gate and into the real
@@ -616,8 +623,9 @@ COPY deploy/docker/patches/apply_kanban_result_required.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-result/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.py /opt/hermes && \
-    grep -q "body = _with_report_format(body)" /opt/hermes/tools/kanban_tools.py && \
+    grep -q "body = _with_report_format(body, platform=_report_format_platform())" /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_report_format import with_report_format" /opt/hermes/tools/kanban_tools.py && \
+    grep -q "from tools.kanban_report_format import current_platform" /opt/hermes/tools/kanban_tools.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_result_required.py /opt/hermes && \
     grep -q "_result_err, result = _require_result(tid, summary, result)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "_apply_result_schema(KANBAN_COMPLETE_SCHEMA)" /opt/hermes/tools/kanban_tools.py && \

@@ -78,6 +78,56 @@ about taste trains its reader to ignore it:
     separating the good card from the bad ones above, and still not worth
     waking anybody over: it is cosmetic, and a false positive on a number that
     was meant to be prose would be maddening.
+
+Why the stanza knows which chat it is writing for
+-------------------------------------------------
+The stanza shipped platform-blind: one text, appended to every card, naming
+Google Chat's limitations whoever the requester was. Four of its seven bullets
+justified a rule with a fact about a platform the card might not be going to,
+and the table bullet was the only rule in the stanza that came with a reason
+*not* to follow it — "Google Chat drops tables", stated twice.
+
+On 2026-08-17 card ``t_c730cf24`` ("List non-Kubernetes cron jobs") answered
+with ten jobs written as three-line bullet groups, 2,449 characters, no table.
+It was delivered to **Slack**, where ``plugins/platforms/slack/block_kit.py``
+turns a pipe table into a native Block Kit ``table`` block with per-column
+alignment. Two near-identical sibling cards — ``t_9f6b9c49`` and
+``t_061b70b7``, both "list the cron jobs" — had used tables, so the stanza was
+not suppressing them outright; it was leaving a platform-dependent choice to be
+made with a platform-blind brief. The detector agreed the report was fine
+(``result_shape_defects`` returned ``()``), because table use is not a defect
+and must not become one: a table is right for repeated fields and wrong for
+prose, and no regex can tell those apart.
+
+So the fix is to stop telling a Slack card that its tables will be dropped.
+:func:`with_report_format` takes the delivery platform and picks between
+:data:`REPORT_FORMAT_STANZA` — unchanged, and still what a Google Chat or
+unknown-target card gets — and :data:`REPORT_FORMAT_STANZA_TABLES`. The two
+share the bullets that are genuinely platform-invariant and differ only where
+the old text asserted something about the renderer.
+
+Unknown stays conservative. Cron, CLI and API-server cards have no chat session
+behind them, so :func:`current_platform` returns ``""`` and they keep the text
+that is safe on the narrower platform. Being wrong in that direction costs a
+table; being wrong the other way costs a wall of pipe characters.
+
+What this does *not* cover: a child card fanned out by a worker. The platform
+comes from the ContextVar bound to the session calling ``kanban_create``, which
+is the same context ``_maybe_auto_subscribe`` needs — and a dispatcher-spawned
+worker does not inherit its parent's, which is why children have to be handed
+their subscription explicitly by ``kanban_notify_propagate.py`` after the fact.
+By then the body is written. So a fan-out child keeps the conservative stanza
+even when its report is ultimately propagated to Slack. That is the behaviour
+this module already had for every card, not a regression, and closing it means
+rewriting a child's body at propagate time rather than at creation.
+
+The Slack variant names its destination out loud ("this card is being delivered
+to Slack"). That is deliberate. ``agents/platform/SOUL.md`` §0 tells every
+worker to "write for the narrower of the two" and calls a table "a Slack-only
+luxury", and that persona line is *correct* for a card whose target is unknown.
+The stanza can outrank it only by being more specific than it, which is the
+same reason this module exists at all: prose in a persona competes with the
+immediate task text and loses.
 """
 
 from __future__ import annotations
@@ -86,7 +136,12 @@ import re
 
 __all__ = [
     "REPORT_FORMAT_STANZA",
+    "REPORT_FORMAT_STANZA_TABLES",
+    "TABLE_RENDERING_PLATFORMS",
     "FORMAT_MARKER",
+    "current_platform",
+    "renders_tables",
+    "stanza_for_platform",
     "has_format_directive",
     "with_report_format",
     "result_shape_defects",
@@ -100,44 +155,168 @@ __all__ = [
 #: still counts as having one — the point is not to append a second copy.
 FORMAT_MARKER = "## Report format"
 
-#: Appended to a new card's ``body`` when it says nothing about report shape.
-#: Written as instructions to the worker, in the second person, because that is
-#: what the rest of a card body is and the model reads the whole thing as one
-#: brief. Everything the detector below measures is stated here, so the card,
-#: the schema wording and the delivery log never describe different contracts.
-#: The reverse does not hold: the lead-with-the-answer, `###`, length and link
-#: rules are stated and not measured, because they came from ``SOUL.md`` §7 and
-#: this stanza travels *in* the task text, where the persona does not. Measuring
-#: them would mean new defect classes and a louder delivery log for something no
-#: reader has yet called wrong — the WARNING tier stays where the evidence is.
-REPORT_FORMAT_STANZA = """\
-## Report format
+#: Platform identifiers whose renderer turns a Markdown pipe table into a real
+#: table. Slack is the only one the harness ships to today:
+#: ``plugins/platforms/slack/block_kit.py`` parses a pipe table into a native
+#: Block Kit ``table`` block with per-column alignment, falling back to aligned
+#: monospace past Slack's 100-row / 20-column / 10k-character limits. The
+#: bundled ``google_chat`` adapter has no table handling at all, so a pipe table
+#: arrives there as its literal pipe characters.
+#:
+#: Matched against ``HERMES_SESSION_PLATFORM``, which the messaging gateway sets
+#: to the plugin directory name (``slack``, ``google_chat``).
+TABLE_RENDERING_PLATFORMS = frozenset({"slack"})
 
+# The bullets below are shared verbatim by both stanzas: they state a rule whose
+# justification does not depend on the renderer. Anything whose *reason* names a
+# platform lives in the per-variant text instead, because a Slack card told that
+# Google Chat drops its tables is exactly the bug this split exists to fix.
+
+_LEAD_BULLET = """\
+- Lead with the answer: what is true, or what is wrong and what you want done.
+  Then the detail. Do not narrate the request back or how you investigated."""
+
+_BACKTICKS_BULLET = """\
+- Wrap raw values — ids, paths, epochs, durations, counts — in backticks."""
+
+#: Flat text on both renderers, so the rule and its reason are both invariant.
+_NO_ASCII_BULLET = """\
+- Do not use `=== Title ===`, `1. SECTION`, or hand-aligned columns. Slack
+  renders those as flat text."""
+
+_DEFAULT_INTRO = """\
 Put the full answer in `result` as standard Markdown — the gateway posts it
 verbatim into the requester's chat thread, where Slack renders it as blocks
 and Google Chat flattens headings to bold, drops tables, and splits anything
-past 4000 characters across messages:
+past 4000 characters across messages:"""
 
-- Lead with the answer: what is true, or what is wrong and what you want done.
-  Then the detail. Do not narrate the request back or how you investigated.
+_DEFAULT_HEADINGS_BULLET = """\
 - Use `##` for sections. Never `#` — the chat message already shows the card
   title, so an H1 renders as a second, duplicate banner — and no `###`: Google
   Chat flattens every level to bold, so a sub-level is invisible there. If you
-  are triaging an incident, SOUL.md §7 fixes the sections; use exactly those.
+  are triaging an incident, SOUL.md §7 fixes the sections; use exactly those."""
+
+_DEFAULT_LENGTH_BULLET = """\
 - Aim under 2,000 characters. Past 4,000 Google Chat delivers your report as
   several messages rather than one, so if the deliverable is genuinely longer,
   publish it, link it, and keep `result` to the headline findings and that
-  link. Never drop a finding to fit.
+  link. Never drop a finding to fit."""
+
+_DEFAULT_LINKS_BULLET = """\
 - Link every artifact you name — cluster, workload, card, PR, issue, console
   view — as `[text](url)`. Both platforms convert it; a bare id is clickable on
-  neither.
+  neither."""
+
+_DEFAULT_TABLES_BULLET = """\
 - Put tabular data in a Markdown pipe table with a `---` separator row, but
   keep it to a few short columns and never let the table be the only place a
-  fact lives — Google Chat drops it.
-- Wrap raw values — ids, paths, epochs, durations, counts — in backticks.
-- Do not use `=== Title ===`, `1. SECTION`, or hand-aligned columns. Slack
-  renders those as flat text.\
-"""
+  fact lives — Google Chat drops it."""
+
+_SLACK_INTRO = """\
+Put the full answer in `result` as standard Markdown — the gateway posts it
+verbatim into the requester's Slack thread, where Block Kit turns `##` into a
+real header, a `|` pipe table into a real table, and `---` into a divider:"""
+
+#: Same rule as the default, different reason. ``_HEADER_RE`` in the Slack
+#: renderer matches ``#{1,6}`` and emits one ``header`` block for every level,
+#: so a `###` is not a sub-level there either — it is the same banner, and the
+#: worker needs to be told that in terms of the platform it is writing for.
+_SLACK_HEADINGS_BULLET = """\
+- Use `##` for sections. Never `#` — the chat message already shows the card
+  title, so an H1 renders as a second, duplicate banner — and no `###`: Slack
+  draws every heading level as the same header block, so a sub-level is
+  invisible. If you are triaging an incident, SOUL.md §7 fixes the sections;
+  use exactly those."""
+
+#: The 2,000-character aim survives the platform split. Slack's adapter chunks
+#: at 39,000 rather than 4,000, so the delivery reason does not apply — but the
+#: readability one does, and dropping the rule here would make the two stanzas
+#: disagree about length for no reason anybody has measured.
+_SLACK_LENGTH_BULLET = """\
+- Aim under 2,000 characters. Slack will carry far more than that in one
+  message, but a report past it stops being read, so if the deliverable is
+  genuinely longer, publish it, link it, and keep `result` to the headline
+  findings and that link. Never drop a finding to fit."""
+
+_SLACK_LINKS_BULLET = """\
+- Link every artifact you name — cluster, workload, card, PR, issue, console
+  view — as `[text](url)`. Slack converts it; a bare id is not clickable."""
+
+#: The bullet this split exists for. It names the destination out loud because
+#: it has to outrank ``agents/platform/SOUL.md`` §0 — "write for the narrower of
+#: the two", "a table is a Slack-only luxury" — which is right for a card whose
+#: target is unknown and wrong for this one. A generic re-permission would read
+#: as the weaker of two conflicting instructions; naming the platform makes it
+#: the more specific one. The limits are Slack's real ones, from
+#: ``plugins/platforms/slack/block_kit.py``: past them the renderer falls back
+#: to aligned monospace, which is a degradation rather than a loss.
+_SLACK_TABLES_BULLET = """\
+- Put tabular data in a Markdown pipe table with a `---` separator row. This
+  card is being delivered to Slack, which renders it as a real table with
+  aligned columns, so prefer one over repeated bullet groups whenever you are
+  reporting the same fields for several things. Keep the cells short; past 100
+  rows or 20 columns Slack falls back to monospace text."""
+
+
+def _stanza(intro: str, headings: str, length: str, links: str, tables: str) -> str:
+    """Assemble one stanza from its four variable clauses and three fixed ones.
+
+    Bullet order is part of the contract: the lead-with-the-answer rule has to
+    be read first, and the two the detector measures for a WARNING
+    (``top-level-heading``, ``ascii-substitute``) bracket the list so neither is
+    buried in the middle of it.
+    """
+    return "{marker}\n\n{intro}\n\n{bullets}".format(
+        marker=FORMAT_MARKER,
+        intro=intro,
+        bullets="\n".join(
+            (
+                _LEAD_BULLET,
+                headings,
+                length,
+                links,
+                tables,
+                _BACKTICKS_BULLET,
+                _NO_ASCII_BULLET,
+            )
+        ),
+    )
+
+
+#: Appended to a new card's ``body`` when it says nothing about report shape and
+#: the delivery platform is Google Chat or unknown. Written as instructions to
+#: the worker, in the second person, because that is what the rest of a card
+#: body is and the model reads the whole thing as one brief. Everything the
+#: detector below measures is stated here, so the card, the schema wording and
+#: the delivery log never describe different contracts. The reverse does not
+#: hold: the lead-with-the-answer, `###`, length and link rules are stated and
+#: not measured, because they came from ``SOUL.md`` §7 and this stanza travels
+#: *in* the task text, where the persona does not. Measuring them would mean new
+#: defect classes and a louder delivery log for something no reader has yet
+#: called wrong — the WARNING tier stays where the evidence is.
+#:
+#: Still the default, and deliberately byte-for-byte what it was before the
+#: platform split: it is what every card created without a chat session behind
+#: it goes on getting, and a test pins the text so the split cannot quietly
+#: reword the conservative case while nobody is reading it.
+REPORT_FORMAT_STANZA = _stanza(
+    _DEFAULT_INTRO,
+    _DEFAULT_HEADINGS_BULLET,
+    _DEFAULT_LENGTH_BULLET,
+    _DEFAULT_LINKS_BULLET,
+    _DEFAULT_TABLES_BULLET,
+)
+
+#: The variant for a card whose report is going somewhere that renders tables.
+#: Same rules, same order, same marker — only the clauses that asserted
+#: something about the renderer are restated for the platform in hand.
+REPORT_FORMAT_STANZA_TABLES = _stanza(
+    _SLACK_INTRO,
+    _SLACK_HEADINGS_BULLET,
+    _SLACK_LENGTH_BULLET,
+    _SLACK_LINKS_BULLET,
+    _SLACK_TABLES_BULLET,
+)
 
 #: Phrases that mean the caller has already said something about shape. A body
 #: carrying any of these is left alone: an explicit instruction from the
@@ -231,6 +410,58 @@ DEFECT_ADVICE = {
 }
 
 
+def renders_tables(platform: object) -> bool:
+    """Whether ``platform``'s renderer turns a pipe table into a real table.
+
+    False for anything unrecognised, including ``None`` and ``""``. Unknown has
+    to mean "assume the narrower renderer": a cron or CLI card has no chat
+    session behind it, and promising it a table it will not get is the more
+    expensive of the two mistakes.
+    """
+    if platform is None:
+        return False
+    return str(platform).strip().lower().replace("-", "_") in TABLE_RENDERING_PLATFORMS
+
+
+def current_platform() -> str:
+    """The messaging platform of the session creating this card, or ``""``.
+
+    Reads the ``HERMES_SESSION_PLATFORM`` ContextVar the messaging gateway sets
+    before agent dispatch — the same value ``_maybe_auto_subscribe`` keys the
+    completion notification off, which is what makes this the platform the
+    report will actually be delivered to rather than a guess about it.
+
+    Imported lazily and behind a blanket ``except``: this module is imported by
+    ``tools/kanban_tools.py`` on the card-creation path, and making ``tools``
+    depend on ``gateway`` at module scope would put a second package on that
+    import graph for the sake of one word in a prompt. Any failure degrades to
+    ``""``, which is the conservative stanza.
+
+    That blanket ``except`` is also the one thing here that can fail silently —
+    a renamed gateway symbol reads exactly like a cron card — so the build's
+    ``verify_kanban_report_format.py`` binds a real Slack session and asserts
+    the value comes back, rather than only that the call does not raise.
+
+    ``get_session_env`` falls back to ``os.environ`` when the ContextVar was
+    never set in this context, which is what makes the value correct under the
+    cron scheduler and the CLI. The agent container sets no
+    ``HERMES_SESSION_PLATFORM`` of its own, so that fallback is inert in
+    production; setting one process-wide would give every cron and API-server
+    card the wording of a chat platform it is not being delivered to.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        return str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip()
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+
+def stanza_for_platform(platform: object) -> str:
+    """The stanza a card delivered to ``platform`` should carry."""
+    return REPORT_FORMAT_STANZA_TABLES if renders_tables(platform) else REPORT_FORMAT_STANZA
+
+
 def has_format_directive(body: object) -> bool:
     """Whether ``body`` already tells the worker how to shape its report."""
     if body is None:
@@ -241,7 +472,7 @@ def has_format_directive(body: object) -> bool:
     return bool(_EXISTING_DIRECTIVE.search(text))
 
 
-def with_report_format(body: object) -> object:
+def with_report_format(body: object, platform: object = None) -> object:
     """Return ``body`` with the report-format stanza appended, if it needs one.
 
     Idempotent, and a no-op for a caller who already gave format instructions —
@@ -249,20 +480,29 @@ def with_report_format(body: object) -> object:
     stanza as its whole body: an empty brief is the case where the worker has the
     least to go on and the default shape matters most.
 
+    ``platform`` is the chat platform the finished report will be posted to, as
+    :func:`current_platform` reports it. It selects between the two stanzas and
+    nothing else; ``None`` — the default, and what every caller that does not
+    know passes — keeps the conservative text. The lookup is not done here so
+    this stays a pure function of its arguments: the impure read belongs at the
+    one call site that is on a live session, not in the function the tests and
+    the build verifier drive.
+
     ``body`` is returned unchanged, and with its own type, whenever there is
     nothing to add, so a ``None`` body stays ``None`` for callers downstream that
     distinguish it from ``""``.
     """
+    stanza = stanza_for_platform(platform)
     if body is not None and not str(body).strip():
         # Whitespace-only. Treat as absent, but keep returning a string so the
         # handler's own `body` semantics do not change shape underneath it.
-        return REPORT_FORMAT_STANZA
+        return stanza
     if body is None:
-        return REPORT_FORMAT_STANZA
+        return stanza
     text = str(body)
     if has_format_directive(text):
         return body
-    return text.rstrip() + "\n\n" + REPORT_FORMAT_STANZA
+    return text.rstrip() + "\n\n" + stanza
 
 
 def _strip_code(body: str) -> str:

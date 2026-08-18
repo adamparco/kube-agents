@@ -67,12 +67,16 @@ BARE_LIST_CARD = """### Sleep Task 3 Execution Details
 print("tools.kanban_report_format:")
 import tools.kanban_report_format as krf  # noqa: E402
 
-check("the stanza is non-empty", bool(krf.REPORT_FORMAT_STANZA.strip()))
-check(
-    "the stanza carries its own marker",
-    krf.FORMAT_MARKER in krf.REPORT_FORMAT_STANZA,
-    "with_report_format would append a second copy on every pass",
-)
+for _label, _stanza in (
+    ("default", krf.REPORT_FORMAT_STANZA),
+    ("table-rendering", krf.REPORT_FORMAT_STANZA_TABLES),
+):
+    check(f"the {_label} stanza is non-empty", bool(_stanza.strip()))
+    check(
+        f"the {_label} stanza carries its own marker",
+        krf.FORMAT_MARKER in _stanza,
+        "with_report_format would append a second copy on every pass",
+    )
 
 # --- 2. The card body a worker is handed ------------------------------------
 print("kanban_create body:")
@@ -83,10 +87,16 @@ check(
     getattr(kt, "_with_report_format", None) is krf.with_report_format,
     "the import landed on a different function than the module exports",
 )
+check(
+    "the handler is wired to the platform lookup",
+    getattr(kt, "_report_format_platform", None) is krf.current_platform,
+    "the stanza would be chosen by something other than the delivery platform",
+)
 _kanban_tools_src = open("tools/kanban_tools.py").read()
 check(
     "the create handler appends the stanza",
-    "body = _with_report_format(body)" in _kanban_tools_src,
+    "body = _with_report_format(body, platform=_report_format_platform())"
+    in _kanban_tools_src,
 )
 
 plain = "Sleep for 1ms and report the epochs."
@@ -107,6 +117,70 @@ check(
 check(
     "a card with no body at all still gets the shape",
     krf.with_report_format(None) == krf.REPORT_FORMAT_STANZA,
+)
+
+# The platform split. A Slack card told its tables will be dropped is the bug
+# this exists to stop, so the check is on the delivered text rather than on the
+# selector: a correct lookup feeding the wrong stanza would pass the latter.
+check(
+    "a Slack card is told its tables render",
+    krf.FORMAT_MARKER in str(krf.with_report_format(plain, platform="slack"))
+    and "drops it" not in str(krf.with_report_format(plain, platform="slack")),
+    "the Slack stanza still carries the Google Chat table warning",
+)
+check(
+    "a Google Chat card keeps the conservative text",
+    krf.with_report_format(plain, platform="google_chat")
+    == krf.with_report_format(plain),
+)
+for _unknown in (None, "", "cron", "api_server", "tui"):
+    check(
+        f"an unknown platform ({_unknown!r}) falls back to the conservative text",
+        krf.with_report_format(plain, platform=_unknown) == krf.with_report_format(plain),
+        "a card with no chat session behind it would be promised a renderer",
+    )
+check(
+    "the platform lookup never raises off a session",
+    isinstance(krf.current_platform(), str),
+    "the card-creation path would fail on a value it only needs for wording",
+)
+# The check the blanket ``except`` in current_platform() would otherwise hide.
+# It degrades to "" on any failure, so a renamed gateway symbol or a moved
+# module looks exactly like a cron card: every report goes back to the
+# conservative stanza and the bug this patch fixes is silently un-fixed. The
+# only way to tell the two apart is to bind a real session and watch the value
+# come back, which is why this drives the actual gateway rather than a stub.
+from gateway.session_context import clear_session_vars, set_session_vars  # noqa: E402
+
+_tokens = set_session_vars(platform="slack", chat_id="C0VERIFY", session_id="s_verify")
+try:
+    _seen = krf.current_platform()
+    check(
+        "the lookup reads a bound Slack session",
+        _seen == "slack",
+        f"read {_seen!r} off a session bound to 'slack' — the lazy import into "
+        "gateway.session_context is failing and every card is falling back to "
+        "the conservative stanza",
+    )
+    check(
+        "a card created on that session is handed the table-rendering stanza",
+        krf.with_report_format(plain, platform=krf.current_platform())
+        == krf.with_report_format(plain, platform="slack"),
+        "the lookup and the selector disagree about the same live session",
+    )
+finally:
+    clear_session_vars(_tokens)
+check(
+    "a cleared session reads as no platform",
+    krf.current_platform() == "",
+    "a card created after a chat session ended would inherit its wording",
+)
+check(
+    "either stanza is recognised as already-present",
+    krf.with_report_format(krf.REPORT_FORMAT_STANZA_TABLES) == krf.REPORT_FORMAT_STANZA_TABLES
+    and krf.with_report_format(krf.REPORT_FORMAT_STANZA, platform="slack")
+    == krf.REPORT_FORMAT_STANZA,
+    "a card re-created under a different platform would carry two briefs",
 )
 
 # --- 3. The detector agrees with the human who read the thread --------------
@@ -144,19 +218,35 @@ check(
 # The check this file exists for. Each rule the notifier can raise a WARNING
 # over has to be a rule the stanza states, in words a model can act on.
 print("contract consistency:")
-check(
-    "the stanza obeys its own rules",
-    krf.serious_defects(krf.REPORT_FORMAT_STANZA) == (),
-    "the instructions would be warned about if a worker sent them back verbatim",
-)
-check(
-    "the stanza forbids the H1 the notifier warns about",
-    "Never `#`" in krf.REPORT_FORMAT_STANZA,
-)
-check(
-    "the stanza forbids the ASCII structure the notifier warns about",
-    "=== Title ===" in krf.REPORT_FORMAT_STANZA,
-)
+# Every rule the notifier can warn about has to be stated by *both* stanzas.
+# The detector does not know which variant a card carried, so a rule dropped
+# from one of them is a WARNING about an instruction that worker never got.
+for _label, _stanza in (
+    ("default", krf.REPORT_FORMAT_STANZA),
+    ("table-rendering", krf.REPORT_FORMAT_STANZA_TABLES),
+):
+    check(
+        f"the {_label} stanza obeys its own rules",
+        krf.serious_defects(_stanza) == (),
+        "the instructions would be warned about if a worker sent them back verbatim",
+    )
+    check(
+        f"the {_label} stanza forbids the H1 the notifier warns about",
+        "Never `#`" in _stanza,
+    )
+    check(
+        f"the {_label} stanza forbids the ASCII structure the notifier warns about",
+        "=== Title ===" in _stanza,
+    )
+    check(
+        f"the {_label} stanza still asks for backticked values",
+        "backticks" in _stanza,
+    )
+    check(
+        f"the {_label} stanza still names the pipe table",
+        "pipe table" in _stanza,
+        "the split dropped a rule from one variant rather than restating it",
+    )
 for defect in krf.SERIOUS_DEFECTS:
     check(
         f"the warning for {defect} names the edit to make",

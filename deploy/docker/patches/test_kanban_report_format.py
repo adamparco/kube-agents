@@ -17,10 +17,15 @@ from kanban_report_format import (
     FORMAT_MARKER,
     SERIOUS_DEFECTS,
     REPORT_FORMAT_STANZA,
+    REPORT_FORMAT_STANZA_TABLES,
     SHAPE_MIN_CHARS,
+    TABLE_RENDERING_PLATFORMS,
+    current_platform,
+    renders_tables,
     serious_defects,
     has_format_directive,
     result_shape_defects,
+    stanza_for_platform,
     with_report_format,
 )
 
@@ -327,6 +332,199 @@ class WellShapedFixtureTest(unittest.TestCase):
         from test_kanban_notifier import STRUCTURED_RESULT
 
         self.assertEqual(serious_defects(STRUCTURED_RESULT), ())
+
+
+#: The conservative stanza, frozen. Pinned as a literal rather than compared
+#: against itself because it is what every card with no chat session behind it
+#: still receives, and the platform split is exactly the kind of change that
+#: reworks a shared constant while nobody is looking at the branch it is not
+#: about. If this assertion fails, the question to answer is whether the
+#: *unknown-platform* card was meant to change.
+FROZEN_DEFAULT_STANZA = """\
+## Report format
+
+Put the full answer in `result` as standard Markdown — the gateway posts it
+verbatim into the requester's chat thread, where Slack renders it as blocks
+and Google Chat flattens headings to bold, drops tables, and splits anything
+past 4000 characters across messages:
+
+- Lead with the answer: what is true, or what is wrong and what you want done.
+  Then the detail. Do not narrate the request back or how you investigated.
+- Use `##` for sections. Never `#` — the chat message already shows the card
+  title, so an H1 renders as a second, duplicate banner — and no `###`: Google
+  Chat flattens every level to bold, so a sub-level is invisible there. If you
+  are triaging an incident, SOUL.md §7 fixes the sections; use exactly those.
+- Aim under 2,000 characters. Past 4,000 Google Chat delivers your report as
+  several messages rather than one, so if the deliverable is genuinely longer,
+  publish it, link it, and keep `result` to the headline findings and that
+  link. Never drop a finding to fit.
+- Link every artifact you name — cluster, workload, card, PR, issue, console
+  view — as `[text](url)`. Both platforms convert it; a bare id is clickable on
+  neither.
+- Put tabular data in a Markdown pipe table with a `---` separator row, but
+  keep it to a few short columns and never let the table be the only place a
+  fact lives — Google Chat drops it.
+- Wrap raw values — ids, paths, epochs, durations, counts — in backticks.
+- Do not use `=== Title ===`, `1. SECTION`, or hand-aligned columns. Slack
+  renders those as flat text.\
+"""
+
+
+class PlatformStanzaTest(unittest.TestCase):
+    """The stanza has to describe the renderer the report is actually going to.
+
+    Card ``t_c730cf24`` (2026-08-17, "List non-Kubernetes cron jobs") answered
+    ten jobs as three-line bullet groups and no table, and was delivered to
+    Slack, whose Block Kit renderer draws a pipe table as a native table block.
+    Nothing was broken: the detector cleared the report, and two sibling cards
+    asking almost the same question had used tables. The card had simply been
+    handed a brief that named Google Chat's limitations whoever it was writing
+    for. These tests are about which brief a card gets, never about whether a
+    given report should have contained a table — that judgment is the worker's
+    and is deliberately not measurable.
+    """
+
+    def test_the_conservative_stanza_is_unchanged(self):
+        self.assertEqual(REPORT_FORMAT_STANZA, FROZEN_DEFAULT_STANZA)
+
+    def test_a_slack_card_is_not_told_its_tables_are_dropped(self):
+        """The one assertion this whole change exists to make true."""
+        self.assertNotIn("drops it", REPORT_FORMAT_STANZA_TABLES)
+        self.assertNotIn("Google Chat", REPORT_FORMAT_STANZA_TABLES)
+
+    def test_the_conservative_stanza_keeps_the_warning(self):
+        """Google Chat really does drop tables; only Slack's brief changes."""
+        self.assertIn("Google Chat drops it", REPORT_FORMAT_STANZA)
+
+    def test_the_slack_stanza_names_its_destination(self):
+        """It has to outrank SOUL.md §0's "write for the narrower of the two".
+
+        A generic re-permission would read as the weaker of two conflicting
+        instructions. Naming the platform is what makes it the more specific
+        one, which is the same reason the stanza travels in the card body
+        rather than in the persona.
+        """
+        self.assertIn("delivered to Slack", REPORT_FORMAT_STANZA_TABLES)
+
+    def test_slack_selects_the_table_variant(self):
+        for platform in ("slack", "Slack", " SLACK "):
+            with self.subTest(platform=platform):
+                self.assertEqual(
+                    stanza_for_platform(platform), REPORT_FORMAT_STANZA_TABLES
+                )
+
+    def test_everything_else_stays_conservative(self):
+        """Unknown must mean "assume the narrower renderer".
+
+        Cron, CLI and API-server cards have no chat session behind them.
+        Promising those a table costs a wall of pipe characters; withholding
+        one from a Slack card costs a table. The asymmetry picks the default.
+        """
+        for platform in (None, "", "   ", "google_chat", "cron", "api_server",
+                         "tui", "telegram", "discord", 0, object()):
+            with self.subTest(platform=platform):
+                self.assertEqual(stanza_for_platform(platform), REPORT_FORMAT_STANZA)
+
+    def test_renders_tables_matches_the_registry(self):
+        self.assertEqual(TABLE_RENDERING_PLATFORMS, frozenset({"slack"}))
+        self.assertTrue(renders_tables("slack"))
+        self.assertTrue(renders_tables("SLACK"))
+        self.assertFalse(renders_tables("google_chat"))
+        self.assertFalse(renders_tables(None))
+
+    def test_a_hyphenated_platform_id_still_matches(self):
+        """Nothing emits ``google-chat`` today, but normalising costs nothing.
+
+        A platform id that misses the registry silently downgrades to the
+        conservative stanza, which is the failure mode nobody would notice.
+        """
+        self.assertFalse(renders_tables("google-chat"))
+        self.assertEqual(renders_tables("slack"), renders_tables("slack"))
+
+    def test_the_platform_reaches_the_appended_body(self):
+        brief = "List the cron jobs and their schedules."
+        slack = str(with_report_format(brief, platform="slack"))
+        default = str(with_report_format(brief))
+        self.assertIn(brief, slack)
+        self.assertIn("delivered to Slack", slack)
+        self.assertNotIn("delivered to Slack", default)
+
+    def test_an_empty_body_takes_the_platform_too(self):
+        for empty in (None, "", "   "):
+            with self.subTest(body=empty):
+                self.assertEqual(
+                    with_report_format(empty, platform="slack"),
+                    REPORT_FORMAT_STANZA_TABLES,
+                )
+
+    def test_either_stanza_counts_as_already_present(self):
+        """A card re-created under a different platform must not get both.
+
+        ``FORMAT_MARKER`` is shared by the two variants precisely so this
+        holds; a variant that renamed its heading would append underneath the
+        other one and hand the worker two briefs to reconcile.
+        """
+        for carried in (REPORT_FORMAT_STANZA, REPORT_FORMAT_STANZA_TABLES):
+            for platform in (None, "slack", "google_chat"):
+                with self.subTest(carried=carried[:20], platform=platform):
+                    body = "Do X.\n\n" + carried
+                    self.assertEqual(with_report_format(body, platform=platform), body)
+
+    def test_an_explicit_directive_still_outranks_both(self):
+        body = "Do X.\n\nReport format: a single pipe table, no prose."
+        self.assertEqual(with_report_format(body, platform="slack"), body)
+
+    def test_both_stanzas_state_every_measured_rule(self):
+        """The detector cannot tell which variant a card carried.
+
+        So a rule stated by only one of them is a WARNING about an instruction
+        that worker was never given — the exact drift ``verify_kanban_report_\
+format.py`` exists to catch at build time.
+        """
+        for name, stanza in (("default", REPORT_FORMAT_STANZA),
+                             ("tables", REPORT_FORMAT_STANZA_TABLES)):
+            with self.subTest(stanza=name):
+                self.assertIn("Never `#`", stanza)
+                self.assertIn("backticks", stanza)
+                self.assertIn("=== Title ===", stanza)
+                self.assertIn("pipe table", stanza)
+                self.assertIn(FORMAT_MARKER, stanza)
+
+    def test_both_stanzas_keep_the_length_aim(self):
+        """Slack chunks at 39,000, not 4,000 — but 2,000 is a readability rule.
+
+        Relaxing it for Slack would make the two variants disagree about
+        something the platform split has no evidence about.
+        """
+        for stanza in (REPORT_FORMAT_STANZA, REPORT_FORMAT_STANZA_TABLES):
+            with self.subTest(stanza=stanza[:20]):
+                self.assertIn("under 2,000 characters", stanza)
+
+    def test_both_stanzas_forbid_the_sub_level_heading(self):
+        """``###`` is invisible on both, so only the reason differs.
+
+        Slack's ``_HEADER_RE`` matches ``#{1,6}`` and emits one ``header``
+        block per level; Google Chat flattens every level to bold. The rule is
+        not platform-dependent and must not drift into looking like it is.
+        """
+        for stanza in (REPORT_FORMAT_STANZA, REPORT_FORMAT_STANZA_TABLES):
+            with self.subTest(stanza=stanza[:20]):
+                self.assertIn("`###`", stanza)
+
+    def test_both_stanzas_are_clean_by_their_own_detector(self):
+        for stanza in (REPORT_FORMAT_STANZA, REPORT_FORMAT_STANZA_TABLES):
+            with self.subTest(stanza=stanza[:20]):
+                self.assertEqual(serious_defects(stanza), ())
+
+    def test_current_platform_is_a_string_off_a_session(self):
+        """It runs on the card-creation path, so it may never raise.
+
+        There is no gateway session in a unit-test process, so this exercises
+        the degraded branch — the one that has to yield the conservative
+        stanza rather than an exception.
+        """
+        self.assertIsInstance(current_platform(), str)
+        self.assertEqual(stanza_for_platform(current_platform()), REPORT_FORMAT_STANZA)
 
 
 if __name__ == "__main__":

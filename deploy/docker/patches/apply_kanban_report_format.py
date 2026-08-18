@@ -3,7 +3,9 @@
 
 Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. One edit: the card
 body a worker is handed at ``kanban_create`` gains the report-format stanza when
-it carries no format instructions of its own.
+it carries no format instructions of its own — the variant written for the chat
+platform the finished report will be delivered to, or the conservative one when
+there is no chat session behind the card.
 
 Why the body and not the persona: the persona is read once at the top of a run
 and then competes with several thousand tokens of immediate task text, which is
@@ -44,18 +46,28 @@ OLD_BODY_READ = '''    body = args.get("body")
     parents = args.get("parents") or []
 '''
 
+# ``_report_format_platform()`` is read here rather than inside
+# ``with_report_format`` so the stanza chooser stays a pure function of its
+# arguments. It resolves the same ``HERMES_SESSION_PLATFORM`` ContextVar that
+# ``_maybe_auto_subscribe`` uses further down this handler to decide where the
+# completion notification goes — so the stanza is written for the platform the
+# report will actually be delivered to, not for a guess. Off a chat session it
+# returns "" and the conservative stanza is used, which is the pre-patch text.
 NEW_BODY_READ = '''    body = args.get("body")
     # kube-agents patch: see tools/kanban_report_format.py
-    body = _with_report_format(body)
+    body = _with_report_format(body, platform=_report_format_platform())
     parents = args.get("parents") or []
 '''
 
 # Imported at module scope rather than inside the handler: an ImportError has to
 # surface when the module loads and the build's verify can see it, not on the
-# first card created in production.
+# first card created in production. ``current_platform`` itself defers its
+# ``gateway`` import to call time — see its docstring for why ``tools`` must not
+# grow a module-scope dependency on ``gateway``.
 REGISTER_PREAMBLE = (
     "# kube-agents patch: see tools/kanban_report_format.py\n"
     "from tools.kanban_report_format import with_report_format as _with_report_format\n"
+    "from tools.kanban_report_format import current_platform as _report_format_platform\n"
     "\n"
 )
 
