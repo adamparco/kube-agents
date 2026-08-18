@@ -234,11 +234,12 @@ def _refresh_credentials_once() -> bool:
         # detail, because github_scan_gate renders `reason` into a chat room and
         # a broker error body is not something to forward unread.
         #
-        # Do not read this as "the detail is recorded elsewhere" -- on the proxy
-        # path it is not preserved anywhere. github_token_refresh raises a fixed
-        # string, the sidecar logs the helper's exit code and drops its stderr,
-        # and the gate reads our stderr only when stdout is empty, which it
-        # never is here. Diagnosing a refusal means the broker's own logs.
+        # Nor is this print the record. On the proxy path github_token_refresh
+        # raises a fixed string, and the gate reads our stderr only when stdout
+        # is empty, which it never is here. What refused, and why, is recorded
+        # by the sidecar: `_handle_github_refresh` in credential_proxy.py logs
+        # the refresh helper's stderr where only an operator sees it. Diagnosing
+        # a refusal means that log, or Minty's own.
         print(
             f"resolver: GitHub credential refresh failed: "
             f"{type(exc).__name__}: {exc}",
