@@ -51,20 +51,66 @@ def _write_settings(directory: str, value=None, key: bool = True) -> str:
     return path
 
 
-def _gh_stub(auth_rc: int = 0, list_rc: int = 0, list_stdout: str = "[]", record=None):
-    """A ``subprocess.run`` replacement that routes on the gh subcommand."""
+def _sequence(values):
+    """Consume one entry per call, with the final entry repeating forever.
+
+    run_gh retries a failed call behind a fresh token, so a test needs to say
+    "fails, then succeeds" -- and every stubbed subcommand needs the same
+    convention, since any of them can be the one that meets an expired token.
+    """
+    pending = list(values)
+
+    def take():
+        return pending.pop(0) if len(pending) > 1 else pending[0]
+
+    return take
+
+
+def _gh_stub(
+    auth_rc: int = 0,
+    list_rc: int = 0,
+    list_stdout: str = "[]",
+    record=None,
+    auth_rcs=None,
+    write_rcs=None,
+):
+    """A ``subprocess.run`` replacement that routes on the gh subcommand.
+
+    ``auth_rcs`` and ``write_rcs`` are exit-code *sequences* -- for the auth
+    preflight and for every write subcommand respectively -- consumed one per
+    call with the final entry repeating. The retry asks the same question
+    twice and the whole point of it is that the second answer can differ from
+    the first, which a single exit code cannot express. ``auth_rc`` stays as
+    the one-answer shorthand.
+    """
+    next_auth = _sequence(auth_rcs if auth_rcs else [auth_rc])
+    next_write = _sequence(write_rcs if write_rcs else [0])
 
     def run(argv, **kwargs):
         if record is not None:
             record.append(argv)
         sub = argv[1:]
         if sub[:2] == ["auth", "status"]:
-            return subprocess.CompletedProcess(argv, auth_rc, "", "")
+            return subprocess.CompletedProcess(argv, next_auth(), "", "")
         if sub[:2] == ["issue", "list"]:
             return subprocess.CompletedProcess(argv, list_rc, list_stdout, "")
-        return subprocess.CompletedProcess(argv, 0, "[]", "")
+        return subprocess.CompletedProcess(argv, next_write(), "[]", "")
 
     return run
+
+
+@contextlib.contextmanager
+def _fresh_refresh_state():
+    """Reset run_gh's per-process mint guard for the duration of a test.
+
+    The guard bounds a real invocation to one mint. A suite runs many
+    invocations' worth of code in a single process, so without this the second
+    test to meet an expired token would find the guard already spent by the
+    first. Patched rather than assigned so it is restored either way.
+    """
+    with mock.patch.object(resolver, "_refresh_attempted", False):
+        with mock.patch.object(resolver, "_refresh_failed", False):
+            yield
 
 
 class GetTargetRepoParsingTest(unittest.TestCase):
@@ -313,12 +359,39 @@ class HandlePollRoutingTest(unittest.TestCase):
         resolver.SETTINGS_PATH = self._settings
         self._tmp.cleanup()
 
-    def _poll(self, value, key=True, **stub):
+    def _poll(self, value, key=True, refresh=None, **stub):
+        """Poll against a stubbed ``gh``, recording refresh attempts.
+
+        ``resolver.refresh_credentials`` is always replaced. The real one talks
+        to the credential sidecar, so leaving it in place would have every test
+        that fails the auth preflight make a live network call. ``refresh`` is
+        the optional body -- raise from it to exercise a broker that refuses.
+        Attempts land in ``self.refresh_calls`` either way.
+
+        stderr is kept in ``self.stderr`` rather than thrown away. The reason
+        code deliberately carries no detail about *why* a refresh failed, so
+        that line is the only thing a test can hold to account -- discarding it
+        here let the whole diagnostic be deleted with every test still green.
+        """
         resolver.SETTINGS_PATH = _write_settings(self.d, value, key=key)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            with mock.patch.object(subprocess, "run", _gh_stub(**stub)):
-                resolver.handle_poll(argparse.Namespace())
+        self.refresh_calls = []
+
+        def _refresh(repo):
+            self.refresh_calls.append(repo)
+            if refresh is not None:
+                refresh(repo)
+
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(buf))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            stack.enter_context(mock.patch.object(subprocess, "run", _gh_stub(**stub)))
+            stack.enter_context(
+                mock.patch.object(resolver, "refresh_credentials", _refresh)
+            )
+            stack.enter_context(_fresh_refresh_state())
+            resolver.handle_poll(argparse.Namespace())
+        self.stderr = err.getvalue()
         return json.loads(buf.getvalue())
 
     def test_not_configured_is_its_own_status(self):
@@ -332,9 +405,71 @@ class HandlePollRoutingTest(unittest.TestCase):
         self.assertEqual(payload["reason"], "GIT_REPO_UNPARSEABLE")
 
     def test_broken_auth_is_a_loud_error(self):
+        """A *freshly minted* token that is still rejected is the real fault.
+
+        The refresh below succeeds and the preflight fails anyway, which is the
+        only remaining way to reach this reason code: an expiry no longer can,
+        because the retry would have cleared it.
+        """
         payload = self._poll("https://github.com/acme/toolkit", auth_rc=1)
         self.assertEqual(payload["status"], "ERROR")
         self.assertEqual(payload["reason"], "GITHUB_AUTH_NOT_CONFIGURED")
+        self.assertEqual(self.refresh_calls, ["acme/toolkit"])
+
+    def test_expired_token_is_refreshed_and_the_poll_continues(self):
+        """The regression this path exists for.
+
+        The broker mints installation tokens that live an hour; this poller runs
+        every ten minutes. Between refreshes the preflight fails on a token that
+        is merely stale, and reporting that as a fault left the watcher silent
+        about real issues for most of every day. One refresh, one retry, and the
+        poll proceeds to its normal answer.
+        """
+        payload = self._poll("https://github.com/acme/toolkit", auth_rcs=[1, 0])
+        self.assertEqual(payload["status"], "NO_ISSUES")
+        self.assertEqual(self.refresh_calls, ["acme/toolkit"])
+
+    def test_refresh_failure_is_not_reported_as_missing_config(self):
+        """A broker that refuses needs a different operator than a blank config.
+
+        Collapsing the two into GITHUB_AUTH_NOT_CONFIGURED is the conflation
+        that sends whoever reads the alert to check settings that are fine.
+        """
+
+        def _boom(repo):
+            raise RuntimeError("Credential sidecar failed to refresh GitHub auth")
+
+        payload = self._poll(
+            "https://github.com/acme/toolkit", auth_rc=1, refresh=_boom
+        )
+        self.assertEqual(payload["status"], "ERROR")
+        self.assertEqual(payload["reason"], "GITHUB_TOKEN_REFRESH_FAILED")
+
+    def test_refresh_detail_goes_to_stderr_and_not_the_payload(self):
+        """The gate script renders `reason` into a chat room.
+
+        A broker error body is not something to forward unread, so the detail
+        belongs on stderr and the payload carries the code alone. Both halves
+        are asserted: without the stderr half the whole diagnostic could be
+        deleted with the suite still green, and GITHUB_TOKEN_REFRESH_FAILED on
+        its own tells an operator nothing about what the broker said.
+        """
+
+        def _boom(repo):
+            raise RuntimeError("minty said 403 for tenant-secret-detail")
+
+        payload = self._poll(
+            "https://github.com/acme/toolkit", auth_rc=1, refresh=_boom
+        )
+        self.assertNotIn("tenant-secret-detail", json.dumps(payload))
+        self.assertEqual(set(payload), {"status", "reason"})
+        self.assertIn("tenant-secret-detail", self.stderr)
+        self.assertIn("RuntimeError", self.stderr)
+
+    def test_healthy_auth_does_not_refresh_pre_emptively(self):
+        """144 ticks a day must not mean 144 mints a day."""
+        self._poll("https://github.com/acme/toolkit")
+        self.assertEqual(self.refresh_calls, [])
 
     def test_unreachable_repo_is_a_loud_error(self):
         """`gh auth status` passes if *any* host is authenticated.
@@ -438,21 +573,83 @@ class ReportFilePathGuardTest(unittest.TestCase):
         resolver.SCRATCH_DIR = self._scratch
         self._tmp.cleanup()
 
-    def _transition(self, report_file):
+    def _transition(self, report_file, **stub):
         """Returns (exit_code_or_None, gh_argv_list)."""
         calls = []
+        self.refresh_calls = []
         args = argparse.Namespace(
             issue=1, state="resolved", report_file=report_file
         )
         buf, err = io.StringIO(), io.StringIO()
         code = None
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
-            with mock.patch.object(subprocess, "run", _gh_stub(record=calls)):
-                try:
-                    resolver.handle_transition(args)
-                except SystemExit as exc:
-                    code = exc.code
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(buf))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            stack.enter_context(
+                mock.patch.object(subprocess, "run", _gh_stub(record=calls, **stub))
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    resolver,
+                    "refresh_credentials",
+                    lambda repo: self.refresh_calls.append(repo),
+                )
+            )
+            stack.enter_context(_fresh_refresh_state())
+            try:
+                resolver.handle_transition(args)
+            except SystemExit as exc:
+                code = exc.code
         return code, calls
+
+    def test_an_expired_token_does_not_lose_the_report(self):
+        """The failure mode the poll fix would otherwise have made common.
+
+        `transition` runs in its own invocation, long after the `poll` that
+        filed the card, and every gh call it makes is check=True -- which exits
+        the process. An investigation that ran past the token's one-hour life
+        used to die on the first `issue comment`: before the report was posted,
+        before the labels moved, and before the scratch file was unlinked. The
+        work was lost, and the issue stayed pinned at status:in-progress until
+        the two-hour sweep escalated it with no record of what had been found.
+
+        Fixing only the poll would have made this *more* frequent, not less --
+        cards would now be filed in the twenty hours a day the poll used to
+        spend refusing to run. Hence the retry living in run_gh, which is the
+        one place all three entry points already pass through.
+        """
+        report = os.path.join(self.scratch, "report_1.md")
+        with open(report, "w", encoding="utf-8") as handle:
+            handle.write("# findings")
+
+        # The first write meets the expired token; the retry has a fresh one.
+        code, calls = self._transition(report, write_rcs=[1, 0])
+
+        self.assertIsNone(code)
+        self.assertEqual(self.refresh_calls, ["acme/toolkit"])
+        subcommands = [argv[1:3] for argv in calls]
+        self.assertIn(["issue", "comment"], subcommands)
+        self.assertIn(["issue", "edit"], subcommands)
+        self.assertIn(["issue", "close"], subcommands)
+        self.assertFalse(os.path.exists(report))
+
+    def test_a_permanently_broken_token_still_exits(self):
+        """The retry must not turn a hard failure into a silent success.
+
+        A fresh token that is rejected too is a genuine fault, and transition
+        exiting non-zero is what tells the caller the report was not posted.
+        """
+        report = os.path.join(self.scratch, "report_2.md")
+        with open(report, "w", encoding="utf-8") as handle:
+            handle.write("# findings")
+
+        # Every write fails, before and after the refresh.
+        code, _ = self._transition(report, write_rcs=[1])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.refresh_calls, ["acme/toolkit"])
+        # The report was not published, so it must not have been unlinked.
+        self.assertTrue(os.path.exists(report))
 
     def test_rejects_paths_outside_scratch(self):
         outside = os.path.join(self.scratch, "..", "secret.md")
@@ -499,6 +696,147 @@ class ReportFilePathGuardTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class RunGhRetryTest(unittest.TestCase):
+    """run_gh is the choke point every entry point passes through.
+
+    The credential is an installation token with a one-hour life and nothing
+    else on this path re-mints it, so any call can be the one that meets an
+    expiry. Putting the retry here rather than at a call site is what covers
+    `claim` and `transition`, whose calls are all check=True and therefore
+    exit the process on failure.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self._settings = resolver.SETTINGS_PATH
+        resolver.SETTINGS_PATH = _write_settings(
+            self._tmp.name, "https://github.com/acme/toolkit"
+        )
+        self.refresh_calls = []
+
+    def tearDown(self):
+        resolver.SETTINGS_PATH = self._settings
+        self._tmp.cleanup()
+
+    def _run(self, argv, check, **stub):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(subprocess, "run", _gh_stub(**stub)))
+            stack.enter_context(
+                mock.patch.object(
+                    resolver,
+                    "refresh_credentials",
+                    lambda repo: self.refresh_calls.append(repo),
+                )
+            )
+            stack.enter_context(_fresh_refresh_state())
+            return resolver.run_gh(argv, check=check)
+
+    def test_a_checked_call_survives_an_expired_token(self):
+        """The regression that would have cost an investigation its report."""
+        result = self._run(["issue", "comment", "1"], True, write_rcs=[1, 0])
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.refresh_calls, ["acme/toolkit"])
+
+    def test_a_genuinely_broken_call_still_exits(self):
+        """The retry must not paper over a fault a fresh token cannot fix."""
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                self._run(["issue", "comment", "1"], True, write_rcs=[1])
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(self.refresh_calls, ["acme/toolkit"])
+
+    def test_a_healthy_call_never_reaches_the_broker(self):
+        """Refresh on failure, not pre-emptively.
+
+        Every gh call minting first would be thousands of tokens a day from a
+        broker that exists to issue them sparingly. SOUL.md's self-healing rule
+        is the same shape: refresh on hitting an authentication error and retry
+        the command, not before one.
+        """
+        result = self._run(["issue", "list"], False)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.refresh_calls, [])
+
+    def test_a_missing_binary_never_reaches_the_broker(self):
+        """No token the broker can mint puts an absent binary back on PATH."""
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(subprocess, "run", side_effect=FileNotFoundError)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    resolver,
+                    "refresh_credentials",
+                    lambda repo: self.refresh_calls.append(repo),
+                )
+            )
+            stack.enter_context(_fresh_refresh_state())
+            result = resolver.run_gh(["auth", "status"], check=False)
+        self.assertEqual(result.returncode, 127)
+        self.assertEqual(self.refresh_calls, [])
+
+    def test_one_mint_covers_a_whole_invocation(self):
+        """The guard bounds an invocation to one mint, not a mint per call site.
+
+        Each call site retries at most once, so a single check=True call cannot
+        show the difference -- it exits at the first failure either way. This
+        uses a run of check=False calls, which is where an unbounded guard
+        would really bite: ensure_labels_exist alone makes four, so a
+        credential broken for a reason no token fixes would become four calls
+        to a broker that exists to issue tokens sparingly.
+        """
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(subprocess, "run", _gh_stub(write_rcs=[1]))
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    resolver,
+                    "refresh_credentials",
+                    lambda repo: self.refresh_calls.append(repo),
+                )
+            )
+            stack.enter_context(_fresh_refresh_state())
+            resolver.ensure_labels_exist("acme/toolkit")
+        self.assertEqual(self.refresh_calls, ["acme/toolkit"])
+
+    def test_an_unconfigured_repo_is_not_a_mint(self):
+        """A token has to be scoped to something.
+
+        With no repository configured there is nothing to ask the broker for,
+        so the original failure stands rather than becoming a broker call that
+        could only fail.
+        """
+        resolver.SETTINGS_PATH = _write_settings(self._tmp.name, "None")
+        result = self._run(["issue", "list"], False, list_rc=1)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.refresh_calls, [])
+
+    def test_an_unreadable_settings_file_is_not_a_new_crash(self):
+        """The repo lookup runs on a path that never touched the filesystem.
+
+        Anything it can raise would otherwise become a brand-new exception in
+        every gh caller, turning a recoverable command failure into a crash.
+        Failing to identify a repository means "do not mint", not "abort".
+        """
+        path = os.path.join(self._tmp.name, "unreadable.md")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("- **Git Repo:** acme/toolkit\n")
+        resolver.SETTINGS_PATH = path
+        os.chmod(path, 0o000)
+        try:
+            # Restored inside the test, not via addCleanup: that runs after
+            # tearDown, by which point the temporary directory is gone.
+            if os.access(path, os.R_OK):
+                self.skipTest("running as a user that ignores file permissions")
+            result = self._run(["issue", "list"], False, list_rc=1)
+        finally:
+            os.chmod(path, 0o600)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.refresh_calls, [])
+
+
 class RunGhTest(unittest.TestCase):
     """A missing `gh` binary must not look like a clean result."""
 
@@ -521,7 +859,11 @@ class RunGhTest(unittest.TestCase):
         They need different operators and different fixes, so collapsing them
         into one reason code would send whoever reads the alert to the wrong
         place -- the same conflation this script exists to avoid.
+
+        It must also not attempt a refresh: no token the broker can mint puts an
+        absent binary back on PATH, so that call could only ever waste a mint.
         """
+        refreshed = []
         with TemporaryDirectory() as tmp:
             original = resolver.SETTINGS_PATH
             resolver.SETTINGS_PATH = _write_settings(
@@ -529,18 +871,29 @@ class RunGhTest(unittest.TestCase):
             )
             try:
                 buf = io.StringIO()
-                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(
-                    io.StringIO()
-                ):
-                    with mock.patch.object(
-                        subprocess, "run", side_effect=FileNotFoundError
-                    ):
-                        resolver.handle_poll(argparse.Namespace())
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(contextlib.redirect_stdout(buf))
+                    stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                    stack.enter_context(
+                        mock.patch.object(
+                            subprocess, "run", side_effect=FileNotFoundError
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            resolver,
+                            "refresh_credentials",
+                            lambda repo: refreshed.append(repo),
+                        )
+                    )
+                    stack.enter_context(_fresh_refresh_state())
+                    resolver.handle_poll(argparse.Namespace())
                 payload = json.loads(buf.getvalue())
             finally:
                 resolver.SETTINGS_PATH = original
         self.assertEqual(payload["status"], "ERROR")
         self.assertEqual(payload["reason"], "GH_CLI_NOT_FOUND")
+        self.assertEqual(refreshed, [])
 
 
 if __name__ == "__main__":
