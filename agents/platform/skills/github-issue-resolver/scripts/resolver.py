@@ -229,12 +229,16 @@ def _refresh_credentials_once() -> bool:
     try:
         refresh_credentials(repo)
     except Exception as exc:
-        # The durable record of *why* is the credential sidecar's own log,
-        # which sees the broker's actual response; this line is for an operator
-        # running the script by hand. Neither the message nor the reason code
-        # the caller derives from `_refresh_failed` carries the detail, because
-        # github_scan_gate renders `reason` into a chat room and a broker error
-        # body is not something to forward unread.
+        # This line is for an operator running the script by hand; the reason
+        # code the caller derives from `_refresh_failed` deliberately carries no
+        # detail, because github_scan_gate renders `reason` into a chat room and
+        # a broker error body is not something to forward unread.
+        #
+        # Do not read this as "the detail is recorded elsewhere" -- on the proxy
+        # path it is not preserved anywhere. github_token_refresh raises a fixed
+        # string, the sidecar logs the helper's exit code and drops its stderr,
+        # and the gate reads our stderr only when stdout is empty, which it
+        # never is here. Diagnosing a refusal means the broker's own logs.
         print(
             f"resolver: GitHub credential refresh failed: "
             f"{type(exc).__name__}: {exc}",
