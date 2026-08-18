@@ -749,9 +749,10 @@ class RunGhRetryTest(unittest.TestCase):
         """Refresh on failure, not pre-emptively.
 
         Every gh call minting first would be thousands of tokens a day from a
-        broker that exists to issue them sparingly. SOUL.md's self-healing rule
-        is the same shape: refresh on hitting an authentication error and retry
-        the command, not before one.
+        broker that exists to issue them sparingly. SOUL.md's Dynamic
+        Self-Healing rule -- the nested bullet under item 2 of §3, restated as
+        step 4 of §4's Worker Recovery Ladder -- is the same shape: refresh on
+        hitting an authentication error and retry the command, not before one.
         """
         result = self._run(["issue", "list"], False)
         self.assertEqual(result.returncode, 0)
