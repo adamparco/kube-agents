@@ -87,13 +87,15 @@ def _register_fake_modules() -> None:
         def create_adapter(self, name, config):
             return None
 
-        # ``scope`` is keyword-only upstream as of Hermes v2026.8.13. A fake
-        # that omits it lets a wrapper which also omits it pass every test in
-        # this file and then fail on the first real registration, which is how
-        # #718 shipped a gateway with no chat adapters at all.
+        # Upstream made ``scope`` keyword-only in Hermes v2026.8.13. This
+        # stand-in is what install() captures as the original wherever a test
+        # does not install its own, so it has to accept what the real registry
+        # accepts -- a fake stuck on the old signature agrees with a wrapper
+        # stuck on the old signature, and #718 shipped a gateway with no chat
+        # adapters through exactly that blind spot. The forwarding itself is
+        # exercised through _register in SlackStandaloneRelaySendTest.setUp.
         def register(self, entry, *, scope=None):
             self.registered = entry
-            self.registered_scope = scope
 
     @dataclasses.dataclass
     class PlatformEntry:
