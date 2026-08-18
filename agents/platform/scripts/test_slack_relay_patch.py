@@ -87,8 +87,13 @@ def _register_fake_modules() -> None:
         def create_adapter(self, name, config):
             return None
 
-        def register(self, entry):
+        # ``scope`` is keyword-only upstream as of Hermes v2026.8.13. A fake
+        # that omits it lets a wrapper which also omits it pass every test in
+        # this file and then fail on the first real registration, which is how
+        # #718 shipped a gateway with no chat adapters at all.
+        def register(self, entry, *, scope=None):
             self.registered = entry
+            self.registered_scope = scope
 
     @dataclasses.dataclass
     class PlatformEntry:
@@ -597,9 +602,11 @@ class SlackStandaloneRelaySendTest(unittest.TestCase):
                 delattr(self.registry_class, sentinel)
 
         self.registered = []
+        self.register_scopes = []
 
-        def _register(_self, entry):
+        def _register(_self, entry, *, scope=None):
             self.registered.append(entry)
+            self.register_scopes.append(scope)
 
         self.registry_class.register = _register
 
@@ -662,6 +669,29 @@ class SlackStandaloneRelaySendTest(unittest.TestCase):
         self.registry.register(entry)
         self.assertIs(entry.standalone_sender_fn, self.original_standalone_send)
         self.assertIsNone(entry.is_connected)
+
+    def test_a_scoped_registration_is_forwarded_untouched(self):
+        entry = self.entry_class(
+            name="slack", standalone_sender_fn=self.original_standalone_send
+        )
+        self.registry.register(entry, scope="plugin:example")
+        self.assertEqual([entry], self.registered)
+        self.assertEqual(["plugin:example"], self.register_scopes)
+
+    def test_a_scoped_registration_of_another_platform_still_lands(self):
+        """The failure mode that takes the whole gateway down.
+
+        This wrapper is installed on the class, so a Slack patch that cannot
+        accept the registry's current keywords does not merely lose Slack --
+        every platform registers through it, and the gateway comes up with
+        Google Chat and A2A missing too.
+        """
+        entry = self.entry_class(
+            name="google_chat", standalone_sender_fn=self.original_standalone_send
+        )
+        self.registry.register(entry, scope="plugin:google_chat")
+        self.assertEqual([entry], self.registered)
+        self.assertEqual(["plugin:google_chat"], self.register_scopes)
 
     def test_an_existing_status_check_still_decides_when_a_token_exists(self):
         os.environ["SLACK_BOT_TOKEN"] = "xoxb-local"

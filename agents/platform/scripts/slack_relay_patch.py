@@ -709,7 +709,7 @@ def install() -> None:
         PlatformRegistry, "_slack_standalone_relay_patched", False
     ):
 
-        def register(self: Any, entry: Any) -> Any:
+        def register(self: Any, entry: Any, *args: Any, **kwargs: Any) -> Any:
             if getattr(entry, "name", None) == "slack":
                 try:
                     patch_slack_entry(entry)
@@ -719,7 +719,23 @@ def install() -> None:
                     # import into a debug line. Raising here would disable the
                     # relay for the life of the process, and say nothing.
                     LOGGER.warning("Slack relay entry patch failed", exc_info=True)
-            return original_registry_register(self, entry)
+            # Forward the rest of the call blind instead of restating today's
+            # signature. This wrapper sits on the class, so every platform
+            # registers through it and one TypeError here takes Slack, Google
+            # Chat and A2A down together -- the gateway comes up with the
+            # built-in adapters missing and the pod answers no chat at all.
+            # v2026.8.13 added a keyword-only ``scope`` and did exactly that
+            # (#718 bumped the base image without touching this line); spelling
+            # the arguments out again would re-arm the same failure on the next
+            # bump.
+            #
+            # One residual difference from calling the original directly: when
+            # ``scope`` is omitted for a plugin-sourced entry the registry
+            # infers it from the call stack at a fixed depth, and this frame
+            # shifts that read. Nothing in the runtime hits it -- the gateway's
+            # plugin loader always passes ``scope`` explicitly -- but a caller
+            # that relies on inference would be attributed to this module.
+            return original_registry_register(self, entry, *args, **kwargs)
 
         PlatformRegistry.register = register
         PlatformRegistry._slack_standalone_relay_patched = True
