@@ -36,6 +36,28 @@ SCRATCH_DIR = "/opt/data/scratch"
 # distinguishable from a gh command that ran and failed.
 GH_MISSING_RC = 127
 
+# The credential sidecar's own timeout (`_execute` in credential_proxy.py),
+# surfaced through credential_proxy_client. Excluded from the retry because a
+# command that ran for the full timeout may well have landed its write; see
+# _looks_like_auth_failure.
+GH_TIMEOUT_RC = 124
+
+# What `gh` prints when the credential is the problem, as opposed to the
+# repository, the network, or the rate limit. Matched case-insensitively
+# against stderr: the REST paths emit `HTTP 401: Bad credentials`, the GraphQL
+# ones `requires authentication`, and `auth status` (which is handled
+# separately, being the explicit question) `not logged in` / `token is invalid`.
+_GH_AUTH_FAILURE = re.compile(
+    r"HTTP 401"
+    r"|bad credentials"
+    r"|requires authentication"
+    r"|authentication failed"
+    r"|not logged in"
+    r"|token is invalid"
+    r"|invalid token",
+    re.IGNORECASE,
+)
+
 # Per-process credential-refresh state, owned by _refresh_credentials_once.
 # `_attempted` bounds an invocation to a single mint; `_failed` lets handle_poll
 # tell "the broker refused" apart from "nobody configured credentials", which
@@ -196,6 +218,35 @@ def _run_gh_once(args: list) -> subprocess.CompletedProcess:
         )
 
 
+def _looks_like_auth_failure(args: list, result) -> bool:
+    """Does this failure look like one a fresh token would fix?
+
+    The retry exists for an expired installation token, and minting on anything
+    else spends a credential on a fault no credential can repair. `gh auth
+    status` passes whenever *any* host is authenticated, so a repository the
+    token cannot reach fails only at `issue list` with a 404 -- and gating the
+    retry on ``returncode != 0`` alone turned that permanent misconfiguration
+    into a mint on every ten-minute tick, indefinitely.
+
+    Two ways in. `auth status` failing needs no pattern: asking whether the
+    credential works is the command's whole purpose, so a non-zero exit *is*
+    the authentication answer, and this is the path the reported expiry took.
+    Every other subcommand is judged on what gh printed.
+
+    ``GH_TIMEOUT_RC`` is excluded rather than pattern-matched. A command killed
+    at the sidecar's timeout may already have landed its write, and a retry
+    would repeat it -- `handle_transition` posts the report with `issue
+    comment`, which is not idempotent.
+    """
+    if result.returncode == 0:
+        return False
+    if result.returncode in (GH_MISSING_RC, GH_TIMEOUT_RC):
+        return False
+    if args[:2] == ["auth", "status"]:
+        return True
+    return bool(_GH_AUTH_FAILURE.search(result.stderr or ""))
+
+
 def _refresh_credentials_once() -> bool:
     """Mint a fresh token, at most once per process.
 
@@ -265,11 +316,13 @@ def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
     leaving the issue pinned at `status:in-progress` until the stale sweep
     escalated it.
 
-    ``GH_MISSING_RC`` is excluded: no token puts an absent binary back on PATH,
-    so refreshing there is a guaranteed-useless call to the sidecar.
+    Only an *authentication* failure earns the retry. ``_looks_like_auth_failure``
+    owns that judgement, including why a missing binary and a sidecar timeout are
+    excluded: no token puts an absent binary back on PATH, and a 404, a rate
+    limit, or a timeout is not a credential problem either.
     """
     result = _run_gh_once(args)
-    if result.returncode not in (0, GH_MISSING_RC) and _refresh_credentials_once():
+    if _looks_like_auth_failure(args, result) and _refresh_credentials_once():
         result = _run_gh_once(args)
 
     if check and result.returncode != 0:

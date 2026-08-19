@@ -66,6 +66,17 @@ def _sequence(values):
     return take
 
 
+# What gh prints when the installation token has expired, copied in shape from
+# the REST error it emits. The retry predicate reads stderr, so a stub that
+# leaves it empty is a stub of a *non-auth* failure -- which is exactly what a
+# 404 on an unreachable repository is, and why the default here stays "".
+GH_AUTH_STDERR = "gh: HTTP 401: Bad credentials (https://api.github.com/graphql)"
+
+# The 404 an installation token without scope for the repository produces. Named
+# so a test asserting "this must not mint" says which failure it means.
+GH_NOT_FOUND_STDERR = "gh: Not Found (HTTP 404)"
+
+
 def _gh_stub(
     auth_rc: int = 0,
     list_rc: int = 0,
@@ -73,6 +84,8 @@ def _gh_stub(
     record=None,
     auth_rcs=None,
     write_rcs=None,
+    write_stderr: str = "",
+    list_stderr: str = "",
 ):
     """A ``subprocess.run`` replacement that routes on the gh subcommand.
 
@@ -82,6 +95,10 @@ def _gh_stub(
     twice and the whole point of it is that the second answer can differ from
     the first, which a single exit code cannot express. ``auth_rc`` stays as
     the one-answer shorthand.
+
+    ``write_stderr``/``list_stderr`` exist because an exit code alone no longer
+    decides whether run_gh retries: ``_looks_like_auth_failure`` reads stderr,
+    so a failure's *text* is now part of the case being stubbed.
     """
     next_auth = _sequence(auth_rcs if auth_rcs else [auth_rc])
     next_write = _sequence(write_rcs if write_rcs else [0])
@@ -93,8 +110,8 @@ def _gh_stub(
         if sub[:2] == ["auth", "status"]:
             return subprocess.CompletedProcess(argv, next_auth(), "", "")
         if sub[:2] == ["issue", "list"]:
-            return subprocess.CompletedProcess(argv, list_rc, list_stdout, "")
-        return subprocess.CompletedProcess(argv, next_write(), "[]", "")
+            return subprocess.CompletedProcess(argv, list_rc, list_stdout, list_stderr)
+        return subprocess.CompletedProcess(argv, next_write(), "[]", write_stderr)
 
     return run
 
@@ -478,10 +495,17 @@ class HandlePollRoutingTest(unittest.TestCase):
         at `issue list` -- which previously exited non-zero having printed no
         JSON at all, leaving the skill with nothing to branch on.
         """
-        payload = self._poll("https://github.com/acme/toolkit", list_rc=1)
+        payload = self._poll(
+            "https://github.com/acme/toolkit",
+            list_rc=1,
+            list_stderr=GH_NOT_FOUND_STDERR,
+        )
         self.assertEqual(payload["status"], "ERROR")
         self.assertEqual(payload["reason"], "REPO_UNREACHABLE")
         self.assertEqual(payload["repository"], "acme/toolkit")
+        # And it costs nothing at the broker: this tick recurs every ten
+        # minutes for as long as the repository stays wrong.
+        self.assertEqual(self.refresh_calls, [])
 
     def test_healthy_and_quiet_is_no_issues(self):
         payload = self._poll("https://github.com/acme/toolkit")
@@ -623,7 +647,9 @@ class ReportFilePathGuardTest(unittest.TestCase):
             handle.write("# findings")
 
         # The first write meets the expired token; the retry has a fresh one.
-        code, calls = self._transition(report, write_rcs=[1, 0])
+        code, calls = self._transition(
+            report, write_rcs=[1, 0], write_stderr=GH_AUTH_STDERR
+        )
 
         self.assertIsNone(code)
         self.assertEqual(self.refresh_calls, ["acme/toolkit"])
@@ -644,7 +670,7 @@ class ReportFilePathGuardTest(unittest.TestCase):
             handle.write("# findings")
 
         # Every write fails, before and after the refresh.
-        code, _ = self._transition(report, write_rcs=[1])
+        code, _ = self._transition(report, write_rcs=[1], write_stderr=GH_AUTH_STDERR)
 
         self.assertEqual(code, 1)
         self.assertEqual(self.refresh_calls, ["acme/toolkit"])
@@ -733,7 +759,12 @@ class RunGhRetryTest(unittest.TestCase):
 
     def test_a_checked_call_survives_an_expired_token(self):
         """The regression that would have cost an investigation its report."""
-        result = self._run(["issue", "comment", "1"], True, write_rcs=[1, 0])
+        result = self._run(
+            ["issue", "comment", "1"],
+            True,
+            write_rcs=[1, 0],
+            write_stderr=GH_AUTH_STDERR,
+        )
         self.assertEqual(result.returncode, 0)
         self.assertEqual(self.refresh_calls, ["acme/toolkit"])
 
@@ -741,7 +772,12 @@ class RunGhRetryTest(unittest.TestCase):
         """The retry must not paper over a fault a fresh token cannot fix."""
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as ctx:
-                self._run(["issue", "comment", "1"], True, write_rcs=[1])
+                self._run(
+                    ["issue", "comment", "1"],
+                    True,
+                    write_rcs=[1],
+                    write_stderr=GH_AUTH_STDERR,
+                )
         self.assertEqual(ctx.exception.code, 1)
         self.assertEqual(self.refresh_calls, ["acme/toolkit"])
 
@@ -788,7 +824,11 @@ class RunGhRetryTest(unittest.TestCase):
         """
         with contextlib.ExitStack() as stack:
             stack.enter_context(
-                mock.patch.object(subprocess, "run", _gh_stub(write_rcs=[1]))
+                mock.patch.object(
+                    subprocess,
+                    "run",
+                    _gh_stub(write_rcs=[1], write_stderr=GH_AUTH_STDERR),
+                )
             )
             stack.enter_context(
                 mock.patch.object(
@@ -800,6 +840,49 @@ class RunGhRetryTest(unittest.TestCase):
             stack.enter_context(_fresh_refresh_state())
             resolver.ensure_labels_exist("acme/toolkit")
         self.assertEqual(self.refresh_calls, ["acme/toolkit"])
+
+    def test_an_unreachable_repo_is_not_a_mint(self):
+        """A 404 is not an expiry, and it never stops being a 404.
+
+        `gh auth status` passes whenever any host is authenticated, so a
+        repository the installation token cannot reach fails only here. Gating
+        the retry on a non-zero exit alone made that permanent misconfiguration
+        mint on every tick -- 144 a day at `*/10`, indefinitely, for a token
+        that cannot fix it.
+        """
+        result = self._run(
+            ["issue", "list"], False, list_rc=1, list_stderr=GH_NOT_FOUND_STDERR
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.refresh_calls, [])
+
+    def test_a_rate_limit_is_not_a_mint(self):
+        """Throttling is not an authentication problem, and minting adds load."""
+        result = self._run(
+            ["issue", "list"],
+            False,
+            list_rc=1,
+            list_stderr="gh: API rate limit exceeded (HTTP 403)",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.refresh_calls, [])
+
+    def test_a_sidecar_timeout_is_never_retried(self):
+        """A timed-out write may already have landed, so replaying it can double-post.
+
+        `_execute` in credential_proxy.py kills a command at its timeout and
+        credential_proxy_client surfaces 124. `handle_transition` posts the
+        report with `issue comment`, which is not idempotent, so this exit code
+        is excluded whatever the stderr says.
+        """
+        result = self._run(
+            ["issue", "comment", "1"],
+            False,
+            write_rcs=[124],
+            write_stderr=GH_AUTH_STDERR,
+        )
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(self.refresh_calls, [])
 
     def test_an_unconfigured_repo_is_not_a_mint(self):
         """A token has to be scoped to something.
