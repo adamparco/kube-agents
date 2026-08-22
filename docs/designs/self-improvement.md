@@ -1,10 +1,12 @@
 # Self-Improvement — kube-agents as its own subject
 
-> **STATUS — proposal; nothing here is implemented.** No script, chart template, values key or
-> cron entry described below exists on `main`. Identifiers are this document's proposals, not the
-> repository's vocabulary. Where the design depends on something that does exist, the file and line
-> are cited; where it depends on something that does not, the gap is called out rather than assumed
-> away.
+> **STATUS — implemented, off by default.** The runner lives in
+> [`agents/selfimprove/`](../../agents/selfimprove/), the manifests in
+> [`charts/kube-agents/templates/self-improvement.yaml`](../../charts/kube-agents/templates/self-improvement.yaml)
+> and its minter sibling, the Google identity in
+> [`terraform/modules/kube-agents-selfimprove/`](../../terraform/modules/kube-agents-selfimprove/).
+> `selfImprovement.enabled` defaults to false and `mode` defaults to `report-only`, so an install
+> that does nothing gets nothing. §12 records where the built thing diverged from this document.
 
 **Scope:** A disabled-by-default hourly investigation of kube-agents itself — its source, its
 harness, and the installation it is running in — which grades what it finds and, above a
@@ -265,21 +267,18 @@ CronJob  kube-agents-selfimprove          schedule 0 * * * *; not rendered at al
         └── container     runner             the agent image, HERMES_HOME=/home/selfimprove
 ```
 
-The run is: scaffold a private profile onto the `emptyDir`; clone this repository at the deployed
-revision and, where a harness signal is in scope, the pinned Hermes tag to diff `/opt/hermes`
-against; execute one agent turn; write the ledger; exit. There is no gateway, no chat
-platform, no dashboard and no PVC. `hermes cron tick` is the invocation, because it is the one
-path in this repository demonstrated to run an agent turn to completion without a gateway —
-[`agents/chat/scripts/profile_cron_tick.py`](../../agents/chat/scripts/profile_cron_tick.py)
-spawns exactly that, and its docstring is explicit that this is the same path a manual tick takes.
-The Kubernetes schedule supplies the timing; the profile's cron store holds one job, due always,
-so the tick always fires.
+The run is: scaffold a private profile onto the `emptyDir`; fetch this repository at the deployed
+revision; execute one agent turn; write the ledger; exit. There is no gateway, no chat platform, no
+dashboard and no PVC. `hermes -z PROMPT --cli` is the invocation — a headless one-shot turn that
+takes the brief on the command line. (This document originally proposed `hermes cron tick`; §12
+records why that changed.)
 
-**The credential proxy must be a native sidecar**, declared as an `initContainer` with
-`restartPolicy: Always`, not as a second `containers` entry. A long-running container in an
-ordinary `containers` list never exits, so the Job never completes and `concurrencyPolicy: Forbid`
-blocks every subsequent run forever. This is a one-word difference in the manifest with a failure
-mode that takes a day to diagnose.
+**The credential proxy, where a mode needs one, must be a native sidecar** — declared as an
+`initContainer` with `restartPolicy: Always`, not as a second `containers` entry. A long-running
+container in an ordinary `containers` list never exits, so the Job never completes and
+`concurrencyPolicy: Forbid` blocks every subsequent run forever. This is a one-word difference in
+the manifest with a failure mode that takes a day to diagnose. It renders only for `fork` and
+`upstream`; `report-only` has no GitHub identity and therefore no proxy at all.
 
 `concurrencyPolicy: Forbid` is also the whole of the mutual-exclusion story. There is no lease,
 because there is no shared mutable state to serialise access to — the design's ledger (§7) is the
@@ -626,12 +625,11 @@ without someone having looked at what its ledger actually contains.
 
 ## 11. Limits
 
-- **Nothing here is implemented.** The chart template, the runner, the ledger schema, the profile
-  and its skill, and the Dockerfile revision stamp all have to be written.
-- **Revision identification is a fallback until the image is stamped.** The registry-digest path in
-  §2 works today for anything CI built, costs a registry read grant, and resolves to nothing for a
-  dev-rebuild image tagged from `vars.sh`. On such an install the loop cannot establish what it is
-  looking at and should refuse to run rather than guess.
+- **Revision identification depends on the build passing `GIT_SHA`.** The stamp in §2 is written by
+  the Dockerfile from a build argument, and the three build paths in this repository all pass it —
+  but a build that does not produces an image the loop refuses to investigate, which is the
+  intended failure and not a silent one. `selfImprovement.allowUnstampedImage` accepts the risk and
+  reads source at a named ref instead; every finding then says so.
 - **Cross-install deduplication is out of scope.** Each install's ledger is its own, so the same bug
   found on ten installs is ten findings and, above the gate, up to ten pull requests. The mitigation
   is `report-only` as the default; a shared ledger would need a service this project does not have.
@@ -646,3 +644,38 @@ without someone having looked at what its ledger actually contains.
 - **The loop cannot validate a fix against a running install**, by construction. Everything it
   proposes is reviewed and exercised by a human or by CI. That is the correct division: it is a
   detector with a strong evidence habit, not an autonomous committer.
+
+## 12. Where the implementation diverged
+
+Four things are built differently from what the sections above proposed. Each is a decision made
+while implementing, recorded here so a reader of the design is not surprised by the code.
+
+**`hermes -z PROMPT --cli`, not `hermes cron tick`.** §5.2 chose the cron path because it was the
+one invocation demonstrated to run a turn to completion without a gateway. It also requires a cron
+store on the profile holding one job contrived to be always due — state to scaffold, and a second
+scheduler underneath the Kubernetes one that decides whether the run happens. `hermes -z` takes the
+brief as an argument and returns when the turn ends, so the CronJob schedule is the only schedule
+and the brief the runner composed is provably the brief that ran. It was exercised headless in this
+image before the switch.
+
+**No credential proxy under `report-only`.** §5.2 drew the sidecar unconditionally. It renders only
+for `fork` and `upstream`. The mode's guarantee is that nothing leaves the cluster, and the way to
+mean that is for the egress path not to exist — rather than to be present, permitted, and relied on
+not to be called. The same conditional governs the shim directory on `PATH`, so under `report-only`
+there is no `git` and no `gh` on it. Telemetry reads use the Google Python clients against the
+investigator's Workload Identity, and Kubernetes reads use the in-cluster client against the pod's
+RBAC, neither of which needs the proxy.
+
+**A tarball, not a clone.** §5.2 said clone. The runner fetches
+`codeload.github.com/<repo>/tar.gz/<sha>` and extracts it with `filter="data"`. It needs one
+immutable tree at one commit, not history, and this way the fetch is a public anonymous HTTPS GET
+with no credential and no `git` binary — which is what lets `report-only` keep both off the pod.
+
+**Harness attribution reads the patch series, not an upstream checkout.** §5.2 proposed also
+fetching the pinned Hermes tag to diff `/opt/hermes` against. The runner does not. It reads the
+pin from the fetched `tags.env` and hands the agent
+[`deploy/docker/patches/`](../../deploy/docker/patches/) — this repository's own record of every
+deliberate divergence from stock Hermes. A diff against upstream answers "what is different", most
+of which is intended; the patch series answers "what did we change and why", which is the question
+attribution actually asks. The cost is that an _undocumented_ divergence — a Hermes behaviour no
+patch here explains — is invisible to the loop.
