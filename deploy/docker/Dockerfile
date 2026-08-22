@@ -1087,7 +1087,17 @@ COPY --chown=hermes:hermes agents/platform/docs/glossary.md \
 
 
 # 5.5. Install and enable hermes-otel plugin in /opt/defaults
-RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel && \
+#
+# The source is `briancaffey/hermes-otel/hermes_otel`, not the repository root.
+# Upstream split the plugin into that subdirectory
+# (briancaffey/hermes-otel#53) because Hermes security-scans a plugin's entire
+# file tree before installing it and grades the repo's docs and test fixtures as
+# executable code. Installing the root now unpacks documentation and Compose
+# examples with no plugin.yaml among them, and the config.yaml this RUN edits is
+# written under plugins/hermes-otel/ instead — so the python3 line below fails
+# on a missing file. The install path is unchanged (plugin.yaml decides it, not
+# the argument), which is why only this one token moves.
+RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel/hermes_otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
 
