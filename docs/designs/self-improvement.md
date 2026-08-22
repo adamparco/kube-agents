@@ -200,8 +200,8 @@ than it saves it.
 | #   | Signal                                      | Where the evidence is                                                                | What a finding must show                                                                    |
 | --- | ------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
 | 1   | Errors                                      | `log_source: agent-file` at ERROR, container stderr, CR `.status` conditions, events | The stack or message, the code path in the cloned revision, and how often it fired          |
-| 2   | Inefficiency — missing permission or tool   | Denials from `command_policy.py`, `gcloud`/`kubectl` 403s, `command not found`       | The refused call, whether the refusal was correct, and the cost of the retry loop it caused |
-| 2   | Inefficiency — unneeded loop or turn        | Span trees; turn counts per session; repeated identical tool calls in one session    | The turn that added nothing, and what in the prompt or harness produced it                  |
+| 2a  | Inefficiency — missing permission or tool   | Denials from `command_policy.py`, `gcloud`/`kubectl` 403s, `command not found`       | The refused call, whether the refusal was correct, and the cost of the retry loop it caused |
+| 2b  | Inefficiency — unneeded loop or turn        | Span trees; turn counts per session; repeated identical tool calls in one session    | The turn that added nothing, and what in the prompt or harness produced it                  |
 | 3   | Latency                                     | Span durations, p50/p95 per tool and per skill, cron run durations                   | The span that dominates, compared against the same span in earlier runs                     |
 | 4   | Wrong, inaccurate or missing user responses | Sessions ending without a delivered reply; kanban cards `blocked` with `result` NULL | The session, what was asked, what was returned, and where the reply was lost                |
 | 5   | Failed chat delivery                        | `last_delivery_error` on cron jobs; the delivery paths in the credential proxy       | The target that failed, the platform, and whether the target was resolvable at all          |
@@ -259,14 +259,15 @@ A Kubernetes `CronJob`, rendered by the chart only when the feature is switched 
 same agent image with a private Hermes home on an `emptyDir`.
 
 ```
-CronJob  kube-agents-selfimprove          schedule 0 * * * *, suspended unless enabled
+CronJob  kube-agents-selfimprove          schedule 0 * * * *; not rendered at all when disabled
   └── Job (concurrencyPolicy: Forbid, backoffLimit: 0, activeDeadlineSeconds)
         ├── initContainer credential-proxy   restartPolicy: Always  ← native sidecar
         └── container     runner             the agent image, HERMES_HOME=/home/selfimprove
 ```
 
-The run is: scaffold a private profile onto the `emptyDir`; clone the two repositories at the
-revisions from §2; execute one agent turn; write the ledger; exit. There is no gateway, no chat
+The run is: scaffold a private profile onto the `emptyDir`; clone this repository at the deployed
+revision and, where a harness signal is in scope, the pinned Hermes tag to diff `/opt/hermes`
+against; execute one agent turn; write the ledger; exit. There is no gateway, no chat
 platform, no dashboard and no PVC. `hermes cron tick` is the invocation, because it is the one
 path in this repository demonstrated to run an agent turn to completion without a gateway —
 [`agents/chat/scripts/profile_cron_tick.py`](../../agents/chat/scripts/profile_cron_tick.py)

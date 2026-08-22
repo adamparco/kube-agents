@@ -1292,6 +1292,24 @@ assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r'
 # into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
+# The self-improvement runner: its persona, its profile config, its two skills,
+# and the three Python modules that drive one hourly run
+# (docs/designs/self-improvement.md). Like the cluster template above, this is a
+# TEMPLATE — selfimprove_run.py copies it onto an emptyDir at the start of each
+# run, so nothing here is ever the live profile.
+#
+# It ships in the agent image and not one of its own, which is the single thing
+# the loop shares with the rest of the install. The reason is in the design's
+# §2: the runner's first job is to say which commit the observed pod is running,
+# and the only statement of that nobody has to be trusted to keep in step is the
+# one carried by the very image the pod was started from. A separate image would
+# have to be told, and something would eventually tell it wrong.
+#
+# It costs one layer and the chain is bounded at 128 — see the layer-budget note
+# at the top of this file. Its permissions ride the normalization RUN below
+# rather than buying a second.
+COPY --chown=hermes:hermes agents/selfimprove/ /opt/selfimprove/
+
 # Plugins land in the shared plugin root regardless of which profile owns them —
 # /opt/hermes/plugins is the only path Hermes resolves them from. The source
 # directory records ownership: kube_agents_memory needs the user identity that
@@ -1314,13 +1332,13 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /opt/hermes/plugins/
 # Every path below is guaranteed to exist at this point: /opt/hermes/skills and
 # /opt/hermes/plugins come from the base image, the rest are COPYed above.
 RUN set -eu; \
-    chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template /opt/platform-template /opt/chat-template; \
-    for d in /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools /opt/cluster-template /opt/platform-template /opt/chat-template; do \
+    chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template /opt/platform-template /opt/chat-template /opt/selfimprove; \
+    for d in /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools /opt/cluster-template /opt/platform-template /opt/chat-template /opt/selfimprove; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + ; \
-    for d in /opt/hermes/skills /opt/platform-template /opt/cluster-template; do \
+    for d in /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/selfimprove; do \
         find "$d" -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
     done
 
@@ -1368,6 +1386,35 @@ RUN set -eu; \
 RUN set -eu; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
       || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2
+
+# The revision stamp: which commit this image was built from.
+#
+# Nothing else in the image answers that question. `.dockerignore` excludes
+# `.git`, so there is no repository to interrogate; the operator's
+# manifest_helpers.go omits a version from what it renders; and the registry
+# knows only because docker-build.yml happens to tag with `${{ github.sha }}` —
+# a convention, not a guarantee, and one a local `make dev-rebuild-agent` does
+# not follow. An agent asked to audit "the deployed code" therefore had no
+# grounded way to say which code that was, and would have reasoned about `main`.
+# See docs/designs/self-improvement.md §2.
+#
+# LAST in the stage, and that placement is deliberate. GIT_SHA changes on every
+# commit, and an ARG invalidates every layer BELOW it — declared any higher, the
+# compileall pass above (and, higher still, the config merges) would rebuild on
+# every single commit. Here the churn is bounded to this one instruction, which
+# writes 100 bytes.
+#
+# Both default to empty rather than to a placeholder like "unknown": the runner
+# treats an empty revision as a refusal to investigate, and a plausible-looking
+# default would turn that refusal into a confident wrong answer. A build that
+# wants the loop to work passes --build-arg GIT_SHA="$(git rev-parse HEAD)".
+ARG GIT_SHA=""
+ARG IMAGE_TAG=""
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+LABEL org.opencontainers.image.source="https://github.com/gke-labs/kube-agents"
+RUN set -eu; \
+    printf '{"revision":"%s","tag":"%s"}\n' "${GIT_SHA}" "${IMAGE_TAG}" > /opt/build-info.json; \
+    chmod 644 /opt/build-info.json
 
 USER 10000:10000
 
