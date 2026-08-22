@@ -443,10 +443,10 @@ def build_brief(
         A JSON array at %(findings_path)s is the only channel out of this run.
 
         Write that file EARLY and REWRITE IT AS YOU GO -- the moment you have your first confirmed
-        finding, not at the end. Your iteration budget is finite and you will not be warned as it
-        runs out; a turn cut off part-way loses everything it has not already written. Two solid
-        findings on disk beat a better list you never reached. Rewriting is cheap, so do it after
-        every finding you confirm.
+        finding, not at the end. You have about 90 model calls for the whole run and you will not
+        be warned as they run out; a turn cut off part-way loses everything it has not already
+        written. Two solid findings on disk beat a better list you never reached. Rewriting is
+        cheap, so do it after every finding you confirm.
 
         An empty array is a valid and common answer -- a run that finds nothing is worth more than
         a run that promotes a guess to fill the file. Write `[]` to say so, early, and replace it
@@ -486,6 +486,15 @@ def run_agent(prompt: str, home: str, timeout: int, label: str) -> Tuple[int, st
     environment["HOME"] = os.path.join(home, "home")
     os.makedirs(environment["HOME"], exist_ok=True)
     environment.setdefault("PYTHONPATH", os.path.join(TEMPLATE_DIR, "scripts"))
+    # The upstream Hermes image ships HERMES_WRITE_SAFE_ROOT=/opt/data, which is
+    # right for the Platform Agent -- /opt/data is its PVC -- and fatal here.
+    # This run's home is an emptyDir somewhere else entirely, so every
+    # `write_file` the agent attempts is denied, including the findings.json the
+    # brief spends a paragraph asking for. The run still exits 0 and reports
+    # nothing found. Pointing the variable at the run's own home keeps the
+    # confinement, which the isolation ledger wants, and puts the one file that
+    # matters inside it.
+    environment["HERMES_WRITE_SAFE_ROOT"] = home
     usage_path = os.path.join(home, "usage-%s.json" % _slug(label))
     started = time.time()
     log("agent turn (%s) starting, budget %ds" % (label, timeout))

@@ -617,6 +617,31 @@ the Platform Agent on every write — an hourly restart caused by the thing that
 observing it without touching it. The ledger is a chart-owned object the agent's Deployment does not
 reference, and it must stay that way.
 
+**The turn ends early and the run reports success.** A `hermes -z` turn that exhausts its iteration
+budget exits 0 after printing a warning, so a truncated investigation and a clean run that found
+nothing are the same event from outside. That is what the first live run was: 34 minutes of real
+evidence-gathering recorded as `outcome=ok findings=0`. The runner passes `--usage-file` and logs
+`completed` and `api_calls` for every turn, and logs the turn's final response — between them the
+Job log now distinguishes the two cases and keeps the only surviving account of what the turn
+decided, the pod's emptyDir being gone by the time anyone reads it.
+
+Instrumenting it is not fixing it. The cap cannot be raised: `hermes -z` constructs its agent
+without passing `max_iterations`, so the constructor default of 90 applies and `agent.max_turns`,
+`--max-turns` and `HERMES_MAX_ITERATIONS` all miss it. The fix is therefore to stop depending on the
+turn reaching a clean end — the skill has the agent write `findings.json` after its first confirmed
+finding and rewrite it as it goes, so a capped turn hands back what it had. The cost is that one run
+does not cover every signal class; successive runs and the ledger's occurrence counts are what make
+that acceptable.
+
+**The agent cannot write its own handoff file.** The upstream Hermes image sets
+`HERMES_WRITE_SAFE_ROOT=/opt/data`, which is correct for the Platform Agent, whose PVC that is, and
+wrong for a run whose home is an emptyDir elsewhere: every `write_file` is denied and the run
+reports nothing found. The runner sets the variable to the run's own home, keeping the confinement
+the isolation ledger asks for while putting the one file that matters inside it. Worth stating as a
+failure mode rather than a fixed bug because it is a class — the runner inherits an image tuned for
+a different process, and anything else in that image keyed to `/opt/data` will fail the same way,
+silently, on a path nobody exercises interactively.
+
 **Evidence leaks.** Logs and spans contain customer cluster names, project IDs and user identifiers,
 and an `upstream`-mode pull request publishes whatever is quoted in it. Evidence must be redacted
 before it is quoted — the credential proxy's `redact_credentials` is the existing precedent for the

@@ -18,9 +18,10 @@ below means `python3 /opt/selfimprove/scripts/selfimprove_evidence.py`.
 - Read the ledger summary in the brief. Known findings get re-reported with the same title and
   location, not renamed.
 - If the brief says the image is unstamped, every finding you write says so too.
-- Budget: a few hundred tool calls for the whole run, and no warning before they are gone. Spend
-  them on the phases below in order, and start writing findings.json as soon as phase 1 is done
-  (§6) rather than saving it for the end.
+- Budget: about 90 model calls for the whole run, and no warning before they are gone. That is not
+  enough to cover every signal class, so go deep on one or two rather than shallow on all seven —
+  successive runs cover the rest, and the ledger accumulates what they find. Start writing
+  findings.json as soon as phase 1 is done (§6) rather than saving it for the end.
 
 ## 1. Cast a wide net (cheap counts before expensive reads)
 

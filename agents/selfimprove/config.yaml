@@ -39,20 +39,22 @@ tool_loop_guardrails:
     max_web_searches: 40
 
 # An investigation is a single non-interactive turn, so the per-turn iteration
-# budget is the whole run's budget. Hermes defaults to 90; reading logs, traces,
-# metrics, the cluster and a source tree spends that on evidence collection
-# before any analysis happens.
+# budget is the whole run's budget.
 #
-# This was 250, matching the fleet audits (agents/platform/config.yaml), on the
-# reasoning that the wall clock bounds the run more firmly than the iteration
-# count does. On a real install it does not: the first live run spent 2064s of
-# its 3000s SELFIMPROVE_INVESTIGATE_TIMEOUT and stopped on the cap, not the
-# clock. Hitting the cap is close to the worst way for a run to end -- Hermes
-# exits 0 with a warning on stdout, so a truncated investigation is reported as
-# a clean run that found nothing. 400 puts the wall clock back in front at the
-# ~8s/call this workload averages. The runner logs `api_calls` and `completed`
-# from `hermes -z --usage-file` every turn, so the next install to outgrow this
-# number says so in its Job log rather than going quiet.
+# `max_turns` DOES NOT BIND ON THIS PATH and the number below is not the cap.
+# `hermes -z` builds its AIAgent in hermes_cli/oneshot.py without passing
+# `max_iterations`, so the constructor default of 90 in run_agent.py applies and
+# neither this key, the `--max-turns` flag nor HERMES_MAX_ITERATIONS reaches it.
+# Measured, not read: a run with 400 here stopped at exactly 90 API calls. The
+# key stays because it is correct for any path that does honour it and costs
+# nothing if none does, but tuning it will not buy a longer investigation.
+#
+# 90 calls is roughly 15 minutes of this workload and does not cover every
+# signal class in one run. What makes that survivable is that findings.json is
+# written incrementally rather than at the end (see the skill's sec. 6), so a
+# capped turn hands back what it had confirmed instead of losing the run. The
+# runner logs `api_calls` and `completed` from `--usage-file` every turn, so the
+# cap being hit is visible in the Job log rather than silent.
 agent:
   max_turns: 400
   # Four interpreters spawned to publish a Python-toolchain line that is wrong
