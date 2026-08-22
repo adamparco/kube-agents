@@ -551,7 +551,12 @@ selfImprovement:
     # be revoked without the other noticing.
     appId: ""
     ksaName: kubeagents-selfimprove
-    gsaName: kubeagents-selfimprove-gsa
+    # The investigator's Google service account. The minter's is derived from it
+    # by appending `-minter`, so this has to leave room: a GCP service account
+    # id is capped at 30 characters, and `kubeagents-selfimprove-gsa-minter`
+    # would be 33 — an account that cannot be created, discovered at terraform
+    # time rather than at render time. The chart checks the derived length.
+    gsaName: kubeagents-selfimprove
     kms:
       keyring: selfimprove-token-minter-keyring
       key: selfimprove-token-minter-key

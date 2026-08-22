@@ -27,7 +27,19 @@ key -- is terraform/modules/kube-agents-selfimprove.
 {{- $location := required "platformAgent.harness.location is required when selfImprovement.mode is fork or upstream" .Values.platformAgent.harness.location }}
 {{- $clusterName := required "platformAgent.harness.clusterName is required when selfImprovement.mode is fork or upstream" .Values.platformAgent.harness.clusterName }}
 {{- $kmsLocation := $g.kms.location | default (regexReplaceAll "-[a-z]$" $location "") }}
-{{- $allowedSa := printf "%s@%s.iam.gserviceaccount.com" ($g.gsaName | default "kubeagents-selfimprove-gsa") $projectId }}
+{{- $gsa := $g.gsaName | default "kubeagents-selfimprove" }}
+{{- $minterGsa := printf "%s-minter" $gsa }}
+{{- /*
+A GCP service account id is 6-30 characters. The minter's is derived by
+appending `-minter` to the investigator's, so a gsaName over 23 characters
+produces an account that cannot exist -- and nothing here would notice: the
+chart renders, the pod schedules, and the failure surfaces as an unauthenticated
+KMS call much later. Fail at render instead.
+*/ -}}
+{{- if gt (len $minterGsa) 30 }}
+{{- fail (printf "selfImprovement.github.gsaName %q makes the derived minter account %q %d characters; a GCP service account id is capped at 30, so use a gsaName of 23 characters or fewer" $gsa $minterGsa (len $minterGsa)) }}
+{{- end }}
+{{- $allowedSa := printf "%s@%s.iam.gserviceaccount.com" $gsa $projectId }}
 {{- /*
 One minty config file per repository the loop touches: the fork it pushes
 branches to, and -- in upstream mode -- the upstream it opens the pull request
@@ -66,7 +78,7 @@ metadata:
     {{- include "kube-agents.labels" . | nindent 4 }}
     app.kubernetes.io/component: selfimprove
   annotations:
-    iam.gke.io/gcp-service-account: {{ printf "%s-minter@%s.iam.gserviceaccount.com" ($g.gsaName | default "kubeagents-selfimprove-gsa") $projectId }}
+    iam.gke.io/gcp-service-account: {{ printf "%s@%s.iam.gserviceaccount.com" $minterGsa $projectId }}
 automountServiceAccountToken: false
 ---
 apiVersion: v1

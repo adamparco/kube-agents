@@ -50,7 +50,7 @@ metadata:
     app.kubernetes.io/component: selfimprove
   {{- if $project }}
   annotations:
-    iam.gke.io/gcp-service-account: {{ printf "%s@%s.iam.gserviceaccount.com" ($si.github.gsaName | default "kubeagents-selfimprove-gsa") $project }}
+    iam.gke.io/gcp-service-account: {{ printf "%s@%s.iam.gserviceaccount.com" ($si.github.gsaName | default "kubeagents-selfimprove") $project }}
   {{- end }}
 ---
 # Read the namespace. `view` is the upstream ClusterRole, bound with a
