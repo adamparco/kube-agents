@@ -42,7 +42,7 @@ import textwrap
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -52,6 +52,11 @@ BUILD_INFO_PATH = "/opt/build-info.json"
 TEMPLATE_DIR = "/opt/selfimprove"
 HERMES_BIN = "/opt/hermes/.venv/bin/hermes"
 HERMES_TREE = "/opt/hermes"
+
+# How much of a turn's final response reaches the Job log. `hermes -z` prints
+# only that text, so this is generous rather than a truncation anyone will hit
+# often -- and the run it exists for is the one where the text is all there is.
+RESPONSE_LOG_CHARS = 4000
 
 DEFAULT_UPSTREAM = "gke-labs/kube-agents"
 
@@ -434,10 +439,18 @@ def build_brief(
 
         %(ledger_summary)s
 
-        WHEN YOU ARE DONE
-        Write a JSON array to %(findings_path)s. Nothing else you print is read. An empty array
-        is a valid and common answer -- a run that finds nothing is worth more than a run that
-        promotes a guess to fill the file.
+        HOW TO HAND BACK WHAT YOU FIND
+        A JSON array at %(findings_path)s is the only channel out of this run.
+
+        Write that file EARLY and REWRITE IT AS YOU GO -- the moment you have your first confirmed
+        finding, not at the end. Your iteration budget is finite and you will not be warned as it
+        runs out; a turn cut off part-way loses everything it has not already written. Two solid
+        findings on disk beat a better list you never reached. Rewriting is cheap, so do it after
+        every finding you confirm.
+
+        An empty array is a valid and common answer -- a run that finds nothing is worth more than
+        a run that promotes a guess to fill the file. Write `[]` to say so, early, and replace it
+        if something turns up later.
         """
     ) % {
         "findings_path": findings_path,
@@ -473,11 +486,12 @@ def run_agent(prompt: str, home: str, timeout: int, label: str) -> Tuple[int, st
     environment["HOME"] = os.path.join(home, "home")
     os.makedirs(environment["HOME"], exist_ok=True)
     environment.setdefault("PYTHONPATH", os.path.join(TEMPLATE_DIR, "scripts"))
+    usage_path = os.path.join(home, "usage-%s.json" % _slug(label))
     started = time.time()
     log("agent turn (%s) starting, budget %ds" % (label, timeout))
     try:
         completed = subprocess.run(
-            [HERMES_BIN, "-z", prompt, "--cli"],
+            [HERMES_BIN, "-z", prompt, "--cli", "--usage-file", usage_path],
             env=environment,
             cwd=home,
             capture_output=True,
@@ -486,62 +500,206 @@ def run_agent(prompt: str, home: str, timeout: int, label: str) -> Tuple[int, st
         )
     except subprocess.TimeoutExpired as exc:
         log("agent turn (%s) hit its %ds budget" % (label, timeout))
+        log_usage(usage_path, label)
         return 124, (exc.stdout or "") if isinstance(exc.stdout, str) else ""
     elapsed = time.time() - started
     log("agent turn (%s) exited %d after %.0fs" % (label, completed.returncode, elapsed))
+    log_usage(usage_path, label)
     if completed.stderr.strip():
         log("agent stderr tail: %s" % completed.stderr.strip()[-2000:])
+    log_response(completed.stdout, label)
     return completed.returncode, completed.stdout
+
+
+def _slug(label: str) -> str:
+    return "".join(char if char.isalnum() or char in "-_" else "-" for char in label)
+
+
+def log_usage(path: str, label: str) -> None:
+    """Log what the turn spent and, above all, whether it ran to the end.
+
+    A turn that exhausts `agent.max_turns` exits 0, writes nothing further and
+    prints a one-line warning on stdout, which from the runner's side is
+    indistinguishable from a turn that finished and found nothing. The first
+    live run was exactly that: 34 minutes of real evidence-gathering reported as
+    `outcome=ok findings=0`. `--usage-file` is the harness's own answer -- it
+    records `completed` and `api_calls` and is written even when the run fails,
+    so the distinction survives into the Job log, which outlives the pod's
+    emptyDir and is the only place anyone can look afterwards.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            usage = json.load(handle)
+    except (OSError, ValueError):
+        log("agent turn (%s) wrote no usage report" % label)
+        return
+    log(
+        "agent turn (%s) usage: api_calls=%s completed=%s total_tokens=%s cost_usd=%s"
+        % (
+            label,
+            usage.get("api_calls"),
+            usage.get("completed"),
+            usage.get("total_tokens"),
+            usage.get("estimated_cost_usd"),
+        )
+    )
+    if usage.get("failure"):
+        log("agent turn (%s) reported a failure: %s" % (label, usage["failure"]))
+    if usage.get("completed") is False:
+        log(
+            "agent turn (%s) did NOT run to completion: it stopped after %s API calls. If that "
+            "number is agent.max_turns from the profile config, the turn was cut off part-way "
+            "and everything it had not already written to disk is gone."
+            % (label, usage.get("api_calls"))
+        )
+
+
+def log_response(stdout: str, label: str) -> None:
+    """Log the turn's final response text.
+
+    `hermes -z` prints only that text, so this is bounded and worth having
+    whole. It is also the only surviving account of what the turn concluded
+    when the handoff file is missing -- without it the failure above is a
+    dead end, because the pod and its emptyDir are gone by the time the run
+    is read.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        log("agent turn (%s) printed no final response" % label)
+    elif len(text) > RESPONSE_LOG_CHARS:
+        log(
+            "agent turn (%s) final response (%d chars, last %d): ...%s"
+            % (label, len(text), RESPONSE_LOG_CHARS, text[-RESPONSE_LOG_CHARS:])
+        )
+    else:
+        log("agent turn (%s) final response: %s" % (label, text))
 
 
 def read_findings(path: str, stdout: str) -> List[Dict[str, Any]]:
     """The agent's findings, from the file it was told to write.
 
-    The stdout fallback exists because the failure it covers is common and
-    silent: a turn that ran the whole investigation, printed the JSON, and never
-    called the write tool. Recovering it costs a few lines here and saves a
-    wasted run.
+    The response fallback exists because the failure it covers is common and
+    silent: a turn that ran the whole investigation, said what it found, and
+    never called the write tool. Recovering it costs a few lines here and saves
+    a wasted run.
     """
-    raw = ""
     try:
         with open(path, "r", encoding="utf-8") as handle:
             raw = handle.read()
     except OSError:
-        log("no findings file at %s; falling back to the turn's stdout" % path)
-        raw = _fenced_json(stdout)
-    if not raw.strip():
+        log("no findings file at %s; falling back to the turn's final response" % path)
+        recovered = recover_findings(stdout)
+        if recovered is None:
+            log(
+                "the response carried no JSON either, so nothing this turn found survived it. "
+                "The response text and the turn's api_calls/completed are logged above; a turn "
+                "cut off at its iteration cap looks exactly like this."
+            )
+            return []
+        log("recovered %d finding(s) from the response text" % len(recovered))
+        return recovered
+    parsed = recover_findings(raw)
+    if parsed is None:
+        log("the findings file held no JSON array; treating the run as having found nothing")
         return []
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        parsed = None
-        recovered = _fenced_json(raw)
-        if recovered:
-            try:
-                parsed = json.loads(recovered)
-            except ValueError:
-                parsed = None
-    if isinstance(parsed, dict) and isinstance(parsed.get("findings"), list):
-        parsed = parsed["findings"]
-    if not isinstance(parsed, list):
-        log("findings were not a JSON array; treating the run as having found nothing")
-        return []
-    return [item for item in parsed if isinstance(item, dict)]
+    return parsed
 
 
-def _fenced_json(text: str) -> str:
-    if not text:
-        return ""
-    start = text.find("```json")
-    if start == -1:
-        start = text.find("```")
-        if start == -1:
-            return ""
-        body = text[start + 3 :]
-    else:
-        body = text[start + 7 :]
-    end = body.find("```")
-    return body[:end] if end != -1 else ""
+def recover_findings(text: str) -> Optional[List[Dict[str, Any]]]:
+    """The findings list `text` carries, or None if it carries none.
+
+    Accepts bare JSON, a ```json fence, a plain ``` fence, and JSON embedded in
+    prose. All four are things a turn asked for a JSON array does, and only the
+    first two were read before. An empty array is a real answer and comes back
+    as `[]`, which is not None -- the caller distinguishes "found nothing" from
+    "handed back nothing".
+    """
+    if not text or not text.strip():
+        return None
+    for candidate in _json_candidates(text):
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("findings"), list):
+            parsed = parsed["findings"]
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+    return None
+
+
+def _json_candidates(text: str) -> Iterator[str]:
+    """Every substring of `text` that might be the findings JSON, best first.
+
+    Whole text, then fenced blocks, then any balanced bracket run. Later
+    candidates are progressively more speculative, so the caller takes the
+    first that parses into a list rather than the longest or the last.
+    """
+    stripped = text.strip()
+    if stripped:
+        yield stripped
+    for fence in ("```json", "```"):
+        cursor = 0
+        while True:
+            start = text.find(fence, cursor)
+            if start == -1:
+                break
+            cursor = start + len(fence)
+            body = text[cursor:]
+            end = body.find("```")
+            candidate = (body[:end] if end != -1 else body).strip()
+            if candidate:
+                yield candidate
+    for candidate in _balanced_runs(text):
+        yield candidate
+
+
+def _balanced_runs(text: str) -> Iterator[str]:
+    """Each balanced `[...]` or `{...}` run in `text`, outermost first."""
+    closers = {"[": "]", "{": "}"}
+    index = 0
+    while index < len(text):
+        opener = text[index]
+        closer = closers.get(opener)
+        if closer is None:
+            index += 1
+            continue
+        end = _match_bracket(text, index, opener, closer)
+        if end == -1:
+            index += 1
+            continue
+        yield text[index : end + 1]
+        index = end + 1
+
+
+def _match_bracket(text: str, start: int, opener: str, closer: str) -> int:
+    """Index of the bracket closing `text[start]`, or -1 if it never closes.
+
+    String-aware, so a bracket inside a JSON string value does not shift the
+    depth and unbalance an otherwise good parse.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
 
 
 # --------------------------------------------------------------------------

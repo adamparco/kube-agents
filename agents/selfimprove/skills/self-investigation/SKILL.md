@@ -18,6 +18,9 @@ below means `python3 /opt/selfimprove/scripts/selfimprove_evidence.py`.
 - Read the ledger summary in the brief. Known findings get re-reported with the same title and
   location, not renamed.
 - If the brief says the image is unstamped, every finding you write says so too.
+- Budget: a few hundred tool calls for the whole run, and no warning before they are gone. Spend
+  them on the phases below in order, and start writing findings.json as soon as phase 1 is done
+  (§6) rather than saving it for the end.
 
 ## 1. Cast a wide net (cheap counts before expensive reads)
 
@@ -85,15 +88,22 @@ Errors announce themselves. These do not:
 - Never construct a test that changes state. There is no state you are permitted to change, but the
   instinct to "just try it" is what the read-only grants exist to stop.
 
-## 6. Write findings.json and stop
+## 6. Write findings.json — early, and again after every finding
 
+The file is the only channel out of the run. Nothing you print is read, and nothing you are still
+holding when the turn ends survives it.
+
+- **Write it before you think you are ready.** Write `[]` at the end of phase 1, and rewrite the
+  whole array each time you confirm a finding. Your iteration budget is finite, you get no warning
+  as it runs out, and a turn cut off part-way is reported as a clean run that found nothing. Two
+  confirmed findings on disk beat a better list you never reached.
 - One object per distinct problem. Two symptoms of one cause are one finding.
 - Titles and locations are stable identity — see SOUL.md §4. Get these right or the counts never
   accumulate and nothing is ever promoted.
 - `evidence` is an array of verbatim strings with timestamps, plus the query that produced each.
   Paraphrased evidence is not evidence.
 - Grade against the SOUL.md §3 rubric, not against how much work the finding took to find.
-- Write the file. Print nothing else. Stop.
+- When the investigation is done, confirm the file holds what you mean to hand back, then stop.
 
 ## What not to report
 
