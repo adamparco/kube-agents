@@ -88,14 +88,15 @@
       #stage {
         position: fixed;
         inset: 0;
-        display: grid;
-        place-items: center;
+        display: block;
       }
       #deck {
         width: 1280px;
         height: 720px;
-        position: relative;
-        transform-origin: center center;
+        position: absolute;
+        top: 0;
+        left: 0;
+        transform-origin: 0 0;
         border-radius: 14px;
         overflow: hidden;
         box-shadow: 0 40px 90px -40px rgba(0, 0, 0, 0.95);
@@ -1331,6 +1332,377 @@
       @keyframes fade-hint {
         to {
           opacity: 0;
+        }
+      }
+      /* The touch nav bar is injected on every load and revealed by the
+         small-screen layer below, so crossing the breakpoint needs no JS.
+         Declared before that layer, because it is the same specificity and
+         whichever comes last would win. */
+      #mnav {
+        display: none;
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 50;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
+        background: rgba(10, 13, 22, 0.92);
+        backdrop-filter: blur(8px);
+        border-top: 1px solid var(--sl-color-hairline);
+      }
+      #mnav button {
+        appearance: none;
+        min-width: 76px;
+        min-height: 44px;
+        border-radius: 10px;
+        border: 1px solid var(--sl-color-hairline);
+        background: rgba(154, 163, 184, 0.1);
+        color: var(--sl-color-gray-1);
+        font-family: var(--sl-font-system-mono);
+        font-size: 18px;
+        line-height: 1;
+      }
+      #mnav button:disabled {
+        opacity: 0.35;
+      }
+      #mnav [data-pos] {
+        font-family: var(--sl-font-system-mono);
+        font-size: 12px;
+        color: var(--sl-color-gray-3);
+      }
+
+      /* ------------------------------------------------------------------
+         Small screens — the deck stops being a fixed stage and reflows.
+
+         Scaling a 1280×720 stage down to a 390px phone takes the type with
+         it: 13px body text lands on screen at 4px. So below this breakpoint
+         the stage is abandoned rather than shrunk — each slide becomes an
+         ordinary block that fills the screen and scrolls, and the grids
+         re-fit themselves to whatever width there is.
+
+         The whole layer is inside the media query, so the desktop deck is
+         byte-identical. The !important flags are load-bearing, not habit:
+         the markup carries inline font-size and grid-template-columns
+         declarations that a plain rule cannot outrank.
+         ------------------------------------------------------------------ */
+      /* 900px catches phones and portrait tablets; 480px catches phones in
+         landscape (932x430 is the largest of them). Deliberately not 540:
+         a half-screen desktop window at 1400x500 still scales to 0.66,
+         which is a readable deck and should stay one. Keep this in sync
+         with the matchMedia() call in the scaffold script. */
+      @media (max-width: 900px), (max-height: 480px) {
+        html,
+        body {
+          height: auto;
+          overflow: visible;
+          -webkit-text-size-adjust: 100%;
+          background: var(--ka-navy);
+        }
+        #stage {
+          position: static;
+          display: block;
+        }
+        #deck {
+          width: 100%;
+          height: auto;
+          position: static;
+          /* fit() clears the inline transform too; this keeps a stale one
+             from surviving a resize across the breakpoint. */
+          transform: none !important;
+          border-radius: 0;
+          box-shadow: none;
+          overflow: visible;
+        }
+        .slide {
+          /* relative, not static: .pagenum and .brandmark are absolute and
+             would otherwise anchor to the viewport. */
+          position: relative;
+          inset: auto;
+          min-height: 100vh;
+          min-height: 100svh;
+          padding: 26px 18px 92px;
+          border-radius: 0;
+        }
+        /* The stagger animates from opacity 0. On a scrolling page it reads
+           as jitter, and anything that stops it running leaves the slide
+           blank. */
+        .slide.on > *,
+        .slide.on > *:nth-child(2),
+        .slide.on > *:nth-child(3),
+        .slide.on > *:nth-child(4) {
+          animation: none;
+        }
+        .body {
+          overflow: visible;
+          min-height: 0;
+        }
+        .body::before,
+        .body::after {
+          display: none;
+        }
+
+        /* --- type: sized for a phone rather than for a projector --- */
+        .eyebrow {
+          font-size: 11px;
+          margin-bottom: 8px;
+        }
+        .st {
+          font-size: 27px !important;
+          line-height: 1.18;
+        }
+        .st.sm {
+          font-size: 24px !important;
+        }
+        .sub {
+          font-size: 15px !important;
+          max-width: none !important;
+          line-height: 1.5;
+        }
+        .card h3 {
+          font-size: 16px !important;
+        }
+        .card p,
+        .card li {
+          font-size: 14px !important;
+          line-height: 1.55 !important;
+        }
+        .caption {
+          font-size: 13px !important;
+        }
+        .quote {
+          font-size: 17px !important;
+          line-height: 1.45;
+        }
+        .quote small {
+          font-size: 13px !important;
+        }
+        .stat .n {
+          font-size: 32px !important;
+        }
+        .stat .l {
+          font-size: 13px !important;
+        }
+        .pill {
+          font-size: 11px !important;
+        }
+
+        /* --- every multi-column grid re-fits itself --- */
+        .grid,
+        .g2,
+        .g3,
+        .g4,
+        .g-3-2,
+        .g-2-3,
+        .g-1-2 {
+          grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)) !important;
+          gap: 12px !important;
+        }
+
+        /* --- the architecture diagram: lanes stack, arrows turn --- */
+        .arch {
+          grid-template-columns: 1fr !important;
+          min-height: 0 !important;
+          gap: 10px !important;
+        }
+        .lane {
+          flex-direction: column;
+        }
+        .arrcol {
+          transform: rotate(90deg);
+          justify-self: center;
+          margin: 2px 0;
+        }
+        .box small {
+          font-size: 11px !important;
+        }
+
+        /* --- node chains run down the page, not across --- */
+        .flow {
+          flex-direction: column;
+          align-items: stretch;
+          gap: 8px;
+        }
+        .flow .node {
+          width: auto;
+        }
+        .flow .arr {
+          transform: rotate(90deg);
+          align-self: center;
+        }
+
+        /* --- tables pan sideways rather than crushing their columns --- */
+        table.t {
+          display: block;
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+          font-size: 12.5px !important;
+        }
+        table.t th {
+          font-size: 11px !important;
+        }
+        table.t th[style] {
+          width: auto !important;
+        }
+
+        /* --- screenshots stay readable by panning, not by shrinking --- */
+        .shot {
+          max-height: none !important;
+        }
+        .shot__view {
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+          /* The base rule centres the image. Once it is wider than the
+             frame that puts its left edge at a negative offset, and
+             scrollLeft cannot go below 0 — so the first column of a
+             GitHub issue list becomes unreachable. Pan from the left. */
+          justify-content: flex-start;
+        }
+        .shot__view img {
+          width: auto;
+          max-width: none;
+          height: auto;
+          /* Every shot in the deck is between 1.14 and 2.05 aspect, so the
+             height cap is what sizes them. The floor is for landscape
+             phones, where 44vh of a 390px viewport would render a GitHub
+             page 170px tall. */
+          max-height: max(44vh, 280px);
+        }
+
+        /* --- chat mocks: nothing clipped, nothing sub-10px --- */
+        .ka-chat__scroll,
+        .ka-chat--mini .ka-chat__scroll {
+          max-height: none;
+          overflow: visible;
+        }
+        .ka-msg__text,
+        .ka-chat--mini .ka-msg__text {
+          font-size: 14px !important;
+          line-height: 1.5 !important;
+        }
+        .ka-report li,
+        .ka-chat--mini .ka-report li {
+          font-size: 13px !important;
+          line-height: 1.5 !important;
+        }
+        .ka-report h4,
+        .ka-chat--mini .ka-report h4 {
+          font-size: 11px !important;
+        }
+        .ka-report__lede,
+        .ka-report__foot,
+        .ka-report__note,
+        .ka-chat--mini .ka-report__foot {
+          font-size: 13px !important;
+        }
+        .ka-msg__meta,
+        .ka-chat--mini .ka-msg__meta {
+          font-size: 12px !important;
+        }
+        .ka-pill,
+        .ka-chat--mini .ka-pill {
+          font-size: 11.5px !important;
+        }
+        .ka-avatar,
+        .ka-chat--mini .ka-avatar {
+          width: 26px;
+          height: 26px;
+          font-size: 11px;
+        }
+        .ka-chat--mini .ka-report table {
+          font-size: 11.5px !important;
+        }
+        .chatpair {
+          flex-direction: column;
+        }
+
+        /* --- terminals and long code pan instead of overflowing --- */
+        .term {
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+          font-size: 11.5px !important;
+        }
+        p code,
+        li code {
+          overflow-wrap: anywhere;
+        }
+
+        /* --- title slide --- */
+        #s1 h1 {
+          font-size: 34px !important;
+          line-height: 1.1;
+        }
+        #s1 .tag {
+          font-size: 15px !important;
+          max-width: none !important;
+        }
+        #s1 .chips {
+          flex-wrap: wrap;
+        }
+        #s1 .byline,
+        #s1 .meta {
+          position: static !important;
+          font-size: 12px !important;
+          margin-top: 14px;
+        }
+        #s1 .glow {
+          display: none;
+        }
+
+        /* --- furniture --- */
+        #bar {
+          position: fixed;
+          bottom: 0;
+          left: 0;
+          z-index: 40;
+        }
+        /* The nav bar already shows "13 / 24" at a readable size, so the
+           10px corner stamp is a second copy of the same fact. */
+        .pagenum,
+        .brandmark {
+          display: none;
+        }
+
+        /* --- legibility floor --------------------------------------------
+           Chrome on the desktop deck can afford 8.6px micro-labels because
+           the audience is looking at a projected 1280px stage. Held at
+           arm's length none of these survive, so nothing that carries
+           meaning is allowed below 11px. */
+        .ka-badge,
+        .ka-chat--mini .ka-badge {
+          font-size: 11px !important;
+        }
+        .ka-msg__meta time,
+        .ka-chat--mini .ka-msg__meta time,
+        .ka-chat__hint,
+        .ka-thread-start,
+        .ka-chat--mini .ka-thread-start {
+          font-size: 11.5px !important;
+        }
+        /* .ka-pill is handled with the rest of the chat mock above. */
+        .pill,
+        .lt,
+        .shot__url {
+          font-size: 11.5px !important;
+        }
+        code,
+        .ka-chat--mini code {
+          font-size: 12px !important;
+        }
+        .flow .node .k {
+          font-size: 11px !important;
+        }
+        .flow .node .d {
+          font-size: 11.5px !important;
+        }
+        /* Keyboard hints are meaningless on a touch device. */
+        #help {
+          display: none !important;
+        }
+        #mnav {
+          display: flex;
         }
       }
     </style>
@@ -3281,16 +3653,46 @@
         const bar = document.getElementById('bar');
         let i = 0;
 
+        // Matches the stylesheet's small-screen layer. Below it the deck is
+        // not a scaled stage at all, so there is no transform to compute.
+        // No '@media' prefix: matchMedia takes a media query list, and an
+        // invalid one parses to 'not all' and silently never matches.
+        const small = window.matchMedia('(max-width: 900px), (max-height: 480px)');
+
         function fit() {
+          if (small.matches) {
+            deck.style.transform = '';
+            return;
+          }
           const pad = 24;
           const s = Math.min(
             (window.innerWidth - pad) / 1280,
             (window.innerHeight - pad) / 720,
           );
-          deck.style.transform = 'scale(' + s + ')';
+          // Centre arithmetically. Letting the stage centre a 1280px box in
+          // a narrower viewport hits grid safe-alignment, which start-aligns
+          // it and leaves the scaled deck 640 - innerWidth/2 px to the right.
+          const x = (window.innerWidth - 1280 * s) / 2;
+          const y = (window.innerHeight - 720 * s) / 2;
+          deck.style.transform =
+            'translate(' + x + 'px,' + y + 'px) scale(' + s + ')';
         }
         window.addEventListener('resize', fit);
+        small.addEventListener('change', fit);
         fit();
+
+        // Touch nav. Injected always, revealed by the media query, so a
+        // rotation across the breakpoint needs no rebuild.
+        const mnav = document.createElement('div');
+        mnav.id = 'mnav';
+        mnav.innerHTML =
+          '<button type="button" data-prev aria-label="Previous slide">&lsaquo;</button>' +
+          '<span data-pos></span>' +
+          '<button type="button" data-next aria-label="Next slide">&rsaquo;</button>';
+        document.body.appendChild(mnav);
+        mnav.querySelector('[data-prev]').addEventListener('click', () => show(i - 1));
+        mnav.querySelector('[data-next]').addEventListener('click', () => show(i + 1));
+        const mpos = mnav.querySelector('[data-pos]');
 
         function show(n) {
           i = Math.max(0, Math.min(slides.length - 1, n));
@@ -3308,6 +3710,11 @@
             slides[i].appendChild(b);
           }
           if (location.hash !== '#' + (i + 1)) history.replaceState(null, '', '#' + (i + 1));
+          if (mpos) mpos.textContent = i + 1 + ' / ' + slides.length;
+          mnav.querySelector('[data-prev]').disabled = i === 0;
+          mnav.querySelector('[data-next]').disabled = i === slides.length - 1;
+          // Reflowed slides scroll; a new one has to start at its own top.
+          if (small.matches) window.scrollTo(0, 0);
           if (slides[i].hasAttribute('data-demo')) window.__playChatDemo?.();
         }
 
@@ -3331,20 +3738,68 @@
         document.addEventListener('click', (e) => {
           // Leave the replay button and anything interactive alone.
           if (e.target.closest('button, a')) return;
+          // On a touch layout every tap would otherwise turn the page,
+          // including the tap that ends a scroll. Swipe and the nav bar are
+          // the only ways forward there.
+          if (small.matches) return;
           show(e.clientX > window.innerWidth * 0.35 ? i + 1 : i - 1);
         });
 
-        let tx = null;
-        document.addEventListener('touchstart', (e) => (tx = e.touches[0].clientX), {
-          passive: true,
-        });
+        // Swipe, axis-locked. Without the lock a vertical scroll on a
+        // reflowed slide also turns the page. Panning a table, a terminal or
+        // a screenshot sideways is the element's gesture, not the deck's.
+        //
+        // Asked at the moment of the touch rather than from a list of
+        // selectors: which boxes actually pan depends on the breakpoint.
+        // A vertically scrolling chat box is deliberately not excluded —
+        // it does not compete with a horizontal swipe, and excluding it
+        // would leave the two chat slides with no way to swipe at all.
+        function pansSideways(node) {
+          for (let el = node; el && el !== document.body; el = el.parentElement) {
+            const ox = getComputedStyle(el).overflowX;
+            if (
+              (ox === 'auto' || ox === 'scroll') &&
+              el.scrollWidth > el.clientWidth + 1
+            )
+              return true;
+          }
+          return false;
+        }
+
+        let tx = null,
+          ty = null,
+          axis = null;
+        document.addEventListener(
+          'touchstart',
+          (e) => {
+            if (e.touches.length !== 1 || pansSideways(e.target)) {
+              tx = null;
+              return;
+            }
+            tx = e.touches[0].clientX;
+            ty = e.touches[0].clientY;
+            axis = null;
+          },
+          { passive: true },
+        );
+        document.addEventListener(
+          'touchmove',
+          (e) => {
+            if (tx === null || axis) return;
+            const dx = Math.abs(e.touches[0].clientX - tx);
+            const dy = Math.abs(e.touches[0].clientY - ty);
+            if (dx > 8 || dy > 8) axis = dx > dy ? 'x' : 'y';
+          },
+          { passive: true },
+        );
         document.addEventListener(
           'touchend',
           (e) => {
             if (tx === null) return;
             const d = e.changedTouches[0].clientX - tx;
-            if (Math.abs(d) > 40) show(d < 0 ? i + 1 : i - 1);
+            if (axis === 'x' && Math.abs(d) > 40) show(d < 0 ? i + 1 : i - 1);
             tx = null;
+            axis = null;
           },
           { passive: true },
         );
