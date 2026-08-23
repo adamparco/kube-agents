@@ -5,7 +5,7 @@ This is the CronJob's entrypoint. It is deliberately not the agent entrypoint --
 `docker-entrypoint.sh` scaffolds profiles onto a PVC, starts a gateway and waits,
 which is the shape of the thing being observed rather than of the observer. The
 runner does the opposite: it builds a private Hermes home on an emptyDir, takes
-one headless agent turn, writes what it learned to the ledger and exits, so the
+its headless agent turns, writes what it learned to the ledger and exits, so the
 Job completes and `concurrencyPolicy: Forbid` can do its job.
 
 The order is fixed and each step can refuse:
@@ -17,8 +17,10 @@ The order is fixed and each step can refuse:
    cross-checked against the live Deployment. A mismatch aborts: it means the
    agent was rolled and the CronJob was not.
 2. **Source.** The repository at that revision, into the emptyDir.
-3. **Investigate.** One `hermes -z` turn, handed the brief below and the
-   read-only evidence tools of selfimprove_evidence.py.
+3. **Investigate.** Up to `investigateMaxTurns` `hermes -z` turns, handed the
+   brief below and the read-only evidence tools of selfimprove_evidence.py. A
+   turn that hits Hermes' 90-call cap before it finishes is continued rather
+   than lost, each turn picking up from the last one's closing account.
 4. **Grade and gate.** The agent's findings are merged into the ledger, which
    owns the occurrence counts; the gate (sec. 7.3) decides which are promoted.
 5. **File.** In fork/upstream mode, one further agent turn per promoted finding
@@ -330,14 +332,25 @@ def seconds_left(deadline: int, namespace: str = "") -> Optional[int]:
     `None` when no deadline was supplied, meaning "unbounded" -- the caller then
     uses its configured timeout unmodified.
 
-    This exists because the two budgets are configured independently and their
-    defaults already conflict: investigateTimeoutSeconds 3000 plus
-    fileTimeoutSeconds 1500 for each of up to maxPullRequestsPerDay findings is
-    6000 seconds against an activeDeadlineSeconds of 3600. The kubelet wins that
-    argument, and it wins it by SIGKILLing the pod at a moment nothing chose --
-    most expensively, after the investigation has been paid for and before the
-    ledger has been written. Rather than making the chart do arithmetic over a
-    finding count it cannot know at render time, the runner measures.
+    This exists because the budgets are configured independently and their
+    defaults already conflict: investigateTimeoutSeconds 3600 for each of up to
+    investigateMaxTurns 6 turns, plus fileTimeoutSeconds 3000 for each of up to
+    maxPullRequestsPerDay 3 findings, is 30600 seconds against an
+    activeDeadlineSeconds of 14400. The defaults are sized so the *measured*
+    course of a run fits -- a turn ends at Hermes' 90-call cap, measured at
+    1424s on live run `selfimprove-fork-4`, not at its timeout -- which is a
+    different thing from the ceilings summing. The ceilings do not sum, and they
+    are not meant to. The kubelet wins that argument, and it wins it by
+    SIGKILLing the pod at a moment nothing chose -- most expensively, after the
+    investigation has been paid for and before the ledger has been written.
+    Rather than making the chart do arithmetic over a finding count it cannot
+    know at render time, the runner measures.
+
+    What this function does *not* do is decide how the remaining clock is shared
+    out between the stages. It reports one number and every caller sees the same
+    one, so a caller that spends it leaves nothing for the caller after it. That
+    is `investigation_budget`'s job, and its docstring is where the reasoning
+    about the split lives.
 
     It measures from the Job's start where it can read it, and from its own
     start where it cannot; `job_started_at` says why the difference is worth an
@@ -359,6 +372,43 @@ def budgeted(configured: int, deadline: int, namespace: str = "") -> int:
     if remaining is None:
         return configured
     return max(0, min(configured, remaining))
+
+
+def investigation_budget(
+    configured: int, deadline: int, filing_reserve: int, namespace: str = ""
+) -> int:
+    """`configured`, clamped to what is left once filing has been held back.
+
+    `budgeted` is the right answer for the filing turn and the wrong one for the
+    investigation, because the two stages are not symmetric. Filing is the point
+    of the run in fork and upstream mode; investigation is how the run earns
+    something to file. Clamping both to the same remaining clock lets the
+    investigation spend the filing turn's seconds, and the loop's only stop
+    condition is its own floor -- so it keeps starting turns for as long as
+    `MIN_TURN_SECONDS` allows and filing takes whatever is left over, which on a
+    long investigation is nothing.
+
+    That is not a theoretical ordering. With the ceilings the chart ships,
+    `investigateMaxTurns` turns at `investigateTimeoutSeconds` each sum to more
+    than `activeDeadlineSeconds` on their own, and the run that reaches the last
+    one has already spent the filing budget. The failure is quiet and expensive:
+    every finding is investigated, graded and counted, the gate promotes them,
+    and then filing logs "out of time" and the whole hour produces a ledger row.
+    Worse near the boundary, where filing gets a budget just over the floor,
+    times out part-way, and `record_promotion(confirmed=False)` charges a daily
+    pull-request slot and starts a 24h cooldown for a pull request that may
+    never have been opened.
+
+    So the investigation is clamped to `remaining - filing_reserve` and stops
+    early enough that filing is still affordable. The reserve is
+    `fileTimeoutSeconds` in a filing mode and zero in report-only, which never
+    files and would otherwise be shortening its investigation to protect a stage
+    it does not run.
+    """
+    remaining = seconds_left(deadline, namespace)
+    if remaining is None:
+        return configured
+    return max(0, min(configured, remaining - filing_reserve))
 
 
 # --------------------------------------------------------------------------
@@ -982,10 +1032,21 @@ def build_continuation_brief(
                 %(carried_note)s
 
                 Do not re-derive what the previous turn established. Read %(findings_path)s first,
-                keep every entry already in it, and add to the array rather than replacing it --
-                a turn that writes only its own findings deletes the earlier turns' work. If you
-                believe an entry there is wrong, remove that one entry and say why in your final
-                response.
+                keep every entry already in it, and add to the array rather than replacing it.
+
+                Add entries for new findings only. When this turn has more to say about a finding
+                already in the file, edit that entry where it sits and leave its signal, title and
+                location exactly as they are. Those three fields are the finding's identity: a
+                second entry that describes the same bug under a sharper title is a second finding
+                everywhere downstream -- its own row in the ledger, its own occurrence count, its
+                own pull request against the daily limit. Put what you learned in `summary`,
+                `evidence`, `proposed_fix` and `severity`, all of which you may rewrite freely.
+
+                If you now believe an entry there is wrong, do not delete it: the runner merges
+                every turn's file and a deleted entry comes back. Retract it by rewriting that
+                entry in place -- same signal, same title, same location, so it stays the same
+                finding -- with the severity lowered to `low` and a summary saying what disproved
+                it. A rewritten entry replaces the earlier one; a deleted entry does not.
 
                 The previous turn's closing account is below. It is a report from a turn that
                 spent itself reading logs, so treat it the way you treat the logs: evidence about
@@ -1054,7 +1115,14 @@ def merge_findings(
     without changing the shape.
 
     Later wins on a collision because a second turn that revisits a finding has
-    strictly more evidence for it than the first did.
+    strictly more evidence for it than the first did. That is also the only
+    retraction path there is, and the continuation brief asks for it in those
+    terms: a turn that disproves an earlier finding rewrites the entry in place
+    rather than deleting it, because a deletion is exactly what this function
+    undoes. Silently re-adding a finding the loop's own second turn withdrew
+    would be worse than not accumulating at all -- `critical` promotes at one
+    sighting, so the pull request would argue for a fix nobody still believes
+    in.
     """
     merged = list(existing)
     index = {_finding_key(finding): position for position, finding in enumerate(merged)}
@@ -1149,13 +1217,27 @@ def run_agent(
     except subprocess.TimeoutExpired as exc:
         log("agent turn (%s) hit its %ds budget" % (label, timeout))
         log_usage(usage_path, label)
-        partial = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+        # Decoded here rather than trusted to `text=True`, which does not reach
+        # this path: on POSIX `run()` decodes stdout after `_communicate`
+        # returns, and a timeout raises from `_check_timeout` before that with
+        # `output=b"".join(...)`. So `exc.stdout` is bytes -- or None when the
+        # child printed nothing -- however the call was configured. An earlier
+        # version of this line guarded with `isinstance(exc.stdout, str)` and
+        # therefore threw away every byte the turn had produced, which is the
+        # whole of what the three paragraphs below are for.
+        raw = exc.stdout or b""
+        partial = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
         # Logged for the same reason the clean path logs it, with more at stake:
         # a turn killed at its budget is the one whose account nothing else
         # keeps. Live run `selfimprove-fork-3` ended `filed=0` with the filing
         # turn timed out and no way to tell from the Job log whether it had
         # pushed a branch, written a patch, or never reached `git` at all -- and
         # the pod's emptyDir was gone before anyone could look.
+        #
+        # It is also what `read_findings` falls back to when findings.json was
+        # emptied mid-turn, and what `file_pull_request` scans for a pull
+        # request URL when the filing turn was killed after `gh pr create`
+        # returned. Both are unreachable if this is the empty string.
         log_response(partial, label)
         # Deliberately False rather than whatever the usage file says: the
         # process was killed mid-turn, so it did not finish however far it got.
@@ -1545,6 +1627,32 @@ def mint_forge_credential(repository: str) -> None:
     log("minted a GitHub token for %s" % repository)
 
 
+def severity_label(entry: Dict[str, Any], prefix: str) -> str:
+    """`prefix` + this finding's grade, or "" when there should not be one.
+
+    Two ways to get nothing back, and they are different settings. An empty
+    prefix is the install opting out, the same way an empty `prLabel` does. A
+    severity outside `ledger_mod.SEVERITIES` is the guard: the grade is
+    agent-written, it reaches this function having survived only the ledger's
+    own coercion, and a label name is about to be interpolated into a shell
+    command in the filing prompt. Anything not in the vocabulary is dropped
+    rather than sanitised, because there is no severity this loop grades that
+    is not one of those four, so a fifth value is a bug or an injection and
+    neither should become a label.
+
+    Why a label at all when the body already states the grade: a maintainer
+    with a queue of these reads the list page, not the bodies, and the whole
+    point of grading a finding is to let someone else decide what to read
+    first.
+    """
+    if not prefix:
+        return ""
+    grade = str(entry.get("severity", "")).strip().lower()
+    if grade not in ledger_mod.SEVERITIES:
+        return ""
+    return "%s%s" % (prefix, grade)
+
+
 def file_pull_request(
     entry: Dict[str, Any],
     identity: Dict[str, Any],
@@ -1556,6 +1664,7 @@ def file_pull_request(
     timeout: int,
     base_branch: str = "main",
     pr_label: str = "",
+    severity_label_prefix: str = "",
 ) -> Tuple[str, Optional[str]]:
     """One further agent turn that turns a promoted finding into a pull request.
 
@@ -1575,6 +1684,7 @@ def file_pull_request(
     # exact repository, and a turn that has to infer the slug from `git remote`
     # will sometimes infer the other one.
     push_target = fork or upstream
+    labels = [name for name in (pr_label, severity_label(entry, severity_label_prefix)) if name]
     # Everything in this block came, directly or at one remove, from log lines,
     # HTTP responses and Kubernetes object fields the loop does not control.
     # This is the one turn in the whole feature that holds a GitHub credential,
@@ -1630,7 +1740,7 @@ def file_pull_request(
           Pass this to `gh pr create --base`. It is not always `main`, and getting it wrong does
           not fail -- it opens a pull request whose diff is every commit between that branch and
           the revision you branched from, which is unreviewable and looks like your change.
-        - Label the pull request: %(pr_label)s
+        - Label the pull request: %(pr_labels)s
         - If GitHub refuses to authenticate you, the token expired -- it is minted fresh for
           this turn and lives one hour. `git push` fails with `Authentication failed` or asks
           for a username on a terminal nothing is attached to; `gh` fails with `HTTP 401` or
@@ -1671,19 +1781,36 @@ def file_pull_request(
         # cannot create the label either -- `pull_requests: write` attaches an
         # existing one, and creating one is an `issues: write` the loop is
         # deliberately not granted (self-improvement-minter.yaml).
-        "pr_label": (
+        #
+        # One `gh pr edit` per label, and that is the reason for the list rather
+        # than a comma-separated flag. `--add-label 'a,b'` resolves both names
+        # before it applies either, so a repository carrying `self-improvement`
+        # but not `severity:medium` loses both -- and the severity labels are
+        # the newer pair, so that is the likely install rather than the exotic
+        # one. Separately, each lands or fails on its own.
+        "pr_labels": (
             (
                 "%s\n"
-                "  Apply it with `gh pr edit <the pull request URL> --add-label '%s'` once the\n"
-                "  pull request is open. Not `gh pr create --label`: gh resolves the name before\n"
-                "  it creates anything and fails the whole command when the repository has no\n"
-                "  label by that name, which spends the turn and leaves nothing behind. Your\n"
-                "  token can attach an existing label and cannot create one, so on a repository\n"
-                "  without it the edit fails -- say so in your reply and carry on to the URL.\n"
-                "  The pull request is the deliverable; the label is how a human tells the\n"
-                "  loop's output from their own." % (pr_label, pr_label)
+                "  Apply them once the pull request is open, one command each:\n"
+                "%s\n"
+                "  One `gh pr edit` per label on purpose: `--add-label 'a,b'` resolves every\n"
+                "  name before it applies any, so one label the repository does not have costs\n"
+                "  you the others too. Not `gh pr create --label` either -- that resolves before\n"
+                "  it creates anything and fails the whole command, spending the turn and\n"
+                "  leaving nothing behind. Your token can attach an existing label and cannot\n"
+                "  create one, so on a repository without one the edit fails: say so in your\n"
+                "  reply, above the URL line, and carry on. The pull request is the deliverable.\n"
+                "  The labels are how a human tells the loop's output from their own, and how\n"
+                "  they sort a queue of it by how much the loop thinks each one matters."
+                % (
+                    ", ".join("`%s`" % name for name in labels),
+                    "\n".join(
+                        "      gh pr edit <the pull request URL> --add-label '%s'" % name
+                        for name in labels
+                    ),
+                )
             )
-            if pr_label
+            if labels
             else "no -- this install opens them unlabelled."
         ),
         "push_target": push_target,
@@ -1739,6 +1866,13 @@ def file_pull_request(
         prompt, home, timeout, "file:%s" % entry.get("fingerprint", "?"), allow_forge=True
     )
     lines = [l.strip() for l in stdout.splitlines() if l.strip()]
+    # The last GitHub URL anywhere in the reply, not `lines[-1]`. The skill asks
+    # for the URL alone on the final line and also asks the turn to note a
+    # failed `gh pr edit --add-label`, and a turn that puts the note last has
+    # still opened the pull request. Reading only the final line would throw
+    # that away and return UNCONFIRMED, and an UNCONFIRMED finding is filed
+    # again by the next run -- a duplicate pull request, over a sentence about a
+    # missing label. Do not tighten this to `lines[-1]`.
     for line in reversed(lines):
         if line.startswith("https://github.com/"):
             return FILED, line
@@ -1794,24 +1928,34 @@ def main(argv: Optional[List[str]] = None) -> int:
     # under `env` a `prLabel: ""` would come back as the default and label the
     # pull request anyway.
     pr_label = os.environ.get("SELFIMPROVE_PR_LABEL", "self-improvement").strip()
+    # Same `os.environ.get` reasoning as above, and the same opt-out: "" means
+    # do not apply one. A prefix rather than four configurable names because
+    # the four grades are `ledger_mod.SEVERITIES` and not an install's to
+    # rename -- what an install does get to choose is whether its label scheme
+    # spells them `severity:high`, `sev/high`, or nothing at all.
+    severity_label_prefix = os.environ.get("SELFIMPROVE_SEVERITY_LABEL_PREFIX", "severity:").strip()
     allow_fallback = env("SELFIMPROVE_ALLOW_UNSTAMPED_IMAGE", "false").lower() in ("1", "true", "yes")
     signals = [s.strip() for s in env("SELFIMPROVE_SIGNALS", ",".join(ledger_mod.SIGNALS)).split(",") if s.strip()]
-    # 3000 to match `investigateTimeoutSeconds` in charts/kube-agents/values.yaml
-    # and the arithmetic in `deadline_budget`'s docstring. The chart always sets
+    # 3600 to match `investigateTimeoutSeconds` in charts/kube-agents/values.yaml
+    # and the arithmetic in `seconds_left`'s docstring. The chart always sets
     # the variable, so this default is only reached by a hand-run outside it --
     # which is exactly when a silently shorter budget is hardest to explain.
-    investigate_timeout = env_int("SELFIMPROVE_INVESTIGATE_TIMEOUT", 3000)
+    investigate_timeout = env_int("SELFIMPROVE_INVESTIGATE_TIMEOUT", 3600)
     # A ceiling on continuation turns, not a target. The loop stops the moment a
     # turn reports it finished, so on an install where one turn is enough this
     # costs nothing; what it buys is that an investigation too big for 90 model
     # calls is no longer permanently too big for the loop.
     #
-    # Clamped at 1 because the alternative is silent: `SELFIMPROVE_MAX_TURNS=0`
-    # would fall straight past the loop with no turn run, no findings and an
-    # `outcome` nothing set, and the run would report itself truncated having
-    # never started the agent.
-    investigate_max_turns = max(1, env_int("SELFIMPROVE_INVESTIGATE_MAX_TURNS", 3))
-    file_timeout = env_int("SELFIMPROVE_FILE_TIMEOUT", 1500)
+    # Clamped at 1 because the alternative is silent:
+    # `SELFIMPROVE_INVESTIGATE_MAX_TURNS=0` would fall straight past the loop
+    # with no turn run, no findings and an `outcome` nothing set, and the run
+    # would report itself truncated having never started the agent.
+    investigate_max_turns = max(1, env_int("SELFIMPROVE_INVESTIGATE_MAX_TURNS", 6))
+    # Under GITHUB_TOKEN_TTL_SECONDS - GITHUB_TOKEN_MARGIN_SECONDS = 3300, or
+    # every filing turn starts by warning that its own token may expire before
+    # it finishes. That warning is worth keeping meaningful, so the budget stays
+    # below it rather than the threshold moving.
+    file_timeout = env_int("SELFIMPROVE_FILE_TIMEOUT", 3000)
     deadline = env_int("SELFIMPROVE_DEADLINE", 0)
     home = env("SELFIMPROVE_HOME", "/home/selfimprove")
     try:
@@ -1829,8 +1973,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     log("mode=%s namespace=%s ledger=%s signals=%s" % (mode, namespace, ledger_name, ",".join(signals)))
     if mode != "report-only":
         log(
-            "pull requests: %s -> %s (base %s, label %s)"
-            % (fork or upstream, upstream, base_branch, pr_label or "none")
+            "pull requests: %s -> %s (base %s, labels %s)"
+            % (
+                fork or upstream,
+                upstream,
+                base_branch,
+                ", ".join(
+                    [name for name in (pr_label, "%s<severity>" % severity_label_prefix if severity_label_prefix else "") if name]
+                )
+                or "none",
+            )
         )
 
     identity = resolve_revision(namespace, deployment, allow_fallback)
@@ -1916,7 +2068,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(brief)
         return 0
 
-    investigate_budget = budgeted(investigate_timeout, deadline, namespace)
+    # Report-only never files, so reserving against a stage it does not run
+    # would just be a shorter investigation for nothing.
+    filing_reserve = 0 if mode == "report-only" else file_timeout
+    investigate_budget = investigation_budget(
+        investigate_timeout, deadline, filing_reserve, namespace
+    )
     if investigate_budget < MIN_TURN_SECONDS:
         # The floor the filing turns already have. `budgeted` clamps to zero
         # when the deadline has passed, and `subprocess.run(timeout=0)` raises
@@ -1927,9 +2084,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         # slow `fetch_source` is exactly the case `job_started_at` exists to
         # measure, so this is the path that measurement was for.
         log(
-            "refusing to start the investigation: %ds of activeDeadlineSeconds=%ds is left, under "
-            "the %ds floor a turn needs to reach the model. Nothing was investigated; the next run "
-            "starts clean." % (max(investigate_budget, 0), deadline, MIN_TURN_SECONDS)
+            "refusing to start the investigation: %ds of activeDeadlineSeconds=%ds is left after "
+            "holding %ds back for filing, under the %ds floor a turn needs to reach the model. "
+            "Nothing was investigated; the next run starts clean."
+            % (max(investigate_budget, 0), deadline, filing_reserve, MIN_TURN_SECONDS)
         )
         if not args.dry_run:
             ledger_mod.record_run(
@@ -1952,7 +2110,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if investigate_budget < investigate_timeout:
         log(
             "clamping the investigation to %ds: SELFIMPROVE_INVESTIGATE_TIMEOUT is %ds but only "
-            "that much of activeDeadlineSeconds=%ds is left" % (investigate_budget, investigate_timeout, deadline)
+            "that much of activeDeadlineSeconds=%ds is left once %ds is held back for filing"
+            % (investigate_budget, investigate_timeout, deadline, filing_reserve)
         )
     findings: List[Dict[str, Any]] = []
     outcome = "truncated"
@@ -1963,12 +2122,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             # Re-measured, not decremented: `budgeted` reads the clock against
             # the Job's start, so a turn that came back early gives its unused
             # seconds to the next one instead of to nobody.
-            investigate_budget = budgeted(investigate_timeout, deadline, namespace)
+            investigate_budget = investigation_budget(
+                investigate_timeout, deadline, filing_reserve, namespace
+            )
             if investigate_budget < MIN_TURN_SECONDS:
                 log(
                     "stopping the investigation after turn %d: %ds is left of "
-                    "activeDeadlineSeconds=%ds, under the %ds a turn needs. What has been found "
-                    "so far is kept." % (turn - 1, max(investigate_budget, 0), deadline, MIN_TURN_SECONDS)
+                    "activeDeadlineSeconds=%ds once %ds is held back for filing, under the %ds a "
+                    "turn needs. What has been found so far is kept, and filing still has its "
+                    "budget."
+                    % (
+                        turn - 1,
+                        max(investigate_budget, 0),
+                        deadline,
+                        filing_reserve,
+                        MIN_TURN_SECONDS,
+                    )
                 )
                 turn -= 1
                 break
@@ -2062,6 +2231,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 turn_budget,
                 base_branch,
                 pr_label,
+                severity_label_prefix,
             )
             if result == SKIPPED:
                 # The turn looked and declined. Nothing was opened, so nothing is

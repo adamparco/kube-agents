@@ -184,14 +184,16 @@ could not be checked, so a reviewer looking at a diff bigger than the change kno
 from.
 
 This is not a hypothetical. Live run `kube-agents-selfimprove-29791620` opened a one-file fix that
-GitHub rendered as 40,346 additions across 400 files, because the install was running a branch the
+GitHub rendered as 40,346 additions across 261 files, because the install was running a branch the
 base had never seen. Nothing failed, and the agent's own reply said the diff was clean — it had
 checked its commit, which was correct, rather than the pull request, which was not.
 
 ## 6. Open it
 
-Write the body to a file first — it is long, and a `--body` argument that size is a quoting
-accident waiting to happen. Then:
+Write the body to `$HERMES_HOME/pr-body.md` first — it is long, and a `--body` argument that size
+is a quoting accident waiting to happen. Use that path and not `/tmp`: `HERMES_WRITE_SAFE_ROOT` is
+this run's home, so a write anywhere else is denied and you spend calls discovering it. Live run
+`selfimprove-fork-4` spent them on `/tmp/pr_body.md`. Then:
 
 ```bash
 gh pr create \
@@ -199,7 +201,7 @@ gh pr create \
   --head '<the owner half of "Push branches to">:selfimprove/<signal>-<short-slug>' \
   --base '<the "Open the pull request against" from your brief>' \
   --title 'fix(operator): stop the reconciler retrying a Secret it cannot read' \
-  --body-file <the body file>
+  --body-file "$HERMES_HOME/pr-body.md"
 ```
 
 All three flags are load-bearing and none can be left to a default. `--base` is not always `main`;
@@ -219,28 +221,35 @@ error>` and end the turn.
 
 ## 7. Label it
 
-Your brief's `Label the pull request` line names the label, and a run configured to open them
-unlabelled says so there. Apply it once the pull request exists:
+Your brief's `Label the pull request` line names the labels and gives you the command for each —
+normally two, one marking the pull request as the loop's and one carrying the finding's severity. A
+run configured to open them unlabelled says so there instead. Apply them once the pull request
+exists, running the commands exactly as the brief lists them:
 
 ```bash
-gh pr edit <the pull request URL> --add-label '<the label from your brief>'
+gh pr edit <the pull request URL> --add-label 'self-improvement'
+gh pr edit <the pull request URL> --add-label 'severity:medium'
 ```
 
-Not `gh pr create --label`. gh resolves label names before it creates anything and fails the whole
-command when the repository has no label by that name, so the obvious spelling trades the pull
-request for the tag.
+One command per label. Do not fold them into `--add-label 'self-improvement,severity:medium'`: gh
+resolves every name before it applies any, so one label the repository is missing costs you the
+others as well. Not `gh pr create --label` either — that resolves before it creates anything and
+fails the whole command, trading the pull request for the tag.
 
 The token attaches an existing label and cannot create one — creating labels is an `issues: write`
 this loop is deliberately not granted. So on a repository that has never been sent a
 self-improvement pull request the edit fails with `not found`. That is a note in your reply and not
-a reason to stop: the pull request stands, its body already says a self-improvement run found the
-finding, and a maintainer creates the label once.
+a reason to stop: the pull request stands, its body already states the finding's severity and says
+a self-improvement run found it, and a maintainer creates the labels once. Write the note above the
+URL line §8 asks for, not after it. Report each label separately — one failing says nothing about
+the other, and a maintainer reading "the label failed" cannot tell which is missing.
 
 ## 8. Finish
 
 - Print the pull request URL on the last line of your reply, alone, with nothing after it. The
   runner reads that line and records it in the ledger; without it the finding is filed but looks
-  unfiled, and the next run files it again.
+  unfiled, and the next run files it again. Anything you still have to say — the label note from
+  §7, a caveat about the fix — goes above it.
 - Do not wait for review, do not merge, do not comment further.
 
 ## Refuse to file when

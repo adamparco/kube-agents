@@ -505,40 +505,79 @@ platformAgent:
 selfImprovement:
   enabled: false
   schedule: "0 * * * *"
-  # Hard stop for one investigation, enforced by the Job. A run that hits this
-  # is itself a finding — the loop is meant to fit in an hour.
-  activeDeadlineSeconds: 3600
-  # Bounds the agent turn inside that, so the runner still gets to write its
-  # ledger when the investigation overruns. Keep it under activeDeadlineSeconds
-  # by a few minutes: the runner's own timeout ends the turn and files what it
-  # found, while the Job's deadline kills the pod, which records only a `killed`
-  # row with whatever counts had accumulated.
-  investigateTimeoutSeconds: 3000
+  # Hard stop for one run, enforced by the Job, and the number every other
+  # budget here is clamped against — `budgeted` in the runner hands each turn
+  # `min(its own timeout, what is left of this)`, so raising a timeout below
+  # without raising this one changes nothing.
+  #
+  # Four hours, against an hourly `schedule`. The pair is deliberate and the
+  # loop self-paces on it: `concurrencyPolicy: Forbid` means a run still going
+  # when the next hour comes round causes that fire to be skipped, so a run
+  # that finishes quickly keeps the hourly cadence and a run that goes deep
+  # takes its four hours and costs the fires in between. Sizing this to the
+  # schedule instead would cap investigation at what fits in an hour, which is
+  # the truncation `investigateMaxTurns` below exists to get out of.
+  #
+  # The cost of a long deadline is paid by the gate, not by the loop: the
+  # worst-case run rate is `24h / this`, so four hours puts a floor of six runs
+  # a day and `minOccurrencesPerDay` below cannot ask for more sightings than
+  # that. Change one and read the other.
+  activeDeadlineSeconds: 14400
+  # Bounds a single agent turn inside that, so the runner still gets to write
+  # its ledger when one overruns: the runner's own timeout ends the turn and
+  # files what it found, while the Job's deadline kills the pod, which records
+  # only a `killed` row with whatever counts had accumulated.
+  #
+  # Per turn, not per run — `investigateMaxTurns` bounds the count. Turns
+  # measured on the live install end at Hermes' call cap rather than here, the
+  # longest at 1424s on run `selfimprove-fork-4`, so this is roughly two and a
+  # half times what one actually takes; it is here to stop a turn that does not
+  # hit the cap from spending the whole deadline.
+  investigateTimeoutSeconds: 3600
   # A ceiling on investigation turns per run, not a target. Hermes caps a
   # headless turn at 90 model calls and the profile cannot raise it — the
   # `hermes -z` entrypoint constructs its agent without passing the config's
   # `agent.max_turns`, so the library default applies. Both investigations
-  # measured on the live install stopped there, at ~1100s of a 3000s budget:
-  # the binding limit is calls, not clock. When a turn reports it was cut off,
-  # the runner starts another with findings.json still on disk and the previous
-  # turn's closing summary as the handoff, and stops as soon as one reports it
-  # finished — so on an install where one turn is enough this costs nothing.
-  # Raise it and the run trades filing time for investigation depth; filing
-  # deferred this way is not lost, because a promoted finding keeps its
+  # measured on the live install stopped there, the longest at 1424s of its
+  # budget: the binding limit is calls, not clock. When a turn reports it was
+  # cut off, the runner starts another with findings.json still on disk and the
+  # previous turn's closing summary as the handoff, and stops as soon as one
+  # reports it finished — so on an install where one turn is enough this costs
+  # nothing.
+  #
+  # Six, sized against the measured 1424s rather than the ceiling above: six
+  # turns is ~8500s of the 14400s deadline, leaving room for `fileTimeoutSeconds`
+  # below plus the 90s ledger reserve and a wide margin on top. Raising it does
+  # not come out of filing, because `investigation_budget` in the runner holds
+  # `fileTimeoutSeconds` back before the loop sees the clock and stops the
+  # investigation early enough that filing is still affordable; what raising it
+  # spends is the deadline, and past six turns the loop hits that instead.
+  # Investigation stopped this way is not lost — a promoted finding keeps its
   # occurrence counts and the next run files it first.
-  investigateMaxTurns: 3
+  investigateMaxTurns: 6
   # Same, for each pull-request turn in fork/upstream mode. A filing turn does
   # more work than it looks like — re-read the finding against the tree, write
   # the patch, commit, push, open the pull request — and 900s was not enough for
   # it on the install this was validated against: live run `selfimprove-fork-3`
   # promoted a finding, minted a token, and then hit the budget mid-turn with
-  # nothing pushed, recording `filed=0`. The two investigate turns measured on
-  # the same install both ended at the 90-iteration cap after ~1100s, well short
-  # of investigateTimeoutSeconds, so in practice there is roughly 2400s of the
-  # Job deadline left when filing starts and this fits inside it. `budgeted`
-  # clamps to what actually remains and says so in the log, which is what keeps
-  # the two ceilings summing over activeDeadlineSeconds from being a problem.
-  fileTimeoutSeconds: 1500
+  # nothing pushed, recording `filed=0`. The investigate turns measured on the
+  # same install all ended at the 90-iteration cap, well short of
+  # investigateTimeoutSeconds. `budgeted` clamps to what actually remains and
+  # says so in the log, which is what keeps the ceilings here summing over
+  # activeDeadlineSeconds from being a problem.
+  #
+  # This is also the size of the reserve: the runner holds exactly this many
+  # seconds back from the investigation loop, so the first filing turn is
+  # affordable however deep the investigation went. Raise it and the
+  # investigation gets correspondingly less.
+  #
+  # 3000 rather than 1500 because a run that files three findings — the default
+  # `maxPullRequestsPerDay` — gives the later ones only what the first left
+  # behind. Only the first is reserved for; the rest take what remains and defer
+  # if that is under the floor, which costs a run and not the finding. The
+  # ceiling on this value is 3300, where a filing turn could outlive the GitHub
+  # token minted at its start and the runner starts warning it might.
+  fileTimeoutSeconds: 3000
 
   # report-only  ledger only, no GitHub credential, no write path out of the cluster
   # fork         branches and pull requests to a fork
@@ -575,8 +614,8 @@ selfImprovement:
     # inside the last 24 hours, is out of cooldown, and the day's budget is
     # unspent. Everything else stays in the ledger and keeps counting.
     #
-    # A severity with no rule is never promoted, which is how `medium` and
-    # `low` are excluded: by omission, not by a separate switch.
+    # A severity with no rule is never promoted, which is how `low` is
+    # excluded: by omission, not by a separate switch.
     #
     # An occurrence is one RUN that reported the finding, not one sighting the
     # agent claims -- a self-reported count is a number the agent writes and the
@@ -585,10 +624,30 @@ selfImprovement:
     # most 24, and a daily schedule means at most 1, at which point the `high`
     # rule below can never fire. Lengthen the schedule and lower these to match;
     # nothing checks the pair for you.
+    #
+    # 24 is the ceiling, not the count, and the number to size these against is
+    # the floor underneath it. `activeDeadlineSeconds` is four hours against an
+    # hourly schedule, and `concurrencyPolicy: Forbid` skips a fire while a run
+    # is going, so a day of runs that each go the distance is six. Every
+    # threshold here has to be reachable at six or it is dead config: it reads
+    # as a policy and behaves as "never".
     rules:
       - severity: critical
         minOccurrencesPerDay: 1
+      # Three of a possible six. `high` is a broken capability -- a skill that
+      # always fails, alerts that never arrive -- so the bar is low enough to
+      # file inside a day while still needing the finding to survive a second
+      # and third independent investigation.
       - severity: high
+        minOccurrencesPerDay: 3
+      # Medium is degraded-or-wasteful: something works, but slowly, expensively
+      # or after retries a user can see. That is where most of the loop's
+      # ordinary output lands, and excluding it entirely meant the common case
+      # could never be filed no matter how many times it recurred. 5 of a
+      # possible 6 is deliberately near the ceiling -- a slow path that shows up
+      # in almost every run of a day is a standing property of the install,
+      # which is the only kind of medium worth a maintainer's pull request.
+      - severity: medium
         minOccurrencesPerDay: 5
     # The backstop that matters most. Whatever the rules say, the loop opens at
     # most this many pull requests a day.
@@ -597,7 +656,12 @@ selfImprovement:
     # taken as the intent it expresses -- no ceiling here, never promote there --
     # a negative is taken as zero, and anything that is not a number at all
     # falls back to the default. Each of those says so in the run log.
-    maxPullRequestsPerDay: 2
+    #
+    # Only the first filing turn of a run has time reserved for it, so three is
+    # a ceiling on the day rather than a promise about any one run: a run that
+    # promotes three findings files what fits and defers the rest, which keep
+    # their counts and go first next time.
+    maxPullRequestsPerDay: 3
     # Do not re-open the same fingerprint inside this window. It also sets how
     # long the ledger keeps a promotion record, since the cooldown is the only
     # thing that reads one. Anything unusable -- negative, `.inf`, not a number
@@ -629,9 +693,15 @@ selfImprovement:
     # does not contain produces a pull request carrying every commit of the
     # difference. Live run `kube-agents-selfimprove-29791620` filed one: the
     # agent's own commit changed a single file, and the pull request showed
-    # 40,346 additions across 400, because the install was running a test
-    # branch the fork's main had never seen. The runner checks the ancestry
-    # before the filing turn and says so in the Job log when it does not hold.
+    # 40,346 additions across 261 files, because the install was running a test
+    # branch the fork's main had never seen.
+    #
+    # Nothing in the runner checks this for you. The filing skill asks the agent
+    # to compare its branch against this base before opening, and to note the
+    # discrepancy in the pull request when the numbers come back far apart — a
+    # check that costs model calls, runs inside the filing turn rather than
+    # before it, and proceeds anyway if the comparison fails. Treat it as a
+    # label on a bad pull request, not as a guard against one.
     #
     # An install pinned to a branch of its own — a live test, a private
     # deployment tracking a release line — sets this to that branch.
@@ -643,9 +713,26 @@ selfImprovement:
     # The label has to already exist in the repository pull requests are opened
     # against: the loop's token carries `pull_requests: write`, which is enough
     # to put an existing label on a pull request and not enough to create one.
-    # A missing label costs the label and not the pull request — the runner
-    # applies it after opening, so the failure is a line in the log.
+    # A missing label costs the label and not the pull request — the filing
+    # agent applies it with `gh pr edit` after opening, and is told to say so
+    # and carry on when that fails.
     prLabel: self-improvement
+    # Prefix for a second label carrying the finding's severity, so a queue of
+    # the loop's pull requests can be read worst-first without opening any of
+    # them. The grade is appended to it, giving `severity:critical`,
+    # `severity:high`, `severity:medium` or `severity:low` — those four and no
+    # others, because they are the vocabulary the ledger grades against. Set to
+    # "" to open them without a severity label.
+    #
+    # A prefix rather than four names: which four grades exist is not an
+    # install's to change, but how its label scheme spells them is, so an
+    # install already using `sev/` sets that here.
+    #
+    # Same "must already exist" constraint as `prLabel`, and it bites harder:
+    # a repository that has taken these pull requests before still needs the
+    # severity labels created once. Each label is applied by its own `gh pr
+    # edit`, so a missing one costs only itself.
+    severityLabelPrefix: "severity:"
     # GitHub App ID for the loop's OWN App — deliberately not the one
     # githubMinter uses. Two Apps means the loop's token cannot reach the
     # GitOps repositories and the agent's cannot reach this one, and either can

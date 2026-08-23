@@ -402,6 +402,72 @@ class DeadlineBudgetTests(unittest.TestCase):
         self.assertEqual(R.budgeted(3000, 3600), 0)
 
 
+class FilingReserveTests(unittest.TestCase):
+    """`investigation_budget` holds the filing turn's seconds back.
+
+    Without it the investigation loop and the filing loop clamp against the
+    same remaining clock, so the investigation -- which runs first and stops
+    only at its own floor -- can spend every second filing needed. The run then
+    investigates, grades and promotes a full set of findings and files none of
+    them, which in fork and upstream mode is the whole point of the run lost at
+    the last step.
+    """
+
+    def setUp(self):
+        self._epoch = R._DEADLINE_EPOCH
+        self._started = R.RUN_STARTED
+        R._DEADLINE_EPOCH = None
+
+    def tearDown(self):
+        R._DEADLINE_EPOCH = self._epoch
+        R.RUN_STARTED = self._started
+
+    def test_no_deadline_means_the_reserve_is_moot(self):
+        """Unbounded is unbounded: there is nothing to hold back from."""
+        self.assertEqual(R.investigation_budget(3600, 0, 3000), 3600)
+
+    def test_a_full_clock_is_not_shortened_by_the_reserve(self):
+        """The common case. 14400s of deadline covers a 3600s turn and a 3000s
+        filing turn many times over, so the reserve changes nothing until the
+        run is actually deep."""
+        R.RUN_STARTED = R.time.time() - 10
+        self.assertEqual(R.investigation_budget(3600, 14400, 3000), 3600)
+
+    def test_the_reserve_bites_before_the_deadline_does(self):
+        """The case the function exists for. 3400s left, so `budgeted` would
+        hand the investigation a full 3000s turn and leave 400s for filing --
+        over `MIN_TURN_SECONDS`, so filing starts, and nowhere near enough to
+        clone, patch, push and open a pull request."""
+        R.RUN_STARTED = R.time.time() - (14400 - 3400 - R.DEADLINE_RESERVE_SECONDS)
+        # 3400s remain, so `budgeted` hands over the whole configured turn and
+        # leaves 400s behind it.
+        self.assertEqual(R.budgeted(3000, 14400), 3000)
+        self.assertAlmostEqual(R.investigation_budget(3000, 14400, 3000), 400, delta=3)
+
+    def test_an_investigation_stops_rather_than_eating_the_filing_turn(self):
+        """Below `MIN_TURN_SECONDS` once the reserve is held back, so the loop
+        stops -- with filing's 3000s still unspent, which is the trade."""
+        R.RUN_STARTED = R.time.time() - (14400 - 3050 - R.DEADLINE_RESERVE_SECONDS)
+        self.assertLess(R.investigation_budget(3600, 14400, 3000), R.MIN_TURN_SECONDS)
+        self.assertGreater(R.budgeted(3000, 14400), R.MIN_TURN_SECONDS)
+
+    def test_report_only_reserves_nothing(self):
+        """A zero reserve is exactly `budgeted`. report-only never files, so
+        reserving would shorten its investigation to protect a stage it does
+        not run."""
+        R.RUN_STARTED = R.time.time() - 5000
+        self.assertEqual(
+            R.investigation_budget(3600, 14400, 0),
+            R.budgeted(3600, 14400),
+        )
+
+    def test_the_reserved_budget_never_goes_negative(self):
+        """A reserve larger than what is left clamps at zero rather than
+        handing `subprocess.run` a negative timeout."""
+        R.RUN_STARTED = R.time.time() - 14000
+        self.assertEqual(R.investigation_budget(3600, 14400, 3000), 0)
+
+
 def _load_credential_proxy():
     """The real `credential_proxy` module, or None with the reason.
 
@@ -530,6 +596,14 @@ class TimedOutTurnLoggingTests(unittest.TestCase):
     The pod's emptyDir is gone by the time anyone reads the Job log, so the log
     is the only surviving account. Live run `selfimprove-fork-3` had its filing
     turn time out and left no record of whether it had pushed a branch.
+
+    Every fixture here is BYTES, because that is what production produces.
+    `subprocess.run(text=True)` decodes stdout after `_communicate` returns, and
+    a timeout raises before that from `_check_timeout`, which builds the
+    exception with `output=b"".join(...)`. An earlier version of this class
+    passed `str` and asserted that the bytes case yielded `""` -- so it pinned
+    the defect rather than the behaviour, and `run_agent` threw away every
+    timed-out turn's output while these tests passed.
     """
 
     def setUp(self):
@@ -545,36 +619,63 @@ class TimedOutTurnLoggingTests(unittest.TestCase):
         self.prior_log = R.log
         R.log = self.lines.append
         self.addCleanup(setattr, R, "log", self.prior_log)
-        self.output = ""
+        self.output = b""
 
     def tearDown(self):
         R.subprocess.run = self.prior_run
 
     def test_the_partial_response_is_logged(self):
-        self.output = "pushed selfimprove/f9a159ab, opening the pull request now"
+        self.output = b"pushed selfimprove/f9a159ab, opening the pull request now"
         code, stdout, ran = R.run_agent("brief", self.home, 1, "file:abc")
         self.assertEqual((code, ran), (124, False))
-        self.assertEqual(stdout, self.output)
+        self.assertEqual(stdout, self.output.decode())
         self.assertTrue(
             any("pushed selfimprove/f9a159ab" in line for line in self.lines),
             "the partial response never reached the log: %r" % self.lines,
         )
 
+    def test_the_partial_response_is_returned_for_the_callers_that_scan_it(self):
+        """Not just logged: two recovery paths read this return value.
+
+        `read_findings` falls back to it when findings.json was emptied
+        mid-turn, and `file_pull_request` scans it for a pull request URL when
+        the filing turn was killed after `gh pr create` returned. Both are
+        unreachable if the timeout path returns the empty string, and both fail
+        quietly -- the second by charging a daily pull-request slot and a 24h
+        cooldown for a pull request nobody can name.
+        """
+        self.output = b"opened https://github.com/gke-agentic/kube-agents/pull/12"
+        _, stdout, _ = R.run_agent("brief", self.home, 1, "file:abc")
+        self.assertIn("https://github.com/gke-agentic/kube-agents/pull/12", stdout)
+
     def test_a_silent_timed_out_turn_says_so(self):
-        self.output = ""
+        self.output = b""
         R.run_agent("brief", self.home, 1, "file:abc")
         self.assertTrue(
             any("printed no final response" in line for line in self.lines),
             "an empty partial response should still be reported: %r" % self.lines,
         )
 
-    def test_non_string_output_does_not_crash_the_handler(self):
-        # `TimeoutExpired.output` is bytes when the subprocess was not opened in
-        # text mode. run_agent always asks for text, but the guard predates this
-        # test and the timeout path is the one that must not raise.
-        self.output = b"bytes not str"
+    def test_a_turn_that_printed_nothing_at_all_gives_none(self):
+        """`TimeoutExpired.output` is None, not b"", when the child was silent."""
+        self.output = None
         code, stdout, ran = R.run_agent("brief", self.home, 1, "file:abc")
         self.assertEqual((code, stdout, ran), (124, "", False))
+
+    def test_undecodable_bytes_do_not_lose_the_rest_of_the_turn(self):
+        """A truncated multi-byte character at the kill point is not a reason to
+        discard the account around it -- the child was killed mid-write, so a
+        split UTF-8 sequence at the tail is the expected shape, not a rarity."""
+        self.output = b"pushed the branch \xff\xfe then stalled"
+        _, stdout, _ = R.run_agent("brief", self.home, 1, "file:abc")
+        self.assertIn("pushed the branch", stdout)
+        self.assertIn("then stalled", stdout)
+
+    def test_a_string_output_still_works(self):
+        """Defensive: POSIX gives bytes, but the handler must not depend on it."""
+        self.output = "already text"
+        _, stdout, _ = R.run_agent("brief", self.home, 1, "file:abc")
+        self.assertEqual(stdout, "already text")
 
 
 class ForgeShimIsolationTests(unittest.TestCase):
@@ -1268,6 +1369,23 @@ class FilingOutcomeTests(unittest.TestCase):
         )
         self.assertEqual(self._file()[1], "https://github.com/gke-labs/kube-agents/pull/99")
 
+    def test_a_note_printed_after_the_url_does_not_lose_the_filing(self):
+        """The skill asks for both, and a turn can order them the wrong way round.
+
+        Section 7 tells the turn to note a failed `gh pr edit --add-label`;
+        section 8 wants the URL alone on the last line. The skill now says the
+        note goes above, but the pull request exists either way, and reading
+        only `lines[-1]` would call it UNCONFIRMED and file it again next run.
+        """
+        self.stdout = (
+            "https://github.com/gke-labs/kube-agents/pull/12\n"
+            "Note: `gh pr edit --add-label` failed with `not found`; the repository has no "
+            "self-improvement label yet."
+        )
+        self.assertEqual(
+            self._file(), (R.FILED, "https://github.com/gke-labs/kube-agents/pull/12")
+        )
+
     def test_a_declined_finding_is_skipped_and_not_charged(self):
         """The skill's own word for it, and its promise: the counts keep rising."""
         self.stdout = "SKIPPED: closed unmerged as #41"
@@ -1468,7 +1586,7 @@ class BaseBranchTests(unittest.TestCase):
     head branched from, so a base that does not contain the deployed revision
     renders every commit of the difference as part of the change. Live run
     `kube-agents-selfimprove-29791620` filed a one-file fix that showed as
-    40,346 additions across 400 files for exactly this reason.
+    40,346 additions across 261 files for exactly this reason.
     """
 
     def setUp(self):
@@ -1535,9 +1653,11 @@ class PullRequestLabelTests(unittest.TestCase):
         R.mint_forge_credential = lambda repo: None
         self.addCleanup(setattr, R, "mint_forge_credential", self.prior_mint)
 
-    def _prompt(self, *args):
+    def _prompt(self, *args, **kwargs):
+        entry = {"fingerprint": "abc123", "title": "t", "summary": "s"}
+        entry.update(kwargs.pop("entry", {}))
         R.file_pull_request(
-            {"fingerprint": "abc123", "title": "t", "summary": "s"},
+            entry,
             {"revision": "deadbeef"},
             "/src/repo",
             "/home/selfimprove",
@@ -1551,24 +1671,71 @@ class PullRequestLabelTests(unittest.TestCase):
         return self.prompts[-1]
 
     def test_the_label_reaches_the_filing_turn(self):
-        self.assertIn("Label the pull request: self-improvement", self._prompt("self-improvement"))
+        self.assertIn(
+            "Label the pull request: `self-improvement`", self._prompt("self-improvement")
+        )
 
     def test_it_names_the_label_in_the_command_too(self):
         """A label named once is a label the turn has to re-type from prose."""
         self.assertIn("--add-label 'triage/from-the-loop'", self._prompt("triage/from-the-loop"))
 
     def test_it_steers_away_from_the_create_flag(self):
-        prompt = self._prompt("self-improvement")
+        prompt = " ".join(self._prompt("self-improvement").split())
         self.assertIn("Not `gh pr create --label`", prompt)
-        self.assertIn("spends the turn and leaves nothing behind", prompt)
+        self.assertIn("spending the turn and leaving nothing behind", prompt)
 
     def test_a_missing_label_is_not_a_reason_to_stop(self):
-        self.assertIn("carry on to the URL", self._prompt("self-improvement"))
+        prompt = " ".join(self._prompt("self-improvement").split())
+        self.assertIn("say so in your reply, above the URL line, and carry on", prompt)
 
     def test_no_label_configured_says_so(self):
         prompt = self._prompt("")
         self.assertIn("Label the pull request: no -- this install opens them unlabelled.", prompt)
         self.assertNotIn("--add-label", prompt)
+
+    def test_the_severity_label_reaches_the_filing_turn_alongside_the_other(self):
+        """Two labels, and the turn gets a command for each rather than a rule
+        for deriving the second from the finding's grade."""
+        prompt = self._prompt(
+            "self-improvement", "severity:", entry={"severity": "critical"}
+        )
+        self.assertIn("--add-label 'self-improvement'", prompt)
+        self.assertIn("--add-label 'severity:critical'", prompt)
+
+    def test_each_label_gets_its_own_command(self):
+        """`--add-label 'a,b'` resolves both names before applying either, so a
+        repository missing one loses both. The severity labels are the newer
+        pair, which makes that the likely install rather than the exotic one."""
+        prompt = " ".join(
+            self._prompt("self-improvement", "severity:", entry={"severity": "high"}).split()
+        )
+        self.assertNotIn("self-improvement,severity", prompt)
+        self.assertIn("One `gh pr edit` per label on purpose", prompt)
+
+    def test_an_empty_prefix_opts_out_of_the_severity_label_only(self):
+        prompt = self._prompt("self-improvement", "", entry={"severity": "high"})
+        self.assertIn("--add-label 'self-improvement'", prompt)
+        self.assertNotIn("severity", prompt.split("WHERE", 1)[1].split("- If GitHub", 1)[0])
+
+    def test_a_severity_outside_the_vocabulary_gets_no_label(self):
+        """The grade is agent-written and the label name is interpolated into a
+        shell command in the prompt. There is no fifth grade this loop assigns,
+        so a fifth value is a bug or an injection -- dropped, not sanitised."""
+        for grade in ("catastrophic", "HIGH ; rm -rf /", "", None):
+            with self.subTest(grade=grade):
+                self.assertEqual(
+                    "", R.severity_label({"severity": grade}, "severity:")
+                )
+
+    def test_the_four_real_grades_all_produce_a_label(self):
+        for grade in ledger_mod.SEVERITIES:
+            with self.subTest(grade=grade):
+                self.assertEqual(
+                    "severity:%s" % grade, R.severity_label({"severity": grade}, "severity:")
+                )
+
+    def test_the_prefix_is_the_installs_to_choose(self):
+        self.assertEqual("sev/low", R.severity_label({"severity": "low"}, "sev/"))
 
     def test_it_defaults_to_labelling(self):
         """Omitting the argument entirely must not silently drop the label."""
@@ -1767,6 +1934,16 @@ class ContinuationBriefTests(unittest.TestCase):
     def test_it_tells_the_agent_to_add_rather_than_replace(self):
         self.assertIn("add to the array rather than replacing it", self._brief())
 
+    def test_it_tells_the_agent_not_to_re_title_a_finding_it_already_wrote(self):
+        """Identity is signal+title+location, so a sharper title on turn 3 is a
+        second finding: its own ledger row, its own count, its own pull request
+        against the daily limit. Loosening the fingerprint instead would let two
+        real bugs at one location merge and manufacture a promotion, which is
+        the trade `selfimprove_ledger._LOCATION_NORMALISERS` argues out."""
+        brief = " ".join(self._brief().split())
+        self.assertIn("Add entries for new findings only", brief)
+        self.assertIn("leave its signal, title and location exactly as they are", brief)
+
     def test_the_previous_response_is_fenced(self):
         brief = self._brief(previous="the trace analysis")
         body = brief.split(R.FENCE, 1)[1].split(R.FENCE_END, 1)[0]
@@ -1941,7 +2118,13 @@ class InvestigationLoopTests(unittest.TestCase):
     def test_a_later_turn_cannot_erase_an_earlier_turn_s_finding(self):
         """The agent ignores the append instruction and rewrites the file with
         an empty array on its last turn. Turn 1's finding still reaches the
-        ledger, because the runner read it while it was on disk."""
+        ledger, because the runner read it while it was on disk.
+
+        This cuts both ways and the continuation brief has to be honest about
+        which: a deliberate deletion is indistinguishable from this one, so the
+        brief asks a turn that has disproved a finding to rewrite the entry in
+        place rather than delete it. `merge_findings` honours a rewrite, which
+        is the case below."""
         code, _, run = self._run(
             [
                 (0, "found one", False, self._finding("the real bug")),
@@ -1950,6 +2133,36 @@ class InvestigationLoopTests(unittest.TestCase):
         )
         self.assertEqual(1, run["findings"])
         self.assertEqual(0, code)
+
+    def test_a_later_turn_retracts_by_rewriting_the_entry_in_place(self):
+        """The path the continuation brief actually offers, and the reason it
+        cannot offer deletion.
+
+        Turn 1 reports a `critical`; turn 2 disproves it and rewrites the same
+        signal/title/location with `severity: low` and a summary saying so.
+        Same fingerprint, so `merge_findings` replaces rather than appends and
+        the ledger ends up holding the retraction. Deleting the entry instead
+        would have been undone by the merge -- and at `critical`'s shipped
+        `minOccurrencesPerDay: 1` the gate would then promote a finding the
+        loop's own second turn withdrew.
+        """
+        entry = {
+            "signal": "errors",
+            "severity": "critical",
+            "title": "the operator drops every reconcile",
+            "location": "a.py:1",
+        }
+        retracted = dict(entry, severity="low", summary="disproved: the log line was a dry run")
+        code, _, run = self._run(
+            [
+                (0, "found one", False, [entry]),
+                (0, "disproved it", True, [retracted]),
+            ]
+        )
+        self.assertEqual(0, code)
+        self.assertEqual(1, run["findings"], "the rewrite must replace, not append")
+        severities = [f["severity"] for f in self.saved[-1]["findings"].values()]
+        self.assertEqual(["low"], severities)
 
     def test_an_errored_turn_is_not_retried(self):
         code, _, run = self._run([(3, "boom", None, None)])

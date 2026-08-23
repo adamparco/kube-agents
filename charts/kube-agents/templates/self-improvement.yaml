@@ -34,9 +34,9 @@ objects share with the rest of this install's cluster-scoped assumptions.
 {{- /*
 And the App id, for the same reason it is worth failing on the fork: without it
 the minter's Secret does not render and its Deployment references it anyway, so
-the install comes up with an hourly CronJob that investigates for half an hour
-and then cannot file, behind a CreateContainerConfigError on a pod nobody is
-watching. Render time is where that is one line of output instead.
+the install comes up with an hourly CronJob that investigates for an hour or
+more and then cannot file, behind a CreateContainerConfigError on a pod nobody
+is watching. Render time is where that is one line of output instead.
 */ -}}
 {{- if and $needsForge (not $si.github.appId) }}
 {{- fail (printf "selfImprovement.mode=%s needs selfImprovement.github.appId: the minter signs as the loop's own GitHub App and cannot start without its id" $mode) }}
@@ -406,9 +406,9 @@ spec:
         - protocol: TCP
           port: 988
     # The Kubernetes API server, as its own rule so the wide 443 rule below can
-    # exclude the private ranges. The runner needs it for three reads and one
-    # write: its own Pod, the observed Deployment, the custom resources, and the
-    # ledger ConfigMap.
+    # exclude the private ranges. The runner needs it for four reads -- its own
+    # Pod, the observed Deployment, the custom resources and the ledger
+    # ConfigMap -- and one write, the ledger again at the end of the run.
     #
     # The ClusterIP is not enough on its own. GKE Dataplane V2 evaluates egress
     # against the destination *after* service translation, so a rule naming only
@@ -427,7 +427,16 @@ spec:
     # API server is reachable at neither, and that is rendered without a live
     # lookup, must set selfImprovement.apiServerCIDRs; otherwise the ledger write
     # fails and every run's findings are lost at the last step.
-    {{- $apiCIDRs := $si.apiServerCIDRs | default (list "34.118.224.1/32" "10.96.0.1/32") }}
+    #
+    # `concat` and not `default`: an operator setting this is naming an address
+    # the chart did not find, not disowning the ones it did, and values.yaml
+    # promises them that. Under `default` a non-empty list replaces the pair
+    # above, so adding one CIDR silently removes the ClusterIP entry -- and the
+    # symptom of removing it is the seven-minute hang described above, on a
+    # cluster where the operator's own mental model says they only widened the
+    # policy. `uniq` at the render below absorbs the overlap when the address
+    # they name is one the lookup found anyway.
+    {{- $apiCIDRs := concat (list "34.118.224.1/32" "10.96.0.1/32") ($si.apiServerCIDRs | default list) }}
     {{- $ep := lookup "v1" "Endpoints" "default" "kubernetes" }}
     {{- range $subset := ((($ep | default dict).subsets) | default list) }}
     {{- range $addr := (($subset.addresses) | default list) }}
@@ -495,18 +504,21 @@ spec:
         {{- include "kube-agents.labels" . | nindent 8 }}
         app.kubernetes.io/name: kube-agents-selfimprove
     spec:
-      # No retries. A failed investigation is not worth re-running inside the
-      # hour -- the next schedule is the retry, with an hour more evidence in
+      # No retries. A failed investigation is not worth re-running before the
+      # next schedule -- that fire is the retry, with an hour more evidence in
       # it. Retrying immediately would also re-read the same window and
       # re-report the same findings, inflating the counts the gate reads.
       #
       # The reason it cannot simply be raised: activeDeadlineSeconds below
       # bounds the Job across all its attempts, not each one. A retry after a
-      # 39-minute first attempt inherits what is left of the hour, and the
+      # long first attempt inherits only what is left of that deadline, and the
       # runner refuses to start a turn under its floor -- so the retry would
       # cost a pod to write a `refused` row and nothing else. Raising the
-      # deadline to make room does not fix it either, because the schedule is
-      # hourly and `concurrencyPolicy: Forbid` would then start skipping runs.
+      # deadline to make room buys the retry time by spending the next
+      # scheduled fire, which `concurrencyPolicy: Forbid` skips while this Job
+      # is still running; see the note on activeDeadlineSeconds in values.yaml
+      # for why that trade is worth making for investigation depth and not for
+      # a retry that re-reads the same window.
       #
       # What makes 0 safe is that the runner exits non-zero only when nothing
       # durable came out of the run. A capped investigation exits 0 with a
@@ -514,7 +526,7 @@ spec:
       # the ones a retry inside the same deadline could not have helped: a
       # revision mismatch, an unwritable ledger, a turn that never started.
       backoffLimit: 0
-      activeDeadlineSeconds: {{ $si.activeDeadlineSeconds | default 3600 }}
+      activeDeadlineSeconds: {{ $si.activeDeadlineSeconds | default 14400 }}
       ttlSecondsAfterFinished: 86400
       template:
         metadata:
@@ -721,25 +733,30 @@ spec:
                   value: {{ $si.github.forkRepo | quote }}
                 - name: SELFIMPROVE_BASE_BRANCH
                   value: {{ $si.github.baseBranch | default "main" | quote }}
-                # `default` is deliberately absent: "" here means open pull
-                # requests unlabelled, and `default` would treat that as unset
-                # and put the label back.
+                # `default` is deliberately absent from both: "" here means open
+                # pull requests unlabelled, and `default` would treat that as
+                # unset and put the label back.
                 - name: SELFIMPROVE_PR_LABEL
                   value: {{ $si.github.prLabel | quote }}
+                - name: SELFIMPROVE_SEVERITY_LABEL_PREFIX
+                  value: {{ $si.github.severityLabelPrefix | quote }}
                 - name: SELFIMPROVE_INVESTIGATE_TIMEOUT
-                  value: {{ $si.investigateTimeoutSeconds | default 3000 | quote }}
+                  value: {{ $si.investigateTimeoutSeconds | default 3600 | quote }}
                 - name: SELFIMPROVE_INVESTIGATE_MAX_TURNS
-                  value: {{ $si.investigateMaxTurns | default 3 | quote }}
+                  value: {{ $si.investigateMaxTurns | default 6 | quote }}
                 - name: SELFIMPROVE_FILE_TIMEOUT
-                  value: {{ $si.fileTimeoutSeconds | default 1500 | quote }}
+                  value: {{ $si.fileTimeoutSeconds | default 3000 | quote }}
                 # The same number as activeDeadlineSeconds above, so the runner
                 # can see the deadline it is being measured against and stop
                 # before the kubelet stops it. The two per-turn timeouts are
                 # configured independently and their defaults already oversubscribe
                 # this one; the runner clamps rather than the chart doing
                 # arithmetic over a finding count nothing knows at render time.
+                # It also holds SELFIMPROVE_FILE_TIMEOUT back out of this before
+                # the investigation loop sees it, so a deep investigation cannot
+                # spend the seconds filing needs.
                 - name: SELFIMPROVE_DEADLINE
-                  value: {{ $si.activeDeadlineSeconds | default 3600 | quote }}
+                  value: {{ $si.activeDeadlineSeconds | default 14400 | quote }}
                 # The gate, as JSON, so the runner reads one value rather than
                 # reconstructing a nested structure from flattened variables.
                 - name: SELFIMPROVE_GATE
