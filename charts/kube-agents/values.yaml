@@ -506,9 +506,18 @@ selfImprovement:
   enabled: false
   schedule: "0 * * * *"
   # Hard stop for one run, enforced by the Job, and the number every other
-  # budget here is clamped against — `budgeted` in the runner hands each turn
-  # `min(its own timeout, what is left of this)`, so raising a timeout below
-  # without raising this one changes nothing.
+  # budget here is clamped against. A filing turn gets `min(its own timeout,
+  # what is left of this)`; an investigation turn gets that same figure less
+  # `fileTimeoutSeconds`, which `investigation_budget` in the runner holds back
+  # before the loop sees the clock. So raising `investigateTimeoutSeconds`
+  # without raising this one changes nothing, while raising `fileTimeoutSeconds`
+  # without raising this one takes the difference out of the investigation.
+  #
+  # Which is also the one way to set this too low. Nothing validates the pair:
+  # below roughly `fileTimeoutSeconds` plus a filing turn's floor, the reserve
+  # leaves the investigation under its own floor, and every run refuses before
+  # it starts and exits 1 — a CronJob that fails hourly and says why in the Job
+  # log. The shipped 14400 has a wide margin; trim it and check the arithmetic.
   #
   # Four hours, against an hourly `schedule`. The pair is deliberate and the
   # loop self-paces on it: `concurrencyPolicy: Forbid` means a run still going
@@ -574,7 +583,11 @@ selfImprovement:
   # 3000 rather than 1500 because a run that files three findings — the default
   # `maxPullRequestsPerDay` — gives the later ones only what the first left
   # behind. Only the first is reserved for; the rest take what remains and defer
-  # if that is under the floor, which costs a run and not the finding. The
+  # if that is under half of this, which costs a run and not the finding. Half,
+  # rather than the 120s a turn needs to reach the model at all: a filing turn
+  # that runs out mid-push is charged a daily slot and a 24-hour cooldown for a
+  # pull request that may not exist, so a budget it cannot finish in is worse
+  # than no attempt. The
   # ceiling on this value is 3300, where a filing turn could outlive the GitHub
   # token minted at its start and the runner starts warning it might.
   fileTimeoutSeconds: 3000
@@ -660,7 +673,9 @@ selfImprovement:
     # Only the first filing turn of a run has time reserved for it, so three is
     # a ceiling on the day rather than a promise about any one run: a run that
     # promotes three findings files what fits and defers the rest, which keep
-    # their counts and go first next time.
+    # their counts. A deferred finding is not queued, though — the gate only
+    # sees fingerprints the next investigation reports again, and a fresh
+    # higher-severity finding is considered ahead of it.
     maxPullRequestsPerDay: 3
     # Do not re-open the same fingerprint inside this window. It also sets how
     # long the ledger keeps a promotion record, since the cooldown is the only
@@ -696,12 +711,13 @@ selfImprovement:
     # 40,346 additions across 261 files, because the install was running a test
     # branch the fork's main had never seen.
     #
-    # Nothing in the runner checks this for you. The filing skill asks the agent
-    # to compare its branch against this base before opening, and to note the
-    # discrepancy in the pull request when the numbers come back far apart — a
-    # check that costs model calls, runs inside the filing turn rather than
-    # before it, and proceeds anyway if the comparison fails. Treat it as a
-    # label on a bad pull request, not as a guard against one.
+    # Nothing in the runner checks this for you. The filing skill compares the
+    # base against its branch before opening and refuses — `SKIPPED`, nothing
+    # filed — when the file count does not match what it committed. It opens
+    # anyway, with a note in the body, only when the comparison call itself
+    # fails: a fork the anonymous API cannot see is not evidence either way.
+    # The check costs model calls and runs inside the filing turn rather than
+    # before it, so a turn that dies before reaching it files nothing at all.
     #
     # An install pinned to a branch of its own — a live test, a private
     # deployment tracking a release line — sets this to that branch.
@@ -812,6 +828,11 @@ selfImprovement:
   # ships -- 34.118.224.10 and 10.96.0.10, the same pair as `apiServerCIDRs` one
   # octet along. Set it if `kubectl get svc kube-dns -n kube-system` shows
   # neither, or nothing the loop reads will resolve.
+  #
+  # Setting it replaces that pair rather than adding to it, which is the
+  # opposite of `apiServerCIDRs` below and deliberate: there is nothing
+  # discovered here to preserve, only two guesses at a convention, and an
+  # operator who has read the Service knows which one is right.
   dnsCIDRs: []
 
   # The API server, as its own egress rule, so the wide 443 rule can exclude the

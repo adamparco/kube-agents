@@ -1394,6 +1394,33 @@ class FilingOutcomeTests(unittest.TestCase):
         self.assertEqual(result, R.SKIPPED)
         self.assertIn("#41", detail)
 
+    def test_a_refusal_that_cites_the_pull_request_it_refused_over_is_still_a_refusal(self):
+        """Section 0 sends the turn to the search API, so it has links in hand.
+
+        Scanning every URL before any `SKIPPED` read this as a filing: a daily
+        slot and a 24-hour cooldown charged against a pull request this run did
+        not open, and on the out-of-bounds path no `record_refusal` at all, so
+        the permanent answer is re-bought every hour.
+        """
+        self.stdout = (
+            "The maintainer closed this one already:\n"
+            "https://github.com/gke-labs/kube-agents/pull/41\n"
+            "SKIPPED: closed unmerged as #41"
+        )
+        result, detail = self._file()
+        self.assertEqual(result, R.SKIPPED)
+        self.assertIn("#41", detail)
+
+    def test_a_github_link_that_is_not_a_pull_request_is_not_a_filing(self):
+        """Only `/pull/<n>` is something a turn can only have got by opening one.
+
+        A repository or search link is something it quotes while explaining
+        itself. Treating one as the pull request records a ledger URL that goes
+        nowhere and charges the day for it.
+        """
+        self.stdout = "I looked at\nhttps://github.com/gke-labs/kube-agents"
+        self.assertEqual(self._file(), (R.UNCONFIRMED, None))
+
     def test_a_turn_killed_at_its_budget_is_unconfirmed_not_skipped(self):
         """Exit 124 with no URL is the case that produced six pull requests.
 
@@ -1637,6 +1664,53 @@ class BaseBranchTests(unittest.TestCase):
                 os.environ["SELFIMPROVE_BASE_BRANCH"] = prior
 
 
+class PermanentRefusalMarkerTests(unittest.TestCase):
+    """Which `SKIPPED` lines mean "never", and which only mean "not yet".
+
+    The asymmetry is the whole design of this predicate. A miss costs an hourly
+    retry: expensive, logged, and over the moment a turn phrases the refusal the
+    documented way. A false positive writes a hold that no code path clears, on
+    a finding that -- being recurrent -- never ages out of the ledger either, so
+    it is filed never again and the only notice is one line in one run's log.
+    """
+
+    def test_the_documented_form_is_a_refusal(self):
+        self.assertTrue(R.is_permanent_refusal("SKIPPED: out of bounds - it changes the gate"))
+
+    def test_the_case_the_turn_used_does_not_matter(self):
+        self.assertTrue(R.is_permanent_refusal("Skipped: Out Of Bounds - it changes the gate"))
+
+    def test_the_punctuation_between_the_two_may_vary(self):
+        for line in (
+            "SKIPPED - out of bounds: it changes the ledger",
+            "SKIPPED:out of bounds",
+            "out of bounds - the grants are not mine to widen",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(R.is_permanent_refusal(line))
+
+    def test_a_reason_that_merely_quotes_an_out_of_bounds_bug_is_not_a_refusal(self):
+        """The finding being skipped can be *about* an out-of-bounds error.
+
+        `reason` is the whole line, and four of the skill's skip paths put free
+        text after the word. Matching the marker anywhere in it cannot tell a
+        deferral about an IndexError from a policy refusal, and gets the
+        irreversible answer wrong in the direction that loses a real finding.
+        """
+        for line in (
+            "SKIPPED: index out of bounds, already filed as #12",
+            "SKIPPED: not confident -- the traceback says the slice went out of bounds",
+            "SKIPPED: the fix for this out of bounds read needs a maintainer's decision",
+        ):
+            with self.subTest(line=line):
+                self.assertFalse(R.is_permanent_refusal(line))
+
+    def test_an_ordinary_skip_and_an_empty_reason_are_not_refusals(self):
+        for line in ("SKIPPED: the evidence is too thin", "SKIPPED", "", None):
+            with self.subTest(line=line):
+                self.assertFalse(R.is_permanent_refusal(line))
+
+
 class PullRequestLabelTests(unittest.TestCase):
     """The label that tells the loop's pull requests from a human's.
 
@@ -1749,6 +1823,24 @@ class PullRequestLabelTests(unittest.TestCase):
         for prefix in ("it's ", "sev,", "a'b"):
             with self.subTest(prefix=prefix):
                 self.assertEqual("", R.severity_label({"severity": "high"}, prefix))
+
+    def test_the_pr_label_gets_the_same_guard_as_the_severity_prefix(self):
+        """Both are operator strings reaching the same single-quoted argument.
+
+        Only the severity prefix was checked, so `prLabel: "ours,theirs"` went
+        through unexamined and produced the two labels the one-command-per-label
+        rule exists to prevent -- with no log line saying where they came from.
+        """
+        for label in ("it's ours", "ours,theirs"):
+            with self.subTest(label=label):
+                self.assertEqual("", R.usable_label(label, "prLabel"))
+        self.assertEqual("self-improvement", R.usable_label("self-improvement", "prLabel"))
+
+    def test_a_refused_pr_label_is_left_out_of_the_prompt(self):
+        prompt = self._prompt("ours,theirs", "severity:", entry={"severity": "high"})
+        self.assertNotIn("ours,theirs", prompt)
+        self.assertIn("severity:high", prompt)
+        self.assertIn("Apply it once the pull request is open:", prompt)
 
     def test_every_shipped_grade_is_a_usable_label_name(self):
         """`severity_label` mints a label out of whatever `SEVERITIES` holds.
@@ -2288,6 +2380,7 @@ class FilingWiringAndRefusalTests(unittest.TestCase):
         self.findings_path = os.path.join(self.home, "findings.json")
         self.saved = []
         self.calls = []
+        self.investigate_timeouts = []
         self.filing_result = (R.SKIPPED, "SKIPPED: out of bounds - it changes the gate")
 
         patches = [
@@ -2307,6 +2400,10 @@ class FilingWiringAndRefusalTests(unittest.TestCase):
             ("mint_forge_credential", lambda repo: None),
             ("run_agent", self._investigate),
             ("file_pull_request", self._file),
+            # Reading it would be an API call, and `seconds_left` already
+            # falls back to `RUN_STARTED` when the read fails -- which is the
+            # clock these tests move.
+            ("job_started_at", lambda ns: None),
         ]
         for name, replacement in patches:
             prior = getattr(R, name)
@@ -2326,7 +2423,15 @@ class FilingWiringAndRefusalTests(unittest.TestCase):
         R.signal.signal = lambda *a: None
         self.addCleanup(setattr, R.signal, "signal", prior_handler)
 
+        self.addCleanup(setattr, R, "RUN_STARTED", R.RUN_STARTED)
+
+    def _remaining(self, seconds, deadline=14400):
+        """Wind `RUN_STARTED` back so `seconds_left` returns `seconds`."""
+        R.RUN_STARTED = R.time.time() - (deadline - seconds - R.DEADLINE_RESERVE_SECONDS)
+        return str(deadline)
+
     def _investigate(self, prompt, home, timeout, label, allow_forge=False):
+        self.investigate_timeouts.append(timeout)
         with open(self.findings_path, "w", encoding="utf-8") as handle:
             json.dump(
                 [{
@@ -2428,6 +2533,82 @@ class FilingWiringAndRefusalTests(unittest.TestCase):
         log = self._run()
         self.assertIn("out of bounds", log)
         self.assertIn("will not be promoted again", log)
+
+    def test_a_skip_that_quotes_an_out_of_bounds_bug_stays_promotable(self):
+        """The marker is a decision, not a phrase that may appear in a reason.
+
+        `reason` is the whole `SKIPPED` line, and four of the skill's five skip
+        paths put free text after the word -- text that may quote the finding
+        being skipped. A finding about an index error, deferred for want of
+        evidence, must not be read as a policy refusal: that hold is written
+        once, cleared by nothing, and would bury a real finding permanently
+        with no notice beyond one line in one run's log.
+        """
+        self.filing_result = (R.SKIPPED, "SKIPPED: index out of bounds, already filed as #12")
+        self._run()
+        finding = list(self.saved[-1]["findings"].values())[0]
+        self.assertNotIn("refused", finding)
+        self.calls.clear()
+        self._run()
+        self.assertTrue(self.calls, "a deferral was mistaken for a permanent refusal")
+
+    def test_the_filing_reserve_is_wired_into_the_investigation_budget(self):
+        """Deleting the reserve at the call site must fail a test, not a run.
+
+        Every other end-to-end harness here sets `SELFIMPROVE_DEADLINE` to 0,
+        which makes `seconds_left` return `None` and `investigation_budget`
+        return its argument unchanged -- so the subtraction is never reached
+        and swapping the call back to plain `budgeted` changes nothing any
+        test can see. This one runs the clock.
+        """
+        deadline = self._remaining(5000)
+        self._run(
+            SELFIMPROVE_DEADLINE=deadline,
+            SELFIMPROVE_INVESTIGATE_TIMEOUT="3600",
+            SELFIMPROVE_FILE_TIMEOUT="3000",
+        )
+        # 5000 left, 3000 held back for filing: 2000, not the 3600 the timeout
+        # asks for and not the 5000 `budgeted` would have allowed.
+        self.assertEqual(1, len(self.investigate_timeouts))
+        self.assertAlmostEqual(2000, self.investigate_timeouts[0], delta=5)
+
+    def test_report_only_does_not_reserve_for_a_stage_it_never_runs(self):
+        deadline = self._remaining(5000)
+        self._run(
+            SELFIMPROVE_MODE="report-only",
+            SELFIMPROVE_DEADLINE=deadline,
+            SELFIMPROVE_INVESTIGATE_TIMEOUT="3600",
+            SELFIMPROVE_FILE_TIMEOUT="3000",
+        )
+        self.assertEqual([3600], self.investigate_timeouts)
+        self.assertEqual([], self.calls, "report-only must not file")
+
+    def test_a_filing_turn_defers_rather_than_starting_on_a_budget_it_cannot_finish(self):
+        """Under half `fileTimeoutSeconds`, do not start: the attempt is charged.
+
+        `investigation_budget` guarantees the reserve to the *first* filing turn
+        only. A later one running on what the first left over used to need just
+        `MIN_TURN_SECONDS`, and a filing turn that dies mid-push is charged a
+        daily slot and a 24-hour cooldown for a pull request that may not exist.
+        """
+        prior = R.budgeted
+        R.budgeted = lambda configured, deadline, namespace="": 1400
+        self.addCleanup(setattr, R, "budgeted", prior)
+        log = self._run(SELFIMPROVE_DEADLINE="14400", SELFIMPROVE_FILE_TIMEOUT="3000")
+        self.assertEqual([], self.calls, "started a filing turn it could not finish")
+        self.assertIn("a filing turn needs 1500s", log)
+        finding = list(self.saved[-1]["findings"].values())[0]
+        self.assertEqual([], finding.get("promotions", []), "charged for an attempt not made")
+
+    def test_a_filing_turn_over_the_floor_still_runs(self):
+        """The converse, so the floor cannot be raised into blocking everything."""
+        prior = R.budgeted
+        R.budgeted = lambda configured, deadline, namespace="": 1600
+        self.addCleanup(setattr, R, "budgeted", prior)
+        self._run(SELFIMPROVE_DEADLINE="14400", SELFIMPROVE_FILE_TIMEOUT="3000")
+        self.assertTrue(self.calls, "deferred a filing turn that had time for one")
+        self.assertEqual(1600, self.calls[0][0][7])
+
 
 if __name__ == "__main__":
     unittest.main()

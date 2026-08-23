@@ -1554,16 +1554,41 @@ UNCONFIRMED = "unconfirmed"
 #: evidence gets, and retrying it hourly costs a minted token and a filing
 #: turn's whole budget each time to arrive at the same no.
 #:
-#: Matched loosely -- lowercased, anywhere in the line -- because the cost of a
-#: miss is that hourly retry and the cost of a false positive is one finding a
-#: human still reads in the ledger. A model that writes "SKIPPED: this is out of
-#: bounds, it changes the gate" should be understood.
+#: Matched at the head of the reason rather than anywhere in it, because the
+#: two ways of getting this wrong do not cost the same. A miss costs the hourly
+#: retry the marker exists to stop -- real money, but it is in the log and it
+#: ends the moment a turn phrases the refusal the documented way. A false
+#: positive holds a genuine finding out of the filing queue for good:
+#: `record_refusal` is written once, cleared by nothing, and outlives every
+#: prune as long as the finding keeps recurring, so recovery means hand-editing
+#: the ledger ConfigMap. And the input invites one. `reason` is `line[:200]` of
+#: any line starting with `SKIPPED`, which the skill prints on four paths that
+#: are not this one -- a stale finding, one closed unmerged, a `gh` error, plain
+#: lack of confidence -- each with free text after it that may quote the finding
+#: being skipped. "SKIPPED: index out of bounds, already filed as #12" is a
+#: deferral about an out-of-bounds bug, and an unanchored match reads it as a
+#: refusal and buries it.
 OUT_OF_BOUNDS_MARKER = "out of bounds"
+
+#: What `gh pr create` prints when it has opened one, and the only shape of
+#: github.com link the runner will read as proof that it did. A trailing path is
+#: allowed (`/files`, `#issuecomment-...`) because `gh` is not the only thing
+#: that may produce the line.
+PULL_REQUEST_URL_RE = re.compile(r"^https://github\.com/[^/\s]+/[^/\s]+/pull/\d+")
 
 
 def is_permanent_refusal(reason: Optional[str]) -> bool:
-    """Did the filing turn decline on policy, rather than defer on evidence."""
-    return OUT_OF_BOUNDS_MARKER in (reason or "").lower()
+    """Did the filing turn decline on policy, rather than defer on evidence.
+
+    The skill asks for `SKIPPED: out of bounds - <why>` and says to use those
+    three words, so they are required where it puts them: first, once `SKIPPED`
+    and its punctuation are off the front. Everything after them is the turn's
+    own prose and is not searched.
+    """
+    text = (reason or "").strip().lower()
+    if text.startswith("skipped"):
+        text = text[len("skipped") :].lstrip(" \t:-—")
+    return text.startswith(OUT_OF_BOUNDS_MARKER)
 
 
 def _fenced(fields: Dict[str, str]) -> str:
@@ -1646,6 +1671,30 @@ def mint_forge_credential(repository: str) -> None:
     log("minted a GitHub token for %s" % repository)
 
 
+def usable_label(name: str, knob: str) -> str:
+    """`name`, or "" when it cannot safely become one `gh pr edit --add-label`.
+
+    The label lands in a single-quoted argument of a shell command the filing
+    turn runs, so a quote in it ends the quoting early and the rest becomes
+    argv, and a comma splits one label into two -- which is the thing
+    one-command-per-label exists to prevent. Neither is a privilege boundary:
+    anyone who can set chart values already owns the CronJob's command. So this
+    refuses the label rather than escaping it, because a typo'd value should
+    cost the label and say so instead of silently producing a different one.
+
+    `knob` names the chart value to go and fix, since by the time this fires the
+    string has been through a template and a prefix concatenation and the log
+    line is the only thing that says where it came from.
+    """
+    if "'" in name or "," in name:
+        log(
+            "%s would build the label %r, which carries a quote or a comma; opening this pull "
+            "request without it" % (knob, name)
+        )
+        return ""
+    return name
+
+
 def severity_label(entry: Dict[str, Any], prefix: str) -> str:
     """`prefix` + this finding's grade, or "" when there should not be one.
 
@@ -1669,23 +1718,9 @@ def severity_label(entry: Dict[str, Any], prefix: str) -> str:
     grade = str(entry.get("severity", "")).strip().lower()
     if grade not in ledger_mod.SEVERITIES:
         return ""
-    name = "%s%s" % (prefix, grade)
     # The grade is allowlisted above; the prefix is an operator's string and is
-    # not. It reaches a single-quoted argument in a shell command the filing
-    # turn runs, so a quote in it ends the quoting early and the rest of the
-    # name becomes argv -- and a comma splits one label into two, which is the
-    # thing one-command-per-label exists to prevent. Neither is a privilege
-    # boundary (anyone who can set chart values already owns the CronJob's
-    # command), so this refuses the label rather than escaping it: a typo'd
-    # prefix should cost the label and say so, not silently produce a different
-    # one.
-    if "'" in name or "," in name:
-        log(
-            "severityLabelPrefix %r would build the label %r, which carries a quote or a comma; "
-            "opening this pull request without a severity label" % (prefix, name)
-        )
-        return ""
-    return name
+    # not, so it goes through the same check `prLabel` does.
+    return usable_label("%s%s" % (prefix, grade), "severityLabelPrefix")
 
 
 def file_pull_request(
@@ -1719,7 +1754,14 @@ def file_pull_request(
     # exact repository, and a turn that has to infer the slug from `git remote`
     # will sometimes infer the other one.
     push_target = fork or upstream
-    labels = [name for name in (pr_label, severity_label(entry, severity_label_prefix)) if name]
+    labels = [
+        name
+        for name in (
+            usable_label(pr_label, "prLabel"),
+            severity_label(entry, severity_label_prefix),
+        )
+        if name
+    ]
     # Everything in this block came, directly or at one remove, from log lines,
     # HTTP responses and Kubernetes object fields the loop does not control.
     # This is the one turn in the whole feature that holds a GitHub credential,
@@ -1909,25 +1951,40 @@ def file_pull_request(
         prompt, home, timeout, "file:%s" % entry.get("fingerprint", "?"), allow_forge=True
     )
     lines = [l.strip() for l in stdout.splitlines() if l.strip()]
-    # The last GitHub URL anywhere in the reply, not `lines[-1]`. The skill asks
-    # for the URL alone on the final line and also asks the turn to note a
-    # failed `gh pr edit --add-label`, and a turn that puts the note last has
-    # still opened the pull request. Reading only the final line would throw
-    # that away and return UNCONFIRMED, and an UNCONFIRMED finding is filed
-    # again by the next run -- a duplicate pull request, over a sentence about a
-    # missing label. Do not tighten this to `lines[-1]`.
-    for line in reversed(lines):
-        if line.startswith("https://github.com/"):
-            return FILED, line
-    # No URL. Whether a pull request exists is now the question, and the two
-    # answers need opposite handling, so guessing one is not available.
+    # Whichever outcome marker the turn wrote *last*, scanning up from the end.
+    # Sec. 8 of the skill puts the pull request URL alone on the final line with
+    # nothing after it, and sec. 7 puts the note about a label that would not
+    # attach above it, so on a turn that filed, the URL is what comes last.
     #
-    # `SKIPPED:` is the skill's word for "I looked and decided not to open one"
-    # -- the finding was stale, already filed, closed unmerged, or the turn was
-    # not confident. Nothing was opened, so nothing may be charged: the skill
-    # promises the finding keeps its counts and a later run may file it, and a
-    # cooldown started here would break that promise silently.
-    for line in lines:
+    # Not `lines[-1]` even so: a turn that adds a sentence after the URL has
+    # opened the pull request all the same, and returning UNCONFIRMED there gets
+    # it filed again next run -- a duplicate pull request, over a trailing
+    # remark. Keep reading upwards past anything that is neither marker.
+    #
+    # But do not scan all the URLs before any of the SKIPPEDs, which is what
+    # this used to do. A refusal that cites the pull request it is refusing over
+    # then reads as a filing: sec. 0 sends the turn to the GitHub search API and
+    # asks for `SKIPPED: closed unmerged as #<n>`, so it has links in hand, and
+    # a link pasted on its own line would charge a daily slot and a 24-hour
+    # cooldown against a pull request this run did not open -- and on the
+    # out-of-bounds path, skip `record_refusal` entirely, leaving the permanent
+    # answer to be re-bought every hour. Taking the later of the two markers
+    # reads the turn's closing statement rather than preferring one word to the
+    # other.
+    #
+    # The URL must be a pull request URL, not any github.com link, for the same
+    # reason: a search URL or a repository URL is something a turn quotes while
+    # explaining itself, and only `/pull/<n>` is something it can only have got
+    # by opening one.
+    for line in reversed(lines):
+        if PULL_REQUEST_URL_RE.match(line):
+            return FILED, line
+        # `SKIPPED:` is the skill's word for "I looked and decided not to open
+        # one" -- the finding was stale, already filed, closed unmerged, or the
+        # turn was not confident. Nothing was opened, so nothing may be charged:
+        # the skill promises the finding keeps its counts and a later run may
+        # file it, and a cooldown started here would break that promise
+        # silently.
         if line.startswith("SKIPPED"):
             return SKIPPED, line[:200]
     # Anything else is unknown, and the likeliest unknown is the dangerous one.
@@ -1935,8 +1992,8 @@ def file_pull_request(
     # request and died before printing the URL, and a turn that exits 0 without
     # saying either word has told us nothing. Treated as a miss, the finding
     # stays uncooled and unbudgeted and the next run files it again: six
-    # upstream pull requests against a ceiling of two, in six hours, which is
-    # what this branch was doing before it existed.
+    # upstream pull requests in six hours against a ceiling that was two at the
+    # time, which is what this branch was doing before it existed.
     return UNCONFIRMED, None
 
 
@@ -2251,13 +2308,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         if promoted:
             log("%d finding(s) cleared the gate; mode is report-only, so they stay in the ledger" % len(promoted))
     else:
+        # The floor for a filing turn is not `MIN_TURN_SECONDS`. That constant
+        # asks whether a turn can reach the model at all, which is the right
+        # question for an investigation turn: one that is cut off part-way still
+        # leaves its findings on disk and costs only the seconds it spent.
+        # Filing is all-or-nothing and charges for the attempt -- a turn that
+        # times out mid-push is `UNCONFIRMED`, which spends a daily slot and
+        # starts a 24-hour cooldown for a pull request that may not exist. Live
+        # run `selfimprove-fork-3` did exactly that at 900s, so anything from
+        # 120s up would be buying that outcome deliberately.
+        #
+        # `investigation_budget` reserves `fileTimeoutSeconds` and so guarantees
+        # the floor for the first filing turn only. The second and third take
+        # what the first left, and this is what stops them starting on a budget
+        # that can only end in a phantom promotion. Half the timeout rather than
+        # a constant, so an operator who raises `fileTimeoutSeconds` because
+        # filing is slow on their install raises the floor with it.
+        file_floor = max(MIN_TURN_SECONDS, file_timeout // 2)
         for fp in promoted:
             turn_budget = budgeted(file_timeout, deadline, namespace)
-            if turn_budget < MIN_TURN_SECONDS:
+            if turn_budget < file_floor:
                 log(
-                    "out of time: %s and any findings after it stay in the ledger, unfiled. They "
-                    "keep their occurrence counts and their gate eligibility, so the next run "
-                    "files them first." % fp
+                    "out of time: %ds is left and a filing turn needs %ds, so %s and any findings "
+                    "after it stay in the ledger, unfiled. They keep their occurrence counts and "
+                    "their gate eligibility, so the next run files them first."
+                    % (max(turn_budget, 0), file_floor, fp)
                 )
                 break
             if turn_budget < file_timeout:

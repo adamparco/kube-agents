@@ -621,8 +621,8 @@ lifecycle, and this feature should follow it rather than invent a second scheme.
 
 A finding is promoted to a pull request when it matches any promotion rule, has not been promoted
 inside its cooldown, and the day's budget is not spent. Everything else stays in the ledger, which
-is not a discard: an unpromoted finding keeps accumulating occurrences, and a `high` at four
-occurrences a day is one bad day away from crossing on its own.
+is not a discard: an unpromoted finding keeps accumulating occurrences, and a `high` at two
+occurrences a day is one more sighting from crossing on its own.
 
 ## 8. The pull request
 
@@ -679,7 +679,16 @@ what stops the runner charging the finding as a filing that may have half-succee
 is what marks the answer permanent, so `record_refusal` can flag the finding and the gate can stop
 promoting it. An ordinary `SKIPPED` deliberately does neither — it means "not yet", keeps the counts
 and invites a better-evidenced retry — and that generosity applied to a permanent no costs a minted
-token and a filing turn's whole budget every hour, forever. The refusal itself lives in
+token and a filing turn's whole budget every hour, forever.
+
+Which is why the runner reads those three words only at the head of the line, immediately after
+`SKIPPED` and its punctuation, rather than anywhere in it. The reason text after them is the turn's
+own prose and can quote the finding it is skipping, so "SKIPPED: index out of bounds, already filed
+as #12" is a deferral about an off-by-one and not a refusal. Getting that backwards is the more
+expensive mistake by a wide margin: a missed marker costs the hourly retry and ends as soon as a
+turn phrases it the documented way, while a spurious one writes a hold that nothing in the code
+clears and that a recurring finding never ages out of — the finding is filed never again, and the
+only notice is a line in one run's log. The refusal itself lives in
 [`agents/selfimprove/skills/file-pull-request/SKILL.md`](../../agents/selfimprove/skills/file-pull-request/SKILL.md),
 which is canonical for it.
 
@@ -870,7 +879,7 @@ does, and every API call the loop makes carries a timeout. The second failure is
 generalising from — an error path that only runs when the dependency answers is not an error path.
 
 **The gate is set too loose on a large fleet.** `maxPullRequestsPerDay` is per install, and fifty
-installs at two a day is a hundred pull requests against one repository. This is the strongest
+installs at three a day is a hundred and fifty pull requests against one repository. This is the strongest
 argument for `report-only` being the default and for `upstream` being a mode a maintainer chooses
 for a small number of installs. Deduplication across installs is not solved here — see §11.
 
@@ -895,8 +904,8 @@ history and each finding's promotion list are fixed-length, and `save` refuses a
 message naming the likely cause rather than letting the API server return a 413. The one that took
 a second look is retention: a promoted finding has to outlive the sighting window, because its
 pull-request record is what stops the loop re-filing it, and the first implementation expressed that
-as never deleting it at all. At two pull requests a day that is a row added every twelve hours and
-none ever removed, which reaches the cap in about a year. A promoted row is now held until its last
+as never deleting it at all. At three pull requests a day that is a row added every eight hours and
+none ever removed, which reaches the cap inside a year. A promoted row is now held until its last
 promotion is older than both the retention period and the cooldown, whichever is longer, since the
 cooldown is the only thing that reads it.
 
@@ -986,9 +995,14 @@ turn is affordable however deep the investigation went; the reserve is zero unde
 never files. `activeDeadlineSeconds` is then sized against the measurement rather than against the
 schedule: four hours covers six turns at the measured 1424s and still leaves a whole
 `fileTimeoutSeconds` for the first pull request. A run that files a second one gives it the
-remainder, and where that is under the turn floor the finding is deferred rather than lost — it
-keeps its occurrence counts and its gate eligibility, and the next run files it first. It reaches
-GitHub an hour later, not never.
+remainder, and where that is under half of `fileTimeoutSeconds` the finding is deferred rather than
+lost — half, and not the `MIN_TURN_SECONDS` an investigation turn stops at, because the two stages
+fail differently. An investigation turn cut short leaves its findings on disk and costs the seconds
+it spent; a filing turn cut short is charged for the attempt, which is the `UNCONFIRMED` slot and
+cooldown two sentences above. A budget it cannot finish in is worse than no attempt. Deferring, it
+keeps its occurrence counts and its gate eligibility. It reaches GitHub an hour later rather than
+never — provided the next investigation finds it again, since the gate only ever considers the
+fingerprints the run in front of it reported.
 
 A run whose investigation was capped exits 0. The exit code answers whether the runner worked, and
 the ledger's `outcome` answers how the investigation went; conflating the two put the ordinary run
@@ -1024,9 +1038,9 @@ a commit, a push and a pull request, so the default is now 3000 seconds. There i
 measured investigations all ended at the 90-iteration cap well short of `investigateTimeoutSeconds`,
 and this many seconds is now reserved out of the investigation rather than left to whatever survives
 it. 3000 rather than 1500 because a run at the default `maxPullRequestsPerDay: 3` can file three
-times, and only the first is reserved for — the rest take the remainder and defer if it is under the
-floor, which costs a run and not the finding. The ceiling is 3300, where a turn could outlive the
-GitHub token minted at its start.
+times, and only the first is reserved for — the rest take the remainder and defer if it is under
+half of this value, which costs a run and not the finding. The ceiling is 3300, where a turn could
+outlive the GitHub token minted at its start.
 
 What made this expensive to diagnose was the second half. `run_agent` logged the turn's response on
 a clean exit and not on a timeout, so the one case where the pod's emptyDir is about to vanish
@@ -1270,6 +1284,15 @@ the top of the run and the write at the bottom, so the window is the whole of
 `activeDeadlineSeconds` — four hours by default. A precondition across a window that wide would turn
 a
 concurrent `helm upgrade` reapplying the chart's labels into a 409 that loses the run's findings
-entirely. `concurrencyPolicy: Forbid` already serialises the only automated writer, and what an
-actual race costs is occurrence counts, which delays a promotion rather than causing a wrong one. The
-exposure that remains is a manually-triggered Job, or a `kubectl edit`, overlapping a scheduled run.
+entirely. `concurrencyPolicy: Forbid` already serialises the only automated writer. The exposure that remains
+is a manually-triggered Job, or a `kubectl edit`, overlapping a scheduled run — `Forbid` governs the
+CronJob's own Jobs, and a Job created by hand is not one of them.
+
+That exposure is not only about occurrence counts, which was the first thing this paragraph said and
+was too kind. A live test hit it: a hand-created Job ran alongside two scheduled runs and its closing
+write took the ledger back to its own view of it, dropping the other two runs' rows and, with them,
+the promotion records for two pull requests that had already been opened. An occurrence count that
+goes backwards delays a promotion. A promotion record that disappears removes the only thing holding
+the cooldown, so the finding is re-filed the next time it is seen and the maintainer gets a duplicate
+of a pull request already in their queue. Do not run a Job by hand against an install whose CronJob
+is enabled; suspend the CronJob first.

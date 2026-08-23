@@ -261,7 +261,10 @@ the other, and a maintainer reading "the label failed" cannot tell which is miss
 - The code does not match the finding (§0).
 - The fix would touch the self-improvement loop's own gate, ledger, or grants. A loop that can widen
   its own permissions is the failure mode this whole design is arranged around. Print
-  `SKIPPED: out of bounds - <why>`, with those three words, and do not open anything. The word
+  `SKIPPED: out of bounds - <why>`, with those three words first and your reason after them, and do
+  not open anything. First matters: the runner reads them only at the head of the line, so that a
+  refusal is never confused with an ordinary skip whose reason happens to quote a finding about an
+  out-of-bounds error. The word
   `SKIPPED` is what stops the runner reading your turn as a filing that failed — which would spend
   one of the day's pull request slots and start a 24-hour cooldown. `out of bounds` is what tells it
   the answer is permanent: without it the finding is offered to a filing turn again every hour,

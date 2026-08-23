@@ -332,9 +332,9 @@ def prune(
     It is not kept *forever*, and the earlier version of this function was: the
     delete was guarded on `not entry.get("promotions")`, so every promoted
     finding became a permanent row. Bounding the `promotions` list inside those
-    rows does not help when the rows themselves accumulate -- at the default two
-    pull requests a day, a few hundred bytes each, an install reaches
-    LEDGER_MAX_BYTES in about a year and then `save` raises on every subsequent
+    rows does not help when the rows themselves accumulate -- at the default
+    three pull requests a day, a few hundred bytes each, an install reaches
+    LEDGER_MAX_BYTES inside a year and then `save` raises on every subsequent
     run. That is the worst failure this file has: the ledger write is where a
     run's findings become durable, so a wedged ledger loses every later run's
     output, and nothing recovers it without someone deleting the ConfigMap.
@@ -810,6 +810,12 @@ def record_refusal(
     Only the first refusal is kept. A second is the same answer to the same
     question, and overwriting the first would move its timestamp forward, which
     is the field telling a human how long the finding has been waiting on them.
+
+    Of the three fields written, only `reason` is read by any code -- `promote`
+    quotes it back so the hold says why. `at` and `revision` are there for
+    someone reading the ConfigMap, which is also the only place this is
+    reversible from: nothing clears a refusal, so an entry written in error
+    stays until a maintainer deletes the key by hand.
     """
     entry = ledger["findings"].get(fp)
     if entry is None:
@@ -840,8 +846,10 @@ def record_run(
     the gate every run and nothing is ever filed -- collapsing the two would
     make the run record say the loop promoted nothing, when what it did was
     promote and then deliberately not file. And in fork/upstream mode a filing
-    turn that fails leaves promoted > filed, which is the signal that the
-    GitHub path is broken rather than that the gate is closed.
+    turn that fails leaves promoted > filed, which is usually the signal that
+    the GitHub path is broken rather than that the gate is closed -- usually,
+    because a healthy `record_refusal` leaves the same arithmetic. Read the
+    finding's `refused` before concluding anything about GitHub from the gap.
     """
     now = now or utcnow()
     ledger.setdefault("runs", []).append(
@@ -1002,13 +1010,21 @@ def save(namespace: str, name: str, ledger: Dict[str, Any]) -> None:
 
     No `resourceVersion` precondition, deliberately. `load` runs at the top of
     the run and this at the bottom, so the read-modify-write window is the whole
-    of `activeDeadlineSeconds` -- an hour by default. A precondition over a
+    of `activeDeadlineSeconds` -- four hours by default. A precondition over a
     window that wide turns anything that touches the object meanwhile, a `helm
     upgrade` reapplying the chart's labels included, into a 409 that loses the
     entire run's findings. `concurrencyPolicy: Forbid` already serialises the
-    only automated writer, and what a genuine race costs is occurrence counts,
-    which delays a promotion rather than causing a wrong one. Losing a run to
-    protect a counter is the worse trade.
+    only automated writer, and losing a whole run to protect a counter is the
+    worse trade.
+
+    What `Forbid` does not cover is a Job created by hand, which the CronJob
+    does not own. A live test ran one alongside two scheduled runs and its
+    closing write took the ledger back to its own view of it: the other two runs
+    lost their rows, and with them the promotion records for two pull requests
+    already open. A lost occurrence count only delays a promotion; a lost
+    promotion record removes the only thing holding the cooldown, so the finding
+    is filed again and the maintainer gets a duplicate. Suspend the CronJob
+    before running a Job by hand.
     """
     from kubernetes import client, config as kube_config  # noqa: PLC0415
 

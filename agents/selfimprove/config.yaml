@@ -47,9 +47,8 @@ tool_loop_guardrails:
 # nothing if none does, but tuning it will not buy a longer investigation.
 #
 # 90 calls is 18 to 24 minutes of this workload, measured across live runs, and
-# does not cover every
-# signal class, so being cut off mid-investigation is the normal case rather
-# than the exceptional one. The runner answers that with turns rather than with
+# does not cover every signal class, so being cut off mid-investigation is the
+# normal case rather than the exceptional one. The runner answers that with turns rather than with
 # a bigger cap it has no way to ask for: when a turn reports it did not finish,
 # it starts another against the same home, up to `investigateMaxTurns`. Three
 # things keep a capped turn from losing what it had. findings.json is written

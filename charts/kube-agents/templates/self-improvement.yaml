@@ -353,6 +353,11 @@ spec:
             cidr: 169.254.20.10/32
         - ipBlock:
             cidr: 169.254.169.254/32
+        {{- /* `default` and not `concat`, the opposite of $apiCIDRs below: the
+               two addresses here are guesses at a convention rather than
+               anything the chart looked up, and values.yaml tells an operator
+               to set this only when it has read the kube-dns Service and found
+               both wrong. Keeping a known-wrong VIP in the policy buys nothing. */}}
         {{- range $si.dnsCIDRs | default (list "34.118.224.10/32" "10.96.0.10/32") }}
         - ipBlock:
             cidr: {{ . }}
@@ -406,9 +411,10 @@ spec:
         - protocol: TCP
           port: 988
     # The Kubernetes API server, as its own rule so the wide 443 rule below can
-    # exclude the private ranges. The runner needs it for four reads -- its own
-    # Pod, the observed Deployment, the custom resources and the ledger
-    # ConfigMap -- and one write, the ledger again at the end of the run.
+    # exclude the private ranges. The runner needs it for five reads -- its own
+    # Pod, its own Job, the observed Deployment, the custom resources and the
+    # ledger ConfigMap -- plus whatever the evidence CLI asks for, and one
+    # write, the ledger again at the end of the run.
     #
     # The ClusterIP is not enough on its own. GKE Dataplane V2 evaluates egress
     # against the destination *after* service translation, so a rule naming only
