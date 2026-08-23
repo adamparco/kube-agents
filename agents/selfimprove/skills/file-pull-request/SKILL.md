@@ -227,9 +227,13 @@ run configured to open them unlabelled says so there instead. Apply them once th
 exists, running the commands exactly as the brief lists them:
 
 ```bash
-gh pr edit <the pull request URL> --add-label 'self-improvement'
-gh pr edit <the pull request URL> --add-label 'severity:medium'
+gh pr edit <the pull request URL> --add-label '<the first label from your brief>'
+gh pr edit <the pull request URL> --add-label '<the second label from your brief>'
 ```
+
+Both names are configurable and the severity one carries this finding's grade, so take them from the
+brief rather than from this page — an install may spell them `sev/high`, and copying the example
+would tag a `critical` finding as something else.
 
 One command per label. Do not fold them into `--add-label 'self-improvement,severity:medium'`: gh
 resolves every name before it applies any, so one label the repository is missing costs you the
@@ -256,8 +260,13 @@ the other, and a maintainer reading "the label failed" cannot tell which is miss
 
 - The code does not match the finding (§0).
 - The fix would touch the self-improvement loop's own gate, ledger, or grants. A loop that can widen
-  its own permissions is the failure mode this whole design is arranged around. Report it as a
-  finding for a human instead.
+  its own permissions is the failure mode this whole design is arranged around. Print
+  `SKIPPED: out of bounds - <why>`, with those three words, and do not open anything. The word
+  `SKIPPED` is what stops the runner reading your turn as a filing that failed — which would spend
+  one of the day's pull request slots and start a 24-hour cooldown. `out of bounds` is what tells it
+  the answer is permanent: without it the finding is offered to a filing turn again every hour,
+  costing a token and a whole turn's budget each time to reach this same refusal. The finding stays
+  in the ledger and keeps counting either way, which is how a human comes to read it.
 - The fix needs a credential, a cluster change, or a decision about product direction.
 - You are not confident. Print `SKIPPED: <why>`. The finding stays in the ledger, the count keeps
   rising, and a later run with better evidence can file it.

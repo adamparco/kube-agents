@@ -347,6 +347,112 @@ class GateTests(unittest.TestCase):
         self.assertEqual(promoted, [])
 
 
+class RefusalTests(unittest.TestCase):
+    """A finding the filing turn declined on policy rather than on evidence.
+
+    The loop is allowed to report a defect in its own gate, ledger or grants and
+    is never allowed to fix one, so that finding comes back from every filing
+    turn with the same no. Without a record of the refusal the gate offers it
+    again an hour later, and each retry costs a minted GitHub token and a whole
+    turn's model budget to reach an answer nothing about the next run can
+    change.
+    """
+
+    def _refused_ledger(self):
+        ledger = L.empty_ledger()
+        fp, _ = L.record_finding(ledger, finding(severity="critical"), "abc", NOW)
+        L.record_refusal(ledger, fp, "SKIPPED: out of bounds - it changes the gate", "abc", NOW)
+        return ledger, fp
+
+    def test_a_refused_finding_is_held_and_the_reason_names_the_refusal(self):
+        ledger, fp = self._refused_ledger()
+        promoted, reasons = L.evaluate_gate(ledger, gate(), [fp], NOW)
+        self.assertEqual(promoted, [])
+        self.assertIn("refused", reasons[fp])
+
+    def test_the_hold_outlasts_any_number_of_later_sightings(self):
+        """The counts keep rising -- a human reads them -- but nothing promotes."""
+        ledger, fp = self._refused_ledger()
+        for age in range(9, -1, -1):
+            L.record_finding(
+                ledger, finding(severity="critical"), "abc", NOW - dt.timedelta(hours=age)
+            )
+        self.assertGreaterEqual(L.occurrences_in_window(ledger["findings"][fp], NOW), 10)
+        promoted, _ = L.evaluate_gate(ledger, gate(), [fp], NOW)
+        self.assertEqual(promoted, [])
+
+    def test_re_recording_the_finding_does_not_clear_the_refusal(self):
+        """`record_finding` must merge into the row, never rebuild it.
+
+        The refused finding is re-reported by every run, so a `record_finding`
+        that replaced the entry would drop `refused` on the next sighting and
+        restore the hourly retry this whole mechanism exists to stop -- silently,
+        with every other test still green.
+        """
+        ledger, fp = self._refused_ledger()
+        L.record_finding(ledger, finding(severity="critical"), "def", NOW)
+        self.assertIn("refused", ledger["findings"][fp])
+
+    def test_a_regrade_does_not_clear_it_either(self):
+        """The refusal is about what the fix would touch, not how bad it is."""
+        ledger, fp = self._refused_ledger()
+        L.record_finding(ledger, finding(severity="low"), "abc", NOW)
+        promoted, _ = L.evaluate_gate(ledger, gate(), [fp], NOW)
+        self.assertEqual(promoted, [])
+        self.assertIn("refused", ledger["findings"][fp])
+
+    def test_it_charges_nothing_against_the_daily_budget(self):
+        """Nothing reached a maintainer's queue, so nothing may be spent.
+
+        Charging it would let one permanently-refused finding crowd out the
+        day's real pull requests, which is a worse outcome than the retry.
+        """
+        ledger, refused = self._refused_ledger()
+        real, _ = L.record_finding(
+            ledger, finding(severity="critical", title="Real", location="a.py:1"), "abc", NOW
+        )
+        other, _ = L.record_finding(
+            ledger, finding(severity="critical", title="Other", location="b.py:1"), "abc", NOW
+        )
+        promoted, _ = L.evaluate_gate(ledger, gate(), [refused, real, other], NOW)
+        self.assertEqual(sorted(promoted), sorted([real, other]))
+        self.assertEqual([], ledger["findings"][refused].get("promotions"))
+
+    def test_only_the_first_refusal_is_kept(self):
+        """Its timestamp is how long the finding has been waiting on a human."""
+        ledger, fp = self._refused_ledger()
+        L.record_refusal(ledger, fp, "a later, differently worded no", "def", NOW + dt.timedelta(hours=5))
+        self.assertEqual(L.to_iso(NOW), ledger["findings"][fp]["refused"]["at"])
+        self.assertIn("it changes the gate", ledger["findings"][fp]["refused"]["reason"])
+
+    def test_recording_against_an_unknown_fingerprint_is_a_no_op(self):
+        ledger = L.empty_ledger()
+        L.record_refusal(ledger, "not-a-fingerprint", "why", "abc", NOW)
+        self.assertEqual({}, ledger["findings"])
+
+    def test_a_refusal_survives_prune_while_the_finding_is_still_seen(self):
+        ledger, fp = self._refused_ledger()
+        L.prune(ledger, NOW)
+        self.assertIn("refused", ledger["findings"][fp])
+
+    def test_a_malformed_refusal_value_does_not_hold_the_finding(self):
+        """Only the dict this module writes counts.
+
+        A hand-edited ConfigMap carrying `refused: true` would otherwise wedge a
+        finding shut with no reason recorded and no way to tell it from one the
+        loop refused itself.
+        """
+        ledger, fp = self._ledger_promotable()
+        ledger["findings"][fp]["refused"] = True
+        promoted, _ = L.evaluate_gate(ledger, gate(), [fp], NOW)
+        self.assertEqual(promoted, [fp])
+
+    def _ledger_promotable(self):
+        ledger = L.empty_ledger()
+        fp, _ = L.record_finding(ledger, finding(severity="critical"), "abc", NOW)
+        return ledger, fp
+
+
 class CooldownSanitisingTests(unittest.TestCase):
     """`cooldownHours` from a human's values.yaml, in every shape it arrives in.
 

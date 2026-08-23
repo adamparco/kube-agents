@@ -148,7 +148,11 @@ of your final response — a backstop for a truncation, not a second place to pu
 - Your own pod's logs and traces. They are filtered by default; do not go looking. This excludes
   your telemetry, not your source: `agents/selfimprove/` is kube-agents code like any other and a
   defect in the runner, the ledger, the evidence CLI or these two skills is a finding worth writing.
-  Grade it on what it costs the same way, and do not soften it because it is yours.
+  Grade it on what it costs the same way, and do not soften it because it is yours. Three of those
+  are reportable but never fixable by this loop — a change to its own gate, ledger or grants is one
+  the filing turn refuses at any severity, so the finding's whole job is to sit in the ledger where
+  a maintainer reads it. Write it anyway, and write it well: that entry is the only way the problem
+  travels.
 - A `Warning` event that is a normal part of an operation that then succeeded.
 - The Slack connect timeout at pod boot — expected, and the relay handles it.
 - A style preference in the source with no evidence attached to it.

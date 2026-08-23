@@ -724,9 +724,9 @@ selfImprovement:
     # others, because they are the vocabulary the ledger grades against. Set to
     # "" to open them without a severity label.
     #
-    # A prefix rather than four names: which four grades exist is not an
-    # install's to change, but how its label scheme spells them is, so an
-    # install already using `sev/` sets that here.
+    # A prefix rather than four names: the ledger fixes which four grades
+    # exist, while the scheme that spells them belongs to the install, so one
+    # already using `sev/` sets that here.
     #
     # Same "must already exist" constraint as `prLabel`, and it bites harder:
     # a repository that has taken these pull requests before still needs the

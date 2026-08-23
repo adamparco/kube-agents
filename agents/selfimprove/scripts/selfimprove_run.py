@@ -1546,6 +1546,25 @@ FILED = "filed"
 SKIPPED = "skipped"
 UNCONFIRMED = "unconfirmed"
 
+#: The words the filing skill prints after `SKIPPED:` when it is declining on
+#: policy rather than on evidence -- a fix that would change the loop's own
+#: gate, ledger or grants. The two are worth separating because they want
+#: opposite handling: an evidence deferral is retried by the next run and must
+#: keep its counts, while this answer will not change no matter how good the
+#: evidence gets, and retrying it hourly costs a minted token and a filing
+#: turn's whole budget each time to arrive at the same no.
+#:
+#: Matched loosely -- lowercased, anywhere in the line -- because the cost of a
+#: miss is that hourly retry and the cost of a false positive is one finding a
+#: human still reads in the ledger. A model that writes "SKIPPED: this is out of
+#: bounds, it changes the gate" should be understood.
+OUT_OF_BOUNDS_MARKER = "out of bounds"
+
+
+def is_permanent_refusal(reason: Optional[str]) -> bool:
+    """Did the filing turn decline on policy, rather than defer on evidence."""
+    return OUT_OF_BOUNDS_MARKER in (reason or "").lower()
+
 
 def _fenced(fields: Dict[str, str]) -> str:
     """Render untrusted fields inside the fence, with the fence made unforgeable.
@@ -1650,7 +1669,23 @@ def severity_label(entry: Dict[str, Any], prefix: str) -> str:
     grade = str(entry.get("severity", "")).strip().lower()
     if grade not in ledger_mod.SEVERITIES:
         return ""
-    return "%s%s" % (prefix, grade)
+    name = "%s%s" % (prefix, grade)
+    # The grade is allowlisted above; the prefix is an operator's string and is
+    # not. It reaches a single-quoted argument in a shell command the filing
+    # turn runs, so a quote in it ends the quoting early and the rest of the
+    # name becomes argv -- and a comma splits one label into two, which is the
+    # thing one-command-per-label exists to prevent. Neither is a privilege
+    # boundary (anyone who can set chart values already owns the CronJob's
+    # command), so this refuses the label rather than escaping it: a typo'd
+    # prefix should cost the label and say so, not silently produce a different
+    # one.
+    if "'" in name or "," in name:
+        log(
+            "severityLabelPrefix %r would build the label %r, which carries a quote or a comma; "
+            "opening this pull request without a severity label" % (prefix, name)
+        )
+        return ""
+    return name
 
 
 def file_pull_request(
@@ -1791,22 +1826,30 @@ def file_pull_request(
         "pr_labels": (
             (
                 "%s\n"
-                "  Apply them once the pull request is open, one command each:\n"
+                "  Apply %s once the pull request is open%s:\n"
                 "%s\n"
-                "  One `gh pr edit` per label on purpose: `--add-label 'a,b'` resolves every\n"
-                "  name before it applies any, so one label the repository does not have costs\n"
-                "  you the others too. Not `gh pr create --label` either -- that resolves before\n"
-                "  it creates anything and fails the whole command, spending the turn and\n"
-                "  leaving nothing behind. Your token can attach an existing label and cannot\n"
-                "  create one, so on a repository without one the edit fails: say so in your\n"
-                "  reply, above the URL line, and carry on. The pull request is the deliverable.\n"
-                "  The labels are how a human tells the loop's output from their own, and how\n"
-                "  they sort a queue of it by how much the loop thinks each one matters."
+                "%s"
+                "  Not `gh pr create --label` -- that resolves the name before it creates\n"
+                "  anything and fails the whole command, spending the turn and leaving nothing\n"
+                "  behind. Your token can attach an existing label and cannot create one, so on\n"
+                "  a repository without one the edit fails: say so in your reply, above the URL\n"
+                "  line, and carry on. The pull request is the deliverable. The labels are how a\n"
+                "  human tells the loop's output from their own, and how they sort a queue of it\n"
+                "  by how much the loop thinks each one matters."
                 % (
                     ", ".join("`%s`" % name for name in labels),
+                    "them" if len(labels) > 1 else "it",
+                    ", one command each" if len(labels) > 1 else "",
                     "\n".join(
                         "      gh pr edit <the pull request URL> --add-label '%s'" % name
                         for name in labels
+                    ),
+                    (
+                        "  One `gh pr edit` per label on purpose: `--add-label 'a,b'` resolves\n"
+                        "  every name before it applies any, so one label the repository does\n"
+                        "  not have costs you the others too.\n"
+                        if len(labels) > 1
+                        else ""
                     ),
                 )
             )
@@ -2229,14 +2272,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                 upstream,
                 fork,
                 turn_budget,
-                base_branch,
-                pr_label,
-                severity_label_prefix,
+                base_branch=base_branch,
+                pr_label=pr_label,
+                severity_label_prefix=severity_label_prefix,
             )
             if result == SKIPPED:
                 # The turn looked and declined. Nothing was opened, so nothing is
                 # charged and the finding keeps its counts for a later run.
                 log("the filing turn declined %s: %s" % (fp, url or "no reason given"))
+                if is_permanent_refusal(url):
+                    # Declined on policy, which no later run will reverse. Recorded
+                    # so the gate stops offering it -- still charging nothing,
+                    # because nothing reached a maintainer's queue.
+                    ledger_mod.record_refusal(ledger, fp, url or "", identity["revision"])
+                    log(
+                        "%s is out of bounds for the filing turn, so it will not be promoted "
+                        "again. It stays in the ledger and keeps counting for a human to read."
+                        % fp
+                    )
             elif result == FILED:
                 ledger_mod.record_promotion(ledger, fp, url, identity["revision"])
                 filed += 1

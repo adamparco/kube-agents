@@ -717,6 +717,23 @@ def evaluate_gate(
     promoted: List[str] = []
     reasons: Dict[str, str] = {}
     for _, fp, entry in candidates:
+        refusal = entry.get("refused")
+        if isinstance(refusal, dict):
+            # A permanent refusal, not a deferral. The filing turn is told to
+            # decline a fix to the loop's own gate, ledger or grants at any
+            # severity, and no later run will decide differently -- the refusal
+            # is about what the change would touch, not about the evidence. The
+            # ordinary `SKIPPED` deliberately charges nothing and starts no
+            # cooldown so a better-evidenced run can retry; applied to a
+            # permanent refusal that same generosity promotes the finding again
+            # every hour, and each promotion costs a minted token and a filing
+            # turn's model budget to reach the same no. The finding stays in the
+            # ledger and keeps counting, which is the point -- a human reads it
+            # there -- it is only never promoted again.
+            reasons[fp] = "held: the filing turn refused this permanently (%s)" % (
+                refusal.get("reason") or "no reason recorded"
+            )
+            continue
         severity = entry.get("severity", "low")
         rule = _rule_for(severity, rules)
         if rule is None:
@@ -771,6 +788,39 @@ def record_promotion(
     if not confirmed:
         promotion["unconfirmed"] = True
     entry.setdefault("promotions", []).append(promotion)
+
+
+def record_refusal(
+    ledger: Dict[str, Any],
+    fp: str,
+    reason: str,
+    revision: str,
+    now: Optional[_dt.datetime] = None,
+) -> None:
+    """Mark a finding the filing turn will never file, at any severity.
+
+    Distinct from `record_promotion` in the one way that matters: it charges
+    nothing. `maxPullRequestsPerDay` limits how much the loop may ask of a
+    maintainer's review queue, and a refusal put nothing in that queue, so
+    spending a slot on it would let one out-of-bounds finding suppress the day's
+    real ones. What it does instead is stop `promote` reaching this finding
+    again -- see the `refused` branch there for why an hourly retry of a
+    permanent no is worth this much machinery.
+
+    Only the first refusal is kept. A second is the same answer to the same
+    question, and overwriting the first would move its timestamp forward, which
+    is the field telling a human how long the finding has been waiting on them.
+    """
+    entry = ledger["findings"].get(fp)
+    if entry is None:
+        return
+    if isinstance(entry.get("refused"), dict):
+        return
+    entry["refused"] = {
+        "at": to_iso(now or utcnow()),
+        "reason": reason or "",
+        "revision": revision,
+    }
 
 
 def record_run(

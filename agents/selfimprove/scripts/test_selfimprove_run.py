@@ -12,6 +12,7 @@ Everything here is pure. `selfimprove_run` imports only the standard library and
 the ledger at module scope, so these run in CI with no cluster and no Hermes.
 """
 
+import copy
 import datetime
 import io
 import json
@@ -1737,6 +1738,47 @@ class PullRequestLabelTests(unittest.TestCase):
     def test_the_prefix_is_the_installs_to_choose(self):
         self.assertEqual("sev/low", R.severity_label({"severity": "low"}, "sev/"))
 
+    def test_a_prefix_that_would_break_the_command_drops_the_label(self):
+        """The grade is allowlisted; the prefix is an operator's free text.
+
+        It lands inside single quotes in a shell command the filing turn runs,
+        so a quote ends the quoting early and a comma splits one label into the
+        two that one-command-per-label exists to avoid. Refused rather than
+        escaped -- a typo should cost the label, not silently make another one.
+        """
+        for prefix in ("it's ", "sev,", "a'b"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual("", R.severity_label({"severity": "high"}, prefix))
+
+    def test_every_shipped_grade_is_a_usable_label_name(self):
+        """`severity_label` mints a label out of whatever `SEVERITIES` holds.
+
+        Nothing else constrains that tuple, so a fifth grade added later with a
+        comma in it would split into two labels and a quote would break the
+        command. Pinned here so the edit that adds one fails a test rather than
+        a filing turn.
+        """
+        for grade in R.ledger_mod.SEVERITIES:
+            with self.subTest(grade=grade):
+                self.assertRegex(grade, r"^[a-z][a-z-]*$")
+
+    def test_one_label_is_not_described_as_two(self):
+        """With the severity label opted out, the brief has one command.
+
+        It used to say "Apply them ... one command each" over a single line and
+        then spend five lines on why `--add-label 'a,b'` is wrong, which is
+        advice about a situation the install has configured away.
+        """
+        prompt = self._prompt("self-improvement", "")
+        self.assertIn("Apply it once the pull request is open:", prompt)
+        self.assertNotIn("one command each", prompt)
+        self.assertNotIn("'a,b'", prompt)
+
+    def test_two_labels_still_get_the_one_command_each_warning(self):
+        prompt = self._prompt("self-improvement", "severity:", entry={"severity": "high"})
+        self.assertIn("Apply them once the pull request is open, one command each:", prompt)
+        self.assertIn("'a,b'", prompt)
+
     def test_it_defaults_to_labelling(self):
         """Omitting the argument entirely must not silently drop the label."""
         R.file_pull_request(
@@ -2228,6 +2270,164 @@ class InvestigationLoopTests(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
+
+class FilingWiringAndRefusalTests(unittest.TestCase):
+    """`main`'s filing branch: what it hands the turn, and what it does with a no.
+
+    Two things nothing else covers. The call into `file_pull_request` has grown
+    a tail of defaulted keyword arguments, and a dropped one is silent -- the
+    pull requests just stop carrying a label and every test still passes. And a
+    `SKIPPED` has two meanings the runner has to tell apart: "not yet", which
+    keeps the finding promotable, and "out of bounds", which must not be
+    offered to a filing turn again.
+    """
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.findings_path = os.path.join(self.home, "findings.json")
+        self.saved = []
+        self.calls = []
+        self.filing_result = (R.SKIPPED, "SKIPPED: out of bounds - it changes the gate")
+
+        patches = [
+            ("resolve_revision", lambda ns, dep, fb: {
+                "revision": "abc1234",
+                "stamped": True,
+                "dirty": False,
+                "fetch_ref": "abc1234",
+                "runner_image": "img",
+                "agent_image": "img",
+                "refuse": None,
+                "image_check": "matched",
+            }),
+            ("fetch_source", lambda *a, **k: "/src"),
+            ("hermes_pin", lambda root: ""),
+            ("scaffold_home", lambda home: None),
+            ("mint_forge_credential", lambda repo: None),
+            ("run_agent", self._investigate),
+            ("file_pull_request", self._file),
+        ]
+        for name, replacement in patches:
+            prior = getattr(R, name)
+            setattr(R, name, replacement)
+            self.addCleanup(setattr, R, name, prior)
+
+        self.ledger = ledger_mod.empty_ledger()
+        for name, replacement in (
+            ("load", lambda ns, n: self.ledger),
+            ("save", lambda ns, n, led: self.saved.append(copy.deepcopy(led))),
+        ):
+            prior = getattr(R.ledger_mod, name)
+            setattr(R.ledger_mod, name, replacement)
+            self.addCleanup(setattr, R.ledger_mod, name, prior)
+
+        prior_handler = R.signal.signal
+        R.signal.signal = lambda *a: None
+        self.addCleanup(setattr, R.signal, "signal", prior_handler)
+
+    def _investigate(self, prompt, home, timeout, label, allow_forge=False):
+        with open(self.findings_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                [{
+                    "title": "the gate promotes a refused finding every hour",
+                    "location": "agents/selfimprove/scripts/selfimprove_ledger.py",
+                    "signal": "inefficiency",
+                    "severity": "critical",
+                    "summary": "s",
+                    "evidence": ["e"],
+                    "proposed_fix": "f",
+                }],
+                handle,
+            )
+        return 0, "", True
+
+    def _file(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.filing_result
+
+    def _run(self, **extra):
+        environment = {
+            "SELFIMPROVE_MODE": "fork",
+            "SELFIMPROVE_HOME": self.home,
+            "SELFIMPROVE_DEADLINE": "0",
+            "SELFIMPROVE_INVESTIGATE_MAX_TURNS": "1",
+            "KUBE_DEFAULT_NAMESPACE": "ns",
+            "SELFIMPROVE_UPSTREAM_REPO": "gke-agentic/kube-agents",
+            "SELFIMPROVE_FORK_REPO": "gke-agentic/kube-agents",
+            "SELFIMPROVE_GATE": json.dumps(
+                {"rules": [{"severity": "critical", "minOccurrencesPerDay": 1}],
+                 "maxPullRequestsPerDay": 3, "cooldownHours": 24}
+            ),
+        }
+        environment.update(extra)
+        prior = {k: os.environ.get(k) for k in environment}
+        os.environ.update(environment)
+        try:
+            buffer = io.StringIO()
+            # `log` prints to stdout, not stderr.
+            stdout, sys.stdout = sys.stdout, buffer
+            try:
+                R.main([])
+            finally:
+                sys.stdout = stdout
+        finally:
+            for key, value in prior.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        return buffer.getvalue()
+
+    def test_the_severity_prefix_reaches_the_filing_call(self):
+        """Deleting the argument at the call site must fail a test, not a run."""
+        self._run(SELFIMPROVE_SEVERITY_LABEL_PREFIX="sev/")
+        self.assertTrue(self.calls, "the filing turn was never reached")
+        _, kwargs = self.calls[0]
+        self.assertEqual("sev/", kwargs.get("severity_label_prefix"))
+
+    def test_the_pr_label_reaches_the_filing_call(self):
+        self._run(SELFIMPROVE_PR_LABEL="loop-wrote-this")
+        _, kwargs = self.calls[0]
+        self.assertEqual("loop-wrote-this", kwargs.get("pr_label"))
+
+    def test_an_out_of_bounds_refusal_is_recorded_on_the_finding(self):
+        self._run()
+        finding = list(self.saved[-1]["findings"].values())[0]
+        self.assertIn("refused", finding)
+        self.assertIn("out of bounds", finding["refused"]["reason"])
+
+    def test_a_refusal_charges_nothing_against_the_days_budget(self):
+        """Nothing reached a maintainer, so nothing may be spent.
+
+        Charging it would let one permanently-refused finding suppress the real
+        pull requests behind it.
+        """
+        self._run()
+        finding = list(self.saved[-1]["findings"].values())[0]
+        self.assertEqual([], finding.get("promotions", []))
+
+    def test_a_refused_finding_is_never_promoted_again(self):
+        """The whole point: no hourly retry of an answer that will not change."""
+        self._run()
+        self.calls.clear()
+        self._run()
+        self.assertEqual([], self.calls, "the gate offered a refused finding a second time")
+
+    def test_an_ordinary_skip_stays_promotable(self):
+        """"Not confident yet" keeps its retry -- a later run may know more."""
+        self.filing_result = (R.SKIPPED, "SKIPPED: the evidence is too thin")
+        self._run()
+        finding = list(self.saved[-1]["findings"].values())[0]
+        self.assertNotIn("refused", finding)
+        self.calls.clear()
+        self._run()
+        self.assertTrue(self.calls, "an evidence deferral must be retried")
+
+    def test_the_run_says_why_it_will_not_come_back(self):
+        log = self._run()
+        self.assertIn("out of bounds", log)
+        self.assertIn("will not be promoted again", log)
 
 if __name__ == "__main__":
     unittest.main()

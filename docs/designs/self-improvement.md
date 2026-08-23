@@ -47,17 +47,25 @@ Three consequences follow immediately, and the rest of the design is mostly work
 runner, the ledger, the evidence CLI and the two skills this document specifies. The loop
 investigates the pod it is running in, and the code it finds there is its own as much as the
 operator's, so a defect in the investigator is a finding like any other and reaches a maintainer the
-same way. This is not a licence granted after the fact; it is what "the observed is kube-agents"
-already meant, and the loop exercised it on its fourth live run. `gke-agentic/kube-agents#159`,
-`fix(selfimprove): route k8s evidence commands through the hermes venv python`, is the
-self-improvement feature repairing the self-improvement feature, and it graded the finding
-`inefficiency`/`medium` without noticing whose code it was.
+same way. That is what "the observed is kube-agents" already meant, and run `selfimprove-fork-4`
+exercised it on a live install pointed at `gke-agentic/kube-agents`: it filed #159,
+`fix(selfimprove): route k8s evidence commands through the hermes venv python`, against the loop's
+own evidence CLI, graded `inefficiency`/`medium`, without noticing whose code it was.
 
 One boundary bounds this, and §8 states it as a refusal rather than a preference: the filing agent
 will not open a pull request that changes the loop's own gate, ledger, or grants. A loop that files
 patches to its own investigator improves; a loop that files patches to the thing deciding what it is
-allowed to file has no ceiling. Findings about those three go in the ledger for a human to read and
-nowhere else.
+allowed to file has no ceiling.
+
+The boundary is on the fix, not on the finding, and the difference is easy to lose because the
+ledger sits on both sides of it. `selfimprove_ledger.py` is the gate as well as the ledger, so it is
+a module the investigator is asked to audit and forbidden to patch. Both instructions are meant: it
+writes the finding, grades it honestly, and the filing turn then declines it permanently, leaving it
+in the ledger for a human. What makes that survivable rather than an hourly tax is that the refusal
+is recorded — `record_refusal` marks the finding and the gate stops offering it, charging nothing
+against the day's budget, because nothing reached anyone's review queue. Without that the gate would
+promote it again every hour, minting a token and spending a filing turn each time to reach the same
+answer.
 
 **The reviewer is not the operator.** A fleet-audit finding lands in front of the person who runs
 the cluster it is about. A self-improvement finding lands in front of kube-agents maintainers, who
@@ -647,9 +655,9 @@ loop's output without reading bodies — the body already says where the pull re
 label is what makes that queryable. The second is `selfImprovement.github.severityLabelPrefix` with
 the finding's grade appended, giving `severity:critical` through `severity:low`: the body states the
 grade too, but a maintainer with a queue of these reads the list page, and grading a finding is
-pointless if it cannot be sorted on. Only the four grades in `ledger_ledger.SEVERITIES` produce a
-label; the grade is agent-written and reaches a shell command, so anything outside the vocabulary in
-`selfimprove_ledger.SEVERITIES` is dropped rather than sanitised.
+pointless if it cannot be sorted on. Only the four grades in `selfimprove_ledger.SEVERITIES` produce
+a label; the grade is agent-written and reaches a shell command, so anything outside that vocabulary
+is dropped rather than sanitised.
 
 Both are applied after the pull request is open rather than at creation, and one `gh pr edit` each.
 `gh pr create --label` resolves the name first and fails the whole command on a label the repository
@@ -664,7 +672,14 @@ grants is not filed, at any severity and however good the evidence. Everything e
 `agents/selfimprove/` is fair game — §1 makes the point that the loop's own code is inside its own
 scope — but a loop that can widen the thing deciding what it is allowed to file has no ceiling, and
 no amount of review discipline downstream substitutes for the patch never being written. Those
-findings stay in the ledger with a `SKIPPED` and wait for a human. The refusal lives in
+findings stay in the ledger and wait for a human.
+
+The turn prints `SKIPPED: out of bounds - <why>`, and both halves earn their place. `SKIPPED` is
+what stops the runner charging the finding as a filing that may have half-succeeded; `out of bounds`
+is what marks the answer permanent, so `record_refusal` can flag the finding and the gate can stop
+promoting it. An ordinary `SKIPPED` deliberately does neither — it means "not yet", keeps the counts
+and invites a better-evidenced retry — and that generosity applied to a permanent no costs a minted
+token and a filing turn's whole budget every hour, forever. The refusal itself lives in
 [`agents/selfimprove/skills/file-pull-request/SKILL.md`](../../agents/selfimprove/skills/file-pull-request/SKILL.md),
 which is canonical for it.
 
@@ -1235,11 +1250,18 @@ that reported the finding, discarding the count the agent claims, because that c
 agent writes and the gate reads, which is the one shape an injected instruction could use to promote
 itself. The consequence is a ceiling nothing validates: on the default hourly schedule a finding
 cannot be seen more than 24 times a day, and on a daily schedule not more than once — at which point
-the shipped `high` rule's threshold of 5 can never be met and that severity is silently disabled.
+the shipped `medium` rule's threshold of 5 can never be met and that severity is silently disabled.
 The boundary is six hours. Five sightings span four intervals, the window they have to fit inside is
 24 hours, and `4 × 6 = 24`; a schedule any slower than that can never clear a threshold of 5,
-whatever the finding does. An operator who lengthens `selfImprovement.schedule` past it has to lower
-the thresholds to match, and nothing warns them.
+whatever the finding does. `high` clears at 3, so it tolerates twelve. An operator who lengthens
+`selfImprovement.schedule` past either has to lower the thresholds to match, and nothing warns them.
+
+`activeDeadlineSeconds` moves the same ceiling from the other side, which is easier to miss because
+the schedule still reads hourly. `concurrencyPolicy: Forbid` skips a firing while the previous run
+is still going, so a run that uses its whole four-hour deadline costs the three firings behind it:
+24 runs a day is the ceiling when runs are short, and six is the ceiling when they are not. Both
+shipped thresholds are set under the pessimistic number rather than the optimistic one, which is why
+widening the deadline in §9 came with lowering them.
 
 **The ledger write is last-writer-wins.** `selfimprove_ledger.save` sends no `resourceVersion`
 precondition, so a second writer that lands between this run's read and its write is overwritten
