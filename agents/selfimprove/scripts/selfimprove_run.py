@@ -556,10 +556,11 @@ def log_usage(path: str, label: str) -> None:
         log("agent turn (%s) reported a failure: %s" % (label, usage["failure"]))
     if usage.get("completed") is False:
         log(
-            "agent turn (%s) did NOT run to completion: it stopped after %s API calls. If that "
-            "number is agent.max_turns from the profile config, the turn was cut off part-way "
-            "and everything it had not already written to disk is gone."
-            % (label, usage.get("api_calls"))
+            "agent turn (%s) did NOT run to completion: it stopped after %s API calls, so "
+            "everything it had not already written to disk is gone. 90 is the cap `hermes -z` "
+            "always applies -- see the comment on agent.max_turns in the profile config -- and "
+            "is expected rather than a fault; anything lower is the turn failing for some other "
+            "reason." % (label, usage.get("api_calls"))
         )
 
 

@@ -102,7 +102,12 @@ metadata:
     {{- include "kube-agents.labels" . | nindent 4 }}
     app.kubernetes.io/component: selfimprove
 rules:
-  - apiGroups: ["agent.kubeagents.x-k8s.io"]
+  # kubeagents.x-k8s.io, not agent.kubeagents.x-k8s.io. The group is set by
+  # k8s-operator/api/v1alpha1/groupversion_info.go and appears in the CRDs under
+  # charts/kube-agents/crds/. A wrong group here does not fail validation or
+  # binding -- it grants nothing, and the loop's `k8s platformagents` and
+  # `k8s agentplugins` evidence commands 403 on every run.
+  - apiGroups: ["kubeagents.x-k8s.io"]
     resources: ["platformagents", "platformagents/status", "agentplugins", "agentplugins/status"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
