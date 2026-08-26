@@ -627,8 +627,12 @@ Each phase is one PR, independently valuable, in this order:
    `collect.py`, whose target model is GKE clusters reached through a kubeconfig; and
    `ai-security-audit`, folded into `collect.py` alongside the two pilots since its target
    model — and its two-dump collection shape — is the same one obtainability and compliance
-   already use. Remaining: `security-patch-orchestrator`, `fleet-wide-cost-analysis`,
-   `fleet-consistency-drift`, `stockout-prevention`.
+   already use; and `security-patch-orchestrator`, its own script (`patch_readiness.py`) since
+   it reads only GKE control-plane/node-pool metadata through `gcloud container` and needs no
+   kubeconfig at all — one `clusters list` call per project plus one `get-server-config` call
+   per distinct location backs every one of its ten checks, where the SOP's own per-check
+   command lines implied a `node-pools describe` per pool per check. Remaining:
+   `fleet-wide-cost-analysis`, `fleet-consistency-drift`, `stockout-prevention`.
 5. **Stream-manifest consolidation** — §4.7, plus fixing the stale "seven streams" surfaces
    (SKILL.md; `autonomous-watchdogs.md`, `governance-sops.md`, `cron-jobs.md`,
    `declarative-workflow.md` on the site) and folding the five in-flight stream PRs'
