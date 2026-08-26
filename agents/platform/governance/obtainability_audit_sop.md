@@ -29,6 +29,8 @@ The helper owns every `git`/`gh` operation and renders the ledger issue body and
 
 ### 1. Enumerate the target fleet
 
+**Run Step 2's collector before doing any of this by hand.** Its manifest enumerates the fleet itself and reports one outcome per cluster; the rules below build `scope.clusters` and `scope.skipped` from that outcome for every stream, whether the collector covered a cluster or not. The commands in this step are the manual path, needed only for a cluster the manifest marks `"unreachable"` or `"gate-failed"`.
+
 ```bash
 gcloud container clusters list --format=json
 ```
@@ -68,20 +70,21 @@ gcloud container clusters list --format=json
   ```
 - If **zero** clusters land in `scope.clusters`, do **not** call `finish` — the helper hard-fails on an empty scope. Report the enumeration failure as your one-line summary and stop.
 
-### 2. Collect workload state
-
-One JSON dump per cluster answers every check in Step 3. **Do not run a separate full-fleet query per check.**
+### 2. Run the collector
 
 ```bash
-KUBECONFIG=$KC kubectl get deployments,statefulsets,daemonsets,poddisruptionbudgets,\
-horizontalpodautoscalers,services,limitranges -A -o json > /opt/data/scratch/wra_state_<cluster>.json
+./skills/fleet-audit/scripts/collect.py obtainability-audit \
+  --project "$(gcloud config get-value project)" > /opt/data/scratch/manifest_obtainability-audit.json
 ```
 
-- Because multiple kinds are requested, every element of `.items[]` carries its own `kind` — filter with `select(.kind=="…")`. (A single-kind `kubectl get` omits per-item `kind`; do not build the checks on that shape.)
-- Read workload **templates** (`spec.template.spec`), not live Pods. Templates are what an admin edits, and they are unaffected by admission-time defaulting.
-- Pods, Jobs, CronJobs, and Events are deliberately excluded: Events expire in roughly an hour, so a fixed 06:50 run samples an arbitrary window, and pod-level data doubles the payload without changing any verdict.
+This is the tested, procedural implementation of every check in Step 3 — see the fleet-audit skill's `collect.py`, whose own module docstring is the design record for what it covers. It enumerates the fleet itself, dumps workload state once per cluster behind a fail-closed gate, and evaluates all eleven checks against that one dump. Read the manifest it prints before doing anything else:
 
-**Autopilot adjustments.** Autopilot injects resource requests (and, absent explicit limits, mirrors limits from requests) at Pod admission, so a missing-request or missing-memory-limit template is a cost-attribution and predictability problem there, not a scheduling failure. On an Autopilot cluster: downgrade checks 3.1 and 3.2 by one severity level and say so in `impact`, naming the mode there. That is the only place the mode is recorded. Autopilot is never a skip — you read the cluster and every check ran — and it is not a `limitations` note either: that field is the coverage flag, and a mode note parked in it would mark a fully audited cluster as partially audited for as long as the cluster exists. Hostname pinning (3.7) stays `critical` on Autopilot — nodes are ephemeral and are replaced on every upgrade, so a hostname-pinned pod has a guaranteed outage. All other checks are mode-independent.
+- Every entry in `manifest.clusters` carries one `outcome`. `"collected"` means every check already ran there — do not re-run any of them by hand, and do not re-dump the cluster. `"unreachable"` or `"gate-failed"` means the collector could not cover this cluster; fall back to Step 1's manual enumeration and dump commands for it alone, then evaluate Step 3's Flag-when/Do-NOT-flag rules yourself against what you read.
+- For a `"collected"` cluster, copy its `commands` list verbatim into that cluster's `checks_run` — each entry already carries `{check, command}` in the exact shape the validator wants; do not retype it.
+- Every entry in a `"collected"` cluster's `candidates` is a verified finding: `check`, `cluster`, `namespace`, `object`, `severity`, and `excerpt` are already computed, including the Autopilot severity downgrade on 3.1/3.2. What is not computed — and is still yours to write — is the `recommendation` (Step 4) and, for a `kind: manifest` remediation, the manifest file itself (Step 3.5's declaration rule).
+- Pass `--manifest-file <path>` to `finish` (Step 6) so it cross-checks your `checks_run` against what the collector actually ran — a check you claim ran on a `"collected"` cluster with no matching manifest command is rejected before publication, not after.
+
+**A cluster the collector covered is not a cluster you dump or query again.** The manual dump command in Step 1 and the per-check reads below exist for the `"unreachable"`/`"gate-failed"` fallback and for confirming a candidate's evidence (Step 3's evidence discipline) — never for re-deriving a verdict the manifest already gives you.
 
 ### 3. Checks
 
@@ -252,8 +255,11 @@ Worked example, for a 3.3 finding on `payments/api`:
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py finish --audit obtainability-audit \
-  --findings-file /opt/data/scratch/findings_obtainability-audit.json
+  --findings-file /opt/data/scratch/findings_obtainability-audit.json \
+  --manifest-file /opt/data/scratch/manifest_obtainability-audit.json
 ```
+
+Omit `--manifest-file` only on a run where Step 2's collector never produced one — every check on every cluster came from the manual fallback. Given one, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`; a cluster the manifest marked `"unreachable"` or `"gate-failed"` is left to this SOP's ordinary attestation rules.
 
 One JSON line comes back, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, and two telemetry durations (`inspect_s`, `publish_s`). Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. Exit 1 is fatal. Exit 0 means it published.
 

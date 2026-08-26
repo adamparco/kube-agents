@@ -101,20 +101,29 @@ Same slugs as `checks_run`, and the `reason` has to say why the check _cannot_ a
 
 ### 2. Checks
 
-Shared setup, evaluated once per cluster. `$PRE` normalises every auditable workload to `{kind, ns, name, spec}` and applies the universal suppressions, so each workload check below is `$WL | jq -r --arg sys "$SYS" "$PRE"'| <filter>'`.
+**Run the collector before evaluating any check below by hand.**
+
+```bash
+./skills/fleet-audit/scripts/collect.py compliance-audit \
+  --project "$PROJECT" > /opt/data/scratch/manifest_compliance-audit.json
+```
+
+This is the tested, procedural implementation of every check below — see the fleet-audit skill's `collect.py`, whose own module docstring is the design record for what it covers. Unlike a single-dump stream, compliance-audit's collector issues five distinct reads per cluster (the workload dump, RBAC, NetworkPolicy plus Namespace, ServiceAccount, and two `gcloud` calls) and fails the whole cluster closed if any one of them cannot be gated. Read the manifest before doing anything else:
+
+- Every entry in `manifest.clusters` carries one `outcome`. `"collected"` means every check already ran there — do not re-run any of them by hand, and do not re-query any of the five sources. `"unreachable"` or `"gate-failed"` means the collector could not cover this cluster; fall back to §1's manual enumeration for it alone, then evaluate the Flag-when/Do-NOT-flag rules below yourself against commands you issue directly.
+- For a `"collected"` cluster, copy its `commands` list verbatim into that cluster's `checks_run` — each entry already carries `{check, command}` in the exact shape the validator wants; do not retype it.
+- Every entry in a `"collected"` cluster's `candidates` is a verified finding: `check`, `cluster`, `namespace`, `object`, `severity`, and `excerpt` are already computed. What is not computed — and is still yours to write — is the `recommendation` (§4) and, for a `kind: manifest` remediation, the manifest file itself (§3's declaration rule).
+- Pass `--manifest-file <path>` to `finish` (§5) so it cross-checks your `checks_run` against what the collector actually ran — a check you claim ran on a `"collected"` cluster with no matching manifest command is rejected before publication, not after.
+
+**A cluster the collector covered is not a cluster you query again.** The commands under each check below exist for the `"unreachable"`/`"gate-failed"` fallback and for confirming a candidate's evidence — never for re-deriving a verdict the manifest already gives you.
+
+This is the fleet-wide system-namespace set, and it is canonical — the cost and reliability SOPs' own namespace exclusions are derived from this pattern, so a namespace added here has to be added there too:
 
 ```bash
 SYS='^(kube-system|kube-public|kube-node-lease|gke-.*|gmp-system|gmp-public|gke-gmp-system|gke-managed-.*|cnrm-system|configconnector-operator-system|krmapihosting-system|istio-system|asm-system|anthos-identity-service|config-management-.*|gatekeeper-system|composer-system)$'
-WL='kubectl get deploy,sts,ds,cronjob,pod -A -o json'
-PRE='.items[]
- | select((.metadata.namespace|test($sys)|not)
-      and (.kind!="Pod" or ((.metadata.ownerReferences//[])|length)==0)
-      and (((.metadata.labels//{})["addonmanager.kubernetes.io/mode"] // (.metadata.annotations//{})["components.gke.io/component-name"])==null))
- | {kind, ns:.metadata.namespace, name:.metadata.name,
-    spec:(.spec.template.spec // .spec.jobTemplate.spec.template.spec // .spec)}'
 ```
 
-**Universal suppressions — every check in this section:** namespaces matching `$SYS`; objects carrying `addonmanager.kubernetes.io/mode` or `components.gke.io/component-name` (the GKE-managed add-ons — `fluentbit-gke`, `gke-metrics-agent`, `pdcsi-node`, `netd`, `anetd`, `ip-masq-agent`, `konnectivity-agent`, `gke-metadata-server`, `nvidia-gpu-device-plugin`; flagging these is the fastest way to get this audit switched off); pods with a non-empty `ownerReferences` — audit the **owning controller**, never the pod, because pod name suffixes are random. `kubeagents-system` is deliberately **not** suppressed: the harness audits itself.
+**Universal suppressions — every check in this section:** namespaces matching `$SYS` above; objects carrying `addonmanager.kubernetes.io/mode` or `components.gke.io/component-name` (the GKE-managed add-ons — `fluentbit-gke`, `gke-metrics-agent`, `pdcsi-node`, `netd`, `anetd`, `ip-masq-agent`, `konnectivity-agent`, `gke-metadata-server`, `nvidia-gpu-device-plugin`; flagging these is the fastest way to get this audit switched off); pods with a non-empty `ownerReferences` — audit the **owning controller**, never the pod, because pod name suffixes are random. `kubeagents-system` is deliberately **not** suppressed: the harness audits itself.
 
 **Finding identity.** **Do not write an `id`.** The harness derives it from `check`, `cluster`, `namespace` and `object`, and ignores any `id` in the file. Set those four correctly and identity takes care of itself; get one of them wrong and you have renamed the finding, which the ledger reads as the old one being fixed.
 
@@ -124,19 +133,11 @@ One finding per (check, object): three privileged containers in one Deployment a
 
 `object` is therefore load-bearing, and it must name the thing the check actually judged. 2.5 judges the **Role or ClusterRole** that carries the wildcard, so `object` is that role — not the binding that grants it, which merely proves the role is live. Naming the binding one run and the role the next is the same problem wearing two names, and the ledger reports the switch as a fix.
 
-**Evidence.** `evidence.command` is mandatory and must be the literal command run, with `$WL`/`$SYS`/`$PRE` expanded so a human can paste it unchanged. **A finding you cannot reproduce is dropped, not softened** — there is no "possible" severity.
+**Evidence.** `evidence.command` is mandatory and must be the literal command run — the manifest's `candidates[].excerpt` for a `"collected"` finding, or the command you issued yourself for the manual fallback, expanded so a human can paste it unchanged. **A finding you cannot reproduce is dropped, not softened** — there is no "possible" severity.
 
 **Credential hygiene.** Never paste a Secret's `data:` block, a ServiceAccount token, a kubeconfig, or a private key into `evidence.excerpt`. Re-run the command with a field selector or an `-o jsonpath` that omits the value and quote that output instead — the object reference proves the finding, the credential never does. The harness redacts high-confidence credential shapes as a backstop, not as the primary control.
 
 #### 2.1 Privileged containers (`privileged-container`)
-
-```bash
-$WL | jq -r --arg sys "$SYS" "$PRE"'
- | [((.spec.containers//[])+(.spec.initContainers//[]))[]
-     | select(.securityContext.privileged==true or ((.securityContext.capabilities.add//[])|index("SYS_ADMIN"))!=null)
-     | .name] as $bad
- | select(($bad|length)>0) | "\(.kind)/\(.ns)/\(.name): \($bad|join(","))"'
-```
 
 - **Flag when:** a container or initContainer sets `securityContext.privileged: true`, or adds capability `SYS_ADMIN`.
 - **Do NOT flag:** universal suppressions; CSI node drivers and CNI agents shipped as GKE add-ons; Autopilot clusters — the check does not run there and §1 records that in the cluster's `checks_not_applicable`, not its `limitations`; `allowPrivilegeEscalation: true` on its own — that is the Kubernetes default and would fire on nearly every workload.
@@ -146,12 +147,6 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 
 #### 2.2 Host namespace sharing (`host-namespace`)
 
-```bash
-$WL | jq -r --arg sys "$SYS" "$PRE"'
- | select(.spec.hostNetwork==true or .spec.hostPID==true or .spec.hostIPC==true)
- | "\(.kind)/\(.ns)/\(.name): hostNetwork=\(.spec.hostNetwork//false) hostPID=\(.spec.hostPID//false) hostIPC=\(.spec.hostIPC//false)"'
-```
-
 - **Flag when:** the pod spec sets `hostNetwork`, `hostPID`, or `hostIPC` to `true`.
 - **Do NOT flag:** universal suppressions; Autopilot clusters (§1 `checks_not_applicable`); ingress/gateway data-plane DaemonSets that legitimately bind host ports — verify `hostNetwork` is the only flag set **and** a `hostPort` is declared, then record `minor` rather than suppressing silently.
 - **Severity:** `critical` when `hostPID` or `hostIPC` is set (direct visibility into other tenants' processes and memory); `major` when only `hostNetwork` is set — it bypasses NetworkPolicy enforcement and exposes node loopback, but does not cross the process boundary.
@@ -159,14 +154,6 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 - **Remediation:** `kind: manual`. Name the field to remove; for `hostNetwork`, note that a `NodePort` Service or a Gateway listener is the supported replacement for `hostPort`.
 
 #### 2.3 hostPath volume mounts (`hostpath-mount`)
-
-```bash
-$WL | jq -r --arg sys "$SYS" "$PRE"'
- | [(.spec.volumes//[])[]|select(.hostPath)|{n:.name,p:.hostPath.path}] as $hv | select(($hv|length)>0)
- | [((.spec.containers//[])+(.spec.initContainers//[]))[]|(.volumeMounts//[])[]|{n:.name,ro:(.readOnly//false)}] as $m
- | [$hv[] as $v | ($m[]|select(.n==$v.n)|"\($v.p) readOnly=\(.ro)")] as $used | select(($used|length)>0)
- | "\(.kind)/\(.ns)/\(.name): \($used|join("; "))"'
-```
 
 - **Flag when:** the pod spec declares a `hostPath` volume that a container actually mounts.
 - **Do NOT flag:** universal suppressions; Autopilot clusters (§1 `checks_not_applicable`); a declared-but-unmounted `hostPath`; the log-shipper pattern (`/var/log`, `/var/lib/docker/containers`) when **every** mount of it is `readOnly: true` — record those `minor`.
@@ -176,16 +163,7 @@ $WL | jq -r --arg sys "$SYS" "$PRE"'
 
 #### 2.4 `cluster-admin` bound to non-system subjects (`cluster-admin-binding`)
 
-```bash
-kubectl get clusterrolebindings -o json | jq -r '.items[]
- | select(.roleRef.name=="cluster-admin") | . as $b | (.subjects//[])[]
- | select((.kind=="ServiceAccount" and ((.namespace//"")|test("^(kube-system|gke-.*|gmp-system|cnrm-system|configconnector-operator-system|krmapihosting-system|config-management-.*)$")|not))
-       or ((.kind=="User" or .kind=="Group") and ((.name|startswith("system:"))|not)
-           and ((.name|test("^(gke-|service-[0-9]+@)|gserviceaccount\\.com$"))|not)))
- | "\($b.metadata.name) -> \(.kind)/\(.namespace//"-")/\(.name)"'
-```
-
-- **Flag when:** a ClusterRoleBinding to `cluster-admin` names a ServiceAccount outside the system namespaces above, or a `User`/`Group` that is neither a `system:` principal nor a Google-managed service identity.
+- **Flag when:** a ClusterRoleBinding to `cluster-admin` names a ServiceAccount outside the system namespaces (`kube-system`, every `gke-*` namespace, `gmp-system`, `cnrm-system`, `configconnector-operator-system`, `krmapihosting-system`, every `config-management-*` namespace), or a `User`/`Group` that is neither a `system:` principal nor a Google-managed service identity (`gke-*`, `service-<number>@…`, or any principal ending `.gserviceaccount.com`).
 - **Do NOT flag:** `Group/system:masters` (the GKE bootstrap binding); GKE-installed `gce:*` / `system:*` bindings; `cnrm-system/cnrm-controller-manager`, which requires it by design. A `Group` that is an organisation email domain is an intentional human-admin grant — downgrade to `minor` and name the group rather than suppressing it.
 - **Severity:** `critical` — a `cluster-admin` ServiceAccount turns any pod compromise in its namespace into full cluster compromise.
 - **Impact:** "Subject holds unrestricted read/write on every resource in the cluster, including Secrets in every namespace."
@@ -193,17 +171,7 @@ kubectl get clusterrolebindings -o json | jq -r '.items[]
 
 #### 2.5 Wildcard verbs/resources in bound Roles and ClusterRoles (`wildcard-rbac`)
 
-```bash
-kubectl get clusterroles,roles -A -o json | jq -r '.items[]
- | select(((.metadata.labels//{})["kubernetes.io/bootstrapping"])!="rbac-defaults" and ((.metadata.name|startswith("system:"))|not))
- | . as $r | [(.rules//[])[]|select(((.verbs//[])|index("*"))!=null
-     and (((.resources//[])|index("*"))!=null or ((.apiGroups//[])|index("*"))!=null))] as $w
- | select(($w|length)>0) | "\($r.kind)/\($r.metadata.namespace//"-")/\($r.metadata.name): \($w|tojson)"'
-kubectl get clusterrolebindings,rolebindings -A -o json | jq -r '.items[]
- | "\(.roleRef.kind)/\(.roleRef.name) <- \(.kind)/\(.metadata.name) subjects=\([(.subjects//[])[]|"\(.kind):\(.namespace//"-"):\(.name)"]|join(","))"'
-```
-
-Intersect the two and report only wildcard roles the second command shows bound to a non-system subject (same subject test as 2.4). An unbound over-broad role grants nothing.
+Intersect wildcard-carrying Roles/ClusterRoles against ClusterRoleBindings/RoleBindings and report only ones bound to a non-system subject (same subject test as 2.4). An unbound over-broad role grants nothing.
 
 - **Flag when:** a Role/ClusterRole has a rule with `verbs: ["*"]` **and** `resources: ["*"]` or `apiGroups: ["*"]`, and a binding grants it to a non-system subject.
 - **Do NOT flag:** roles labelled `kubernetes.io/bootstrapping=rbac-defaults` or named `system:*`; **unbound** roles; a wildcard confined to one vendor apiGroup (`apiGroups: ["kubeagents.io"], resources: ["*"]`) — that is the operator-owns-its-own-CRDs pattern, not an escalation. A wildcard over the core group (`apiGroups: [""]`) is never suppressed.
@@ -212,15 +180,6 @@ Intersect the two and report only wildcard roles the second command shows bound 
 - **Remediation:** `kind: manual`. Include the `kubectl auth can-i --list --as=...` output as the starting point for an enumerated replacement rule set.
 
 #### 2.6 Namespaces with no enforcing NetworkPolicy (`netpol-missing`)
-
-```bash
-comm -23 \
-  <(kubectl get ns -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -Ev "$SYS" | sort) \
-  <(kubectl get netpol -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u)
-kubectl get netpol -A -o json | jq -r '.items[]
- | select(.spec.podSelector=={} and (((.spec.ingress//[])|any(.=={})) or ((.spec.policyTypes//[])|length)==0))
- | "\(.metadata.namespace)/\(.metadata.name): allow-all"'
-```
 
 - **Flag when:** a non-system namespace has **zero** NetworkPolicies, or every policy in it is an allow-all (`podSelector: {}` with an empty ingress rule). Both are a default-allow posture.
 - **Do NOT flag:** universal suppressions; namespaces with zero workloads (`kubectl get pods -n <ns> --no-headers | wc -l` is `0`) — no exposure, pure churn; namespaces already covered by a cluster-wide policy under Dataplane V2 (`kubectl get ccnp -o name`).
@@ -234,15 +193,7 @@ kubectl get netpol -A -o json | jq -r '.items[]
 
 #### 2.7 Default ServiceAccount token automounting (`default-sa-automount`)
 
-```bash
-kubectl get sa -A --field-selector metadata.name=default -o json \
-  | jq -r '.items[]|select(.automountServiceAccountToken!=false)|.metadata.namespace'
-$WL | jq -r --arg sys "$SYS" "$PRE"'
- | select(((.spec.serviceAccountName // .spec.serviceAccount)//"default")=="default")
- | select(.spec.automountServiceAccountToken!=false) | "\(.kind)/\(.ns)/\(.name)"'
-```
-
-- **Flag when:** a workload resolves to the `default` ServiceAccount **and** neither the pod spec nor the `default` SA object sets `automountServiceAccountToken: false`. Both commands must agree — the SA-level setting suppresses the pod-level default.
+- **Flag when:** a workload resolves to the `default` ServiceAccount **and** neither the pod spec nor the `default` SA object sets `automountServiceAccountToken: false`. Both must agree — the SA-level setting suppresses the pod-level default.
 - **Do NOT flag:** universal suppressions; workloads using a dedicated named ServiceAccount — a mounted token there is intentional, and whether its RBAC is right is 2.4/2.5's job; namespaces whose `default` SA already sets `automountServiceAccountToken: false`.
 - **Severity:** `major` — the mounted token is a live API credential handed to a workload that by definition did not ask for one, and it is the standard first move after a container compromise.
 - **Impact:** "Workload mounts an API-server credential it does not use, handing an attacker an authenticated foothold for free."
@@ -290,21 +241,7 @@ gcloud container clusters describe "$C" --location="$L" --project="$PROJECT" \
 
 #### 2.11 Pod Security `restricted` profile gaps (`podsecurity-gaps`)
 
-```bash
-$WL | jq -r --arg sys "$SYS" "$PRE"'
- | . as $o | [((.spec.containers//[])+(.spec.initContainers//[]))[]
-     | . as $c
-     | (if (($c.securityContext//{})|has("runAsNonRoot")) then $c.securityContext.runAsNonRoot
-        elif (($o.spec.securityContext//{})|has("runAsNonRoot")) then $o.spec.securityContext.runAsNonRoot
-        else null end) as $nonroot
-     | select(($nonroot!=true)
-           or (($c.securityContext.runAsUser // $o.spec.securityContext.runAsUser)==0)
-           or (((($c.securityContext.seccompProfile.type // $o.spec.securityContext.seccompProfile.type)//"")|test("^(RuntimeDefault|Localhost)$"))|not))
-     | .name] as $bad
- | select(($bad|length)>0) | "\(.kind)/\(.ns)/\(.name): \($bad|join(","))"'
-```
-
-**Resolve `runAsNonRoot` with `has()`, never with `//`.** `//` is jq's _alternative_ operator: it fires on `false` exactly as it fires on `null`, so `(.securityContext.runAsNonRoot // $o.spec.securityContext.runAsNonRoot)` turns a container that explicitly sets `runAsNonRoot: false` over a compliant pod-level `true` into `true` — the check silently passes the one input it exists to catch. The `has()` ladder above distinguishes absent from false. `runAsUser` and `seccompProfile.type` keep `//` safely: neither `0` nor a string is falsy in jq, so the alternative fires only on a genuinely absent field.
+The collector resolves `runAsNonRoot` per container by walking container-level then pod-level `securityContext`, stopping at the first one that actually **sets** the field — absent and `false` are different states, and only checking whether the resolved value is `true` catches a container that explicitly sets `runAsNonRoot: false` over a compliant pod-level default. A manual fallback read must preserve that distinction: do not fold "unset" and "false" together into one default.
 
 - **Flag when:** a container neither inherits nor sets `runAsNonRoot: true` — **including a container that explicitly sets `runAsNonRoot: false` over a compliant pod-level default** — or explicitly sets `runAsUser: 0`, or has no `seccompProfile.type` of `RuntimeDefault`/`Localhost`.
 - **Do NOT flag:** universal suppressions; any workload already reported by 2.1 — the privileged finding subsumes this one, never emit both; namespaces labelled `pod-security.kubernetes.io/enforce=restricted`, where admission already guarantees it.
@@ -367,11 +304,14 @@ Three `rationale`/`risk` pairs in this SOP are check-specific and must not be wr
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py finish --audit compliance-audit \
-  --findings-file /opt/data/scratch/findings_compliance-audit.json
+  --findings-file /opt/data/scratch/findings_compliance-audit.json \
+  --manifest-file /opt/data/scratch/manifest_compliance-audit.json
 # -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true,"inspect_s":214.0,"publish_s":41.5}
 ```
+
+Omit `--manifest-file` only on a run where §2's collector never produced one — every check on every cluster came from the manual fallback. Given one, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never recorded at `rc == 0`; a cluster the manifest marked `"unreachable"` or `"gate-failed"` is left to this SOP's ordinary attestation rules.
 
 `finish` owns publication end to end. Tier 1 is one ledger issue for this stream, rewritten in place every run and labelled `agent:audit`, `audit:compliance-audit`, `severity:<highest>`; a clean run closes it as completed. Tier 2 is a narrow remediation PR per remediation group, branched `platform-agent/fix-compliance-audit-<slug>-<digest>` off `main` — the digest is taken over the group's sorted remediation paths, so the branch is keyed on the files the fix touches and stays put across runs even though the finding ids are re-derived every morning — linked with `Part of #<issue>` and additionally labelled `audit:remediation`. A PR opens automatically only for a finding that is `critical` **and** `manifest` **and** has no **live** pull request on its branch: one the harness closed itself carries `audit:stale-closed` and may be promoted again, while one a human closed and one that merged may not, because re-opening either would overrule a person every morning. Capped at five per run, with any withheld findings named in the ledger. Everything else waits for a repo writer to comment `/remediate <finding-id>` or `/remediate all`. A comment naming ids arrives as `pending_remediation_requests` on the next run's `start`, so you know which manifests to write while inspecting; `all` does not, because it names no particular file — it is expanded at `finish` against that run's manifest findings. Every such comment gets exactly one answer on the ledger — an acknowledgement naming each target and what became of it, or a single refusal saying why (the commenter has no write access, an id is not in the current document, the target is not a `manifest`, or the command was not written at the start of its own line and so was never parsed as one) — so a standing request is answered once, not re-answered every run.
 
