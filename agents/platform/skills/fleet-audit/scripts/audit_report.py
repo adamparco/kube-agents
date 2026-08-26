@@ -36,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
@@ -1008,6 +1009,80 @@ def inspect_seconds(audit_id: str, now: datetime) -> float | None:
         return None
     seconds = (now - t0).total_seconds()
     return round(seconds, 1) if seconds >= 0 else None
+
+
+# --------------------------------------------------------------------------- #
+# Status surface — observability only, never a read input to any audit
+# decision. See docs/designs/fleet-audit-collectors-and-status.md §4.5.
+#
+# The write is one best-effort HTTP call to the credential-proxy sidecar's
+# internal endpoint (`_handle_fleet_audit_status` in credential_proxy.py),
+# which patches a chart-created ConfigMap using its own in-cluster identity —
+# never this process's `kubectl`, and never `command_policy.py`. Any failure
+# (the sidecar unreachable, the chart not rendering the ConfigMap, no RBAC)
+# logs a WARNING and returns; nothing here may raise past its own boundary or
+# change a subcommand's exit code. There is no read-before-write: each call
+# replaces the stream's `last` row wholesale, so a stale value only ever
+# lasts until the next run overwrites it, and the view (§4.6) derives every
+# flag it needs — including a died-mid-run stream — from that one row.
+# --------------------------------------------------------------------------- #
+
+STATUS_PROXY_URL = os.environ.get("CREDENTIAL_PROXY_URL") or ""
+
+
+def _status_post(audit_id: str, row: dict) -> None:
+    if not STATUS_PROXY_URL:
+        return
+    try:
+        request = urllib.request.Request(
+            f"{STATUS_PROXY_URL}/v1/internal/fleet-audit-status",
+            method="POST",
+            data=json.dumps(
+                {"stream": audit_id, "data": json.dumps({"last": row})}
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            resp.read()
+    except Exception as exc:  # noqa: BLE001 — telemetry must never fail a run
+        log(f"WARNING: status write for {audit_id} failed: {exc}")
+
+
+def status_record_started(audit_id: str, t0: datetime) -> None:
+    _status_post(audit_id, {"at": t0.isoformat(), "phase": "started"})
+
+
+def status_record_run(audit_id: str, row: dict) -> None:
+    _status_post(audit_id, {**row, "phase": "finished"})
+
+
+def _status_row(payload: dict, data: dict, findings: list, now: datetime) -> dict:
+    """The status row `finish` records: the exit payload's semantic fields,
+    with PR lists reshaped into counts (the URLs' durable home is the ledger
+    and the PR labels; the row stays row-sized) plus the totals the payload
+    does not carry. `note` is the first coverage gap, already redacted where
+    `coverage_gaps` was assembled."""
+    scope = data.get("scope") or {}
+    gaps = payload.get("coverage_gaps") or []
+    return {
+        "at": now.isoformat(),
+        "status": payload.get("status"),
+        "partial": payload.get("partial"),
+        "silent_ok": payload.get("silent_ok"),
+        "new": payload.get("new"),
+        "resolved": payload.get("resolved"),
+        "findings": len(findings),
+        "critical": sum(1 for f in findings if f.get("severity") == "critical"),
+        "prs_opened": len(payload.get("prs_opened") or []),
+        "prs_closed": len(payload.get("prs_closed") or []),
+        "issue_url": payload.get("issue_url"),
+        "inspect_s": payload.get("inspect_s"),
+        "publish_s": payload.get("publish_s"),
+        "clusters": len(scope.get("clusters") or []),
+        "skipped": len(scope.get("skipped") or []),
+        "coverage_gaps": len(gaps),
+        "note": str(gaps[0])[:200] if gaps else "",
+    }
 
 
 def base_branch() -> str:
@@ -5258,7 +5333,9 @@ def handle_start(args: argparse.Namespace) -> None:
     # t0 for `finish`'s `inspect_s`. Written after the scrub so a crash between
     # the two lines leaves a fresh t0 and a missing findings file — the safe
     # combination — rather than the reverse.
-    write_phase_start(audit_id, datetime.now(timezone.utc))
+    t0 = datetime.now(timezone.utc)
+    write_phase_start(audit_id, t0)
+    status_record_started(audit_id, t0)
 
     print(
         json.dumps(
@@ -5694,18 +5771,27 @@ def handle_remediate(args: argparse.Namespace) -> None:
         issue_number=issue_number,
         generated_at=now,
     )
-    print(
-        json.dumps(
-            {
-                "status": "REMEDIATED",
-                "prs_opened": opened,
-                "already_open": plan.already_open,
-                "superseded": plan.superseded,
-                "refused": refused,
-                "duration_s": round(time.monotonic() - entry_mono, 1),
-            }
-        )
+    payload = {
+        "status": "REMEDIATED",
+        "prs_opened": opened,
+        "already_open": plan.already_open,
+        "superseded": plan.superseded,
+        "refused": refused,
+        "duration_s": round(time.monotonic() - entry_mono, 1),
+    }
+    status_record_run(
+        audit_id,
+        {
+            "at": now.isoformat(),
+            "status": "REMEDIATED",
+            "prs_opened": len(opened),
+            "already_open": len(plan.already_open),
+            "superseded": len(plan.superseded),
+            "refused": len(refused),
+            "duration_s": payload["duration_s"],
+        },
     )
+    print(json.dumps(payload))
 
 
 def handle_finish(args: argparse.Namespace) -> None:
@@ -5884,28 +5970,26 @@ def handle_finish(args: argparse.Namespace) -> None:
         # applies, because "nothing found" over an unchecked fleet is not the
         # same as "nothing there".
         clean_resolved = 0 if gaps else len(previous_ids)
-        print(
-            json.dumps(
-                {
-                    "status": "CLEAN",
-                    "issue_url": existing_url,
-                    "new": 0,
-                    "resolved": clean_resolved,
-                    "prs_opened": [],
-                    "prs_closed": prs_closed,
-                    # Same rule as the findings branch below — see the long note
-                    # there. A clean run is the *usual* silent one, but not
-                    # unconditionally: `resolved > 0` is the fleet getting
-                    # better and is the best news this audit ever delivers, and
-                    # a gap means it could not look rather than found nothing.
-                    "silent_ok": not (clean_resolved or gaps or prs_closed),
-                    "partial": bool(gaps),
-                    "coverage_gaps": gaps,
-                    "inspect_s": inspect_s,
-                    "publish_s": round(time.monotonic() - entry_mono, 1),
-                }
-            )
-        )
+        payload = {
+            "status": "CLEAN",
+            "issue_url": existing_url,
+            "new": 0,
+            "resolved": clean_resolved,
+            "prs_opened": [],
+            "prs_closed": prs_closed,
+            # Same rule as the findings branch below — see the long note
+            # there. A clean run is the *usual* silent one, but not
+            # unconditionally: `resolved > 0` is the fleet getting
+            # better and is the best news this audit ever delivers, and
+            # a gap means it could not look rather than found nothing.
+            "silent_ok": not (clean_resolved or gaps or prs_closed),
+            "partial": bool(gaps),
+            "coverage_gaps": gaps,
+            "inspect_s": inspect_s,
+            "publish_s": round(time.monotonic() - entry_mono, 1),
+        }
+        status_record_run(audit_id, _status_row(payload, data, findings, now))
+        print(json.dumps(payload))
         return
 
     # --- Findings: publish the ledger, then propose fixes separately. ---
@@ -6129,9 +6213,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     reported_resolved = (
         0 if (gaps or stale_scheme or not delta_known) else len(resolved_ids)
     )
-    print(
-        json.dumps(
-            {
+    payload = {
                 "status": status,
                 "issue_url": issue_url,
                 "new": reported_new,
@@ -6186,9 +6268,9 @@ def handle_finish(args: argparse.Namespace) -> None:
                 "coverage_gaps": gaps,
                 "inspect_s": inspect_s,
                 "publish_s": round(time.monotonic() - entry_mono, 1),
-            }
-        )
-    )
+    }
+    status_record_run(audit_id, _status_row(payload, data, findings, now))
+    print(json.dumps(payload))
 
 
 # --------------------------------------------------------------------------- #

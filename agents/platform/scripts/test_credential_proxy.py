@@ -21,6 +21,7 @@ import credential_proxy
 import gke_endpoint
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
+    MAX_STATUS_STREAM_LENGTH,
     AgentAPIProxyHandler,
     CommandExecutor,
     CredentialProxyHandler,
@@ -33,6 +34,7 @@ from credential_proxy import (
     _slack_error_fields,
     git_argument_violation,
     is_valid_repository,
+    is_valid_status_stream,
     parse_gke_context,
     read_current_context,
 )
@@ -2065,6 +2067,145 @@ class GitHubRefreshHandlerTest(unittest.TestCase):
 
         self.assertNotIn("ghs_", logs[0])
         self.assertNotIn("B" * 20, logs[0])
+
+
+class ValidStatusStreamTest(unittest.TestCase):
+    def test_accepts_the_shape_every_audit_id_actually_has(self):
+        for stream in ("compliance-audit", "ai-security-audit", "gcp-networking-fabric-audit"):
+            with self.subTest(stream=stream):
+                self.assertTrue(is_valid_status_stream(stream))
+
+    def test_rejects_non_strings(self):
+        self.assertFalse(is_valid_status_stream(None))
+        self.assertFalse(is_valid_status_stream(["compliance-audit"]))
+
+    def test_rejects_a_leading_digit_or_uppercase(self):
+        self.assertFalse(is_valid_status_stream("1audit"))
+        self.assertFalse(is_valid_status_stream("Compliance-Audit"))
+
+    def test_rejects_path_separators_and_traversal(self):
+        self.assertFalse(is_valid_status_stream("../secret"))
+        self.assertFalse(is_valid_status_stream("a/b"))
+
+    def test_rejects_an_oversized_stream(self):
+        self.assertFalse(is_valid_status_stream("a" * (MAX_STATUS_STREAM_LENGTH + 1)))
+
+
+class FleetAuditStatusHandlerTest(unittest.TestCase):
+    """The one write path this proxy exposes that never touches an agent's
+    kubectl argv or `command_policy`: see `_handle_fleet_audit_status`.
+
+    Every test constructs a bare handler the way `GitHubRefreshHandlerTest`
+    does — no socket — and points `_SERVICE_ACCOUNT_DIR` at a temp directory
+    standing in for the projected volume, so these run identically on a dev
+    machine and in the pod.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sa_dir = Path(self.tmp.name)
+        self.original_sa_dir = credential_proxy._SERVICE_ACCOUNT_DIR
+        credential_proxy._SERVICE_ACCOUNT_DIR = self.sa_dir
+        self.addCleanup(
+            setattr, credential_proxy, "_SERVICE_ACCOUNT_DIR", self.original_sa_dir
+        )
+
+    def write_identity(self, token="tok", namespace="kubeagents-system"):
+        (self.sa_dir / "token").write_text(token, encoding="utf-8")
+        (self.sa_dir / "namespace").write_text(namespace, encoding="utf-8")
+        (self.sa_dir / "ca.crt").write_text("not-a-real-cert", encoding="utf-8")
+
+    def call(self, body, urlopen_result=None, urlopen_exc=None):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 10 * 1024 * 1024
+        encoded = json.dumps(body).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        requests = []
+
+        def fake_urlopen(request, timeout=None, context=None):
+            requests.append(request)
+            if urlopen_exc is not None:
+                raise urlopen_exc
+            return io.BytesIO(urlopen_result or b"{}")
+
+        # The real CA file this test writes is not a parseable certificate;
+        # only the outbound request matters here, not TLS validation itself.
+        with mock.patch.object(urllib.request, "urlopen", fake_urlopen), \
+                mock.patch.object(credential_proxy.ssl, "create_default_context"):
+            handler._handle_fleet_audit_status()
+        return replies, requests
+
+    def test_a_well_formed_patch_reaches_the_apiserver_with_the_pod_s_identity(self):
+        self.write_identity(token="secret-token", namespace="kubeagents-system")
+        replies, requests = self.call(
+            {"stream": "compliance-audit", "data": '{"last":{"status":"CLEAN"}}'}
+        )
+        self.assertEqual(replies, [(HTTPStatus.OK, {"status": "patched"})])
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        self.assertEqual(request.get_method(), "PATCH")
+        self.assertIn("kubeagents-system", request.full_url)
+        self.assertIn(
+            credential_proxy.FLEET_AUDIT_STATUS_CONFIGMAP, request.full_url
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret-token")
+        patched = json.loads(request.data)
+        self.assertEqual(
+            patched, {"data": {"compliance-audit.json": '{"last":{"status":"CLEAN"}}'}}
+        )
+
+    def test_an_invalid_stream_is_refused_before_any_identity_is_read(self):
+        replies, requests = self.call({"stream": "../evil", "data": "{}"})
+        self.assertEqual(replies[0][0], HTTPStatus.BAD_REQUEST)
+        self.assertEqual(requests, [])
+
+    def test_a_non_string_data_value_is_refused(self):
+        replies, requests = self.call({"stream": "compliance-audit", "data": {"x": 1}})
+        self.assertEqual(replies[0][0], HTTPStatus.BAD_REQUEST)
+        self.assertEqual(requests, [])
+
+    def test_missing_fields_are_refused(self):
+        replies, requests = self.call({"stream": "compliance-audit"})
+        self.assertEqual(replies[0][0], HTTPStatus.BAD_REQUEST)
+        self.assertEqual(requests, [])
+
+    def test_no_projected_identity_degrades_to_service_unavailable(self):
+        # The temp dir exists but write_identity() was never called — the
+        # shape a non-Kubernetes run (dev machine, this very test suite on a
+        # laptop) actually has.
+        replies, requests = self.call({"stream": "compliance-audit", "data": "{}"})
+        self.assertEqual(replies[0][0], HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertEqual(requests, [])
+
+    def test_an_apiserver_refusal_is_reported_not_raised(self):
+        self.write_identity()
+        replies, _ = self.call(
+            {"stream": "compliance-audit", "data": "{}"},
+            urlopen_exc=urllib.error.HTTPError(
+                "url", 404, "not found", {}, io.BytesIO(b"")
+            ),
+        )
+        self.assertEqual(replies[0][0], HTTPStatus.BAD_GATEWAY)
+
+    def test_apiserver_unreachable_is_reported_not_raised(self):
+        self.write_identity()
+        replies, _ = self.call(
+            {"stream": "compliance-audit", "data": "{}"},
+            urlopen_exc=urllib.error.URLError("connection refused"),
+        )
+        self.assertEqual(replies[0][0], HTTPStatus.BAD_GATEWAY)
+
+    def test_the_route_is_wired_in_do_post(self):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/internal/fleet-audit-status"
+        called = []
+        handler._handle_fleet_audit_status = lambda: called.append(True)
+        CredentialProxyHandler.do_POST(handler)
+        self.assertEqual(called, [True])
 
 
 class RedactCredentialsTest(unittest.TestCase):

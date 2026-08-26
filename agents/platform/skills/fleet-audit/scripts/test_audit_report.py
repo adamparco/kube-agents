@@ -4829,6 +4829,91 @@ class TestTiming(HarnessTestCase):
         self.assertIn("could not write", self.err)
 
 
+class TestStatusWriter(HarnessTestCase):
+    """The status writer: one best-effort HTTP POST to the credential-proxy
+    sidecar's internal endpoint, never `kubectl`, never `command_policy`. See
+    `_handle_fleet_audit_status` in credential_proxy.py for the other end.
+    Observability only — nothing here may change an exit code, and nothing
+    issues a request at all unless the pod set CREDENTIAL_PROXY_URL.
+    """
+
+    PROXY = "http://127.0.0.1:8765"
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("STATUS_PROXY_URL", self.PROXY)
+        self.requests = []
+
+        def fake_urlopen(request, timeout=None):
+            self.requests.append(request)
+            if self.status_fails:
+                raise self.status_fails
+            return io.BytesIO(b"{}")
+
+        self.status_fails = None
+        patcher = patch.object(audit_report.urllib.request, "urlopen", fake_urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def call_captured(self, fn, *args):
+        """Direct writer calls log to real stderr; capture it like run_main does."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            fn(*args)
+        self.err = err.getvalue()
+
+    def posted(self):
+        """The (stream, row) of the last status POST."""
+        self.assertTrue(self.requests, "no status request was issued")
+        body = json.loads(self.requests[-1].data)
+        return body["stream"], json.loads(body["data"])["last"]
+
+    def test_off_without_a_proxy_url_issues_no_request_at_all(self):
+        self.patch_attr("STATUS_PROXY_URL", "")
+        audit_report.status_record_run(AUDIT, {"status": "CLEAN"})
+        self.assertEqual(self.requests, [])
+
+    def test_started_stub_names_the_stream_and_phase(self):
+        self.call_captured(audit_report.status_record_started, AUDIT, NOW)
+        stream, row = self.posted()
+        self.assertEqual(stream, AUDIT)
+        self.assertEqual(row["phase"], "started")
+        self.assertEqual(row["at"], NOW.isoformat())
+
+    def test_finish_records_the_row(self):
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        stream, row = self.posted()
+        self.assertEqual(stream, AUDIT)
+        self.assertEqual(row["phase"], "finished")
+        self.assertEqual(row["status"], "CLEAN")
+        self.assertEqual(row["findings"], 0)
+        self.assertEqual(row["clusters"], 2)
+        self.assertIsInstance(row["publish_s"], (int, float))
+
+    def test_remediate_records_counts_not_urls(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        path = self.write_findings(make_doc())
+        rc = self.run_main(
+            ["remediate", "--audit", AUDIT, "--findings-file", path,
+             "--finding", derived_id()]
+        )
+        self.assertEqual(rc, 0)
+        _, row = self.posted()
+        self.assertEqual(row["status"], "REMEDIATED")
+        self.assertEqual(row["prs_opened"], 1)
+        self.assertNotIn("github.com", json.dumps(row))
+
+    def test_write_failures_never_touch_the_exit_code(self):
+        self.status_fails = OSError("connection refused")
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertIn("status write for", self.err)
+        self.assertIn(AUDIT, self.err)
+
+
 class TestSyncOpenRemediationLabels(HarnessTestCase):
     """Labels are re-asserted from the path that actually sees open PRs."""
 
