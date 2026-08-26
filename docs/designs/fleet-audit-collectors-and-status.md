@@ -598,22 +598,26 @@ Each phase is one PR, independently valuable, in this order:
    sidecar's internal endpoint (`credential_proxy.py`, no `command_policy.py` or operator
    change), the harness writer, `scripts/fleet_audit_status_view.py`, `make fleet-audit-view`.
    Depends on 1 for durations; ships without collectors (rows carry today's runs).
-3. **Collector framework, proved against two checks of one stream.** The driver
+3. **Collector framework, proved against one stream's full roster.** The driver
    (`collect.py`: fleet enumeration, per-cluster credential fetch, the fail-closed dump gate,
-   cross-cluster parallelism, manifest emission) plus `obtainability-audit`'s two simplest
-   checks — §3.1 `no-requests`, §3.2 `no-memory-limit`, chosen because neither needs selector
-   matching, cross-object resolution, or judgment — and the manifest cross-check wired into
-   `finish` behind `--manifest-file`, opt-in per run. This is the existence proof: a real
-   collector, tested with golden dumps and fault injection (zero-byte dump, truncated dump, a
-   `get-credentials` failure under parallelism), producing a manifest `finish` already knows
-   how to verify. It does not yet touch the SOP prose, the cron prompt, or the other nine
-   checks — those are the next slices of this same phase, each sized like this one.
-4. **The rest of `obtainability-audit`, then the remaining streams** — the other nine checks
-   (§3.3–§3.11 carry selector matching, HPA target resolution, and roll-up logic that deserve
-   their own scrutiny rather than shipping alongside the first two), then SOP shrink and cron
-   prompt update for the stream once it is fully covered, then the other seven streams in turn
-   — `compliance-audit` next (measured as the other extreme in #985), including the cost
-   stream's hoisted sampling and the drift stream's arithmetic; stockout last, after its
+   cross-cluster parallelism, manifest emission) plus every one of `obtainability-audit`'s
+   eleven checks — including the ones that need a label-selector matcher (`no-pdb`,
+   `blocking-pdb`, `no-hpa`, `no-spread`), cross-object resolution (`probes-readiness`,
+   `single-replica` against `Service` selectors; `hpa-cannot-scale` against workload
+   existence), and a severity that forks on which of two conditions fired
+   (`hpa-cannot-scale`, `rigid-scheduling`) — and the manifest cross-check wired into `finish`
+   behind `--manifest-file`, opt-in per run. This is the existence proof at full weight: a real
+   collector, tested with golden dumps, fault injection (zero-byte dump, truncated dump, a
+   `get-credentials` failure under parallelism), and one integration test that runs a real
+   manifest through `finish`'s own cross-check rather than asserting the two modules agree on
+   a shared shape by inspection. It does not yet touch the SOP prose or the cron prompt for
+   this stream — SOP shrink is deliberately its own slice, reviewable without also reviewing
+   eleven checks' worth of logic in the same diff.
+4. **SOP shrink for `obtainability-audit`, then the remaining streams** — retire the SOP's
+   §3 command/filter prose now that `collect.py` carries it, update the cron prompt, then the
+   other seven streams in turn — `compliance-audit` next (measured as the other extreme in
+   #985), including the cost stream's hoisted sampling and the drift stream's arithmetic;
+   stockout last, after its
    qualitative thresholds ("latency-sensitive", "substantial") are pinned in an SOP-hardening
    pre-PR.
 5. **Stream-manifest consolidation** — §4.7, plus fixing the stale "seven streams" surfaces
