@@ -598,28 +598,30 @@ Each phase is one PR, independently valuable, in this order:
    sidecar's internal endpoint (`credential_proxy.py`, no `command_policy.py` or operator
    change), the harness writer, `scripts/fleet_audit_status_view.py`, `make fleet-audit-view`.
    Depends on 1 for durations; ships without collectors (rows carry today's runs).
-3. **Collector framework, proved against one stream's full roster.** The driver
+3. **Collector framework, proved against both pilot streams' full rosters.** The driver
    (`collect.py`: fleet enumeration, per-cluster credential fetch, the fail-closed dump gate,
-   cross-cluster parallelism, manifest emission) plus every one of `obtainability-audit`'s
-   eleven checks — including the ones that need a label-selector matcher (`no-pdb`,
-   `blocking-pdb`, `no-hpa`, `no-spread`), cross-object resolution (`probes-readiness`,
-   `single-replica` against `Service` selectors; `hpa-cannot-scale` against workload
-   existence), and a severity that forks on which of two conditions fired
-   (`hpa-cannot-scale`, `rigid-scheduling`) — and the manifest cross-check wired into `finish`
-   behind `--manifest-file`, opt-in per run. This is the existence proof at full weight: a real
-   collector, tested with golden dumps, fault injection (zero-byte dump, truncated dump, a
-   `get-credentials` failure under parallelism), and one integration test that runs a real
-   manifest through `finish`'s own cross-check rather than asserting the two modules agree on
-   a shared shape by inspection. It does not yet touch the SOP prose or the cron prompt for
-   this stream — SOP shrink is deliberately its own slice, reviewable without also reviewing
-   eleven checks' worth of logic in the same diff.
-4. **SOP shrink for `obtainability-audit`, then the remaining streams** — retire the SOP's
-   §3 command/filter prose now that `collect.py` carries it, update the cron prompt, then the
-   other seven streams in turn — `compliance-audit` next (measured as the other extreme in
-   #985), including the cost stream's hoisted sampling and the drift stream's arithmetic;
-   stockout last, after its
-   qualitative thresholds ("latency-sensitive", "substantial") are pinned in an SOP-hardening
-   pre-PR.
+   cross-cluster parallelism, manifest emission) plus every check of `obtainability-audit`
+   (eleven — label-selector matching for PDBs/HPAs/Services, cross-object resolution, a
+   severity that forks on which of two conditions fired) and every check of
+   `compliance-audit` (eleven more — a stream whose collection has no single-dump shape at
+   all: a workload dump plus four more distinct `kubectl`/`gcloud` reads, RBAC subject
+   classification shared between two checks, and the has()-vs-`//` distinction the SOP is
+   emphatic a jq filter must get right). Generalized `collect_cluster` into a dispatcher over
+   per-stream context builders so the second stream's genuinely different collection shape
+   proved the seam rather than being forced into the first stream's, and the manifest
+   cross-check wired into `finish` behind `--manifest-file`, opt-in per run. Both streams:
+   golden dumps, fault injection (zero-byte dump, truncated dump, a `get-credentials` failure
+   under parallelism, a gate failure on one of several collections failing the whole cluster
+   closed), and an integration test running `collect_fleet`'s real output through `finish`'s
+   own cross-check rather than asserting the two modules agree on a shape by inspection. It
+   does not yet touch either stream's SOP prose or cron prompt — SOP shrink is deliberately
+   its own slice, reviewable without also reviewing twenty-two checks' worth of logic in the
+   same diff.
+4. **SOP shrink for both pilot streams, then the remaining streams** — retire each SOP's
+   command/filter prose now that `collect.py` carries it, update the cron prompts, then the
+   other six streams in turn, including the cost stream's hoisted sampling and the drift
+   stream's arithmetic; stockout last, after its qualitative thresholds ("latency-sensitive",
+   "substantial") are pinned in an SOP-hardening pre-PR.
 5. **Stream-manifest consolidation** — §4.7, plus fixing the stale "seven streams" surfaces
    (SKILL.md; `autonomous-watchdogs.md`, `governance-sops.md`, `cron-jobs.md`,
    `declarative-workflow.md` on the site) and folding the five in-flight stream PRs'

@@ -4,30 +4,37 @@ wearing prose.
 
 See docs/designs/fleet-audit-collectors-and-status.md §4.2, §4.3, §6.
 
-**Scope of this file today: the collector engine, plus one stream's check
-table in full.** `obtainability-audit`'s complete eleven-check roster
-(§3.1–§3.11 of `governance/obtainability_audit_sop.md`) is converted — every
-check the SOP defines is fully mechanical (design §2, point 2: this stream
-needed zero `needs_triage` judgment calls), so nothing was left on the SOP
-side to skip. Every other stream's checks still run the way they do today,
-by SOP prose executed as shell — this collector does not change that yet.
-Converting one stream in full is proof the shape holds under its harder
-cases too (label-selector matching for PDBs/HPAs/Services, a check whose
-severity forks on which of two conditions fired, a check that iterates
-objects other than workloads); converting the rest is the next several
-phases in the design's §10 work breakdown, each its own PR, deliberately.
+**Scope of this file today: the collector engine, plus both pilot streams'
+check tables in full.** `obtainability-audit`'s complete eleven-check roster
+(§3.1–§3.11 of `governance/obtainability_audit_sop.md`) and
+`compliance-audit`'s complete eleven-check roster (§2.1–§2.11 of
+`governance/compliance_audit_sop.md`) are both converted — every check
+either SOP defines is fully mechanical (design §2, point 2: neither stream
+needed a `needs_triage` judgment call), so nothing was left on the SOP side
+to skip. Every other stream's checks still run the way they do today, by SOP
+prose executed as shell — this collector does not change that yet. The two
+streams collect in genuinely different shapes: obtainability answers every
+check from one dump; compliance reads a workload dump plus RBAC, NetworkPolicy
+and Namespace, ServiceAccount, and two distinct `gcloud` calls, none of them
+optional. `collect_cluster` is a thin dispatcher over a per-stream *context
+builder* for exactly this reason — the engine below is what both streams
+share, not what the first one happened to need. Converting the rest is the
+next several phases in the design's §10 work breakdown, each its own PR,
+deliberately.
 
 What this file does for the checks it covers:
 
   1. Enumerates the fleet (`gcloud container clusters list`).
   2. Fetches per-cluster credentials into an isolated kubeconfig — the same
      path convention every SOP already uses (`AGENTS.md`, "Cluster
-     Credentials") — and dumps workload state once, behind a fail-closed
-     `jq -e`-equivalent gate so a truncated or empty dump cannot read as a
-     clean cluster.
-  3. Runs every covered check's filter against that one dump, in parallel
-     across clusters (a thread pool; each cluster's kubeconfig is a private
-     file, so no cluster's read can bleed into another's — see §4.3).
+     Credentials") — then runs the stream's context builder: one dump for
+     obtainability, several distinct `kubectl`/`gcloud` reads for
+     compliance, each behind its own fail-closed `jq -e`-equivalent gate so
+     a truncated or empty result cannot read as a clean cluster.
+  3. Runs every covered check's filter against the collected context, in
+     parallel across clusters (a thread pool; each cluster's kubeconfig is a
+     private file, so no cluster's read can bleed into another's — see
+     §4.3).
   4. Emits the run manifest (§6): for every enumerated cluster, an outcome,
      the literal collection commands (so `checks_run` stays falsifiable —
      §4.1), and every candidate finding.
@@ -47,6 +54,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -179,37 +187,64 @@ def fetch_credentials(
 DUMP_COMMAND_KINDS = "deployments,statefulsets,daemonsets,poddisruptionbudgets,horizontalpodautoscalers,services,limitranges"
 
 
+def run_and_gate(argv: list[str], kubeconfig: Path, *, run: RunFn = default_run) -> tuple[dict | None, Run]:
+    """One collection command, behind a fail-closed gate.
+
+    The gate is the ai-security SOP's pattern (`ai_security_audit_sop.md:89`):
+    a `kubectl`/`gcloud` that failed leaves empty or truncated output, and
+    reading that as "nothing here" is indistinguishable from a genuinely
+    empty result unless something checks the output is well-formed *before*
+    any check trusts it. Returns `(parsed_json_or_None, command_run)` —
+    `None` means the gate failed; the caller records that as
+    `outcome: "gate-failed"` for the whole cluster, never as a shorter
+    candidate list from the checks that happened to run first.
+
+    A `kubectl get <kinds> ... -o json` list response gates on `.items`
+    being a list; a `gcloud ... --format=json(...)` object response has no
+    such envelope, so it gates on parsing as an object at all. Both share
+    the same failure mode this function exists to catch: exit 0 with
+    truncated or empty output, which the 4 MiB credential-proxy cap makes a
+    real possibility, not a theoretical one.
+    """
+    env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
+    result = run(argv, env=env, timeout=DEFAULT_TIMEOUT_S)
+    if result.rc != 0 or not result.stdout.strip():
+        return None, result
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None, result
+    if "get" in argv and isinstance(parsed, dict) and not isinstance(parsed.get("items"), list):
+        return None, result
+    if not isinstance(parsed, (dict, list)):
+        return None, result
+    return parsed, result
+
+
+class GateFailure(Exception):
+    """Raised by a stream's context builder when a required collection
+    command fails its gate. `collect_cluster` turns this into
+    `outcome: "gate-failed"` for the whole cluster — a stream that collects
+    from several commands fails closed on any one of them, the same way a
+    single-dump stream does; a partially-gated cluster is not a smaller
+    success, it is the false-all-clear shape at a different scale."""
+
+
 def dump_state(
     kubeconfig: Path, cluster: str, *, run: RunFn = default_run
 ) -> tuple[Path, Run, bool]:
-    """One JSON dump answering every §3 check, behind a fail-closed gate.
-
-    The gate is the ai-security SOP's pattern (`ai_security_audit_sop.md:89`):
-    a `kubectl` that failed leaves an empty or truncated file, and reading
-    that as "zero workloads" is indistinguishable from a genuinely empty
-    cluster unless something checks the dump is well-formed *before* any
-    check trusts it. Returns `(dump_path, collection_run, gate_ok)` — the
-    caller records `gate_ok is False` as `outcome: "gate-failed"`, never as a
-    shorter candidate list.
+    """`obtainability-audit`'s one dump, behind `run_and_gate`. Kept as its
+    own function (rather than inlined into its context builder) because its
+    fixed dump-to-a-named-file shape predates the multi-collection builder
+    contract and nothing else needs a file on disk — every check reads the
+    parsed dict `run_and_gate` already returns.
     """
     dump_path = Path(SCRATCH_DIR) / f"wra_state_{cluster}.json"
-    env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
-    result = run(
-        ["kubectl", "get", DUMP_COMMAND_KINDS, "-A", "-o", "json"],
-        env=env,
-        timeout=DEFAULT_TIMEOUT_S,
-    )
-    gate_ok = False
-    if result.rc == 0 and result.stdout.strip():
-        try:
-            parsed = json.loads(result.stdout)
-            gate_ok = isinstance(parsed.get("items"), list)
-        except json.JSONDecodeError:
-            gate_ok = False
-    if gate_ok:
+    parsed, result = run_and_gate(["kubectl", "get", DUMP_COMMAND_KINDS, "-A", "-o", "json"], kubeconfig, run=run)
+    if parsed is not None:
         dump_path.parent.mkdir(parents=True, exist_ok=True)
         dump_path.write_text(result.stdout, encoding="utf-8")
-    return dump_path, result, gate_ok
+    return dump_path, result, parsed is not None
 
 
 def output_digest(text: str) -> str:
@@ -620,6 +655,361 @@ def check_single_replica(workload: dict, context: dict) -> dict | None:
     return {"object": f"Deployment/{workload['name']}", "excerpt": "single replica, Service-backed"}
 
 
+# --------------------------------------------------------------------------- #
+# compliance-audit: all eleven checks of §2.
+#
+# Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
+# stream's workload dump includes bare Pods (owned ones excluded — audit the
+# owning controller, per the SOP's own reasoning) and reads `.spec` directly,
+# resolved per kind: a Pod's `.spec` *is* the pod spec; a CronJob's is nested
+# two objects deeper. `_pod_spec_of` is that resolution, done once instead of
+# three times.
+# --------------------------------------------------------------------------- #
+
+COMPLIANCE_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob", "Pod")
+COMPLIANCE_DUMP_KINDS = "deploy,sts,ds,cronjob,pod"
+_SYSTEM_SA_NAMESPACE_RE_PARTS = (
+    "kube-system", "gmp-system", "cnrm-system", "configconnector-operator-system", "krmapihosting-system",
+)
+
+
+def _pod_spec_of(item: dict) -> dict:
+    kind, spec = item.get("kind"), item.get("spec") or {}
+    if kind == "Pod":
+        return spec
+    if kind == "CronJob":
+        return (((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("spec") or {}
+    return (spec.get("template") or {}).get("spec") or {}
+
+
+def normalize_compliance_workloads(dump: dict) -> list[dict]:
+    """Every object surviving compliance's universal suppressions, as
+    `{kind, ns, name, spec}` where `spec` is the resolved **pod** spec —
+    compliance's checks read `securityContext`, `hostNetwork`, `volumes`,
+    never the owning object's own fields. Bare Pods are included and owned
+    ones excluded (audit the controller, never the pod, whose name carries a
+    random suffix) — the opposite inclusion rule from `normalize_workloads`,
+    which drops Pods from its kind list entirely because obtainability reads
+    templates, not live objects.
+    """
+    out = []
+    for item in dump.get("items", []) or []:
+        if item.get("kind") not in COMPLIANCE_WORKLOAD_KINDS:
+            continue
+        meta = item.get("metadata") or {}
+        ns = meta.get("namespace", "")
+        if _is_system_namespace(ns):
+            continue
+        labels = meta.get("labels") or {}
+        if "addonmanager.kubernetes.io/mode" in labels:
+            continue
+        if (meta.get("annotations") or {}).get("components.gke.io/component-name"):
+            continue
+        if item.get("kind") == "Pod" and meta.get("ownerReferences"):
+            continue
+        out.append({"kind": item["kind"], "ns": ns, "name": meta.get("name", ""), "spec": _pod_spec_of(item)})
+    return out
+
+
+def check_privileged_container(workload: dict, context: dict) -> dict | None:
+    bad = [
+        c.get("name", "")
+        for c in (workload["spec"].get("containers") or []) + (workload["spec"].get("initContainers") or [])
+        if (c.get("securityContext") or {}).get("privileged") is True
+        or "SYS_ADMIN" in ((c.get("securityContext") or {}).get("capabilities") or {}).get("add", [])
+    ]
+    if not bad:
+        return None
+    return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"privileged/SYS_ADMIN: {', '.join(bad)}"}
+
+
+def check_host_namespace(workload: dict, context: dict) -> dict | None:
+    spec = workload["spec"]
+    host_pid, host_ipc, host_net = bool(spec.get("hostPID")), bool(spec.get("hostIPC")), bool(spec.get("hostNetwork"))
+    if not (host_pid or host_ipc or host_net):
+        return None
+    severity = "critical" if (host_pid or host_ipc) else "major"
+    return {
+        "object": f"{workload['kind']}/{workload['name']}",
+        "excerpt": f"hostNetwork={host_net} hostPID={host_pid} hostIPC={host_ipc}",
+        "severity": severity,
+    }
+
+
+_SENSITIVE_HOSTPATHS = ("/", "/etc", "/proc", "/var/run/docker.sock", "/run/containerd/containerd.sock")
+
+
+def check_hostpath_mount(workload: dict, context: dict) -> dict | None:
+    host_volumes = {
+        v["name"]: v["hostPath"]["path"]
+        for v in workload["spec"].get("volumes") or []
+        if v.get("hostPath", {}).get("path")
+    }
+    if not host_volumes:
+        return None
+    mounted = []
+    for container in (workload["spec"].get("containers") or []) + (workload["spec"].get("initContainers") or []):
+        for vm in container.get("volumeMounts") or []:
+            if vm.get("name") in host_volumes:
+                mounted.append((host_volumes[vm["name"]], bool(vm.get("readOnly"))))
+    if not mounted:
+        return None
+
+    def sensitive(path: str) -> bool:
+        return path in _SENSITIVE_HOSTPATHS or path.startswith("/var/lib/kubelet")
+
+    critical = any(sensitive(p) or not ro for p, ro in mounted)
+    return {
+        "object": f"{workload['kind']}/{workload['name']}",
+        "excerpt": "; ".join(f"{p} readOnly={ro}" for p, ro in mounted),
+        "severity": "critical" if critical else "major",
+    }
+
+
+_SYSTEM_PRINCIPAL_RE = re.compile(r"^system:")
+_MANAGED_IDENTITY_RE = re.compile(r"^gke-|^service-\d+@|\.gserviceaccount\.com$")
+_ORG_EMAIL_GROUP_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def _is_non_system_subject(subject: dict) -> tuple[bool, bool]:
+    """Returns (flagged, is_org_email_group) for one binding subject."""
+    kind, name, ns = subject.get("kind"), subject.get("name", ""), subject.get("namespace", "")
+    if kind == "ServiceAccount":
+        return ns not in _SYSTEM_SA_NAMESPACE_RE_PARTS and not ns.startswith("gke-") and not ns.startswith("config-management-"), False
+    if kind in ("User", "Group"):
+        if _SYSTEM_PRINCIPAL_RE.match(name) or _MANAGED_IDENTITY_RE.search(name):
+            return False, False
+        is_org_group = kind == "Group" and bool(_ORG_EMAIL_GROUP_RE.match(name))
+        return True, is_org_group
+    return False, False
+
+
+def check_cluster_admin_binding(context: dict) -> list[dict]:
+    hits = []
+    for crb in context.get("clusterrolebindings") or []:
+        role_ref = crb.get("roleRef") or {}
+        if role_ref.get("name") != "cluster-admin":
+            continue
+        name = (crb.get("metadata") or {}).get("name", "")
+        for subject in crb.get("subjects") or []:
+            flagged, is_org_group = _is_non_system_subject(subject)
+            if not flagged:
+                continue
+            target = f"{subject.get('kind')}/{subject.get('namespace', '-')}/{subject.get('name')}"
+            hits.append(
+                {
+                    "namespace": "",
+                    "object": f"ClusterRoleBinding/{name}",
+                    "excerpt": f"{name} -> {target}",
+                    "severity": "minor" if is_org_group else "critical",
+                }
+            )
+    return hits
+
+
+_WILDCARD_BOOTSTRAP_LABEL = "kubernetes.io/bootstrapping"
+
+
+def check_wildcard_rbac(context: dict) -> list[dict]:
+    bound_non_system = set()
+    for kind_key in ("clusterrolebindings", "rolebindings"):
+        for binding in context.get(kind_key) or []:
+            role_ref = binding.get("roleRef") or {}
+            for subject in binding.get("subjects") or []:
+                flagged, _ = _is_non_system_subject(subject)
+                if flagged:
+                    bound_non_system.add((role_ref.get("kind"), role_ref.get("name")))
+
+    hits = []
+    for role in (context.get("roles") or []):
+        meta = role.get("metadata") or {}
+        if (meta.get("labels") or {}).get(_WILDCARD_BOOTSTRAP_LABEL) == "rbac-defaults":
+            continue
+        if meta.get("name", "").startswith("system:"):
+            continue
+        wildcard_rules = [
+            rule
+            for rule in role.get("rules") or []
+            if "*" in (rule.get("verbs") or [])
+            and (
+                (rule.get("apiGroups") or []) == [""]
+                or "*" in (rule.get("resources") or [])
+                or "*" in (rule.get("apiGroups") or [])
+            )
+        ]
+        # Vendor-apiGroup exception: a wildcard confined to one non-core
+        # apiGroup that is not "*" itself is the operator-owns-its-own-CRDs
+        # pattern, not an escalation. A wildcard over the core group ("")
+        # is never suppressed, which the list-equality check above already
+        # requires explicitly rather than falling out of the "*" membership
+        # test (an apiGroups list of [""] contains no "*" at all).
+        wildcard_rules = [
+            r
+            for r in wildcard_rules
+            if (r.get("apiGroups") or []) == [""]
+            or "*" in (r.get("apiGroups") or [])
+            or len(set(r.get("apiGroups") or [])) != 1
+        ]
+        if not wildcard_rules:
+            continue
+        key = (role.get("kind"), meta.get("name"))
+        if key not in bound_non_system:
+            continue
+        ns = meta.get("namespace", "")
+        hits.append(
+            {
+                "namespace": ns,
+                "object": f"{role['kind']}/{meta.get('name')}",
+                "excerpt": json.dumps(wildcard_rules),
+                "severity": "critical" if role.get("kind") == "ClusterRole" else "major",
+            }
+        )
+    return hits
+
+
+def check_netpol_missing(context: dict) -> list[dict]:
+    hits = []
+    netpols_by_ns: dict[str, list[dict]] = {}
+    for netpol in context.get("networkpolicies") or []:
+        ns = (netpol.get("metadata") or {}).get("namespace", "")
+        netpols_by_ns.setdefault(ns, []).append(netpol)
+    pod_count_by_ns: dict[str, int] = {}
+    for wl in context.get("workloads") or []:
+        if wl["kind"] == "Pod":
+            pod_count_by_ns[wl["ns"]] = pod_count_by_ns.get(wl["ns"], 0) + 1
+
+    for ns_item in context.get("namespaces") or []:
+        ns = (ns_item.get("metadata") or {}).get("name", "")
+        if _is_system_namespace(ns):
+            continue
+        policies = netpols_by_ns.get(ns, [])
+        if not policies:
+            if pod_count_by_ns.get(ns, 0) == 0:
+                continue  # no workloads, no exposure, pure churn
+            hits.append(
+                {"namespace": ns, "object": f"Namespace/{ns}", "excerpt": "zero NetworkPolicies", "severity": "major"}
+            )
+            continue
+        allow_all = [
+            p
+            for p in policies
+            if (p.get("spec") or {}).get("podSelector") == {}
+            and (
+                any(rule == {} for rule in (p.get("spec") or {}).get("ingress") or [])
+                or not (p.get("spec") or {}).get("policyTypes")
+            )
+        ]
+        if allow_all and len(allow_all) == len(policies):
+            for p in allow_all:
+                hits.append(
+                    {
+                        "namespace": ns,
+                        "object": f"NetworkPolicy/{(p.get('metadata') or {}).get('name', '')}",
+                        "excerpt": "allow-all (podSelector: {} with an empty ingress rule)",
+                        "severity": "minor",
+                    }
+                )
+    return hits
+
+
+def check_default_sa_automount(context: dict) -> list[dict]:
+    unsafe_sa_namespaces = set()
+    for sa in context.get("serviceaccounts") or []:
+        meta = sa.get("metadata") or {}
+        if sa.get("automountServiceAccountToken") is not False:
+            unsafe_sa_namespaces.add(meta.get("namespace", ""))
+
+    hits = []
+    for wl in context.get("workloads") or []:
+        sa_name = wl["spec"].get("serviceAccountName") or wl["spec"].get("serviceAccount") or "default"
+        if sa_name != "default":
+            continue
+        if wl["ns"] not in unsafe_sa_namespaces:
+            continue
+        if wl["spec"].get("automountServiceAccountToken") is False:
+            continue
+        hits.append(
+            {
+                "namespace": wl["ns"],
+                "object": f"{wl['kind']}/{wl['name']}",
+                "excerpt": "resolves to the default ServiceAccount with automount not disabled",
+            }
+        )
+    return hits
+
+
+def check_workload_identity_off(context: dict) -> list[dict]:
+    describe = context.get("cluster_describe") or {}
+    pool = ((describe.get("workloadIdentityConfig") or {}).get("workloadPool") or "").strip()
+    if pool:
+        return []
+    return [{"namespace": "", "object": "Cluster", "excerpt": "workloadIdentityConfig.workloadPool is empty"}]
+
+
+def check_legacy_metadata(context: dict) -> list[dict]:
+    hits = []
+    for pool in context.get("node_pools") or []:
+        mode = ((pool.get("config") or {}).get("workloadMetadataConfig") or {}).get("mode") or ""
+        if mode == "GKE_METADATA":
+            continue
+        hits.append(
+            {
+                "namespace": "",
+                "object": f"NodePool/{pool.get('name', '')}",
+                "excerpt": f"workloadMetadataConfig.mode={mode or '(empty)'}",
+            }
+        )
+    return hits
+
+
+def check_public_control_plane(context: dict) -> list[dict]:
+    describe = context.get("cluster_describe") or {}
+    private_cfg = describe.get("privateClusterConfig") or {}
+    public_endpoint_enabled = (
+        (describe.get("controlPlaneEndpointsConfig") or {}).get("ipEndpointsConfig") or {}
+    ).get("enablePublicEndpoint")
+    reachable = private_cfg.get("enablePrivateEndpoint") is not True or public_endpoint_enabled is True
+    if not reachable:
+        return []
+    man_cfg = describe.get("masterAuthorizedNetworksConfig") or {}
+    unrestricted = man_cfg.get("enabled") is not True or "0.0.0.0/0" in (man_cfg.get("cidrBlocks") or [])
+    if not unrestricted:
+        return []
+    return [{"namespace": "", "object": "Cluster", "excerpt": "public endpoint reachable with no restrictive authorized networks"}]
+
+
+def _namespace_labels(context: dict, ns: str) -> dict:
+    for item in context.get("namespaces") or []:
+        meta = item.get("metadata") or {}
+        if meta.get("name") == ns:
+            return meta.get("labels") or {}
+    return {}
+
+
+def check_podsecurity_gaps(workload: dict, context: dict) -> dict | None:
+    if check_privileged_container(workload, context) is not None:
+        return None  # 2.1's finding subsumes this one; never emit both
+    if _namespace_labels(context, workload["ns"]).get("pod-security.kubernetes.io/enforce") == "restricted":
+        return None  # admission already guarantees it
+    pod_sc = workload["spec"].get("securityContext") or {}
+    bad = []
+    for container in (workload["spec"].get("containers") or []) + (workload["spec"].get("initContainers") or []):
+        c_sc = container.get("securityContext") or {}
+        if "runAsNonRoot" in c_sc:
+            non_root = c_sc["runAsNonRoot"]
+        elif "runAsNonRoot" in pod_sc:
+            non_root = pod_sc["runAsNonRoot"]
+        else:
+            non_root = None
+        run_as_user = c_sc.get("runAsUser", pod_sc.get("runAsUser"))
+        seccomp_type = ((c_sc.get("seccompProfile") or {}).get("type") or (pod_sc.get("seccompProfile") or {}).get("type") or "")
+        if non_root is not True or run_as_user == 0 or seccomp_type not in ("RuntimeDefault", "Localhost"):
+            bad.append(container.get("name", ""))
+    if not bad:
+        return None
+    return {"object": f"{workload['kind']}/{workload['name']}", "excerpt": f"containers: {', '.join(bad)}"}
+
+
 class CheckSpec(NamedTuple):
     slug: str
     kind: str  # "workload": run(workload, context) -> hit|None, one call per workload.
@@ -735,16 +1125,250 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
     ),
 )
 
-CHECK_TABLES: dict[str, tuple[CheckSpec, ...]] = {"obtainability-audit": OBTAINABILITY_CHECKS}
+COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
+    CheckSpec(
+        "privileged-container",
+        "workload",
+        check_privileged_container,
+        "critical",
+        None,
+        "Container has full host device and kernel access; compromising this "
+        "workload compromises the node.",
+    ),
+    CheckSpec(
+        "host-namespace",
+        "workload",
+        check_host_namespace,
+        "major",  # overridden per hit: critical for hostPID/hostIPC
+        None,
+        "Workload shares the node's process/IPC/network namespace, bypassing "
+        "pod isolation and NetworkPolicy enforcement.",
+    ),
+    CheckSpec(
+        "hostpath-mount",
+        "workload",
+        check_hostpath_mount,
+        "major",  # overridden per hit: critical for a sensitive or writable path
+        None,
+        "Workload mounts a node filesystem path, giving it access to state "
+        "belonging to the node and to other tenants' pods.",
+    ),
+    CheckSpec(
+        "cluster-admin-binding",
+        "cluster",
+        check_cluster_admin_binding,
+        "critical",  # overridden per hit: minor for an org-email Group
+        None,
+        "Subject holds unrestricted read/write on every resource in the "
+        "cluster, including Secrets in every namespace.",
+    ),
+    CheckSpec(
+        "wildcard-rbac",
+        "cluster",
+        check_wildcard_rbac,
+        "critical",  # overridden per hit: major for a namespaced Role
+        None,
+        "Subject can perform any verb on any resource in this scope, "
+        "including reading Secrets and creating privileged pods — an "
+        "unbounded escalation path.",
+    ),
+    CheckSpec(
+        "netpol-missing",
+        "cluster",
+        check_netpol_missing,
+        "major",  # overridden per hit: minor for allow-all-only
+        None,
+        "Every pod in this namespace accepts traffic from every pod in the "
+        "cluster; a compromise anywhere reaches these workloads unimpeded.",
+    ),
+    CheckSpec(
+        "default-sa-automount",
+        "cluster",
+        check_default_sa_automount,
+        "major",
+        None,
+        "Workload mounts an API-server credential it does not use, handing "
+        "an attacker an authenticated foothold for free.",
+    ),
+    CheckSpec(
+        "workload-identity-off",
+        "cluster",
+        check_workload_identity_off,
+        "critical",
+        None,
+        "All pods on this cluster share the node service account's Google "
+        "Cloud permissions; there is no per-workload IAM boundary.",
+    ),
+    CheckSpec(
+        "legacy-metadata",
+        "cluster",
+        check_legacy_metadata,
+        "critical",
+        None,
+        "Any pod on this node pool can read the node service account's "
+        "access token from the legacy metadata endpoint and escalate to "
+        "that identity's full Google Cloud permissions.",
+    ),
+    CheckSpec(
+        "public-control-plane",
+        "cluster",
+        check_public_control_plane,
+        "critical",
+        None,
+        "The cluster's API server accepts connections from any address on "
+        "the internet; credential compromise or an API-server CVE is "
+        "directly exploitable from outside the network.",
+    ),
+    CheckSpec(
+        "podsecurity-gaps",
+        "workload",
+        check_podsecurity_gaps,
+        "minor",
+        None,
+        "Containers run as root and/or without a seccomp filter, so a "
+        "runtime escape has an unfiltered syscall surface and immediate "
+        "root in the namespace it reaches.",
+    ),
+)
+
+CHECK_TABLES: dict[str, tuple[CheckSpec, ...]] = {
+    "obtainability-audit": OBTAINABILITY_CHECKS,
+    "compliance-audit": COMPLIANCE_CHECKS,
+}
 
 
 # --------------------------------------------------------------------------- #
 # Orchestration
+#
+# A stream's *context builder* owns how it collects (one dump, or several —
+# compliance-audit's RBAC/NetworkPolicy/ServiceAccount/gcloud reads have no
+# single-dump shape to share); `collect_cluster` owns what every stream does
+# with the result once collected, which is identical regardless of shape:
+# run each check, apply the autopilot/per-hit severity rule, emit candidates.
 # --------------------------------------------------------------------------- #
 
 
+class CollectedContext(NamedTuple):
+    context: dict
+    workloads: list[dict]  # for "workload"-kind checks; [] for a stream with none
+    commands: dict[str, dict]  # check slug -> {command, rc, duration_s, output_sha256}
+
+
+def _record(argv_str: str, result: Run) -> dict:
+    return {
+        "command": argv_str,
+        "rc": result.rc,
+        "duration_s": round(result.duration_s, 2),
+        "output_sha256": output_digest(result.stdout),
+    }
+
+
+def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
+    dump_path, dump_run, gate_ok = dump_state(kubeconfig, cluster["name"], run=run)
+    if not gate_ok:
+        raise GateFailure(f"dump gate failed (rc={dump_run.rc}): {dump_run.stderr.strip()[:300]}")
+    dump = json.loads(dump_path.read_text(encoding="utf-8"))
+    workloads = normalize_workloads(dump)
+    record = _record(f"KUBECONFIG={kubeconfig} kubectl get {DUMP_COMMAND_KINDS} -A -o json", dump_run)
+    return CollectedContext(build_context(dump, workloads), workloads, {spec.slug: record for spec in checks})
+
+
+# check slug -> which named collection(s) it needs, so a gate failure on one
+# collection (e.g. the gcloud describe) does not also invalidate checks that
+# only need another (e.g. the workload dump). Every slug not listed here
+# needs no cross-reference beyond the workload dump.
+_COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
+    "cluster-admin-binding": ("rbac",),
+    "wildcard-rbac": ("rbac",),
+    "netpol-missing": ("netpol", "namespaces", "workloads"),
+    "default-sa-automount": ("serviceaccounts", "workloads"),
+    "workload-identity-off": ("describe",),
+    "legacy-metadata": ("node_pools",),
+    "public-control-plane": ("describe",),
+}
+
+
+def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
+    name, project, location = cluster["name"], cluster["project"], cluster["location"]
+    commands: dict[str, dict] = {}
+    context: dict = {"workloads": []}
+
+    def gated(argv: list[str]) -> tuple[dict | list | None, Run]:
+        return run_and_gate(argv, kubeconfig, run=run)
+
+    # Every collection below is gate-checked independently, and a gate
+    # failure raises immediately — this stream fails the whole cluster
+    # closed on any missing input, the same as a single-dump stream, per
+    # `GateFailure`'s own docstring.
+    workload_argv = ["kubectl", "get", COMPLIANCE_DUMP_KINDS, "-A", "-o", "json"]
+    parsed, result = gated(workload_argv)
+    if parsed is None:
+        raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+    context["workloads"] = normalize_compliance_workloads(parsed)
+    workload_record = _record(f"KUBECONFIG={kubeconfig} {' '.join(workload_argv)}", result)
+    for spec in checks:
+        if spec.slug not in _COMPLIANCE_CHECK_SOURCES:
+            commands[spec.slug] = workload_record
+
+    rbac_argv = ["kubectl", "get", "clusterroles,roles,clusterrolebindings,rolebindings", "-A", "-o", "json"]
+    parsed, result = gated(rbac_argv)
+    if parsed is None:
+        raise GateFailure(f"RBAC dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+    items = parsed.get("items", [])
+    context["roles"] = [i for i in items if i.get("kind") in ("ClusterRole", "Role")]
+    context["clusterrolebindings"] = [i for i in items if i.get("kind") == "ClusterRoleBinding"]
+    context["rolebindings"] = [i for i in items if i.get("kind") == "RoleBinding"]
+    record = _record(f"KUBECONFIG={kubeconfig} {' '.join(rbac_argv)}", result)
+    for slug in ("cluster-admin-binding", "wildcard-rbac"):
+        commands[slug] = record
+
+    netpol_argv = ["kubectl", "get", "netpol,ns", "-A", "-o", "json"]
+    parsed, result = gated(netpol_argv)
+    if parsed is None:
+        raise GateFailure(f"NetworkPolicy/Namespace dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+    items = parsed.get("items", [])
+    context["networkpolicies"] = [i for i in items if i.get("kind") == "NetworkPolicy"]
+    context["namespaces"] = [i for i in items if i.get("kind") == "Namespace"]
+    commands["netpol-missing"] = _record(f"KUBECONFIG={kubeconfig} {' '.join(netpol_argv)}", result)
+
+    sa_argv = ["kubectl", "get", "sa", "-A", "--field-selector", "metadata.name=default", "-o", "json"]
+    parsed, result = gated(sa_argv)
+    if parsed is None:
+        raise GateFailure(f"ServiceAccount dump gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+    context["serviceaccounts"] = parsed.get("items", [])
+    commands["default-sa-automount"] = _record(f"KUBECONFIG={kubeconfig} {' '.join(sa_argv)}", result)
+
+    describe_argv = [
+        "gcloud", "container", "clusters", "describe", name, "--location", location, "--project", project,
+        "--format", "json(workloadIdentityConfig,privateClusterConfig,masterAuthorizedNetworksConfig,"
+        "controlPlaneEndpointsConfig)",
+    ]
+    parsed, result = gated(describe_argv)
+    if parsed is None:
+        raise GateFailure(f"cluster describe gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+    context["cluster_describe"] = parsed
+    describe_command = " ".join(describe_argv)
+    for slug in ("workload-identity-off", "public-control-plane"):
+        commands[slug] = _record(describe_command, result)
+
+    node_pools_argv = ["gcloud", "container", "node-pools", "list", "--cluster", name, "--location", location, "--project", project, "--format", "json"]
+    parsed, result = gated(node_pools_argv)
+    if parsed is None:
+        raise GateFailure(f"node-pools list gate failed (rc={result.rc}): {result.stderr.strip()[:300]}")
+    context["node_pools"] = parsed if isinstance(parsed, list) else []
+    commands["legacy-metadata"] = _record(" ".join(node_pools_argv), result)
+
+    return CollectedContext(context, context["workloads"], commands)
+
+
+_COLLECTORS: dict[str, Callable[..., CollectedContext]] = {
+    "obtainability-audit": _collect_obtainability,
+    "compliance-audit": _collect_compliance,
+}
+
+
 def collect_cluster(
-    cluster: dict, checks: tuple[CheckSpec, ...], *, run: RunFn = default_run
+    cluster: dict, audit_id: str, checks: tuple[CheckSpec, ...], *, run: RunFn = default_run
 ) -> dict:
     """One manifest `clusters[]` entry (§6): every enumerated cluster gets
     one, whatever happened — `outcome` says which of the three shapes it is.
@@ -758,30 +1382,14 @@ def collect_cluster(
             "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:300]}",
         }
 
-    dump_path, dump_run, gate_ok = dump_state(kubeconfig, name, run=run)
-    if not gate_ok:
+    try:
+        collected = _COLLECTORS[audit_id](cluster, kubeconfig, checks, run=run)
+    except GateFailure as exc:
         return {
             "name": name, "project": project, "location": location,
             "outcome": "gate-failed",
-            "error": f"dump gate failed (rc={dump_run.rc}): {dump_run.stderr.strip()[:300]}",
+            "error": str(exc),
         }
-
-    dump = json.loads(dump_path.read_text(encoding="utf-8"))
-    workloads = normalize_workloads(dump)
-    context = build_context(dump, workloads)
-    collection_command = f"KUBECONFIG={kubeconfig} kubectl get {DUMP_COMMAND_KINDS} -A -o json"
-    digest = output_digest(dump_run.stdout)
-
-    commands = [
-        {
-            "check": spec.slug,
-            "command": collection_command,
-            "rc": dump_run.rc,
-            "duration_s": round(dump_run.duration_s, 2),
-            "output_sha256": digest,
-        }
-        for spec in checks
-    ]
 
     def emit(spec: CheckSpec, hit: dict, default_namespace: str) -> dict:
         severity = hit.get("severity") or spec.severity
@@ -803,18 +1411,18 @@ def collect_cluster(
     candidates = []
     for spec in checks:
         if spec.kind == "workload":
-            for workload in workloads:
-                hit = spec.run(workload, context)
+            for workload in collected.workloads:
+                hit = spec.run(workload, collected.context)
                 if hit is not None:
                     candidates.append(emit(spec, hit, workload["ns"]))
         else:
-            for hit in spec.run(context):
+            for hit in spec.run(collected.context):
                 candidates.append(emit(spec, hit, hit.get("namespace", "")))
 
     return {
         "name": name, "project": project, "location": location,
         "outcome": "collected",
-        "commands": commands,
+        "commands": [{"check": spec.slug, **collected.commands[spec.slug]} for spec in checks],
         "candidates": candidates,
     }
 
@@ -836,7 +1444,7 @@ def collect_fleet(
     results = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
-            pool.submit(collect_cluster, cluster, checks, run=run): index
+            pool.submit(collect_cluster, cluster, audit_id, checks, run=run): index
             for index, cluster in enumerate(clusters)
         }
         for future in as_completed(futures):

@@ -687,7 +687,7 @@ class TestCollectCluster(unittest.TestCase):
             with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
                     patch.object(collect, "SCRATCH_DIR", tmp):
                 result = collect.collect_cluster(
-                    self.CLUSTER, checks or collect.OBTAINABILITY_CHECKS, run=run
+                    self.CLUSTER, "obtainability-audit", checks or collect.OBTAINABILITY_CHECKS, run=run
                 )
         return result, calls
 
@@ -762,7 +762,7 @@ class TestCollectCluster(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
                     patch.object(collect, "SCRATCH_DIR", tmp):
-                result = collect.collect_cluster(cluster, collect.OBTAINABILITY_CHECKS, run=run)
+                result = collect.collect_cluster(cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
         by_slug = {c["check"]: c for c in result["candidates"]}
         self.assertEqual(by_slug["no-requests"]["severity"], "minor")
         self.assertEqual(by_slug["no-memory-limit"]["severity"], "major")
@@ -895,6 +895,572 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
         doc["scope"]["clusters"][0]["checks_run"].append({"check": "not-a-real-check", "command": "x"})
         with self.assertRaises(audit_report.ValidationError):
             audit_report.cross_check_manifest(doc, manifest)
+
+    def test_compliance_audits_full_roster_also_verifies_through_collect_fleet(self):
+        # The multi-source builder is the part obtainability's version of
+        # this test cannot cover -- five distinct collection commands,
+        # cross-referenced, assembled by collect_fleet's outer enumeration
+        # and thread pool, not just one cluster's collect_cluster call.
+        clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING"}])
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return Run(argv, 0, clusters_json, "", 0.05)
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
+                return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "x"}}), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 0, "[]", "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+                manifest = collect.collect_fleet("compliance-audit", "acme", run=run)
+
+        checks_run = [{"check": c.slug, "command": "x"} for c in collect.COMPLIANCE_CHECKS]
+        doc = {"audit": "compliance-audit", "scope": {"clusters": [{"name": "c1", "checks_run": checks_run}]}}
+        audit_report.cross_check_manifest(doc, manifest)  # must not raise
+
+
+# --------------------------------------------------------------------------- #
+# compliance-audit
+# --------------------------------------------------------------------------- #
+
+
+def compliance_pod(name, ns="default", **meta_overrides):
+    """A bare Pod — compliance's dump includes these (unlike obtainability's,
+    which reads templates only). `pod_spec_of()` gives a mutable reference
+    into the container list for tests that need to set securityContext etc.
+    """
+    doc = {
+        "kind": "Pod",
+        "metadata": {"namespace": ns, "name": name, "labels": {}, "annotations": {}},
+        "spec": {"containers": [{"name": "app", "securityContext": {}}]},
+    }
+    doc["metadata"].update(meta_overrides)
+    return doc
+
+
+def compliance_workload(kind, name, ns="default"):
+    """A Deployment/StatefulSet/DaemonSet/CronJob wrapping the same pod spec
+    shape `compliance_pod` uses, nested at the depth compliance's
+    `_pod_spec_of` expects for that kind."""
+    pod_spec = {"containers": [{"name": "app", "securityContext": {}}]}
+    if kind == "CronJob":
+        spec = {"jobTemplate": {"spec": {"template": {"spec": pod_spec}}}}
+    else:
+        spec = {"template": {"spec": pod_spec}}
+    return {"kind": kind, "metadata": {"namespace": ns, "name": name, "labels": {}, "annotations": {}}, "spec": spec}
+
+
+def pod_spec_of(doc):
+    return collect._pod_spec_of(doc)
+
+
+def crb(name, subjects, role="cluster-admin"):
+    return {"kind": "ClusterRoleBinding", "metadata": {"name": name}, "roleRef": {"kind": "ClusterRole", "name": role}, "subjects": subjects}
+
+
+def subject(kind, name, ns=None):
+    d = {"kind": kind, "name": name}
+    if ns is not None:
+        d["namespace"] = ns
+    return d
+
+
+def cluster_role(name, rules, ns=None, labels=None):
+    doc = {"kind": "ClusterRole" if ns is None else "Role", "metadata": {"name": name, "labels": labels or {}}, "rules": rules}
+    if ns is not None:
+        doc["metadata"]["namespace"] = ns
+    return doc
+
+
+def role_binding(role_kind, role_name, subjects, ns=None):
+    doc = {
+        "kind": "ClusterRoleBinding" if ns is None else "RoleBinding",
+        "metadata": {"name": f"{role_name}-binding"},
+        "roleRef": {"kind": role_kind, "name": role_name},
+        "subjects": subjects,
+    }
+    if ns is not None:
+        doc["metadata"]["namespace"] = ns
+    return doc
+
+
+def netpol(name, ns="default", pod_selector=None, ingress=None, policy_types=None):
+    spec = {"podSelector": pod_selector if pod_selector is not None else {}}
+    if ingress is not None:
+        spec["ingress"] = ingress
+    if policy_types is not None:
+        spec["policyTypes"] = policy_types
+    return {"kind": "NetworkPolicy", "metadata": {"namespace": ns, "name": name}, "spec": spec}
+
+
+def namespace(name, labels=None):
+    return {"kind": "Namespace", "metadata": {"name": name, "labels": labels or {}}}
+
+
+def default_sa(ns, automount=None):
+    doc = {"kind": "ServiceAccount", "metadata": {"namespace": ns, "name": "default"}}
+    if automount is not None:
+        doc["automountServiceAccountToken"] = automount
+    return doc
+
+
+class TestComplianceNormalize(unittest.TestCase):
+    def test_a_bare_unowned_pod_is_included(self):
+        out = collect.normalize_compliance_workloads(dump_of(compliance_pod("standalone")))
+        self.assertEqual(len(out), 1)
+
+    def test_an_owned_pod_is_excluded_audit_the_controller_instead(self):
+        pod = compliance_pod("api-abc123")
+        pod["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "api"}]
+        self.assertEqual(collect.normalize_compliance_workloads(dump_of(pod)), [])
+
+    def test_a_deployment_template_is_included(self):
+        out = collect.normalize_compliance_workloads(dump_of(compliance_workload("Deployment", "api")))
+        self.assertEqual(len(out), 1)
+        self.assertIn("containers", out[0]["spec"])
+
+    def test_a_cronjob_resolves_two_levels_deep(self):
+        out = collect.normalize_compliance_workloads(dump_of(compliance_workload("CronJob", "job")))
+        self.assertEqual(out[0]["spec"]["containers"][0]["name"], "app")
+
+    def test_system_namespace_is_excluded(self):
+        self.assertEqual(
+            collect.normalize_compliance_workloads(dump_of(compliance_pod("x", ns="kube-system"))), []
+        )
+
+    def test_kubeagents_system_is_not_suppressed(self):
+        # The harness audits itself -- unlike obtainability's suppression
+        # list, compliance deliberately leaves this one unfiltered.
+        out = collect.normalize_compliance_workloads(dump_of(compliance_pod("x", ns="kubeagents-system")))
+        self.assertEqual(len(out), 1)
+
+    def test_a_gke_addon_is_excluded(self):
+        pod = compliance_pod("x")
+        pod["metadata"]["labels"]["addonmanager.kubernetes.io/mode"] = "Reconcile"
+        self.assertEqual(collect.normalize_compliance_workloads(dump_of(pod)), [])
+
+
+class TestPrivilegedContainer(unittest.TestCase):
+    def wl(self):
+        return collect.normalize_compliance_workloads(dump_of(compliance_pod("x")))[0]
+
+    def test_privileged_true_is_flagged(self):
+        d = compliance_pod("x")
+        pod_spec_of(d)["containers"][0]["securityContext"] = {"privileged": True}
+        wl = collect.normalize_compliance_workloads(dump_of(d))[0]
+        self.assertIsNotNone(collect.check_privileged_container(wl, context_of()))
+
+    def test_sys_admin_capability_is_flagged(self):
+        d = compliance_pod("x")
+        pod_spec_of(d)["containers"][0]["securityContext"] = {"capabilities": {"add": ["SYS_ADMIN"]}}
+        wl = collect.normalize_compliance_workloads(dump_of(d))[0]
+        self.assertIsNotNone(collect.check_privileged_container(wl, context_of()))
+
+    def test_allow_privilege_escalation_alone_is_never_flagged(self):
+        d = compliance_pod("x")
+        pod_spec_of(d)["containers"][0]["securityContext"] = {"allowPrivilegeEscalation": True}
+        wl = collect.normalize_compliance_workloads(dump_of(d))[0]
+        self.assertIsNone(collect.check_privileged_container(wl, context_of()))
+
+    def test_a_plain_container_is_not_flagged(self):
+        self.assertIsNone(collect.check_privileged_container(self.wl(), context_of()))
+
+
+class TestHostNamespace(unittest.TestCase):
+    def wl(self, **spec_overrides):
+        d = compliance_pod("x")
+        d["spec"].update(spec_overrides)
+        return collect.normalize_compliance_workloads(dump_of(d))[0]
+
+    def test_host_pid_is_critical(self):
+        hit = collect.check_host_namespace(self.wl(hostPID=True), context_of())
+        self.assertEqual(hit["severity"], "critical")
+
+    def test_host_ipc_is_critical(self):
+        hit = collect.check_host_namespace(self.wl(hostIPC=True), context_of())
+        self.assertEqual(hit["severity"], "critical")
+
+    def test_host_network_alone_is_major(self):
+        hit = collect.check_host_namespace(self.wl(hostNetwork=True), context_of())
+        self.assertEqual(hit["severity"], "major")
+
+    def test_none_set_is_not_flagged(self):
+        self.assertIsNone(collect.check_host_namespace(self.wl(), context_of()))
+
+
+class TestHostpathMount(unittest.TestCase):
+    def wl(self, path, ro, mount_name="hostvol"):
+        d = compliance_pod("x")
+        d["spec"]["volumes"] = [{"name": mount_name, "hostPath": {"path": path}}]
+        d["spec"]["containers"][0]["volumeMounts"] = [{"name": mount_name, "readOnly": ro}]
+        return collect.normalize_compliance_workloads(dump_of(d))[0]
+
+    def test_root_path_is_critical(self):
+        hit = collect.check_hostpath_mount(self.wl("/", True), context_of())
+        self.assertEqual(hit["severity"], "critical")
+
+    def test_docker_socket_is_critical(self):
+        hit = collect.check_hostpath_mount(self.wl("/var/run/docker.sock", True), context_of())
+        self.assertEqual(hit["severity"], "critical")
+
+    def test_a_writable_mount_is_critical_regardless_of_path(self):
+        hit = collect.check_hostpath_mount(self.wl("/data", False), context_of())
+        self.assertEqual(hit["severity"], "critical")
+
+    def test_a_readonly_non_sensitive_path_is_major(self):
+        hit = collect.check_hostpath_mount(self.wl("/data", True), context_of())
+        self.assertEqual(hit["severity"], "major")
+
+    def test_a_declared_but_unmounted_hostpath_is_never_flagged(self):
+        d = compliance_pod("x")
+        d["spec"]["volumes"] = [{"name": "v", "hostPath": {"path": "/"}}]
+        wl = collect.normalize_compliance_workloads(dump_of(d))[0]
+        self.assertIsNone(collect.check_hostpath_mount(wl, context_of()))
+
+    def test_var_lib_kubelet_is_critical(self):
+        hit = collect.check_hostpath_mount(self.wl("/var/lib/kubelet/pods", True), context_of())
+        self.assertEqual(hit["severity"], "critical")
+
+
+class TestClusterAdminBinding(unittest.TestCase):
+    def test_a_non_system_service_account_is_critical(self):
+        ctx = context_of(clusterrolebindings=[crb("b", [subject("ServiceAccount", "app", "default")])])
+        hits = collect.check_cluster_admin_binding(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "critical")
+
+    def test_a_system_masters_group_is_never_flagged(self):
+        ctx = context_of(clusterrolebindings=[crb("b", [subject("Group", "system:masters")])])
+        self.assertEqual(collect.check_cluster_admin_binding(ctx), [])
+
+    def test_a_kube_system_service_account_is_never_flagged(self):
+        ctx = context_of(clusterrolebindings=[crb("b", [subject("ServiceAccount", "x", "kube-system")])])
+        self.assertEqual(collect.check_cluster_admin_binding(ctx), [])
+
+    def test_a_google_managed_service_account_email_is_never_flagged(self):
+        ctx = context_of(
+            clusterrolebindings=[crb("b", [subject("User", "sa@my-project.iam.gserviceaccount.com")])]
+        )
+        self.assertEqual(collect.check_cluster_admin_binding(ctx), [])
+
+    def test_an_org_email_group_is_downgraded_to_minor(self):
+        ctx = context_of(clusterrolebindings=[crb("b", [subject("Group", "platform-admins@acme.com")])])
+        hits = collect.check_cluster_admin_binding(ctx)
+        self.assertEqual(hits[0]["severity"], "minor")
+
+    def test_a_binding_to_a_different_role_is_never_flagged(self):
+        ctx = context_of(
+            clusterrolebindings=[crb("b", [subject("ServiceAccount", "app", "default")], role="edit")]
+        )
+        self.assertEqual(collect.check_cluster_admin_binding(ctx), [])
+
+
+class TestWildcardRbac(unittest.TestCase):
+    WILDCARD_RULE = [{"verbs": ["*"], "resources": ["*"], "apiGroups": ["*"]}]
+
+    def test_a_bound_clusterrole_wildcard_is_critical(self):
+        ctx = context_of(
+            roles=[cluster_role("god-mode", self.WILDCARD_RULE)],
+            clusterrolebindings=[role_binding("ClusterRole", "god-mode", [subject("ServiceAccount", "app", "default")])],
+        )
+        hits = collect.check_wildcard_rbac(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "critical")
+
+    def test_a_bound_namespaced_role_wildcard_is_major(self):
+        ctx = context_of(
+            roles=[cluster_role("god-mode", self.WILDCARD_RULE, ns="default")],
+            rolebindings=[role_binding("Role", "god-mode", [subject("ServiceAccount", "app", "default")], ns="default")],
+        )
+        hits = collect.check_wildcard_rbac(ctx)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_an_unbound_wildcard_role_is_never_flagged(self):
+        ctx = context_of(roles=[cluster_role("god-mode", self.WILDCARD_RULE)])
+        self.assertEqual(collect.check_wildcard_rbac(ctx), [])
+
+    def test_a_bootstrapping_default_role_is_never_flagged(self):
+        ctx = context_of(
+            roles=[cluster_role("x", self.WILDCARD_RULE, labels={"kubernetes.io/bootstrapping": "rbac-defaults"})],
+            clusterrolebindings=[role_binding("ClusterRole", "x", [subject("ServiceAccount", "app", "default")])],
+        )
+        self.assertEqual(collect.check_wildcard_rbac(ctx), [])
+
+    def test_a_vendor_apigroup_wildcard_is_never_flagged(self):
+        rule = [{"verbs": ["*"], "resources": ["*"], "apiGroups": ["kubeagents.io"]}]
+        ctx = context_of(
+            roles=[cluster_role("operator", rule)],
+            clusterrolebindings=[role_binding("ClusterRole", "operator", [subject("ServiceAccount", "app", "default")])],
+        )
+        self.assertEqual(collect.check_wildcard_rbac(ctx), [])
+
+    def test_a_core_group_wildcard_is_never_suppressed(self):
+        rule = [{"verbs": ["*"], "resources": ["*"], "apiGroups": [""]}]
+        ctx = context_of(
+            roles=[cluster_role("core-god", rule)],
+            clusterrolebindings=[role_binding("ClusterRole", "core-god", [subject("ServiceAccount", "app", "default")])],
+        )
+        self.assertEqual(len(collect.check_wildcard_rbac(ctx)), 1)
+
+
+class TestNetpolMissing(unittest.TestCase):
+    def test_zero_policies_with_workloads_is_major(self):
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+        )
+        hits = collect.check_netpol_missing(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "major")
+
+    def test_zero_policies_and_zero_workloads_is_not_flagged(self):
+        ctx = context_of(namespaces=[namespace("empty")], networkpolicies=[], workloads=[])
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_an_allow_all_policy_is_minor(self):
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[netpol("allow-all", ns="payments", ingress=[{}])],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+        )
+        hits = collect.check_netpol_missing(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "minor")
+        self.assertIn("NetworkPolicy/allow-all", hits[0]["object"])
+
+    def test_a_real_default_deny_policy_is_never_flagged(self):
+        ctx = context_of(
+            namespaces=[namespace("payments")],
+            networkpolicies=[netpol("deny", ns="payments", policy_types=["Ingress"])],
+            workloads=[{"kind": "Pod", "ns": "payments", "name": "api"}],
+        )
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+    def test_a_system_namespace_is_never_flagged(self):
+        ctx = context_of(namespaces=[namespace("kube-system")], networkpolicies=[], workloads=[])
+        self.assertEqual(collect.check_netpol_missing(ctx), [])
+
+
+class TestDefaultSaAutomount(unittest.TestCase):
+    def test_default_sa_with_no_override_is_flagged(self):
+        ctx = context_of(
+            serviceaccounts=[default_sa("default")],
+            workloads=[{"kind": "Pod", "ns": "default", "name": "api", "spec": {}}],
+        )
+        self.assertEqual(len(collect.check_default_sa_automount(ctx)), 1)
+
+    def test_a_dedicated_service_account_is_never_flagged(self):
+        ctx = context_of(
+            serviceaccounts=[default_sa("default")],
+            workloads=[{"kind": "Pod", "ns": "default", "name": "api", "spec": {"serviceAccountName": "api-sa"}}],
+        )
+        self.assertEqual(collect.check_default_sa_automount(ctx), [])
+
+    def test_the_namespace_default_sa_disabling_automount_suppresses_it(self):
+        ctx = context_of(
+            serviceaccounts=[default_sa("default", automount=False)],
+            workloads=[{"kind": "Pod", "ns": "default", "name": "api", "spec": {}}],
+        )
+        self.assertEqual(collect.check_default_sa_automount(ctx), [])
+
+    def test_the_pod_level_override_suppresses_it_even_if_the_sa_does_not(self):
+        ctx = context_of(
+            serviceaccounts=[default_sa("default")],
+            workloads=[
+                {"kind": "Pod", "ns": "default", "name": "api", "spec": {"automountServiceAccountToken": False}}
+            ],
+        )
+        self.assertEqual(collect.check_default_sa_automount(ctx), [])
+
+
+class TestWorkloadIdentityOff(unittest.TestCase):
+    def test_empty_workload_pool_is_flagged(self):
+        ctx = context_of(cluster_describe={"workloadIdentityConfig": {}})
+        self.assertEqual(len(collect.check_workload_identity_off(ctx)), 1)
+
+    def test_a_set_workload_pool_is_never_flagged(self):
+        ctx = context_of(cluster_describe={"workloadIdentityConfig": {"workloadPool": "acme.svc.id.goog"}})
+        self.assertEqual(collect.check_workload_identity_off(ctx), [])
+
+
+class TestLegacyMetadata(unittest.TestCase):
+    def test_gce_metadata_mode_is_flagged(self):
+        ctx = context_of(node_pools=[{"name": "pool-1", "config": {"workloadMetadataConfig": {"mode": "GCE_METADATA"}}}])
+        self.assertEqual(len(collect.check_legacy_metadata(ctx)), 1)
+
+    def test_empty_mode_is_flagged(self):
+        ctx = context_of(node_pools=[{"name": "pool-1", "config": {}}])
+        self.assertEqual(len(collect.check_legacy_metadata(ctx)), 1)
+
+    def test_gke_metadata_mode_is_never_flagged(self):
+        ctx = context_of(node_pools=[{"name": "pool-1", "config": {"workloadMetadataConfig": {"mode": "GKE_METADATA"}}}])
+        self.assertEqual(collect.check_legacy_metadata(ctx), [])
+
+
+class TestPublicControlPlane(unittest.TestCase):
+    def test_public_endpoint_with_no_restriction_is_flagged(self):
+        ctx = context_of(cluster_describe={"privateClusterConfig": {}, "masterAuthorizedNetworksConfig": {}})
+        self.assertEqual(len(collect.check_public_control_plane(ctx)), 1)
+
+    def test_public_endpoint_with_unrestricted_cidr_is_flagged(self):
+        ctx = context_of(
+            cluster_describe={
+                "privateClusterConfig": {},
+                "masterAuthorizedNetworksConfig": {"enabled": True, "cidrBlocks": ["0.0.0.0/0"]},
+            }
+        )
+        self.assertEqual(len(collect.check_public_control_plane(ctx)), 1)
+
+    def test_a_private_endpoint_is_never_flagged(self):
+        ctx = context_of(cluster_describe={"privateClusterConfig": {"enablePrivateEndpoint": True}})
+        self.assertEqual(collect.check_public_control_plane(ctx), [])
+
+    def test_a_narrow_authorized_cidr_is_never_flagged(self):
+        ctx = context_of(
+            cluster_describe={
+                "privateClusterConfig": {},
+                "masterAuthorizedNetworksConfig": {"enabled": True, "cidrBlocks": ["10.0.0.0/8"]},
+            }
+        )
+        self.assertEqual(collect.check_public_control_plane(ctx), [])
+
+
+class TestPodSecurityGaps(unittest.TestCase):
+    def wl(self, container_sc=None, pod_sc=None):
+        d = compliance_pod("x")
+        if container_sc is not None:
+            d["spec"]["containers"][0]["securityContext"] = container_sc
+        if pod_sc is not None:
+            d["spec"]["securityContext"] = pod_sc
+        return collect.normalize_compliance_workloads(dump_of(d))[0]
+
+    def test_no_security_context_at_all_is_flagged(self):
+        self.assertIsNotNone(collect.check_podsecurity_gaps(self.wl(), context_of()))
+
+    def test_full_compliant_context_is_not_flagged(self):
+        sc = {"runAsNonRoot": True, "runAsUser": 10001, "seccompProfile": {"type": "RuntimeDefault"}}
+        self.assertIsNone(collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of()))
+
+    def test_explicit_false_over_a_compliant_pod_default_is_still_flagged(self):
+        # The has()-vs-// distinction the SOP is emphatic about: a container
+        # explicitly setting runAsNonRoot: false must not inherit a
+        # compliant pod-level true.
+        wl = self.wl(
+            container_sc={"runAsNonRoot": False, "runAsUser": 10001, "seccompProfile": {"type": "RuntimeDefault"}},
+            pod_sc={"runAsNonRoot": True},
+        )
+        self.assertIsNotNone(collect.check_podsecurity_gaps(wl, context_of()))
+
+    def test_runAsUser_zero_is_flagged_even_with_nonroot_true(self):
+        sc = {"runAsNonRoot": True, "runAsUser": 0, "seccompProfile": {"type": "RuntimeDefault"}}
+        self.assertIsNotNone(collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of()))
+
+    def test_missing_seccomp_profile_is_flagged(self):
+        sc = {"runAsNonRoot": True, "runAsUser": 10001}
+        self.assertIsNotNone(collect.check_podsecurity_gaps(self.wl(container_sc=sc), context_of()))
+
+    def test_pod_level_inheritance_is_honored_when_container_is_silent(self):
+        sc = {"runAsNonRoot": True, "runAsUser": 10001, "seccompProfile": {"type": "RuntimeDefault"}}
+        self.assertIsNone(collect.check_podsecurity_gaps(self.wl(pod_sc=sc), context_of()))
+
+    def test_already_flagged_by_privileged_container_is_suppressed_here(self):
+        d = compliance_pod("x")
+        d["spec"]["containers"][0]["securityContext"] = {"privileged": True}
+        wl = collect.normalize_compliance_workloads(dump_of(d))[0]
+        self.assertIsNone(collect.check_podsecurity_gaps(wl, context_of()))
+
+    def test_a_restricted_labelled_namespace_is_suppressed(self):
+        ctx = context_of(namespaces=[namespace("default", labels={"pod-security.kubernetes.io/enforce": "restricted"})])
+        self.assertIsNone(collect.check_podsecurity_gaps(self.wl(), ctx))
+
+
+class TestComplianceCollectCluster(unittest.TestCase):
+    """One end-to-end pass over compliance-audit's real collection plan --
+    five distinct kubectl/gcloud commands, gated and cross-referenced --
+    proving the multi-source builder actually composes with the shared
+    check-iteration loop `collect_cluster` runs regardless of stream shape.
+    """
+
+    CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+
+    def run_with(self, workload_items=(), rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=()):
+        describe = describe if describe is not None else {}
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:2] == ["kubectl", "get"]:
+                kinds = argv[2]
+                if kinds == collect.COMPLIANCE_DUMP_KINDS:
+                    return Run(argv, 0, json.dumps(dump_of(*workload_items)), "", 0.1)
+                if "clusterroles" in kinds:
+                    return Run(argv, 0, json.dumps(dump_of(*rbac_items)), "", 0.1)
+                if kinds == "netpol,ns":
+                    return Run(argv, 0, json.dumps(dump_of(*netpol_items)), "", 0.1)
+                if kinds == "sa":
+                    return Run(argv, 0, json.dumps(dump_of(*sa_items)), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return Run(argv, 0, json.dumps(describe), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 0, json.dumps(list(node_pools)), "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+                return collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
+
+    def test_a_clean_cluster_reports_nothing(self):
+        result = self.run_with(
+            describe={
+                "workloadIdentityConfig": {"workloadPool": "acme.svc.id.goog"},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            }
+        )
+        self.assertEqual(result["outcome"], "collected")
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(len(result["commands"]), 11)
+
+    def test_a_dirty_cluster_reports_across_multiple_sources(self):
+        privileged_pod = compliance_pod("bad")
+        privileged_pod["spec"]["containers"][0]["securityContext"] = {"privileged": True}
+        result = self.run_with(
+            workload_items=[privileged_pod],
+            rbac_items=[
+                crb("admin-binding", [subject("ServiceAccount", "app", "default")]),
+            ],
+            netpol_items=[namespace("default")],
+            describe={"workloadIdentityConfig": {}},
+        )
+        slugs = {c["check"] for c in result["candidates"]}
+        self.assertIn("privileged-container", slugs)
+        self.assertIn("cluster-admin-binding", slugs)
+        self.assertIn("netpol-missing", slugs)
+        self.assertIn("workload-identity-off", slugs)
+
+    def test_a_gate_failure_on_one_source_fails_the_whole_cluster(self):
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
+                return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
+            if argv[:2] == ["kubectl", "get"] and "clusterroles" in argv[2]:
+                return Run(argv, 1, "", "RBAC forbidden", 0.1)  # this one fails
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+                result = collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
+        self.assertEqual(result["outcome"], "gate-failed")
+        self.assertNotIn("candidates", result)
 
 
 if __name__ == "__main__":
