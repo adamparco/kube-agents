@@ -4914,6 +4914,113 @@ class TestStatusWriter(HarnessTestCase):
         self.assertIn(AUDIT, self.err)
 
 
+class TestCrossCheckManifest(unittest.TestCase):
+    """Manifest-scoped attestation upgrade: see
+    docs/designs/fleet-audit-collectors-and-status.md §6 and
+    `audit_report.cross_check_manifest`.
+    """
+
+    def manifest(self, **cluster_overrides):
+        cluster = {
+            "name": "prod-us-east",
+            "outcome": "collected",
+            "commands": [{"check": "no-requests", "rc": 0}, {"check": "no-memory-limit", "rc": 0}],
+        }
+        cluster.update(cluster_overrides)
+        return {"clusters": [cluster]}
+
+    def doc(self, checks_run):
+        return {
+            "audit": "obtainability-audit",
+            "scope": {
+                "clusters": [
+                    {"name": "prod-us-east", "checks_run": [{"check": c, "command": "x"} for c in checks_run]}
+                ]
+            },
+        }
+
+    def test_a_check_the_manifest_verified_passes(self):
+        audit_report.cross_check_manifest(self.doc(["no-requests"]), self.manifest())
+
+    def test_a_check_the_manifest_never_ran_is_rejected(self):
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-pdb"]), self.manifest())
+        self.assertIn("no-pdb", str(ctx.exception))
+        self.assertIn("prod-us-east", str(ctx.exception))
+
+    def test_a_check_that_ran_but_failed_is_rejected(self):
+        manifest = self.manifest(commands=[{"check": "no-requests", "rc": 1}])
+        with self.assertRaises(audit_report.ValidationError):
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+
+    def test_an_unreachable_cluster_is_not_cross_checked_at_all(self):
+        # The SOP's manual fallback applies here -- attestation, not
+        # manifest-verification, exactly as it does for streams with no
+        # collector at all.
+        manifest = self.manifest(outcome="unreachable", commands=[])
+        audit_report.cross_check_manifest(self.doc(["no-requests", "no-pdb", "no-hpa"]), manifest)
+
+    def test_a_gate_failed_cluster_is_not_cross_checked_either(self):
+        manifest = self.manifest(outcome="gate-failed", commands=[])
+        audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+
+    def test_a_cluster_absent_from_the_manifest_is_ignored(self):
+        # A stream only partially covered, or a manifest scoped narrower than
+        # the findings document -- not this function's concern.
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"][0]["name"] = "some-other-cluster"
+        audit_report.cross_check_manifest(doc, self.manifest())
+
+    def test_an_empty_manifest_cross_checks_nothing(self):
+        audit_report.cross_check_manifest(self.doc(["no-requests"]), {"clusters": []})
+
+
+class TestFinishManifestFlag(HarnessTestCase):
+    """The --manifest-file CLI wiring in handle_finish."""
+
+    def manifest_file(self, manifest):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def test_a_passing_manifest_lets_the_run_publish(self):
+        self.harness.replies = {"issue list": "[]"}
+        manifest = {
+            "clusters": [
+                {"name": "prod-us-east", "outcome": "collected",
+                 "commands": [{"check": c, "rc": 0} for c in audit_report.audit_checks(AUDIT)]},
+                {"name": "stage-eu", "outcome": "collected",
+                 "commands": [{"check": c, "rc": 0} for c in audit_report.audit_checks(AUDIT)]},
+            ]
+        }
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0)
+
+    def test_a_failing_manifest_rejects_before_any_publish(self):
+        manifest = {"clusters": [{"name": "prod-us-east", "outcome": "collected", "commands": []}]}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 2)
+        self.assertFalse(self.harness.matching("issue", "create"))
+        self.assertFalse(self.harness.matching("issue", "edit"))
+
+    def test_a_missing_manifest_file_is_rejected(self):
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", "/nonexistent.json"])
+        self.assertEqual(rc, 2)
+
+    def test_a_malformed_manifest_file_is_rejected(self):
+        path = self.tmp_path / "bad.json"
+        path.write_text("not json", encoding="utf-8")
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", str(path)])
+        self.assertEqual(rc, 2)
+
+    def test_no_manifest_flag_means_no_cross_check_at_all(self):
+        # Every existing test in this file relies on this: unconverted
+        # streams keep today's attestation semantics unchanged.
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.run_finish(make_doc(findings=[]))
+        self.assertEqual(rc, 0)
+
+
 class TestSyncOpenRemediationLabels(HarnessTestCase):
     """Labels are re-asserted from the path that actually sees open PRs."""
 

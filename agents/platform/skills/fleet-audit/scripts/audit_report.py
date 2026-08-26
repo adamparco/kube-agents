@@ -1960,6 +1960,54 @@ def coverage_gaps(data: dict) -> list[str]:
     return gaps
 
 
+def cross_check_manifest(data: dict, manifest: dict) -> None:
+    """Raise if `checks_run` names a check a collect.py manifest says did
+    not run. See docs/designs/fleet-audit-collectors-and-status.md §6.
+
+    Scoped per cluster, not per stream: a manifest cluster marked `collected`
+    is cross-checked in full — every `checks_run` entry for it must name a
+    (check, cluster) pair the manifest recorded at `rc == 0` — but a cluster
+    the manifest marks `unreachable` or `gate-failed` is left to the SOP's
+    ordinary attestation rules, because the collector could not cover it and
+    a human may have hand-collected it instead. The two regimes never mix
+    within one cluster: a `collected` cluster's entries are all
+    manifest-checked, so a fabricated extra check cannot hide behind a real
+    manual fallback on the same cluster.
+
+    Absent-from-the-manifest is silent: a cluster in `checks_run` that the
+    manifest never enumerated is not this function's business (a stream only
+    partially converted to a collector, or a manifest built for a narrower
+    scope) — `coverage_gaps` and the ordinary roster checks already govern
+    clusters the manifest says nothing about.
+    """
+    audit_id = str(data.get("audit") or "")
+    manifest_clusters = {
+        c["name"]: c
+        for c in (manifest.get("clusters") or [])
+        if isinstance(c, dict) and c.get("name")
+    }
+    for cluster in data.get("scope", {}).get("clusters") or []:
+        name = str(cluster.get("name", ""))
+        manifest_cluster = manifest_clusters.get(name)
+        if not manifest_cluster or manifest_cluster.get("outcome") != "collected":
+            continue
+        verified = {
+            (entry.get("check"), entry.get("rc"))
+            for entry in manifest_cluster.get("commands") or []
+        }
+        ok_checks = {check for check, rc in verified if rc == 0}
+        for entry in checks_ran(cluster):
+            if entry not in ok_checks:
+                raise ValidationError(
+                    f"scope.clusters: {name!r}.checks_run names {entry!r}, but the "
+                    f"collect.py manifest for {audit_id} marks {name!r} 'collected' "
+                    f"and records no successful command for that check there. A "
+                    "collected cluster's checks_run must match the manifest that "
+                    "collected it — see collect.py's manifest and "
+                    "cross_check_manifest."
+                )
+
+
 class ContainmentError(ValidationError):
     """A remediation path that passed the string check still escapes the repo."""
 
@@ -5797,6 +5845,17 @@ def handle_remediate(args: argparse.Namespace) -> None:
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
+    if getattr(args, "manifest_file", None):
+        manifest_path = Path(args.manifest_file)
+        if not manifest_path.is_file():
+            raise ValidationError(f"--manifest-file: {args.manifest_file} does not exist")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                f"--manifest-file: {args.manifest_file} is not valid JSON: {exc}"
+            ) from exc
+        cross_check_manifest(data, manifest)
     findings = list(data["findings"])
     now = datetime.now(timezone.utc)
     # Timing: `inspect_s` is t0 → here (the LLM-inclusive inspection phase),
@@ -6304,6 +6363,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Validate and render to stdout; perform zero git/gh side effects.",
+    )
+    finish_parser.add_argument(
+        "--manifest-file",
+        default=None,
+        help=(
+            "Optional collect.py run manifest (see collect.py's module "
+            "docstring). When given, checks_run entries for a manifest "
+            "cluster marked 'collected' are cross-checked against the "
+            "manifest's own rc=0 commands — see cross_check_manifest. "
+            "Streams without a collector never pass this."
+        ),
     )
 
     remediate_parser = subparsers.add_parser(
