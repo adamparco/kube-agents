@@ -32,6 +32,19 @@ gcloud compute networks subnets list --format=json
 
 ### 2. Diagnostic checks roster
 
+**Run the collector before evaluating any check below by hand.**
+
+```bash
+./skills/gcp-networking-fabric-audit/scripts/networking_audit.py > /opt/data/scratch/manifest_gcp-networking-fabric-audit.json
+```
+
+This stream's targets are GCP compute resources, not GKE clusters, so its collector is its own script rather than `fleet-audit`'s `collect.py` — see the script's own module docstring for the field contracts it assumes of each `gcloud` command's JSON. It sweeps every project named by `MONITORED_PROJECT_IDS`/`GCP_PROJECT_ID` on its own; pass `--project <id>` only to scope a run to one project. Read the manifest before doing anything else:
+
+- Every entry in `manifest.clusters` is one target — a subnet (`<project>/<region>/<subnet>`, `subnet-ip-exhaustion` only) or a project (`project/<project>`, the other four checks) — carrying one `outcome`. `"collected"` means every check that applies to that target already ran; do not re-run it by hand. `"gate-failed"` means one of that target's `gcloud` reads failed; fall back to this section's commands for that target alone.
+- For a `"collected"` target, copy its `commands` list verbatim into that target's `checks_run`.
+- Every entry in a `"collected"` target's `candidates` is a verified finding: `check`, `object`, `severity`, and `excerpt` are already computed. What is still yours to write is the `recommendation` and, for a `kind: manifest` remediation, the manifest or Terraform file itself (§3).
+- Pass `--manifest-file <path>` to `finish` (§5) so it cross-checks your `checks_run` against what the collector actually ran.
+
 #### 2.1 Subnet primary and secondary IP range exhaustion (`subnet-ip-exhaustion`)
 
 - **Severity**: `critical`
@@ -181,11 +194,15 @@ Every finding must conform to the full findings schema:
 ### 5. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit   --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json
+./skills/fleet-audit/scripts/audit_report.py finish --audit gcp-networking-fabric-audit \
+  --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json \
+  --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json
 # -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true,"inspect_s":214.0,"publish_s":41.5}
 ```
+
+Omit `--manifest-file` only on a run where §2's collector never produced one. Given one, `finish` rejects a `checks_run` entry on a `"collected"` target that names a check the manifest never recorded at `rc == 0`.
 
 - On a **scheduled** run, `silent_ok: true` -> your final response is exactly `[SILENT]`.
 - **An on-demand run is never silent.** If a person dispatched this job, report the outcome and the ledger URL whatever `silent_ok` says.
